@@ -1,0 +1,17 @@
+[package]
+name = "cyfs-process-chain"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+log = "*"
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+toml = "*"
+async-trait = "*"
+regex = "*"
+nom = "*"
+shlex = "*"
+http-types = "*"
+async-recursion = "*"
+xmltree = "*"
