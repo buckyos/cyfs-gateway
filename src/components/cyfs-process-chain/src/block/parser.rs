@@ -1,12 +1,13 @@
-use super::{block::*, cmd::CommandParserFactory};
+use super::block::*;
+use crate::cmd::CommandParserFactory;
 use nom::{
+    IResult, Parser,
     branch::alt,
     bytes::complete::tag,
     character::complete::space0,
     combinator::{map, opt},
     multi::many0,
     sequence::delimited,
-    IResult, Parser,
 };
 use shlex;
 
@@ -114,11 +115,17 @@ impl BlockParser {
         let (input, key) = nom::bytes::complete::take_till(|c: char| c == '=' || c == ':')(input)?;
         let (input, op) = alt((tag(":="), tag("="))).parse(input)?;
         let (input, value) =
-            nom::bytes::complete::take_till(|c: char| c.is_whitespace() || c == '&' || c == '|')(input)?;
-        
+            nom::bytes::complete::take_till(|c: char| c.is_whitespace() || c == '&' || c == '|')(
+                input,
+            )?;
+
         let name = "assign".to_string();
-        let args = vec![key.trim().to_string(), op.trim().to_string(), value.trim().to_string()];
-    
+        let args = vec![
+            key.trim().to_string(),
+            op.trim().to_string(),
+            value.trim().to_string(),
+        ];
+
         let cmd = CommandItem::new(name, args);
         Ok((input, Expression::Command(cmd)))
     }

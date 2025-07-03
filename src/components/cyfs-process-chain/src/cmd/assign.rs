@@ -1,5 +1,5 @@
 use super::cmd::*;
-use crate::block::{block::BlockType, context::Context};
+use crate::block::{BlockType, Context};
 use std::sync::Arc;
 
 // If key is "REQ_HEADER", "REQ_BODY", "RESP_HEADER", "RESP_BODY", then assign to request or response

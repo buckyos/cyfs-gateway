@@ -1,6 +1,6 @@
 
 use http_types::{headers::HeaderValue, Request, Response};
-use super::storage::{HostStorageRef, new_memory_host_storage};
+use crate::collection::{HostStorageRef, new_memory_host_storage};
 use std::str::FromStr;
 
 // The environment in which the commands are executed

@@ -1,6 +1,6 @@
 use super::block::{Block, Line, Operator, Expression, CommandItem};
 use super::context::Context;
-use super::cmd::{CommandResult, CommandAction};
+use crate::cmd::{CommandResult, CommandAction};
 
 pub const MAX_GOTO_COUNT_IN_BLOCK: u32 = 128;
 

@@ -1,5 +1,5 @@
 use super::cmd::*;
-use crate::block::{context::Context, block::BlockType};
+use crate::block::{Context, BlockType};
 use std::sync::Arc;
 
 // CMD: set_label_by_host_db REQ_HEADER.host
