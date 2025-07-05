@@ -1,15 +1,7 @@
 use super::cmd::*;
-use crate::block::{BlockType, Context};
+use crate::block::{AssignKind, BlockType, Context};
+use crate::chain::EnvLevel;
 use std::sync::Arc;
-
-// If key is "REQ_HEADER", "REQ_BODY", "RESP_HEADER", "RESP_BODY", then assign to request or response
-const REQUEST_VARS: [&str; 4] = ["REQ_HEADER", "REQ_BODY", "RESP_HEADER", "RESP_BODY"];
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AssignType {
-    // Normal assignment, use KEY=VALUE
-    Normal,
-}
 
 pub struct AssignCommandParser {}
 
@@ -21,74 +13,68 @@ impl AssignCommandParser {
 
 impl CommandParser for AssignCommandParser {
     fn check(&self, _block_type: BlockType) -> bool {
-        // Assign cmd can be used in any block
         true
     }
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        if args.len() != 3 {
+        // Args must not be empty
+        if args.len() < 2 {
             let msg = format!("Invalid assign command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
 
-        let _type = match args[1] {
-            "=" => AssignType::Normal,
-            _ => {
-                let msg = format!("Invalid assign type: {:?}", args);
-                error!("{}", msg);
-                return Err(msg);
-            }
+        // Expect a single argument in the form of KEY=VALUE
+        let kind = args[0];
+        let kind = AssignKind::from_str(kind)
+            .map_err(|e| format!("Invalid assign kind: {}. Error: {}", kind, e))?;
+
+        let key = args[1].to_string();
+        let value = if args.len() > 2 {
+            Some(args[2].to_string())
+        } else {
+            None
         };
 
-        let key = args[0].to_owned();
-        let value = args[2].to_owned();
+        let cmd: AssignCommand = AssignCommand::new(kind, key, value);
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
 
-        // Check is request assign or env assign
-        if REQUEST_VARS.contains(&key.as_str()) {
-            let cmd = RequestAssignCommand::new(_type, key, value);
-            Ok(Arc::new(Box::new(cmd)))
-        } else {
+pub struct AssignCommand {
+    kind: AssignKind,
+    key: String,
+    value: Option<String>,
+}
 
-            let cmd = EnvAssignCommand::new(key, value);
-            Ok(Arc::new(Box::new(cmd)))
+impl AssignCommand {
+    pub fn new(kind: AssignKind, key: String, value: Option<String>) -> Self {
+        Self { kind, key, value }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for AssignCommand {
+    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+        match self.value {
+            Some(ref value) => {
+                // Handle assignment with value
+                let env_level = match self.kind {
+                    AssignKind::Block => EnvLevel::Block,
+                    AssignKind::Chain => EnvLevel::Chain,
+                    AssignKind::Global => EnvLevel::Global,
+                };
+
+                // Set the value in the context
+                context.set_env_value(self.key.as_str(), value, Some(env_level));
+            }
+            None => {
+                // Handle assignment without value
+                todo!("Assign command without value not implemented yet");
+            }
         }
-    }
-}
 
-pub struct EnvAssignCommand {
-    key: String,
-    value: String,
-}
-
-impl EnvAssignCommand {
-    pub fn new(key: String, value: String) -> Self {
-        Self { key, value }
-    }
-}
-
-#[async_trait::async_trait]
-impl CommandExecutor for EnvAssignCommand {
-    async fn exec(&self, _context: &mut Context) -> Result<CommandResult, String> {
-        todo!("EnvAssignCommand not implemented yet");
-    }
-}
-
-pub struct RequestAssignCommand {
-    type_: AssignType,
-    key: String,
-    value: String,
-}
-
-impl RequestAssignCommand {
-    pub fn new(type_: AssignType, key: String, value: String) -> Self {
-        Self { type_, key, value }
-    }
-}
-
-#[async_trait::async_trait]
-impl CommandExecutor for RequestAssignCommand {
-    async fn exec(&self, _context: &mut Context) -> Result<CommandResult, String> {
-        todo!("RequestAssignCommand not implemented yet");
+        // Return success
+        Ok(CommandResult::success())
     }
 }

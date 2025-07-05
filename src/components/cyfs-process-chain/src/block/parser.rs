@@ -1,22 +1,20 @@
 use super::block::*;
-use super::exec::DynamicCommandExecutor;
-use crate::cmd::{CommandExecutor, CommandParserFactory};
 use nom::{
     IResult, Parser,
     branch::alt,
     bytes::complete::tag,
     bytes::complete::{escaped_transform, is_not},
     bytes::streaming::take_while1,
-    character::complete::{alphanumeric1, char},
+    character::complete::{alpha1, alphanumeric1, char},
     character::complete::{space0, space1},
     character::multispace0,
-    combinator::{map, opt, value},
+    combinator::{map, opt, recognize, value},
     error::{ErrorKind, ParseError},
     multi::many0,
     multi::separated_list0,
-    sequence::{delimited, preceded, terminated},
+    sequence::{delimited, pair, preceded, terminated},
 };
-use std::sync::Arc;
+
 
 pub struct BlockParser {
     block_type: BlockType,
@@ -92,7 +90,6 @@ impl BlockParser {
         )
         .parse(input)
         .map(|(rest, expr_groups)| {
-            
             // Covert each group of expressions into a Statement
             let stmts = expr_groups
                 .into_iter()
@@ -134,7 +131,8 @@ impl BlockParser {
         Ok((input, Expression::Group(expressions)))
     }
 
-    // Parse assign expression with = or :=
+    /*
+    // Parse assign expression with =
     fn parse_assign(input: &str) -> IResult<&str, Expression> {
         let (input, key) = nom::bytes::complete::take_till(|c: char| c == '=' || c == ':')(input)?;
         let (input, op) = alt((tag(":="), tag("="))).parse(input)?;
@@ -152,6 +150,49 @@ impl BlockParser {
         let args = CommandArgs::new(args);
 
         let cmd = CommandItem::new(name, args);
+        Ok((input, Expression::Command(cmd)))
+    }
+    */
+
+    fn parse_assign(input: &str) -> IResult<&str, Expression> {
+        let (input, kind) = opt(terminated(
+            alt((
+                value(AssignKind::Global, tag("export")),
+                value(AssignKind::Global, tag("global")),
+                value(AssignKind::Chain, tag("chain")),
+                value(AssignKind::Block, tag("local")),
+                value(AssignKind::Block, tag("block")),
+            )),
+            space1,
+        ))
+        .parse(input)?;
+
+        let kind = kind.unwrap_or_default();
+
+        let (input, key) = recognize(pair(
+            alt((alpha1, tag("_"))),
+            many0(alt((alphanumeric1, tag("_")))),
+        ))
+        .parse(input)?;
+
+        let (input, value) = opt(preceded(char('='), Self::parse_arg)).parse(input)?;
+
+        let mut args = vec![
+            CommandArg::Literal(kind.as_str().to_string()),
+            CommandArg::Literal(key.to_string()),
+        ];
+
+        if value.is_some() {
+            args.push(value.unwrap());
+        } else {
+            // For assignments without value, such as: export KEY
+        }
+
+        let args = CommandArgs::new(args);
+        let cmd = CommandItem::new(
+            "assign".to_string(),
+            args,
+        );
         Ok((input, Expression::Command(cmd)))
     }
 
@@ -282,63 +323,5 @@ impl BlockParser {
             Self::parse_literal,       // "..." or '...' or unquoted
         ))
         .parse(input)
-    }
-}
-
-pub struct BlockCommandTranslator {
-    parser: CommandParserFactory,
-}
-
-impl BlockCommandTranslator {
-    pub fn new(parser: CommandParserFactory) -> Self {
-        Self { parser }
-    }
-
-    pub async fn translate(&self, block: &mut Block) -> Result<(), String> {
-        for line in &mut block.lines {
-            for statement in &mut line.statements {
-                // For each statement, we need to translate the expressions
-                for (expr, _) in &mut statement.expressions {
-                    if let Expression::Command(cmd) = expr {
-                        let parser = self.parser.get_parser(&cmd.command.name);
-                        if parser.is_none() {
-                            let msg = format!("No parser for command: {}", cmd.command.name);
-                            error!("{}", msg);
-                            return Err(msg);
-                        }
-
-                        let parser = parser.unwrap();
-
-                        // First check if cmd is valid for the block type
-                        if !parser.check(block.block_type) {
-                            let msg = format!(
-                                "Invalid command for block type: {:?}, block={:?}",
-                                cmd.command, block.block_type
-                            );
-                            error!("{}", msg);
-                            return Err(msg);
-                        }
-
-                        // Then parse args to executor
-                        let executer = if cmd.command.args.is_literal() {
-                            let args = cmd.command.args.as_literal_list();
-                            parser.parse(&args).map_err(|e| {
-                                let msg = format!("Parse command error: {:?}, {:?}", cmd.command, e);
-                                error!("{}", msg);
-                                msg
-                            })?
-                        } else {
-                            let exec = DynamicCommandExecutor::new(parser, cmd.take_args());
-
-                            Arc::new(Box::new(exec) as Box<dyn CommandExecutor>)
-                        };
-
-                        cmd.executor = Some(executer);
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 }

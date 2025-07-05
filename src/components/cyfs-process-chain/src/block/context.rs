@@ -1,4 +1,4 @@
-use crate::chain::{EnvManager, EnvRef, ProcessChainManagerRef, ProcessChainRef};
+use crate::chain::{EnvManager, EnvRef, ProcessChainManagerRef, ProcessChainRef, EnvLevel};
 
 // The context in which the block are executed
 pub struct Context {
@@ -24,8 +24,8 @@ impl Context {
         self.env.get(key, None)
     }
 
-    pub fn set_env_value(&self, key: &str, value: &str) -> Option<String> {
-        self.env.set(key, value, None)
+    pub fn set_env_value(&self, key: &str, value: &str, level: Option<EnvLevel>) -> Option<String> {
+        self.env.set(key, value, level)
     }
 
     pub fn delete_env_value(&self, key: &str) -> Option<String> {

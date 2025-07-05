@@ -9,3 +9,4 @@ mod assign;
 
 pub use cmd::*;
 pub use factory::*;
+pub use assign::*;

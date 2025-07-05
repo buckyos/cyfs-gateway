@@ -53,12 +53,12 @@ impl Env {
         let mut values = self.values.write().unwrap();
         if let Some(prev) = values.insert(key.to_string(), value.to_string()) {
             info!(
-                "Env key {} already exists, will be replaced, old value: {}",
-                key, prev
+                "Env {} key {} already exists, will be replaced, old value: {}",
+                self.level.as_str(), key, prev
             );
             Some(prev)
         } else {
-            debug!("Set env key {} to value {}", key, value);
+            debug!("Set {} env key {} to value {}", self.level.as_str(), key, value);
             None
         }
     }
@@ -79,17 +79,17 @@ impl Env {
     pub fn delete(&self, key: &str) -> Option<String> {
         let mut values = self.values.write().unwrap();
         if let Some(prev) = values.remove(key) {
-            info!("Env key {} removed, old value: {}", key, prev);
+            info!("Env {} key {} removed, old value: {}", self.level.as_str(), key, prev);
             Some(prev)
         } else {
-            info!("Env key {} not found", key);
+            info!("Env {} key {} not found", self.level.as_str(), key);
             None
         }
     }
 
     pub fn dump(&self) {
         let values = self.values.read().unwrap();
-        info!("Env level: {:?}", self.level);
+        info!("Env level: {}", self.level.as_str());
         for (key, value) in values.iter() {
             info!("{}: {}", key, value);
         }

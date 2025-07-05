@@ -155,12 +155,64 @@ impl CommandItem {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignKind {
+    // Normal assignment, use KEY=VALUE, var is visible in the current process chain
+    Chain,
+
+    // Local assignment, use local KEY=VALUE, var is only visible in the current block
+    Block,
+
+    // Global assignment, use export KEY=VALUE, var is visible in all process chains
+    Global, 
+}
+
+impl Default for AssignKind {
+    fn default() -> Self {
+        AssignKind::Chain // Default to chain level assignment
+    }
+}
+
+impl AssignKind {
+    pub fn as_str(&self) -> &str {
+        match self {
+            AssignKind::Chain => "chain",
+            AssignKind::Block => "block",
+            AssignKind::Global => "global",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "chain" => Ok(AssignKind::Chain),
+            "block" => Ok(AssignKind::Block),
+            "global" => Ok(AssignKind::Global),
+            _ => Err(format!("Invalid assign kind: {}", s)),
+        }
+    }
+}
+
+/*
+#[derive(Debug, Clone)]
+pub struct AssignExpression {
+    pub kind: AssignKind,
+    pub key: String,
+    pub value: Option<CommandArg>,
+}
+
+impl AssignExpression {
+    pub fn new(kind: AssignKind, key: String, value: Option<CommandArg>) -> Self {
+        Self { kind, key, value }
+    }
+}
+*/
+
 // Command or Expression
 #[derive(Debug, Clone)]
 pub enum Expression {
     Command(CommandItem),
     Group(Vec<(Expression, Operator)>), // Sub-expression in brackets
-    Goto(CommandArg),                       // Goto label
+    Goto(CommandArg),                   // Goto label
 }
 
 #[derive(Debug, Clone)]

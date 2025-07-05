@@ -52,7 +52,6 @@ impl CommandParserFactory {
 
         // assign command
         self.register("assign", Arc::new(Box::new(AssignCommandParser::new())));
-        
         // match command
         self.register("match", Arc::new(Box::new(MatchCommandParser::new())));
 
