@@ -1,6 +1,9 @@
 use super::block::{Block, CommandItem, Expression, Line, Operator, Statement};
+use super::block::{CommandArg, CommandArgs};
 use super::context::Context;
 use crate::cmd::{CommandAction, CommandResult};
+use crate::cmd::{CommandExecutor, CommandParser};
+use std::sync::Arc;
 
 pub const MAX_GOTO_COUNT_IN_BLOCK: u32 = 128;
 
@@ -161,10 +164,6 @@ impl BlockExecuter {
     }
 }
 
-use super::block::{CommandArg, CommandArgs};
-use crate::cmd::{CommandExecutor, CommandParser};
-use std::sync::Arc;
-
 pub struct DynamicCommandExecutor {
     pub parser: Arc<Box<dyn CommandParser>>,
     pub args: CommandArgs,
@@ -186,7 +185,7 @@ impl CommandExecutor for DynamicCommandExecutor {
                 CommandArg::Literal(value) => resolved_args.push(value.clone()),
                 CommandArg::Var(var) => {
                     // Resolve variable from context
-                    if let Some(value) = context.get_value(&var) {
+                    if let Some(value) = context.get_env_value(&var) {
                         resolved_args.push(value.clone());
                     } else {
                         // If variable is not found, push an empty string

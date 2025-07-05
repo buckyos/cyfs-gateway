@@ -3,9 +3,25 @@ use std::sync::{Arc, RwLock};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum EnvLevel {
-    Global,
-    Chain,
-    Block,
+    Global, // Global level environment, used for global settings, used by: export name=value
+    Chain,  // Chain level environment, used for chain-wide settings, which is default
+    Block,  // Block level environment, used for block-specific settings, use by: local name=value
+}
+
+impl Default for EnvLevel {
+    fn default() -> Self {
+        EnvLevel::Chain // Default to chain level
+    }
+}
+
+impl EnvLevel {
+    pub fn as_str(&self) -> &str {
+        match self {
+            EnvLevel::Global => "global",
+            EnvLevel::Chain => "chain",
+            EnvLevel::Block => "block",
+        }
+    }
 }
 
 pub struct Env {
@@ -25,15 +41,25 @@ impl Env {
         }
     }
 
-    pub fn set(&self, key: &str, value: &str) {
+    pub fn level(&self) -> EnvLevel {
+        self.level
+    }
+
+    pub fn parent(&self) -> Option<&EnvRef> {
+        self.parent.as_ref()
+    }
+
+    pub fn set(&self, key: &str, value: &str) -> Option<String> {
         let mut values = self.values.write().unwrap();
         if let Some(prev) = values.insert(key.to_string(), value.to_string()) {
             info!(
                 "Env key {} already exists, will be replaced, old value: {}",
                 key, prev
             );
+            Some(prev)
         } else {
             debug!("Set env key {} to value {}", key, value);
+            None
         }
     }
 
@@ -70,6 +96,7 @@ impl Env {
     }
 }
 
+#[derive(Clone)]
 pub struct EnvManager {
     global: EnvRef,
     chain: EnvRef,
@@ -77,14 +104,21 @@ pub struct EnvManager {
 }
 
 impl EnvManager {
-    pub fn new() -> Self {
-        let global = Arc::new(Env::new(EnvLevel::Global, None));
-        let chain = Arc::new(Env::new(EnvLevel::Chain, Some(global.clone())));
-        let block = Arc::new(Env::new(EnvLevel::Block, Some(chain.clone())));
+    pub fn new(global_env: EnvRef, chain_env: EnvRef) -> Self {
+        assert!(
+            global_env.level() == EnvLevel::Global,
+            "Global environment must be at global level"
+        );
+        assert!(
+            chain_env.level() == EnvLevel::Chain,
+            "Chain environment must be at chain level"
+        );
+
+        let block = Arc::new(Env::new(EnvLevel::Block, Some(chain_env.clone())));
 
         Self {
-            global,
-            chain,
+            global: global_env,
+            chain: chain_env,
             block,
         }
     }
@@ -101,40 +135,13 @@ impl EnvManager {
         &self.block
     }
 
-    fn parse_key(key: &str) -> Result<(EnvLevel, &str), String> {
-        let parts: Vec<&str> = key.split('.').collect();
-        let level = match parts.len() {
-            1 => EnvLevel::Block,
-            2 => match parts[0].to_ascii_lowercase().as_str() {
-                "global" => EnvLevel::Global,
-                "chain" => EnvLevel::Chain,
-                "block" => EnvLevel::Block,
-                _ => {
-                    let msg = format!("Invalid env key: {}", key);
-                    error!("{}", msg);
-                    return Err(msg);
-                }
-            },
-            _ => {
-                let msg = format!("Invalid env key: {}", key);
-                error!("{}", msg);
-                return Err(msg);
-            }
-        };
-
-        let key = parts[parts.len() - 1];
-        Ok((level, key))
+    // Set a value in the environment, level can be specified or default to chain level
+    pub fn set(&self, key: &str, value: &str, level: Option<EnvLevel>) -> Option<String> {
+        let level = level.unwrap_or_default();
+        self.set_inner(level, key, value)
     }
 
-    // Key format: level.key, if level not specified, use block level
-    pub fn set(&self, key: &str, value: &str) -> Result<(), String> {
-        let (level, key) = Self::parse_key(key)?;
-        self.set_inner(level, key, value);
-
-        Ok(())
-    }
-
-    fn set_inner(&self, level: EnvLevel, key: &str, value: &str) {
+    fn set_inner(&self, level: EnvLevel, key: &str, value: &str) -> Option<String> {
         match level {
             EnvLevel::Global => self.global.set(key, value),
             EnvLevel::Chain => self.chain.set(key, value),
@@ -142,10 +149,10 @@ impl EnvManager {
         }
     }
 
-    pub fn get(&self, key: &str) -> Result<Option<String>, String> {
-        let (level, key) = Self::parse_key(key)?;
+    pub fn get(&self, key: &str, level: Option<EnvLevel>) -> Option<String> {
+        let level = level.unwrap_or_default();
 
-        Ok(self.get_inner(level, key))
+        self.get_inner(level, key)
     }
 
     fn get_inner(&self, level: EnvLevel, key: &str) -> Option<String> {
@@ -156,10 +163,10 @@ impl EnvManager {
         }
     }
 
-    pub fn delete(&self, key: &str) -> Result<Option<String>, String> {
-        let (level, key) = Self::parse_key(key)?;
+    pub fn delete(&self, key: &str, level: Option<EnvLevel>) -> Option<String> {
+        let level = level.unwrap_or_default();
 
-        Ok(self.delete_inner(level, key))
+        self.delete_inner(level, key)
     }
 
     fn delete_inner(&self, level: EnvLevel, key: &str) -> Option<String> {

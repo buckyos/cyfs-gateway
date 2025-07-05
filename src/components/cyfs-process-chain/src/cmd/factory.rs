@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use super::cmd::*;
 use super::external::ExternalCommandParser;
-use super::label::{HaveLabelCommandParser, SetLabelByHostDbCommandParser};
 use super::sni::HttpSniProbeCommandParser;
 use super::action::ActionCommandParser;
 use super::match_::MatchCommandParser;
@@ -59,10 +58,6 @@ impl CommandParserFactory {
 
         // external command
         self.register("EXEC", Arc::new(Box::new(ExternalCommandParser::new())));
-
-        // label command
-        self.register("set_label_by_host_db", Arc::new(Box::new(SetLabelByHostDbCommandParser::new())));
-        self.register("have_label", Arc::new(Box::new(HaveLabelCommandParser::new())));
 
         // sni command
         self.register("http-sni-probe", Arc::new(Box::new(HttpSniProbeCommandParser::new())));

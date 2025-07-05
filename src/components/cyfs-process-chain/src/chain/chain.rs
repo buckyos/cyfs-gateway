@@ -1,5 +1,7 @@
-use std::collections::HashMap;
+use super::env::{Env, EnvLevel, EnvRef};
 use crate::block::*;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 pub struct ProcessChain {
     id: String,
@@ -8,7 +10,10 @@ pub struct ProcessChain {
 
 impl ProcessChain {
     pub fn new(id: String) -> Self {
-        ProcessChain { id, blocks: Vec::new() }
+        ProcessChain {
+            id,
+            blocks: Vec::new(),
+        }
     }
 
     pub fn add_block(&mut self, block: Block) {
@@ -19,9 +24,12 @@ impl ProcessChain {
         &self.blocks
     }
 
-     // Execute the chain with multiple blocks
-     pub async fn execute(&self, context: &mut Context) -> Result<BlockResult, String> {
-        assert!(self.blocks.len() > 0, "Process chain must have at least one block");
+    // Execute the chain with multiple blocks
+    pub async fn execute(&self, context: &mut Context) -> Result<BlockResult, String> {
+        assert!(
+            self.blocks.len() > 0,
+            "Process chain must have at least one block"
+        );
         let mut block_executer = BlockExecuter::new();
 
         for block in &self.blocks {
@@ -32,24 +40,40 @@ impl ProcessChain {
         }
 
         Ok(BlockResult::Ok)
-     }
+    }
 }
+
+pub type ProcessChainRef = Arc<ProcessChain>;
 
 // Manager for process chain with ids
 pub struct ProcessChainManager {
-    chains: HashMap<String, ProcessChain>,
+    chains: RwLock<HashMap<String, ProcessChainRef>>,
+    env: EnvRef, // Environment manager for global environment
 }
 
 impl ProcessChainManager {
     pub fn new() -> Self {
-        ProcessChainManager { chains: HashMap::new() }
+        ProcessChainManager {
+            chains: RwLock::new(HashMap::new()),
+            env: Arc::new(Env::new(EnvLevel::Global, None)), // Initialize with a new environment
+        }
+
+        // TODO: We can load some existing env vars from a persistent storage if needed
     }
 
-    pub fn add_chain(&mut self, chain: ProcessChain) {
-        self.chains.insert(chain.id.clone(), chain);
+    pub fn get_env(&self) -> &EnvRef {
+        &self.env
     }
 
-    pub fn get_chain(&self, id: &str) -> Option<&ProcessChain> {
-        self.chains.get(id)
+    pub fn add_chain(&self, chain: ProcessChain) {
+        let mut chains = self.chains.write().unwrap();
+        chains.insert(chain.id.clone(), Arc::new(chain));
+    }
+
+    pub fn get_chain(&self, id: &str) -> Option<ProcessChainRef> {
+        let chains = self.chains.read().unwrap();
+        chains.get(id).cloned()
     }
 }
+
+pub type ProcessChainManagerRef = Arc<ProcessChainManager>;
