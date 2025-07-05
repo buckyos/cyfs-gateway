@@ -61,6 +61,11 @@ impl CommandExecutor for MatchCommandExecutor {
     }
 }
 
+// Match regex command, like: match-regex REQ_HEADER.host "^(.*)\.local$"
+/*
+* MATCH_REG some_input "^pattern$"
+* MATCH_REG --capture name some_input "^pattern$"
+*/
 pub struct MatchRegexCommandParser {}
 
 impl MatchRegexCommandParser {
@@ -76,35 +81,59 @@ impl CommandParser for MatchRegexCommandParser {
     }
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        if args.len() != 2 {
-            let msg = format!("Invalid match_regex command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
+        let mut i = 0;
+        let mut capture = None;
+
+        // Check if there is a --capture flag
+        if args.get(i) == Some(&"--capture") {
+            if let Some(name) = args.get(i + 1) {
+                capture = Some(name.to_string());
+                i += 2;
+            } else {
+                let msg = format!("Expected name after --capture: {:?}", args);
+                error!("{}", msg);
+                return Err(msg);
+            }
         }
 
-        let value = args[0].to_owned();
-        let pattern = Regex::new(args[1]).map_err(|e| {
+        let value = args.get(i).ok_or("Missing value argument")?.to_string();
+        let pattern_str = args.get(i + 1).ok_or("Missing pattern argument")?;
+
+        let pattern = Regex::new(pattern_str).map_err(|e| {
             let msg = format!("Invalid regex pattern: {}: {}", args[1], e);
             error!("{}", msg);
             msg
         })?;
 
-        let cmd = MatchRegexCommandExecutor { value, pattern };
+        let cmd = MatchRegexCommandExecutor {
+            capture,
+            value,
+            pattern,
+        };
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // Match regex command executer
 pub struct MatchRegexCommandExecutor {
+    pub capture: Option<String>, // Optional capture group name
     pub value: String,
     pub pattern: Regex,
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for MatchRegexCommandExecutor {
-    async fn exec(&self, _context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
         // Match the value
-        if self.pattern.is_match(&self.value) {
+        if let Some(caps) = self.pattern.captures(&self.value) {
+            if let Some(name) = &self.capture {
+                for (i, cap) in caps.iter().enumerate() {
+                    if let Some(m) = cap {
+                        context.set_value(format!("{}[{}]", name, i).as_str(), m.as_str())?;
+                    }
+                }
+            }
+
             Ok(CommandResult::success())
         } else {
             Ok(CommandResult::failure(2))
@@ -185,7 +214,6 @@ impl CommandExecutor for EQCommandExecutor {
         }
     }
 }
-
 
 pub struct RangeCommandParser {}
 
