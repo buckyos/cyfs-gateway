@@ -65,6 +65,11 @@ impl BlockExecuter {
                         return Err(msg);
                     }
                 }
+                CommandAction::Value(ret) => {
+                    let msg = format!("Unexpected return value from line {}: {}", current_line, ret);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
             }
         }
 
@@ -122,7 +127,8 @@ impl BlockExecuter {
                 Ok(result)
             }
             Expression::Goto(target) => {
-                Ok(CommandResult::goto(target.clone()))
+                todo!("Goto expression not implemented yet");
+                // Ok(CommandResult::goto(target.clone()))
             }
         }
     }
@@ -130,4 +136,58 @@ impl BlockExecuter {
     async fn execute_command(_cmd: &CommandItem, _context: &mut Context) -> Result<CommandResult, String> {
         todo!("execute_command not implemented yet");
     }
+}
+
+use crate::cmd::{CommandParser, CommandExecutor};
+use super::block::{CommandArg, CommandArgs};
+use std::sync::Arc;
+
+pub struct DynamicCommandExecutor {
+    pub parser: Arc<Box<dyn CommandParser>>,
+    pub args: CommandArgs,
+}
+
+impl DynamicCommandExecutor {
+    pub fn new(parser: Arc<Box<dyn CommandParser>>, args: CommandArgs) -> Self {
+        Self { parser, args }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for DynamicCommandExecutor {
+    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+        // First exec embedded commands in args to got their values
+        let mut resolved_args = Vec::with_capacity(self.args.len());
+        for arg in &*self.args {
+            match arg {
+                CommandArg::Literal(value) => resolved_args.push(value.clone()),
+                CommandArg::Var(var) => {
+                    // Resolve variable from context
+                    if let Some(value) = context.get_value(&var) {
+                        resolved_args.push(value.clone());
+                    } else {
+                        // If variable is not found, push an empty string
+                        resolved_args.push("".to_string());
+                    }
+                }
+                CommandArg::CommandSubstitution(cmd) => {
+                    // Execute the command and get its result
+                    let ret = BlockExecuter::execute_expression(&cmd, context).await?;
+                    if !ret.is_value() {
+                        let msg = format!("Command substitution did not return a value: {:?}", cmd);
+                        warn!("{}", msg);
+                        return Err(msg);
+                    }
+
+                    resolved_args.push(ret.into_value().unwrap());
+                }
+            }
+        }
+
+        // Parse the command using the dynamic parser
+        let args = resolved_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+        let executor = self.parser.parse(&args)?;
+        executor.exec(context).await
+    }
+
 }

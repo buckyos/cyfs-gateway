@@ -16,7 +16,7 @@ impl CommandParser for SetLabelByHostDbCommandParser {
        true
     }
 
-    fn parse(&self, args: &Vec<String>) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
         // Args should not be empty
         if args.is_empty() {
             let msg = format!("Invalid set_label_by_host_db command: {:?}", args);
@@ -31,7 +31,7 @@ impl CommandParser for SetLabelByHostDbCommandParser {
             return Err(msg);
         }
 
-        let cmd = SetLabelByHostDbCommandExecutor::new(args[0].as_str());
+        let cmd = SetLabelByHostDbCommandExecutor::new(args[0]);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -82,14 +82,14 @@ impl CommandParser for HaveLabelCommandParser {
         true
     }
 
-    fn parse(&self, args: &Vec<String>) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
         if args.len() != 2 {
             let msg = format!("Invalid have_label command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
 
-        let cmd = HaveLabelCommandExecutor::new(args[0].clone(), args[1].clone());
+        let cmd = HaveLabelCommandExecutor::new(args[0].to_owned(), args[1].to_owned());
         Ok(Arc::new(Box::new(cmd)))
     }
 }

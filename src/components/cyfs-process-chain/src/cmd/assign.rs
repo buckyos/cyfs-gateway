@@ -7,11 +7,8 @@ const REQUEST_VARS: [&str; 4] = ["REQ_HEADER", "REQ_BODY", "RESP_HEADER", "RESP_
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssignType {
-    // Normal assignment, use KEY = VALUE
+    // Normal assignment, use KEY=VALUE
     Normal,
-
-    // Virtual assignment, use KEY := VALUE
-    Virtual,
 }
 
 pub struct AssignCommandParser {}
@@ -28,16 +25,15 @@ impl CommandParser for AssignCommandParser {
         true
     }
 
-    fn parse(&self, args: &Vec<String>) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
         if args.len() != 3 {
             let msg = format!("Invalid assign command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
 
-        let _type = match args[1].as_str() {
+        let _type = match args[1] {
             "=" => AssignType::Normal,
-            ":=" => AssignType::Virtual,
             _ => {
                 let msg = format!("Invalid assign type: {:?}", args);
                 error!("{}", msg);
@@ -45,20 +41,14 @@ impl CommandParser for AssignCommandParser {
             }
         };
 
-        let key = args[0].clone();
-        let value = args[2].clone();
+        let key = args[0].to_owned();
+        let value = args[2].to_owned();
 
         // Check is request assign or env assign
         if REQUEST_VARS.contains(&key.as_str()) {
             let cmd = RequestAssignCommand::new(_type, key, value);
             Ok(Arc::new(Box::new(cmd)))
         } else {
-            // Env not support virtual assignment
-            if _type == AssignType::Virtual {
-                let msg = format!("Invalid virtual assignment for env: {:?}", args);
-                error!("{}", msg);
-                return Err(msg);
-            }
 
             let cmd = EnvAssignCommand::new(key, value);
             Ok(Arc::new(Box::new(cmd)))

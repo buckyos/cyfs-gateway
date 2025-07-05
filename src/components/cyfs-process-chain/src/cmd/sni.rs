@@ -19,7 +19,7 @@ impl CommandParser for HttpSniProbeCommandParser {
         }
     }
 
-    fn parse(&self, args: &Vec<String>) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
         // Args must be empty
         if !args.is_empty() {
             let msg = format!("Invalid http-sni-probe command: {:?}", args);

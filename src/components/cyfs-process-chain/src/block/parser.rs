@@ -1,15 +1,22 @@
 use super::block::*;
-use crate::cmd::CommandParserFactory;
+use super::exec::DynamicCommandExecutor;
+use crate::cmd::{CommandExecutor, CommandParserFactory};
 use nom::{
     IResult, Parser,
     branch::alt,
     bytes::complete::tag,
-    character::complete::space0,
-    combinator::{map, opt},
+    bytes::complete::{escaped_transform, is_not},
+    bytes::streaming::take_while1,
+    character::complete::space1,
+    character::complete::{alphanumeric1, char},
+    character::multispace0,
+    combinator::{map, opt, value},
+    error::{ErrorKind, ParseError},
     multi::many0,
-    sequence::delimited,
+    multi::separated_list0,
+    sequence::{delimited, preceded, terminated},
 };
-use shlex;
+use std::sync::Arc;
 
 pub struct BlockParser {
     block_type: BlockType,
@@ -121,10 +128,11 @@ impl BlockParser {
 
         let name = "assign".to_string();
         let args = vec![
-            key.trim().to_string(),
-            op.trim().to_string(),
-            value.trim().to_string(),
+            Self::parse_arg(key.trim())?.1,
+            Self::parse_arg(op.trim())?.1,
+            Self::parse_arg(value.trim())?.1,
         ];
+        let args = CommandArgs::new(args);
 
         let cmd = CommandItem::new(name, args);
         Ok((input, Expression::Command(cmd)))
@@ -132,36 +140,131 @@ impl BlockParser {
 
     // Parse command
     fn parse_command(input: &str) -> IResult<&str, Expression> {
-        let (input, tokens) = map(
-            many0(delimited(
-                space0,
-                |i| Ok((i, shlex::split(i).unwrap_or_default())),
-                space0,
-            )),
-            |token_sets| {
-                if token_sets.is_empty() {
-                    let cmd = CommandItem::new_empty();
-                    return Expression::Command(cmd);
-                }
+        let (input, args) =
+            separated_list0(space1, preceded(multispace0(), Self::parse_arg)).parse(input)?;
 
-                let tokens = token_sets[0].clone();
-                let name = tokens[0].clone();
-                if name.to_ascii_lowercase() == "goto" && tokens.len() > 1 {
-                    Expression::Goto(tokens[1].clone())
+        let cmd = if args.is_empty() {
+            let cmd = CommandItem::new_empty();
+            Expression::Command(cmd)
+        } else {
+            if let Some(name) = args[0].as_literal_str() {
+                if name.to_ascii_lowercase() == "goto" && args.len() > 1 {
+                    Expression::Goto(args[1].clone())
                 } else {
-                    let args = tokens[1..].to_vec();
-                    Expression::Command(CommandItem::new(name, args))
+                    Expression::Command(CommandItem::new(
+                        name.to_owned(),
+                        CommandArgs::new(args[1..].to_vec()),
+                    ))
                 }
-            },
+            } else {
+                let msg = format!("Command name must be a literal string, got: {:?}", args[0]);
+                error!("{}", msg);
+                return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                    input,
+                    ErrorKind::Tag,
+                )));
+            }
+        };
+
+        Ok((input, cmd))
+    }
+
+    fn parse_literal(input: &str) -> IResult<&str, CommandArg> {
+        let (input, arg) = alt(
+            // double quoted string with escapes
+            (
+                delimited(
+                    char('"'),
+                    escaped_transform(
+                        is_not("\\\""),
+                        '\\',
+                        alt((
+                            value("\\", tag("\\")),
+                            value("\"", tag("\"")),
+                            value("\n", tag("n")),
+                            value("\t", tag("t")),
+                            value(" ", tag(" ")),
+                        )),
+                    ),
+                    char('"'),
+                ),
+                // single quoted string
+                map(delimited(char('\''), is_not("'"), char('\'')), |s: &str| {
+                    s.to_string()
+                }),
+                // unquoted word
+                map(
+                    take_while1(|c: char| {
+                        !c.is_whitespace() && c != '"' && c != '\'' && c != '$' && c != '('
+                    }),
+                    |s: &str| s.to_string(),
+                ),
+            ),
+        )
+        .parse(input)?;
+
+        // Return as CommandArg::Literal
+        Ok((input, CommandArg::Literal(arg)))
+    }
+
+    fn parse_var_dollar(input: &str) -> IResult<&str, CommandArg> {
+        map(preceded(char('$'), alphanumeric1), |var: &str| {
+            CommandArg::Var(var.to_string())
+        })
+        .parse(input)
+    }
+
+    fn parse_var_braced(input: &str) -> IResult<&str, CommandArg> {
+        // ${var}
+        map(
+            preceded(
+                tag("${"),
+                terminated(
+                    take_while1(|c: char| c.is_alphanumeric() || c == '_'),
+                    char('}'),
+                ),
+            ),
+            |var: &str| CommandArg::Var(var.to_string()),
         )
         .parse(input)
-        .map_err(|e| {
-            let msg = format!("Parse command error: {}, {:?}", input, e);
-            error!("{}", msg);
-            e
-        })?;
+    }
 
-        Ok((input, tokens))
+    fn parse_command_subst(input: &str) -> IResult<&str, CommandArg> {
+        let (rest, _) = tag("$(")(input)?;
+        let mut depth = 1;
+        let mut chars = rest.char_indices();
+
+        while let Some((idx, c)) = chars.next() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let content = &rest[..idx];
+                        let (_, exp) = Self::parse_command(content.trim())?;
+
+                        let remaining = &rest[idx + 1..];
+                        return Ok((remaining, CommandArg::CommandSubstitution(Box::new(exp))));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Err(nom::Err::Error(nom::error::Error::from_error_kind(
+            rest,
+            ErrorKind::Tag,
+        )))
+    }
+
+    fn parse_arg(input: &str) -> IResult<&str, CommandArg> {
+        alt((
+            Self::parse_command_subst, // $(...)
+            Self::parse_var_braced,    // ${VAR}
+            Self::parse_var_dollar,    // $VAR
+            Self::parse_literal,       // "..." or '...' or unquoted
+        ))
+        .parse(input)
     }
 }
 
@@ -198,11 +301,18 @@ impl BlockCommandTranslator {
                     }
 
                     // Then parse args to executor
-                    let executer = parser.parse(&cmd.command.args).map_err(|e| {
-                        let msg = format!("Parse command error: {:?}, {:?}", cmd.command, e);
-                        error!("{}", msg);
-                        msg
-                    })?;
+                    let executer = if cmd.command.args.is_literal() {
+                        let args = cmd.command.args.as_literal_list();
+                        parser.parse(&args).map_err(|e| {
+                            let msg = format!("Parse command error: {:?}, {:?}", cmd.command, e);
+                            error!("{}", msg);
+                            msg
+                        })?
+                    } else {
+                        let exec = DynamicCommandExecutor::new(parser, cmd.take_args());
+
+                        Arc::new(Box::new(exec) as Box<dyn CommandExecutor>)
+                    };
 
                     cmd.executor = Some(executer);
                 }

@@ -1,6 +1,7 @@
 use crate::cmd::*;
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Deref;
 use std::str::FromStr;
 
 // The different types of blocks, some cmds are only allowed in certain blocks
@@ -42,11 +43,85 @@ pub enum Operator {
     None, // None of the above
 }
 
+#[derive(Debug, Clone)]
+pub enum CommandArg {
+    // A simple command arg in string format
+    Literal(String),
+
+    // A command arg that is a variable, like $VAR_NAME ${VAR_NAME}
+    Var(String), // A reference to a variable, like $VAR_NAME
+
+    // An embedded command, which return is a string value and can be used as an arg, ${COMMAND}
+    CommandSubstitution(Box<Expression>),
+}
+
+impl CommandArg {
+    pub fn is_literal(&self) -> bool {
+        matches!(self, CommandArg::Literal(_))
+    }
+
+    pub fn as_literal_str(&self) -> Option<&str> {
+        if let CommandArg::Literal(s) = self {
+            Some(s.as_str())
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandArgs(Vec<CommandArg>);
+
+impl Deref for CommandArgs {
+    type Target = [CommandArg];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Default for CommandArgs {
+    fn default() -> Self {
+        Self::new_empty()
+    }
+}
+
+impl CommandArgs {
+    pub fn new_empty() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn new(args: Vec<CommandArg>) -> Self {
+        Self(args)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn as_slice(&self) -> &[CommandArg] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_literal(&self) -> bool {
+        self.0.iter().all(|arg| arg.is_literal())
+    }
+
+    // Must all args be literal strings
+    pub fn as_literal_list(&self) -> Vec<&str> {
+        self.0.iter().map(|arg| arg.as_literal_str().unwrap()).collect()
+    }
+}
+
 // Single command
 #[derive(Debug, Clone)]
 pub struct Command {
     pub name: String,
-    pub args: Vec<String>,
+    pub args: CommandArgs,
 }
 
 #[derive(Clone)]
@@ -63,7 +138,7 @@ impl fmt::Debug for CommandItem {
 }
 
 impl CommandItem {
-    pub fn new(name: String, args: Vec<String>) -> Self {
+    pub fn new(name: String, args: CommandArgs) -> Self {
         let command = Command { name, args };
         Self {
             command,
@@ -72,7 +147,11 @@ impl CommandItem {
     }
 
     pub fn new_empty() -> Self {
-        Self::new("".to_string(), Vec::new())
+        Self::new("".to_string(), CommandArgs::new_empty())
+    }
+
+    pub fn take_args(&mut self) -> CommandArgs {
+        std::mem::take(&mut self.command.args)
     }
 }
 
@@ -81,7 +160,7 @@ impl CommandItem {
 pub enum Expression {
     Command(CommandItem),
     Group(Vec<(Expression, Operator)>), // Sub-expression in brackets
-    Goto(String),                       // Goto label
+    Goto(CommandArg),                       // Goto label
 }
 
 // Line of commands, top level structure

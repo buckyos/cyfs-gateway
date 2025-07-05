@@ -20,7 +20,7 @@ impl CommandParser for ExternalCommandParser {
         }
     }
 
-    fn parse(&self, args: &Vec<String>) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
         // Args should not be empty
         if args.is_empty() {
             let msg = format!("Invalid exec command: {:?}", args);
@@ -40,19 +40,19 @@ pub struct ExternalCommandExecutor {
 }
 
 impl ExternalCommandExecutor {
-    pub fn new(args: &Vec<String>) -> Self {
+    pub fn new(args: &[&str]) -> Self {
         assert!(args.len() > 0);
 
         if args.len() == 1 {
             return Self {
-                command: args[0].clone(),
+                command: args[0].to_owned(),
                 args: vec![],
             };
         }
 
         Self {
-            command: args[0].clone(),
-            args: args[1..].to_vec(),
+            command: args[0].to_owned(),
+            args: args[1..].iter().map(|&s| s.to_owned()).collect(),
         }
     }
 }

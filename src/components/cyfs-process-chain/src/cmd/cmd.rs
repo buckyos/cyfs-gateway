@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 pub type CommandParserRef = Arc<Box<dyn CommandParser>>;
 
-pub trait CommandParser {
+pub trait CommandParser: Send + Sync {
     // To check if the command is valid in the block
     fn check(&self, block_type: BlockType) -> bool;
-    fn parse(&self, args: &Vec<String>) -> Result<CommandExecutorRef, String>;
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String>;
 }
 
 #[derive(Debug, Clone)]
@@ -15,6 +15,7 @@ pub enum CommandAction {
     Drop,
     Pass,
     Goto(String),
+    Value(String),
 }
 
 // The result of a command execution
@@ -66,10 +67,31 @@ impl CommandResult {
         }
     }
 
+    pub fn value(value: impl Into<String>) -> Self {
+        CommandResult {
+            success: true,
+            action: CommandAction::Value(value.into()),
+            error_code: 0,
+        }
+    }
+
     pub fn is_special_action(&self) -> bool {
         match self.action {
             CommandAction::Ok => false,
+            CommandAction::Value(_) => false,
             _ => true,
+        }
+    }
+
+    pub fn is_value(&self) -> bool {
+        matches!(self.action, CommandAction::Value(_))
+    }
+
+    pub fn into_value(self) -> Option<String> {
+        if let CommandAction::Value(value) = self.action {
+            Some(value)
+        } else {
+            None
         }
     }
 }
