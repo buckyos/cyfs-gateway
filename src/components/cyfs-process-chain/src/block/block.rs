@@ -163,15 +163,20 @@ pub enum Expression {
     Goto(CommandArg),                       // Goto label
 }
 
-// Line of commands, top level structure
-#[derive(Debug)]
-pub struct Line {
-    pub label: Option<String>, // Label of the line
+#[derive(Debug, Clone)]
+pub struct Statement {
     pub expressions: Vec<(Expression, Operator)>,
 }
 
+// Line of commands, top level structure
+#[derive(Debug, Clone)]
+pub struct Line {
+    pub label: Option<String>, // Label of the line
+    pub statements: Vec<Statement>, // Statements in the line
+}
+
 // Block of lines
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Block {
     pub block_type: BlockType,
     pub lines: Vec<Line>,

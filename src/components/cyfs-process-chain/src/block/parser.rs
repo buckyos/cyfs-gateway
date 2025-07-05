@@ -7,8 +7,8 @@ use nom::{
     bytes::complete::tag,
     bytes::complete::{escaped_transform, is_not},
     bytes::streaming::take_while1,
-    character::complete::space1,
     character::complete::{alphanumeric1, char},
+    character::complete::{space0, space1},
     character::multispace0,
     combinator::{map, opt, value},
     error::{ErrorKind, ParseError},
@@ -65,7 +65,7 @@ impl BlockParser {
         if trimmed.is_empty() {
             return Ok(Line {
                 label: None,
-                expressions: Vec::new(),
+                statements: Vec::new(),
             });
         }
 
@@ -76,13 +76,30 @@ impl BlockParser {
             (None, trimmed)
         };
 
-        let (_, expressions) = Self::parse_expressions(expr_input).map_err(|e| {
+        let (_, statements) = Self::parse_statements(expr_input).map_err(|e| {
             let msg = format!("Parse expressions error: {}, {:?}", expr_input, e);
             error!("{}", msg);
             msg
         })?;
 
-        Ok(Line { label, expressions })
+        Ok(Line { label, statements })
+    }
+
+    fn parse_statements(input: &str) -> IResult<&str, Vec<Statement>> {
+        separated_list0(
+            preceded(space0, char(';')),
+            preceded(space0, Self::parse_expressions),
+        )
+        .parse(input)
+        .map(|(rest, expr_groups)| {
+            
+            // Covert each group of expressions into a Statement
+            let stmts = expr_groups
+                .into_iter()
+                .map(|expressions| Statement { expressions })
+                .collect();
+            (rest, stmts)
+        })
     }
 
     // Parse expressions with operators
@@ -279,42 +296,45 @@ impl BlockCommandTranslator {
 
     pub async fn translate(&self, block: &mut Block) -> Result<(), String> {
         for line in &mut block.lines {
-            for (expr, _) in &mut line.expressions {
-                if let Expression::Command(cmd) = expr {
-                    let parser = self.parser.get_parser(&cmd.command.name);
-                    if parser.is_none() {
-                        let msg = format!("No parser for command: {}", cmd.command.name);
-                        error!("{}", msg);
-                        return Err(msg);
-                    }
-
-                    let parser = parser.unwrap();
-
-                    // First check if cmd is valid for the block type
-                    if !parser.check(block.block_type) {
-                        let msg = format!(
-                            "Invalid command for block type: {:?}, block={:?}",
-                            cmd.command, block.block_type
-                        );
-                        error!("{}", msg);
-                        return Err(msg);
-                    }
-
-                    // Then parse args to executor
-                    let executer = if cmd.command.args.is_literal() {
-                        let args = cmd.command.args.as_literal_list();
-                        parser.parse(&args).map_err(|e| {
-                            let msg = format!("Parse command error: {:?}, {:?}", cmd.command, e);
+            for statement in &mut line.statements {
+                // For each statement, we need to translate the expressions
+                for (expr, _) in &mut statement.expressions {
+                    if let Expression::Command(cmd) = expr {
+                        let parser = self.parser.get_parser(&cmd.command.name);
+                        if parser.is_none() {
+                            let msg = format!("No parser for command: {}", cmd.command.name);
                             error!("{}", msg);
-                            msg
-                        })?
-                    } else {
-                        let exec = DynamicCommandExecutor::new(parser, cmd.take_args());
+                            return Err(msg);
+                        }
 
-                        Arc::new(Box::new(exec) as Box<dyn CommandExecutor>)
-                    };
+                        let parser = parser.unwrap();
 
-                    cmd.executor = Some(executer);
+                        // First check if cmd is valid for the block type
+                        if !parser.check(block.block_type) {
+                            let msg = format!(
+                                "Invalid command for block type: {:?}, block={:?}",
+                                cmd.command, block.block_type
+                            );
+                            error!("{}", msg);
+                            return Err(msg);
+                        }
+
+                        // Then parse args to executor
+                        let executer = if cmd.command.args.is_literal() {
+                            let args = cmd.command.args.as_literal_list();
+                            parser.parse(&args).map_err(|e| {
+                                let msg = format!("Parse command error: {:?}, {:?}", cmd.command, e);
+                                error!("{}", msg);
+                                msg
+                            })?
+                        } else {
+                            let exec = DynamicCommandExecutor::new(parser, cmd.take_args());
+
+                            Arc::new(Box::new(exec) as Box<dyn CommandExecutor>)
+                        };
+
+                        cmd.executor = Some(executer);
+                    }
                 }
             }
         }

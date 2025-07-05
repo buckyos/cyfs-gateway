@@ -1,6 +1,6 @@
-use super::block::{Block, Line, Operator, Expression, CommandItem};
+use super::block::{Block, CommandItem, Expression, Line, Operator, Statement};
 use super::context::Context;
-use crate::cmd::{CommandResult, CommandAction};
+use crate::cmd::{CommandAction, CommandResult};
 
 pub const MAX_GOTO_COUNT_IN_BLOCK: u32 = 128;
 
@@ -16,29 +16,28 @@ pub struct BlockExecuter {
     pub goto_counter: u32,
 }
 
-
 impl BlockExecuter {
     pub fn new() -> Self {
         Self { goto_counter: 0 }
     }
 
     // Execute the block
-    pub async fn execute_block(&mut self, block: &Block, context: &mut Context) -> Result<BlockResult, String> {
+    pub async fn execute_block(
+        &mut self,
+        block: &Block,
+        context: &mut Context,
+    ) -> Result<BlockResult, String> {
         let mut current_line = 0;
         let mut result = BlockResult::Ok;
         while current_line < block.lines.len() {
             let line = &block.lines[current_line];
-            let line_result= Self::execute_line(line, context).await?;
-            info!(
-                "Line {} executed: result={:?}",
-                current_line, line_result
-            );
+            let line_result = Self::execute_line(line, context).await?;
+            info!("Line {} executed: result={:?}", current_line, line_result);
 
             match line_result.action {
                 CommandAction::Ok => {
                     current_line += 1;
                     result = BlockResult::Ok;
-
                 }
                 CommandAction::Drop => {
                     result = BlockResult::Drop;
@@ -51,11 +50,12 @@ impl BlockExecuter {
                 CommandAction::Goto(goto_target) => {
                     if let Some(&target_line) = block.label_map.get(&goto_target) {
                         current_line = target_line;
-                        
+
                         // Increase the goto counter and check the limit
                         self.goto_counter += 1;
                         if self.goto_counter > MAX_GOTO_COUNT_IN_BLOCK {
-                            let msg = format!("Goto count exceeds limit {}", MAX_GOTO_COUNT_IN_BLOCK);
+                            let msg =
+                                format!("Goto count exceeds limit {}", MAX_GOTO_COUNT_IN_BLOCK);
                             error!("{}", msg);
                             return Err(msg);
                         }
@@ -66,7 +66,10 @@ impl BlockExecuter {
                     }
                 }
                 CommandAction::Value(ret) => {
-                    let msg = format!("Unexpected return value from line {}: {}", current_line, ret);
+                    let msg = format!(
+                        "Unexpected return value from line {}: {}",
+                        current_line, ret
+                    );
                     error!("{}", msg);
                     return Err(msg);
                 }
@@ -76,10 +79,24 @@ impl BlockExecuter {
         Ok(result)
     }
 
-    // Execute a single line
+    // Execute a single line with multiple statements
     async fn execute_line(line: &Line, context: &mut Context) -> Result<CommandResult, String> {
+        // We execute each statement in the line sequentially, and got the result of the last statement
         let mut result = CommandResult::success();
-        for (expr, op) in &line.expressions {
+        for statement in line.statements.iter() {
+            result = Self::execute_statement(statement, context).await?;
+        }
+
+        Ok(result)
+    }
+
+    // Execute a single statement
+    async fn execute_statement(
+        statement: &Statement,
+        context: &mut Context,
+    ) -> Result<CommandResult, String> {
+        let mut result = CommandResult::success();
+        for (expr, op) in &statement.expressions {
             result = Self::execute_expression(expr, context).await?;
 
             // Check if the result is a special action such as goto/drop/pass
@@ -99,7 +116,10 @@ impl BlockExecuter {
 
     // Execute a single expression
     #[async_recursion::async_recursion]
-    async fn execute_expression(expr: &Expression, context: &mut Context) -> Result<CommandResult, String> {
+    async fn execute_expression(
+        expr: &Expression,
+        context: &mut Context,
+    ) -> Result<CommandResult, String> {
         match expr {
             Expression::Command(cmd) => {
                 let result = Self::execute_command(cmd, context).await?;
@@ -133,13 +153,16 @@ impl BlockExecuter {
         }
     }
 
-    async fn execute_command(_cmd: &CommandItem, _context: &mut Context) -> Result<CommandResult, String> {
+    async fn execute_command(
+        _cmd: &CommandItem,
+        _context: &mut Context,
+    ) -> Result<CommandResult, String> {
         todo!("execute_command not implemented yet");
     }
 }
 
-use crate::cmd::{CommandParser, CommandExecutor};
 use super::block::{CommandArg, CommandArgs};
+use crate::cmd::{CommandExecutor, CommandParser};
 use std::sync::Arc;
 
 pub struct DynamicCommandExecutor {
@@ -185,9 +208,11 @@ impl CommandExecutor for DynamicCommandExecutor {
         }
 
         // Parse the command using the dynamic parser
-        let args = resolved_args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+        let args = resolved_args
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<&str>>();
         let executor = self.parser.parse(&args)?;
         executor.exec(context).await
     }
-
 }
