@@ -1,4 +1,4 @@
-use super::cmd::{CommandExecutorRef, CommandParser, CommandResult};
+use super::cmd::{CommandExecutorRef, CommandParser, CommandResult, CommandExecutor};
 use crate::block::{BlockType, CommandArgs, Context};
 use globset::{GlobBuilder, GlobMatcher};
 use std::sync::Arc;
@@ -69,7 +69,7 @@ impl RewriteCommand {
 }
 
 #[async_trait::async_trait]
-impl super::CommandExecutor for RewriteCommand {
+impl CommandExecutor for RewriteCommand {
     async fn exec(&self, context: &mut Context) -> Result<super::CommandResult, String> {
         let key_value = self.args[0].as_str();
         let pattern_value = self.args[1].as_str();
@@ -151,7 +151,7 @@ impl RewriteRegexCommand {
 }
 
 #[async_trait::async_trait]
-impl super::CommandExecutor for RewriteRegexCommand {
+impl CommandExecutor for RewriteRegexCommand {
     async fn exec(&self, context: &mut Context) -> Result<super::CommandResult, String> {
         let key_value = self.args[0].as_str();
         let template = self.args[2].as_str();
@@ -253,7 +253,7 @@ impl StringReplaceCommand {
 }
 
 #[async_trait::async_trait]
-impl super::CommandExecutor for StringReplaceCommand {
+impl CommandExecutor for StringReplaceCommand {
     async fn exec(&self, context: &mut Context) -> Result<super::CommandResult, String> {
         let key_value = self.args[0].as_str();
         let match_text = &self.args[1];
@@ -313,7 +313,7 @@ impl StringConstCommand {
 }
 
 #[async_trait::async_trait]
-impl super::CommandExecutor for StringConstCommand {
+impl CommandExecutor for StringConstCommand {
     async fn exec(&self, _context: &mut Context) -> Result<super::CommandResult, String> {
         // Just return the result without modifying the context
 

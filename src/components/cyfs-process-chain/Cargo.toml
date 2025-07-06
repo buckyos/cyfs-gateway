@@ -16,3 +16,4 @@ http-types = "*"
 async-recursion = "*"
 xmltree = "*"
 globset = "*"
+tokio = { version = "*", features = ["full"] }
