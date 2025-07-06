@@ -1,4 +1,4 @@
-use crate::block::{BlockType, Context};
+use crate::block::{BlockType, Context, CommandArgs};
 use std::sync::Arc;
 
 pub type CommandParserRef = Arc<Box<dyn CommandParser>>;
@@ -6,7 +6,18 @@ pub type CommandParserRef = Arc<Box<dyn CommandParser>>;
 pub trait CommandParser: Send + Sync {
     // To check if the command is valid in the block
     fn check(&self, block_type: BlockType) -> bool;
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String>;
+
+    fn parse_origin(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
+        let args = args
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<&str>>();
+        self.parse(&args)
+    }
+
+    fn parse(&self, _args: &[&str]) -> Result<CommandExecutorRef, String> {
+        unimplemented!("CommandParser::parse should be implemented by the command parser");
+    }
 }
 
 #[derive(Debug, Clone)]

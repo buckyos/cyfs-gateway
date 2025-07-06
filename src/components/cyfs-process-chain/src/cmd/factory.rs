@@ -31,17 +31,6 @@ impl CommandParserFactory {
         parsers.get(name).cloned()
     }
 
-    pub fn parse(&self, name: &str, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        let parser = self.get_parser(name);
-        if parser.is_none() {
-            let msg = format!("Command parser {} not found", name);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
-        parser.unwrap().parse(args)
-    }
-
     pub fn init(&self) {
         // action command
         let drop_action_parser = ActionCommandParser::new(CommandAction::Drop);

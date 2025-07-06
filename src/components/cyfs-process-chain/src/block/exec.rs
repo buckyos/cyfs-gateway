@@ -207,11 +207,7 @@ impl CommandExecutor for DynamicCommandExecutor {
         }
 
         // Parse the command using the dynamic parser
-        let args = resolved_args
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<&str>>();
-        let executor = self.parser.parse(&args)?;
+        let executor = self.parser.parse_origin(resolved_args, &self.args)?;
         executor.exec(context).await
     }
 }

@@ -67,6 +67,18 @@ impl CommandArg {
             None
         }
     }
+
+    pub fn is_var(&self) -> bool {
+        matches!(self, CommandArg::Var(_))
+    }
+    
+    pub fn as_var_str(&self) -> Option<&str> {
+        if let CommandArg::Var(s) = self {
+            Some(s.as_str())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +125,10 @@ impl CommandArgs {
 
     // Must all args be literal strings
     pub fn as_literal_list(&self) -> Vec<&str> {
-        self.0.iter().map(|arg| arg.as_literal_str().unwrap()).collect()
+        self.0
+            .iter()
+            .map(|arg| arg.as_literal_str().unwrap())
+            .collect()
     }
 }
 
@@ -164,7 +179,7 @@ pub enum AssignKind {
     Block,
 
     // Global assignment, use export KEY=VALUE, var is visible in all process chains
-    Global, 
+    Global,
 }
 
 impl Default for AssignKind {
@@ -223,7 +238,7 @@ pub struct Statement {
 // Line of commands, top level structure
 #[derive(Debug, Clone)]
 pub struct Line {
-    pub label: Option<String>, // Label of the line
+    pub label: Option<String>,      // Label of the line
     pub statements: Vec<Statement>, // Statements in the line
 }
 
