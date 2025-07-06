@@ -1,9 +1,11 @@
 use crate::chain::{EnvManager, EnvRef, ProcessChainManagerRef, ProcessChainRef, EnvLevel};
+use crate::collection::CollectionManager;
 
 // The context in which the block are executed
 pub struct Context {
     env: EnvManager,
     process_chain_manager: ProcessChainManagerRef,
+    collection_manager: CollectionManager,
 }
 
 impl Context {
@@ -13,11 +15,17 @@ impl Context {
         process_chain_manager: ProcessChainManagerRef,
     ) -> Self {
         let env_manager = EnvManager::new(global_env, chain_env);
+        let collection_manager = CollectionManager::new();
 
         Self {
             env: env_manager,
             process_chain_manager,
+            collection_manager,
         }
+    }
+
+    pub fn collection_manager(&self) -> &CollectionManager {
+        &self.collection_manager
     }
 
     pub fn get_env_value(&self, key: &str) -> Option<String> {
