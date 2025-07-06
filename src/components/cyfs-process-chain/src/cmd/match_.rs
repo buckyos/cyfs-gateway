@@ -130,7 +130,7 @@ impl CommandExecutor for MatchRegexCommandExecutor {
                 for (i, cap) in caps.iter().enumerate() {
                     if let Some(m) = cap {
                         // TODO: Add env level support, such as --capture export/local name
-                        context.set_env_value(format!("{}[{}]", name, i).as_str(), m.as_str(), None);
+                        context.set_env_value(format!("{}[{}]", name, i).as_str(), m.as_str(), None).await?;
                     }
                 }
             }

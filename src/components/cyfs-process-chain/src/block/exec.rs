@@ -185,7 +185,7 @@ impl CommandExecutor for DynamicCommandExecutor {
                 CommandArg::Literal(value) => resolved_args.push(value.clone()),
                 CommandArg::Var(var) => {
                     // Resolve variable from context
-                    if let Some(value) = context.get_env_value(&var) {
+                    if let Some(value) = context.get_env_value(&var).await? {
                         resolved_args.push(value.clone());
                     } else {
                         // If variable is not found, push an empty string

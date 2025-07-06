@@ -66,7 +66,7 @@ impl CommandExecutor for AssignCommand {
                 };
 
                 // Set the value in the context
-                context.set_env_value(self.key.as_str(), value, Some(env_level));
+                context.set_env_value(self.key.as_str(), value, Some(env_level)).await?;
             }
             None => {
                 // Handle assignment without value
