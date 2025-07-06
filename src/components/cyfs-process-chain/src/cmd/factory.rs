@@ -55,5 +55,12 @@ impl CommandParserFactory {
         self.register("rewrite", Arc::new(Box::new(RewriteCommandParser::new())));
         self.register("rewrite_reg", Arc::new(Box::new(RewriteRegexCommandParser::new())));
 
+        self.register("replace", Arc::new(Box::new(StringReplaceCommandParser::new())));
+        self.register("append", Arc::new(Box::new(StringAppendCommandParser::new())));
+        self.register("slice", Arc::new(Box::new(StringSliceCommandParser::new())));
+        self.register("strlen", Arc::new(Box::new(StringLengthCommandParser::new())));
+        self.register("starts_with", Arc::new(Box::new(StringStartsWithCommandParser)));
+        self.register("ends_with", Arc::new(Box::new(StringEndsWithCommandParser)));
+
     }
 }
