@@ -6,6 +6,7 @@ use super::sni::HttpSniProbeCommandParser;
 use super::action::ActionCommandParser;
 use super::match_::MatchCommandParser;
 use super::assign::AssignCommandParser;
+use super::string::*;
 
 #[derive(Clone)]
 pub struct CommandParserFactory {
@@ -49,5 +50,10 @@ impl CommandParserFactory {
 
         // sni command
         self.register("http-sni-probe", Arc::new(Box::new(HttpSniProbeCommandParser::new())));
+
+        // string command
+        self.register("rewrite", Arc::new(Box::new(RewriteCommandParser::new())));
+        self.register("rewrite_reg", Arc::new(Box::new(RewriteRegexCommandParser::new())));
+
     }
 }
