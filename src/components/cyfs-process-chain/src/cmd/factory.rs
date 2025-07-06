@@ -1,12 +1,13 @@
+use super::action::ActionCommandParser;
+use super::assign::AssignCommandParser;
+use super::cmd::*;
+use super::coll::*;
+use super::external::ExternalCommandParser;
+use super::match_::MatchCommandParser;
+use super::sni::HttpSniProbeCommandParser;
+use super::string::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use super::cmd::*;
-use super::external::ExternalCommandParser;
-use super::sni::HttpSniProbeCommandParser;
-use super::action::ActionCommandParser;
-use super::match_::MatchCommandParser;
-use super::assign::AssignCommandParser;
-use super::string::*;
 
 #[derive(Clone)]
 pub struct CommandParserFactory {
@@ -49,18 +50,61 @@ impl CommandParserFactory {
         self.register("EXEC", Arc::new(Box::new(ExternalCommandParser::new())));
 
         // sni command
-        self.register("http-sni-probe", Arc::new(Box::new(HttpSniProbeCommandParser::new())));
+        self.register(
+            "http-sni-probe",
+            Arc::new(Box::new(HttpSniProbeCommandParser::new())),
+        );
 
         // string command
         self.register("rewrite", Arc::new(Box::new(RewriteCommandParser::new())));
-        self.register("rewrite_reg", Arc::new(Box::new(RewriteRegexCommandParser::new())));
+        self.register(
+            "rewrite_reg",
+            Arc::new(Box::new(RewriteRegexCommandParser::new())),
+        );
 
-        self.register("replace", Arc::new(Box::new(StringReplaceCommandParser::new())));
-        self.register("append", Arc::new(Box::new(StringAppendCommandParser::new())));
+        self.register(
+            "replace",
+            Arc::new(Box::new(StringReplaceCommandParser::new())),
+        );
+        self.register(
+            "append",
+            Arc::new(Box::new(StringAppendCommandParser::new())),
+        );
         self.register("slice", Arc::new(Box::new(StringSliceCommandParser::new())));
-        self.register("strlen", Arc::new(Box::new(StringLengthCommandParser::new())));
-        self.register("starts_with", Arc::new(Box::new(StringStartsWithCommandParser)));
+        self.register(
+            "strlen",
+            Arc::new(Box::new(StringLengthCommandParser::new())),
+        );
+        self.register(
+            "starts_with",
+            Arc::new(Box::new(StringStartsWithCommandParser)),
+        );
         self.register("ends_with", Arc::new(Box::new(StringEndsWithCommandParser)));
 
+        // collection commands
+        self.register(
+            "match_include",
+            Arc::new(Box::new(MatchIncludeCommandParser::new())),
+        );
+
+        self.register(
+            "set_create",
+            Arc::new(Box::new(SetCreateCommandParser::new())),
+        );
+        self.register("set_add", Arc::new(Box::new(SetAddCommandParser::new())));
+        self.register(
+            "set_remove",
+            Arc::new(Box::new(SetRemoveCommandParser::new())),
+        );
+
+        self.register(
+            "map_create",
+            Arc::new(Box::new(MapCreateCommandParser::new())),
+        );
+        self.register("map_add", Arc::new(Box::new(MapAddCommandParser::new())));
+        self.register(
+            "map_remove",
+            Arc::new(Box::new(MapRemoveCommandParser::new())),
+        );
     }
 }

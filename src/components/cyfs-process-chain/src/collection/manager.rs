@@ -45,53 +45,52 @@ impl CollectionManager {
         }
     }
 
-    /// Adds a set collection to the manager, if it already exists, it will fail with an error.
-    pub async fn add_set_collection(&self, id: &str, collection: SetCollectionRef) -> Result<(), String> {
+    /// Adds a set collection to the manager, if it already exists, it will return None.
+    /// If the collection is added successfully, it will return the collection.
+    pub async fn add_set_collection(&self, id: &str, collection: SetCollectionRef) -> Option<SetCollectionRef> {
         let mut collections = self.collections.write().await;
         if collections.is_collection_exists(id) {
             let msg = format!("Collection with id '{}' already exists", id);
-            error!("{}", msg);
-            return Err(msg);
+            warn!("{}", msg);
+            return None;
         }
 
         collections
             .set_collections
-            .insert(id.to_string(), collection);
+            .insert(id.to_string(), collection.clone());
 
         info!("Add set collection with id '{}' added successfully", id);
 
-        Ok(())
+        Some(collection)
     }
 
     /// Creates a new set collection with the given id and adds it to the manager.
     /// If the collection already exists, it will return an error.
-    pub async fn create_set_collection(&self, id: &str) -> Result<SetCollectionRef, String> {
+    pub async fn create_set_collection(&self, id: &str) -> Option<SetCollectionRef> {
         let collection = Arc::new(Box::new(MemorySetCollection::new()) as Box<dyn SetCollection>);
-        self.add_set_collection(id, collection.clone()).await?;
-        Ok(collection)
+        self.add_set_collection(id, collection.clone()).await
     }
 
-    pub async fn add_map_collection(&self, id: &str, collection: MapCollectionRef) -> Result<(), String> {
+    pub async fn add_map_collection(&self, id: &str, collection: MapCollectionRef) -> Option<MapCollectionRef> {
         let mut collections = self.collections.write().await;
         if collections.is_collection_exists(id) {
             let msg = format!("Collection with id '{}' already exists", id);
-            error!("{}", msg);
-            return Err(msg);
+            warn!("{}", msg);
+            return None;
         }
 
-        collections.map_collections.insert(id.to_string(), collection);
+        collections.map_collections.insert(id.to_string(), collection.clone());
 
         info!("Add map collection with id '{}' added successfully", id);
 
-        Ok(())
+        Some(collection)
     }
 
     /// Creates a new map collection with the given id and adds it to the manager.
     /// If the collection already exists, it will return an error.
-    pub async fn create_map_collection(&self, id: &str) -> Result<MapCollectionRef, String> {
+    pub async fn create_map_collection(&self, id: &str) -> Option<MapCollectionRef> {
         let collection = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
-        self.add_map_collection(id, collection.clone()).await?;
-        Ok(collection)
+        self.add_map_collection(id, collection.clone()).await
     }
 
     pub async fn get_set_collection(&self, id: &str) -> Option<SetCollectionRef> {
