@@ -245,15 +245,16 @@ pub struct Line {
 // Block of lines
 #[derive(Debug, Clone)]
 pub struct Block {
-    pub block_type: BlockType,
+    // pub block_type: BlockType,
+    pub id: String, // Unique identifier for the block
     pub lines: Vec<Line>,
     pub label_map: HashMap<String, usize>, // Label to line index
 }
 
 impl Block {
-    pub fn new(block_type: BlockType) -> Self {
+    pub fn new(id: &str) -> Self {
         Self {
-            block_type,
+            id: id.to_string(),
             lines: Vec::new(),
             label_map: HashMap::new(),
         }

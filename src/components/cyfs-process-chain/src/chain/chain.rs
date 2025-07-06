@@ -16,8 +16,21 @@ impl ProcessChain {
         }
     }
 
-    pub fn add_block(&mut self, block: Block) {
+    pub fn add_block(&mut self, block: Block) -> Result<(), String> {
+        // First check if the block id is unique
+        if self.get_block(&block.id).is_some() {
+            let msg = format!("Block with id '{}' already exists in the chain", block.id);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
         self.blocks.push(block);
+
+        Ok(())
+    }
+
+    pub fn get_block(&self, id: &str) -> Option<&Block> {
+        self.blocks.iter().find(|b| b.id == id)
     }
 
     pub fn get_blocks(&self) -> &Vec<Block> {

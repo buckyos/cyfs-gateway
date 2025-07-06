@@ -17,19 +17,20 @@ use nom::{
 
 
 pub struct BlockParser {
-    block_type: BlockType,
+    // block_type: BlockType,
+    id: String,
 }
 
 impl BlockParser {
-    pub fn new(block_type: BlockType) -> Self {
-        Self { block_type }
+    pub fn new(id: &str) -> Self {
+        Self { id: id.to_owned() }
     }
 }
 
 impl BlockParser {
     pub fn parse(&self, block: &str) -> Result<Block, String> {
         let lines: Vec<&str> = Self::split_lines(block);
-        let mut block = Block::new(self.block_type);
+        let mut block = Block::new(&self.id);
 
         if lines.is_empty() {
             warn!("Empty block");

@@ -1,4 +1,4 @@
-use super::block::{Block, BlockType, CommandItem, Expression};
+use super::block::{Block, CommandItem, Expression};
 use super::exec::DynamicCommandExecutor;
 use crate::cmd::{CommandExecutor, CommandParserFactory};
 use std::sync::Arc;
@@ -17,7 +17,7 @@ impl BlockCommandTranslator {
             for statement in &mut line.statements {
                 // For each statement, we need to translate the expressions
                 for (expr, _) in &mut statement.expressions {
-                    self.translate_expression(expr, block.block_type)?;
+                    self.translate_expression(expr)?;
                 }
             }
         }
@@ -28,16 +28,15 @@ impl BlockCommandTranslator {
     fn translate_expression(
         &self,
         expr: &mut Expression,
-        block_type: BlockType,
     ) -> Result<(), String> {
         match expr {
             Expression::Command(cmd) => {
-                self.translate_command(cmd, block_type)?;
+                self.translate_command(cmd)?;
             }
             Expression::Group(exprs) => {
                 // For group expressions, we need to translate each sub-expression
                 for (sub_expr, _) in exprs {
-                    self.translate_expression(sub_expr, block_type)?;
+                    self.translate_expression(sub_expr)?;
                 }
             }
             Expression::Goto(_) => {
@@ -51,7 +50,6 @@ impl BlockCommandTranslator {
     fn translate_command(
         &self,
         cmd: &mut CommandItem,
-        block_type: BlockType,
     ) -> Result<(), String> {
         let parser = self.parser.get_parser(&cmd.command.name);
         if parser.is_none() {
@@ -62,17 +60,7 @@ impl BlockCommandTranslator {
 
         let parser = parser.unwrap();
 
-        // First check if cmd is valid for the block type
-        if !parser.check(block_type) {
-            let msg = format!(
-                "Invalid command for block type: {:?}, cmd={:?}",
-                cmd.command, block_type
-            );
-            error!("{}", msg);
-            return Err(msg);
-        }
-
-        // Then parse args to executor
+        // Try parse args to executor
         let executer = if cmd.command.args.is_literal() {
             let args = cmd.command.args.as_literal_list();
             parser.parse(&args).map_err(|e| {

@@ -1,19 +1,18 @@
 use super::chain::ProcessChain;
 use crate::block::*;
-use std::str::FromStr;
 use xmltree::Element;
 
 /**
  * Process chain in xml format, at least one block is required in the chain.
  *
 <root>
-</process_chain id="main_http_server">
-    <block type="process">
+<process_chain id="main_http_server">
+    <block id="process">
     </block>
 </process_chain>
 
-</process_chain id="main_http_server.post">
-    <block type="rewrite">
+<process_chain id="main_http_server.post">
+    <block id="rewrite">
     </block>
 </process_chain>
 </root>
@@ -53,7 +52,7 @@ impl ProcessChainParser {
                 for block in &process_chain.children {
                     if let xmltree::XMLNode::Element(block) = block {
                         let block = Self::load_block(block)?;
-                        chain_item.add_block(block);
+                        chain_item.add_block(block)?;
                     }
                 }
 
@@ -75,21 +74,15 @@ impl ProcessChainParser {
     }
 
     fn load_block(block: &xmltree::Element) -> Result<Block, String> {
-        // First load block type
-        let block_type = block.attributes.get("type").ok_or_else(|| {
-            let msg = format!("Block must have a type: {:?}", block.attributes);
+        // First load block id
+        let id = block.attributes.get("id").ok_or_else(|| {
+            let msg = format!("Block must have an id: {:?}", block.attributes);
             error!("{}", msg);
             msg
         })?;
 
-        // Try to parse block type
-        let block_type = BlockType::from_str(block_type).map_err(|e| {
-            let msg = format!("Invalid block type: {}, {}", block_type, e);
-            error!("{}", msg);
-            msg
-        })?;
 
-        let block_parser = BlockParser::new(block_type);
+        let block_parser = BlockParser::new(id);
 
         let content = block.get_text().ok_or_else(|| {
             let msg = format!("Block must have content: {:?}", block.attributes);
