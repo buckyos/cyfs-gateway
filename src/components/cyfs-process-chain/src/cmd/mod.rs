@@ -6,7 +6,7 @@ mod match_;
 mod factory;
 mod sni;
 mod assign;
+mod string;
 
 pub use cmd::*;
 pub use factory::*;
-pub use assign::*;
