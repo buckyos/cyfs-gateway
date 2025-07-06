@@ -52,7 +52,7 @@ pub struct MatchCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for MatchCommandExecutor {
-    async fn exec(&self, _context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
         if self.pattern.is_match(&self.value) {
             Ok(CommandResult::success())
         } else {
@@ -123,7 +123,7 @@ pub struct MatchRegexCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for MatchRegexCommandExecutor {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Match the value
         if let Some(caps) = self.pattern.captures(&self.value) {
             if let Some(name) = &self.capture {
@@ -201,7 +201,7 @@ pub struct EQCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for EQCommandExecutor {
-    async fn exec(&self, _context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
         let is_eq = if self.ignore_case {
             self.value1.eq_ignore_ascii_case(&self.value2)
         } else {
@@ -268,7 +268,7 @@ pub struct RangeCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for RangeCommandExecutor {
-    async fn exec(&self, _context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
         if self.value >= self.min && self.value <= self.max {
             Ok(CommandResult::success())
         } else {

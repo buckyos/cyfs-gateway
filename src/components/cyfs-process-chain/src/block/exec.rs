@@ -28,7 +28,7 @@ impl BlockExecuter {
     pub async fn execute_block(
         &mut self,
         block: &Block,
-        context: &mut Context,
+        context: &Context,
     ) -> Result<BlockResult, String> {
         let mut current_line = 0;
         let mut result = BlockResult::Ok;
@@ -83,7 +83,7 @@ impl BlockExecuter {
     }
 
     // Execute a single line with multiple statements
-    async fn execute_line(line: &Line, context: &mut Context) -> Result<CommandResult, String> {
+    async fn execute_line(line: &Line, context: &Context) -> Result<CommandResult, String> {
         // We execute each statement in the line sequentially, and got the result of the last statement
         let mut result = CommandResult::success();
         for statement in line.statements.iter() {
@@ -96,7 +96,7 @@ impl BlockExecuter {
     // Execute a single statement
     async fn execute_statement(
         statement: &Statement,
-        context: &mut Context,
+        context: &Context,
     ) -> Result<CommandResult, String> {
         let mut result = CommandResult::success();
         for (expr, op) in &statement.expressions {
@@ -121,7 +121,7 @@ impl BlockExecuter {
     #[async_recursion::async_recursion]
     async fn execute_expression(
         expr: &Expression,
-        context: &mut Context,
+        context: &Context,
     ) -> Result<CommandResult, String> {
         match expr {
             Expression::Command(cmd) => {
@@ -158,7 +158,7 @@ impl BlockExecuter {
 
     async fn execute_command(
         _cmd: &CommandItem,
-        _context: &mut Context,
+        _context: &Context,
     ) -> Result<CommandResult, String> {
         todo!("execute_command not implemented yet");
     }
@@ -177,7 +177,7 @@ impl DynamicCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for DynamicCommandExecutor {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // First exec embedded commands in args to got their values
         let mut resolved_args = Vec::with_capacity(self.args.len());
         for arg in &*self.args {

@@ -43,7 +43,7 @@ impl HttpSniProbeCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for HttpSniProbeCommandExecutor {
-    async fn exec(&self, _context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
         todo!("http-sni-probe not implemented yet");
 
         // context.set_value("REQ_HEADER.host", "");

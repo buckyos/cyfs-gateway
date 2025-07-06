@@ -52,7 +52,7 @@ impl SetLabelByHostDbCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for SetLabelByHostDbCommandExecutor {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // First get value from context, then load label from host db, then set label to request header
         let value = context.get_value(self.key.as_str());
         if value.is_none() {
@@ -111,7 +111,7 @@ impl HaveLabelCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for HaveLabelCommandExecutor {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // First get value from context, then check if the label exists
         let labels = context.get_value(self.key.as_str());
         if labels.is_none() {

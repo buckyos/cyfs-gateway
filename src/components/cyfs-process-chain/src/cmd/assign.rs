@@ -55,7 +55,7 @@ impl AssignCommand {
 
 #[async_trait::async_trait]
 impl CommandExecutor for AssignCommand {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         match self.value {
             Some(ref value) => {
                 // Handle assignment with value

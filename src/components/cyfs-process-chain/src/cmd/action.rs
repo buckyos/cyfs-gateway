@@ -47,7 +47,7 @@ impl ActionCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for ActionCommandExecutor {
-    async fn exec(&self, _context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
         Ok(CommandResult {
             success: true,
             action: self.action.clone(),

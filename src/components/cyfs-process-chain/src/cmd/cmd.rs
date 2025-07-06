@@ -110,7 +110,7 @@ impl CommandResult {
 // CommandExecutor is the trait for executing a command
 #[async_trait::async_trait]
 pub trait CommandExecutor: Send + Sync {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String>;
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String>;
 }
 
 pub type CommandExecutorRef = Arc<Box<dyn CommandExecutor>>;

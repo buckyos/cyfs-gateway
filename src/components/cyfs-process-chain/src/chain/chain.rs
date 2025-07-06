@@ -25,7 +25,7 @@ impl ProcessChain {
     }
 
     // Execute the chain with multiple blocks
-    pub async fn execute(&self, context: &mut Context) -> Result<BlockResult, String> {
+    pub async fn execute(&self, context: &Context) -> Result<BlockResult, String> {
         assert!(
             self.blocks.len() > 0,
             "Process chain must have at least one block"
@@ -61,8 +61,12 @@ impl ProcessChainManager {
         // TODO: We can load some existing env vars from a persistent storage if needed
     }
 
-    pub fn get_env(&self) -> &EnvRef {
+    pub fn get_global_env(&self) -> &EnvRef {
         &self.env
+    }
+
+    pub fn create_chain_env(&self) -> EnvRef {
+        Arc::new(Env::new(EnvLevel::Chain, Some(self.env.clone())))
     }
 
     pub fn add_chain(&self, chain: ProcessChain) {

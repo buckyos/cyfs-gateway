@@ -10,7 +10,7 @@ pub struct Context {
 }
 
 impl Context {
-    fn new(
+    pub fn new(
         global_env: EnvRef,
         chain_env: EnvRef,
         process_chain_manager: ProcessChainManagerRef,

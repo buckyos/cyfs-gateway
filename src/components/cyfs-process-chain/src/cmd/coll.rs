@@ -54,7 +54,7 @@ impl MatchIncludeCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for MatchIncludeCommandExecutor {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Get the collection from the context
         let contains = context
             .collection_manager()
@@ -119,7 +119,7 @@ impl SetCreateCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for SetCreateCommandExecutor {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Create a new set collection with the given id
         match context
             .collection_manager()
@@ -196,7 +196,7 @@ impl SetAddCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for SetAddCommandExecutor {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Add the value to the specified set collection
         let ret = context
             .collection_manager()
@@ -282,7 +282,7 @@ impl SetRemoveCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for SetRemoveCommandExecutor {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Remove the value from the specified set collection
         let ret = context
             .collection_manager()
@@ -365,7 +365,7 @@ impl MapCreateCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for MapCreateCommandExecutor {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Create a new map collection with the given id
         match context
             .collection_manager()
@@ -444,7 +444,7 @@ impl MapAddCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for MapAddCommandExecutor {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Add the key-value pair to the specified map collection
         let ret = context
             .collection_manager()
@@ -527,7 +527,7 @@ impl MapRemoveCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for MapRemoveCommandExecutor {
-    async fn exec(&self, context: &mut Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Remove the key from the specified map collection
         let ret = context
             .collection_manager()
