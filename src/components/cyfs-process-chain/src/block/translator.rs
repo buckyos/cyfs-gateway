@@ -16,7 +16,7 @@ impl BlockCommandTranslator {
         for line in &mut block.lines {
             for statement in &mut line.statements {
                 // For each statement, we need to translate the expressions
-                for (expr, _) in &mut statement.expressions {
+                for (_, expr, _) in &mut statement.expressions {
                     self.translate_expression(expr)?;
                 }
             }
@@ -35,7 +35,7 @@ impl BlockCommandTranslator {
             }
             Expression::Group(exprs) => {
                 // For group expressions, we need to translate each sub-expression
-                for (sub_expr, _) in exprs {
+                for (_, sub_expr, _) in exprs {
                     self.translate_expression(sub_expr)?;
                 }
             }

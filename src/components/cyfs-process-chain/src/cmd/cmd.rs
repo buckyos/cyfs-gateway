@@ -105,6 +105,14 @@ impl CommandResult {
             None
         }
     }
+
+    pub fn not(self) -> Self {
+        CommandResult {
+            success: !self.success,
+            action: self.action,
+            error_code: self.error_code,
+        }
+    }
 }
 
 // CommandExecutor is the trait for executing a command

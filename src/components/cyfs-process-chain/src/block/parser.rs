@@ -114,7 +114,9 @@ impl BlockParser {
     }
 
     // Parse expressions with operators
-    fn parse_expressions(input: &str) -> IResult<&str, Vec<(Expression, Operator)>> {
+    fn parse_expressions(
+        input: &str,
+    ) -> IResult<&str, Vec<(Option<Operator>, Expression, Option<Operator>)>> {
         println!("Parsing expressions: {}", input);
         let input = input.trim();
         if input.is_empty() {
@@ -123,10 +125,20 @@ impl BlockParser {
         }
 
         let (i, exprs) = many0(|i| {
+            // Parse zero or more not operators
+            let (i, not_count) = many0(preceded(space0, tag("!"))).parse(i)?;
+            let not_count = not_count.len();
+            println!("Parsed not operators: {}, count={}", i, not_count);
+            let prefix_op = if not_count % 2 == 1 {
+                Some(Operator::Not)
+            } else {
+                None
+            };
+
             let (i, expr) = Self::parse_expression(i)?;
             println!("Parsed expressions: {}, {:?}", i, expr);
-            let (i, op) = opt(preceded(
-                multispace0(),
+            let (i, post_op) = opt(preceded(
+                space0,
                 alt((
                     map(tag("&&"), |_| Operator::And),
                     map(tag("||"), |_| Operator::Or),
@@ -134,15 +146,15 @@ impl BlockParser {
             ))
             .parse(i)?;
 
-            println!("Parsed operator: {}, {:?}", i, op);
-            Ok((i, (expr, op.unwrap_or(Operator::None))))
+            println!("Parsed operator: {}, {:?}", i, post_op);
+            Ok((i, (prefix_op, expr, post_op)))
         })
         .parse(input)?;
 
         // Check expressions, only the last expression can have no operator
         if exprs.len() > 1 {
             for expr in &exprs[..exprs.len() - 1] {
-                if expr.1 == Operator::None {
+                if expr.2.is_none() {
                     let msg = format!("Expression without operator: {:?}", expr);
                     error!("{}", msg);
                     return Err(nom::Err::Failure(nom::error::Error::from_error_kind(
@@ -437,19 +449,30 @@ mod tests {
         assert!(ret.is_err());
 
         let block_str = r#"
-            map_create test_map && map_create test_map2;
+            ! map_create test_map && !!map_create test_map2;
         "#;
         let ret = parser.parse(block_str);
         assert!(ret.is_ok());
+        let block = ret.unwrap();
+        let line = block.lines.first().unwrap();
+        assert_eq!(line.statements.len(), 1);
+        let statement = &line.statements[0];
+        assert_eq!(statement.expressions.len(), 2);
+        assert_eq!(statement.expressions[0].0, Some(Operator::Not));
+        assert_eq!(statement.expressions[0].1.as_command().unwrap().command.name, "map_create");
+        assert_eq!(statement.expressions[0].2, Some(Operator::And));
+        assert_eq!(statement.expressions[1].0, None);
+        assert_eq!(statement.expressions[1].1.as_command().unwrap().command.name, "map_create");
+        assert_eq!(statement.expressions[1].2, None);
 
         let block_str = r#"
             (map_create test_map) && (map_create test_map2 || map_create test_map3);
-            #local key1="test.key1";
-            #map_create test_map && map_set test_map key1 value1 && map_set test_map key2 $(append ${key1} _value2);
+            local key1="test.key1";
+            map_create test_map && map_set test_map key1 value1 && map_set test_map key2 $(append ${key1} _value2);
         "#;
 
         let block = parser.parse(block_str).unwrap();
         assert_eq!(block.id, "test_block");
-        assert_eq!(block.lines.len(), 2);
+        assert_eq!(block.lines.len(), 3);
     }
 }

@@ -40,7 +40,28 @@ impl FromStr for BlockType {
 pub enum Operator {
     And,  // &&
     Or,   // ||
-    None, // None of the above
+    Not,  // !
+}
+
+
+impl Operator {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::And => "&&",
+            Self::Or => "||",
+            Self::Not => "!",
+        }
+    }
+
+    // If the operator is a unary operator
+    pub fn is_unary(&self) -> bool {
+        matches!(self, Self::Not)
+    }
+
+    // If the operator is a binary operator
+    pub fn is_binary(&self) -> bool {
+        matches!(self, Self::And | Self::Or)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -226,13 +247,50 @@ impl AssignExpression {
 #[derive(Debug, Clone)]
 pub enum Expression {
     Command(CommandItem),
-    Group(Vec<(Expression, Operator)>), // Sub-expression in brackets
+    Group(Vec<(Option<Operator>, Expression, Option<Operator>)>), // Sub-expression in brackets
     Goto(CommandArg),                   // Goto label
 }
 
+impl Expression {
+    pub fn is_command(&self) -> bool {
+        matches!(self, Expression::Command(_))
+    }
+
+    pub fn as_command(&self) -> Option<&CommandItem> {
+        if let Expression::Command(cmd) = self {
+            Some(cmd)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_group(&self) -> bool {
+        matches!(self, Expression::Group(_))
+    }
+
+    pub fn as_group(&self) -> Option<&Vec<(Option<Operator>, Expression, Option<Operator>)>> {
+        if let Expression::Group(group) = self {
+            Some(group)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_goto(&self) -> bool {
+        matches!(self, Expression::Goto(_))
+    }
+
+    pub fn as_goto(&self) -> Option<&CommandArg> {
+        if let Expression::Goto(target) = self {
+            Some(target)
+        } else {
+            None
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub struct Statement {
-    pub expressions: Vec<(Expression, Operator)>,
+    pub expressions: Vec<(Option<Operator>, Expression, Option<Operator>)>,
 }
 
 // Line of commands, top level structure

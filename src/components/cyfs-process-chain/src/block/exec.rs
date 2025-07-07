@@ -101,18 +101,23 @@ impl BlockExecuter {
         context: &Context,
     ) -> Result<CommandResult, String> {
         let mut result = CommandResult::success();
-        for (expr, op) in &statement.expressions {
+        for (prefix_op, expr, post_op) in &statement.expressions {
             println!("Executing expression: {:?}", expr);
             result = Self::execute_expression(expr, context).await?;
+
+            result = match prefix_op {
+                Some(Operator::Not) => result.not(),
+                _ => result,
+            };
 
             // Check if the result is a special action such as goto/drop/pass
             if result.is_special_action() {
                 return Ok(result);
             }
 
-            match op {
-                Operator::And if !result.success => return Ok(result),
-                Operator::Or if result.success => return Ok(result),
+            match *post_op {
+                Some(Operator::And) if !result.success => return Ok(result),
+                Some(Operator::Or) if result.success => return Ok(result),
                 _ => continue,
             }
         }
@@ -133,9 +138,14 @@ impl BlockExecuter {
             }
             Expression::Group(exprs) => {
                 let mut result = CommandResult::success();
-                for (sub_expr, op) in exprs {
+                for (prefix_op, sub_expr, post_op) in exprs {
                     result = {
                         let sub_result = Self::execute_expression(sub_expr, context).await?;
+
+                        let sub_result = match prefix_op {
+                            Some(Operator::Not) => sub_result.not(),
+                            _ => sub_result,
+                        };
 
                         // Check if the result is a special action such as goto/drop/pass
                         if sub_result.is_special_action() {
@@ -144,9 +154,10 @@ impl BlockExecuter {
 
                         sub_result
                     };
-                    match op {
-                        Operator::And if !result.success => return Ok(result),
-                        Operator::Or if result.success => return Ok(result),
+
+                    match post_op {
+                        Some(Operator::And) if !result.success => return Ok(result),
+                        Some(Operator::Or) if result.success => return Ok(result),
                         _ => continue,
                     }
                 }
