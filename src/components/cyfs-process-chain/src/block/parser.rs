@@ -59,7 +59,8 @@ impl BlockParser {
                     return false; // Filter out empty lines
                 }
 
-                true
+                // Filter out lines that are comments
+                !line.starts_with('#') && !line.starts_with("//")
             }) // Filter out empty lines
             .collect()
     }
@@ -137,7 +138,22 @@ impl BlockParser {
             Ok((i, (expr, op.unwrap_or(Operator::None))))
         })
         .parse(input)?;
+
+        // Check expressions, only the last expression can have no operator
+        if exprs.len() > 1 {
+            for expr in &exprs[..exprs.len() - 1] {
+                if expr.1 == Operator::None {
+                    let msg = format!("Expression without operator: {:?}", expr);
+                    error!("{}", msg);
+                    return Err(nom::Err::Failure(nom::error::Error::from_error_kind(
+                        i,
+                        ErrorKind::Tag,
+                    )));
+                }
+            }
+        }
         println!("Parsed expressions with operators: {}, {:?}", i, exprs);
+
         Ok((i, exprs))
     }
 
@@ -150,7 +166,11 @@ impl BlockParser {
     // Parse group of expressions with brackets
     fn parse_group(input: &str) -> IResult<&str, Expression> {
         println!("Parsing group: {}", input);
-        let mut parser = delimited(tag("("), Self::parse_expressions, tag(")"));
+        let mut parser = preceded(
+            multispace0(),
+            delimited(tag("("), Self::parse_expressions, tag(")")),
+        );
+
         let (input, expressions) = parser.parse(input)?;
 
         Ok((input, Expression::Group(expressions)))
@@ -409,9 +429,23 @@ mod tests {
     #[test]
     fn test_parse() {
         let parser = BlockParser::new("test_block");
+
         let block_str = r#"
-            local key1="test.key1";
-            map_create test_map && map_set test_map key1 value1 && map_set test_map key2 $(append ${key1} _value2);
+            (map_create test_map) (map_create test_map2);
+        "#;
+        let ret = parser.parse(block_str);
+        assert!(ret.is_err());
+
+        let block_str = r#"
+            map_create test_map && map_create test_map2;
+        "#;
+        let ret = parser.parse(block_str);
+        assert!(ret.is_ok());
+
+        let block_str = r#"
+            (map_create test_map) && (map_create test_map2 || map_create test_map3);
+            #local key1="test.key1";
+            #map_create test_map && map_set test_map key1 value1 && map_set test_map key2 $(append ${key1} _value2);
         "#;
 
         let block = parser.parse(block_str).unwrap();
