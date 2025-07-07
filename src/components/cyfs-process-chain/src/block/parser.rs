@@ -8,13 +8,12 @@ use nom::{
     character::complete::{alpha1, alphanumeric1, char},
     character::complete::{space0, space1},
     character::multispace0,
-    combinator::{map, opt, recognize, value},
+    combinator::{complete, map, opt, recognize, value},
     error::{ErrorKind, ParseError},
     multi::many0,
     multi::separated_list0,
     sequence::{delimited, pair, preceded, terminated},
 };
-
 
 pub struct BlockParser {
     // block_type: BlockType,
@@ -102,6 +101,7 @@ impl BlockParser {
 
     // Parse expressions with operators
     fn parse_expressions(input: &str) -> IResult<&str, Vec<(Expression, Operator)>> {
+        println!("Parsing expressions: {}", input);
         many0(|i| {
             let (i, expr) = Self::parse_expression(i)?;
             let (i, op) = opt(alt((
@@ -117,11 +117,13 @@ impl BlockParser {
 
     // Parse expression with brackets or command
     fn parse_expression(input: &str) -> IResult<&str, Expression> {
+        println!("Parsing expression: {}", input);
         alt((Self::parse_assign, Self::parse_group, Self::parse_command)).parse(input)
     }
 
     // Parse group of expressions with brackets
     fn parse_group(input: &str) -> IResult<&str, Expression> {
+        println!("Parsing group: {}", input);
         let mut parser = delimited(tag("("), Self::parse_expressions, tag(")"));
         let (input, expressions) = parser.parse(input).map_err(|e| {
             let msg = format!("Parse group error: {}, {:?}", input, e);
@@ -155,7 +157,10 @@ impl BlockParser {
     }
     */
 
+    /// Parse assign expression with = or without value
+    /// This supports both `export KEY=VALUE` and `export KEY`
     fn parse_assign(input: &str) -> IResult<&str, Expression> {
+        println!("Parsing assign: {}", input);
         let (input, kind) = opt(terminated(
             alt((
                 value(AssignKind::Global, tag("export")),
@@ -168,7 +173,7 @@ impl BlockParser {
         ))
         .parse(input)?;
 
-        let kind = kind.unwrap_or_default();
+        println!("Parsed assign kind: {}, {:?}", input, kind);
 
         let (input, key) = recognize(pair(
             alt((alpha1, tag("_"))),
@@ -176,8 +181,21 @@ impl BlockParser {
         ))
         .parse(input)?;
 
+        println!("Parsed assign key: {}, {:?}", input, key);
+
         let (input, value) = opt(preceded(char('='), Self::parse_arg)).parse(input)?;
 
+        println!("Parsed assign value: {}, {:?}", input, value);
+
+        if kind.is_none() && value.is_none() {
+            // If no kind and no value, it's not an assign expression
+            return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                input,
+                ErrorKind::Tag,
+            )));
+        }
+
+        let kind = kind.unwrap_or_default();
         let mut args = vec![
             CommandArg::Literal(kind.as_str().to_string()),
             CommandArg::Literal(key.to_string()),
@@ -190,17 +208,16 @@ impl BlockParser {
         }
 
         let args = CommandArgs::new(args);
-        let cmd = CommandItem::new(
-            "assign".to_string(),
-            args,
-        );
+        let cmd = CommandItem::new("assign".to_string(), args);
         Ok((input, Expression::Command(cmd)))
     }
 
     // Parse command
     fn parse_command(input: &str) -> IResult<&str, Expression> {
+        println!("Parsing command: {}", input);
         let (input, args) =
             separated_list0(space1, preceded(multispace0(), Self::parse_arg)).parse(input)?;
+        println!("Parsed command args: {}, {:?}", input, args);
 
         let cmd = if args.is_empty() {
             let cmd = CommandItem::new_empty();
@@ -229,39 +246,44 @@ impl BlockParser {
     }
 
     fn parse_literal(input: &str) -> IResult<&str, CommandArg> {
-        let (input, arg) = alt(
-            // double quoted string with escapes
-            (
-                delimited(
-                    char('"'),
-                    escaped_transform(
-                        is_not("\\\""),
-                        '\\',
-                        alt((
-                            value("\\", tag("\\")),
-                            value("\"", tag("\"")),
-                            value("\n", tag("n")),
-                            value("\t", tag("t")),
-                            value(" ", tag(" ")),
-                        )),
-                    ),
-                    char('"'),
-                ),
-                // single quoted string
-                map(delimited(char('\''), is_not("'"), char('\'')), |s: &str| {
-                    s.to_string()
-                }),
-                // unquoted word
-                map(
-                    take_while1(|c: char| {
-                        !c.is_whitespace() && c != '"' && c != '\'' && c != '$' && c != '('
-                    }),
-                    |s: &str| s.to_string(),
-                ),
-            ),
-        )
-        .parse(input)?;
+        println!("Parsing literal: {}", input);
 
+        // double quoted string with escapes
+        let double_quoted = delimited(
+            char('"'),
+            escaped_transform(
+                is_not("\\\""),
+                '\\',
+                alt((
+                    value("\\", tag("\\")),
+                    value("\"", tag("\"")),
+                    value("\n", tag("n")),
+                    value("\t", tag("t")),
+                    value(" ", tag(" ")),
+                )),
+            ),
+            char('"'),
+        );
+
+        // single quoted string
+        let single_quoted = delimited(
+            char('\''),
+            map(is_not("'"), |s: &str| s.to_string()),
+            char('\''),
+        );
+
+        // Unquoted string, must start with a letter or underscore, followed by letters, digits, or underscores
+        let unquoted = map(
+            recognize(pair(
+                alt((nom::character::complete::alpha1, tag("_"))),
+                many0(alt((nom::character::complete::alphanumeric1, tag("_")))),
+            )),
+            |s: &str| s.to_string(),
+        );
+
+        let (input, arg) = complete(alt((double_quoted, single_quoted, unquoted))).parse(input)?;
+
+        println!("Parsed literal: {}, {:?}", input, arg);
         // Return as CommandArg::Literal
         Ok((input, CommandArg::Literal(arg)))
     }
@@ -317,12 +339,46 @@ impl BlockParser {
     }
 
     fn parse_arg(input: &str) -> IResult<&str, CommandArg> {
-        alt((
-            Self::parse_command_subst, // $(...)
-            Self::parse_var_braced,    // ${VAR}
-            Self::parse_var_dollar,    // $VAR
-            Self::parse_literal,       // "..." or '...' or unquoted
-        ))
-        .parse(input)
+        println!("Parsing arg: {}", input);
+        let ret = preceded(
+            multispace0(),
+            alt((
+                Self::parse_command_subst, // $(...)
+                Self::parse_var_braced,    // ${VAR}
+                Self::parse_var_dollar,    // $VAR
+                Self::parse_literal,       // "..." or '...' or unquoted
+            )),
+        )
+        .parse(input)?;
+
+        println!("Parsed arg: {}, {:?}", ret.0, ret.1);
+        Ok(ret)
+    }
+}
+
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_literal() {
+        let (input, arg) = BlockParser::parse_literal("abc").unwrap();
+        assert_eq!(input, "");
+        assert_eq!(arg.as_literal_str().unwrap(), "abc");
+
+        let (input, arg) = BlockParser::parse_literal("\"abc def\"").unwrap();
+        assert_eq!(input, "");
+        assert_eq!(arg.as_literal_str().unwrap(), "abc def");
+
+        let (input, arg) = BlockParser::parse_literal("\"line\\nbreak\"").unwrap();
+        assert_eq!(input, "");
+        assert_eq!(arg.as_literal_str().unwrap(), "line\nbreak");
+
+        let (input, arg) = BlockParser::parse_literal("'abc def'").unwrap();
+        assert_eq!(input, "");
+        assert_eq!(arg.as_literal_str().unwrap(), "abc def");
+
+        let (input, arg) = BlockParser::parse_literal("test123_").unwrap();
+        assert_eq!(input, "");
+        assert_eq!(arg.as_literal_str().unwrap(), "test123_");
     }
 }
