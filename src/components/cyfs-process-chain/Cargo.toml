@@ -17,3 +17,4 @@ async-recursion = "*"
 xmltree = "*"
 globset = "*"
 tokio = { version = "*", features = ["full"] }
+simplelog = "*"

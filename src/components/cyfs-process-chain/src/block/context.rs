@@ -43,6 +43,7 @@ impl Context {
     }
 
     pub async fn set_env_value(&self, key: &str, value: &str, level: Option<EnvLevel>) -> Result<Option<String>, String> {
+        println!("Setting env value: {} = {}", key, value);
         // First check if the key in visitor manager
         let (exists, ret) = self.variable_visitor_manager.set_value(key, value).await?;
         if exists {

@@ -11,7 +11,7 @@ use nom::{
     combinator::{complete, map, opt, recognize, value},
     error::{ErrorKind, ParseError},
     multi::many0,
-    multi::separated_list0,
+    multi::{separated_list0, separated_list1},
     sequence::{delimited, pair, preceded, terminated},
 };
 
@@ -41,6 +41,7 @@ impl BlockParser {
             if let Some(ref label) = parsed_line.label {
                 block.label_map.insert(label.clone(), i);
             }
+            println!("Parsed line {}: {:?}", i, parsed_line);
             block.lines.push(parsed_line);
         }
 
@@ -52,8 +53,14 @@ impl BlockParser {
     fn split_lines(block: &str) -> Vec<&str> {
         block
             .split(|c| c == '\n' || c == '\r')
-            .map(|line| line.trim_end_matches('\r')) // Remove '\r' at the end of line if any
-            .filter(|line| !line.is_empty()) // Filter out empty lines
+            .map(|line| line.trim_end_matches('\r').trim()) // Remove '\r' at the end of line if any
+            .filter(|line| {
+                if line.is_empty() {
+                    return false; // Filter out empty lines
+                }
+
+                true
+            }) // Filter out empty lines
             .collect()
     }
 
@@ -79,6 +86,10 @@ impl BlockParser {
             error!("{}", msg);
             msg
         })?;
+        println!(
+            "Parsed line: line={}, label={:?}, statements={:?}",
+            line, label, statements
+        );
 
         Ok(Line { label, statements })
     }
@@ -90,9 +101,11 @@ impl BlockParser {
         )
         .parse(input)
         .map(|(rest, expr_groups)| {
+            println!("Parsed statements: {}, {:?}", rest, expr_groups);
             // Covert each group of expressions into a Statement
             let stmts = expr_groups
                 .into_iter()
+                .filter(|expressions| !expressions.is_empty())
                 .map(|expressions| Statement { expressions })
                 .collect();
             (rest, stmts)
@@ -102,17 +115,30 @@ impl BlockParser {
     // Parse expressions with operators
     fn parse_expressions(input: &str) -> IResult<&str, Vec<(Expression, Operator)>> {
         println!("Parsing expressions: {}", input);
-        many0(|i| {
+        let input = input.trim();
+        if input.is_empty() {
+            println!("No expressions to parse");
+            return Ok((input, Vec::new()));
+        }
+
+        let (i, exprs) = many0(|i| {
             let (i, expr) = Self::parse_expression(i)?;
-            let (i, op) = opt(alt((
-                map(tag("&&"), |_| Operator::And),
-                map(tag("||"), |_| Operator::Or),
-            )))
+            println!("Parsed expressions: {}, {:?}", i, expr);
+            let (i, op) = opt(preceded(
+                multispace0(),
+                alt((
+                    map(tag("&&"), |_| Operator::And),
+                    map(tag("||"), |_| Operator::Or),
+                )),
+            ))
             .parse(i)?;
 
+            println!("Parsed operator: {}, {:?}", i, op);
             Ok((i, (expr, op.unwrap_or(Operator::None))))
         })
-        .parse(input)
+        .parse(input)?;
+        println!("Parsed expressions with operators: {}, {:?}", i, exprs);
+        Ok((i, exprs))
     }
 
     // Parse expression with brackets or command
@@ -125,11 +151,7 @@ impl BlockParser {
     fn parse_group(input: &str) -> IResult<&str, Expression> {
         println!("Parsing group: {}", input);
         let mut parser = delimited(tag("("), Self::parse_expressions, tag(")"));
-        let (input, expressions) = parser.parse(input).map_err(|e| {
-            let msg = format!("Parse group error: {}, {:?}", input, e);
-            error!("{}", msg);
-            e
-        })?;
+        let (input, expressions) = parser.parse(input)?;
 
         Ok((input, Expression::Group(expressions)))
     }
@@ -220,8 +242,10 @@ impl BlockParser {
         println!("Parsed command args: {}, {:?}", input, args);
 
         let cmd = if args.is_empty() {
-            let cmd = CommandItem::new_empty();
-            Expression::Command(cmd)
+            return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                input,
+                ErrorKind::Tag,
+            )));
         } else {
             if let Some(name) = args[0].as_literal_str() {
                 if name.to_ascii_lowercase() == "goto" && args.len() > 1 {
@@ -380,5 +404,18 @@ mod tests {
         let (input, arg) = BlockParser::parse_literal("test123_").unwrap();
         assert_eq!(input, "");
         assert_eq!(arg.as_literal_str().unwrap(), "test123_");
+    }
+
+    #[test]
+    fn test_parse() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            local key1="test.key1";
+            map_create test_map && map_set test_map key1 value1 && map_set test_map key2 $(append ${key1} _value2);
+        "#;
+
+        let block = parser.parse(block_str).unwrap();
+        assert_eq!(block.id, "test_block");
+        assert_eq!(block.lines.len(), 2);
     }
 }

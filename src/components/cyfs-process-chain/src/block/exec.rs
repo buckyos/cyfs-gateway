@@ -30,10 +30,12 @@ impl BlockExecuter {
         block: &Block,
         context: &Context,
     ) -> Result<BlockResult, String> {
+        info!("Executing block: {} lines {}", block.id, block.lines.len());
         let mut current_line = 0;
         let mut result = BlockResult::Ok;
         while current_line < block.lines.len() {
             let line = &block.lines[current_line];
+            println!("Executing line {}: {:?}", current_line, line);
             let line_result = Self::execute_line(line, context).await?;
             info!("Line {} executed: result={:?}", current_line, line_result);
 
@@ -100,6 +102,7 @@ impl BlockExecuter {
     ) -> Result<CommandResult, String> {
         let mut result = CommandResult::success();
         for (expr, op) in &statement.expressions {
+            println!("Executing expression: {:?}", expr);
             result = Self::execute_expression(expr, context).await?;
 
             // Check if the result is a special action such as goto/drop/pass
