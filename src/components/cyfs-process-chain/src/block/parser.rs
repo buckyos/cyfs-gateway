@@ -38,9 +38,6 @@ impl BlockParser {
 
         for (i, line) in lines.iter().enumerate() {
             let parsed_line = Self::parse_line(line)?;
-            if let Some(ref label) = parsed_line.label {
-                block.label_map.insert(label.clone(), i);
-            }
             println!("Parsed line {}: {:?}", i, parsed_line);
             block.lines.push(parsed_line);
         }
@@ -70,29 +67,21 @@ impl BlockParser {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return Ok(Line {
-                label: None,
                 statements: Vec::new(),
             });
         }
 
-        // First try to split the line into label and expressions, the label is start with "label: "
-        let (label, expr_input) = if let Some((label_part, rest)) = trimmed.split_once(": ") {
-            (Some(label_part.trim().to_string()), rest.trim())
-        } else {
-            (None, trimmed)
-        };
-
-        let (_, statements) = Self::parse_statements(expr_input).map_err(|e| {
-            let msg = format!("Parse expressions error: {}, {:?}", expr_input, e);
+        let (_, statements) = Self::parse_statements(trimmed).map_err(|e| {
+            let msg = format!("Parse expressions error: {}, {:?}", trimmed, e);
             error!("{}", msg);
             msg
         })?;
         println!(
-            "Parsed line: line={}, label={:?}, statements={:?}",
-            line, label, statements
+            "Parsed line: line={}, statements={:?}",
+            line, statements
         );
 
-        Ok(Line { label, statements })
+        Ok(Line { statements })
     }
 
     fn parse_statements(input: &str) -> IResult<&str, Vec<Statement>> {
@@ -480,7 +469,7 @@ mod tests {
         let block_str = r#"
             (map_create test_map) && (map_create test_map2 || map_create test_map3);
             local key1="test.key1";
-            map_create test_map && map_set test_map key1 value1 && map_set test_map key2 $(append ${key1} _value2);
+            map_create test_map && map_add test_map key1 value1 && map_add test_map key2 $(append ${key1} _value2);
         "#;
 
         let block = parser.parse(block_str).unwrap();

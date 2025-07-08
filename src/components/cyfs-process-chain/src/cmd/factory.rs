@@ -116,3 +116,12 @@ impl CommandParserFactory {
         );
     }
 }
+
+lazy_static::lazy_static! {
+    // Global command parser factory instance
+    pub static ref COMMAND_PARSER_FACTORY: CommandParserFactory = {
+        let factory = CommandParserFactory::new();
+        factory.init();
+        factory
+    };
+}

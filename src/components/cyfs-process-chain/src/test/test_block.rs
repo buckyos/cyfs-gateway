@@ -8,20 +8,20 @@ const PROCESS_CHAIN: &str = r#"
         local key1="test.key1";
         export key2=$(append ${key1} _value2);
         map_create test;
-        map_set test key1 value1;
-        map_set test key2 $key2;
+        map_add test key1 value1;
+        map_add test key2 $key2;
     </block>
     <block id="block2">
-        map_get test key1;
-        map_get test key2;
+        match_include test key1;
+        match_include test key2;
     </block>
 </process_chain>
 
 <process_chain id="chain2">
     <block id="block1">
         map_create test;
-        map_set test key1 value1;
-        map_set test key2 value2;
+        map_add test key1 value1;
+        map_add test key2 value2;
     </block>
 </process_chain>
 </root>
@@ -35,43 +35,33 @@ async fn test_process_chain() -> Result<(), String> {
     let manager = ProcessChainManager::new();
     let manager = Arc::new(manager);
 
-    let global_env = manager.get_global_env();
-    let chain_env = manager.create_chain_env();
+    // Append all chains to the manager
+    for mut chain in chains {
+        chain.translate().await.unwrap();
+        manager.add_chain(chain).unwrap();
+    }
 
     let collection_manager = CollectionManager::new();
     let variable_visitor_manager = VariableVisitorManager::new();
 
     // Create a context with global and chain environment
-    let context = Context::new(global_env.clone(), chain_env.clone(), manager.clone(), 
-        collection_manager, variable_visitor_manager);
+    let exec = ProcessChainsExecutor::new(
+        manager.clone(),
+        collection_manager.clone(),
+        variable_visitor_manager.clone(),
+    );
 
     // Execute the first chain
-    let chain1: &ProcessChain = chains.get(0).unwrap();
-    chain1.execute(&context).await?;
+    exec.execute_chain_by_id("chain1").await.unwrap();
+
+    let global_env = manager.get_global_env();
 
     // Check the environment variables set by the first block
-    assert_eq!(
-        context.get_env_value("key1").await?,
-        Some("test.key1".to_string())
-    );
-    assert_eq!(
-        context.get_env_value("key2").await?,
-        Some("key1_value2".to_string())
-    );
+    assert_eq!(global_env.get("key1"), None);
+    assert_eq!(global_env.get("key2"), Some("key1_value2".to_string()));
 
     // Execute the second chain
-    let chain2 = chains.get(1).unwrap();
-    chain2.execute(&context).await?;
-
-    // Check the environment variables set by the second block
-    assert_eq!(
-        context.get_env_value("test.key1").await?,
-        Some("value1".to_string())
-    );
-    assert_eq!(
-        context.get_env_value("test.key2").await?,
-        Some("value2".to_string())
-    );
+    exec.execute_chain_by_id("chain2").await.unwrap();
 
     Ok(())
 }

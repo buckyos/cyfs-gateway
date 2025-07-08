@@ -1,5 +1,4 @@
 use crate::cmd::*;
-use std::collections::HashMap;
 use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
@@ -283,7 +282,6 @@ pub struct Statement {
 // Line of commands, top level structure
 #[derive(Debug, Clone)]
 pub struct Line {
-    pub label: Option<String>,      // Label of the line
     pub statements: Vec<Statement>, // Statements in the line
 }
 
@@ -293,7 +291,6 @@ pub struct Block {
     // pub block_type: BlockType,
     pub id: String, // Unique identifier for the block
     pub lines: Vec<Line>,
-    pub label_map: HashMap<String, usize>, // Label to line index
 }
 
 impl Block {
@@ -301,7 +298,6 @@ impl Block {
         Self {
             id: id.to_string(),
             lines: Vec::new(),
-            label_map: HashMap::new(),
         }
     }
 }

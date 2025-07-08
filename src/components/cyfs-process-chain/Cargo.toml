@@ -18,3 +18,4 @@ xmltree = "*"
 globset = "*"
 tokio = { version = "*", features = ["full"] }
 simplelog = "*"
+lazy_static = "*"

@@ -1,9 +1,9 @@
 use super::env::{Env, EnvLevel, EnvRef};
+use super::exec::ProcessChainExecutor;
 use crate::block::*;
-use crate::cmd::CommandResult;
+use crate::cmd::{CommandResult, COMMAND_PARSER_FACTORY};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use super::exec::ProcessChainExecutor;
 
 pub struct ProcessChain {
     id: String,
@@ -47,6 +47,16 @@ impl ProcessChain {
         &self.blocks
     }
 
+    pub async fn translate(&mut self) -> Result<(), String> {
+        let translator = BlockCommandTranslator::new(COMMAND_PARSER_FACTORY.clone());
+        // Translate each block in the chain
+        for block in &mut self.blocks {
+            translator.translate(block).await?;
+        }
+        
+        Ok(())
+    }
+
     // Execute the chain with multiple blocks
     pub async fn execute(&self, context: &Context) -> Result<CommandResult, String> {
         let executor = ProcessChainExecutor::new();
@@ -80,9 +90,20 @@ impl ProcessChainManager {
         Arc::new(Env::new(EnvLevel::Chain, Some(self.env.clone())))
     }
 
-    pub fn add_chain(&self, chain: ProcessChain) {
+    pub fn add_chain(&self, chain: ProcessChain) -> Result<(), String> {
         let mut chains = self.chains.write().unwrap();
-        chains.insert(chain.id.clone(), Arc::new(chain));
+        match chains.entry(chain.id().to_string()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                let msg = format!("Process chain with id '{}' already exists", chain.id);
+                error!("{}", msg);
+                return Err(msg);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::new(chain));
+            }
+        }
+
+        Ok(())
     }
 
     pub fn get_chain(&self, id: &str) -> Option<ProcessChainRef> {

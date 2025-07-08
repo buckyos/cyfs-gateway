@@ -147,10 +147,11 @@ impl BlockExecuter {
     }
 
     async fn execute_command(
-        _cmd: &CommandItem,
-        _context: &Context,
+        cmd: &CommandItem,
+        context: &Context,
     ) -> Result<CommandResult, String> {
-        todo!("execute_command not implemented yet");
+        let exec = cmd.executor.as_ref().unwrap();
+        exec.exec(context).await
     }
 }
 
