@@ -7,11 +7,10 @@ use nom::{
     bytes::streaming::take_while1,
     character::complete::{alpha1, alphanumeric1, char},
     character::complete::{space0, space1},
-    character::multispace0,
     combinator::{complete, map, opt, recognize, value},
     error::{ErrorKind, ParseError},
     multi::many0,
-    multi::{separated_list0},
+    multi::separated_list0,
     sequence::{delimited, pair, preceded, terminated},
 };
 
@@ -37,6 +36,7 @@ impl BlockParser {
         }
 
         for (i, line) in lines.iter().enumerate() {
+            debug!("Parsing line {}: {}", i, line.trim());
             let parsed_line = Self::parse_line(line)?;
             debug!("Parsed line {}: {:?}", i, parsed_line);
             block.lines.push(parsed_line);
@@ -72,17 +72,24 @@ impl BlockParser {
             });
         }
 
-        let (_, statements) = Self::parse_statements(trimmed).map_err(|e| {
+        let (rest, statements) = Self::parse_statements(trimmed).map_err(|e| {
             let msg = format!("Parse expressions error: {}, {:?}", trimmed, e);
             error!("{}", msg);
             msg
         })?;
-        debug!(
-            "Parsed line: line={}, statements={:?}",
-            trimmed, statements
-        );
 
-        Ok(Line { statements, source: trimmed.to_string() })
+        if !rest.trim().is_empty() {
+            let msg = format!("Unexpected content after statements: '{}'", rest);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        debug!("Parsed line: line={}, statements={:?}", trimmed, statements);
+
+        Ok(Line {
+            statements,
+            source: trimmed.to_string(),
+        })
     }
 
     fn parse_statements(input: &str) -> IResult<&str, Vec<Statement>> {
@@ -169,7 +176,7 @@ impl BlockParser {
     fn parse_group(input: &str) -> IResult<&str, Expression> {
         debug!("Parsing group: {}", input);
         let mut parser = preceded(
-            multispace0(),
+            space0,
             delimited(tag("("), Self::parse_expressions, tag(")")),
         );
 
@@ -260,7 +267,7 @@ impl BlockParser {
     fn parse_command(input: &str) -> IResult<&str, Expression> {
         debug!("Parsing command: {}", input);
         let (input, args) =
-            separated_list0(space1, preceded(multispace0(), Self::parse_arg)).parse(input)?;
+            separated_list0(space1, preceded(space0, Self::parse_arg)).parse(input)?;
         debug!("Parsed command args: {}, {:?}", input, args);
 
         let cmd = if args.is_empty() {
@@ -364,7 +371,18 @@ impl BlockParser {
                     depth -= 1;
                     if depth == 0 {
                         let content = &rest[..idx];
-                        let (_, exp) = Self::parse_command(content.trim())?;
+                        let (cmd_rest, exp) = Self::parse_command(content.trim())?;
+                        if !cmd_rest.trim().is_empty() {
+                            let msg = format!(
+                                "Unexpected content after command substitution: '{}'",
+                                cmd_rest
+                            );
+                            error!("{}", msg);
+                            return Err(nom::Err::Failure(nom::error::Error::from_error_kind(
+                                cmd_rest,
+                                ErrorKind::Tag,
+                            )));
+                        }
 
                         let remaining = &rest[idx + 1..];
                         return Ok((remaining, CommandArg::CommandSubstitution(Box::new(exp))));
@@ -383,7 +401,7 @@ impl BlockParser {
     fn parse_arg(input: &str) -> IResult<&str, CommandArg> {
         debug!("Parsing arg: {}", input);
         let ret = preceded(
-            multispace0(),
+            space0,
             alt((
                 Self::parse_command_subst, // $(...)
                 Self::parse_var_braced,    // ${VAR}

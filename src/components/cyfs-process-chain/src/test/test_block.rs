@@ -5,8 +5,15 @@ const PROCESS_CHAIN: &str = r#"
 <root>
 <process_chain id="chain1">
     <block id="block1">
-        local key1="test.key1";
+        local key1="key1";
+        export key1=$(append $key1 '2');
+        local key1
         export key2=$(append ${key1} _value2);
+        # key2 shoule be "key1_value2"
+        export key1;
+        export key3=$(append ${key1} _value2);
+        # key3 should be "key12_value2"
+
         map_create test;
         map_add test key1 value1;
         map_add test key2 $key2;
@@ -57,8 +64,9 @@ async fn test_process_chain() -> Result<(), String> {
     let global_env = manager.get_global_env();
 
     // Check the environment variables set by the first block
-    assert_eq!(global_env.get("key1"), None);
+    assert_eq!(global_env.get("key1"), Some("key12".to_string()));
     assert_eq!(global_env.get("key2"), Some("key1_value2".to_string()));
+    assert_eq!(global_env.get("key3"), Some("key12_value2".to_string()));
 
     // Execute the second chain
     exec.execute_chain_by_id("chain2").await.unwrap();
@@ -70,7 +78,7 @@ async fn test_process_chain() -> Result<(), String> {
 async fn test_process_chain_main() {
     use simplelog::*;
     TermLogger::init(
-        LevelFilter::Info,
+        LevelFilter::Debug,
         Config::default(),
         TerminalMode::Mixed,
         ColorChoice::Auto,
