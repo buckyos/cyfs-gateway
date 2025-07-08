@@ -112,6 +112,12 @@ impl Deref for CommandArgs {
     }
 }
 
+impl std::ops::DerefMut for CommandArgs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 impl Default for CommandArgs {
     fn default() -> Self {
         Self::new_empty()
@@ -227,20 +233,6 @@ impl AssignKind {
     }
 }
 
-/*
-#[derive(Debug, Clone)]
-pub struct AssignExpression {
-    pub kind: AssignKind,
-    pub key: String,
-    pub value: Option<CommandArg>,
-}
-
-impl AssignExpression {
-    pub fn new(kind: AssignKind, key: String, value: Option<CommandArg>) -> Self {
-        Self { kind, key, value }
-    }
-}
-*/
 
 // Command or Expression
 #[derive(Debug, Clone)]
@@ -282,6 +274,7 @@ pub struct Statement {
 // Line of commands, top level structure
 #[derive(Debug, Clone)]
 pub struct Line {
+    pub source: String, // Source code of the line
     pub statements: Vec<Statement>, // Statements in the line
 }
 

@@ -42,7 +42,7 @@ impl BlockExecuter {
                 self.block_id, current_line, line
             );
             let line_result = Self::execute_line(line, context).await?;
-            info!("Line {} executed: result={:?}", current_line, line_result);
+            info!("Line {} executed: {}, {:?}", current_line, line.source, line_result);
 
             if line_result.is_control() {
                 // If the line result is a control action, we handle it immediately
@@ -180,6 +180,7 @@ impl CommandExecutor for DynamicCommandExecutor {
                         resolved_args.push(value.clone());
                     } else {
                         // If variable is not found, push an empty string
+                        warn!("Variable '{}' not found in context, using empty string", var);
                         resolved_args.push("".to_string());
                     }
                 }

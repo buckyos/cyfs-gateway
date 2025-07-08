@@ -38,7 +38,7 @@ impl BlockParser {
 
         for (i, line) in lines.iter().enumerate() {
             let parsed_line = Self::parse_line(line)?;
-            println!("Parsed line {}: {:?}", i, parsed_line);
+            debug!("Parsed line {}: {:?}", i, parsed_line);
             block.lines.push(parsed_line);
         }
 
@@ -67,6 +67,7 @@ impl BlockParser {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return Ok(Line {
+                source: trimmed.to_string(),
                 statements: Vec::new(),
             });
         }
@@ -76,12 +77,12 @@ impl BlockParser {
             error!("{}", msg);
             msg
         })?;
-        println!(
+        debug!(
             "Parsed line: line={}, statements={:?}",
-            line, statements
+            trimmed, statements
         );
 
-        Ok(Line { statements })
+        Ok(Line { statements, source: trimmed.to_string() })
     }
 
     fn parse_statements(input: &str) -> IResult<&str, Vec<Statement>> {
@@ -91,7 +92,7 @@ impl BlockParser {
         )
         .parse(input)
         .map(|(rest, expr_groups)| {
-            println!("Parsed statements: {}, {:?}", rest, expr_groups);
+            debug!("Parsed statements: {}, {:?}", rest, expr_groups);
             // Covert each group of expressions into a Statement
             let stmts = expr_groups
                 .into_iter()
@@ -106,10 +107,10 @@ impl BlockParser {
     fn parse_expressions(
         input: &str,
     ) -> IResult<&str, Vec<(Option<Operator>, Expression, Option<Operator>)>> {
-        println!("Parsing expressions: {}", input);
+        debug!("Parsing expressions: {}", input);
         let input = input.trim();
         if input.is_empty() {
-            println!("No expressions to parse");
+            debug!("No expressions to parse");
             return Ok((input, Vec::new()));
         }
 
@@ -117,7 +118,7 @@ impl BlockParser {
             // Parse zero or more not operators
             let (i, not_count) = many0(preceded(space0, tag("!"))).parse(i)?;
             let not_count = not_count.len();
-            println!("Parsed not operators: {}, count={}", i, not_count);
+            debug!("Parsed not operators: {}, count={}", i, not_count);
             let prefix_op = if not_count % 2 == 1 {
                 Some(Operator::Not)
             } else {
@@ -125,7 +126,7 @@ impl BlockParser {
             };
 
             let (i, expr) = Self::parse_expression(i)?;
-            println!("Parsed expressions: {}, {:?}", i, expr);
+            debug!("Parsed expressions: {}, {:?}", i, expr);
             let (i, post_op) = opt(preceded(
                 space0,
                 alt((
@@ -135,7 +136,7 @@ impl BlockParser {
             ))
             .parse(i)?;
 
-            println!("Parsed operator: {}, {:?}", i, post_op);
+            debug!("Parsed operator: {}, {:?}", i, post_op);
             Ok((i, (prefix_op, expr, post_op)))
         })
         .parse(input)?;
@@ -153,20 +154,20 @@ impl BlockParser {
                 }
             }
         }
-        println!("Parsed expressions with operators: {}, {:?}", i, exprs);
+        debug!("Parsed expressions with operators: {}, {:?}", i, exprs);
 
         Ok((i, exprs))
     }
 
     // Parse expression with brackets or command
     fn parse_expression(input: &str) -> IResult<&str, Expression> {
-        println!("Parsing expression: {}", input);
+        debug!("Parsing expression: {}", input);
         alt((Self::parse_assign, Self::parse_group, Self::parse_command)).parse(input)
     }
 
     // Parse group of expressions with brackets
     fn parse_group(input: &str) -> IResult<&str, Expression> {
-        println!("Parsing group: {}", input);
+        debug!("Parsing group: {}", input);
         let mut parser = preceded(
             multispace0(),
             delimited(tag("("), Self::parse_expressions, tag(")")),
@@ -203,7 +204,7 @@ impl BlockParser {
     /// Parse assign expression with = or without value
     /// This supports both `export KEY=VALUE` and `export KEY`
     fn parse_assign(input: &str) -> IResult<&str, Expression> {
-        println!("Parsing assign: {}", input);
+        debug!("Parsing assign: {}", input);
         let (input, kind) = opt(terminated(
             alt((
                 value(AssignKind::Global, tag("export")),
@@ -216,7 +217,7 @@ impl BlockParser {
         ))
         .parse(input)?;
 
-        println!("Parsed assign kind: {}, {:?}", input, kind);
+        debug!("Parsed assign kind: {}, {:?}", input, kind);
 
         let (input, key) = recognize(pair(
             alt((alpha1, tag("_"))),
@@ -224,11 +225,11 @@ impl BlockParser {
         ))
         .parse(input)?;
 
-        println!("Parsed assign key: {}, {:?}", input, key);
+        debug!("Parsed assign key: {}, {:?}", input, key);
 
         let (input, value) = opt(preceded(char('='), Self::parse_arg)).parse(input)?;
 
-        println!("Parsed assign value: {}, {:?}", input, value);
+        debug!("Parsed assign value: {}, {:?}", input, value);
 
         if kind.is_none() && value.is_none() {
             // If no kind and no value, it's not an assign expression
@@ -257,10 +258,10 @@ impl BlockParser {
 
     // Parse command
     fn parse_command(input: &str) -> IResult<&str, Expression> {
-        println!("Parsing command: {}", input);
+        debug!("Parsing command: {}", input);
         let (input, args) =
             separated_list0(space1, preceded(multispace0(), Self::parse_arg)).parse(input)?;
-        println!("Parsed command args: {}, {:?}", input, args);
+        debug!("Parsed command args: {}, {:?}", input, args);
 
         let cmd = if args.is_empty() {
             return Err(nom::Err::Error(nom::error::Error::from_error_kind(
@@ -287,7 +288,7 @@ impl BlockParser {
     }
 
     fn parse_literal(input: &str) -> IResult<&str, CommandArg> {
-        println!("Parsing literal: {}", input);
+        debug!("Parsing literal: {}", input);
 
         // double quoted string with escapes
         let double_quoted = delimited(
@@ -324,7 +325,7 @@ impl BlockParser {
 
         let (input, arg) = complete(alt((double_quoted, single_quoted, unquoted))).parse(input)?;
 
-        println!("Parsed literal: {}, {:?}", input, arg);
+        debug!("Parsed literal: {}, {:?}", input, arg);
         // Return as CommandArg::Literal
         Ok((input, CommandArg::Literal(arg)))
     }
@@ -380,7 +381,7 @@ impl BlockParser {
     }
 
     fn parse_arg(input: &str) -> IResult<&str, CommandArg> {
-        println!("Parsing arg: {}", input);
+        debug!("Parsing arg: {}", input);
         let ret = preceded(
             multispace0(),
             alt((
@@ -392,7 +393,7 @@ impl BlockParser {
         )
         .parse(input)?;
 
-        println!("Parsed arg: {}, {:?}", ret.0, ret.1);
+        debug!("Parsed arg: {}, {:?}", ret.0, ret.1);
         Ok(ret)
     }
 }

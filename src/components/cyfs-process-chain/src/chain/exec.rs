@@ -79,8 +79,6 @@ impl ProcessChainExecutor {
                             // TODO: What should the result be in this case?
                             // For now, we just set it to success and continue to the next block
                             chain_result = CommandResult::success();
-
-                            continue;
                         } else if *level == CommandControlLevel::Chain {
                             // If it's a chain-level goto, we exit the chain execution
                             chain_result = result;
@@ -92,6 +90,8 @@ impl ProcessChainExecutor {
                 // If the block execution result is not a control action, we continue to the next block
                 chain_result = result;
             }
+
+            i += 1;
         }
 
         Ok(chain_result)

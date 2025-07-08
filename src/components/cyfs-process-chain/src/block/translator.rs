@@ -1,4 +1,4 @@
-use super::block::{Block, CommandItem, Expression};
+use super::block::{Block, CommandItem, Expression, CommandArg};
 use super::exec::DynamicCommandExecutor;
 use crate::cmd::{CommandExecutor, CommandParserFactory};
 use std::sync::Arc;
@@ -66,6 +66,15 @@ impl BlockCommandTranslator {
                 msg
             })?
         } else {
+            for arg in cmd.command.args.iter_mut() {
+                match arg {
+                    CommandArg::CommandSubstitution(cmd_sub) => {
+                        self.translate_expression(cmd_sub.as_mut())?;
+                    }
+                    _ => {}
+                }
+            }
+
             let exec = DynamicCommandExecutor::new(parser, cmd.take_args());
 
             Arc::new(Box::new(exec) as Box<dyn CommandExecutor>)
