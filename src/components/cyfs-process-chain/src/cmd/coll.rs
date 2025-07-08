@@ -64,7 +64,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
         if contains {
             Ok(CommandResult::success())
         } else {
-            Ok(CommandResult::failure(1))
+            Ok(CommandResult::error())
         }
     }
 }
@@ -136,7 +136,7 @@ impl CommandExecutor for SetCreateCommandExecutor {
             None => {
                 let msg = format!("Failed to create set collection with id '{}'", self.set_id);
                 warn!("{}", msg);
-                Ok(CommandResult::failure(1))
+                Ok(CommandResult::error_with_value(msg))
             }
         }
     }
@@ -203,8 +203,9 @@ impl CommandExecutor for SetAddCommandExecutor {
             .get_set_collection(&self.set_id)
             .await;
         if ret.is_none() {
-            warn!("Set collection with id '{}' not found", self.set_id);
-            return Ok(CommandResult::failure(1));
+            let msg = format!("Set collection with id '{}' not found", self.set_id);
+            warn!("{}", msg);
+            return Ok(CommandResult::error_with_value(msg));
         }
 
         let collection = ret.unwrap();
@@ -222,7 +223,7 @@ impl CommandExecutor for SetAddCommandExecutor {
                     self.value, self.set_id
                 );
                 warn!("{}", msg);
-                Ok(CommandResult::failure(2))
+                Ok(CommandResult::error_with_value(msg))
             }
         }
     }
@@ -289,8 +290,9 @@ impl CommandExecutor for SetRemoveCommandExecutor {
             .get_set_collection(&self.set_id)
             .await;
         if ret.is_none() {
-            warn!("Set collection with id '{}' not found", self.set_id);
-            return Ok(CommandResult::failure(1));
+            let msg = format!("Set collection with id '{}' not found", self.set_id);
+            warn!("{}", msg);
+            return Ok(CommandResult::error_with_value(msg));
         }
 
         let collection = ret.unwrap();
@@ -308,7 +310,7 @@ impl CommandExecutor for SetRemoveCommandExecutor {
                     self.value, self.set_id
                 );
                 warn!("{}", msg);
-                Ok(CommandResult::failure(2))
+                Ok(CommandResult::error_with_value(msg))
             }
         }
     }
@@ -382,7 +384,7 @@ impl CommandExecutor for MapCreateCommandExecutor {
             None => {
                 let msg = format!("Failed to create map collection with id '{}'", self.map_id);
                 warn!("{}", msg);
-                Ok(CommandResult::failure(1))
+                Ok(CommandResult::error_with_value(msg))
             }
         }
     }
@@ -451,8 +453,9 @@ impl CommandExecutor for MapAddCommandExecutor {
             .get_map_collection(&self.map_id)
             .await;
         if ret.is_none() {
-            warn!("Map collection with id '{}' not found", self.map_id);
-            return Ok(CommandResult::failure(1));
+            let msg = format!("Map collection with id '{}' not found", self.map_id);
+            warn!("{}", msg);
+            return Ok(CommandResult::error_with_value(msg));
         }
 
         let collection = ret.unwrap();
@@ -534,8 +537,9 @@ impl CommandExecutor for MapRemoveCommandExecutor {
             .get_map_collection(&self.map_id)
             .await;
         if ret.is_none() {
-            warn!("Map collection with id '{}' not found", self.map_id);
-            return Ok(CommandResult::failure(1));
+            let msg = format!("Map collection with id '{}' not found", self.map_id);
+            warn!("{}", msg);
+            return Ok(CommandResult::error_with_value(msg));
         }
 
         let collection = ret.unwrap();
@@ -545,7 +549,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                     "Key '{}' removed from map collection with id '{}': {}",
                     self.key, self.map_id, value
                 );
-                Ok(CommandResult::success())
+                Ok(CommandResult::success_with_value(value))
             }
             None => {
                 info!(

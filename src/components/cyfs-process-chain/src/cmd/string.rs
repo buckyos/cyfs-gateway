@@ -81,11 +81,16 @@ impl CommandExecutor for RewriteCommand {
                     let tail = &key_value[prefix.len()..];
                     let rewritten = format!("{}{}", &template[..template.len() - 1], tail);
                     context.set_env_value(self.key.as_str(), &rewritten, None).await?;
+                    Ok(CommandResult::success_with_value(rewritten))
+                } else {
+                    Ok(CommandResult::success())
                 }
+            } else {
+                Ok(CommandResult::success())
             }
-            Ok(CommandResult::success())
+            
         } else {
-            Ok(CommandResult::failure(2))
+            Ok(CommandResult::error())
         }
     }
 }
@@ -192,9 +197,9 @@ impl CommandExecutor for RewriteRegexCommand {
             context.set_env_value(self.key.as_str(), &result, None).await?;
             info!("Rewritten value for {}: {}", self.key, result);
 
-            Ok(CommandResult::success())
+            Ok(CommandResult::success_with_value(result))
         } else {
-            Ok(CommandResult::failure(2))
+            Ok(CommandResult::error())
         }
     }
 }
@@ -264,9 +269,9 @@ impl CommandExecutor for StringReplaceCommand {
             context.set_env_value(self.key.as_str(), &rewritten, None).await?;
             info!("Replace value for {}: {}", self.key, rewritten);
 
-            Ok(super::CommandResult::success())
+            Ok(super::CommandResult::success_with_value(rewritten))
         } else {
-            Ok(super::CommandResult::failure(2))
+            Ok(super::CommandResult::error())
         }
     }
 }
@@ -317,7 +322,7 @@ impl CommandExecutor for StringConstCommand {
     async fn exec(&self, _context: &Context) -> Result<super::CommandResult, String> {
         // Just return the result without modifying the context
 
-        Ok(super::CommandResult::value(&self.result))
+        Ok(super::CommandResult::success_with_value(&self.result))
     }
 }
 

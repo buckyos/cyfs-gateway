@@ -36,10 +36,13 @@ impl CommandParserFactory {
     pub fn init(&self) {
         // action command
         let drop_action_parser = ActionCommandParser::new(CommandAction::Drop);
-        self.register("DROP", Arc::new(Box::new(drop_action_parser)));
+        self.register("drop", Arc::new(Box::new(drop_action_parser)));
 
-        let pass_action = ActionCommandParser::new(CommandAction::Pass);
-        self.register("PASS", Arc::new(Box::new(pass_action)));
+        let accept_action = ActionCommandParser::new(CommandAction::Accept);
+        self.register("pass", Arc::new(Box::new(accept_action)));
+
+        let reject_action = ActionCommandParser::new(CommandAction::Reject);
+        self.register("reject", Arc::new(Box::new(reject_action)));
 
         // assign command
         self.register("assign", Arc::new(Box::new(AssignCommandParser::new())));

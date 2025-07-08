@@ -37,8 +37,13 @@ async fn test_process_chain() -> Result<(), String> {
 
     let global_env = manager.get_global_env();
     let chain_env = manager.create_chain_env();
+
+    let collection_manager = CollectionManager::new();
+    let variable_visitor_manager = VariableVisitorManager::new();
+
     // Create a context with global and chain environment
-    let context = Context::new(global_env.clone(), chain_env.clone(), manager.clone());
+    let context = Context::new(global_env.clone(), chain_env.clone(), manager.clone(), 
+        collection_manager, variable_visitor_manager);
 
     // Execute the first chain
     let chain1: &ProcessChain = chains.get(0).unwrap();

@@ -67,14 +67,14 @@ impl CommandExecutor for AssignCommand {
 
                 // Set the value in the context
                 context.set_env_value(self.key.as_str(), value, Some(env_level)).await?;
+
+                Ok(CommandResult::success_with_value(value))
             }
             None => {
                 // Handle assignment without value
                 todo!("Assign command without value not implemented yet");
+                Ok(CommandResult::success())
             }
         }
-
-        // Return success
-        Ok(CommandResult::success())
     }
 }

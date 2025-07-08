@@ -2,13 +2,14 @@ use super::cmd::*;
 use crate::block::{BlockType, Context};
 use std::sync::Arc;
 
+// some action commands, DROP/ACCEPT/REJECT
 pub struct ActionCommandParser {
     action: CommandAction,
 }
 
 impl ActionCommandParser {
     pub fn new(action: CommandAction) -> Self {
-        ActionCommandParser { action }
+        Self { action }
     }
 }
 
@@ -18,7 +19,7 @@ impl CommandParser for ActionCommandParser {
         true
     }
 
-    fn parse(&self,  args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
         // Args must be empty
         if !args.is_empty() {
             let msg = format!("Invalid action command: {:?}", args);
@@ -29,7 +30,7 @@ impl CommandParser for ActionCommandParser {
         let cmd = ActionCommandExecutor {
             action: self.action.clone(),
         };
-        
+
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -48,10 +49,12 @@ impl ActionCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for ActionCommandExecutor {
     async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
-        Ok(CommandResult {
-            success: true,
-            action: self.action.clone(),
-            error_code: 0,
-        })
+        let ret = match self.action {
+            CommandAction::Drop => CommandResult::drop(),
+            CommandAction::Accept => CommandResult::accept(),
+            CommandAction::Reject => CommandResult::reject(),
+        };
+
+        Ok(ret)
     }
 }

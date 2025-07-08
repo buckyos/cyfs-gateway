@@ -56,7 +56,7 @@ impl CommandExecutor for MatchCommandExecutor {
         if self.pattern.is_match(&self.value) {
             Ok(CommandResult::success())
         } else {
-            Ok(CommandResult::failure(2))
+            Ok(CommandResult::error())
         }
     }
 }
@@ -137,7 +137,7 @@ impl CommandExecutor for MatchRegexCommandExecutor {
 
             Ok(CommandResult::success())
         } else {
-            Ok(CommandResult::failure(2))
+            Ok(CommandResult::error())
         }
     }
 }
@@ -211,7 +211,7 @@ impl CommandExecutor for EQCommandExecutor {
         if is_eq {
             Ok(CommandResult::success())
         } else {
-            Ok(CommandResult::failure(2))
+            Ok(CommandResult::error())
         }
     }
 }
@@ -272,7 +272,7 @@ impl CommandExecutor for RangeCommandExecutor {
         if self.value >= self.min && self.value <= self.max {
             Ok(CommandResult::success())
         } else {
-            Ok(CommandResult::failure(2))
+            Ok(CommandResult::error())
         }
     }
 }

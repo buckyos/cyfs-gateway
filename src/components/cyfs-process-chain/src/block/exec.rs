@@ -1,7 +1,7 @@
 use super::block::{Block, CommandItem, Expression, Line, Operator, Statement};
 use super::block::{CommandArg, CommandArgs};
 use super::context::Context;
-use crate::cmd::{CommandAction, CommandResult};
+use crate::cmd::CommandResult;
 use crate::cmd::{CommandExecutor, CommandParser};
 use std::sync::Arc;
 
@@ -15,70 +15,45 @@ pub enum BlockResult {
 }
 
 pub struct BlockExecuter {
-    // Goto counter
-    pub goto_counter: u32,
+    block_id: String, // Block ID
 }
 
 impl BlockExecuter {
-    pub fn new() -> Self {
-        Self { goto_counter: 0 }
+    pub fn new(block_id: &str) -> Self {
+        Self {
+            block_id: block_id.to_string(),
+        }
     }
 
     // Execute the block
     pub async fn execute_block(
-        &mut self,
+        &self,
         block: &Block,
         context: &Context,
-    ) -> Result<BlockResult, String> {
+    ) -> Result<CommandResult, String> {
         info!("Executing block: {} lines {}", block.id, block.lines.len());
+
         let mut current_line = 0;
-        let mut result = BlockResult::Ok;
+        let mut result = CommandResult::success();
         while current_line < block.lines.len() {
             let line = &block.lines[current_line];
-            println!("Executing line {}: {:?}", current_line, line);
+            println!(
+                "Executing line {}:{}: {:?}",
+                self.block_id, current_line, line
+            );
             let line_result = Self::execute_line(line, context).await?;
             info!("Line {} executed: result={:?}", current_line, line_result);
 
-            match line_result.action {
-                CommandAction::Ok => {
-                    current_line += 1;
-                    result = BlockResult::Ok;
-                }
-                CommandAction::Drop => {
-                    result = BlockResult::Drop;
-                    break;
-                }
-                CommandAction::Pass => {
-                    result = BlockResult::Pass;
-                    break;
-                }
-                CommandAction::Goto(goto_target) => {
-                    if let Some(&target_line) = block.label_map.get(&goto_target) {
-                        current_line = target_line;
-
-                        // Increase the goto counter and check the limit
-                        self.goto_counter += 1;
-                        if self.goto_counter > MAX_GOTO_COUNT_IN_BLOCK {
-                            let msg =
-                                format!("Goto count exceeds limit {}", MAX_GOTO_COUNT_IN_BLOCK);
-                            error!("{}", msg);
-                            return Err(msg);
-                        }
-                    } else {
-                        let msg = format!("Goto target {} not found", goto_target);
-                        error!("{}", msg);
-                        return Err(msg);
-                    }
-                }
-                CommandAction::Value(ret) => {
-                    let msg = format!(
-                        "Unexpected return value from line {}: {}",
-                        current_line, ret
-                    );
-                    error!("{}", msg);
-                    return Err(msg);
-                }
+            if line_result.is_control() {
+                // If the line result is a control action, we handle it immediately
+                info!("Control action at line {}: {:?}", current_line, line_result);
+                return Ok(line_result);
             }
+
+            result = line_result;
+            // Continue to the next line
+
+            current_line += 1;
         }
 
         Ok(result)
@@ -90,6 +65,10 @@ impl BlockExecuter {
         let mut result = CommandResult::success();
         for statement in line.statements.iter() {
             result = Self::execute_statement(statement, context).await?;
+            if result.is_control() {
+                // If the result is an action (exit/goto/return), we return it immediately
+                return Ok(result);
+            }
         }
 
         Ok(result)
@@ -101,23 +80,24 @@ impl BlockExecuter {
         context: &Context,
     ) -> Result<CommandResult, String> {
         let mut result = CommandResult::success();
+
         for (prefix_op, expr, post_op) in &statement.expressions {
             println!("Executing expression: {:?}", expr);
             result = Self::execute_expression(expr, context).await?;
 
             result = match prefix_op {
-                Some(Operator::Not) => result.not(),
+                Some(Operator::Not) => result.try_not()?,
                 _ => result,
             };
 
             // Check if the result is a special action such as goto/drop/pass
-            if result.is_special_action() {
+            if result.is_control() {
                 return Ok(result);
             }
 
             match *post_op {
-                Some(Operator::And) if !result.success => return Ok(result),
-                Some(Operator::Or) if result.success => return Ok(result),
+                Some(Operator::And) if !result.is_success() => return Ok(result),
+                Some(Operator::Or) if result.is_success() => return Ok(result),
                 _ => continue,
             }
         }
@@ -143,12 +123,12 @@ impl BlockExecuter {
                         let sub_result = Self::execute_expression(sub_expr, context).await?;
 
                         let sub_result = match prefix_op {
-                            Some(Operator::Not) => sub_result.not(),
+                            Some(Operator::Not) => sub_result.try_not()?,
                             _ => sub_result,
                         };
 
                         // Check if the result is a special action such as goto/drop/pass
-                        if sub_result.is_special_action() {
+                        if sub_result.is_control() {
                             return Ok(sub_result);
                         }
 
@@ -156,8 +136,8 @@ impl BlockExecuter {
                     };
 
                     match post_op {
-                        Some(Operator::And) if !result.success => return Ok(result),
-                        Some(Operator::Or) if result.success => return Ok(result),
+                        Some(Operator::And) if !result.is_success() => return Ok(result),
+                        Some(Operator::Or) if result.is_success() => return Ok(result),
                         _ => continue,
                     }
                 }
@@ -209,13 +189,13 @@ impl CommandExecutor for DynamicCommandExecutor {
                 CommandArg::CommandSubstitution(cmd) => {
                     // Execute the command and get its result
                     let ret = BlockExecuter::execute_expression(&cmd, context).await?;
-                    if !ret.is_value() {
+                    if !ret.is_substitution_value() {
                         let msg = format!("Command substitution did not return a value: {:?}", cmd);
                         warn!("{}", msg);
                         return Err(msg);
                     }
 
-                    resolved_args.push(ret.into_value().unwrap());
+                    resolved_args.push(ret.into_substitution_value().unwrap());
                 }
             }
         }

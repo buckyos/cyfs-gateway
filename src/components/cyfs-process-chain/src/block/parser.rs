@@ -11,7 +11,7 @@ use nom::{
     combinator::{complete, map, opt, recognize, value},
     error::{ErrorKind, ParseError},
     multi::many0,
-    multi::{separated_list0, separated_list1},
+    multi::{separated_list0},
     sequence::{delimited, pair, preceded, terminated},
 };
 
@@ -459,10 +459,26 @@ mod tests {
         let statement = &line.statements[0];
         assert_eq!(statement.expressions.len(), 2);
         assert_eq!(statement.expressions[0].0, Some(Operator::Not));
-        assert_eq!(statement.expressions[0].1.as_command().unwrap().command.name, "map_create");
+        assert_eq!(
+            statement.expressions[0]
+                .1
+                .as_command()
+                .unwrap()
+                .command
+                .name,
+            "map_create"
+        );
         assert_eq!(statement.expressions[0].2, Some(Operator::And));
         assert_eq!(statement.expressions[1].0, None);
-        assert_eq!(statement.expressions[1].1.as_command().unwrap().command.name, "map_create");
+        assert_eq!(
+            statement.expressions[1]
+                .1
+                .as_command()
+                .unwrap()
+                .command
+                .name,
+            "map_create"
+        );
         assert_eq!(statement.expressions[1].2, None);
 
         let block_str = r#"

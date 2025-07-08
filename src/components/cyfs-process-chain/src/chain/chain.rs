@@ -1,7 +1,9 @@
 use super::env::{Env, EnvLevel, EnvRef};
 use crate::block::*;
+use crate::cmd::CommandResult;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use super::exec::ProcessChainExecutor;
 
 pub struct ProcessChain {
     id: String,
@@ -14,6 +16,10 @@ impl ProcessChain {
             id,
             blocks: Vec::new(),
         }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     pub fn add_block(&mut self, block: Block) -> Result<(), String> {
@@ -33,26 +39,18 @@ impl ProcessChain {
         self.blocks.iter().find(|b| b.id == id)
     }
 
+    pub fn get_block_index(&self, id: &str) -> Option<usize> {
+        self.blocks.iter().position(|b| b.id == id)
+    }
+
     pub fn get_blocks(&self) -> &Vec<Block> {
         &self.blocks
     }
 
     // Execute the chain with multiple blocks
-    pub async fn execute(&self, context: &Context) -> Result<BlockResult, String> {
-        assert!(
-            self.blocks.len() > 0,
-            "Process chain must have at least one block"
-        );
-        let mut block_executer = BlockExecuter::new();
-
-        for block in &self.blocks {
-            let result = block_executer.execute_block(block, context).await?;
-            if result != BlockResult::Ok {
-                return Ok(result);
-            }
-        }
-
-        Ok(BlockResult::Ok)
+    pub async fn execute(&self, context: &Context) -> Result<CommandResult, String> {
+        let executor = ProcessChainExecutor::new();
+        executor.execute_chain(self, context).await
     }
 }
 
