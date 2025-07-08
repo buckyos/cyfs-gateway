@@ -1,6 +1,10 @@
+use std::sync::Arc;
+
 use super::chain::{ProcessChain, ProcessChainManagerRef, ProcessChainRef};
+use crate::GotoCounter;
 use crate::block::{BlockExecuter, Context};
 use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
+use crate::collection::{CollectionManager, VariableVisitorManager};
 
 pub struct ProcessChainExecutor {}
 
@@ -70,6 +74,8 @@ impl ProcessChainExecutor {
 
                             i = goto_index.unwrap();
 
+                            context.counter().increment()?;
+
                             // TODO: What should the result be in this case?
                             // For now, we just set it to success and continue to the next block
                             chain_result = CommandResult::success();
@@ -94,20 +100,24 @@ impl ProcessChainExecutor {
 
 pub struct ProcessChainsExecutor {
     process_chain_manager: ProcessChainManagerRef,
+    collection_manager: CollectionManager,
+    variable_visitor_manager: VariableVisitorManager,
 }
 
 impl ProcessChainsExecutor {
-    pub fn new(process_chain_manager: ProcessChainManagerRef) -> Self {
+    pub fn new(
+        process_chain_manager: ProcessChainManagerRef,
+        collection_manager: CollectionManager,
+        variable_visitor_manager: VariableVisitorManager,
+    ) -> Self {
         Self {
             process_chain_manager,
+            collection_manager,
+            variable_visitor_manager,
         }
     }
 
-    pub async fn execute_chain(
-        &self,
-        chain_id: &str,
-        context: &Context,
-    ) -> Result<CommandResult, String> {
+    pub async fn execute_chain_by_id(&self, chain_id: &str) -> Result<CommandResult, String> {
         let chain = self.process_chain_manager.get_chain(chain_id);
         if chain.is_none() {
             let msg = format!("Process chain '{}' not found", chain_id);
@@ -116,7 +126,25 @@ impl ProcessChainsExecutor {
         }
 
         let chain = chain.unwrap();
-        self.execute_chain_loop(&chain, context).await
+        self.execute_chain(&chain).await
+    }
+
+    pub async fn execute_chain(&self, chain: &ProcessChainRef) -> Result<CommandResult, String> {
+        let global_env = self.process_chain_manager.get_global_env().clone();
+        let chain_env = self.process_chain_manager.create_chain_env();
+
+        let counter = Arc::new(GotoCounter::new());
+        let context = Context::new(
+            chain.clone(),
+            global_env,
+            chain_env,
+            self.process_chain_manager.clone(),
+            self.collection_manager.clone(),
+            self.variable_visitor_manager.clone(),
+            counter,
+        );
+
+        self.execute_chain_loop(chain, &context).await
     }
 
     #[async_recursion::async_recursion]
@@ -138,6 +166,9 @@ impl ProcessChainsExecutor {
                     warn!("{}", msg);
                     return Err(msg);
                 }
+
+                context.counter().increment()?;
+
                 let chain = chain.unwrap();
                 let context = context.fork_chain(chain.clone());
                 return self.execute_chain_inner(&chain, &context).await;
@@ -180,11 +211,13 @@ impl ProcessChainsExecutor {
                         return Err(msg);
                     }
 
+                    context.counter().increment()?;
+
                     let target = target.unwrap();
                     info!("Goto process chain '{}'", target_chain_id);
                     target_context = Some(context.fork_chain(target.clone()));
                     target_chain = Some(target);
-                    
+
                     continue;
                 } else {
                     break Ok(ret);
