@@ -56,23 +56,24 @@ impl AssignCommand {
 #[async_trait::async_trait]
 impl CommandExecutor for AssignCommand {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let env_level = match self.kind {
+            AssignKind::Block => EnvLevel::Block,
+            AssignKind::Chain => EnvLevel::Chain,
+            AssignKind::Global => EnvLevel::Global,
+        };
+
         match self.value {
             Some(ref value) => {
                 // Handle assignment with value
-                let env_level = match self.kind {
-                    AssignKind::Block => EnvLevel::Block,
-                    AssignKind::Chain => EnvLevel::Chain,
-                    AssignKind::Global => EnvLevel::Global,
-                };
-
-                // Set the value in the context
-                context.set_env_value(self.key.as_str(), value, Some(env_level)).await?;
+                context
+                    .set_env_value(self.key.as_str(), value, Some(env_level))
+                    .await?;
 
                 Ok(CommandResult::success_with_value(value))
             }
             None => {
-                // Handle assignment without value
-                todo!("Assign command without value not implemented yet");
+                // Handle assignment without value, which will change the variable scope
+                context.env().change_var_level(self.key.as_str(), Some(env_level));
                 Ok(CommandResult::success())
             }
         }

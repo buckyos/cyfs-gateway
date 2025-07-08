@@ -101,6 +101,9 @@ pub struct EnvManager {
     global: EnvRef,
     chain: EnvRef,
     block: EnvRef,
+
+    // Tracking variables current level
+    var_level_tracker: Arc<RwLock<HashMap<String, EnvLevel>>>, 
 }
 
 impl EnvManager {
@@ -115,13 +118,82 @@ impl EnvManager {
         );
 
         let block = Arc::new(Env::new(EnvLevel::Block, Some(chain_env.clone())));
+        let var_level_tracker = Arc::new(RwLock::new(HashMap::new()));
 
         Self {
             global: global_env,
             chain: chain_env,
             block,
+            var_level_tracker,
         }
     }
+
+    fn get_env(&self, level: EnvLevel) -> &EnvRef {
+        match level {
+            EnvLevel::Global => &self.global,
+            EnvLevel::Chain => &self.chain,
+            EnvLevel::Block => &self.block,
+        }
+    }
+
+    pub fn get_var_level(&self, key: &str) -> EnvLevel {
+        let tracker = self.var_level_tracker.read().unwrap();
+        tracker.get(key).cloned().unwrap_or_default()
+    }
+
+    pub fn change_var_level(&self, key: &str, level: Option<EnvLevel>) {
+        let level = level.unwrap_or_default();
+        let mut tracker = self.var_level_tracker.write().unwrap();
+        match tracker.entry(key.to_string()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get() != &level {
+                    info!(
+                        "Variable '{}' level changed from '{}' to '{}'",
+                        key,
+                        entry.get().as_str(),
+                        level.as_str()
+                    );
+                    entry.insert(level);
+                } else {
+                    debug!("Variable '{}' already at level '{}'", key, level.as_str());
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                if level != EnvLevel::default() {
+                    entry.insert(level);
+                    info!(
+                        "Variable '{}' set to level '{}'",
+                        key,
+                        level.as_str()
+                    );
+                }
+            }
+        }
+    }
+
+    /*
+    // FIXME: Should we allow moving variables between levels? or just track their level?
+    fn move_var_level(&self, key: &str, from: EnvLevel, to: EnvLevel) {
+        let from_env = self.get_env(from);
+        let value = from_env.delete(key);
+        if let Some(value) = value {
+            let to_end = self.get_env(to);
+            if let Some(prev) = to_end.set(key, &value) {
+                info!(
+                    "Moved variable '{}' from '{}' to '{}', replaced value: {}",
+                    key, from.as_str(), to.as_str(), prev
+                );
+            } else {
+                info!("Moved variable '{}' from '{}' to '{}'", key, from.as_str(), to.as_str());
+            }
+        } else {
+            warn!(
+                "Variable '{}' not found in '{}' environment, cannot move to '{}'",
+                key, from.as_str(), to.as_str()
+            );
+        }
+    }
+    */
 
     pub fn get_global(&self) -> &EnvRef {
         &self.global
@@ -138,7 +210,10 @@ impl EnvManager {
     // Set a value in the environment, level can be specified or default to chain level
     pub fn set(&self, key: &str, value: &str, level: Option<EnvLevel>) -> Option<String> {
         let level = level.unwrap_or_default();
-        self.set_inner(level, key, value)
+        let ret = self.set_inner(level, key, value);
+        self.change_var_level(key, Some(level));
+
+        ret
     }
 
     fn set_inner(&self, level: EnvLevel, key: &str, value: &str) -> Option<String> {
@@ -150,7 +225,10 @@ impl EnvManager {
     }
 
     pub fn get(&self, key: &str, level: Option<EnvLevel>) -> Option<String> {
-        let level = level.unwrap_or_default();
+        let level = match level {
+            Some(l) => l,
+            None => self.get_var_level(key),
+        };
 
         self.get_inner(level, key)
     }
@@ -164,7 +242,10 @@ impl EnvManager {
     }
 
     pub fn delete(&self, key: &str, level: Option<EnvLevel>) -> Option<String> {
-        let level = level.unwrap_or_default();
+        let level = match level {
+            Some(l) => l,
+            None => self.get_var_level(key),
+        };
 
         self.delete_inner(level, key)
     }
