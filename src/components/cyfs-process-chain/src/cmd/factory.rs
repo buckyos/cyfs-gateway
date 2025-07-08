@@ -8,6 +8,7 @@ use super::sni::HttpSniProbeCommandParser;
 use super::string::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use super::control::*;
 
 #[derive(Clone)]
 pub struct CommandParserFactory {
@@ -34,6 +35,10 @@ impl CommandParserFactory {
     }
 
     pub fn init(&self) {
+        // control command
+        self.register("goto", Arc::new(Box::new(GotoCommandParser::new())));
+        self.register("exec", Arc::new(Box::new(ExecCommandParser::new())));
+
         // action command
         let drop_action_parser = ActionCommandParser::new(CommandAction::Drop);
         self.register("drop", Arc::new(Box::new(drop_action_parser)));

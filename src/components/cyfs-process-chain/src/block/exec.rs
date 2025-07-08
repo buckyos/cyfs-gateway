@@ -143,10 +143,6 @@ impl BlockExecuter {
                 }
                 Ok(result)
             }
-            Expression::Goto(target) => {
-                todo!("Goto expression not implemented yet");
-                // Ok(CommandResult::goto(target.clone()))
-            }
         }
     }
 

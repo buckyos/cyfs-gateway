@@ -248,7 +248,6 @@ impl AssignExpression {
 pub enum Expression {
     Command(CommandItem),
     Group(Vec<(Option<Operator>, Expression, Option<Operator>)>), // Sub-expression in brackets
-    Goto(CommandArg),                   // Goto label
 }
 
 impl Expression {
@@ -271,18 +270,6 @@ impl Expression {
     pub fn as_group(&self) -> Option<&Vec<(Option<Operator>, Expression, Option<Operator>)>> {
         if let Expression::Group(group) = self {
             Some(group)
-        } else {
-            None
-        }
-    }
-
-    pub fn is_goto(&self) -> bool {
-        matches!(self, Expression::Goto(_))
-    }
-
-    pub fn as_goto(&self) -> Option<&CommandArg> {
-        if let Expression::Goto(target) = self {
-            Some(target)
         } else {
             None
         }

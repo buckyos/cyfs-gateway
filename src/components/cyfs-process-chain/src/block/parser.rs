@@ -280,14 +280,10 @@ impl BlockParser {
             )));
         } else {
             if let Some(name) = args[0].as_literal_str() {
-                if name.to_ascii_lowercase() == "goto" && args.len() > 1 {
-                    Expression::Goto(args[1].clone())
-                } else {
-                    Expression::Command(CommandItem::new(
-                        name.to_owned(),
-                        CommandArgs::new(args[1..].to_vec()),
-                    ))
-                }
+                Expression::Command(CommandItem::new(
+                    name.to_owned(),
+                    CommandArgs::new(args[1..].to_vec()),
+                ))
             } else {
                 let msg = format!("Command name must be a literal string, got: {:?}", args[0]);
                 error!("{}", msg);

@@ -1,9 +1,8 @@
-use super::chain::ProcessChain;
-use crate::block::{Context, BlockExecuter};
-use crate::cmd::{CommandResult, CommandControl, CommandControlLevel};
+use super::chain::{ProcessChain, ProcessChainManagerRef, ProcessChainRef};
+use crate::block::{BlockExecuter, Context};
+use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
 
-pub struct ProcessChainExecutor {
-}
+pub struct ProcessChainExecutor {}
 
 impl ProcessChainExecutor {
     pub fn new() -> Self {
@@ -24,7 +23,6 @@ impl ProcessChainExecutor {
             return Ok(CommandResult::success());
         }
 
-        
         let mut chain_result = CommandResult::success();
 
         let mut i = 0;
@@ -53,12 +51,19 @@ impl ProcessChainExecutor {
                         break;
                     }
                     CommandControl::Goto((level, target)) => {
-                        info!("Goto action in block '{}': level={:?}, target={}", block.id, level, target);
+                        info!(
+                            "Goto action in block '{}': level={:?}, target={}",
+                            block.id, level, target
+                        );
                         if *level == CommandControlLevel::Block {
                             // If it's a block-level goto, we can continue to the target block
                             let goto_index = chain.get_block_index(&target);
                             if goto_index.is_none() {
-                                let msg = format!("Goto target block '{}' not found in chain '{}'", target, chain.id());
+                                let msg = format!(
+                                    "Goto target block '{}' not found in chain '{}'",
+                                    target,
+                                    chain.id()
+                                );
                                 warn!("{}", msg);
                                 return Err(msg);
                             }
@@ -68,7 +73,7 @@ impl ProcessChainExecutor {
                             // TODO: What should the result be in this case?
                             // For now, we just set it to success and continue to the next block
                             chain_result = CommandResult::success();
-                            
+
                             continue;
                         } else if *level == CommandControlLevel::Chain {
                             // If it's a chain-level goto, we exit the chain execution
@@ -84,5 +89,109 @@ impl ProcessChainExecutor {
         }
 
         Ok(chain_result)
+    }
+}
+
+pub struct ProcessChainsExecutor {
+    process_chain_manager: ProcessChainManagerRef,
+}
+
+impl ProcessChainsExecutor {
+    pub fn new(process_chain_manager: ProcessChainManagerRef) -> Self {
+        Self {
+            process_chain_manager,
+        }
+    }
+
+    pub async fn execute_chain(
+        &self,
+        chain_id: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let chain = self.process_chain_manager.get_chain(chain_id);
+        if chain.is_none() {
+            let msg = format!("Process chain '{}' not found", chain_id);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let chain = chain.unwrap();
+        self.execute_chain_loop(&chain, context).await
+    }
+
+    #[async_recursion::async_recursion]
+    async fn execute_chain_inner(
+        &self,
+        chain: &ProcessChainRef,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let ret = chain.execute(context).await?;
+        if ret.is_control() {
+            info!("Chain execution result is a control action: {:?}", ret);
+            let control = ret.as_control().unwrap();
+            if control.is_goto_chain() {
+                let target_chain_id = control.as_goto_chain().unwrap();
+
+                let chain = self.process_chain_manager.get_chain(target_chain_id);
+                if chain.is_none() {
+                    let msg = format!("Goto process chain '{}' not found", target_chain_id);
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+                let chain = chain.unwrap();
+                let context = context.fork_chain(chain.clone());
+                return self.execute_chain_inner(&chain, &context).await;
+            }
+        }
+
+        Ok(ret)
+    }
+
+    async fn execute_chain_loop(
+        &self,
+        chain: &ProcessChainRef,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let mut target_chain = None;
+        let mut target_context = None;
+        loop {
+            let chain = if let Some(c) = target_chain.as_ref() {
+                c
+            } else {
+                chain
+            };
+
+            let context = if let Some(c) = target_context.as_ref() {
+                c
+            } else {
+                context
+            };
+
+            let ret = chain.execute(context).await?;
+            if ret.is_control() {
+                let control = ret.as_control().unwrap();
+                if control.is_goto_chain() {
+                    let target_chain_id = control.as_goto_chain().unwrap();
+
+                    let target = self.process_chain_manager.get_chain(target_chain_id);
+                    if target.is_none() {
+                        let msg = format!("Goto process chain '{}' not found", target_chain_id);
+                        warn!("{}", msg);
+                        return Err(msg);
+                    }
+
+                    let target = target.unwrap();
+                    info!("Goto process chain '{}'", target_chain_id);
+                    target_context = Some(context.fork_chain(target.clone()));
+                    target_chain = Some(target);
+                    
+                    continue;
+                } else {
+                    break Ok(ret);
+                }
+            } else {
+                break Ok(ret);
+            }
+        }
     }
 }

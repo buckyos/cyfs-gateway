@@ -52,6 +52,43 @@ pub enum CommandControl {
     Goto((CommandControlLevel, String)), // Goto a specific block or chain
 }
 
+impl CommandControl {
+    pub fn is_goto_block(&self) -> bool {
+        matches!(self, CommandControl::Goto((CommandControlLevel::Block, _)))
+    }
+
+    pub fn as_goto_block(&self) -> Option<&str> {
+        if let CommandControl::Goto((CommandControlLevel::Block, block_id)) = self {
+            Some(block_id)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_goto_chain(&self) -> bool {
+        matches!(self, CommandControl::Goto((CommandControlLevel::Chain, _)))
+    }
+
+    pub fn as_goto_chain(&self) -> Option<&str> {
+        if let CommandControl::Goto((CommandControlLevel::Chain, chain_id)) = self {
+            Some(chain_id)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_return(&self) -> bool {
+        matches!(self, CommandControl::Return(_))
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self, CommandControl::Error(_))
+    }
+
+    pub fn is_exit(&self) -> bool {
+        matches!(self, CommandControl::Exit(_))
+    }
+}
 #[derive(Debug, Clone)]
 pub enum CommandResult {
     Success(String),

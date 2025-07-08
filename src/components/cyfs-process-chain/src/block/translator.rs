@@ -39,9 +39,6 @@ impl BlockCommandTranslator {
                     self.translate_expression(sub_expr)?;
                 }
             }
-            Expression::Goto(_) => {
-                // Goto does not need translation
-            }
         }
 
         Ok(())
