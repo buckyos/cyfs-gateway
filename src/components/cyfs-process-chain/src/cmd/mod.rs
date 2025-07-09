@@ -9,6 +9,7 @@ mod factory;
 mod match_;
 //mod sni;
 mod string;
+mod echo;
 
 pub use cmd::*;
 pub use factory::*;

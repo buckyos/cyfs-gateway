@@ -1,9 +1,10 @@
-use super::context::Context;
 use super::chain::{ProcessChain, ProcessChainManagerRef, ProcessChainRef};
+use super::context::Context;
 use crate::GotoCounter;
 use crate::block::BlockExecuter;
 use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
 use crate::collection::{CollectionManager, VariableVisitorManager};
+use crate::pipe::CommandPipe;
 use std::sync::Arc;
 
 pub struct ProcessChainExecutor {}
@@ -102,6 +103,7 @@ pub struct ProcessChainsExecutor {
     process_chain_manager: ProcessChainManagerRef,
     collection_manager: CollectionManager,
     variable_visitor_manager: VariableVisitorManager,
+    pipe: CommandPipe,
 }
 
 impl ProcessChainsExecutor {
@@ -109,11 +111,13 @@ impl ProcessChainsExecutor {
         process_chain_manager: ProcessChainManagerRef,
         collection_manager: CollectionManager,
         variable_visitor_manager: VariableVisitorManager,
+        pipe: CommandPipe,
     ) -> Self {
         Self {
             process_chain_manager,
             collection_manager,
             variable_visitor_manager,
+            pipe,
         }
     }
 
@@ -142,6 +146,7 @@ impl ProcessChainsExecutor {
             self.collection_manager.clone(),
             self.variable_visitor_manager.clone(),
             counter,
+            self.pipe.clone(),
         );
 
         self.execute_chain_loop(chain, &context).await

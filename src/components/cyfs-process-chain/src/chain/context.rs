@@ -2,6 +2,7 @@ use crate::chain::{EnvLevel, EnvManager, EnvRef, ProcessChainManagerRef, Process
 use crate::collection::{CollectionManager, VariableVisitorManager};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use crate::pipe::CommandPipe;
 
 pub const MAX_GOTO_COUNT: u32 = 128; // Maximum number of times the goto command can be executed in process chains execution
 
@@ -45,6 +46,7 @@ pub struct Context {
     collection_manager: CollectionManager,
     variable_visitor_manager: VariableVisitorManager,
     goto_counter: GotoCounterRef, // Counter for goto command executions
+    pipe: CommandPipe, // Pipe for command execution
 }
 
 impl Context {
@@ -56,6 +58,7 @@ impl Context {
         collection_manager: CollectionManager,
         variable_visitor_manager: VariableVisitorManager,
         goto_counter: GotoCounterRef,
+        pipe: CommandPipe,
     ) -> Self {
         let env_manager = EnvManager::new(global_env, chain_env);
 
@@ -66,6 +69,7 @@ impl Context {
             collection_manager,
             variable_visitor_manager,
             goto_counter,
+            pipe,
         }
     }
 
@@ -83,6 +87,10 @@ impl Context {
 
     pub fn counter(&self) -> &GotoCounterRef {
         &self.goto_counter
+    }
+
+    pub fn pipe(&self) -> &CommandPipe {
+        &self.pipe
     }
     
     pub async fn get_env_value(&self, key: &str) -> Result<Option<String>, String> {
@@ -134,6 +142,7 @@ impl Context {
             self.collection_manager.clone(),
             self.variable_visitor_manager.clone(),
             self.goto_counter.clone(),  // Use the same goto counter for the chain context
+            self.pipe.clone(),
         )
     }
 
@@ -147,6 +156,7 @@ impl Context {
             self.collection_manager.clone(),
             self.variable_visitor_manager.clone(),
             self.goto_counter.clone(), // Use the same goto counter for the block context
+            self.pipe.clone(),
         )
     }
 }
