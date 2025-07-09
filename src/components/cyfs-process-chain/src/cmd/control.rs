@@ -1,5 +1,6 @@
 use super::cmd::*;
-use crate::block::{BlockExecuter, CommandArgs, Context};
+use crate::block::{BlockExecuter, CommandArgs};
+use crate::chain::Context;
 use std::sync::Arc;
 
 // exec command, like: EXEC block1

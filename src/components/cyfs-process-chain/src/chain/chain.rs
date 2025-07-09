@@ -1,7 +1,8 @@
+use super::context::Context;
 use super::env::{Env, EnvLevel, EnvRef};
 use super::exec::ProcessChainExecutor;
 use crate::block::*;
-use crate::cmd::{CommandResult, COMMAND_PARSER_FACTORY};
+use crate::cmd::{COMMAND_PARSER_FACTORY, CommandResult};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -53,7 +54,7 @@ impl ProcessChain {
         for block in &mut self.blocks {
             translator.translate(block).await?;
         }
-        
+
         Ok(())
     }
 

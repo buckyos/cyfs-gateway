@@ -1,5 +1,6 @@
 use super::cmd::*;
-use crate::block::{Context, CommandArgs};
+use crate::block::CommandArgs;
+use crate::chain::Context;
 use std::sync::Arc;
 
 // some action commands, DROP/ACCEPT/REJECT

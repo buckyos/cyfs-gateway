@@ -424,6 +424,7 @@ impl BlockParser {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
 

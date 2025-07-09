@@ -1,5 +1,6 @@
 use super::cmd::*;
-use crate::block::{CommandArgs, Context};
+use crate::block::CommandArgs;
+use crate::chain::Context;
 use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
 use std::sync::Arc;

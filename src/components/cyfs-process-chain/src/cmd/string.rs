@@ -1,5 +1,6 @@
 use super::cmd::{CommandExecutor, CommandExecutorRef, CommandParser, CommandResult};
-use crate::block::{CommandArgs, Context};
+use crate::block::CommandArgs;
+use crate::chain::Context;
 use globset::{GlobBuilder, GlobMatcher};
 use std::sync::Arc;
 

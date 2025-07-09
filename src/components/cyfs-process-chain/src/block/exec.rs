@@ -1,6 +1,6 @@
 use super::block::{Block, CommandItem, Expression, Line, Operator, Statement};
 use super::block::{CommandArg, CommandArgs};
-use super::context::Context;
+use crate::chain::Context;
 use crate::cmd::CommandResult;
 use crate::cmd::{CommandExecutor, CommandParser};
 use std::sync::Arc;
@@ -42,7 +42,10 @@ impl BlockExecuter {
                 self.block_id, current_line, line
             );
             let line_result = Self::execute_line(line, context).await?;
-            info!("Line {} executed: {}, {:?}", current_line, line.source, line_result);
+            info!(
+                "Line {} executed: {}, {:?}",
+                current_line, line.source, line_result
+            );
 
             if line_result.is_control() {
                 // If the line result is a control action, we handle it immediately
@@ -181,7 +184,10 @@ impl CommandExecutor for DynamicCommandExecutor {
                         resolved_args.push(value.clone());
                     } else {
                         // If variable is not found, push an empty string
-                        warn!("Variable '{}' not found in context, using empty string", var);
+                        warn!(
+                            "Variable '{}' not found in context, using empty string",
+                            var
+                        );
                         resolved_args.push("".to_string());
                     }
                 }

@@ -1,5 +1,6 @@
 use super::cmd::*;
-use crate::block::{Context, BlockType};
+use crate::block::BlockType;
+use crate::chain::Context;
 use std::sync::Arc;
 
 // CMD: set_label_by_host_db REQ_HEADER.host
@@ -13,7 +14,7 @@ impl SetLabelByHostDbCommandParser {
 
 impl CommandParser for SetLabelByHostDbCommandParser {
     fn check(&self, _block_type: BlockType) -> bool {
-       true
+        true
     }
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
@@ -49,7 +50,6 @@ impl SetLabelByHostDbCommandExecutor {
     }
 }
 
-
 #[async_trait::async_trait]
 impl CommandExecutor for SetLabelByHostDbCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
@@ -66,9 +66,7 @@ impl CommandExecutor for SetLabelByHostDbCommandExecutor {
 }
 
 // CMD: have_label REQ_HEADER.label "xxx"
-pub struct HaveLabelCommandParser {
-
-}
+pub struct HaveLabelCommandParser {}
 
 impl HaveLabelCommandParser {
     pub fn new() -> Self {
@@ -101,13 +99,9 @@ pub struct HaveLabelCommandExecutor {
 
 impl HaveLabelCommandExecutor {
     pub fn new(key: String, label: String) -> Self {
-        HaveLabelCommandExecutor {
-            key,
-            label,
-        }
+        HaveLabelCommandExecutor { key, label }
     }
 }
-
 
 #[async_trait::async_trait]
 impl CommandExecutor for HaveLabelCommandExecutor {

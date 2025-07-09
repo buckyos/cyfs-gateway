@@ -1,5 +1,6 @@
 use super::cmd::*;
-use crate::block::{Context, BlockType};
+use crate::block::BlockType;
+use crate::chain::Context;
 use std::sync::Arc;
 
 // http-sni-probe command parser
