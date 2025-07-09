@@ -19,8 +19,11 @@ const PROCESS_CHAIN: &str = r#"
         map_add test key2 $key2;
     </block>
     <block id="block2">
-        match_include test key1;
-        match_include test key2;
+        <![CDATA[
+            match_include key3 test && accept;
+            match_include key1 test && exit drop;
+            match_include key2 test;
+        ]]>
     </block>
 </process_chain>
 

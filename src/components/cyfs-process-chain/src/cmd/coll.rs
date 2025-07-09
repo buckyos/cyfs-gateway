@@ -59,6 +59,10 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
             .is_include_key(&self.collection_id, &self.key)
             .await?;
 
+        info!(
+            "MatchInclude command: key='{}', collection_id='{}', contains={}",
+            self.key, self.collection_id, contains
+        );
         if contains {
             Ok(CommandResult::success())
         } else {

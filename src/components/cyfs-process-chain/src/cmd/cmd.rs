@@ -118,15 +118,27 @@ impl CommandResult {
         Self::Control(action)
     }
 
-    pub fn return_to_block(value: impl Into<String>) -> Self {
+    pub fn return_to_block() -> Self {
+        Self::Control(CommandControl::Return("".to_string()))
+    }
+
+    pub fn return_to_block_with_value(value: impl Into<String>) -> Self {
         Self::Control(CommandControl::Return(value.into()))
     }
 
-    pub fn error_to_block(value: impl Into<String>) -> Self {
+    pub fn error_to_block() -> Self {
+        Self::Control(CommandControl::Error("".to_string()))
+    }
+
+    pub fn error_to_block_with_value(value: impl Into<String>) -> Self {
         Self::Control(CommandControl::Error(value.into()))
     }
 
-    pub fn exit_chain(value: impl Into<String>) -> Self {
+    pub fn exit_chain() -> Self {
+        Self::Control(CommandControl::Exit("".to_string()))
+    }
+
+    pub fn exit_chain_with_value(value: impl Into<String>) -> Self {
         Self::Control(CommandControl::Exit(value.into()))
     }
 
@@ -146,17 +158,17 @@ impl CommandResult {
 
     // drop is same as exit drop
     pub fn drop() -> Self {
-        Self::exit_chain(CommandAction::Drop.as_str())
+        Self::exit_chain_with_value(CommandAction::Drop.as_str())
     }
 
     // Accept is same as exit success
     pub fn accept() -> Self {
-        Self::exit_chain(CommandAction::Accept.as_str())
+        Self::exit_chain_with_value(CommandAction::Accept.as_str())
     }
 
     // Reject is same as exit reject
     pub fn reject() -> Self {
-        Self::exit_chain(CommandAction::Reject.as_str())
+        Self::exit_chain_with_value(CommandAction::Reject.as_str())
     }
 
     // ret = !ret, but  is action, then will return error

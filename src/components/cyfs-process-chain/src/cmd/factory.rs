@@ -36,13 +36,16 @@ impl CommandParserFactory {
         // control command
         self.register("goto", Arc::new(Box::new(GotoCommandParser::new())));
         self.register("exec", Arc::new(Box::new(ExecCommandParser::new())));
+        self.register("return", Arc::new(Box::new(ReturnCommandParser::new())));
+        self.register("error", Arc::new(Box::new(ErrorCommandParser::new())));
+        self.register("exit", Arc::new(Box::new(ExitCommandParser::new())));
 
         // action command
         let drop_action_parser = ActionCommandParser::new(CommandAction::Drop);
         self.register("drop", Arc::new(Box::new(drop_action_parser)));
 
         let accept_action = ActionCommandParser::new(CommandAction::Accept);
-        self.register("pass", Arc::new(Box::new(accept_action)));
+        self.register("accept", Arc::new(Box::new(accept_action)));
 
         let reject_action = ActionCommandParser::new(CommandAction::Reject);
         self.register("reject", Arc::new(Box::new(reject_action)));

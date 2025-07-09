@@ -37,7 +37,7 @@ impl BlockExecuter {
         let mut result = CommandResult::success();
         while current_line < block.lines.len() {
             let line = &block.lines[current_line];
-            println!(
+            info!(
                 "Executing line {}:{}: {:?}",
                 self.block_id, current_line, line
             );
@@ -82,7 +82,7 @@ impl BlockExecuter {
         let mut result = CommandResult::success();
 
         for (prefix_op, expr, post_op) in &statement.expressions {
-            println!("Executing expression: {:?}", expr);
+            debug!("Executing expression: {:?}", expr);
             result = Self::execute_expression(expr, context).await?;
 
             result = match prefix_op {
@@ -150,6 +150,7 @@ impl BlockExecuter {
         cmd: &CommandItem,
         context: &Context,
     ) -> Result<CommandResult, String> {
+        debug!("Executing command: {:?}", cmd);
         let exec = cmd.executor.as_ref().unwrap();
         exec.exec(context).await
     }
