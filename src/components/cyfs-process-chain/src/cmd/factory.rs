@@ -58,7 +58,7 @@ impl CommandParserFactory {
         // string command
         self.register("rewrite", Arc::new(Box::new(RewriteCommandParser::new())));
         self.register(
-            "rewrite_reg",
+            "rewrite-reg",
             Arc::new(Box::new(RewriteRegexCommandParser::new())),
         );
 
@@ -76,34 +76,34 @@ impl CommandParserFactory {
             Arc::new(Box::new(StringLengthCommandParser::new())),
         );
         self.register(
-            "starts_with",
+            "starts-with",
             Arc::new(Box::new(StringStartsWithCommandParser)),
         );
         self.register("ends_with", Arc::new(Box::new(StringEndsWithCommandParser)));
 
         // collection commands
         self.register(
-            "match_include",
+            "match-include",
             Arc::new(Box::new(MatchIncludeCommandParser::new())),
         );
 
         self.register(
-            "set_create",
+            "set-create",
             Arc::new(Box::new(SetCreateCommandParser::new())),
         );
-        self.register("set_add", Arc::new(Box::new(SetAddCommandParser::new())));
+        self.register("set-add", Arc::new(Box::new(SetAddCommandParser::new())));
         self.register(
             "set_remove",
             Arc::new(Box::new(SetRemoveCommandParser::new())),
         );
 
         self.register(
-            "map_create",
+            "map-create",
             Arc::new(Box::new(MapCreateCommandParser::new())),
         );
-        self.register("map_add", Arc::new(Box::new(MapAddCommandParser::new())));
+        self.register("map-add", Arc::new(Box::new(MapAddCommandParser::new())));
         self.register(
-            "map_remove",
+            "map-remove",
             Arc::new(Box::new(MapRemoveCommandParser::new())),
         );
     }

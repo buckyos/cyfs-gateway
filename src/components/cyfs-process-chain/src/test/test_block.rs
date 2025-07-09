@@ -9,29 +9,29 @@ const PROCESS_CHAIN: &str = r#"
         export key1=$(append $key1 '2');
         local key1
         export key2=$(append ${key1} _value2);
-        # key2 shoule be "key1_value2"
+        # key2 should be "key1_value2"
         export key1;
         export key3=$(append ${key1} _value2);
         # key3 should be "key12_value2"
 
-        map_create test;
-        map_add test key1 value1;
-        map_add test key2 $key2;
+        map-create test;
+        map-add test key1 value1;
+        map-add test key2 $key2;
     </block>
     <block id="block2">
         <![CDATA[
-            match_include key3 test && accept;
-            match_include key1 test && exit drop;
-            match_include key2 test;
+            match-include key3 test && accept;
+            match-include key1 test && exit drop;
+            match-include key2 test;
         ]]>
     </block>
 </process_chain>
 
 <process_chain id="chain2">
     <block id="block1">
-        map_create test;
-        map_add test key1 value1;
-        map_add test key2 value2;
+        map-create test;
+        map-add test key1 value1;
+        map-add test key2 value2;
     </block>
 </process_chain>
 </root>

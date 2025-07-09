@@ -266,32 +266,40 @@ impl BlockParser {
     // Parse command
     fn parse_command(input: &str) -> IResult<&str, Expression> {
         debug!("Parsing command: {}", input);
+
+        // First parse command name
+        let (input, _) = space0(input)?;
+        let (input, cmd_name) = Self::parse_command_literal(input)?;
+
         let (input, args) =
             separated_list0(space1, preceded(space0, Self::parse_arg)).parse(input)?;
         debug!("Parsed command args: {}, {:?}", input, args);
 
-        let cmd = if args.is_empty() {
+        let cmd = if let Some(name) = cmd_name.as_literal_str() {
+            Expression::Command(CommandItem::new(name.to_owned(), CommandArgs::new(args)))
+        } else {
+            let msg = format!("Command name must be a literal string, got: {:?}", args[0]);
+            error!("{}", msg);
             return Err(nom::Err::Error(nom::error::Error::from_error_kind(
                 input,
                 ErrorKind::Tag,
             )));
-        } else {
-            if let Some(name) = args[0].as_literal_str() {
-                Expression::Command(CommandItem::new(
-                    name.to_owned(),
-                    CommandArgs::new(args[1..].to_vec()),
-                ))
-            } else {
-                let msg = format!("Command name must be a literal string, got: {:?}", args[0]);
-                error!("{}", msg);
-                return Err(nom::Err::Error(nom::error::Error::from_error_kind(
-                    input,
-                    ErrorKind::Tag,
-                )));
-            }
         };
 
         Ok((input, cmd))
+    }
+
+    fn is_command_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/'
+    }
+
+    /// Parse command literal, which can be a command name or a path
+    /// This is used for command names like `ls`, `my-command`, `python3`, `./script`
+    fn parse_command_literal(input: &str) -> IResult<&str, CommandArg> {
+        map(complete(take_while1(Self::is_command_char)), |s: &str| {
+            CommandArg::Literal(s.to_string())
+        })
+        .parse(input)
     }
 
     fn parse_literal(input: &str) -> IResult<&str, CommandArg> {
