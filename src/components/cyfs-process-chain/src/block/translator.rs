@@ -57,6 +57,13 @@ impl BlockCommandTranslator {
 
         let parser = parser.unwrap();
 
+        // First check if the command is valid
+        if let Err(e) = parser.check(&cmd.command.args) {
+            let msg = format!("Invalid command: {:?} {}", cmd.command, e);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
         // Try parse args to executor
         let executer = if cmd.command.args.is_literal() {
             let args = cmd.command.args.as_literal_list();

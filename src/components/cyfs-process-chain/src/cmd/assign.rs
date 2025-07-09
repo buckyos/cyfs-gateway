@@ -1,5 +1,5 @@
 use super::cmd::*;
-use crate::block::{AssignKind, BlockType, Context};
+use crate::block::{AssignKind, CommandArgs, Context};
 use crate::chain::EnvLevel;
 use std::sync::Arc;
 
@@ -12,17 +12,33 @@ impl AssignCommandParser {
 }
 
 impl CommandParser for AssignCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    // export KEY=VALUE or export KEY
+    // The first param is the kind of assignment, which can be "block", "chain" or "global"
+    // The second param is the key, and the third param is the value (optional)
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args must not be empty
-        if args.len() < 2 {
+        if args.is_empty() {
+            let msg = "Invalid assign command: args cannot be empty".to_string();
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        // Expect a single argument in the form of KEY=VALUE
+        if args.len() < 2 || args.len() > 3 {
             let msg = format!("Invalid assign command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        // Args must not be checked before calling parse
+        assert!(
+            args.len() >= 2 && args.len() <= 3,
+            "Assign command should have 2 or 3 args"
+        );
 
         // Expect a single argument in the form of KEY=VALUE
         let kind = args[0];
@@ -73,7 +89,9 @@ impl CommandExecutor for AssignCommand {
             }
             None => {
                 // Handle assignment without value, which will change the variable scope
-                context.env().change_var_level(self.key.as_str(), Some(env_level));
+                context
+                    .env()
+                    .change_var_level(self.key.as_str(), Some(env_level));
                 Ok(CommandResult::success())
             }
         }

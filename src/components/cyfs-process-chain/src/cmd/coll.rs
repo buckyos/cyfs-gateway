@@ -1,5 +1,5 @@
 use super::cmd::{CommandExecutor, CommandExecutorRef, CommandParser, CommandResult};
-use crate::block::{BlockType, Context};
+use crate::block::{CommandArgs, Context};
 use std::sync::Arc;
 
 // match_include <var> <collection_id>
@@ -13,24 +13,22 @@ impl MatchIncludeCommandParser {
 }
 
 impl CommandParser for MatchIncludeCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        // Args should not be empty
-        if args.is_empty() {
-            let msg = format!("Invalid match_include command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should have exactly two elements
         if args.len() != 2 {
             let msg = format!("Invalid match_include command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(
+            args.len() == 2,
+            "MatchInclude command should have exactly 2 args"
+        );
 
         let cmd = MatchIncludeCommandExecutor::new(args[0], args[1]);
         Ok(Arc::new(Box::new(cmd)))
@@ -80,24 +78,22 @@ impl SetCreateCommandParser {
 }
 
 impl CommandParser for SetCreateCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        // Args should not be empty
-        if args.is_empty() {
-            let msg = format!("Invalid set_create command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should have exactly one element
         if args.len() != 1 {
             let msg = format!("Invalid set_create command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(
+            args.len() == 1,
+            "SetCreate command should have exactly 1 arg"
+        );
 
         let cmd = SetCreateCommandExecutor::new(args[0]);
         Ok(Arc::new(Box::new(cmd)))
@@ -155,24 +151,19 @@ impl SetAddCommandParser {
 }
 
 impl CommandParser for SetAddCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        // Args should not be empty
-        if args.is_empty() {
-            let msg = format!("Invalid set_add command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should have exactly two elements
         if args.len() != 2 {
             let msg = format!("Invalid set_add command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(args.len() == 2, "SetAdd command should have exactly 2 args");
 
         let cmd = SetAddCommandExecutor::new(args[0], args[1]);
         Ok(Arc::new(Box::new(cmd)))
@@ -242,24 +233,22 @@ impl SetRemoveCommandParser {
 }
 
 impl CommandParser for SetRemoveCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        // Args should not be empty
-        if args.is_empty() {
-            let msg = format!("Invalid set_remove command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should have exactly two elements
         if args.len() != 2 {
             let msg = format!("Invalid set_remove command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(
+            args.len() == 2,
+            "SetRemove command should have exactly 2 args"
+        );
 
         let cmd = SetRemoveCommandExecutor::new(args[0], args[1]);
         Ok(Arc::new(Box::new(cmd)))
@@ -328,24 +317,22 @@ impl MapCreateCommandParser {
 }
 
 impl CommandParser for MapCreateCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        // Args should not be empty
-        if args.is_empty() {
-            let msg = format!("Invalid map_create command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should have exactly one element
         if args.len() != 1 {
             let msg = format!("Invalid map_create command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(
+            args.len() == 1,
+            "MapCreate command should have exactly 1 arg"
+        );
 
         let cmd = MapCreateCommandExecutor::new(args[0]);
         Ok(Arc::new(Box::new(cmd)))
@@ -403,24 +390,19 @@ impl MapAddCommandParser {
 }
 
 impl CommandParser for MapAddCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        // Args should not be empty
-        if args.is_empty() {
-            let msg = format!("Invalid map_add command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should have exactly three elements
         if args.len() != 3 {
             let msg = format!("Invalid map_add command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(args.len() == 3, "MapAdd command should have exactly 3 args");
 
         let cmd = MapAddCommandExecutor::new(args[0], args[1], args[2]);
         Ok(Arc::new(Box::new(cmd)))
@@ -489,24 +471,22 @@ impl MapRemoveCommandParser {
 }
 
 impl CommandParser for MapRemoveCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        // Args should not be empty
-        if args.is_empty() {
-            let msg = format!("Invalid map_remove command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should have exactly two elements
         if args.len() != 2 {
             let msg = format!("Invalid map_remove command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(
+            args.len() == 2,
+            "MapRemove command should have exactly 2 args"
+        );
 
         let cmd = MapRemoveCommandExecutor::new(args[0], args[1]);
         Ok(Arc::new(Box::new(cmd)))

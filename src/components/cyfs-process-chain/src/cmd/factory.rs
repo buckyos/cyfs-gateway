@@ -2,9 +2,7 @@ use super::action::ActionCommandParser;
 use super::assign::AssignCommandParser;
 use super::cmd::*;
 use super::coll::*;
-use super::external::ExternalCommandParser;
 use super::match_::MatchCommandParser;
-use super::sni::HttpSniProbeCommandParser;
 use super::string::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -53,15 +51,6 @@ impl CommandParserFactory {
         self.register("assign", Arc::new(Box::new(AssignCommandParser::new())));
         // match command
         self.register("match", Arc::new(Box::new(MatchCommandParser::new())));
-
-        // external command
-        self.register("EXEC", Arc::new(Box::new(ExternalCommandParser::new())));
-
-        // sni command
-        self.register(
-            "http-sni-probe",
-            Arc::new(Box::new(HttpSniProbeCommandParser::new())),
-        );
 
         // string command
         self.register("rewrite", Arc::new(Box::new(RewriteCommandParser::new())));

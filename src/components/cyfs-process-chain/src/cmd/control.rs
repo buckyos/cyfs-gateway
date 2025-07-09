@@ -1,5 +1,5 @@
 use super::cmd::*;
-use crate::block::{BlockExecuter, BlockType, Context};
+use crate::block::{BlockExecuter, CommandArgs, Context};
 use std::sync::Arc;
 
 // exec command, like: EXEC block1
@@ -12,16 +12,18 @@ impl ExecCommandParser {
 }
 
 impl CommandParser for ExecCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
         if args.len() != 1 {
             let msg = format!("Invalid exec command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(args.len() == 1, "Exec command should have exactly 1 arg");
 
         let cmd = ExecCommandExecutor::new(args[0]);
         Ok(Arc::new(Box::new(cmd)))
@@ -76,16 +78,45 @@ impl GotoCommandParser {
 }
 
 impl CommandParser for GotoCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args must be either one or two elements
         if args.len() < 1 || args.len() > 2 {
             let msg = format!("Invalid goto command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+        // If two arguments are provided, the first one must be --chain or --block
+        if args.len() == 2 {
+            if !args[0].is_literal() {
+                let msg = format!(
+                    "Invalid goto command: expected --chain or --block, got {:?}",
+                    args[0]
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            let t = args[0].as_literal_str().unwrap();
+
+            // Check if the first argument is either --chain or --block
+            if t != "--chain" && t != "--block" {
+                let msg = format!(
+                    "Invalid goto command: expected --chain or --block, got {}",
+                    t
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(
+            args.len() >= 1 && args.len() <= 2,
+            "Goto command should have 1 or 2 args"
+        );
 
         // Parse the command arguments
         // If only one argument is provided, it is considered a chain name

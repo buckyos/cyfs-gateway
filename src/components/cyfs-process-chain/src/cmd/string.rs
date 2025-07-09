@@ -1,5 +1,5 @@
-use super::cmd::{CommandExecutorRef, CommandParser, CommandResult, CommandExecutor};
-use crate::block::{BlockType, CommandArgs, Context};
+use super::cmd::{CommandExecutor, CommandExecutorRef, CommandParser, CommandResult};
+use crate::block::{CommandArgs, Context};
 use globset::{GlobBuilder, GlobMatcher};
 use std::sync::Arc;
 
@@ -14,8 +14,35 @@ impl RewriteCommandParser {
 }
 
 impl CommandParser for RewriteCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly three elements
+        if args.len() != 3 {
+            let msg = format!("Invalid rewrite command: {:?}", args);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        // The first argument must be a variable
+        if !args[0].is_var() {
+            let msg = format!(
+                "Invalid rewrite command: {:?}, the first argument must be a variable",
+                args
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        // The second argument must be a valid glob pattern if is literal
+        if args[1].is_literal() {
+            let pattern = args[1].as_literal_str().unwrap();
+            if let Err(e) = GlobBuilder::new(pattern).case_insensitive(true).build() {
+                let msg = format!("Invalid glob pattern: {}, {}", pattern, e);
+                error!("{}", msg);
+                return Err(msg);
+            }
+        }
+
+        Ok(())
     }
 
     fn parse_origin(
@@ -23,11 +50,10 @@ impl CommandParser for RewriteCommandParser {
         args: Vec<String>,
         origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        if args.len() != 3 {
-            let msg = format!("Invalid rewrite command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        assert!(
+            args.len() == 3,
+            "Rewrite command should have exactly 3 args"
+        );
 
         let key_arg = &origin_args.as_slice()[0];
         if !key_arg.is_var() {
@@ -80,7 +106,9 @@ impl CommandExecutor for RewriteCommand {
                 if key_value.starts_with(prefix) && template.ends_with('*') {
                     let tail = &key_value[prefix.len()..];
                     let rewritten = format!("{}{}", &template[..template.len() - 1], tail);
-                    context.set_env_value(self.key.as_str(), &rewritten, None).await?;
+                    context
+                        .set_env_value(self.key.as_str(), &rewritten, None)
+                        .await?;
                     Ok(CommandResult::success_with_value(rewritten))
                 } else {
                     Ok(CommandResult::success())
@@ -88,14 +116,13 @@ impl CommandExecutor for RewriteCommand {
             } else {
                 Ok(CommandResult::success())
             }
-            
         } else {
             Ok(CommandResult::error())
         }
     }
 }
 
-// rewrite ^/test/(\w+)(?:/(\d+))? /new/$1/$2
+// rewrite $var ^/test/(\w+)(?:/(\d+))? /new/$1/$2
 pub struct RewriteRegexCommandParser;
 
 impl RewriteRegexCommandParser {
@@ -105,8 +132,35 @@ impl RewriteRegexCommandParser {
 }
 
 impl CommandParser for RewriteRegexCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly three elements
+        if args.len() != 3 {
+            let msg = format!("Invalid rewrite-regex command: {:?}", args);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        // The first argument must be a variable
+        if !args[0].is_var() {
+            let msg = format!(
+                "Invalid rewrite-regex command: {:?}, the first argument must be a variable",
+                args
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        // The second argument must be a valid regex pattern if is literal
+        if args[1].is_literal() {
+            let pattern = args[1].as_literal_str().unwrap();
+            if let Err(e) = regex::Regex::new(pattern) {
+                let msg = format!("Invalid regex pattern: {}, {}", pattern, e);
+                error!("{}", msg);
+                return Err(msg);
+            }
+        }
+
+        Ok(())
     }
 
     fn parse_origin(
@@ -114,11 +168,10 @@ impl CommandParser for RewriteRegexCommandParser {
         args: Vec<String>,
         origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        if args.len() != 3 {
-            let msg = format!("Invalid rewrite-reg command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        assert!(
+            args.len() == 3,
+            "Rewrite-regex command should have exactly 3 args"
+        );
 
         let key_arg = &origin_args.as_slice()[0];
         if !key_arg.is_var() {
@@ -194,7 +247,9 @@ impl CommandExecutor for RewriteRegexCommand {
                 }
             }
 
-            context.set_env_value(self.key.as_str(), &result, None).await?;
+            context
+                .set_env_value(self.key.as_str(), &result, None)
+                .await?;
             info!("Rewritten value for {}: {}", self.key, result);
 
             Ok(CommandResult::success_with_value(result))
@@ -214,8 +269,25 @@ impl StringReplaceCommandParser {
 }
 
 impl CommandParser for StringReplaceCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly three elements
+        if args.len() != 3 {
+            let msg = format!("Invalid string replace command: {:?}", args);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        // The first argument must be a variable
+        if !args[0].is_var() {
+            let msg = format!(
+                "Invalid string replace command: {:?}, the first argument must be a variable",
+                args
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        Ok(())
     }
 
     fn parse_origin(
@@ -223,11 +295,10 @@ impl CommandParser for StringReplaceCommandParser {
         args: Vec<String>,
         origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        if args.len() != 3 {
-            let msg = format!("Invalid string-replace command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        assert!(
+            args.len() == 3,
+            "String replace command should have exactly 3 args"
+        );
 
         let key_arg = &origin_args.as_slice()[0];
         if !key_arg.is_var() {
@@ -266,7 +337,9 @@ impl CommandExecutor for StringReplaceCommand {
 
         if key_value.contains(match_text) {
             let rewritten = key_value.replace(match_text, new_text);
-            context.set_env_value(self.key.as_str(), &rewritten, None).await?;
+            context
+                .set_env_value(self.key.as_str(), &rewritten, None)
+                .await?;
             info!("Replace value for {}: {}", self.key, rewritten);
 
             Ok(super::CommandResult::success_with_value(rewritten))
@@ -287,16 +360,22 @@ impl StringAppendCommandParser {
 }
 
 impl CommandParser for StringAppendCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly two elements
         if args.len() != 2 {
-            let msg = format!("Invalid string-append command: {:?}", args);
+            let msg = format!("Invalid string append command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(
+            args.len() == 2,
+            "String append command should have exactly 2 args"
+        );
 
         let result = args[0].to_string() + args[1];
         info!("String append {} + {} = {}", args[0], args[1], result);
@@ -334,23 +413,11 @@ impl StringSliceCommandParser {
     pub fn new() -> Self {
         Self {}
     }
-}
 
-impl CommandParser for StringSliceCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        if args.len() != 2 {
-            let msg = format!("Invalid string-slice command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
-        let range_parts: Vec<&str> = args[1].split(':').collect();
+    fn parse_range(range: &str) -> Result<(usize, usize), String> {
+        let range_parts: Vec<&str> = range.split(':').collect();
         if range_parts.len() != 2 {
-            let msg = format!("Invalid range format: {}", args[1]);
+            let msg = format!("Invalid range format: {}", range);
             error!("{}", msg);
             return Err(msg);
         }
@@ -365,6 +432,36 @@ impl CommandParser for StringSliceCommandParser {
             error!("{}", msg);
             msg
         })?;
+
+        Ok((start, end))
+    }
+}
+
+impl CommandParser for StringSliceCommandParser {
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly two elements
+        if args.len() != 2 {
+            let msg = format!("Invalid string slice command: {:?}", args);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        // The second argument must be a valid range format if is literal
+        if args[1].is_literal() {
+            let range = args[1].as_literal_str().unwrap();
+            Self::parse_range(range)?;
+        }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(
+            args.len() == 2,
+            "String slice command should have exactly 2 args"
+        );
+
+        let (start, end) = Self::parse_range(args[1])?;
 
         let ret =
             if start <= end && args[0].is_char_boundary(start) && args[1].is_char_boundary(end) {
@@ -393,16 +490,19 @@ impl StringLengthCommandParser {
 }
 
 impl CommandParser for StringLengthCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly one element
         if args.len() != 1 {
-            let msg = format!("Invalid string-length command: {:?}", args);
+            let msg = format!("Invalid strlen command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(args.len() == 1, "strlen command should have exactly 1 arg");
 
         let length = args[0].len();
         info!("String length of {} is {}", args[0], length);
@@ -413,7 +513,7 @@ impl CommandParser for StringLengthCommandParser {
     }
 }
 
-// starts_with <string> <prefix>
+// starts-with <string> <prefix>
 // This command checks if a string starts with a given prefix
 
 pub struct StringStartsWithCommandParser;
@@ -425,16 +525,22 @@ impl StringStartsWithCommandParser {
 }
 
 impl CommandParser for StringStartsWithCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly two elements
         if args.len() != 2 {
-            let msg = format!("Invalid string startwith command: {:?}", args);
+            let msg = format!("Invalid string starts-with command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(
+            args.len() == 2,
+            "String starts-with command should have exactly 2 args"
+        );
 
         let starts_with = args[0].starts_with(args[1]);
         info!(
@@ -448,7 +554,7 @@ impl CommandParser for StringStartsWithCommandParser {
     }
 }
 
-// ends_with <string> <suffix>
+// ends-with <string> <suffix>
 // This command checks if a string ends with a given suffix
 pub struct StringEndsWithCommandParser;
 
@@ -459,16 +565,22 @@ impl StringEndsWithCommandParser {
 }
 
 impl CommandParser for StringEndsWithCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly two elements
         if args.len() != 2 {
-            let msg = format!("Invalid string endwith command: {:?}", args);
+            let msg = format!("Invalid string ends-with command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(
+            args.len() == 2,
+            "String ends-with command should have exactly 2 args"
+        );
 
         let ends_with = args[0].ends_with(args[1]);
         info!(

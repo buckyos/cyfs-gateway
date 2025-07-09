@@ -1,5 +1,5 @@
 use super::cmd::*;
-use crate::block::{BlockType, Context};
+use crate::block::{CommandArgs, Context};
 use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
 use std::sync::Arc;
@@ -15,17 +15,19 @@ impl MatchCommandParser {
 }
 
 impl CommandParser for MatchCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        // Match cmd can be used in any block
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly two elements
         if args.len() != 2 {
             let msg = format!("Invalid match command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(args.len() == 2, "Match command should have exactly 2 args");
 
         let value = args[0].to_owned();
 
@@ -75,9 +77,36 @@ impl MatchRegexCommandParser {
 }
 
 impl CommandParser for MatchRegexCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        // Match regex cmd can be used in any block
-        true
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly two or four elements
+        if args.len() != 2 || args.len() != 4 {
+            let msg = format!("Invalid match_regex command: {:?}", args);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        if args.len() == 4 {
+            if !args[0].is_literal() {
+                let msg = format!(
+                    "Invalid match_regex command: --capture must be a literal: {:?}",
+                    args
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            let arg = args[0].as_literal_str().unwrap();
+            if arg != "--capture" {
+                let msg = format!(
+                    "Invalid match_regex command: expected --capture, got: {:?}",
+                    args
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+        }
+
+        Ok(())
     }
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
@@ -130,7 +159,9 @@ impl CommandExecutor for MatchRegexCommandExecutor {
                 for (i, cap) in caps.iter().enumerate() {
                     if let Some(m) = cap {
                         // TODO: Add env level support, such as --capture export/local name
-                        context.set_env_value(format!("{}[{}]", name, i).as_str(), m.as_str(), None).await?;
+                        context
+                            .set_env_value(format!("{}[{}]", name, i).as_str(), m.as_str(), None)
+                            .await?;
                     }
                 }
             }
@@ -142,6 +173,7 @@ impl CommandExecutor for MatchRegexCommandExecutor {
     }
 }
 
+// EQ command, like: eq REQ_HEADER.host "localhost"; eq --ignore-case REQ_HEADER.host "LOCALHOST"
 pub struct EQCommandParser {}
 
 impl EQCommandParser {
@@ -151,12 +183,41 @@ impl EQCommandParser {
 }
 
 impl CommandParser for EQCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        // EQ cmd can be used in any block
-        true
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly two or three elements
+        if args.len() < 2 && args.len() > 3 {
+            let msg = format!("Invalid eq command: {:?}", args);
+            error!("{}", msg);
+            return Err(msg);
+        }
+        // If there are 3 args, the first one must be --ignore-case
+        if args.len() == 3 {
+            if !args[0].is_literal() {
+                let msg = format!("Invalid eq command: {:?}", args);
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            let arg = args[0].as_literal_str().unwrap();
+            if arg != "--ignore-case" {
+                let msg = format!(
+                    "Invalid eq command: expected --ignore-case, got: {:?}",
+                    args
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+        }
+
+        Ok(())
     }
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(
+            args.len() == 2 || args.len() == 3,
+            "EQ command should have 2 or 3 args"
+        );
+
         // If there are 3 args, the first one must be --ignore-case
         let cmd = if args.len() == 2 {
             let value1 = args[0].to_owned();
@@ -216,6 +277,7 @@ impl CommandExecutor for EQCommandExecutor {
     }
 }
 
+// Range command, like: range var range_begin range_end
 pub struct RangeCommandParser {}
 
 impl RangeCommandParser {
@@ -225,17 +287,30 @@ impl RangeCommandParser {
 }
 
 impl CommandParser for RangeCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        // Range cmd can be used in any block
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly three elements
         if args.len() != 3 {
             let msg = format!("Invalid range command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        // If arg is literal, it must be a valid number
+        for arg in args.iter() {
+            if arg.is_literal() {
+                if let Err(e) = arg.as_literal_str().unwrap().parse::<f64>() {
+                    let msg = format!("Invalid range command value: {:?}: {}", arg, e);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(args.len() == 3, "Range command should have exactly 3 args");
 
         let value = args[1].parse::<f64>().map_err(|e| {
             let msg = format!("Invalid range value: {}: {}", args[1], e);

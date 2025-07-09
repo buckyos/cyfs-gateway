@@ -7,7 +7,7 @@ mod assign;
 mod control;
 mod factory;
 mod match_;
-mod sni;
+//mod sni;
 mod string;
 
 pub use cmd::*;

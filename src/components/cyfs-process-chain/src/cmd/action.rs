@@ -1,5 +1,5 @@
 use super::cmd::*;
-use crate::block::{BlockType, Context};
+use crate::block::{Context, CommandArgs};
 use std::sync::Arc;
 
 // some action commands, DROP/ACCEPT/REJECT
@@ -14,18 +14,20 @@ impl ActionCommandParser {
 }
 
 impl CommandParser for ActionCommandParser {
-    fn check(&self, _block_type: BlockType) -> bool {
-        // Action command can be used in any block
-        true
-    }
-
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args must be empty
         if !args.is_empty() {
             let msg = format!("Invalid action command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        // Args must be empty
+        assert!(args.is_empty(), "Action command should not have any args");
 
         let cmd = ActionCommandExecutor {
             action: self.action.clone(),

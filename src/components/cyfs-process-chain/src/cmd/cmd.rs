@@ -1,11 +1,12 @@
-use crate::block::{BlockType, CommandArgs, Context};
+use crate::block::{CommandArgs, Context};
 use std::sync::Arc;
 
 pub type CommandParserRef = Arc<Box<dyn CommandParser>>;
 
 pub trait CommandParser: Send + Sync {
-    // To check if the command is valid in the block
-    fn check(&self, block_type: BlockType) -> bool;
+    // To check if the command is valid at first parse, such as checking if the params count is correct.
+    // This is used to validate the command before load params if needed and executing it.
+    fn check(&self, args: &CommandArgs) -> Result<(), String>;
 
     fn parse_origin(
         &self,
