@@ -129,7 +129,13 @@ impl MultiMapCollection for MemoryMultiMapCollection {
     async fn remove(&self, key: &str, value: &str) -> Result<bool, String> {
         let mut data = self.data.write().unwrap();
         if let Some(set) = data.get_mut(key) {
-            return Ok(set.remove(value));
+            let ret = set.remove(value);
+
+            if set.is_empty() {
+                data.remove(key);
+            }
+
+            return Ok(ret);
         }
 
         Ok(false)

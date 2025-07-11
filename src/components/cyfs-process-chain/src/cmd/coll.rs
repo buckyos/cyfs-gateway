@@ -546,3 +546,84 @@ impl CommandExecutor for MapRemoveCommandExecutor {
         }
     }
 }
+
+
+/// map-get <map_id> <key>
+/// Get the value of a key from the specified map collection.
+pub struct MapGetCommandParser {}
+
+impl MapGetCommandParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl CommandParser for MapGetCommandParser {
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Args should have exactly two elements
+        if args.len() != 2 {
+            let msg = format!("Invalid map_get command: {:?}", args);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        Ok(())
+    }
+
+    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+        assert!(args.len() == 2, "map-get command should have exactly 2 args");
+
+        let cmd = MapGetCommandExecutor::new(args[0], args[1]);
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+// MapGetCommandExecutor
+pub struct MapGetCommandExecutor {
+    pub map_id: String,
+    pub key: String,
+}
+
+impl MapGetCommandExecutor {
+    pub fn new(map_id: &str, key: &str) -> Self {
+        Self {
+            map_id: map_id.to_owned(),
+            key: key.to_owned(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for MapGetCommandExecutor {    
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        // Get the value of the key from the specified map collection
+        let ret = context
+            .collection_manager()
+            .get_map_collection(&self.map_id)
+            .await;
+        if ret.is_none() {
+            let msg = format!("Map collection with id '{}' not found", self.map_id);
+            warn!("{}", msg);
+            return Ok(CommandResult::error_with_value(msg));
+        }
+
+        let collection = ret.unwrap();
+        match collection.get(&self.key).await? {
+            Some(value) => {
+                info!(
+                    "Key '{}' found in map collection with id '{}': {}",
+                    self.key, self.map_id, value
+                );
+                Ok(CommandResult::success_with_value(value))
+            }
+            None => {
+                warn!(
+                    "Key '{}' not found in map collection with id '{}'",
+                    self.key, self.map_id
+                );
+                Ok(CommandResult::error())
+            }
+        }
+    }
+}
+
