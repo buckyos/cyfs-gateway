@@ -30,3 +30,30 @@ pub trait MapCollection: Send + Sync {
 }
 
 pub type MapCollectionRef = Arc<Box<dyn MapCollection>>;
+
+
+#[async_trait::async_trait]
+pub trait MultiMapCollection: Send + Sync {
+    /// Sets the value for the given key in the collection.
+    async fn insert(&self, key: &str, value: &str) -> Result<bool, String>;
+
+    /// Inserts multiple values for the given key in the collection.
+    async fn insert_many(&self, key: &str, values: &[&str]) -> Result<bool, String>;
+
+    /// Gets first value for the given key from the collection.
+    async fn get(&self, key: &str) -> Result<Option<String>, String>;
+
+    /// Gets all values for the given key from the collection.
+    async fn get_many(&self, keys: &str) -> Result<Option<SetCollectionRef>, String>;
+
+    /// Checks if the collection contains the given key.
+    async fn contains_key(&self, key: &str) -> Result<bool, String>;
+
+    /// Removes the value for the given key from the collection.
+    /// If the key or value is not found, it returns false.
+    async fn remove(&self, key: &str, value: &str) -> Result<bool, String>;
+
+    /// Removes all values for the given key from the collection.
+    /// If the key is not found, it returns false.
+    async fn remove_all(&self, key: &str) -> Result<bool, String>;
+}
