@@ -1,7 +1,23 @@
 use super::cmd::{CommandExecutor, CommandExecutorRef, CommandParser, CommandResult};
 use crate::block::CommandArgs;
 use crate::chain::Context;
+use crate::collection::MapCollectionResult;
 use std::sync::Arc;
+
+/*
+// Map collection commands support both normal map and multi map.
+match-include map_id key	// for normal map
+match-include map_id key value1 value2 // for multi map
+
+map-create [-multi] map_id
+
+map-add map_id key value	// for normal map, accept only one value
+map-add map_id key value1 value2	// for multi map, accept multi value at one call
+map-remove map_id key // for normal map
+map-remove map_id key value	// for multi map
+
+map-get map_id key	// for both map, return value or value collection
+*/
 
 // match_include <var> <collection_id>
 // Check if the variable is included in the specified collection
@@ -310,7 +326,7 @@ impl CommandExecutor for SetRemoveCommandExecutor {
     }
 }
 
-/// map create <map_id>
+/// map create [-multi] <map_id>
 /// Create a new map collection with the given id.
 /// If the map already exists, it will fail
 pub struct MapCreateCommandParser {}
@@ -324,10 +340,27 @@ impl MapCreateCommandParser {
 impl CommandParser for MapCreateCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should have exactly one element
-        if args.len() != 1 {
-            let msg = format!("Invalid map_create command: {:?}", args);
+        if args.len() < 1 || args.len() > 2 {
+            let msg = format!("Invalid map-create command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
+        }
+
+        // If the first argument is "-multi", it should be the only argument
+        if args.len() == 2 {
+            let param = args.get(0).unwrap();
+            if !param.is_literal() {
+                let msg = format!("Invalid map-create command param: {:?}", args);
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            let param = param.as_literal_str().unwrap();
+            if param != "-multi" && param != "--multi" {
+                let msg = format!("Invalid map-create command: {:?}", args);
+                error!("{}", msg);
+                return Err(msg);
+            }
         }
 
         Ok(())
@@ -335,23 +368,27 @@ impl CommandParser for MapCreateCommandParser {
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
         assert!(
-            args.len() == 1,
-            "MapCreate command should have exactly 1 arg"
+            args.len() == 1 || args.len() == 2,
+            "map-create command should have 1 or 2 args"
         );
 
-        let cmd = MapCreateCommandExecutor::new(args[0]);
+        let is_multi = args.len() == 2 && (args[0] == "-multi" || args[0] == "--multi");
+
+        let cmd = MapCreateCommandExecutor::new(is_multi, if is_multi { args[1] } else { args[0] });
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // MapCreateCommandExecutor
 pub struct MapCreateCommandExecutor {
-    pub map_id: String,
+    is_multi: bool, // Indicates if this is a multi-map
+    map_id: String,
 }
 
 impl MapCreateCommandExecutor {
-    pub fn new(map_id: &str) -> Self {
+    pub fn new(is_multi: bool, map_id: &str) -> Self {
         Self {
+            is_multi,
             map_id: map_id.to_owned(),
         }
     }
@@ -361,20 +398,33 @@ impl MapCreateCommandExecutor {
 impl CommandExecutor for MapCreateCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Create a new map collection with the given id
-        match context
-            .collection_manager()
-            .create_map_collection(&self.map_id)
-            .await
-        {
-            Some(_) => {
+        let ret = if self.is_multi {
+            context
+                .collection_manager()
+                .create_multi_map_collection(&self.map_id)
+                .await
+                .is_some()
+        } else {
+            context
+                .collection_manager()
+                .create_map_collection(&self.map_id)
+                .await
+                .is_some()
+        };
+
+        match ret {
+            true => {
                 info!(
-                    "Map collection with id '{}' created successfully",
-                    self.map_id
+                    "Map collection with id '{}' multi={}, created successfully",
+                    self.map_id, self.is_multi
                 );
                 Ok(CommandResult::success())
             }
-            None => {
-                let msg = format!("Failed to create map collection with id '{}'", self.map_id);
+            false => {
+                let msg = format!(
+                    "Failed to create map collection with id '{}' multi={}",
+                    self.map_id, self.is_multi
+                );
                 warn!("{}", msg);
                 Ok(CommandResult::error_with_value(msg))
             }
@@ -382,7 +432,8 @@ impl CommandExecutor for MapCreateCommandExecutor {
     }
 }
 
-/// map_add <map_id> <key> <value>
+/// map_add <map_id> <key> <value>; // for normal map
+/// map_add <map_id> <key> <value1> <value2>; // for multi map
 /// Set a key-value pair in the specified map collection.
 /// If the key already exists, it will be updated and the command will succeed.
 /// If the key does not exist, it will be added and the command will succeed.
@@ -396,8 +447,8 @@ impl MapAddCommandParser {
 
 impl CommandParser for MapAddCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have exactly three elements
-        if args.len() != 3 {
+        // Args should have at least three elements
+        if args.len() < 3 {
             let msg = format!("Invalid map_add command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
@@ -407,9 +458,12 @@ impl CommandParser for MapAddCommandParser {
     }
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        assert!(args.len() == 3, "MapAdd command should have exactly 3 args");
+        assert!(
+            args.len() >= 3,
+            "MapAdd command should have at least 3 args"
+        );
 
-        let cmd = MapAddCommandExecutor::new(args[0], args[1], args[2]);
+        let cmd = MapAddCommandExecutor::new(args[0], args[1], &args[2..]);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -418,15 +472,15 @@ impl CommandParser for MapAddCommandParser {
 pub struct MapAddCommandExecutor {
     pub map_id: String,
     pub key: String,
-    pub value: String,
+    pub value: Vec<String>,
 }
 
 impl MapAddCommandExecutor {
-    pub fn new(map_id: &str, key: &str, value: &str) -> Self {
+    pub fn new(map_id: &str, key: &str, value: &[&str]) -> Self {
         Self {
             map_id: map_id.to_owned(),
             key: key.to_owned(),
-            value: value.to_owned(),
+            value: value.iter().map(|s| (*s).to_owned()).collect(),
         }
     }
 }
@@ -445,27 +499,76 @@ impl CommandExecutor for MapAddCommandExecutor {
             return Ok(CommandResult::error_with_value(msg));
         }
 
-        let collection = ret.unwrap();
-        match collection.insert(&self.key, &self.value).await? {
-            None => {
-                info!(
-                    "Key '{}' with value '{}' added to map collection with id '{}'",
-                    self.key, self.value, self.map_id
-                );
-                Ok(CommandResult::success())
+        let ret = ret.unwrap();
+        match ret {
+            MapCollectionResult::Map(collection) => {
+                // For normal map, we expect only one value
+                if self.value.len() != 1 {
+                    warn!(
+                        "map-add command for normal map with id '{}' expects exactly one value, got {}",
+                        self.map_id,
+                        self.value.len()
+                    );
+
+                    // FIXME: What should we do if there is more than one value? We now only use the first value
+                }
+
+                match collection.insert(&self.key, &self.value[0]).await? {
+                    None => {
+                        info!(
+                            "Key '{}' with value '{}' added to map collection with id '{}'",
+                            self.key, self.value[0], self.map_id
+                        );
+                        Ok(CommandResult::success())
+                    }
+                    Some(prev) => {
+                        info!(
+                            "Key '{}' updated from value '{}' to '{}' in map collection with id '{}'",
+                            self.key, prev, self.value[0], self.map_id
+                        );
+                        Ok(CommandResult::success())
+                    }
+                }
             }
-            Some(prev) => {
-                info!(
-                    "Key '{}' updated from value '{}' to '{}' in map collection with id '{}'",
-                    self.key, prev, self.value, self.map_id
-                );
-                Ok(CommandResult::success())
+            MapCollectionResult::MultiMap(collection) => {
+                let ret = if self.value.len() == 1 {
+                    collection.insert(&self.key, &self.value[0]).await?
+                } else {
+                    assert!(
+                        self.value.len() > 1,
+                        "map-add command for multi-map with id '{}' expects at least one value, got {}",
+                        self.map_id,
+                        self.value.len()
+                    );
+
+                    let values: Vec<&str> = self.value.iter().map(|s| s.as_str()).collect();
+                    collection.insert_many(&self.key, &values).await?
+                };
+
+                match ret {
+                    true => {
+                        info!(
+                            "Key '{}' with values '{:?}' added to multi-map collection with id '{}'",
+                            self.key, self.value, self.map_id
+                        );
+                        Ok(CommandResult::success())
+                    }
+                    false => {
+                        let msg = format!(
+                            "Key '{}' with values '{:?}' already exists in multi-map collection with id '{}'",
+                            self.key, self.value, self.map_id
+                        );
+                        warn!("{}", msg);
+                        Ok(CommandResult::error_with_value(msg))
+                    }
+                }
             }
         }
     }
 }
 
-/// map_remove <map_id> <key>
+/// map-remove <map_id> <key>; // for normal map and multi map
+/// map-remove <map_id> <key> value value1;    // for multi map only, accept multi value
 /// Remove a key from the specified map collection.
 pub struct MapRemoveCommandParser {}
 
@@ -477,9 +580,9 @@ impl MapRemoveCommandParser {
 
 impl CommandParser for MapRemoveCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have exactly two elements
-        if args.len() != 2 {
-            let msg = format!("Invalid map_remove command: {:?}", args);
+        // Args should have at least two elements
+        if args.len() < 2 {
+            let msg = format!("Invalid map-remove command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
@@ -489,26 +592,37 @@ impl CommandParser for MapRemoveCommandParser {
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
         assert!(
-            args.len() == 2,
-            "MapRemove command should have exactly 2 args"
+            args.len() >= 2,
+            "map-remove command should have at least 2 args"
         );
 
-        let cmd = MapRemoveCommandExecutor::new(args[0], args[1]);
+        let values = if args.len() > 2 {
+            args[2..]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()
+        } else {
+            vec![]
+        };
+
+        let cmd = MapRemoveCommandExecutor::new(args[0], args[1], values);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // MapRemoveCommandExecutor
 pub struct MapRemoveCommandExecutor {
-    pub map_id: String,
-    pub key: String,
+    map_id: String,
+    key: String,
+    values: Vec<String>,
 }
 
 impl MapRemoveCommandExecutor {
-    pub fn new(map_id: &str, key: &str) -> Self {
+    pub fn new(map_id: &str, key: &str, values: Vec<String>) -> Self {
         Self {
             map_id: map_id.to_owned(),
             key: key.to_owned(),
+            values,
         }
     }
 }
@@ -527,28 +641,74 @@ impl CommandExecutor for MapRemoveCommandExecutor {
             return Ok(CommandResult::error_with_value(msg));
         }
 
-        let collection = ret.unwrap();
-        match collection.remove(&self.key).await? {
-            Some(value) => {
-                info!(
-                    "Key '{}' removed from map collection with id '{}': {}",
-                    self.key, self.map_id, value
-                );
-                Ok(CommandResult::success_with_value(value))
+        let ret = ret.unwrap();
+        match ret {
+            MapCollectionResult::Map(collection) => {
+                // For normal map, we expect only one value
+                if self.values.len() > 1 {
+                    warn!(
+                        "map-remove command for normal map with id '{}' expects at most one value, got {}",
+                        self.map_id,
+                        self.values.len()
+                    );
+                }
+
+                match collection.remove(&self.key).await? {
+                    Some(value) => {
+                        info!(
+                            "Key '{}' removed from map collection with id '{}': {}",
+                            self.key, self.map_id, value
+                        );
+                        Ok(CommandResult::success_with_value(value))
+                    }
+                    None => {
+                        warn!(
+                            "Key '{}' not found in map collection with id '{}'",
+                            self.key, self.map_id
+                        );
+                        Ok(CommandResult::error())
+                    }
+                }
             }
-            None => {
-                info!(
-                    "Key '{}' not found in map collection with id '{}'",
-                    self.key, self.map_id
-                );
-                Ok(CommandResult::success())
+            MapCollectionResult::MultiMap(collection) => {
+                if self.values.is_empty() {
+                    return Ok(CommandResult::error_with_value(
+                        "No values provided for multi-map remove".to_string(),
+                    ));
+                }
+
+                let ret = if self.values.len() == 0 {
+                    collection.remove_all(&self.key).await?
+                } else if self.values.len() == 1 {
+                    collection.remove(&self.key, &self.values[0]).await?
+                } else {
+                    let values = self
+                        .values
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<&str>>();
+                    collection.remove_many(&self.key, &values).await?
+                };
+
+                if ret {
+                    info!(
+                        "Key '{}' with values '{:?}' removed from multi-map collection with id '{}'",
+                        self.key, self.values, self.map_id
+                    );
+                    Ok(CommandResult::success())
+                } else {
+                    warn!(
+                        "Key '{}' with values '{:?}' not found in multi-map collection with id '{}'",
+                        self.key, self.values, self.map_id
+                    );
+                    Ok(CommandResult::error())
+                }
             }
         }
     }
 }
 
-
-/// map-get <map_id> <key>
+/// map-get <map_id> <key>; // Get the value of a key from the specified map collection. for multi-map, it returns all values join by space
 /// Get the value of a key from the specified map collection.
 pub struct MapGetCommandParser {}
 
@@ -571,7 +731,10 @@ impl CommandParser for MapGetCommandParser {
     }
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        assert!(args.len() == 2, "map-get command should have exactly 2 args");
+        assert!(
+            args.len() == 2,
+            "map-get command should have exactly 2 args"
+        );
 
         let cmd = MapGetCommandExecutor::new(args[0], args[1]);
         Ok(Arc::new(Box::new(cmd)))
@@ -594,7 +757,7 @@ impl MapGetCommandExecutor {
 }
 
 #[async_trait::async_trait]
-impl CommandExecutor for MapGetCommandExecutor {    
+impl CommandExecutor for MapGetCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Get the value of the key from the specified map collection
         let ret = context
@@ -607,23 +770,53 @@ impl CommandExecutor for MapGetCommandExecutor {
             return Ok(CommandResult::error_with_value(msg));
         }
 
-        let collection = ret.unwrap();
-        match collection.get(&self.key).await? {
-            Some(value) => {
-                info!(
-                    "Key '{}' found in map collection with id '{}': {}",
-                    self.key, self.map_id, value
-                );
-                Ok(CommandResult::success_with_value(value))
-            }
-            None => {
-                warn!(
-                    "Key '{}' not found in map collection with id '{}'",
-                    self.key, self.map_id
-                );
-                Ok(CommandResult::error())
+        let ret = ret.unwrap();
+        match ret {
+            MapCollectionResult::Map(collection) => match collection.get(&self.key).await? {
+                Some(value) => {
+                    info!(
+                        "Key '{}' found in map collection with id '{}': {}",
+                        self.key, self.map_id, value
+                    );
+                    Ok(CommandResult::success_with_value(value))
+                }
+                None => {
+                    warn!(
+                        "Key '{}' not found in map collection with id '{}'",
+                        self.key, self.map_id
+                    );
+                    Ok(CommandResult::error())
+                }
+            },
+            MapCollectionResult::MultiMap(collection) => {
+                match collection.get_many(&self.key).await? {
+                    Some(values) => {
+                        let values = values.get_all().await?;
+                        if values.is_empty() {
+                            warn!(
+                                "Key '{}' not found in multi-map collection with id '{}'",
+                                self.key, self.map_id
+                            );
+                            Ok(CommandResult::error())
+                        } else {
+                            info!(
+                                "Key '{}' found in multi-map collection with id '{}': {:?}",
+                                self.key, self.map_id, values
+                            );
+
+                            let values = values.join(" ");
+                            Ok(CommandResult::success_with_value(values))
+                        }
+                    }
+                    None => {
+                        warn!(
+                            "Key '{}' not found in multi-map collection with id '{}'",
+                            self.key, self.map_id
+                        );
+                        Ok(CommandResult::error())
+                    }
+                }
             }
         }
     }
 }
-

@@ -30,6 +30,11 @@ impl SetCollection for MemorySetCollection {
         let mut data = self.data.write().unwrap();
         Ok(data.remove(key))
     }
+
+    async fn get_all(&self) -> Result<Vec<String>, String> {
+        let data = self.data.read().unwrap();
+        Ok(data.iter().cloned().collect())
+    }
 }
 
 pub struct MemoryMapCollection {
@@ -141,6 +146,24 @@ impl MultiMapCollection for MemoryMultiMapCollection {
         Ok(false)
     }
 
+    async fn remove_many(&self, key: &str, values: &[&str]) -> Result<bool, String> {
+        let mut data = self.data.write().unwrap();
+        if let Some(set) = data.get_mut(key) {
+            let initial_len = set.len();
+            for value in values {
+                set.remove(*value);
+            }
+
+            let changed = set.len() < initial_len;
+            if set.is_empty() {
+                data.remove(key);
+            }
+
+            return Ok(changed);
+        }
+
+        Ok(false)
+    }
     async fn remove_all(&self, key: &str) -> Result<bool, String> {
         let mut data = self.data.write().unwrap();
         Ok(data.remove(key).is_some())
