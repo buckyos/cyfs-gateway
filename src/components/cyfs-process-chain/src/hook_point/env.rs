@@ -16,7 +16,7 @@ pub struct HookPointEnv {
 }
 
 impl HookPointEnv {
-    pub fn new(id: String, data_dir: PathBuf) -> Self {
+    pub fn new(id: impl Into<String>, data_dir: PathBuf) -> Self {
         let collection_manager = CollectionManager::new();
 
         let variable_visitor_manager = VariableVisitorManager::new();
@@ -24,7 +24,7 @@ impl HookPointEnv {
 
         let global_env = Arc::new(Env::new(EnvLevel::Global, None));
         Self {
-            id,
+            id: id.into(),
             data_dir,
             collection_manager,
             global_env,

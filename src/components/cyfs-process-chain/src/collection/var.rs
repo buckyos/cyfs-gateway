@@ -4,10 +4,12 @@ use tokio::sync::RwLock;
 
 #[async_trait::async_trait]
 pub trait VariableVisitor: Send + Sync {
-    /// Visits a set collection with the given id.
+    /// Visits variable with the given id.
     async fn get(&self, id: &str) -> Result<String, String>;
 
-    /// Visits a map collection with the given id.
+    /// Sets the value for the variable with the given id.
+    /// Returns the previous value if it exists.
+    /// If the variable is read-only, it should return an error.
     async fn set(&self, value: &str) -> Result<Option<String>, String>;
 }
 

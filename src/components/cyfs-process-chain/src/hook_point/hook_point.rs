@@ -1,3 +1,4 @@
+use super::loader::ProcessChainXMLLoader;
 use crate::chain::{ProcessChain, ProcessChainManager};
 use std::sync::Arc;
 
@@ -7,12 +8,12 @@ pub struct HookPoint {
 }
 
 impl HookPoint {
-    pub fn new(id: String) -> Self {
+    pub fn new(id: impl Into<String>) -> Self {
         let process_chain_manager = ProcessChainManager::new();
         let process_chain_manager = Arc::new(process_chain_manager);
 
         Self {
-            id,
+            id: id.into(),
             process_chain_manager,
         }
     }
@@ -29,11 +30,16 @@ impl HookPoint {
         self.process_chain_manager.add_chain(chain)
     }
 
-    pub fn load_process_chain(
-        &self,
-        chain_id: &str,
-        _content: &str,
-    ) -> Result<ProcessChain, String> {
-        todo!("Load process chain by ID: {}", chain_id);
+    // Load process chain list in xml format
+    pub async fn load_process_chain_list(&self, content: &str) -> Result<(), String> {
+        let chains = ProcessChainXMLLoader::parse(content)?;
+
+        // Append all chains to the manager
+        for mut chain in chains {
+            chain.translate().await?;
+            self.add_process_chain(chain)?;
+        }
+
+        Ok(())
     }
 }

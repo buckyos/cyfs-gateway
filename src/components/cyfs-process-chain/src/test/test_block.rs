@@ -45,10 +45,10 @@ const PROCESS_CHAIN: &str = r#"
 
 async fn test_process_chain() -> Result<(), String> {
     // Parse the process chain
-    let chains = ProcessChainParser::parse(PROCESS_CHAIN)?;
+    let chains = ProcessChainXMLLoader::parse(PROCESS_CHAIN)?;
     assert_eq!(chains.len(), 2);
 
-    let global_env = Arc::new( Env::new(EnvLevel::Global, None));
+    let global_env = Arc::new(Env::new(EnvLevel::Global, None));
 
     let manager = ProcessChainManager::new();
     let manager = Arc::new(manager);
@@ -110,6 +110,37 @@ async fn test_process_chain() -> Result<(), String> {
     Ok(())
 }
 
+async fn test_hook_point() -> Result<(), String> {
+    // Create a hook point
+    let hook_point = HookPoint::new("test_hook_point");
+    hook_point.load_process_chain_list(PROCESS_CHAIN).await.unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Create env to execute the hook point
+    let hook_point_env = HookPointEnv::new(
+        "test-hook-point",
+        data_dir,
+    );
+
+    // Load some collections for file
+    hook_point_env
+        .load_collection("host", CollectionType::MultiMap, CollectionFileFormat::Json, true).await.unwrap();
+
+    hook_point_env
+        .load_collection("ip", CollectionType::MultiMap, CollectionFileFormat::Json, true).await.unwrap();
+    
+    let ret = hook_point_env.exec_list(&hook_point).await.unwrap();
+    assert!(ret.is_accept());
+    
+    let global_env = hook_point_env.global_env();
+    assert_eq!(global_env.get("key1"), Some("key12".to_string()));
+
+    Ok(())
+}
+
+
 #[tokio::test]
 async fn test_process_chain_main() {
     use simplelog::*;
@@ -128,4 +159,8 @@ async fn test_process_chain_main() {
         Ok(_) => println!("Process chain executed successfully"),
         Err(e) => eprintln!("Error executing process chain: {}", e),
     }
+
+    test_hook_point().await.unwrap_or_else(|e| {
+        eprintln!("Error executing hook point: {}", e);
+    });
 }

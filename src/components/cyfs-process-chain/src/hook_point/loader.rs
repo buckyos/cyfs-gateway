@@ -18,9 +18,9 @@ use xmltree::Element;
 </root>
  */
 
-pub struct ProcessChainParser {}
+pub struct ProcessChainXMLLoader {}
 
-impl ProcessChainParser {
+impl ProcessChainXMLLoader {
     pub fn parse(config: &str) -> Result<Vec<ProcessChain>, String> {
         // First parse config in xml format
         let root = Element::parse(config.as_bytes()).map_err(|e| {
