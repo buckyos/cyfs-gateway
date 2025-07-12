@@ -271,6 +271,8 @@ impl BlockParser {
         let (input, _) = space0(input)?;
         let (input, cmd_name) = Self::parse_command_literal(input)?;
 
+        debug!("Parsed command name: {}, {:?}", input, cmd_name);
+
         let (input, args) =
             separated_list0(space1, preceded(space0, Self::parse_arg)).parse(input)?;
         debug!("Parsed command args: {}, {:?}", input, args);
@@ -355,10 +357,30 @@ impl BlockParser {
     }
 
     fn parse_var_dollar(input: &str) -> IResult<&str, CommandArg> {
-        map(preceded(char('$'), alphanumeric1), |var: &str| {
-            CommandArg::Var(var.to_string())
-        })
-        .parse(input)
+        debug!("Parsing var dollar: {}", input);
+        let (input, var) = preceded(
+            char('$'),
+            recognize(pair(
+                alt((alpha1, tag("_"))),               // Variable must start with a letter or underscore
+                many0(alt((alphanumeric1, tag("_")))), // followed by letters, digits, or underscores
+            )),
+        )
+        .parse(input)?;
+
+        if var.is_empty() {
+            let msg = format!(
+                "Variable name must not be empty after '$', input: {}",
+                input
+            );
+            error!("{}", msg);
+            return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                input,
+                ErrorKind::Tag,
+            )));
+        }
+
+        debug!("Parsed var dollar: {}, {}", input, var);
+        Ok((input, CommandArg::Var(var.to_string())))
     }
 
     fn parse_var_braced(input: &str) -> IResult<&str, CommandArg> {
