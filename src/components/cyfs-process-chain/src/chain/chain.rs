@@ -7,19 +7,25 @@ use std::sync::{Arc, RwLock};
 
 pub struct ProcessChain {
     id: String,
+    priority: i32,
     blocks: Vec<Block>,
 }
 
 impl ProcessChain {
-    pub fn new(id: String) -> Self {
+    pub fn new(id: String, priority: i32) -> Self {
         ProcessChain {
             id,
+            priority,
             blocks: Vec::new(),
         }
     }
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn priority(&self) -> i32 {
+        self.priority
     }
 
     pub fn add_block(&mut self, block: Block) -> Result<(), String> {

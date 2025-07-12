@@ -6,12 +6,12 @@ use xmltree::Element;
  * Process chain in xml format, at least one block is required in the chain.
  *
 <root>
-<process_chain id="main_http_server">
+<process_chain id="main_http_server" priority="100">
     <block id="process">
     </block>
 </process_chain>
 
-<process_chain id="main_http_server.post">
+<process_chain id="main_http_server.post" priority="200">
     <block id="rewrite">
     </block>
 </process_chain>
@@ -43,8 +43,14 @@ impl ProcessChainParser {
                     return Err(msg);
                 }
 
+                let priority = process_chain
+                    .attributes
+                    .get("priority")
+                    .and_then(|p| p.parse::<i32>().ok())
+                    .unwrap_or(0); // Default priority is 0 if not specified
+
                 let id = id.unwrap();
-                let mut chain_item = ProcessChain::new(id.to_string());
+                let mut chain_item = ProcessChain::new(id.to_string(), priority);
 
                 info!("Will parse process chain: {}", id);
 

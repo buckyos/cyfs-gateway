@@ -253,6 +253,10 @@ impl ProcessChainListExecutor {
         variable_visitor_manager: VariableVisitorManager,
         pipe: CommandPipe,
     ) -> Self {
+        // Ensure the process chain list is sorted by priority
+        let mut process_chain_list = process_chain_list;
+        process_chain_list.sort_by_key(|chain| chain.priority());
+        
         Self {
             process_chain_list,
             global_env,
@@ -303,7 +307,7 @@ impl ProcessChainListExecutor {
         let mut chain_index = 0;
         while chain_index < self.process_chain_list.len() {
             let chain = &self.process_chain_list[chain_index];
-            info!("Executing process chain: {}, {}", chain_index, chain.id());
+            info!("Executing process chain: {}:{}, {}", chain_index, chain.priority(), chain.id());
 
             let context = target_context.as_ref().unwrap();
             let ret = chain.execute(context).await?;
