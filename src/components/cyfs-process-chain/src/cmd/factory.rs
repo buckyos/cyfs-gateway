@@ -7,6 +7,7 @@ use super::string::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use super::control::*;
+use super::echo::EchoCommandParser;
 
 #[derive(Clone)]
 pub struct CommandParserFactory {
@@ -110,6 +111,9 @@ impl CommandParserFactory {
             "map-get",
             Arc::new(Box::new(MapGetCommandParser::new())),
         );
+
+        // echo
+        self.register("echo", Arc::new(Box::new(EchoCommandParser::new())));
     }
 }
 

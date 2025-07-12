@@ -234,6 +234,7 @@ impl BlockParser {
 
         debug!("Parsed assign key: {}, {:?}", input, key);
 
+        let (input, _) = space0(input)?;
         let (input, value) = opt(preceded(char('='), Self::parse_arg)).parse(input)?;
 
         debug!("Parsed assign value: {}, {:?}", input, value);

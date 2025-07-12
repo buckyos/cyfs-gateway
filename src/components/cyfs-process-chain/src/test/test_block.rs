@@ -10,15 +10,20 @@ const PROCESS_CHAIN: &str = r#"
             # We reject the request if the protocol is not https
             !(match $PROTOCOL https) && reject;
 
-            # We accept the request if the from buckyos.com
-            #match $REQ_url "*.buckyos.com" && accept;
-
+    
             map-create test1;
             map-add test1 key1 value1;
             map-add test1 key2 value2;
             map-add host "google.com" tag1 tag2;
             map-add host "baidu.com" tag1;
             match-include host "google.com" tag3 && reject;
+
+            local key1 = value1;
+            export key2 = $(append $key1 _value2);
+
+            # We accept the request if the from buckyos.com
+            echo ${REQ_url};
+            match $REQ_url "*.buckyos.com" && accept;
         ]]>
     </block>
 </process_chain>
@@ -220,11 +225,15 @@ async fn test_hook_point() -> Result<(), String> {
     let ret = hook_point_env.exec_list(&hook_point).await.unwrap();
     assert!(ret.is_accept());
 
-    // Rry save the collections to disk if they are persistent and there is changes
+    // Try save the collections to disk if they are persistent and there is changes
     hook_point_env.flush_collections().await.unwrap();
 
+    // Get all output into string from the pipe
+    let output = hook_point_env.pipe().stdout.clone_string();
+    info!("Hook point output: {}", output);
+
     let global_env = hook_point_env.global_env();
-    assert_eq!(global_env.get("key1"), Some("key12".to_string()));
+    assert_eq!(global_env.get("key2"), Some("value1_value2".to_string()));
 
     Ok(())
 }
