@@ -1,11 +1,18 @@
 use crate::*;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 const PROCESS_CHAIN: &str = r#"
 <root>
 <process_chain id="chain2">
     <block id="block1">
         <![CDATA[
+            # We reject the request if the protocol is not https
+            !(match $PROTOCOL https) && reject;
+
+            # We accept the request if the from buckyos.com
+            #match $REQ_url "*.buckyos.com" && accept;
+
             map-create test1;
             map-add test1 key1 value1;
             map-add test1 key2 value2;
@@ -114,6 +121,63 @@ async fn test_process_chain() -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone)]
+struct TestVisitor {
+    url: Arc<RwLock<String>>,
+}
+
+impl TestVisitor {
+    pub fn new() -> Self {
+        Self {
+            url: Arc::new(RwLock::new("http://www.buckyos.com".to_string())),
+        }
+    }
+
+    pub async fn register(&self, manager: &VariableVisitorManager) -> Result<(), String> {
+        let visitor = Arc::new(Box::new(self.clone()) as Box<dyn VariableVisitor>);
+        manager
+            .add_visitor("PROTOCOL", visitor.clone())
+            .await?;
+
+        manager.add_visitor("REQ_from_ip", visitor.clone()).await?;
+        manager.add_visitor("REQ_url", visitor.clone()).await?;
+
+        info!("TestVisitor registered successfully");
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl VariableVisitor for TestVisitor {
+    async fn get(&self, id: &str) -> Result<String, String> {
+        match id {
+            "PROTOCOL" => Ok("https".to_string()),
+            "REQ_from_ip" => Ok("127.0.0.1".to_string()),
+            "REQ_url" => Ok(self.url.read().unwrap().clone()),
+            _ => Err(format!("Variable '{}' not found", id)),
+        }
+    }
+
+    async fn set(&self, id: &str, value: &str) -> Result<Option<String>, String> {
+        match id {
+            "$PROTOCOL" | "REQ_from_ip" => {
+                let msg = format!("Cannot set read-only variable '{}'", id);
+                warn!("{}", msg);
+                return Err(msg);
+            }
+            "REQ_url" => {
+                let mut url = self.url.write().unwrap();
+                let old_value = url.clone();
+                *url = value.to_string();
+
+                info!("Set variable '{}' to '{}'", id, value);
+                return Ok(Some(old_value));
+            }
+            _ => Err(format!("Variable '{}' is read-only", id)),
+        }
+    }
+} 
+
 async fn test_hook_point() -> Result<(), String> {
     // Create a hook point
     let hook_point = HookPoint::new("test_hook_point");
@@ -148,6 +212,10 @@ async fn test_hook_point() -> Result<(), String> {
         )
         .await
         .unwrap();
+
+    // Init some visitors
+    let test_visitor = TestVisitor::new();
+    test_visitor.register(hook_point_env.variable_visitor_manager()).await.unwrap();
 
     let ret = hook_point_env.exec_list(&hook_point).await.unwrap();
     assert!(ret.is_accept());

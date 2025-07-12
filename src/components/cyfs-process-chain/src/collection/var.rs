@@ -10,7 +10,7 @@ pub trait VariableVisitor: Send + Sync {
     /// Sets the value for the variable with the given id.
     /// Returns the previous value if it exists.
     /// If the variable is read-only, it should return an error.
-    async fn set(&self, value: &str) -> Result<Option<String>, String>;
+    async fn set(&self, id: &str, value: &str) -> Result<Option<String>, String>;
 }
 
 pub type VariableVisitorRef = Arc<Box<dyn VariableVisitor>>;
@@ -81,7 +81,7 @@ impl VariableVisitorManager {
     pub async fn set_value(&self, id: &str, value: &str) -> Result<(bool, Option<String>), String> {
         let visitor = self.get_visitor(id).await;
         if let Some(visitor) = visitor {
-            let ret=  visitor.set(value).await?;
+            let ret=  visitor.set(id, value).await?;
             Ok((true, ret))
         } else {
             Ok((false, None))
