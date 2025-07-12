@@ -6,6 +6,8 @@ use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
 use crate::collection::{CollectionManager, VariableVisitorManager};
 use crate::pipe::CommandPipe;
 use std::sync::Arc;
+use super::env::{Env, EnvLevel, EnvRef};
+
 
 pub struct ProcessChainExecutor {}
 
@@ -101,6 +103,7 @@ impl ProcessChainExecutor {
 
 pub struct ProcessChainsExecutor {
     process_chain_manager: ProcessChainManagerRef,
+    global_env: EnvRef,
     collection_manager: CollectionManager,
     variable_visitor_manager: VariableVisitorManager,
     pipe: CommandPipe,
@@ -109,12 +112,14 @@ pub struct ProcessChainsExecutor {
 impl ProcessChainsExecutor {
     pub fn new(
         process_chain_manager: ProcessChainManagerRef,
+        global_env: EnvRef,
         collection_manager: CollectionManager,
         variable_visitor_manager: VariableVisitorManager,
         pipe: CommandPipe,
     ) -> Self {
         Self {
             process_chain_manager,
+            global_env,
             collection_manager,
             variable_visitor_manager,
             pipe,
@@ -134,15 +139,13 @@ impl ProcessChainsExecutor {
     }
 
     pub async fn execute_chain(&self, chain: &ProcessChainRef) -> Result<CommandResult, String> {
-        let global_env = self.process_chain_manager.get_global_env().clone();
-        let chain_env = self.process_chain_manager.create_chain_env();
+        let chain_env = Arc::new(Env::new(EnvLevel::Chain, Some(self.global_env.clone())));
 
         let counter = Arc::new(GotoCounter::new());
         let context = Context::new(
             chain.clone(),
-            global_env,
+            self.global_env.clone(),
             chain_env,
-            self.process_chain_manager.clone(),
             self.collection_manager.clone(),
             self.variable_visitor_manager.clone(),
             counter,
@@ -231,5 +234,120 @@ impl ProcessChainsExecutor {
                 break Ok(ret);
             }
         }
+    }
+}
+
+pub struct ProcessChainListExecutor {
+    process_chain_list: Vec<ProcessChainRef>,
+    global_env: EnvRef,
+    collection_manager: CollectionManager,
+    variable_visitor_manager: VariableVisitorManager,
+    pipe: CommandPipe,
+}
+
+impl ProcessChainListExecutor {
+    pub fn new(
+        process_chain_list: Vec<ProcessChainRef>,
+        global_env: EnvRef,
+        collection_manager: CollectionManager,
+        variable_visitor_manager: VariableVisitorManager,
+        pipe: CommandPipe,
+    ) -> Self {
+        Self {
+            process_chain_list,
+            global_env,
+            collection_manager,
+            variable_visitor_manager,
+            pipe,
+        }
+    }
+
+    pub fn get_chain(&self, id: &str) -> Option<(usize, &ProcessChainRef)> {
+        self.process_chain_list
+            .iter()
+            .enumerate()
+            .find(|(_, chain)| chain.id() == id)
+    }
+
+    pub fn get_chain_index(&self, id: &str) -> Option<usize> {
+        self.process_chain_list
+            .iter()
+            .position(|chain| chain.id() == id)
+    }
+
+    pub async fn execute_all(&self) -> Result<CommandResult, String> {
+        if self.process_chain_list.is_empty() {
+            warn!("No process chains to execute");
+            return Ok(CommandResult::success());
+        }
+
+        // We execute the first chain in the list
+        let chain = &self.process_chain_list[0];
+
+        // Create a exec context for the first chain
+        let chain_env = Arc::new(Env::new(EnvLevel::Chain, Some(self.global_env.clone())));
+        let counter = Arc::new(GotoCounter::new());
+        let context = Context::new(
+            chain.clone(),
+            self.global_env.clone(),
+            chain_env,
+            self.collection_manager.clone(),
+            self.variable_visitor_manager.clone(),
+            counter,
+            self.pipe.clone(),
+        );
+
+        let mut final_result = CommandResult::success();
+        let mut target_context = Some(context);
+
+        let mut chain_index = 0;
+        while chain_index < self.process_chain_list.len() {
+            let chain = &self.process_chain_list[chain_index];
+            info!("Executing process chain: {}, {}", chain_index, chain.id());
+
+            let context = target_context.as_ref().unwrap();
+            let ret = chain.execute(context).await?;
+            if ret.is_control() {
+                let control = ret.as_control().unwrap();
+                if control.is_goto_chain() {
+                    let target_chain_id = control.as_goto_chain().unwrap();
+
+                    let ret = self.get_chain(target_chain_id);
+                    if ret.is_none() {
+                        let msg = format!("Goto process chain '{}' not found", target_chain_id);
+                        warn!("{}", msg);
+                        return Err(msg);
+                    }
+
+                    let (target_index, target) = ret.unwrap();
+
+                    context.counter().increment()?;
+
+                    info!("Goto process chain {}, '{}'", target_index, target_chain_id);
+
+                    target_context = Some(context.fork_chain(target.clone()));
+                    chain_index = target_index;
+
+                    continue;
+                } else if control.is_exit() {
+                    info!(
+                        "Exiting process chain execution from chain '{}'",
+                        chain.id()
+                    );
+                    final_result = ret;
+                    break;
+                } else {
+                    // For other control actions, we just return the result
+                    final_result = ret;
+                }
+            } else {
+                // For normal execution, we just continue to the next chain
+                final_result = ret;
+            }
+
+            chain_index += 1;
+        }
+
+        Ok(final_result)
     }
 }

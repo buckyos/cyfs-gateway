@@ -128,6 +128,10 @@ impl EnvManager {
         }
     }
 
+    pub fn create_chain_env(&self) -> EnvRef {
+        Arc::new(Env::new(EnvLevel::Chain, Some(self.global.clone())))
+    }
+
     fn get_env(&self, level: EnvLevel) -> &EnvRef {
         match level {
             EnvLevel::Global => &self.global,

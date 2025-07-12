@@ -165,6 +165,7 @@ impl HookPointEnv {
 
         let exec = ProcessChainsExecutor::new(
             hook_point.process_chain_manager().clone(),
+            self.global_env.clone(),
             self.collection_manager.clone(),
             self.variable_visitor_manager.clone(),
             self.pipe.pipe().clone(),

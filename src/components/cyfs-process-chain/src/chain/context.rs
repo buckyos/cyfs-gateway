@@ -1,4 +1,4 @@
-use crate::chain::{EnvLevel, EnvManager, EnvRef, ProcessChainManagerRef, ProcessChainRef};
+use crate::chain::{EnvLevel, EnvManager, EnvRef, ProcessChainRef};
 use crate::collection::{CollectionManager, VariableVisitorManager};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
@@ -42,7 +42,6 @@ pub type GotoCounterRef = Arc<GotoCounter>;
 pub struct Context {
     chain: ProcessChainRef, // The chain that this context belongs to
     env: EnvManager,
-    process_chain_manager: ProcessChainManagerRef,
     collection_manager: CollectionManager,
     variable_visitor_manager: VariableVisitorManager,
     goto_counter: GotoCounterRef, // Counter for goto command executions
@@ -54,7 +53,6 @@ impl Context {
         chain: ProcessChainRef,
         global_env: EnvRef,
         chain_env: EnvRef,
-        process_chain_manager: ProcessChainManagerRef,
         collection_manager: CollectionManager,
         variable_visitor_manager: VariableVisitorManager,
         goto_counter: GotoCounterRef,
@@ -65,7 +63,6 @@ impl Context {
         Self {
             chain,
             env: env_manager,
-            process_chain_manager,
             collection_manager,
             variable_visitor_manager,
             goto_counter,
@@ -126,19 +123,14 @@ impl Context {
         self.env.delete(key, None)
     }
 
-    pub fn get_process_chain(&self, id: &str) -> Option<ProcessChainRef> {
-        self.process_chain_manager.get_chain(id)
-    }
-
     pub fn fork_chain(&self, chain: ProcessChainRef) -> Self {
         // Create a new chain environment that inherits from the global environment
-        let chain_env = self.process_chain_manager.create_chain_env();
+        let chain_env = self.env.create_chain_env();
 
         Self::new(
             chain,
             self.env.get_global().clone(),
             chain_env,
-            self.process_chain_manager.clone(),
             self.collection_manager.clone(),
             self.variable_visitor_manager.clone(),
             self.goto_counter.clone(),  // Use the same goto counter for the chain context
@@ -152,7 +144,6 @@ impl Context {
             self.chain.clone(),
             self.env.get_global().clone(),
             self.env.get_chain().clone(),
-            self.process_chain_manager.clone(),
             self.collection_manager.clone(),
             self.variable_visitor_manager.clone(),
             self.goto_counter.clone(), // Use the same goto counter for the block context

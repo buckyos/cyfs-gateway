@@ -1,5 +1,4 @@
 use super::context::Context;
-use super::env::{Env, EnvLevel, EnvRef};
 use super::exec::ProcessChainExecutor;
 use crate::block::*;
 use crate::cmd::{COMMAND_PARSER_FACTORY, CommandResult};
@@ -70,25 +69,13 @@ pub type ProcessChainRef = Arc<ProcessChain>;
 // Manager for process chain with ids
 pub struct ProcessChainManager {
     chains: RwLock<HashMap<String, ProcessChainRef>>,
-    env: EnvRef, // Environment manager for global environment
 }
 
 impl ProcessChainManager {
     pub fn new() -> Self {
         ProcessChainManager {
             chains: RwLock::new(HashMap::new()),
-            env: Arc::new(Env::new(EnvLevel::Global, None)), // Initialize with a new environment
         }
-
-        // TODO: We can load some existing env vars from a persistent storage if needed
-    }
-
-    pub fn get_global_env(&self) -> &EnvRef {
-        &self.env
-    }
-
-    pub fn create_chain_env(&self) -> EnvRef {
-        Arc::new(Env::new(EnvLevel::Chain, Some(self.env.clone())))
     }
 
     pub fn add_chain(&self, chain: ProcessChain) -> Result<(), String> {
