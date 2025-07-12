@@ -276,6 +276,15 @@ impl BlockParser {
         debug!("Parsed command args: {}, {:?}", input, args);
 
         let cmd = if let Some(name) = cmd_name.as_literal_str() {
+            if name.starts_with('-') {
+                let msg = format!("Command name cannot start with '-', got: {}", name);
+                error!("{}", msg);
+                return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                    input,
+                    ErrorKind::Tag,
+                )));
+            }
+
             Expression::Command(CommandItem::new(name.to_owned(), CommandArgs::new(args)))
         } else {
             let msg = format!("Command name must be a literal string, got: {:?}", args[0]);
@@ -406,6 +415,41 @@ impl BlockParser {
         )))
     }
 
+    fn parse_option(input: &str) -> IResult<&str, CommandArg> {
+        debug!("Parsing option: {}", input);
+        let (input, option) = recognize(alt((
+            // Long options start with '--' and can contain letters, digits, underscores, and hyphens
+            pair(
+                tag("--"),
+                pair(
+                    alt((alpha1, tag("_"))),
+                    many0(alt((alphanumeric1, tag("_"), tag("-")))),
+                ),
+            ),
+            // Short options start with '-' and can contain letters, digits, underscores, and hyphens
+            pair(
+                tag("-"),
+                pair(
+                    alt((alpha1, tag("_"))),
+                    many0(alt((alphanumeric1, tag("_")))),
+                ),
+            ),
+        )))
+        .parse(input)?;
+
+        if option == "-" || option == "--" {
+            let msg = format!("Option must have a name after '-' or '--', got: {}", option);
+            error!("{}", msg);
+            return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                input,
+                ErrorKind::Tag,
+            )));
+        }
+
+        debug!("Parsed option: {}, {}", input, option);
+        Ok((input, CommandArg::Literal(option.to_string())))
+    }
+
     fn parse_arg(input: &str) -> IResult<&str, CommandArg> {
         debug!("Parsing arg: {}", input);
         let ret = preceded(
@@ -415,6 +459,7 @@ impl BlockParser {
                 Self::parse_var_braced,    // ${VAR}
                 Self::parse_var_dollar,    // $VAR
                 Self::parse_literal,       // "..." or '...' or unquoted
+                Self::parse_option,        // -o or --option
             )),
         )
         .parse(input)?;
