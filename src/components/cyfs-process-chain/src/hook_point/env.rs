@@ -1,5 +1,5 @@
 use super::hook_point::HookPoint;
-use crate::chain::{Env, EnvLevel, EnvRef, ProcessChainsExecutor};
+use crate::chain::{Env, EnvLevel, EnvRef, ProcessChainListExecutor, ProcessChainsExecutor};
 use crate::cmd::CommandResult;
 use crate::collection::*;
 use crate::pipe::SharedMemoryPipe;
@@ -160,8 +160,28 @@ impl HookPointEnv {
         Ok(())
     }
 
-    pub async fn exec(&self, hook_point: &HookPoint) -> Result<CommandResult, String> {
-        info!("Executing hook point: {}", hook_point.id());
+    // Execute the chain list defined in the hook point
+    pub async fn exec_list(&self, hook_point: &HookPoint) -> Result<CommandResult, String> {
+        info!("Executing hook point chain list: {}", hook_point.id());
+
+        let exec = ProcessChainListExecutor::new(
+            &hook_point.process_chain_manager(),
+            self.global_env.clone(),
+            self.collection_manager.clone(),
+            self.variable_visitor_manager.clone(),
+            self.pipe.pipe().clone(),
+        );
+
+        exec.execute_all().await
+    }
+
+    // Just execute a single chain by id(maybe exec multi chain if there is one or more goto commands)
+    pub async fn exec_chain(
+        &self,
+        hook_point: &HookPoint,
+        id: &str,
+    ) -> Result<CommandResult, String> {
+        info!("Executing process chain: {}", id);
 
         let exec = ProcessChainsExecutor::new(
             hook_point.process_chain_manager().clone(),
@@ -171,6 +191,6 @@ impl HookPointEnv {
             self.pipe.pipe().clone(),
         );
 
-        exec.execute_chain_by_id("chain1").await
+        exec.execute_chain_by_id(id).await
     }
 }

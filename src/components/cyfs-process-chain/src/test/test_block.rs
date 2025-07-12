@@ -48,6 +48,8 @@ async fn test_process_chain() -> Result<(), String> {
     let chains = ProcessChainParser::parse(PROCESS_CHAIN)?;
     assert_eq!(chains.len(), 2);
 
+    let global_env = Arc::new( Env::new(EnvLevel::Global, None));
+
     let manager = ProcessChainManager::new();
     let manager = Arc::new(manager);
 
@@ -86,17 +88,16 @@ async fn test_process_chain() -> Result<(), String> {
     // Create a context with global and chain environment
     let exec = ProcessChainsExecutor::new(
         manager.clone(),
+        global_env.clone(),
         collection_manager.clone(),
         variable_visitor_manager.clone(),
         pipe.pipe().clone(),
     );
 
     // Execute the first chain
-    let ret = exec.execute_chain_by_id("chain1").await.unwrap();
+    let ret: CommandResult = exec.execute_chain_by_id("chain1").await.unwrap();
     info!("Execution result: {:?}", ret);
     assert!(ret.is_accept());
-
-    let global_env = manager.get_global_env();
 
     // Check the environment variables set by the first block
     assert_eq!(global_env.get("key1"), Some("key12".to_string()));

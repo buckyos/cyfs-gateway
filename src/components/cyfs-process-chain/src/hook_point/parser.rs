@@ -1,4 +1,4 @@
-use super::chain::ProcessChain;
+use crate::chain::ProcessChain;
 use crate::block::*;
 use xmltree::Element;
 

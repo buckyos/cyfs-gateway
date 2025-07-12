@@ -1,4 +1,4 @@
-use super::chain::{ProcessChain, ProcessChainManagerRef, ProcessChainRef};
+use super::chain::{ProcessChain, ProcessChainManagerRef, ProcessChainRef, ProcessChainManager};
 use super::context::Context;
 use crate::GotoCounter;
 use crate::block::BlockExecuter;
@@ -247,14 +247,15 @@ pub struct ProcessChainListExecutor {
 
 impl ProcessChainListExecutor {
     pub fn new(
-        process_chain_list: Vec<ProcessChainRef>,
+        process_chain_manager: &ProcessChainManager,
         global_env: EnvRef,
         collection_manager: CollectionManager,
         variable_visitor_manager: VariableVisitorManager,
         pipe: CommandPipe,
     ) -> Self {
+        let mut process_chain_list = process_chain_manager.clone_process_chain_list();
+
         // Ensure the process chain list is sorted by priority
-        let mut process_chain_list = process_chain_list;
         process_chain_list.sort_by_key(|chain| chain.priority());
         
         Self {

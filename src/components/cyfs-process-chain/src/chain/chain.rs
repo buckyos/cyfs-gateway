@@ -2,7 +2,6 @@ use super::context::Context;
 use super::exec::ProcessChainExecutor;
 use crate::block::*;
 use crate::cmd::{COMMAND_PARSER_FACTORY, CommandResult};
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 pub struct ProcessChain {
@@ -74,35 +73,42 @@ pub type ProcessChainRef = Arc<ProcessChain>;
 
 // Manager for process chain with ids
 pub struct ProcessChainManager {
-    chains: RwLock<HashMap<String, ProcessChainRef>>,
+    chains: RwLock<Vec<ProcessChainRef>>,
 }
 
 impl ProcessChainManager {
     pub fn new() -> Self {
         ProcessChainManager {
-            chains: RwLock::new(HashMap::new()),
+            chains: RwLock::new(Vec::new()),
         }
     }
 
     pub fn add_chain(&self, chain: ProcessChain) -> Result<(), String> {
         let mut chains = self.chains.write().unwrap();
-        match chains.entry(chain.id().to_string()) {
-            std::collections::hash_map::Entry::Occupied(_) => {
-                let msg = format!("Process chain with id '{}' already exists", chain.id);
-                error!("{}", msg);
-                return Err(msg);
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Arc::new(chain));
-            }
+        // Check if the chain id is unique
+        if chains.iter().any(|c| c.id() == chain.id) {
+            let msg = format!("Process chain with id '{}' already exists", chain.id);
+            error!("{}", msg);
+            return Err(msg);
         }
+
+        info!("Added process chain with id '{}'", chain.id);
+
+        // Create a reference counted version of the chain
+        let chain_ref = Arc::new(chain);
+        chains.push(chain_ref);
 
         Ok(())
     }
 
     pub fn get_chain(&self, id: &str) -> Option<ProcessChainRef> {
         let chains = self.chains.read().unwrap();
-        chains.get(id).cloned()
+        chains.iter().find(|c| c.id() == id).cloned()
+    }
+
+    pub fn clone_process_chain_list(&self) -> Vec<ProcessChainRef> {
+        let chains = self.chains.read().unwrap();
+        chains.clone()
     }
 }
 
