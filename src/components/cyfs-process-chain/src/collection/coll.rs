@@ -1,5 +1,18 @@
 use std::sync::Arc;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollectionType {
+    Set,
+    Map,
+    MultiMap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollectionFileFormat {
+    Json,
+    Sqlite,
+}
+
 #[async_trait::async_trait]
 pub trait SetCollection: Send + Sync {
     /// Sets the collection with the given value.

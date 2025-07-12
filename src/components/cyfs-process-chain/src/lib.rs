@@ -7,6 +7,7 @@ mod block;
 mod chain;
 mod cmd;
 mod collection;
+mod hook_point;
 mod pipe;
 
 #[cfg(test)]
@@ -16,4 +17,5 @@ pub use block::*;
 pub use chain::*;
 pub use cmd::*;
 pub use collection::*;
+pub use hook_point::*;
 pub use pipe::*;
