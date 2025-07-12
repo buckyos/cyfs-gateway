@@ -200,4 +200,21 @@ impl CollectionManager {
         let collections = self.collections.read().await;
         collections.is_include_key(id, key).await
     }
+
+    /// Flushes all collections to persistent storage if applicable.
+    pub async fn flush(&self) -> Result<(), String> {
+        let collections = self.collections.read().await;
+
+        for collection in collections.set_collections.values() {
+            collection.flush().await?;
+        }
+        for collection in collections.map_collections.values() {
+            collection.flush().await?;
+        }
+        for collection in collections.multi_map_collections.values() {
+            collection.flush().await?;
+        }
+
+        Ok(())
+    }
 }

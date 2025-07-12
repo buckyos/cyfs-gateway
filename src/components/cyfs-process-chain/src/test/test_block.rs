@@ -3,6 +3,18 @@ use std::sync::Arc;
 
 const PROCESS_CHAIN: &str = r#"
 <root>
+<process_chain id="chain2">
+    <block id="block1">
+        <![CDATA[
+            map-create test1;
+            map-add test1 key1 value1;
+            map-add test1 key2 value2;
+            map-add host "google.com" tag1 tag2;
+            map-add host "baidu.com" tag1;
+            match-include host "google.com" tag3 && reject;
+        ]]>
+    </block>
+</process_chain>
 <process_chain id="chain1">
     <block id="block1">
         local key1="key1";
@@ -30,14 +42,6 @@ const PROCESS_CHAIN: &str = r#"
             match-include test key1 && exit drop;
             match-include test key2;
         ]]>
-    </block>
-</process_chain>
-
-<process_chain id="chain2">
-    <block id="block1">
-        map-create test;
-        map-add test key1 value1;
-        map-add test key2 value2;
     </block>
 </process_chain>
 </root>
@@ -113,33 +117,49 @@ async fn test_process_chain() -> Result<(), String> {
 async fn test_hook_point() -> Result<(), String> {
     // Create a hook point
     let hook_point = HookPoint::new("test_hook_point");
-    hook_point.load_process_chain_list(PROCESS_CHAIN).await.unwrap();
+    hook_point
+        .load_process_chain_list(PROCESS_CHAIN)
+        .await
+        .unwrap();
 
     let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
     std::fs::create_dir_all(&data_dir).unwrap();
 
     // Create env to execute the hook point
-    let hook_point_env = HookPointEnv::new(
-        "test-hook-point",
-        data_dir,
-    );
+    let hook_point_env = HookPointEnv::new("test-hook-point", data_dir);
 
     // Load some collections for file
     hook_point_env
-        .load_collection("host", CollectionType::MultiMap, CollectionFileFormat::Json, true).await.unwrap();
+        .load_collection(
+            "host",
+            CollectionType::MultiMap,
+            CollectionFileFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
 
     hook_point_env
-        .load_collection("ip", CollectionType::MultiMap, CollectionFileFormat::Json, true).await.unwrap();
-    
+        .load_collection(
+            "ip",
+            CollectionType::MultiMap,
+            CollectionFileFormat::Json,
+            true,
+        )
+        .await
+        .unwrap();
+
     let ret = hook_point_env.exec_list(&hook_point).await.unwrap();
     assert!(ret.is_accept());
-    
+
+    // Rry save the collections to disk if they are persistent and there is changes
+    hook_point_env.flush_collections().await.unwrap();
+
     let global_env = hook_point_env.global_env();
     assert_eq!(global_env.get("key1"), Some("key12".to_string()));
 
     Ok(())
 }
-
 
 #[tokio::test]
 async fn test_process_chain_main() {

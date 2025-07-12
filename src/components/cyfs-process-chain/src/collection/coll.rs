@@ -26,6 +26,12 @@ pub trait SetCollection: Send + Sync {
 
     /// Gets all values in the collection.
     async fn get_all(&self) -> Result<Vec<String>, String>;
+
+    /// Flushes the collection to persistent storage if applicable.
+    async fn flush(&self) -> Result<(), String> {
+        // Default implementation does nothing, can be overridden by specific collections
+        Ok(())
+    }
 }
 
 pub type SetCollectionRef = Arc<Box<dyn SetCollection>>;
@@ -43,6 +49,12 @@ pub trait MapCollection: Send + Sync {
 
     /// Removes the key from the collection.
     async fn remove(&self, key: &str) -> Result<Option<String>, String>;
+
+    /// Flushes the collection to persistent storage if applicable.
+    async fn flush(&self) -> Result<(), String> {
+        // Default implementation does nothing, can be overridden by specific collections
+        Ok(())
+    }
 }
 
 pub type MapCollectionRef = Arc<Box<dyn MapCollection>>;
@@ -75,6 +87,12 @@ pub trait MultiMapCollection: Send + Sync {
     /// Removes all values for the given key from the collection.
     /// If the key is not found, it returns false.
     async fn remove_all(&self, key: &str) -> Result<bool, String>;
+
+    /// Flushes the collection to persistent storage if applicable.
+    async fn flush(&self) -> Result<(), String> {
+        // Default implementation does nothing, can be overridden by specific collections
+        Ok(())
+    }
 }
 
 pub type MultiMapCollectionRef = Arc<Box<dyn MultiMapCollection>>;

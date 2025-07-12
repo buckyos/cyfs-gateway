@@ -57,6 +57,10 @@ impl HookPointEnv {
         &self.pipe
     }
 
+    pub async fn flush_collections(&self) -> Result<(), String> {
+        self.collection_manager.flush().await
+    }
+    
     pub async fn load_collection(
         &self,
         id: &str,

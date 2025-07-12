@@ -7,77 +7,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/*
-pub struct JsonFileCollection<T: Send + Sync + for<'a> Deserialize<'a> + Serialize + Default> {
-    file: PathBuf,
-    is_dirty: AtomicBool,
-    data: RwLock<T>,
-}
-
-impl<T: Send + Sync + for<'a> Deserialize<'a> + Serialize + Default> JsonFileCollection<T> {
-    pub fn new(file: PathBuf) -> Result<Self, String> {
-        let data = Self::load(&file)?;
-
-        Ok(Self {
-            data: RwLock::new(data),
-            file,
-            is_dirty: AtomicBool::new(false),
-        })
-    }
-
-    fn load(file: &Path) -> Result<T, String> {
-        if file.exists() {
-            let content = std::fs::read_to_string(file).map_err(|e| {
-                let msg = format!("Failed to read file {}: {}", file.display(), e);
-                msg
-            })?;
-
-            let ret: T = serde_json::from_str(&content).map_err(|e| {
-                let msg = format!("Failed to parse JSON from file {}: {}", file.display(), e);
-                msg
-            })?;
-
-            Ok(ret)
-        } else {
-            Ok(T::default())
-        }
-    }
-
-    fn save(&self) -> Result<(), String> {
-        let content = {
-            let data = self.data.read().unwrap();
-            serde_json::to_string(&*data).map_err(|e| {
-                let msg = format!("Failed to serialize data to JSON: {}", e);
-                msg
-            })?
-        };
-
-        std::fs::write(&self.file, content).map_err(|e| {
-            let msg = format!("Failed to write to file {}: {}", self.file.display(), e);
-            msg
-        })?;
-
-        Ok(())
-    }
-
-    pub fn flush(&self) -> Result<(), String> {
-        if self.is_dirty() {
-            self.save()?;
-            self.is_dirty.store(false, Ordering::SeqCst);
-        }
-
-        Ok(())
-    }
-
-    fn mark_dirty(&self) {
-        self.is_dirty.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_dirty(&self) -> bool {
-        self.is_dirty.load(Ordering::SeqCst)
-    }
-}
-*/
 
 pub struct JsonFileCollection<T: Send + Sync + for<'a> Deserialize<'a> + Serialize + Default> {
     file: PathBuf,
@@ -199,6 +128,10 @@ impl SetCollection for JsonSetCollection {
     async fn get_all(&self) -> Result<Vec<String>, String> {
         self.data.get_all().await
     }
+
+    async fn flush(&self) -> Result<(), String> {
+        self.flush()
+    }
 }
 
 #[derive(Clone)]
@@ -256,6 +189,10 @@ impl MapCollection for JsonMapCollection {
         }
 
         Ok(ret)
+    }
+
+    async fn flush(&self) -> Result<(), String> {
+        self.flush()
     }
 }
 
@@ -343,6 +280,10 @@ impl MultiMapCollection for JsonMultiMapCollection {
         }
 
         Ok(ret)
+    }
+
+    async fn flush(&self) -> Result<(), String> {
+        self.flush()
     }
 }
 
