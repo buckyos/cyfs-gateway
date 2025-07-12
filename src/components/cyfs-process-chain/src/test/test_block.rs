@@ -53,12 +53,14 @@ async fn test_process_chain() -> Result<(), String> {
 
     let collection_manager = CollectionManager::new();
     let variable_visitor_manager = VariableVisitorManager::new();
+    let pipe = SharedMemoryPipe::new_empty();
 
     // Create a context with global and chain environment
     let exec = ProcessChainsExecutor::new(
         manager.clone(),
         collection_manager.clone(),
         variable_visitor_manager.clone(),
+        pipe.pipe().clone(),
     );
 
     // Execute the first chain

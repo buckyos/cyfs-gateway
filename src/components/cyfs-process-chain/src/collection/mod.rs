@@ -3,6 +3,7 @@ mod manager;
 // mod storage;
 mod mem;
 mod var;
+mod file;
 
 // pub use storage::*;
 

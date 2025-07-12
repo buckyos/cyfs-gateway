@@ -12,6 +12,16 @@ impl MemorySetCollection {
             data: RwLock::new(HashSet::new()),
         }
     }
+
+    pub(crate) fn from_set(set: HashSet<String>) -> Self {
+        Self {
+            data: RwLock::new(set),
+        }
+    }
+
+    pub fn data(&self) -> &RwLock<HashSet<String>> {
+        &self.data
+    }
 }
 
 #[async_trait::async_trait]
@@ -46,6 +56,16 @@ impl MemoryMapCollection {
         Self {
             data: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn from_map(map: HashMap<String, String>) -> Self {
+        Self {
+            data: RwLock::new(map),
+        }
+    }
+
+    pub fn data(&self) -> &RwLock<HashMap<String, String>> {
+        &self.data
     }
 }
 
@@ -82,6 +102,16 @@ impl MemoryMultiMapCollection {
         Self {
             data: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn from_map(map: HashMap<String, HashSet<String>>) -> Self {
+        Self {
+            data: RwLock::new(map),
+        }
+    }
+
+    pub fn data(&self) -> &RwLock<HashMap<String, HashSet<String>>> {
+        &self.data
     }
 }
 
