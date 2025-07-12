@@ -17,12 +17,18 @@ const PROCESS_CHAIN: &str = r#"
         map-create test;
         map-add test key1 value1;
         map-add test key2 $key2;
+
+        map-create -multi test_multi;
+        map-add test_multi key1 value1 value2 value3;
+        map-add test_multi key2 value2;
+        map-remove test_multi key1 value1;
     </block>
     <block id="block2">
         <![CDATA[
-            match-include key3 test && accept;
-            match-include key1 test && exit drop;
-            match-include key2 test;
+            match-include test_multi key1 value2 value3 && accept;
+            match-include test key3 && accept;
+            match-include test key1 && exit drop;
+            match-include test key2;
         ]]>
     </block>
 </process_chain>
@@ -64,7 +70,9 @@ async fn test_process_chain() -> Result<(), String> {
     );
 
     // Execute the first chain
-    exec.execute_chain_by_id("chain1").await.unwrap();
+    let ret = exec.execute_chain_by_id("chain1").await.unwrap();
+    info!("Execution result: {:?}", ret);
+    assert!(ret.is_accept());
 
     let global_env = manager.get_global_env();
 

@@ -4,6 +4,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+pub enum CollectionResult {
+    Set(SetCollectionRef),
+    Map(MapCollectionRef),
+    MultiMap(MultiMapCollectionRef),
+}
+
 pub enum MapCollectionResult {
     Map(MapCollectionRef),
     MultiMap(MultiMapCollectionRef),
@@ -38,6 +44,20 @@ impl Collections {
         }
         if let Some(collection) = self.multi_map_collections.get(id) {
             return Some(MapCollectionResult::MultiMap(collection.clone()));
+        }
+
+        None
+    }
+
+    fn get_collection(&self, id: &str) -> Option<CollectionResult> {
+        if let Some(collection) = self.set_collections.get(id) {
+            return Some(CollectionResult::Set(collection.clone()));
+        }
+        if let Some(collection) = self.map_collections.get(id) {
+            return Some(CollectionResult::Map(collection.clone()));
+        }
+        if let Some(collection) = self.multi_map_collections.get(id) {
+            return Some(CollectionResult::MultiMap(collection.clone()));
         }
 
         None
@@ -169,6 +189,11 @@ impl CollectionManager {
     pub async fn get_map_collection(&self, id: &str) -> Option<MapCollectionResult> {
         let collections = self.collections.read().await;
         collections.get_map_collection(id)
+    }
+
+    pub async fn get_collection(&self, id: &str) -> Option<CollectionResult> {
+        let collections = self.collections.read().await;
+        collections.get_collection(id)
     }
 
     pub async fn is_include_key(&self, id: &str, key: &str) -> Result<bool, String> {

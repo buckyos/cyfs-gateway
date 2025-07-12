@@ -1,12 +1,13 @@
 use super::cmd::{CommandExecutor, CommandExecutorRef, CommandParser, CommandResult};
 use crate::block::CommandArgs;
 use crate::chain::Context;
-use crate::collection::MapCollectionResult;
+use crate::collection::{CollectionResult, MapCollectionResult};
 use std::sync::Arc;
 
 /*
 // Map collection commands support both normal map and multi map.
 match-include map_id key	// for normal map
+match-include map_id key value1	// for normal map or multi map
 match-include map_id key value1 value2 // for multi map
 
 map-create [-multi] map_id
@@ -19,7 +20,8 @@ map-remove map_id key value	// for multi map
 map-get map_id key	// for both map, return value or value collection
 */
 
-// match_include <var> <collection_id>
+// match_include <collection_id> <var> // for normal set/map or multi map
+
 // Check if the variable is included in the specified collection
 pub struct MatchIncludeCommandParser {}
 
@@ -31,9 +33,9 @@ impl MatchIncludeCommandParser {
 
 impl CommandParser for MatchIncludeCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have exactly two elements
-        if args.len() != 2 {
-            let msg = format!("Invalid match_include command: {:?}", args);
+        // Args should have at least two elements
+        if args.len() < 2 {
+            let msg = format!("Invalid match-include command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
@@ -43,26 +45,39 @@ impl CommandParser for MatchIncludeCommandParser {
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
         assert!(
-            args.len() == 2,
-            "MatchInclude command should have exactly 2 args"
+            args.len() >= 2,
+            "match-include command should have at least 2 args"
         );
 
-        let cmd = MatchIncludeCommandExecutor::new(args[0], args[1]);
+        let collection_id = args[0];
+        let key = args[1];
+        let values = if args.len() > 2 {
+            // If there are more than 2 args, we treat them as values
+            args[2..]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()
+        } else {
+            vec![]
+        };
+        let cmd = MatchIncludeCommandExecutor::new(collection_id, key, values);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // MatchIncludeCommandExecutor
 pub struct MatchIncludeCommandExecutor {
-    pub key: String,
     pub collection_id: String,
+    pub key: String,
+    pub values: Vec<String>,
 }
 
 impl MatchIncludeCommandExecutor {
-    pub fn new(key: &str, collection_id: &str) -> Self {
+    pub fn new(collection_id: &str, key: &str, values: Vec<String>) -> Self {
         Self {
-            key: key.to_owned(),
             collection_id: collection_id.to_owned(),
+            key: key.to_owned(),
+            values,
         }
     }
 }
@@ -71,19 +86,107 @@ impl MatchIncludeCommandExecutor {
 impl CommandExecutor for MatchIncludeCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Get the collection from the context
-        let contains = context
+        let ret = context
             .collection_manager()
-            .is_include_key(&self.collection_id, &self.key)
-            .await?;
+            .get_collection(&self.collection_id)
+            .await;
+        if ret.is_none() {
+            let msg = format!("Collection with id '{}' not found", self.collection_id);
+            warn!("{}", msg);
+            return Ok(CommandResult::error_with_value(msg));
+        }
 
-        info!(
-            "MatchInclude command: key='{}', collection_id='{}', contains={}",
-            self.key, self.collection_id, contains
-        );
-        if contains {
-            Ok(CommandResult::success())
-        } else {
-            Ok(CommandResult::error())
+        match ret.unwrap() {
+            CollectionResult::Set(collection) => {
+                // For set collection, we check if the key is included
+                let contains = collection.contains(&self.key).await?;
+                info!(
+                    "MatchInclude command: key='{}', collection_id='{}', contains={}",
+                    self.key, self.collection_id, contains
+                );
+                if contains {
+                    Ok(CommandResult::success())
+                } else {
+                    Ok(CommandResult::error())
+                }
+            }
+            CollectionResult::Map(collection) => {
+                // For map collection, we check if the key exists and matches the value
+                let value = collection.get(&self.key).await?;
+                if let Some(value) = value {
+                    if self.values.is_empty() {
+                        info!(
+                            "MatchInclude command: key='{}', collection_id='{}', value='{}' found",
+                            self.key, self.collection_id, value
+                        );
+                        return Ok(CommandResult::success());
+                    } else {
+                        if self.values.len() > 1 {
+                            warn!(
+                                "match-include command for map with id '{}' expects at most one value, got {}",
+                                self.collection_id,
+                                self.values.len()
+                            );
+                        }
+
+                        // Only check if the first value matches
+                        if self.values[0] == value {
+                            info!(
+                                "MatchInclude command: key='{}', collection_id='{}', value='{}' found",
+                                self.key, self.collection_id, value
+                            );
+                            return Ok(CommandResult::success());
+                        }
+                    }
+                }
+
+                info!(
+                    "MatchInclude command: key='{}', collection_id='{}', no matching key or value found",
+                    self.key, self.collection_id
+                );
+
+                Ok(CommandResult::error())
+            }
+
+            CollectionResult::MultiMap(collection) => {
+                // For multi-map collection, we check if the key exists and matches any of the values
+                let values = collection.get_many(&self.key).await?;
+                if let Some(values) = values {
+                    if self.values.is_empty() {
+                        info!(
+                            "MatchInclude command: key='{}', collection_id='{}'",
+                            self.key, self.collection_id
+                        );
+
+                        return Ok(CommandResult::success());
+                    } else {
+                        // Check if all values match
+                        let mut all_match = false;
+                        for value in &self.values {
+                            if !values.contains(value).await? {
+                                all_match = false;
+                                break;
+                            } else {
+                                all_match = true;
+                            }
+                        }
+
+                        if all_match {
+                            info!(
+                                "MatchInclude command: key='{}', collection_id='{}', values match",
+                                self.key, self.collection_id
+                            );
+                            return Ok(CommandResult::success());
+                        }
+                    }
+                }
+
+                info!(
+                    "MatchInclude command: key='{}', collection_id='{}', no matching key or values found",
+                    self.key, self.collection_id
+                );
+                Ok(CommandResult::error())
+            }
         }
     }
 }

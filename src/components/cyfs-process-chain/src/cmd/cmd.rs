@@ -197,6 +197,18 @@ impl CommandResult {
         matches!(self, CommandResult::Control(_))
     }
 
+    pub fn is_accept(&self) -> bool {
+        matches!(self, CommandResult::Control(CommandControl::Exit(value)) if value == CommandAction::Accept.as_str())
+    }
+
+    pub fn is_drop(&self) -> bool {
+        matches!(self, CommandResult::Control(CommandControl::Exit(value)) if value == CommandAction::Drop.as_str())
+    }
+
+    pub fn is_reject(&self) -> bool {
+        matches!(self, CommandResult::Control(CommandControl::Exit(value)) if value == CommandAction::Reject.as_str())
+    }
+
     pub fn into_control(self) -> Option<CommandControl> {
         if let CommandResult::Control(action) = self {
             Some(action)
