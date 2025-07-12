@@ -69,9 +69,7 @@ impl VariableVisitorManager {
     pub async fn get_value(&self, id: &str) -> Result<Option<String>, String> {
         let visitor = self.get_visitor(id).await;
         if let Some(visitor) = visitor {
-            let ret = visitor
-                .get(id)
-                .await?;
+            let ret = visitor.get(id).await?;
             Ok(Some(ret))
         } else {
             Ok(None)
@@ -81,10 +79,78 @@ impl VariableVisitorManager {
     pub async fn set_value(&self, id: &str, value: &str) -> Result<(bool, Option<String>), String> {
         let visitor = self.get_visitor(id).await;
         if let Some(visitor) = visitor {
-            let ret=  visitor.set(id, value).await?;
+            let ret = visitor.set(id, value).await?;
             Ok((true, ret))
         } else {
             Ok((false, None))
+        }
+    }
+}
+
+use crate::collection::MapCollectionRef;
+
+#[derive(Debug, Clone)]
+pub struct VariableVisitorItem {
+    pub id: String,
+    pub key: String,
+    pub read_only: bool,
+}
+
+pub struct VariableVisitorWrapperForMapCollection {
+    collection: MapCollectionRef,
+    vars: HashMap<String, VariableVisitorItem>,
+}
+
+impl VariableVisitorWrapperForMapCollection {
+    pub fn new(collection: MapCollectionRef) -> Self {
+        Self {
+            collection,
+            vars: HashMap::new(),
+        }
+    }
+
+    pub fn add_variable(&mut self, id: &str, key: &str, read_only: bool) {
+        self.vars.insert(
+            id.to_string(),
+            VariableVisitorItem {
+                id: id.to_string(),
+                key: key.to_string(),
+                read_only,
+            },
+        );
+    }
+}
+
+#[async_trait::async_trait]
+impl VariableVisitor for VariableVisitorWrapperForMapCollection {
+    async fn get(&self, id: &str) -> Result<String, String> {
+        if let Some(item) = self.vars.get(id) {
+            match self.collection.get(&item.key).await? {
+                Some(value) => Ok(value),
+                None => Ok("".to_string()),
+            }
+        } else {
+            // FIXME: Should not reach here if the variable is registered?
+            let msg = format!("Variable '{}' not registered", id);
+            warn!("{}", msg);
+            Err(msg)
+        }
+    }
+
+    async fn set(&self, id: &str, value: &str) -> Result<Option<String>, String> {
+        if let Some(item) = self.vars.get(id) {
+            if item.read_only {
+                let msg = format!("Cannot set read-only variable '{}'", id);
+                warn!("{}", msg);
+                return Err(msg);
+            }
+
+            self.collection.insert(&item.key, value).await
+        } else {
+            // FIXME: Should not reach here if the variable is registered?
+            let msg = format!("Variable '{}' not registered", id);
+            warn!("{}", msg);
+            Err(msg)
         }
     }
 }

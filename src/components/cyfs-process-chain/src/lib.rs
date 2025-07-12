@@ -9,6 +9,7 @@ mod cmd;
 mod collection;
 mod hook_point;
 mod pipe;
+mod http;
 
 #[cfg(test)]
 mod test;

@@ -1,104 +1,131 @@
-use http_types::{Request, Response};
+use crate::collection::*;
+use http_types::{Request, Url};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestItemType {
-    // Use for write indeed
-    Normal,
+const HTTP_REQUEST_HEADER_VARS: &[(&str, &str, bool)] = &[
+    ("REQ_host", "host", true),
+    ("REQ_method", "method", true),
+    ("REQ_content_length", "content-length", true),
+    ("REQ_content_type", "content-type", true),
+    ("REQ_user_agent", "user-agent", true),
+];
 
-    // Use for virtual write(assign)
-    Virtual,
+#[derive(Clone)]
+pub struct HttpRequestHeaderMap {
+    request: Arc<RwLock<Request>>,
 }
 
-pub struct RequestItem {
-    pub type_: RequestItemType,
-    pub req: Request,
-    pub resp: Option<Response>,
-}
-
-impl RequestItem {
-    pub fn new(req: Request, resp: Option<Response>) -> Self {
+impl HttpRequestHeaderMap {
+    pub fn new(request: Request) -> Self {
         Self {
-            type_: RequestItemType::Normal,
-            req,
-            resp,
+            request: Arc::new(RwLock::new(request)),
         }
     }
 
-    pub fn fork_virtual(&self) -> Self {
-        Self {
-            type_: RequestItemType::Virtual,
-            req: Request::new(self.req.method().clone(), self.req.url().clone()),
-            resp: self.resp.as_ref().map(|r| Response::new(r.status())),
-        }
-    }
+    pub async fn register_visitors(
+        &self,
+        visitor_manager: &VariableVisitorManager,
+    ) -> Result<(), String> {
+        // First register visitors for var in header
+        let coll = Arc::new(Box::new(self.clone()) as Box<dyn MapCollection>);
+        let mut wrapper = VariableVisitorWrapperForMapCollection::new(coll);
 
-    pub fn get_method(&self) -> http_types::Method {
-        self.req.method()
-    }
-
-    pub fn set_method(&mut self, method: http_types::Method) {
-        if self.req.method() == method {
-            return;
+        for item in HTTP_REQUEST_HEADER_VARS {
+            wrapper.add_variable(item.0, item.1, item.2);
         }
 
-        info!(
-            "Method changed from {} to {}",
-            self.req.method(),
-            method
-        );
-        self.req.set_method(method);
-    }
-
-    // Header related
-    pub fn get_header(&self, key: &str) -> Option<&str> {
-        self.req.header(key).map(|h| h.as_str())
-    }
-
-    pub fn set_header(&mut self, key: &str, value: &str) {
-        if let Some(prev) = self.req.insert_header(key, value) {
-            info!(
-                "Header {} already exists, will be replaced, old value: {}",
-                key, prev
-            );
-        } else {
-            debug!("Set header {} to value {}", key, value);
-        }
-    }
-
-    pub fn append_header(&mut self, key: &str, value: &str) {
-        self.req.append_header(key, value);
-         
-        debug!("Append header {} with value {}", key, value);
-    }
-
-    pub fn get_resp_header(&self, key: &str) -> Option<&str> {
-        self.resp
-            .as_ref()
-            .and_then(|r| r.header(key))
-            .map(|h| h.as_str())
-    }
-
-    pub fn set_resp_header(&mut self, key: &str, value: &str) -> Result<(), String> {
-        if self.resp.is_none() {
-            let msg = "Response not set yet".to_string();
-            error!("{}", msg);
-            return Err(msg);
+        let visitor = Arc::new(Box::new(wrapper) as Box<dyn VariableVisitor>);
+        for (id, _, _) in HTTP_REQUEST_HEADER_VARS {
+            visitor_manager.add_visitor(*id, visitor.clone()).await?;
         }
 
-        if let Some(prev) = self.resp.as_mut().unwrap().insert_header(key, value) {
-            info!(
-                "Response header {} already exists, will be replaced, old value: {}",
-                key, prev
-            );
-        } else {
-            debug!("Set response header {} to value {}", key, value);
-        }
+        // Url visitor
+        let url_visitor = HttpRequestUrlVisitor::new(self.request.clone(), false);
+        visitor_manager
+            .add_visitor(
+                "REQ_url",
+                Arc::new(Box::new(url_visitor) as Box<dyn VariableVisitor>),
+            )
+            .await?;
 
         Ok(())
     }
+}
 
-    // Body related
-    pub fn get_content_type(&self) -> Option<String> {
-        self.req.content_type().map(|c| c.to_string())
+#[async_trait::async_trait]
+impl MapCollection for HttpRequestHeaderMap {
+    async fn insert(&self, key: &str, value: &str) -> Result<Option<String>, String> {
+        let mut request = self.request.write().await;
+        let prev = request.insert_header(key, value);
+        if let Some(prev_value) = prev {
+            Ok(Some(prev_value.to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<String>, String> {
+        let request = self.request.read().await;
+        Ok(request.header(key).map(|h| h.to_string()))
+    }
+
+    async fn contains_key(&self, key: &str) -> Result<bool, String> {
+        let request = self.request.read().await;
+        Ok(request.header(key).is_some())
+    }
+
+    async fn remove(&self, key: &str) -> Result<Option<String>, String> {
+        let mut request = self.request.write().await;
+        let prev = request.remove_header(key);
+        if let Some(prev_value) = prev {
+            Ok(Some(prev_value.to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+// Url visitor for HTTP requests
+#[derive(Clone)]
+pub struct HttpRequestUrlVisitor {
+    request: Arc<RwLock<Request>>,
+    read_only: bool,
+}
+
+impl HttpRequestUrlVisitor {
+    pub fn new(request: Arc<RwLock<Request>>, read_only: bool) -> Self {
+        Self { request, read_only }
+    }
+}
+
+#[async_trait::async_trait]
+impl VariableVisitor for HttpRequestUrlVisitor {
+    async fn get(&self, _id: &str) -> Result<String, String> {
+        let request = self.request.read().await;
+        let ret = request.url().to_string();
+
+        Ok(ret)
+    }
+
+    async fn set(&self, id: &str, value: &str) -> Result<Option<String>, String> {
+        if self.read_only {
+            let msg = format!("Cannot set read-only variable '{}'", id);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let new_url = Url::parse(value).map_err(|e| {
+            let msg = format!("Invalid URL '{}': {}", value, e);
+            warn!("{}", msg);
+            msg
+        })?;
+
+        let mut request = self.request.write().await;
+        let old_value = request.url().to_string();
+        *request.url_mut() = new_url;
+
+        info!("Set request url variable '{}' to '{}'", id, value);
+        Ok(Some(old_value))
     }
 }
