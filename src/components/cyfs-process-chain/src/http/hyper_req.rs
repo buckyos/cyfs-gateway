@@ -1,22 +1,17 @@
+use super::req::HTTP_REQUEST_HEADER_VARS;
 use crate::collection::*;
-use http_types::{Request, Url};
+use hyper::{Uri, header::HeaderName};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-pub const HTTP_REQUEST_HEADER_VARS: &[(&str, &str, bool)] = &[
-    ("REQ_host", "host", true),
-    ("REQ_method", "method", true),
-    ("REQ_content_length", "content-length", true),
-    ("REQ_content_type", "content-type", true),
-    ("REQ_user_agent", "user-agent", true),
-];
+type Request = hyper::Request<hyper::Body>;
 
 #[derive(Clone)]
-pub struct HttpRequestHeaderMap {
+pub struct HyperHttpRequestHeaderMap {
     request: Arc<RwLock<Request>>,
 }
 
-impl HttpRequestHeaderMap {
+impl HyperHttpRequestHeaderMap {
     pub fn new(request: Request) -> Self {
         Self {
             request: Arc::new(RwLock::new(request)),
@@ -30,7 +25,7 @@ impl HttpRequestHeaderMap {
 
         Ok(req)
     }
-    
+
     pub async fn register_visitors(
         &self,
         visitor_manager: &VariableVisitorManager,
@@ -49,7 +44,7 @@ impl HttpRequestHeaderMap {
         }
 
         // Url visitor
-        let url_visitor = HttpRequestUrlVisitor::new(self.request.clone(), false);
+        let url_visitor = HyperHttpRequestUrlVisitor::new(self.request.clone(), false);
         visitor_manager
             .add_visitor(
                 "REQ_url",
@@ -62,12 +57,32 @@ impl HttpRequestHeaderMap {
 }
 
 #[async_trait::async_trait]
-impl MapCollection for HttpRequestHeaderMap {
+impl MapCollection for HyperHttpRequestHeaderMap {
     async fn insert(&self, key: &str, value: &str) -> Result<Option<String>, String> {
         let mut request = self.request.write().await;
-        let prev = request.insert_header(key, value);
+        let header = value.parse().map_err(|e| {
+            let msg = format!("Invalid header value '{}': {}", value, e);
+            warn!("{}", msg);
+            msg
+        })?;
+
+        let name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
+            let msg = format!("Invalid header name '{}': {}", key, e);
+            warn!("{}", msg);
+            msg.to_string()
+        })?;
+
+        let prev = request.headers_mut().insert(name, header);
         if let Some(prev_value) = prev {
-            Ok(Some(prev_value.to_string()))
+            let prev = match prev_value.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    let msg = format!("Header value for '{}' is not valid UTF-8", key);
+                    warn!("{}", msg);
+                    "".to_string()
+                }
+            };
+            Ok(Some(prev))
         } else {
             Ok(None)
         }
@@ -75,19 +90,38 @@ impl MapCollection for HttpRequestHeaderMap {
 
     async fn get(&self, key: &str) -> Result<Option<String>, String> {
         let request = self.request.read().await;
-        Ok(request.header(key).map(|h| h.to_string()))
+        let ret = request.headers().get(key);
+        if let Some(value) = ret {
+            if let Ok(value_str) = value.to_str() {
+                Ok(Some(value_str.to_owned()))
+            } else {
+                warn!("Header value for '{}' is not valid UTF-8", key);
+                Ok(Some("".to_string()))
+            }
+        } else {
+            warn!("Header '{}' not found", key);
+            Ok(None)
+        }
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
         let request = self.request.read().await;
-        Ok(request.header(key).is_some())
+        Ok(request.headers().get(key).is_some())
     }
 
     async fn remove(&self, key: &str) -> Result<Option<String>, String> {
         let mut request = self.request.write().await;
-        let prev = request.remove_header(key);
+        let prev = request.headers_mut().remove(key);
         if let Some(prev_value) = prev {
-            Ok(Some(prev_value.to_string()))
+            let prev = match prev_value.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    let msg = format!("Header value for '{}' is not valid UTF-8", key);
+                    warn!("{}", msg);
+                    "".to_string()
+                }
+            };
+            Ok(Some(prev))
         } else {
             Ok(None)
         }
@@ -96,22 +130,22 @@ impl MapCollection for HttpRequestHeaderMap {
 
 // Url visitor for HTTP requests
 #[derive(Clone)]
-pub struct HttpRequestUrlVisitor {
+pub struct HyperHttpRequestUrlVisitor {
     request: Arc<RwLock<Request>>,
     read_only: bool,
 }
 
-impl HttpRequestUrlVisitor {
+impl HyperHttpRequestUrlVisitor {
     pub fn new(request: Arc<RwLock<Request>>, read_only: bool) -> Self {
         Self { request, read_only }
     }
 }
 
 #[async_trait::async_trait]
-impl VariableVisitor for HttpRequestUrlVisitor {
+impl VariableVisitor for HyperHttpRequestUrlVisitor {
     async fn get(&self, _id: &str) -> Result<String, String> {
         let request = self.request.read().await;
-        let ret = request.url().to_string();
+        let ret = request.uri().to_string();
 
         Ok(ret)
     }
@@ -123,15 +157,15 @@ impl VariableVisitor for HttpRequestUrlVisitor {
             return Err(msg);
         }
 
-        let new_url = Url::parse(value).map_err(|e| {
+        let new_url = value.parse::<Uri>().map_err(|e| {
             let msg = format!("Invalid URL '{}': {}", value, e);
             warn!("{}", msg);
             msg
         })?;
 
         let mut request = self.request.write().await;
-        let old_value = request.url().to_string();
-        *request.url_mut() = new_url;
+        let old_value = request.uri().to_string();
+        *request.uri_mut() = new_url;
 
         info!("Set request url variable '{}' to '{}'", id, value);
         Ok(Some(old_value))

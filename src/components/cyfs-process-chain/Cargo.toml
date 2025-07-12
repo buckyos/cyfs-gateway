@@ -19,3 +19,4 @@ globset = "*"
 tokio = { version = "*", features = ["full"] }
 simplelog = "*"
 lazy_static = "*"
+hyper = { version = "0.14", features = ["full"] }
