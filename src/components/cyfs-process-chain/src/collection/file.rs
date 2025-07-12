@@ -1,11 +1,10 @@
-use crate::collection::mem::MemorySetCollection;
-
 use super::coll::*;
 use super::mem::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /*
@@ -146,9 +145,10 @@ impl<T: Send + Sync + for<'a> Deserialize<'a> + Serialize + Default> JsonFileCol
     }
 }
 
+#[derive(Clone)]
 pub struct JsonSetCollection {
-    data: MemorySetCollection,
-    file: JsonFileCollection<HashSet<String>>,
+    data: Arc<MemorySetCollection>,
+    file: Arc<JsonFileCollection<HashSet<String>>>,
 }
 
 impl JsonSetCollection {
@@ -156,7 +156,10 @@ impl JsonSetCollection {
         let file = JsonFileCollection::new(file);
         let set = file.load()?;
         let data = MemorySetCollection::from_set(set);
-        Ok(Self { data, file })
+        Ok(Self {
+            data: Arc::new(data),
+            file: Arc::new(file),
+        })
     }
 
     pub fn flush(&self) -> Result<(), String> {
@@ -198,9 +201,10 @@ impl SetCollection for JsonSetCollection {
     }
 }
 
+#[derive(Clone)]
 pub struct JsonMapCollection {
-    data: MemoryMapCollection,
-    file: JsonFileCollection<HashMap<String, String>>,
+    data: Arc<MemoryMapCollection>,
+    file: Arc<JsonFileCollection<HashMap<String, String>>>,
 }
 
 impl JsonMapCollection {
@@ -208,7 +212,10 @@ impl JsonMapCollection {
         let file = JsonFileCollection::new(file);
         let map = file.load()?;
         let data = MemoryMapCollection::from_map(map);
-        Ok(Self { data, file })
+        Ok(Self {
+            data: Arc::new(data),
+            file: Arc::new(file),
+        })
     }
 
     pub fn flush(&self) -> Result<(), String> {
@@ -252,9 +259,10 @@ impl MapCollection for JsonMapCollection {
     }
 }
 
+#[derive(Clone)]
 pub struct JsonMultiMapCollection {
-    data: MemoryMultiMapCollection,
-    file: JsonFileCollection<HashMap<String, HashSet<String>>>,
+    data: Arc<MemoryMultiMapCollection>,
+    file: Arc<JsonFileCollection<HashMap<String, HashSet<String>>>>,
 }
 
 impl JsonMultiMapCollection {
@@ -262,7 +270,10 @@ impl JsonMultiMapCollection {
         let file = JsonFileCollection::new(file);
         let map = file.load()?;
         let data = MemoryMultiMapCollection::from_map(map);
-        Ok(Self { data, file })
+        Ok(Self {
+            data: Arc::new(data),
+            file: Arc::new(file),
+        })
     }
 
     pub fn flush(&self) -> Result<(), String> {
@@ -335,7 +346,6 @@ impl MultiMapCollection for JsonMultiMapCollection {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,7 +367,7 @@ mod tests {
         for i in 0..10 {
             collection.insert(&format!("value{}", i)).await.unwrap();
         }
-        
+
         collection.flush().unwrap();
 
         // Test loading from file
@@ -375,20 +385,35 @@ mod tests {
         std::fs::remove_file(&file_path).ok(); // Clean up before test
         let collection = JsonMapCollection::new(file_path.clone()).unwrap();
         assert_eq!(collection.insert("key1", "value1").await.unwrap(), None);
-        assert_eq!(collection.insert("key1", "value1").await.unwrap(), Some("value1".to_string()));
-        assert_eq!(collection.get("key1").await.unwrap(), Some("value1".to_string()));
-        assert_eq!(collection.remove("key1").await.unwrap(), Some("value1".to_string()));
+        assert_eq!(
+            collection.insert("key1", "value1").await.unwrap(),
+            Some("value1".to_string())
+        );
+        assert_eq!(
+            collection.get("key1").await.unwrap(),
+            Some("value1".to_string())
+        );
+        assert_eq!(
+            collection.remove("key1").await.unwrap(),
+            Some("value1".to_string())
+        );
         assert_eq!(collection.get("key1").await.unwrap(), None);
 
         for i in 0..10 {
-            collection.insert(&format!("key{}", i), &format!("value{}", i)).await.unwrap();
+            collection
+                .insert(&format!("key{}", i), &format!("value{}", i))
+                .await
+                .unwrap();
         }
-        
+
         collection.flush().unwrap();
 
         // Test loading from file
         let loaded_collection = JsonMapCollection::new(file_path).unwrap();
-        assert_eq!(loaded_collection.get("key5").await.unwrap(), Some("value5".to_string()));
+        assert_eq!(
+            loaded_collection.get("key5").await.unwrap(),
+            Some("value5".to_string())
+        );
         assert_eq!(loaded_collection.get("non_existent").await.unwrap(), None);
     }
 
@@ -400,12 +425,15 @@ mod tests {
         println!("Using file: {:?}", file_path);
         std::fs::remove_file(&file_path).ok(); // Clean up before test
         let collection = JsonMultiMapCollection::new(file_path.clone()).unwrap();
-        
+
         assert!(collection.insert("key1", "value1").await.unwrap());
         assert!(collection.insert("key1", "value2").await.unwrap());
         assert!(collection.get("key1").await.unwrap().is_some());
 
-        let changed = collection.insert_many("key1", &["value1", "value2"]).await.unwrap();
+        let changed = collection
+            .insert_many("key1", &["value1", "value2"])
+            .await
+            .unwrap();
         assert!(!changed); // No change since values already exist
 
         let ret = collection.get_many("key1").await.unwrap();
@@ -413,25 +441,31 @@ mod tests {
         let ret = ret.unwrap();
         assert!(ret.contains("value1").await.unwrap());
         assert!(ret.contains("value2").await.unwrap());
-        
+
         let values = collection.get_many("key1").await.unwrap().unwrap();
         assert!(values.contains("value1").await.unwrap());
         assert!(values.contains("value2").await.unwrap());
 
         assert!(collection.remove("key1", "value1").await.unwrap());
-        assert_eq!(collection.get("key1").await.unwrap(), Some("value2".to_string()));
+        assert_eq!(
+            collection.get("key1").await.unwrap(),
+            Some("value2".to_string())
+        );
 
         let ret = collection.get_many("key1").await.unwrap();
         assert!(ret.is_some());
         let ret = ret.unwrap();
         assert!(ret.contains("value2").await.unwrap());
         assert!(!ret.contains("value1").await.unwrap());
-        
+
         // Insert multiple values
         for i in 1..10 {
-            let value_list: Vec<String> = (0..i+2).map(|j| format!("value{}", j)).collect();
+            let value_list: Vec<String> = (0..i + 2).map(|j| format!("value{}", j)).collect();
             let value_list: Vec<&str> = value_list.iter().map(|s| s.as_str()).collect();
-            collection.insert_many(&format!("key{}", i), &value_list).await.unwrap();
+            collection
+                .insert_many(&format!("key{}", i), &value_list)
+                .await
+                .unwrap();
         }
 
         collection.flush().unwrap();

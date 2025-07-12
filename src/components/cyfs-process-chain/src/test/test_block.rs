@@ -58,6 +58,28 @@ async fn test_process_chain() -> Result<(), String> {
     }
 
     let collection_manager = CollectionManager::new();
+
+    // Load host db and ip db from file
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Load host db, if not exists, it create a new one
+    let host_db_file = data_dir.join("host.json");
+    let host_db = JsonMultiMapCollection::new(host_db_file.clone()).unwrap();
+
+    collection_manager
+        .add_multi_map_collection("host", Arc::new(Box::new(host_db.clone())))
+        .await
+        .unwrap();
+
+    // Load ip db, if not exists, it create a new one
+    let ip_db_file = data_dir.join("ip.json");
+    let ip_db = JsonMultiMapCollection::new(ip_db_file.clone()).unwrap();
+    collection_manager
+        .add_multi_map_collection("ip", Arc::new(Box::new(ip_db.clone())))
+        .await
+        .unwrap();
+
     let variable_visitor_manager = VariableVisitorManager::new();
     let pipe = SharedMemoryPipe::new_empty();
 

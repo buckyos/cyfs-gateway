@@ -1,12 +1,11 @@
 mod coll;
+mod file;
 mod manager;
-// mod storage;
 mod mem;
 mod var;
-mod file;
 
-// pub use storage::*;
-
-pub use manager::*;
 pub use coll::*;
+pub use file::*;
+pub use manager::*;
+pub use mem::*;
 pub use var::*;
