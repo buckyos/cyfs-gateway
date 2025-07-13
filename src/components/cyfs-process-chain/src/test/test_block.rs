@@ -246,7 +246,7 @@ async fn test_process_chain_main() {
         ColorChoice::Auto,
     )
     .unwrap_or_else(|_| {
-        // 如果 TermLogger 不可用（如在某些环境），回退到 SimpleLogger
+        // If TermLogger is not available (e.g., in some environments), fall back to SimpleLogger
         SimpleLogger::init(LevelFilter::Info, Config::default()).unwrap()
     });
 

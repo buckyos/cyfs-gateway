@@ -111,6 +111,7 @@ impl CommandExecutor for RewriteCommand {
                         .env()
                         .set(self.key.as_str(), &rewritten, None)
                         .await?;
+                    info!("Rewritten value for {}: {} -> {}", self.key, key_value, rewritten);
                     Ok(CommandResult::success_with_value(rewritten))
                 } else {
                     Ok(CommandResult::success())

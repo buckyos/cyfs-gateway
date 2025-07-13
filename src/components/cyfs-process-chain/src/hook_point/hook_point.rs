@@ -43,3 +43,5 @@ impl HookPoint {
         Ok(())
     }
 }
+
+pub type HookPointRef = Arc<HookPoint>;

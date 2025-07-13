@@ -79,8 +79,16 @@ impl Context {
         current_chain.clone()
     }
 
+    pub fn chain_env(&self) -> &EnvRef {
+        self.env.get_chain()
+    }
+
     pub fn collection_manager(&self) -> &CollectionManager {
         &self.collection_manager
+    }
+
+    pub fn chain_collections(&self) -> &Collections {
+        self.collection_manager.get_chain_collections()
     }
 
     pub fn env(&self) -> &EnvManager {

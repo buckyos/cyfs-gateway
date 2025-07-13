@@ -268,6 +268,22 @@ impl ProcessChainListExecutor {
         &self.context
     }
 
+    pub fn chain_env(&self) -> &EnvRef {
+        self.context.chain_env()
+    }
+
+    pub fn global_env(&self) -> &EnvRef {
+        &self.global_env
+    }
+
+    pub fn chain_collections(&self) -> &Collections {
+        self.context.chain_collections()
+    }
+
+    pub fn global_collections(&self) -> &Collections {
+        &self.global_collections
+    }
+
     pub fn get_chain(&self, id: &str) -> Option<(usize, &ProcessChainRef)> {
         self.process_chain_list
             .iter()

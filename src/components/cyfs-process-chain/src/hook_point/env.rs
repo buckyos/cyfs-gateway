@@ -217,3 +217,5 @@ impl HookPointEnv {
     }
     */
 }
+
+pub type HookPointEnvRef = Arc<HookPointEnv>;

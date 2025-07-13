@@ -1,9 +1,11 @@
+use super::hyper_req::HyperHttpRequestHeaderMap;
 use hyper::body::to_bytes;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
 use hyper::{Client, Uri};
 use hyper::{Method, StatusCode};
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use crate::*;
 
@@ -13,11 +15,12 @@ const PROCESS_CHAIN: &str = r#"
     <block id="block1">
         <![CDATA[
             # We reject the request if the protocol is not https
-            !(match $PROTOCOL https) && reject;
+            #!(match $PROTOCOL https) && reject;
 
             # We accept the request if the from buckyos.com
             echo ${REQ_url};
             match $REQ_url "*.buckyos.com" && accept;
+            rewrite  $REQ_url "**/index.html" "**/buckyos/index.html";
         ]]>
     </block>
 </process_chain>
@@ -67,10 +70,12 @@ impl HttpHookManager {
     }
 }
 
-async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+type HttpHookManagerRef = Arc<HttpHookManager>;
+
+async fn process_request(req: Request<Body>) -> Result<Response<Body>, Infallible> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/") => {
-            println!("Received a GET request");
+            info!("Received a GET request {}", req.uri());
             Ok(Response::new(Body::from("Hello, World!")))
         }
         _ => {
@@ -81,9 +86,62 @@ async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {
     }
 }
 
+async fn handle(
+    req: Request<Body>,
+    hook_manager: HttpHookManagerRef,
+) -> Result<Response<Body>, Infallible> {
+    // Create a HyperHttpRequestHeaderMap from the request
+    let req_map = HyperHttpRequestHeaderMap::new(req);
+
+    {
+        let exec = hook_manager
+            .hook_point_env
+            .prepare_exec_list(&hook_manager.hook_point);
+
+        // Register visitors for the request headers in the chain environment
+        let chain_env = exec.chain_env();
+        req_map
+            .register_visitors(&chain_env.variable_visitor_manager())
+            .await
+            .unwrap();
+
+        exec.chain_collections()
+            .add_map_collection("REQ", Arc::new(Box::new(req_map.clone()) as Box<dyn MapCollection>))
+            .await
+            .unwrap();
+
+        // Exec the process chain list
+        let ret = exec.execute_all().await.unwrap();
+
+        if ret.is_control() {
+            if ret.is_drop() {
+                info!("Request dropped by the process chain");
+                return Ok(Response::new(Body::from("Request dropped")));
+            } else if ret.is_reject() {
+                info!("Request rejected by the process chain");
+                let mut response = Response::new(Body::from("Request rejected"));
+                *response.status_mut() = StatusCode::FORBIDDEN;
+                return Ok(response);
+            } else {
+                info!("Request accepted by the process chain");
+            }
+        }
+    }
+
+    let req = req_map.into_request().unwrap();
+
+    process_request(req).await
+}
+
 async fn server_main() {
+    let hok_manager = HttpHookManager::create(PROCESS_CHAIN).await.unwrap();
+    let hook_manager = Arc::new(hok_manager);
+
     let addr = ([127, 0, 0, 1], 3000).into();
-    let make_svc = make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(handle)) });
+    let make_svc = make_service_fn(move |_conn| {
+        let hook_manager = hook_manager.clone();
+        async move { Ok::<_, Infallible>(service_fn(move |req| handle(req, hook_manager.clone()))) }
+    });
 
     let server = Server::bind(&addr).serve(make_svc);
 
@@ -95,7 +153,7 @@ async fn server_main() {
 async fn client_main() {
     let client = Client::new();
 
-    let uri = "http://127.0.0.1:3000".parse::<Uri>().unwrap();
+    let uri = "http://127.0.0.1:3000/index.html".parse::<Uri>().unwrap();
     let resp = client.get(uri).await.unwrap();
 
     assert!(resp.status().is_success());
@@ -106,6 +164,18 @@ async fn client_main() {
 
 #[tokio::test]
 async fn test_main() {
+    use simplelog::*;
+    TermLogger::init(
+        LevelFilter::Info,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        // If TermLogger is not available (e.g., in some environments), fall back to SimpleLogger
+        SimpleLogger::init(LevelFilter::Info, Config::default()).unwrap()
+    });
+
     tokio::spawn(async {
         server_main().await;
     });
