@@ -10,8 +10,7 @@ const PROCESS_CHAIN: &str = r#"
             # We reject the request if the protocol is not https
             !(match $PROTOCOL https) && reject;
 
-    
-            map-create test1;
+            map-create -multi -chain test1;
             map-add test1 key1 value1;
             map-add test1 key2 value2;
             map-add host "google.com" tag1 tag2;
@@ -240,7 +239,7 @@ async fn test_hook_point() -> Result<(), String> {
 async fn test_process_chain_main() {
     use simplelog::*;
     TermLogger::init(
-        LevelFilter::Debug,
+        LevelFilter::Info,
         Config::default(),
         TerminalMode::Mixed,
         ColorChoice::Auto,

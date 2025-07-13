@@ -1,7 +1,8 @@
 use super::cmd::{CommandExecutor, CommandExecutorRef, CommandParser, CommandResult};
+use super::helper::CommandArgHelper;
 use crate::block::CommandArgs;
 use crate::chain::Context;
-use crate::collection::{CollectionResult, MapCollectionResult, CollectionLevel};
+use crate::collection::{CollectionLevel, CollectionResult, MapCollectionResult};
 use std::sync::Arc;
 
 /*
@@ -10,7 +11,7 @@ match-include map_id key	// for normal map
 match-include map_id key value1	// for normal map or multi map
 match-include map_id key value1 value2 // for multi map
 
-map-create [-multi] map_id
+map-create [-multi] [-global] map_id
 
 map-add map_id key value	// for normal map, accept only one value
 map-add map_id key value1 value2	// for multi map, accept multi value at one call
@@ -191,7 +192,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
     }
 }
 
-/// set_create <set_id>
+/// set-create [-global|-chain] <set_id>
 /// Create a new set collection with the given id.
 pub struct SetCreateCommandParser {}
 
@@ -203,11 +204,16 @@ impl SetCreateCommandParser {
 
 impl CommandParser for SetCreateCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have exactly one element
-        if args.len() != 1 {
-            let msg = format!("Invalid set_create command: {:?}", args);
+        // Args should have at least one element
+        if args.len() < 1 {
+            let msg = format!("Invalid set-create command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
+        }
+
+        // Check options
+        if args.len() > 1 {
+            CommandArgHelper::check_origin_options(args, &[&["global", "chain"]])?;
         }
 
         Ok(())
@@ -215,11 +221,30 @@ impl CommandParser for SetCreateCommandParser {
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
         assert!(
-            args.len() == 1,
-            "SetCreate command should have exactly 1 arg"
+            args.len() >= 1,
+            "set-create command should have at least 1 arg"
         );
 
-        let cmd = SetCreateCommandExecutor::new(args[0]);
+        // Parse options
+        let mut level = CollectionLevel::Chain; // Default to chain level
+        if args.len() > 1 {
+            let options = CommandArgHelper::parse_options(args, &[&["global", "chain"]])?;
+            for option in options {
+                if option == "global" {
+                    // Set level to Global
+                    level = CollectionLevel::Global;
+                } else if option == "chain" {
+                    // Set level to Chain
+                    level = CollectionLevel::Chain;
+                } else {
+                    let msg = format!("Invalid option '{}' in set-create command", option);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
+        }
+
+        let cmd = SetCreateCommandExecutor::new(level, args[0]);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -231,9 +256,9 @@ pub struct SetCreateCommandExecutor {
 }
 
 impl SetCreateCommandExecutor {
-    pub fn new(set_id: &str) -> Self {
+    pub fn new(level: CollectionLevel, set_id: &str) -> Self {
         Self {
-            level: CollectionLevel::Chain, // Default to chain level
+            level,
             set_id: set_id.to_owned(),
         }
     }
@@ -256,7 +281,10 @@ impl CommandExecutor for SetCreateCommandExecutor {
                 Ok(CommandResult::success())
             }
             None => {
-                let msg = format!("Failed to create set collection with id '{}' {:?}", self.set_id, self.level);
+                let msg = format!(
+                    "Failed to create set collection with id '{}' {:?}",
+                    self.set_id, self.level
+                );
                 warn!("{}", msg);
                 Ok(CommandResult::error_with_value(msg))
             }
@@ -264,7 +292,7 @@ impl CommandExecutor for SetCreateCommandExecutor {
     }
 }
 
-/// set_add <set_id> <value>
+/// set-add <set_id> <value>
 /// Add a value to the specified set collection.
 /// If the value not exists, it will be added and the command will succeed.
 /// If the value already exists, the command will fail.
@@ -280,7 +308,7 @@ impl CommandParser for SetAddCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should have exactly two elements
         if args.len() != 2 {
-            let msg = format!("Invalid set_add command: {:?}", args);
+            let msg = format!("Invalid set-add command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
@@ -431,7 +459,7 @@ impl CommandExecutor for SetRemoveCommandExecutor {
     }
 }
 
-/// map create [-multi] [-global] <map_id>
+/// map-create [-multi] [-global|-chain] <map_id>
 /// Create a new map collection with the given id, default is chain level.
 /// If the map already exists, it will fail
 pub struct MapCreateCommandParser {}
@@ -444,28 +472,16 @@ impl MapCreateCommandParser {
 
 impl CommandParser for MapCreateCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have exactly one element
-        if args.len() < 1 || args.len() > 2 {
+        // Args should have exactly one elements
+        if args.len() < 1 {
             let msg = format!("Invalid map-create command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
 
-        // If there is options start with "-", it should be "-multi" or "--multi" "-global" or "--global"
-        if args.len() == 2 {
-            let param = args.get(0).unwrap();
-            if !param.is_literal() {
-                let msg = format!("Invalid map-create command param: {:?}", args);
-                error!("{}", msg);
-                return Err(msg);
-            }
-
-            let param = param.as_literal_str().unwrap();
-            if param != "-multi" && param != "--multi" {
-                let msg = format!("Invalid map-create command: {:?}", args);
-                error!("{}", msg);
-                return Err(msg);
-            }
+        // If there is options start with "-", it should be "-multi""-global" or "-chain"
+        if args.len() > 1 {
+            CommandArgHelper::check_origin_options(args, &[&["multi"], &["global", "chain"]])?;
         }
 
         Ok(())
@@ -473,13 +489,39 @@ impl CommandParser for MapCreateCommandParser {
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
         assert!(
-            args.len() == 1 || args.len() == 2,
-            "map-create command should have 1 or 2 args"
+            args.len() >= 1,
+            "map-create command should have at least 1 arg"
         );
 
-        let is_multi = args.len() == 2 && (args[0] == "-multi" || args[0] == "--multi");
+        // Parse options
+        let mut is_multi = false; // Default to single map
+        let mut level = CollectionLevel::Chain; // Default to chain level
+        if args.len() > 1 {
+            let options =
+                CommandArgHelper::parse_options(args, &[&["multi"], &["global", "chain"]])?;
+            for option in options {
+                if option == "multi" {
+                    // Set is_multi to true
+                    is_multi = true;
+                } else if option == "global" {
+                    // Set level to Global
+                    level = CollectionLevel::Global;
+                } else if option == "chain" {
+                    // Set level to Chain
+                    level = CollectionLevel::Chain;
+                } else {
+                    let msg = format!("Invalid option '{}' in map-create command", option);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
+        }
 
-        let cmd = MapCreateCommandExecutor::new(is_multi, if is_multi { args[1] } else { args[0] });
+        let cmd = MapCreateCommandExecutor::new(
+            is_multi,
+            level,
+            if is_multi { args[1] } else { args[0] },
+        );
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -487,14 +529,14 @@ impl CommandParser for MapCreateCommandParser {
 // MapCreateCommandExecutor
 pub struct MapCreateCommandExecutor {
     level: CollectionLevel, // Chain or Global
-    is_multi: bool, // Indicates if this is a multi-map
+    is_multi: bool,         // Indicates if this is a multi-map
     map_id: String,
 }
 
 impl MapCreateCommandExecutor {
-    pub fn new(is_multi: bool, map_id: &str) -> Self {
+    pub fn new(is_multi: bool, level: CollectionLevel, map_id: &str) -> Self {
         Self {
-            level: CollectionLevel::Chain, // Default to chain level
+            level,
             is_multi,
             map_id: map_id.to_owned(),
         }
@@ -539,8 +581,8 @@ impl CommandExecutor for MapCreateCommandExecutor {
     }
 }
 
-/// map_add <map_id> <key> <value>; // for normal map
-/// map_add <map_id> <key> <value1> <value2>; // for multi map
+/// map-add <map_id> <key> <value>; // for normal map
+/// map-add <map_id> <key> <value1> <value2>; // for multi map
 /// Set a key-value pair in the specified map collection.
 /// If the key already exists, it will be updated and the command will succeed.
 /// If the key does not exist, it will be added and the command will succeed.
@@ -556,7 +598,7 @@ impl CommandParser for MapAddCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should have at least three elements
         if args.len() < 3 {
-            let msg = format!("Invalid map_add command: {:?}", args);
+            let msg = format!("Invalid map-add command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
@@ -829,7 +871,7 @@ impl CommandParser for MapGetCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should have exactly two elements
         if args.len() != 2 {
-            let msg = format!("Invalid map_get command: {:?}", args);
+            let msg = format!("Invalid map-get command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }

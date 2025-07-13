@@ -37,7 +37,7 @@ impl BlockParser {
         for (i, line) in lines.iter().enumerate() {
             debug!("Parsing line {}: {}", i, line.trim());
             let parsed_line = Self::parse_line(line)?;
-            debug!("Parsed line {}: {:?}", i, parsed_line);
+            info!("Parsed line {}: {:?}", i, parsed_line);
             block.lines.push(parsed_line);
         }
 
