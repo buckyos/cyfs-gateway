@@ -1,8 +1,8 @@
-use crate::chain::{EnvLevel, EnvManager, EnvRef, ProcessChainRef};
-use crate::collection::{CollectionManager, VariableVisitorManager};
-use std::sync::atomic::AtomicU32;
-use std::sync::Arc;
+use crate::chain::{EnvManager, EnvRef, ProcessChainRef};
+use crate::collection::CollectionManager;
 use crate::pipe::CommandPipe;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 
 pub const MAX_GOTO_COUNT: u32 = 128; // Maximum number of times the goto command can be executed in process chains execution
 
@@ -43,9 +43,8 @@ pub struct Context {
     chain: ProcessChainRef, // The chain that this context belongs to
     env: EnvManager,
     collection_manager: CollectionManager,
-    variable_visitor_manager: VariableVisitorManager,
     goto_counter: GotoCounterRef, // Counter for goto command executions
-    pipe: CommandPipe, // Pipe for command execution
+    pipe: CommandPipe,            // Pipe for command execution
 }
 
 impl Context {
@@ -54,7 +53,6 @@ impl Context {
         global_env: EnvRef,
         chain_env: EnvRef,
         collection_manager: CollectionManager,
-        variable_visitor_manager: VariableVisitorManager,
         goto_counter: GotoCounterRef,
         pipe: CommandPipe,
     ) -> Self {
@@ -64,7 +62,6 @@ impl Context {
             chain,
             env: env_manager,
             collection_manager,
-            variable_visitor_manager,
             goto_counter,
             pipe,
         }
@@ -89,39 +86,6 @@ impl Context {
     pub fn pipe(&self) -> &CommandPipe {
         &self.pipe
     }
-    
-    pub async fn get_env_value(&self, key: &str) -> Result<Option<String>, String> {
-        // First check if the key in visitor manager
-        if let Some(value) = self.variable_visitor_manager.get_value(key).await? {
-            return Ok(Some(value));
-        }
-
-        // Then treat it as a regular environment variable
-        let ret = self.env.get(key, None);
-        Ok(ret)
-    }
-
-    pub async fn set_env_value(
-        &self,
-        key: &str,
-        value: &str,
-        level: Option<EnvLevel>,
-    ) -> Result<Option<String>, String> {
-        info!("Setting env value: {} = {}", key, value);
-        // First check if the key in visitor manager
-        let (exists, ret) = self.variable_visitor_manager.set_value(key, value).await?;
-        if exists {
-            return Ok(ret);
-        }
-
-        // Then treat it as a regular environment variable
-        let ret = self.env.set(key, value, level);
-        Ok(ret)
-    }
-
-    pub fn delete_env_value(&self, key: &str) -> Option<String> {
-        self.env.delete(key, None)
-    }
 
     pub fn fork_chain(&self, chain: ProcessChainRef) -> Self {
         // Create a new chain environment that inherits from the global environment
@@ -132,8 +96,7 @@ impl Context {
             self.env.get_global().clone(),
             chain_env,
             self.collection_manager.clone(),
-            self.variable_visitor_manager.clone(),
-            self.goto_counter.clone(),  // Use the same goto counter for the chain context
+            self.goto_counter.clone(), // Use the same goto counter for the chain context
             self.pipe.clone(),
         )
     }
@@ -145,7 +108,6 @@ impl Context {
             self.env.get_global().clone(),
             self.env.get_chain().clone(),
             self.collection_manager.clone(),
-            self.variable_visitor_manager.clone(),
             self.goto_counter.clone(), // Use the same goto counter for the block context
             self.pipe.clone(),
         )

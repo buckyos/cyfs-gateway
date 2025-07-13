@@ -1,3 +1,4 @@
+use crate::collection::VariableVisitorManager;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -28,16 +29,22 @@ pub struct Env {
     level: EnvLevel,
     values: RwLock<HashMap<String, String>>,
     parent: Option<EnvRef>,
+
+    variable_visitor_manager: VariableVisitorManager,
 }
 
 pub type EnvRef = Arc<Env>;
 
 impl Env {
     pub fn new(level: EnvLevel, parent: Option<EnvRef>) -> Self {
+        let variable_visitor_manager = VariableVisitorManager::new();
+
         Self {
             level,
             values: RwLock::new(HashMap::new()),
             parent,
+
+            variable_visitor_manager,
         }
     }
 
@@ -49,41 +56,80 @@ impl Env {
         self.parent.as_ref()
     }
 
-    pub fn set(&self, key: &str, value: &str) -> Option<String> {
+    pub fn variable_visitor_manager(&self) -> &VariableVisitorManager {
+        &self.variable_visitor_manager
+    }
+
+    pub async fn set(&self, key: &str, value: &str) -> Result<Option<String>, String> {
+        // First check if the key in visitor manager
+        let (exists, ret) = self.variable_visitor_manager.set_value(key, value).await?;
+        if exists {
+            return Ok(ret);
+        }
+
+        // Then set it in the environment
         let mut values = self.values.write().unwrap();
         if let Some(prev) = values.insert(key.to_string(), value.to_string()) {
             info!(
                 "Env {} key {} already exists, will be replaced, old value: {}",
-                self.level.as_str(), key, prev
+                self.level.as_str(),
+                key,
+                prev
             );
-            Some(prev)
+            Ok(Some(prev))
         } else {
-            debug!("Set {} env key {} to value {}", self.level.as_str(), key, value);
-            None
+            debug!(
+                "Set {} env key {} to value {}",
+                self.level.as_str(),
+                key,
+                value
+            );
+            Ok(None)
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<String> {
-        let values = self.values.read().unwrap();
-        if let Some(value) = values.get(key) {
-            return Some(value.clone());
+    #[async_recursion::async_recursion]
+    pub async fn get(&self, key: &str) -> Result<Option<String>, String> {
+        // First check if the key in visitor manager
+        if let Some(value) = self.variable_visitor_manager.get_value(key).await? {
+            return Ok(Some(value));
+        }
+
+        {
+            let values = self.values.read().unwrap();
+            if let Some(value) = values.get(key) {
+                return Ok(Some(value.clone()));
+            }
         }
 
         if let Some(parent) = &self.parent {
-            return parent.get(key);
+            return parent.get(key).await;
         }
 
-        None
+        Ok(None)
     }
 
-    pub fn delete(&self, key: &str) -> Option<String> {
+    pub async fn delete(&self, key: &str) -> Result<Option<String>, String> {
+        // First check if the key in visitor manager
+        if let Some(_) = self.variable_visitor_manager.get_value(key).await? {
+            let msg = format!("Cannot delete visitor variable '{}'", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        // Then delete it from the environment
         let mut values = self.values.write().unwrap();
         if let Some(prev) = values.remove(key) {
-            info!("Env {} key {} removed, old value: {}", self.level.as_str(), key, prev);
-            Some(prev)
+            info!(
+                "Env {} key {} removed, old value: {}",
+                self.level.as_str(),
+                key,
+                prev
+            );
+            Ok(Some(prev))
         } else {
             info!("Env {} key {} not found", self.level.as_str(), key);
-            None
+            Ok(None)
         }
     }
 
@@ -103,7 +149,7 @@ pub struct EnvManager {
     block: EnvRef,
 
     // Tracking variables current level
-    var_level_tracker: Arc<RwLock<HashMap<String, EnvLevel>>>, 
+    var_level_tracker: Arc<RwLock<HashMap<String, EnvLevel>>>,
 }
 
 impl EnvManager {
@@ -165,11 +211,7 @@ impl EnvManager {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 if level != EnvLevel::default() {
                     entry.insert(level);
-                    info!(
-                        "Variable '{}' set to level '{}'",
-                        key,
-                        level.as_str()
-                    );
+                    info!("Variable '{}' set to level '{}'", key, level.as_str());
                 }
             }
         }
@@ -212,53 +254,67 @@ impl EnvManager {
     }
 
     // Set a value in the environment, level can be specified or default to chain level
-    pub fn set(&self, key: &str, value: &str, level: Option<EnvLevel>) -> Option<String> {
+    pub async fn set(
+        &self,
+        key: &str,
+        value: &str,
+        level: Option<EnvLevel>,
+    ) -> Result<Option<String>, String> {
         let level = level.unwrap_or_default();
-        let ret = self.set_inner(level, key, value);
+        let ret = self.set_inner(level, key, value).await?;
         self.change_var_level(key, Some(level));
 
-        ret
+        Ok(ret)
     }
 
-    fn set_inner(&self, level: EnvLevel, key: &str, value: &str) -> Option<String> {
+    async fn set_inner(
+        &self,
+        level: EnvLevel,
+        key: &str,
+        value: &str,
+    ) -> Result<Option<String>, String> {
         match level {
-            EnvLevel::Global => self.global.set(key, value),
-            EnvLevel::Chain => self.chain.set(key, value),
-            EnvLevel::Block => self.block.set(key, value),
+            EnvLevel::Global => self.global.set(key, value).await,
+            EnvLevel::Chain => self.chain.set(key, value).await,
+            EnvLevel::Block => self.block.set(key, value).await,
         }
     }
 
-    pub fn get(&self, key: &str, level: Option<EnvLevel>) -> Option<String> {
+    pub async fn get(&self, key: &str, level: Option<EnvLevel>) -> Result<Option<String>, String> {
         let level = match level {
             Some(l) => l,
             None => self.get_var_level(key),
         };
 
-        self.get_inner(level, key)
+        self.get_inner(level, key).await
     }
 
-    fn get_inner(&self, level: EnvLevel, key: &str) -> Option<String> {
+    async fn get_inner(&self, level: EnvLevel, key: &str) -> Result<Option<String>, String> {
         match level {
-            EnvLevel::Global => self.global.get(key),
-            EnvLevel::Chain => self.chain.get(key),
-            EnvLevel::Block => self.block.get(key),
+            EnvLevel::Global => self.global.get(key).await,
+            EnvLevel::Chain => self.chain.get(key).await,
+            EnvLevel::Block => self.block.get(key).await,
         }
     }
 
-    pub fn delete(&self, key: &str, level: Option<EnvLevel>) -> Option<String> {
+    pub async fn delete(
+        &self,
+        key: &str,
+        level: Option<EnvLevel>,
+    ) -> Result<Option<String>, String> {
         let level = match level {
             Some(l) => l,
             None => self.get_var_level(key),
         };
 
-        self.delete_inner(level, key)
+        self.delete_inner(level, key).await
     }
 
-    fn delete_inner(&self, level: EnvLevel, key: &str) -> Option<String> {
+    async fn delete_inner(&self, level: EnvLevel, key: &str) -> Result<Option<String>, String> {
         match level {
-            EnvLevel::Global => self.global.delete(key),
-            EnvLevel::Chain => self.chain.delete(key),
-            EnvLevel::Block => self.block.delete(key),
+            EnvLevel::Global => self.global.delete(key).await,
+            EnvLevel::Chain => self.chain.delete(key).await,
+            EnvLevel::Block => self.block.delete(key).await,
         }
     }
 

@@ -83,7 +83,8 @@ impl CommandExecutor for AssignCommand {
             Some(ref value) => {
                 // Handle assignment with value
                 context
-                    .set_env_value(self.key.as_str(), value, Some(env_level))
+                    .env()
+                    .set(self.key.as_str(), value, Some(env_level))
                     .await?;
 
                 Ok(CommandResult::success_with_value(value))

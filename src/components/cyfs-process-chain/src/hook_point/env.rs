@@ -11,15 +11,12 @@ pub struct HookPointEnv {
     data_dir: PathBuf,
     collection_manager: CollectionManager,
     global_env: EnvRef,
-    variable_visitor_manager: VariableVisitorManager,
     pipe: SharedMemoryPipe,
 }
 
 impl HookPointEnv {
     pub fn new(id: impl Into<String>, data_dir: PathBuf) -> Self {
         let collection_manager = CollectionManager::new();
-
-        let variable_visitor_manager = VariableVisitorManager::new();
         let pipe: SharedMemoryPipe = SharedMemoryPipe::new_empty();
 
         let global_env = Arc::new(Env::new(EnvLevel::Global, None));
@@ -28,7 +25,6 @@ impl HookPointEnv {
             data_dir,
             collection_manager,
             global_env,
-            variable_visitor_manager,
             pipe,
         }
     }
@@ -49,8 +45,9 @@ impl HookPointEnv {
         &self.global_env
     }
 
+    // Return variable visitor manager in global env
     pub fn variable_visitor_manager(&self) -> &VariableVisitorManager {
-        &self.variable_visitor_manager
+        &self.global_env.variable_visitor_manager()
     }
 
     pub fn pipe(&self) -> &SharedMemoryPipe {
@@ -60,7 +57,7 @@ impl HookPointEnv {
     pub async fn flush_collections(&self) -> Result<(), String> {
         self.collection_manager.flush().await
     }
-    
+
     pub async fn load_collection(
         &self,
         id: &str,
@@ -172,7 +169,6 @@ impl HookPointEnv {
             &hook_point.process_chain_manager(),
             self.global_env.clone(),
             self.collection_manager.clone(),
-            self.variable_visitor_manager.clone(),
             self.pipe.pipe().clone(),
         );
 
@@ -191,7 +187,6 @@ impl HookPointEnv {
             hook_point.process_chain_manager().clone(),
             self.global_env.clone(),
             self.collection_manager.clone(),
-            self.variable_visitor_manager.clone(),
             self.pipe.pipe().clone(),
         );
 

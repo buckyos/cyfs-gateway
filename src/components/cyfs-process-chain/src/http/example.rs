@@ -4,7 +4,6 @@ use hyper::{Body, Request, Response, Server};
 use hyper::{Client, Uri};
 use hyper::{Method, StatusCode};
 use std::convert::Infallible;
-use std::os::windows::process;
 
 use crate::*;
 

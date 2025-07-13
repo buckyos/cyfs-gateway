@@ -98,7 +98,6 @@ async fn test_process_chain() -> Result<(), String> {
         .await
         .unwrap();
 
-    let variable_visitor_manager = VariableVisitorManager::new();
     let pipe = SharedMemoryPipe::new_empty();
 
     // Create a context with global and chain environment
@@ -106,7 +105,6 @@ async fn test_process_chain() -> Result<(), String> {
         manager.clone(),
         global_env.clone(),
         collection_manager.clone(),
-        variable_visitor_manager.clone(),
         pipe.pipe().clone(),
     );
 
@@ -116,9 +114,9 @@ async fn test_process_chain() -> Result<(), String> {
     assert!(ret.is_accept());
 
     // Check the environment variables set by the first block
-    assert_eq!(global_env.get("key1"), Some("key12".to_string()));
-    assert_eq!(global_env.get("key2"), Some("key1_value2".to_string()));
-    assert_eq!(global_env.get("key3"), Some("key12_value2".to_string()));
+    assert_eq!(global_env.get("key1").await.unwrap(), Some("key12".to_string()));
+    assert_eq!(global_env.get("key2").await.unwrap(), Some("key1_value2".to_string()));
+    assert_eq!(global_env.get("key3").await.unwrap(), Some("key12_value2".to_string()));
 
     // Execute the second chain
     exec.execute_chain_by_id("chain2").await.unwrap();
@@ -233,7 +231,7 @@ async fn test_hook_point() -> Result<(), String> {
     info!("Hook point output: {}", output);
 
     let global_env = hook_point_env.global_env();
-    assert_eq!(global_env.get("key2"), Some("value1_value2".to_string()));
+    assert_eq!(global_env.get("key2").await.unwrap(), Some("value1_value2".to_string()));
 
     Ok(())
 }

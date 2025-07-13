@@ -161,7 +161,8 @@ impl CommandExecutor for MatchRegexCommandExecutor {
                     if let Some(m) = cap {
                         // TODO: Add env level support, such as --capture export/local name
                         context
-                            .set_env_value(format!("{}[{}]", name, i).as_str(), m.as_str(), None)
+                            .env()
+                            .set(format!("{}[{}]", name, i).as_str(), m.as_str(), None)
                             .await?;
                     }
                 }

@@ -1,13 +1,12 @@
-use super::chain::{ProcessChain, ProcessChainManagerRef, ProcessChainRef, ProcessChainManager};
+use super::chain::{ProcessChain, ProcessChainManager, ProcessChainManagerRef, ProcessChainRef};
 use super::context::Context;
+use super::env::{Env, EnvLevel, EnvRef};
 use crate::GotoCounter;
 use crate::block::BlockExecuter;
 use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
-use crate::collection::{CollectionManager, VariableVisitorManager};
+use crate::collection::CollectionManager;
 use crate::pipe::CommandPipe;
 use std::sync::Arc;
-use super::env::{Env, EnvLevel, EnvRef};
-
 
 pub struct ProcessChainExecutor {}
 
@@ -105,7 +104,6 @@ pub struct ProcessChainsExecutor {
     process_chain_manager: ProcessChainManagerRef,
     global_env: EnvRef,
     collection_manager: CollectionManager,
-    variable_visitor_manager: VariableVisitorManager,
     pipe: CommandPipe,
 }
 
@@ -114,14 +112,12 @@ impl ProcessChainsExecutor {
         process_chain_manager: ProcessChainManagerRef,
         global_env: EnvRef,
         collection_manager: CollectionManager,
-        variable_visitor_manager: VariableVisitorManager,
         pipe: CommandPipe,
     ) -> Self {
         Self {
             process_chain_manager,
             global_env,
             collection_manager,
-            variable_visitor_manager,
             pipe,
         }
     }
@@ -147,7 +143,6 @@ impl ProcessChainsExecutor {
             self.global_env.clone(),
             chain_env,
             self.collection_manager.clone(),
-            self.variable_visitor_manager.clone(),
             counter,
             self.pipe.clone(),
         );
@@ -241,7 +236,6 @@ pub struct ProcessChainListExecutor {
     process_chain_list: Vec<ProcessChainRef>,
     global_env: EnvRef,
     collection_manager: CollectionManager,
-    variable_visitor_manager: VariableVisitorManager,
     pipe: CommandPipe,
 }
 
@@ -250,19 +244,17 @@ impl ProcessChainListExecutor {
         process_chain_manager: &ProcessChainManager,
         global_env: EnvRef,
         collection_manager: CollectionManager,
-        variable_visitor_manager: VariableVisitorManager,
         pipe: CommandPipe,
     ) -> Self {
         let mut process_chain_list = process_chain_manager.clone_process_chain_list();
 
         // Ensure the process chain list is sorted by priority
         process_chain_list.sort_by_key(|chain| chain.priority());
-        
+
         Self {
             process_chain_list,
             global_env,
             collection_manager,
-            variable_visitor_manager,
             pipe,
         }
     }
@@ -297,7 +289,6 @@ impl ProcessChainListExecutor {
             self.global_env.clone(),
             chain_env,
             self.collection_manager.clone(),
-            self.variable_visitor_manager.clone(),
             counter,
             self.pipe.clone(),
         );
@@ -308,7 +299,12 @@ impl ProcessChainListExecutor {
         let mut chain_index = 0;
         while chain_index < self.process_chain_list.len() {
             let chain = &self.process_chain_list[chain_index];
-            info!("Executing process chain: {}:{}, {}", chain_index, chain.priority(), chain.id());
+            info!(
+                "Executing process chain: {}:{}, {}",
+                chain_index,
+                chain.priority(),
+                chain.id()
+            );
 
             let context = target_context.as_ref().unwrap();
             let ret = chain.execute(context).await?;

@@ -108,7 +108,8 @@ impl CommandExecutor for RewriteCommand {
                     let tail = &key_value[prefix.len()..];
                     let rewritten = format!("{}{}", &template[..template.len() - 1], tail);
                     context
-                        .set_env_value(self.key.as_str(), &rewritten, None)
+                        .env()
+                        .set(self.key.as_str(), &rewritten, None)
                         .await?;
                     Ok(CommandResult::success_with_value(rewritten))
                 } else {
@@ -249,7 +250,8 @@ impl CommandExecutor for RewriteRegexCommand {
             }
 
             context
-                .set_env_value(self.key.as_str(), &result, None)
+                .env()
+                .set(self.key.as_str(), &result, None)
                 .await?;
             info!("Rewritten value for {}: {}", self.key, result);
 
@@ -339,7 +341,8 @@ impl CommandExecutor for StringReplaceCommand {
         if key_value.contains(match_text) {
             let rewritten = key_value.replace(match_text, new_text);
             context
-                .set_env_value(self.key.as_str(), &rewritten, None)
+                .env()
+                .set(self.key.as_str(), &rewritten, None)
                 .await?;
             info!("Replace value for {}: {}", self.key, rewritten);
 
