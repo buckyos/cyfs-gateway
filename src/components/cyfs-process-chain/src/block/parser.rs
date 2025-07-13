@@ -15,7 +15,6 @@ use nom::{
 };
 
 pub struct BlockParser {
-    // block_type: BlockType,
     id: String,
 }
 
