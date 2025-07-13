@@ -219,7 +219,8 @@ async fn test_hook_point() -> Result<(), String> {
     let test_visitor = TestVisitor::new();
     test_visitor.register(hook_point_env.variable_visitor_manager()).await.unwrap();
 
-    let ret = hook_point_env.exec_list(&hook_point).await.unwrap();
+    let exec = hook_point_env.prepare_exec_list(&hook_point);
+    let ret = exec.execute_all().await.unwrap();
     assert!(ret.is_accept());
 
     // Try save the collections to disk if they are persistent and there is changes

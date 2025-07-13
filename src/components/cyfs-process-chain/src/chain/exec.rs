@@ -105,6 +105,7 @@ pub struct ProcessChainsExecutor {
     global_env: EnvRef,
     global_collections: Collections,
     pipe: CommandPipe,
+    context: Context,
 }
 
 impl ProcessChainsExecutor {
@@ -114,12 +115,25 @@ impl ProcessChainsExecutor {
         global_collections: Collections,
         pipe: CommandPipe,
     ) -> Self {
+        let counter = Arc::new(GotoCounter::new());
+        let context = Context::new(
+            global_env.clone(),
+            global_collections.clone(),
+            counter,
+            pipe.clone(),
+        );
+
         Self {
             process_chain_manager,
             global_env,
             global_collections,
             pipe,
+            context,
         }
+    }
+
+    pub fn context(&self) -> &Context {
+        &self.context
     }
 
     pub async fn execute_chain_by_id(&self, chain_id: &str) -> Result<CommandResult, String> {
@@ -134,19 +148,12 @@ impl ProcessChainsExecutor {
         self.execute_chain(&chain).await
     }
 
+    // If call execute_chain multiple times for one instance, it will shared the same goto counter
     pub async fn execute_chain(&self, chain: &ProcessChainRef) -> Result<CommandResult, String> {
-        let counter = Arc::new(GotoCounter::new());
-        let context = Context::new(
-            chain.clone(),
-            self.global_env.clone(),
-            self.global_collections.clone(),
-            counter,
-            self.pipe.clone(),
-        );
-
-        self.execute_chain_loop(chain, &context).await
+        self.execute_chain_loop(chain).await
     }
 
+    /*
     #[async_recursion::async_recursion]
     async fn execute_chain_inner(
         &self,
@@ -170,21 +177,18 @@ impl ProcessChainsExecutor {
                 context.counter().increment()?;
 
                 let chain = chain.unwrap();
-                let context = context.fork_chain(chain.clone());
+                context.bind_chain(chain.clone());
                 return self.execute_chain_inner(&chain, &context).await;
             }
         }
 
         Ok(ret)
     }
+    */
 
-    async fn execute_chain_loop(
-        &self,
-        chain: &ProcessChainRef,
-        context: &Context,
-    ) -> Result<CommandResult, String> {
+    async fn execute_chain_loop(&self, chain: &ProcessChainRef) -> Result<CommandResult, String> {
         let mut target_chain = None;
-        let mut target_context = None;
+
         loop {
             let chain = if let Some(c) = target_chain.as_ref() {
                 c
@@ -192,13 +196,8 @@ impl ProcessChainsExecutor {
                 chain
             };
 
-            let context = if let Some(c) = target_context.as_ref() {
-                c
-            } else {
-                context
-            };
-
-            let ret = chain.execute(context).await?;
+            self.context.bind_chain(chain.clone());
+            let ret = chain.execute(&self.context).await?;
             if ret.is_control() {
                 let control = ret.as_control().unwrap();
                 if control.is_goto_chain() {
@@ -211,11 +210,10 @@ impl ProcessChainsExecutor {
                         return Err(msg);
                     }
 
-                    context.counter().increment()?;
+                    self.context.counter().increment()?;
 
                     let target = target.unwrap();
                     info!("Goto process chain '{}'", target_chain_id);
-                    target_context = Some(context.fork_chain(target.clone()));
                     target_chain = Some(target);
 
                     continue;
@@ -234,6 +232,7 @@ pub struct ProcessChainListExecutor {
     global_env: EnvRef,
     global_collections: Collections,
     pipe: CommandPipe,
+    context: Context,
 }
 
 impl ProcessChainListExecutor {
@@ -248,12 +247,25 @@ impl ProcessChainListExecutor {
         // Ensure the process chain list is sorted by priority
         process_chain_list.sort_by_key(|chain| chain.priority());
 
+        let counter = Arc::new(GotoCounter::new());
+        let context = Context::new(
+            global_env.clone(),
+            global_collections.clone(),
+            counter,
+            pipe.clone(),
+        );
+
         Self {
             process_chain_list,
             global_env,
             global_collections,
             pipe,
+            context,
         }
+    }
+
+    pub fn context(&self) -> &Context {
+        &self.context
     }
 
     pub fn get_chain(&self, id: &str) -> Option<(usize, &ProcessChainRef)> {
@@ -275,22 +287,9 @@ impl ProcessChainListExecutor {
             return Ok(CommandResult::success());
         }
 
-        // We execute the first chain in the list
-        let chain = &self.process_chain_list[0];
-
-        // Create a exec context for the first chain
-        let counter = Arc::new(GotoCounter::new());
-        let context = Context::new(
-            chain.clone(),
-            self.global_env.clone(),
-            self.global_collections.clone(),
-            counter,
-            self.pipe.clone(),
-        );
-
         let mut final_result = CommandResult::success();
-        let mut target_context = Some(context);
 
+        // We execute the first chain in the list
         let mut chain_index = 0;
         while chain_index < self.process_chain_list.len() {
             let chain = &self.process_chain_list[chain_index];
@@ -301,8 +300,8 @@ impl ProcessChainListExecutor {
                 chain.id()
             );
 
-            let context = target_context.as_ref().unwrap();
-            let ret = chain.execute(context).await?;
+            self.context.bind_chain(chain.clone());
+            let ret = chain.execute(&self.context).await?;
             if ret.is_control() {
                 let control = ret.as_control().unwrap();
                 if control.is_goto_chain() {
@@ -315,13 +314,12 @@ impl ProcessChainListExecutor {
                         return Err(msg);
                     }
 
-                    let (target_index, target) = ret.unwrap();
+                    let (target_index, _target) = ret.unwrap();
 
-                    context.counter().increment()?;
+                    self.context.counter().increment()?;
 
                     info!("Goto process chain {}, '{}'", target_index, target_chain_id);
 
-                    target_context = Some(context.fork_chain(target.clone()));
                     chain_index = target_index;
 
                     continue;

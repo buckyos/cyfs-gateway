@@ -1,6 +1,5 @@
 use super::hook_point::HookPoint;
 use crate::chain::{Env, EnvLevel, EnvRef, ProcessChainListExecutor, ProcessChainsExecutor};
-use crate::cmd::CommandResult;
 use crate::collection::*;
 use crate::pipe::SharedMemoryPipe;
 use std::path::{Path, PathBuf};
@@ -161,7 +160,18 @@ impl HookPointEnv {
         Ok(())
     }
 
-    // Execute the chain list defined in the hook point
+    // Prepare execute the chain list defined in the hook point, will return a ProcessChainListExecutor
+    // which can be used to execute the chain list.
+    pub fn prepare_exec_list(&self, hook_point: &HookPoint) -> ProcessChainListExecutor {
+        ProcessChainListExecutor::new(
+            hook_point.process_chain_manager(),
+            self.global_env.clone(),
+            self.global_collections.clone(),
+            self.pipe.pipe().clone(),
+        )
+    }
+
+    /*
     pub async fn exec_list(&self, hook_point: &HookPoint) -> Result<CommandResult, String> {
         info!("Executing hook point chain list: {}", hook_point.id());
 
@@ -174,7 +184,20 @@ impl HookPointEnv {
 
         exec.execute_all().await
     }
+    */
 
+    // Prepare a ProcessChainsExecutor to execute the chain in the hook point
+    // This executor can be used to execute a single chain or multiple chains.
+    pub fn prepare_exec_chain(&self, hook_point: &HookPoint) -> ProcessChainsExecutor {
+        ProcessChainsExecutor::new(
+            hook_point.process_chain_manager().clone(),
+            self.global_env.clone(),
+            self.global_collections.clone(),
+            self.pipe.pipe().clone(),
+        )
+    }
+
+    /*
     // Just execute a single chain by id(maybe exec multi chain if there is one or more goto commands)
     pub async fn exec_chain(
         &self,
@@ -192,4 +215,5 @@ impl HookPointEnv {
 
         exec.execute_chain_by_id(id).await
     }
+    */
 }

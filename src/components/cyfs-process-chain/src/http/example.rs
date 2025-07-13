@@ -65,12 +65,6 @@ impl HttpHookManager {
             hook_point_env,
         })
     }
-
-    pub async fn execute_hook(&self) -> Result<(), String> {
-        self.hook_point_env.exec_list(&self.hook_point).await?;
-        self.hook_point_env.flush_collections().await?;
-        Ok(())
-    }
 }
 
 async fn handle(req: Request<Body>) -> Result<Response<Body>, Infallible> {

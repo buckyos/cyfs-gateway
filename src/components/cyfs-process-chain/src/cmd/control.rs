@@ -48,7 +48,13 @@ impl ExecCommandExecutor {
 impl CommandExecutor for ExecCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Get target block from context
-        let block = context.chain().get_block(&self.block);
+        let chain = context.chain().ok_or_else(|| {
+            let msg = "Exec command requires a chain context".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+
+        let block = chain.get_block(&self.block);
         if block.is_none() {
             let msg = format!("Exec target block not found: {}", self.block);
             error!("{}", msg);
