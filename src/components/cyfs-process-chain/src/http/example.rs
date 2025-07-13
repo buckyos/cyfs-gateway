@@ -18,9 +18,11 @@ const PROCESS_CHAIN: &str = r#"
             #!(match $PROTOCOL https) && reject;
 
             # We accept the request if the from buckyos.com
+            echo $(map-get REQ "content-type");
+            !match $(map-get REQ "content-type") "text/html" && reject;
             echo ${REQ_url};
             match $REQ_url "*.buckyos.com" && accept;
-            rewrite  $REQ_url "**/index.html" "**/buckyos/index.html";
+            rewrite  $REQ_url "/index.html" "/buckyos/index.html";
         ]]>
     </block>
 </process_chain>
@@ -74,7 +76,7 @@ type HttpHookManagerRef = Arc<HttpHookManager>;
 
 async fn process_request(req: Request<Body>) -> Result<Response<Body>, Infallible> {
     match (req.method(), req.uri().path()) {
-        (&Method::GET, "/") => {
+        (&Method::GET, "/buckyos/index.html") => {
             info!("Received a GET request {}", req.uri());
             Ok(Response::new(Body::from("Hello, World!")))
         }
@@ -86,10 +88,12 @@ async fn process_request(req: Request<Body>) -> Result<Response<Body>, Infallibl
     }
 }
 
-async fn handle(
+async fn pre_process_request(
     req: Request<Body>,
-    hook_manager: HttpHookManagerRef,
-) -> Result<Response<Body>, Infallible> {
+    hook_manager: &HttpHookManagerRef,
+) -> Result<Request<Body>, Response<Body>> {
+    info!("Pre-processing request: {:?}", req);
+
     // Create a HyperHttpRequestHeaderMap from the request
     let req_map = HyperHttpRequestHeaderMap::new(req);
 
@@ -106,22 +110,26 @@ async fn handle(
             .unwrap();
 
         exec.chain_collections()
-            .add_map_collection("REQ", Arc::new(Box::new(req_map.clone()) as Box<dyn MapCollection>))
+            .add_map_collection(
+                "REQ",
+                Arc::new(Box::new(req_map.clone()) as Box<dyn MapCollection>),
+            )
             .await
             .unwrap();
 
         // Exec the process chain list
         let ret = exec.execute_all().await.unwrap();
 
+        info!("Process chain execution result: {:?}", ret);
         if ret.is_control() {
             if ret.is_drop() {
                 info!("Request dropped by the process chain");
-                return Ok(Response::new(Body::from("Request dropped")));
+                return Err(Response::new(Body::from("Request dropped")));
             } else if ret.is_reject() {
                 info!("Request rejected by the process chain");
                 let mut response = Response::new(Body::from("Request rejected"));
                 *response.status_mut() = StatusCode::FORBIDDEN;
-                return Ok(response);
+                return Err(response);
             } else {
                 info!("Request accepted by the process chain");
             }
@@ -129,6 +137,21 @@ async fn handle(
     }
 
     let req = req_map.into_request().unwrap();
+    Ok(req)
+}
+
+async fn handle(
+    req: Request<Body>,
+    hook_manager: HttpHookManagerRef,
+) -> Result<Response<Body>, Infallible> {
+    info!("Handling request: {:?}", req);
+
+    let req = match pre_process_request(req, &hook_manager).await {
+        Ok(req) => req,
+        Err(response) => return Ok(response),
+    };
+
+    info!("Will processing request: {:?}", req);
 
     process_request(req).await
 }
@@ -153,8 +176,14 @@ async fn server_main() {
 async fn client_main() {
     let client = Client::new();
 
-    let uri = "http://127.0.0.1:3000/index.html".parse::<Uri>().unwrap();
-    let resp = client.get(uri).await.unwrap();
+    let req = Request::builder()
+        .method(Method::GET)
+        .header("content-type", "text/html")
+        .uri("http://127.0.0.1:3000/index.html")
+        .body(Body::empty())
+        .expect("Failed to build request");
+
+    let resp = client.request(req).await.unwrap();
 
     assert!(resp.status().is_success());
 

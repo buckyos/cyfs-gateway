@@ -934,7 +934,7 @@ impl CommandExecutor for MapGetCommandExecutor {
                         "Key '{}' not found in map collection with id '{}'",
                         self.key, self.map_id
                     );
-                    Ok(CommandResult::error())
+                    Ok(CommandResult::success_with_value(""))
                 }
             },
             MapCollectionResult::MultiMap(collection) => {
@@ -946,7 +946,7 @@ impl CommandExecutor for MapGetCommandExecutor {
                                 "Key '{}' not found in multi-map collection with id '{}'",
                                 self.key, self.map_id
                             );
-                            Ok(CommandResult::error())
+                            Ok(CommandResult::success_with_value(""))
                         } else {
                             info!(
                                 "Key '{}' found in multi-map collection with id '{}': {:?}",
@@ -962,7 +962,7 @@ impl CommandExecutor for MapGetCommandExecutor {
                             "Key '{}' not found in multi-map collection with id '{}'",
                             self.key, self.map_id
                         );
-                        Ok(CommandResult::error())
+                        Ok(CommandResult::success_with_value(""))
                     }
                 }
             }

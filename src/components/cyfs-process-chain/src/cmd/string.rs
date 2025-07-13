@@ -114,12 +114,23 @@ impl CommandExecutor for RewriteCommand {
                     info!("Rewritten value for {}: {} -> {}", self.key, key_value, rewritten);
                     Ok(CommandResult::success_with_value(rewritten))
                 } else {
+                    let msg = format!(
+                        "Pattern '{}' did not match '{}', expected prefix '{}'",
+                        pattern_value, key_value, prefix
+                    );
+                    info!("{}", msg);
                     Ok(CommandResult::success())
                 }
             } else {
-                Ok(CommandResult::success())
+                info!("Pattern '{}' matched '{}', setting to template '{}'", pattern_value, key_value, template);
+                context
+                        .env()
+                        .set(self.key.as_str(), &template, None)
+                        .await?;
+                Ok(CommandResult::success_with_value(template.to_string()))
             }
         } else {
+            info!("Pattern '{}' did not match '{}'", pattern_value, key_value);
             Ok(CommandResult::error())
         }
     }
