@@ -344,7 +344,7 @@ impl BlockParser {
         let unquoted = map(
             recognize(pair(
                 alt((nom::character::complete::alpha1, tag("_"))),
-                many0(alt((nom::character::complete::alphanumeric1, tag("_")))),
+                many0(alt((nom::character::complete::alphanumeric1, tag("_"), tag("-")))),
             )),
             |s: &str| s.to_string(),
         );

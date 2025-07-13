@@ -18,11 +18,11 @@ const PROCESS_CHAIN: &str = r#"
             #!(match $PROTOCOL https) && reject;
 
             # We accept the request if the from buckyos.com
-            echo $(map-get REQ "content-type");
-            !match $(map-get REQ "content-type") "text/html" && reject;
+            echo $(map-get REQ content-type);
+            !match $(map-get REQ content-type) "text/html" && reject;
             echo ${REQ_url};
             match $REQ_url "*.buckyos.com" && accept;
-            rewrite  $REQ_url "/index.html" "/buckyos/index.html";
+            rewrite $REQ_url "/index.html" "/buckyos/index.html";
         ]]>
     </block>
 </process_chain>
