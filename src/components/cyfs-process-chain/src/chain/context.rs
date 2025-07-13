@@ -1,5 +1,6 @@
+use super::env::{Env, EnvLevel};
 use crate::chain::{EnvManager, EnvRef, ProcessChainRef};
-use crate::collection::CollectionManager;
+use crate::collection::{CollectionManager, Collections};
 use crate::pipe::CommandPipe;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
@@ -51,12 +52,13 @@ impl Context {
     pub fn new(
         chain: ProcessChainRef,
         global_env: EnvRef,
-        chain_env: EnvRef,
-        collection_manager: CollectionManager,
+        global_collections: Collections,
         goto_counter: GotoCounterRef,
         pipe: CommandPipe,
     ) -> Self {
+        let chain_env = Arc::new(Env::new(EnvLevel::Chain, Some(global_env.clone())));
         let env_manager = EnvManager::new(global_env, chain_env);
+        let collection_manager = CollectionManager::new(global_collections);
 
         Self {
             chain,
@@ -88,14 +90,12 @@ impl Context {
     }
 
     pub fn fork_chain(&self, chain: ProcessChainRef) -> Self {
-        // Create a new chain environment that inherits from the global environment
-        let chain_env = self.env.create_chain_env();
+        // Call new that will create a new chain environment that inherits from the global environment
 
         Self::new(
             chain,
-            self.env.get_global().clone(),
-            chain_env,
-            self.collection_manager.clone(),
+            self.env.get_global().clone(), // Use independent chain environment, just share global environment
+            self.collection_manager.get_global_collections().clone(), // Use independent chain collections, just share global collections
             self.goto_counter.clone(), // Use the same goto counter for the chain context
             self.pipe.clone(),
         )
@@ -103,13 +103,15 @@ impl Context {
 
     pub fn fork_block(&self) -> Self {
         // Create a new block environment that inherits from the chain environment
-        Self::new(
-            self.chain.clone(),
-            self.env.get_global().clone(),
-            self.env.get_chain().clone(),
-            self.collection_manager.clone(),
-            self.goto_counter.clone(), // Use the same goto counter for the block context
-            self.pipe.clone(),
-        )
+
+        // Use the same global and chain environment
+        let env = EnvManager::new(self.env.get_global().clone(), self.env.get_chain().clone());
+        Self {
+            chain: self.chain.clone(),
+            env,
+            collection_manager: self.collection_manager.clone(), // Use the same collection manager for the block context
+            goto_counter: self.goto_counter.clone(), // Use the same goto counter for the block context
+            pipe: self.pipe.clone(),
+        }
     }
 }

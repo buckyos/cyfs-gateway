@@ -1,10 +1,10 @@
 use super::chain::{ProcessChain, ProcessChainManager, ProcessChainManagerRef, ProcessChainRef};
 use super::context::Context;
-use super::env::{Env, EnvLevel, EnvRef};
+use super::env::EnvRef;
 use crate::GotoCounter;
 use crate::block::BlockExecuter;
 use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
-use crate::collection::CollectionManager;
+use crate::collection::Collections;
 use crate::pipe::CommandPipe;
 use std::sync::Arc;
 
@@ -103,7 +103,7 @@ impl ProcessChainExecutor {
 pub struct ProcessChainsExecutor {
     process_chain_manager: ProcessChainManagerRef,
     global_env: EnvRef,
-    collection_manager: CollectionManager,
+    global_collections: Collections,
     pipe: CommandPipe,
 }
 
@@ -111,13 +111,13 @@ impl ProcessChainsExecutor {
     pub fn new(
         process_chain_manager: ProcessChainManagerRef,
         global_env: EnvRef,
-        collection_manager: CollectionManager,
+        global_collections: Collections,
         pipe: CommandPipe,
     ) -> Self {
         Self {
             process_chain_manager,
             global_env,
-            collection_manager,
+            global_collections,
             pipe,
         }
     }
@@ -135,14 +135,11 @@ impl ProcessChainsExecutor {
     }
 
     pub async fn execute_chain(&self, chain: &ProcessChainRef) -> Result<CommandResult, String> {
-        let chain_env = Arc::new(Env::new(EnvLevel::Chain, Some(self.global_env.clone())));
-
         let counter = Arc::new(GotoCounter::new());
         let context = Context::new(
             chain.clone(),
             self.global_env.clone(),
-            chain_env,
-            self.collection_manager.clone(),
+            self.global_collections.clone(),
             counter,
             self.pipe.clone(),
         );
@@ -235,7 +232,7 @@ impl ProcessChainsExecutor {
 pub struct ProcessChainListExecutor {
     process_chain_list: Vec<ProcessChainRef>,
     global_env: EnvRef,
-    collection_manager: CollectionManager,
+    global_collections: Collections,
     pipe: CommandPipe,
 }
 
@@ -243,7 +240,7 @@ impl ProcessChainListExecutor {
     pub fn new(
         process_chain_manager: &ProcessChainManager,
         global_env: EnvRef,
-        collection_manager: CollectionManager,
+        global_collections: Collections,
         pipe: CommandPipe,
     ) -> Self {
         let mut process_chain_list = process_chain_manager.clone_process_chain_list();
@@ -254,7 +251,7 @@ impl ProcessChainListExecutor {
         Self {
             process_chain_list,
             global_env,
-            collection_manager,
+            global_collections,
             pipe,
         }
     }
@@ -282,13 +279,11 @@ impl ProcessChainListExecutor {
         let chain = &self.process_chain_list[0];
 
         // Create a exec context for the first chain
-        let chain_env = Arc::new(Env::new(EnvLevel::Chain, Some(self.global_env.clone())));
         let counter = Arc::new(GotoCounter::new());
         let context = Context::new(
             chain.clone(),
             self.global_env.clone(),
-            chain_env,
-            self.collection_manager.clone(),
+            self.global_collections.clone(),
             counter,
             self.pipe.clone(),
         );

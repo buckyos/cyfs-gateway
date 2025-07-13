@@ -75,7 +75,7 @@ async fn test_process_chain() -> Result<(), String> {
         manager.add_chain(chain).unwrap();
     }
 
-    let collection_manager = CollectionManager::new();
+    let global_collections = Collections::new();
 
     // Load host db and ip db from file
     let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
@@ -85,7 +85,7 @@ async fn test_process_chain() -> Result<(), String> {
     let host_db_file = data_dir.join("host.json");
     let host_db = JsonMultiMapCollection::new(host_db_file.clone()).unwrap();
 
-    collection_manager
+    global_collections
         .add_multi_map_collection("host", Arc::new(Box::new(host_db.clone())))
         .await
         .unwrap();
@@ -93,7 +93,7 @@ async fn test_process_chain() -> Result<(), String> {
     // Load ip db, if not exists, it create a new one
     let ip_db_file = data_dir.join("ip.json");
     let ip_db = JsonMultiMapCollection::new(ip_db_file.clone()).unwrap();
-    collection_manager
+    global_collections
         .add_multi_map_collection("ip", Arc::new(Box::new(ip_db.clone())))
         .await
         .unwrap();
@@ -104,7 +104,7 @@ async fn test_process_chain() -> Result<(), String> {
     let exec = ProcessChainsExecutor::new(
         manager.clone(),
         global_env.clone(),
-        collection_manager.clone(),
+        global_collections.clone(),
         pipe.pipe().clone(),
     );
 

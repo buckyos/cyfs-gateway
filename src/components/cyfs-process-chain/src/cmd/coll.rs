@@ -1,7 +1,7 @@
 use super::cmd::{CommandExecutor, CommandExecutorRef, CommandParser, CommandResult};
 use crate::block::CommandArgs;
 use crate::chain::Context;
-use crate::collection::{CollectionResult, MapCollectionResult};
+use crate::collection::{CollectionResult, MapCollectionResult, CollectionLevel};
 use std::sync::Arc;
 
 /*
@@ -226,12 +226,14 @@ impl CommandParser for SetCreateCommandParser {
 
 // SetCreateCommandExecutor
 pub struct SetCreateCommandExecutor {
-    pub set_id: String,
+    level: CollectionLevel, // Chain or Global
+    set_id: String,
 }
 
 impl SetCreateCommandExecutor {
     pub fn new(set_id: &str) -> Self {
         Self {
+            level: CollectionLevel::Chain, // Default to chain level
             set_id: set_id.to_owned(),
         }
     }
@@ -243,18 +245,18 @@ impl CommandExecutor for SetCreateCommandExecutor {
         // Create a new set collection with the given id
         match context
             .collection_manager()
-            .create_set_collection(&self.set_id)
+            .create_set_collection(self.level, &self.set_id)
             .await
         {
             Some(_) => {
                 info!(
-                    "Set collection with id '{}' created successfully",
-                    self.set_id
+                    "Set collection with id '{}' {:?} created successfully",
+                    self.set_id, self.level
                 );
                 Ok(CommandResult::success())
             }
             None => {
-                let msg = format!("Failed to create set collection with id '{}'", self.set_id);
+                let msg = format!("Failed to create set collection with id '{}' {:?}", self.set_id, self.level);
                 warn!("{}", msg);
                 Ok(CommandResult::error_with_value(msg))
             }
@@ -429,8 +431,8 @@ impl CommandExecutor for SetRemoveCommandExecutor {
     }
 }
 
-/// map create [-multi] <map_id>
-/// Create a new map collection with the given id.
+/// map create [-multi] [-global] <map_id>
+/// Create a new map collection with the given id, default is chain level.
 /// If the map already exists, it will fail
 pub struct MapCreateCommandParser {}
 
@@ -449,7 +451,7 @@ impl CommandParser for MapCreateCommandParser {
             return Err(msg);
         }
 
-        // If the first argument is "-multi", it should be the only argument
+        // If there is options start with "-", it should be "-multi" or "--multi" "-global" or "--global"
         if args.len() == 2 {
             let param = args.get(0).unwrap();
             if !param.is_literal() {
@@ -484,6 +486,7 @@ impl CommandParser for MapCreateCommandParser {
 
 // MapCreateCommandExecutor
 pub struct MapCreateCommandExecutor {
+    level: CollectionLevel, // Chain or Global
     is_multi: bool, // Indicates if this is a multi-map
     map_id: String,
 }
@@ -491,6 +494,7 @@ pub struct MapCreateCommandExecutor {
 impl MapCreateCommandExecutor {
     pub fn new(is_multi: bool, map_id: &str) -> Self {
         Self {
+            level: CollectionLevel::Chain, // Default to chain level
             is_multi,
             map_id: map_id.to_owned(),
         }
@@ -504,13 +508,13 @@ impl CommandExecutor for MapCreateCommandExecutor {
         let ret = if self.is_multi {
             context
                 .collection_manager()
-                .create_multi_map_collection(&self.map_id)
+                .create_multi_map_collection(self.level, &self.map_id)
                 .await
                 .is_some()
         } else {
             context
                 .collection_manager()
-                .create_map_collection(&self.map_id)
+                .create_map_collection(self.level, &self.map_id)
                 .await
                 .is_some()
         };
@@ -518,15 +522,15 @@ impl CommandExecutor for MapCreateCommandExecutor {
         match ret {
             true => {
                 info!(
-                    "Map collection with id '{}' multi={}, created successfully",
-                    self.map_id, self.is_multi
+                    "Map collection with id '{}' multi={} level={:?}, created successfully",
+                    self.map_id, self.is_multi, self.level,
                 );
                 Ok(CommandResult::success())
             }
             false => {
                 let msg = format!(
-                    "Failed to create map collection with id '{}' multi={}",
-                    self.map_id, self.is_multi
+                    "Failed to create map collection with id '{}' multi={} level={:?}",
+                    self.map_id, self.is_multi, self.level
                 );
                 warn!("{}", msg);
                 Ok(CommandResult::error_with_value(msg))

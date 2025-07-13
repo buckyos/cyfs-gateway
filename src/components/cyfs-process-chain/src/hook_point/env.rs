@@ -9,21 +9,21 @@ use std::sync::Arc;
 pub struct HookPointEnv {
     id: String,
     data_dir: PathBuf,
-    collection_manager: CollectionManager,
+    global_collections: Collections,
     global_env: EnvRef,
     pipe: SharedMemoryPipe,
 }
 
 impl HookPointEnv {
     pub fn new(id: impl Into<String>, data_dir: PathBuf) -> Self {
-        let collection_manager = CollectionManager::new();
+        let global_collections = Collections::new();
         let pipe: SharedMemoryPipe = SharedMemoryPipe::new_empty();
 
         let global_env = Arc::new(Env::new(EnvLevel::Global, None));
         Self {
             id: id.into(),
             data_dir,
-            collection_manager,
+            global_collections,
             global_env,
             pipe,
         }
@@ -37,8 +37,8 @@ impl HookPointEnv {
         &self.data_dir
     }
 
-    pub fn collection_manager(&self) -> &CollectionManager {
-        &self.collection_manager
+    pub fn global_collections(&self) -> &Collections {
+        &self.global_collections
     }
 
     pub fn global_env(&self) -> &EnvRef {
@@ -55,7 +55,7 @@ impl HookPointEnv {
     }
 
     pub async fn flush_collections(&self) -> Result<(), String> {
-        self.collection_manager.flush().await
+        self.global_collections.flush().await
     }
 
     pub async fn load_collection(
@@ -92,7 +92,7 @@ impl HookPointEnv {
                 };
 
                 let ret = self
-                    .collection_manager
+                    .global_collections
                     .add_set_collection(id, Arc::new(set))
                     .await;
                 if ret.is_none() {
@@ -116,7 +116,7 @@ impl HookPointEnv {
                 };
 
                 let ret = self
-                    .collection_manager
+                    .global_collections
                     .add_map_collection(id, Arc::new(map))
                     .await;
                 if ret.is_none() {
@@ -140,7 +140,7 @@ impl HookPointEnv {
                 };
 
                 let ret = self
-                    .collection_manager
+                    .global_collections
                     .add_multi_map_collection(id, Arc::new(multi_map))
                     .await;
                 if ret.is_none() {
@@ -168,7 +168,7 @@ impl HookPointEnv {
         let exec = ProcessChainListExecutor::new(
             &hook_point.process_chain_manager(),
             self.global_env.clone(),
-            self.collection_manager.clone(),
+            self.global_collections.clone(),
             self.pipe.pipe().clone(),
         );
 
@@ -186,7 +186,7 @@ impl HookPointEnv {
         let exec = ProcessChainsExecutor::new(
             hook_point.process_chain_manager().clone(),
             self.global_env.clone(),
-            self.collection_manager.clone(),
+            self.global_collections.clone(),
             self.pipe.pipe().clone(),
         );
 

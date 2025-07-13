@@ -1,7 +1,6 @@
 use crate::cmd::*;
 use std::fmt;
 use std::ops::Deref;
-use std::str::FromStr;
 
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
