@@ -156,6 +156,56 @@ impl MapCollection for MemoryMapCollection {
         let mut data = self.data.write().unwrap();
         Ok(data.remove(key))
     }
+
+    async fn flush(&self) -> Result<(), String> {
+        let list = {
+            let data = self.data.read().unwrap();
+            // Get all collections that are flushable
+            data.iter()
+                .filter_map(|(_key, item)| match item {
+                    CollectionValue::Set(set) => {
+                        if set.is_flushable() {
+                            Some(CollectionValue::Set(set.clone()))
+                        } else {
+                            None
+                        }
+                    }
+                    CollectionValue::Map(map) => {
+                        if map.is_flushable() {
+                            Some(CollectionValue::Map(map.clone()))
+                        } else {
+                            None
+                        }
+                    }
+                    CollectionValue::MultiMap(multi_map) => {
+                        if multi_map.is_flushable() {
+                            Some(CollectionValue::MultiMap(multi_map.clone()))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<CollectionValue>>()
+        };
+
+        for item in list {
+            match item {
+                CollectionValue::Set(set) => {
+                    set.flush().await?;
+                }
+                CollectionValue::Map(map) => {
+                    map.flush().await?;
+                }
+                CollectionValue::MultiMap(multi_map) => {
+                    multi_map.flush().await?;
+                }
+                _ => unreachable!("Unexpected collection type in flush"),
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub struct MemoryMultiMapCollection {

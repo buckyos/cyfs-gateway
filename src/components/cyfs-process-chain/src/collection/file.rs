@@ -130,6 +130,10 @@ impl SetCollection for JsonSetCollection {
         self.data.get_all().await
     }
 
+    fn is_flushable(&self) -> bool {
+        self.file.is_dirty()
+    }
+    
     async fn flush(&self) -> Result<(), String> {
         self.flush()
     }
@@ -251,6 +255,10 @@ impl MapCollection for JsonMapCollection {
         Ok(ret)
     }
 
+    fn is_flushable(&self) -> bool {
+        self.file.is_dirty()
+    }
+
     async fn flush(&self) -> Result<(), String> {
         self.flush()
     }
@@ -340,6 +348,10 @@ impl MultiMapCollection for JsonMultiMapCollection {
         }
 
         Ok(ret)
+    }
+
+    fn is_flushable(&self) -> bool {
+        self.file.is_dirty()
     }
 
     async fn flush(&self) -> Result<(), String> {

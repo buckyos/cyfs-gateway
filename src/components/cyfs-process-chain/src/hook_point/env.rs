@@ -42,8 +42,7 @@ impl HookPointEnv {
     }
 
     pub async fn flush_collections(&self) -> Result<(), String> {
-        todo!("Implement flush_collections for HookPointEnv");
-        // self.global_collections.flush().await
+        self.global_env.flush().await
     }
 
     pub async fn load_collection(

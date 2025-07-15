@@ -88,6 +88,11 @@ impl Env {
     pub async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         self.values.remove(key).await
     }
+
+    pub async fn flush(&self) -> Result<(), String> {
+        // Flush the current environment's values
+        self.values.flush().await
+    }
 }
 
 #[derive(Clone)]

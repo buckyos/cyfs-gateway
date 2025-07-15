@@ -27,7 +27,7 @@ impl std::fmt::Display for CollectionValue {
             CollectionValue::MultiMap(_) => write!(f, "[MultiMap]"),
             CollectionValue::Visitor(_) => write!(f, "[Visitor]"),
         }
-    } 
+    }
 }
 
 impl std::fmt::Debug for CollectionValue {
@@ -123,10 +123,7 @@ impl CollectionValue {
         if let CollectionValue::Set(s) = self {
             Ok(s)
         } else {
-            let msg = format!(
-                "Expected CollectionValue::Set, found {}",
-                self.get_type(),
-            );
+            let msg = format!("Expected CollectionValue::Set, found {}", self.get_type(),);
             warn!("{}", msg);
             Err(msg)
         }
@@ -144,10 +141,7 @@ impl CollectionValue {
         if let CollectionValue::Map(m) = self {
             Ok(m)
         } else {
-            let msg = format!(
-                "Expected CollectionValue::Map, found {}",
-                self.get_type(),
-            );
+            let msg = format!("Expected CollectionValue::Map, found {}", self.get_type(),);
             warn!("{}", msg);
             Err(msg)
         }
@@ -210,6 +204,12 @@ pub trait SetCollection: Send + Sync {
     /// Gets all values in the collection.
     async fn get_all(&self) -> Result<Vec<String>, String>;
 
+    /// Checks if the collection is flushable.
+    fn is_flushable(&self) -> bool {
+        // Default implementation returns false, can be overridden by specific collections
+        false
+    }
+
     /// Flushes the collection to persistent storage if applicable.
     async fn flush(&self) -> Result<(), String> {
         // Default implementation does nothing, can be overridden by specific collections
@@ -221,12 +221,9 @@ pub type SetCollectionRef = Arc<Box<dyn SetCollection>>;
 
 #[async_trait::async_trait]
 pub trait MapCollection: Send + Sync {
-    
     /// Inserts a key-value pair into the collection.
     /// If the key already exists, it will return false.
-    async fn insert_new(
-        &self, key: &str, value: CollectionValue,
-    ) -> Result<bool, String>;
+    async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String>;
 
     /// Sets the value for the given key in the collection.
     async fn insert(
@@ -243,6 +240,12 @@ pub trait MapCollection: Send + Sync {
 
     /// Removes the key from the collection.
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String>;
+
+    /// Checks if the collection is flushable.
+    fn is_flushable(&self) -> bool {
+        // Default implementation returns false, can be overridden by specific collections
+        false
+    }
 
     /// Flushes the collection to persistent storage if applicable.
     async fn flush(&self) -> Result<(), String> {
@@ -281,6 +284,12 @@ pub trait MultiMapCollection: Send + Sync {
     /// Removes all values for the given key from the collection.
     /// If the key is not found, it returns false.
     async fn remove_all(&self, key: &str) -> Result<bool, String>;
+
+    /// Checks if the collection is flushable.
+    fn is_flushable(&self) -> bool {
+        // Default implementation returns false, can be overridden by specific collections
+        false
+    }
 
     /// Flushes the collection to persistent storage if applicable.
     async fn flush(&self) -> Result<(), String> {
