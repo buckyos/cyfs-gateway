@@ -25,12 +25,13 @@ impl CommandParser for EchoCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         // Check first argument is not empty
         let mut suppress_newline = true;
         let mut option_count = 0;
         if !args.is_empty() {
-            let options = CommandArgHelper::parse_options(args, &[&["n"]])?;
+            let str_args = args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+            let options = CommandArgHelper::parse_options(&str_args, &[&["n"]])?;
             option_count = options.len();
 
             for option in options {

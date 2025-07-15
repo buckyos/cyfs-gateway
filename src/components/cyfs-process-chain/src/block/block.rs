@@ -2,14 +2,12 @@ use crate::cmd::*;
 use std::fmt;
 use std::ops::Deref;
 
-
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Operator {
-    And,  // &&
-    Or,   // ||
-    Not,  // !
+    And, // &&
+    Or,  // ||
+    Not, // !
 }
-
 
 impl Operator {
     pub fn as_str(&self) -> &str {
@@ -59,12 +57,20 @@ impl CommandArg {
     pub fn is_var(&self) -> bool {
         matches!(self, CommandArg::Var(_))
     }
-    
+
     pub fn as_var_str(&self) -> Option<&str> {
         if let CommandArg::Var(s) = self {
             Some(s.as_str())
         } else {
             None
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            CommandArg::Literal(s) => s.as_str(),
+            CommandArg::Var(s) => s.as_str(),
+            CommandArg::CommandSubstitution(_) => "",
         }
     }
 }
@@ -201,7 +207,6 @@ impl AssignKind {
     }
 }
 
-
 // Command or Expression
 #[derive(Debug, Clone)]
 pub enum Expression {
@@ -242,7 +247,7 @@ pub struct Statement {
 // Line of commands, top level structure
 #[derive(Debug, Clone)]
 pub struct Line {
-    pub source: String, // Source code of the line
+    pub source: String,             // Source code of the line
     pub statements: Vec<Statement>, // Statements in the line
 }
 

@@ -24,7 +24,7 @@ impl CommandParser for ExternalCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         // Args should not be empty
         assert!(!args.is_empty(), "Exec command should have at least 1 arg");
 
@@ -40,7 +40,7 @@ pub struct ExternalCommandExecutor {
 }
 
 impl ExternalCommandExecutor {
-    pub fn new(args: &[&str]) -> Self {
+    pub fn new(args: Vec<String>) -> Self {
         assert!(args.len() > 0);
 
         if args.len() == 1 {
@@ -52,7 +52,7 @@ impl ExternalCommandExecutor {
 
         Self {
             command: args[0].to_owned(),
-            args: args[1..].iter().map(|&s| s.to_owned()).collect(),
+            args: args[1..].iter().map(|s| s.clone()).collect(),
         }
     }
 }

@@ -35,7 +35,7 @@ impl CommandParser for AssignCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         // Args must not be checked before calling parse
         assert!(
             args.len() >= 2 && args.len() <= 3,
@@ -43,18 +43,18 @@ impl CommandParser for AssignCommandParser {
         );
 
         // Expect a single argument in the form of KEY=VALUE
-        let kind = args[0];
-        let kind = AssignKind::from_str(kind)
+        let kind = &args[0];
+        let kind = AssignKind::from_str(&kind)
             .map_err(|e| format!("Invalid assign kind: {}. Error: {}", kind, e))?;
 
-        let key = args[1].to_string();
+        let key = &args[1];
         let value = if args.len() > 2 {
-            Some(args[2].to_string())
+            Some(args[2].clone())
         } else {
             None
         };
 
-        let cmd: AssignCommand = AssignCommand::new(kind, key, value);
+        let cmd: AssignCommand = AssignCommand::new(kind.to_owned(), key.to_owned(), value);
         Ok(Arc::new(Box::new(cmd)))
     }
 }

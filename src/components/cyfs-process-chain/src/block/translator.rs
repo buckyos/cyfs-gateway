@@ -67,7 +67,8 @@ impl BlockCommandTranslator {
         // Try parse args to executor
         let executer = if cmd.command.args.is_literal() {
             let args = cmd.command.args.as_literal_list();
-            parser.parse(&args).map_err(|e| {
+            let args = args.iter().map(|s| s.to_string()).collect();
+            parser.parse(args, &cmd.command.args).map_err(|e| {
                 let msg = format!("Parse command error: {:?}, {:?}", cmd.command, e);
                 error!("{}", msg);
                 msg

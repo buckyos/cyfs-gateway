@@ -1,5 +1,6 @@
 use crate::block::CommandArgs;
 use crate::chain::Context;
+use crate::collection::CollectionValue;
 use std::sync::Arc;
 
 pub type CommandParserRef = Arc<Box<dyn CommandParser>>;
@@ -11,14 +12,25 @@ pub trait CommandParser: Send + Sync {
 
     fn parse_origin(
         &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
+        args: Vec<CollectionValue>,
+        origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let args = args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
-        self.parse(&args)
+        let mut str_args = Vec::with_capacity(args.len());
+        for value in args {
+            match value {
+                CollectionValue::String(s) => str_args.push(s),
+                _ => {
+                    let msg = format!("Invalid command argument: {}", value);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
+        }
+
+        self.parse(str_args, origin_args)
     }
 
-    fn parse(&self, _args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, _args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         unimplemented!("CommandParser::parse should be implemented by the command parser");
     }
 }

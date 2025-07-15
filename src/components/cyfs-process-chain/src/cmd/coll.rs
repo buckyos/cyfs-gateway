@@ -44,23 +44,25 @@ impl CommandParser for MatchIncludeCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() >= 2,
             "match-include command should have at least 2 args"
         );
 
-        let collection_id = args[0];
-        let key = args[1];
+        let collection_id = args[0].clone();
+        let key = args[1].clone();
         let values = if args.len() > 2 {
             // If there are more than 2 args, we treat them as values
-            args[2..]
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<String>>()
+            args[2..].iter().map(|s| s.clone()).collect::<Vec<String>>()
         } else {
             vec![]
         };
+
         let cmd = MatchIncludeCommandExecutor::new(collection_id, key, values);
         Ok(Arc::new(Box::new(cmd)))
     }
@@ -74,10 +76,10 @@ pub struct MatchIncludeCommandExecutor {
 }
 
 impl MatchIncludeCommandExecutor {
-    pub fn new(collection_id: &str, key: &str, values: Vec<String>) -> Self {
+    pub fn new(collection_id: String, key: String, values: Vec<String>) -> Self {
         Self {
-            collection_id: collection_id.to_owned(),
-            key: key.to_owned(),
+            collection_id,
+            key,
             values,
         }
     }
@@ -225,7 +227,8 @@ impl CommandParser for SetCreateCommandParser {
 
         // Check options
         if args.len() > 1 {
-            let option_count = CommandArgHelper::check_origin_options(args, &[&["global", "chain"]])?;
+            let option_count =
+                CommandArgHelper::check_origin_options(args, &[&["global", "chain"]])?;
             if option_count + 1 != args.len() {
                 let msg = format!(
                     "Invalid set-create command: expected 1 set-id, but found {} options",
@@ -239,7 +242,11 @@ impl CommandParser for SetCreateCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() >= 1,
             "set-create command should have at least 1 arg"
@@ -249,7 +256,9 @@ impl CommandParser for SetCreateCommandParser {
         let mut level = EnvLevel::Chain; // Default to chain level
         let mut option_count = 0;
         if args.len() > 1 {
-            let options = CommandArgHelper::parse_options(args, &[&["global", "chain", "block"]])?;
+            let str_args = args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+            let options =
+                CommandArgHelper::parse_options(&str_args, &[&["global", "chain", "block"]])?;
             option_count = options.len();
 
             for option in options {
@@ -279,7 +288,7 @@ impl CommandParser for SetCreateCommandParser {
             return Err(msg);
         }
 
-        let cmd = SetCreateCommandExecutor::new(level, args[option_count]);
+        let cmd = SetCreateCommandExecutor::new(level, args[option_count].clone());
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -291,11 +300,8 @@ pub struct SetCreateCommandExecutor {
 }
 
 impl SetCreateCommandExecutor {
-    pub fn new(level: EnvLevel, set_id: &str) -> Self {
-        Self {
-            level,
-            set_id: set_id.to_owned(),
-        }
+    pub fn new(level: EnvLevel, set_id: String) -> Self {
+        Self { level, set_id }
     }
 }
 
@@ -351,10 +357,14 @@ impl CommandParser for SetAddCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         assert!(args.len() == 2, "SetAdd command should have exactly 2 args");
 
-        let cmd = SetAddCommandExecutor::new(args[0], args[1]);
+        let cmd = SetAddCommandExecutor::new(args[0].clone(), args[1].clone());
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -366,11 +376,8 @@ pub struct SetAddCommandExecutor {
 }
 
 impl SetAddCommandExecutor {
-    pub fn new(set_id: &str, value: &str) -> Self {
-        Self {
-            set_id: set_id.to_owned(),
-            value: value.to_owned(),
-        }
+    pub fn new(set_id: String, value: String) -> Self {
+        Self { set_id, value }
     }
 }
 
@@ -432,13 +439,17 @@ impl CommandParser for SetRemoveCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() == 2,
             "SetRemove command should have exactly 2 args"
         );
 
-        let cmd = SetRemoveCommandExecutor::new(args[0], args[1]);
+        let cmd = SetRemoveCommandExecutor::new(args[0].clone(), args[1].clone());
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -450,11 +461,8 @@ pub struct SetRemoveCommandExecutor {
 }
 
 impl SetRemoveCommandExecutor {
-    pub fn new(set_id: &str, value: &str) -> Self {
-        Self {
-            set_id: set_id.to_owned(),
-            value: value.to_owned(),
-        }
+    pub fn new(set_id: String, value: String) -> Self {
+        Self { set_id, value }
     }
 }
 
@@ -514,7 +522,8 @@ impl CommandParser for MapCreateCommandParser {
 
         // If there is options start with "-", it should be "-multi""-global" or "-chain"
         if args.len() > 1 {
-            let option_count = CommandArgHelper::check_origin_options(args, &[&["multi"], &["global", "chain"]])?;
+            let option_count =
+                CommandArgHelper::check_origin_options(args, &[&["multi"], &["global", "chain"]])?;
             if option_count + 1 != args.len() {
                 let msg = format!(
                     "Invalid map-create command: expected 1 map-id, but found {} options",
@@ -528,7 +537,11 @@ impl CommandParser for MapCreateCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() >= 1,
             "map-create command should have at least 1 arg"
@@ -539,10 +552,13 @@ impl CommandParser for MapCreateCommandParser {
         let mut level = EnvLevel::Chain; // Default to chain level
         let mut option_count = 0;
         if args.len() > 1 {
-            let options =
-                CommandArgHelper::parse_options(args, &[&["multi"], &["global", "chain", "block"]])?;
+            let str_args = args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+            let options = CommandArgHelper::parse_options(
+                &str_args,
+                &[&["multi"], &["global", "chain", "block"]],
+            )?;
             option_count = options.len();
-            
+
             for option in options {
                 if option == "multi" {
                     // Set is_multi to true
@@ -563,7 +579,7 @@ impl CommandParser for MapCreateCommandParser {
                 }
             }
         }
-        
+
         if option_count + 1 != args.len() {
             let msg = format!(
                 "Invalid map-create command: map-id is required, but found {} options",
@@ -573,11 +589,7 @@ impl CommandParser for MapCreateCommandParser {
             return Err(msg);
         }
 
-        let cmd = MapCreateCommandExecutor::new(
-            is_multi,
-            level,
-            args[option_count],
-        );
+        let cmd = MapCreateCommandExecutor::new(is_multi, level, args[option_count].clone());
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -590,11 +602,11 @@ pub struct MapCreateCommandExecutor {
 }
 
 impl MapCreateCommandExecutor {
-    pub fn new(is_multi: bool, level: EnvLevel, map_id: &str) -> Self {
+    pub fn new(is_multi: bool, level: EnvLevel, map_id: String) -> Self {
         Self {
             level,
             is_multi,
-            map_id: map_id.to_owned(),
+            map_id,
         }
     }
 }
@@ -660,13 +672,18 @@ impl CommandParser for MapAddCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() >= 3,
             "MapAdd command should have at least 3 args"
         );
 
-        let cmd = MapAddCommandExecutor::new(args[0], args[1], &args[2..]);
+        let cmd =
+            MapAddCommandExecutor::new(args[0].clone(), args[1].clone(), args[2..].to_owned());
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -679,11 +696,11 @@ pub struct MapAddCommandExecutor {
 }
 
 impl MapAddCommandExecutor {
-    pub fn new(map_id: &str, key: &str, value: &[&str]) -> Self {
+    pub fn new(map_id: String, key: String, value: Vec<String>) -> Self {
         Self {
             map_id: map_id.to_owned(),
             key: key.to_owned(),
-            value: value.iter().map(|s| (*s).to_owned()).collect(),
+            value,
         }
     }
 }
@@ -802,22 +819,23 @@ impl CommandParser for MapRemoveCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() >= 2,
             "map-remove command should have at least 2 args"
         );
 
         let values = if args.len() > 2 {
-            args[2..]
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<String>>()
+            args[2..].iter().map(|s| s.clone()).collect::<Vec<String>>()
         } else {
             vec![]
         };
 
-        let cmd = MapRemoveCommandExecutor::new(args[0], args[1], values);
+        let cmd = MapRemoveCommandExecutor::new(args[0].clone(), args[1].clone(), values);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -830,10 +848,10 @@ pub struct MapRemoveCommandExecutor {
 }
 
 impl MapRemoveCommandExecutor {
-    pub fn new(map_id: &str, key: &str, values: Vec<String>) -> Self {
+    pub fn new(map_id: String, key: String, values: Vec<String>) -> Self {
         Self {
-            map_id: map_id.to_owned(),
-            key: key.to_owned(),
+            map_id,
+            key,
             values,
         }
     }
@@ -947,13 +965,13 @@ impl CommandParser for MapGetCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() == 2,
             "map-get command should have exactly 2 args"
         );
 
-        let cmd = MapGetCommandExecutor::new(args[0], args[1]);
+        let cmd = MapGetCommandExecutor::new(args[0].clone(), args[1].clone());
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -965,10 +983,10 @@ pub struct MapGetCommandExecutor {
 }
 
 impl MapGetCommandExecutor {
-    pub fn new(map_id: &str, key: &str) -> Self {
+    pub fn new(map_id: String, key: String) -> Self {
         Self {
-            map_id: map_id.to_owned(),
-            key: key.to_owned(),
+            map_id,
+            key,
         }
     }
 }

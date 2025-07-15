@@ -178,23 +178,18 @@ impl CommandExecutor for DynamicCommandExecutor {
         let mut resolved_args = Vec::with_capacity(self.args.len());
         for arg in &*self.args {
             match arg {
-                CommandArg::Literal(value) => resolved_args.push(value.clone()),
+                CommandArg::Literal(value) => resolved_args.push(CollectionValue::String(value.clone())),
                 CommandArg::Var(var) => {
                     // Resolve variable from context
                     if let Some(value) = context.env().get(&var, None).await? {
-                        match value {
-                            CollectionValue::String(s) => resolved_args.push(s),
-                            _ => {
-                                todo!("Variable '{}' is not a string", var);
-                            }
-                        }
+                        resolved_args.push(value);
                     } else {
                         // If variable is not found, push an empty string
                         warn!(
                             "Variable '{}' not found in context, using empty string",
                             var
                         );
-                        resolved_args.push("".to_string());
+                        resolved_args.push(CollectionValue::String(String::new()));
                     }
                 }
                 CommandArg::CommandSubstitution(cmd) => {
@@ -206,7 +201,7 @@ impl CommandExecutor for DynamicCommandExecutor {
                         return Err(msg);
                     }
 
-                    resolved_args.push(ret.into_substitution_value().unwrap());
+                    resolved_args.push(CollectionValue::String(ret.into_substitution_value().unwrap()));
                 }
             }
         }

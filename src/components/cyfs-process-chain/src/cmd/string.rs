@@ -47,7 +47,7 @@ impl CommandParser for RewriteCommandParser {
         Ok(())
     }
 
-    fn parse_origin(
+    fn parse(
         &self,
         args: Vec<String>,
         origin_args: &CommandArgs,
@@ -194,7 +194,7 @@ impl CommandParser for RewriteRegexCommandParser {
         Ok(())
     }
 
-    fn parse_origin(
+    fn parse(
         &self,
         args: Vec<String>,
         origin_args: &CommandArgs,
@@ -326,7 +326,7 @@ impl CommandParser for StringReplaceCommandParser {
         Ok(())
     }
 
-    fn parse_origin(
+    fn parse(
         &self,
         args: Vec<String>,
         origin_args: &CommandArgs,
@@ -408,13 +408,13 @@ impl CommandParser for StringAppendCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() == 2,
             "String append command should have exactly 2 args"
         );
 
-        let result = args[0].to_string() + args[1];
+        let result = args[0].clone() + &args[1];
         info!("String append {} + {} = {}", args[0], args[1], result);
 
         let cmd = StringConstCommand::new(result);
@@ -492,13 +492,13 @@ impl CommandParser for StringSliceCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() == 2,
             "String slice command should have exactly 2 args"
         );
 
-        let (start, end) = Self::parse_range(args[1])?;
+        let (start, end) = Self::parse_range(&args[1])?;
 
         let ret =
             if start <= end && args[0].is_char_boundary(start) && args[1].is_char_boundary(end) {
@@ -538,7 +538,7 @@ impl CommandParser for StringLengthCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         assert!(args.len() == 1, "strlen command should have exactly 1 arg");
 
         let length = args[0].len();
@@ -573,13 +573,13 @@ impl CommandParser for StringStartsWithCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() == 2,
             "String starts-with command should have exactly 2 args"
         );
 
-        let starts_with = args[0].starts_with(args[1]);
+        let starts_with = args[0].starts_with(&args[1]);
         info!(
             "String '{}' starts with '{}': {}",
             args[0], args[1], starts_with
@@ -613,13 +613,13 @@ impl CommandParser for StringEndsWithCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() == 2,
             "String ends-with command should have exactly 2 args"
         );
 
-        let ends_with = args[0].ends_with(args[1]);
+        let ends_with = args[0].ends_with(&args[1]);
         info!(
             "String '{}' ends with '{}': {}",
             args[0], args[1], ends_with

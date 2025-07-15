@@ -24,10 +24,10 @@ impl CommandParser for ExecCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         assert!(args.len() == 1, "Exec command should have exactly 1 arg");
 
-        let cmd = ExecCommandExecutor::new(args[0]);
+        let cmd = ExecCommandExecutor::new(args[0].clone());
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -38,9 +38,9 @@ pub struct ExecCommandExecutor {
 }
 
 impl ExecCommandExecutor {
-    pub fn new(block: &str) -> Self {
+    pub fn new(block: String) -> Self {
         ExecCommandExecutor {
-            block: block.to_string(),
+            block,
         }
     }
 }
@@ -100,7 +100,7 @@ impl CommandParser for GotoCommandParser {
             error!("{}", msg);
             return Err(msg);
         }
-        
+
         // If there are options, they must be valid
         if args.len() >= 2 {
             let option_count =
@@ -118,7 +118,7 @@ impl CommandParser for GotoCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         assert!(args.len() >= 1, "Goto command should have at least 1 arg");
 
         // Parse the command arguments
@@ -129,7 +129,8 @@ impl CommandParser for GotoCommandParser {
         let mut target_level = GotoTargetLevel::Chain;
         let mut option_count = 0;
         if args.len() >= 2 {
-            let options = CommandArgHelper::parse_options(args, &[&["chain", "block"]])?;
+            let str_args = args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+            let options = CommandArgHelper::parse_options(&str_args, &[&["chain", "block"]])?;
             option_count = options.len();
 
             for option in options {
@@ -215,7 +216,7 @@ impl CommandParser for ReturnCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         assert!(args.len() <= 1, "Return command should have at most 1 arg");
 
         let cmd = ReturnCommandExecutor::new(args.get(0).cloned());
@@ -229,9 +230,9 @@ pub struct ReturnCommandExecutor {
 }
 
 impl ReturnCommandExecutor {
-    pub fn new(value: Option<&str>) -> Self {
+    pub fn new(value: Option<String>) -> Self {
         Self {
-            value: value.map(|s| s.to_string()),
+            value,
         }
     }
 }
@@ -270,7 +271,7 @@ impl CommandParser for ErrorCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         assert!(args.len() <= 1, "Error command should have at most 1 arg");
 
         let cmd = ErrorCommandExecutor::new(args.get(0).cloned());
@@ -284,9 +285,9 @@ pub struct ErrorCommandExecutor {
 }
 
 impl ErrorCommandExecutor {
-    pub fn new(value: Option<&str>) -> Self {
+    pub fn new(value: Option<String>) -> Self {
         Self {
-            value: value.map(|s| s.to_string()),
+            value,
         }
     }
 }
@@ -325,7 +326,7 @@ impl CommandParser for ExitCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         assert!(args.len() <= 1, "Exit command should have at most 1 arg");
 
         let cmd = ExitCommandExecutor::new(args.get(0).cloned());
@@ -339,9 +340,9 @@ pub struct ExitCommandExecutor {
 }
 
 impl ExitCommandExecutor {
-    pub fn new(value: Option<&str>) -> Self {
+    pub fn new(value: Option<String>) -> Self {
         Self {
-            value: value.map(|s| s.to_string()),
+            value,
         }
     }
 }

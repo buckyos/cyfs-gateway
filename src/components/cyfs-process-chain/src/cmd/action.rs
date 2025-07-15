@@ -26,7 +26,7 @@ impl CommandParser for ActionCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
         // Args must be empty
         assert!(args.is_empty(), "Action command should not have any args");
 

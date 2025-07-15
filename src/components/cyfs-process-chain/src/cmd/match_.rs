@@ -28,12 +28,16 @@ impl CommandParser for MatchCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         assert!(args.len() == 2, "Match command should have exactly 2 args");
 
-        let value = args[0].to_owned();
+        let value = args[0].clone();
 
-        let pattern = GlobBuilder::new(args[1])
+        let pattern = GlobBuilder::new(&args[1])
             .case_insensitive(true)
             .build()
             .map_err(|e| {
@@ -67,8 +71,8 @@ impl CommandExecutor for MatchCommandExecutor {
 
 // Match regex command, like: match-regex REQ_HEADER.host "^(.*)\.local$"
 /*
-* MATCH_REG some_input "^pattern$"
-* MATCH_REG --capture name some_input "^pattern$"
+* match-reg some_input "^pattern$"
+* match-reg --capture name some_input "^pattern$"
 */
 pub struct MatchRegexCommandParser {}
 
@@ -111,14 +115,18 @@ impl CommandParser for MatchRegexCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         let mut i = 0;
         let mut capture = None;
 
         // Check if there is a --capture flag
-        if args.get(i) == Some(&"--capture") {
+        if args.get(i).map(|s| s.as_str()) == Some("--capture") {
             if let Some(name) = args.get(i + 1) {
-                capture = Some(name.to_string());
+                capture = Some(name.clone());
                 i += 2;
             } else {
                 let msg = format!("Expected name after --capture: {:?}", args);
@@ -219,7 +227,11 @@ impl CommandParser for EQCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() == 2 || args.len() == 3,
             "EQ command should have 2 or 3 args"
@@ -316,7 +328,11 @@ impl CommandParser for RangeCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         assert!(args.len() == 3, "Range command should have exactly 3 args");
 
         let value = args[1].parse::<f64>().map_err(|e| {
