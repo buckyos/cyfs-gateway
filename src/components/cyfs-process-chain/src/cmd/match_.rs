@@ -1,6 +1,7 @@
 use super::cmd::*;
 use crate::block::CommandArgs;
 use crate::chain::Context;
+use crate::collection::CollectionValue;
 use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
 use std::sync::Arc;
@@ -162,7 +163,11 @@ impl CommandExecutor for MatchRegexCommandExecutor {
                         // TODO: Add env level support, such as --capture export/local name
                         context
                             .env()
-                            .set(format!("{}[{}]", name, i).as_str(), m.as_str(), None)
+                            .set(
+                                format!("{}[{}]", name, i).as_str(),
+                                CollectionValue::String(m.as_str().to_owned()),
+                                None,
+                            )
                             .await?;
                     }
                 }

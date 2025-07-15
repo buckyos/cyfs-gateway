@@ -1,4 +1,5 @@
 use super::req::HTTP_REQUEST_HEADER_VARS;
+use crate::chain::EnvRef;
 use crate::collection::*;
 use hyper::{Uri, header::HeaderName};
 use std::sync::Arc;
@@ -26,10 +27,7 @@ impl HyperHttpRequestHeaderMap {
         Ok(req)
     }
 
-    pub async fn register_visitors(
-        &self,
-        visitor_manager: &VariableVisitorManager,
-    ) -> Result<(), String> {
+    pub async fn register_visitors(&self, env: &EnvRef) -> Result<(), String> {
         // First register visitors for var in header
         let coll = Arc::new(Box::new(self.clone()) as Box<dyn MapCollection>);
         let mut wrapper = VariableVisitorWrapperForMapCollection::new(coll);
@@ -40,16 +38,14 @@ impl HyperHttpRequestHeaderMap {
 
         let visitor = Arc::new(Box::new(wrapper) as Box<dyn VariableVisitor>);
         for (id, _, _) in HTTP_REQUEST_HEADER_VARS {
-            visitor_manager.add_visitor(*id, visitor.clone()).await?;
+            env.create(*id, CollectionValue::Visitor(Arc::clone(&visitor)))
+                .await?;
         }
 
         // Url visitor
         let url_visitor = HyperHttpRequestUrlVisitor::new(self.request.clone(), false);
-        visitor_manager
-            .add_visitor(
-                "REQ_url",
-                Arc::new(Box::new(url_visitor) as Box<dyn VariableVisitor>),
-            )
+        let visitor = Arc::new(Box::new(url_visitor) as Box<dyn VariableVisitor>);
+        env.create("REQ_url", CollectionValue::Visitor(visitor))
             .await?;
 
         Ok(())
@@ -58,9 +54,37 @@ impl HyperHttpRequestHeaderMap {
 
 #[async_trait::async_trait]
 impl MapCollection for HyperHttpRequestHeaderMap {
-    async fn insert(&self, key: &str, value: &str) -> Result<Option<String>, String> {
+    async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
         let mut request = self.request.write().await;
-        let header = value.parse().map_err(|e| {
+        let header = value.try_as_str()?.parse().map_err(|e| {
+            let msg = format!("Invalid header value '{}': {}", value, e);
+            warn!("{}", msg);
+            msg
+        })?;
+
+        let name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
+            let msg = format!("Invalid header name '{}': {}", key, e);
+            warn!("{}", msg);
+            msg.to_string()
+        })?;
+
+        if request.headers().contains_key(&name) {
+            let msg = format!("Header '{}' already exists", key);
+            warn!("{}", msg);
+            return Ok(false);
+        }
+
+        request.headers_mut().insert(name, header);
+        Ok(true)
+    }
+
+    async fn insert(
+        &self,
+        key: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
+        let mut request = self.request.write().await;
+        let header = value.try_as_str()?.parse().map_err(|e| {
             let msg = format!("Invalid header value '{}': {}", value, e);
             warn!("{}", msg);
             msg
@@ -82,21 +106,21 @@ impl MapCollection for HyperHttpRequestHeaderMap {
                     "".to_string()
                 }
             };
-            Ok(Some(prev))
+            Ok(Some(CollectionValue::String(prev)))
         } else {
             Ok(None)
         }
     }
 
-    async fn get(&self, key: &str) -> Result<Option<String>, String> {
+    async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         let request = self.request.read().await;
         let ret = request.headers().get(key);
         if let Some(value) = ret {
             if let Ok(value_str) = value.to_str() {
-                Ok(Some(value_str.to_owned()))
+                Ok(Some(CollectionValue::String(value_str.to_string())))
             } else {
                 warn!("Header value for '{}' is not valid UTF-8", key);
-                Ok(Some("".to_string()))
+                Ok(Some(CollectionValue::String("".to_string())))
             }
         } else {
             warn!("Header '{}' not found", key);
@@ -109,7 +133,7 @@ impl MapCollection for HyperHttpRequestHeaderMap {
         Ok(request.headers().get(key).is_some())
     }
 
-    async fn remove(&self, key: &str) -> Result<Option<String>, String> {
+    async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         let mut request = self.request.write().await;
         let prev = request.headers_mut().remove(key);
         if let Some(prev_value) = prev {
@@ -121,7 +145,7 @@ impl MapCollection for HyperHttpRequestHeaderMap {
                     "".to_string()
                 }
             };
-            Ok(Some(prev))
+            Ok(Some(CollectionValue::String(prev)))
         } else {
             Ok(None)
         }
@@ -143,21 +167,25 @@ impl HyperHttpRequestUrlVisitor {
 
 #[async_trait::async_trait]
 impl VariableVisitor for HyperHttpRequestUrlVisitor {
-    async fn get(&self, _id: &str) -> Result<String, String> {
+    async fn get(&self, _id: &str) -> Result<CollectionValue, String> {
         let request = self.request.read().await;
         let ret = request.uri().to_string();
 
-        Ok(ret)
+        Ok(CollectionValue::String(ret))
     }
 
-    async fn set(&self, id: &str, value: &str) -> Result<Option<String>, String> {
+    async fn set(
+        &self,
+        id: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
         if self.read_only {
             let msg = format!("Cannot set read-only variable '{}'", id);
             warn!("{}", msg);
             return Err(msg);
         }
 
-        let new_url = value.parse::<Uri>().map_err(|e| {
+        let new_url = value.try_as_str()?.parse::<Uri>().map_err(|e| {
             let msg = format!("Invalid URL '{}': {}", value, e);
             warn!("{}", msg);
             msg
@@ -168,6 +196,6 @@ impl VariableVisitor for HyperHttpRequestUrlVisitor {
         *request.uri_mut() = new_url;
 
         info!("Set request url variable '{}' to '{}'", id, value);
-        Ok(Some(old_value))
+        Ok(Some(CollectionValue::String(old_value)))
     }
 }

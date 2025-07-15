@@ -2,6 +2,7 @@ use super::cmd::*;
 use crate::block::{AssignKind, CommandArgs};
 use crate::chain::Context;
 use crate::chain::EnvLevel;
+use crate::collection::CollectionValue;
 use std::sync::Arc;
 
 pub struct AssignCommandParser {}
@@ -84,7 +85,7 @@ impl CommandExecutor for AssignCommand {
                 // Handle assignment with value
                 context
                     .env()
-                    .set(self.key.as_str(), value, Some(env_level))
+                    .set(self.key.as_str(), CollectionValue::String(value.clone()), Some(env_level))
                     .await?;
 
                 Ok(CommandResult::success_with_value(value))

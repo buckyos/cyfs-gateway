@@ -1,12 +1,13 @@
 use super::coll::*;
 use super::mem::*;
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
+use serde::{Deserializer, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-
 
 pub struct JsonFileCollection<T: Send + Sync + for<'a> Deserialize<'a> + Serialize + Default> {
     file: PathBuf,
@@ -134,10 +135,55 @@ impl SetCollection for JsonSetCollection {
     }
 }
 
+impl Serialize for CollectionValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            CollectionValue::String(s) => serializer.serialize_str(s),
+            _ => serializer.serialize_str(""),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CollectionValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct StringVisitor;
+
+        impl<'de> Visitor<'de> for StringVisitor {
+            type Value = CollectionValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(CollectionValue::String(v.to_string()))
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(CollectionValue::String(v))
+            }
+        }
+
+        deserializer.deserialize_string(StringVisitor)
+    }
+}
+
 #[derive(Clone)]
 pub struct JsonMapCollection {
     data: Arc<MemoryMapCollection>,
-    file: Arc<JsonFileCollection<HashMap<String, String>>>,
+    file: Arc<JsonFileCollection<HashMap<String, CollectionValue>>>,
 }
 
 impl JsonMapCollection {
@@ -163,10 +209,24 @@ impl JsonMapCollection {
 
 #[async_trait::async_trait]
 impl MapCollection for JsonMapCollection {
-    async fn insert(&self, key: &str, value: &str) -> Result<Option<String>, String> {
+    async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
+        let ret = self.data.insert_new(key, value).await?;
+        if ret {
+            self.file.mark_dirty();
+        }
+
+        Ok(ret)
+    }
+
+    async fn insert(
+        &self,
+        key: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
+        let new_value = value.clone();
         let ret = self.data.insert(key, value).await?;
         if let Some(prev) = &ret {
-            if prev != value {
+            if let Some(false) = prev.compare_string(&new_value) {
                 self.file.mark_dirty();
             }
         }
@@ -174,7 +234,7 @@ impl MapCollection for JsonMapCollection {
         Ok(ret)
     }
 
-    async fn get(&self, key: &str) -> Result<Option<String>, String> {
+    async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         self.data.get(key).await
     }
 
@@ -182,7 +242,7 @@ impl MapCollection for JsonMapCollection {
         self.data.contains_key(key).await
     }
 
-    async fn remove(&self, key: &str) -> Result<Option<String>, String> {
+    async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         let ret = self.data.remove(key).await?;
         if ret.is_some() {
             self.file.mark_dirty();

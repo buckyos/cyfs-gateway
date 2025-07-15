@@ -1,4 +1,169 @@
+use super::var::VariableVisitorRef;
 use std::sync::Arc;
+
+#[derive(Clone)]
+pub enum CollectionValue {
+    String(String),
+    Set(SetCollectionRef),
+    Map(MapCollectionRef),
+    MultiMap(MultiMapCollectionRef),
+    Visitor(VariableVisitorRef),
+}
+
+pub enum CollectionValueRef<'a> {
+    String(&'a str),
+    Set(&'a SetCollectionRef),
+    Map(&'a MapCollectionRef),
+    MultiMap(&'a MultiMapCollectionRef),
+    Visitor(&'a VariableVisitorRef),
+}
+
+impl std::fmt::Display for CollectionValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CollectionValue::String(s) => write!(f, "{}", s),
+            CollectionValue::Set(_) => write!(f, "[Set]"),
+            CollectionValue::Map(_) => write!(f, "[Map]"),
+            CollectionValue::MultiMap(_) => write!(f, "[MultiMap]"),
+            CollectionValue::Visitor(_) => write!(f, "[Visitor]"),
+        }
+    } 
+}
+
+impl CollectionValue {
+    pub fn compare_string(&self, other: &Self) -> Option<bool> {
+        match (self, other) {
+            (CollectionValue::String(s1), CollectionValue::String(s2)) => Some(s1 == s2),
+            _ => None,
+        }
+    }
+
+    pub fn get_type(&self) -> &str {
+        match self {
+            CollectionValue::String(_) => "String",
+            CollectionValue::Set(_) => "Set",
+            CollectionValue::Map(_) => "Map",
+            CollectionValue::MultiMap(_) => "MultiMap",
+            CollectionValue::Visitor(_) => "Visitor",
+        }
+    }
+
+    pub fn as_ref(&self) -> CollectionValueRef {
+        match self {
+            CollectionValue::String(s) => CollectionValueRef::String(s.as_str()),
+            CollectionValue::Set(s) => CollectionValueRef::Set(s),
+            CollectionValue::Map(m) => CollectionValueRef::Map(m),
+            CollectionValue::MultiMap(mm) => CollectionValueRef::MultiMap(mm),
+            CollectionValue::Visitor(v) => CollectionValueRef::Visitor(v),
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        if let CollectionValue::String(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    pub fn try_as_str(&self) -> Result<&str, String> {
+        if let CollectionValue::String(s) = self {
+            Ok(s)
+        } else {
+            let msg = format!(
+                "Expected CollectionValue::String, found {}",
+                self.get_type(),
+            );
+            warn!("{}", msg);
+            Err(msg)
+        }
+    }
+
+    pub fn treat_as_str(&self) -> &str {
+        match self {
+            CollectionValue::String(s) => s.as_str(),
+            _ => {
+                let msg = format!(
+                    "Expected CollectionValue::String, found {}",
+                    self.get_type(),
+                );
+                warn!("{}", msg);
+                ""
+            }
+        }
+    }
+
+    pub fn as_set(&self) -> Option<&SetCollectionRef> {
+        if let CollectionValue::Set(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    pub fn try_as_set(&self) -> Result<&SetCollectionRef, String> {
+        if let CollectionValue::Set(s) = self {
+            Ok(s)
+        } else {
+            let msg = format!(
+                "Expected CollectionValue::Set, found {}",
+                self.get_type(),
+            );
+            warn!("{}", msg);
+            Err(msg)
+        }
+    }
+
+    pub fn as_map(&self) -> Option<&MapCollectionRef> {
+        if let CollectionValue::Map(m) = self {
+            Some(m)
+        } else {
+            None
+        }
+    }
+
+    pub fn try_as_map(&self) -> Result<&MapCollectionRef, String> {
+        if let CollectionValue::Map(m) = self {
+            Ok(m)
+        } else {
+            let msg = format!(
+                "Expected CollectionValue::Map, found {}",
+                self.get_type(),
+            );
+            warn!("{}", msg);
+            Err(msg)
+        }
+    }
+
+    pub fn as_multi_map(&self) -> Option<&MultiMapCollectionRef> {
+        if let CollectionValue::MultiMap(mm) = self {
+            Some(mm)
+        } else {
+            None
+        }
+    }
+
+    pub fn try_as_multi_map(&self) -> Result<&MultiMapCollectionRef, String> {
+        if let CollectionValue::MultiMap(mm) = self {
+            Ok(mm)
+        } else {
+            let msg = format!(
+                "Expected CollectionValue::MultiMap, found {}",
+                self.get_type(),
+            );
+            warn!("{}", msg);
+            Err(msg)
+        }
+    }
+
+    pub fn as_visitor(&self) -> Option<&VariableVisitorRef> {
+        if let CollectionValue::Visitor(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CollectionType {
@@ -38,17 +203,28 @@ pub type SetCollectionRef = Arc<Box<dyn SetCollection>>;
 
 #[async_trait::async_trait]
 pub trait MapCollection: Send + Sync {
+    
+    /// Inserts a key-value pair into the collection.
+    /// If the key already exists, it will return false.
+    async fn insert_new(
+        &self, key: &str, value: CollectionValue,
+    ) -> Result<bool, String>;
+
     /// Sets the value for the given key in the collection.
-    async fn insert(&self, key: &str, value: &str) -> Result<Option<String>, String>;
+    async fn insert(
+        &self,
+        key: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String>;
 
     /// Gets the value for the given key from the collection.
-    async fn get(&self, key: &str) -> Result<Option<String>, String>;
+    async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String>;
 
     /// Checks if the collection contains the given key.
     async fn contains_key(&self, key: &str) -> Result<bool, String>;
 
     /// Removes the key from the collection.
-    async fn remove(&self, key: &str) -> Result<Option<String>, String>;
+    async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String>;
 
     /// Flushes the collection to persistent storage if applicable.
     async fn flush(&self) -> Result<(), String> {

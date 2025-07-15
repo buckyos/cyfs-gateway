@@ -1,6 +1,7 @@
 use super::cmd::{CommandExecutor, CommandExecutorRef, CommandParser, CommandResult};
 use crate::block::CommandArgs;
 use crate::chain::Context;
+use crate::collection::CollectionValue;
 use globset::{GlobBuilder, GlobMatcher};
 use std::sync::Arc;
 
@@ -109,9 +110,17 @@ impl CommandExecutor for RewriteCommand {
                     let rewritten = format!("{}{}", &template[..template.len() - 1], tail);
                     context
                         .env()
-                        .set(self.key.as_str(), &rewritten, None)
+                        .set(
+                            self.key.as_str(),
+                            CollectionValue::String(rewritten.clone()),
+                            None,
+                        )
                         .await?;
-                    info!("Rewritten value for {}: {} -> {}", self.key, key_value, rewritten);
+                    info!(
+                        "Rewritten value for {}: {} -> {}",
+                        self.key, key_value, rewritten
+                    );
+
                     Ok(CommandResult::success_with_value(rewritten))
                 } else {
                     let msg = format!(
@@ -122,12 +131,20 @@ impl CommandExecutor for RewriteCommand {
                     Ok(CommandResult::success())
                 }
             } else {
-                info!("Pattern '{}' matched '{}', setting to template '{}'", pattern_value, key_value, template);
+                info!(
+                    "Pattern '{}' matched '{}', setting to template '{}'",
+                    pattern_value, key_value, template
+                );
                 context
-                        .env()
-                        .set(self.key.as_str(), &template, None)
-                        .await?;
-                Ok(CommandResult::success_with_value(template.to_string()))
+                    .env()
+                    .set(
+                        self.key.as_str(),
+                        CollectionValue::String(template.to_owned()),
+                        None,
+                    )
+                    .await?;
+
+                Ok(CommandResult::success_with_value(template.to_owned()))
             }
         } else {
             info!("Pattern '{}' did not match '{}'", pattern_value, key_value);
@@ -263,7 +280,11 @@ impl CommandExecutor for RewriteRegexCommand {
 
             context
                 .env()
-                .set(self.key.as_str(), &result, None)
+                .set(
+                    self.key.as_str(),
+                    CollectionValue::String(result.clone()),
+                    None,
+                )
                 .await?;
             info!("Rewritten value for {}: {}", self.key, result);
 
@@ -354,7 +375,7 @@ impl CommandExecutor for StringReplaceCommand {
             let rewritten = key_value.replace(match_text, new_text);
             context
                 .env()
-                .set(self.key.as_str(), &rewritten, None)
+                .set(self.key.as_str(), CollectionValue::String(rewritten.clone()), None)
                 .await?;
             info!("Replace value for {}: {}", self.key, rewritten);
 

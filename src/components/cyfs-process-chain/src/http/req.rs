@@ -1,3 +1,4 @@
+use crate::chain::Env;
 use crate::collection::*;
 use http_types::{Request, Url};
 use std::sync::Arc;
@@ -30,11 +31,8 @@ impl HttpRequestHeaderMap {
 
         Ok(req)
     }
-    
-    pub async fn register_visitors(
-        &self,
-        visitor_manager: &VariableVisitorManager,
-    ) -> Result<(), String> {
+
+    pub async fn register_visitors(&self, env: &Env) -> Result<(), String> {
         // First register visitors for var in header
         let coll = Arc::new(Box::new(self.clone()) as Box<dyn MapCollection>);
         let mut wrapper = VariableVisitorWrapperForMapCollection::new(coll);
@@ -45,16 +43,14 @@ impl HttpRequestHeaderMap {
 
         let visitor = Arc::new(Box::new(wrapper) as Box<dyn VariableVisitor>);
         for (id, _, _) in HTTP_REQUEST_HEADER_VARS {
-            visitor_manager.add_visitor(*id, visitor.clone()).await?;
+            env.create(*id, CollectionValue::Visitor(visitor.clone()))
+                .await?;
         }
 
         // Url visitor
         let url_visitor = HttpRequestUrlVisitor::new(self.request.clone(), false);
-        visitor_manager
-            .add_visitor(
-                "REQ_url",
-                Arc::new(Box::new(url_visitor) as Box<dyn VariableVisitor>),
-            )
+        let visitor = Arc::new(Box::new(url_visitor) as Box<dyn VariableVisitor>);
+        env.create("REQ_url", CollectionValue::Visitor(visitor))
             .await?;
 
         Ok(())
@@ -63,19 +59,36 @@ impl HttpRequestHeaderMap {
 
 #[async_trait::async_trait]
 impl MapCollection for HttpRequestHeaderMap {
-    async fn insert(&self, key: &str, value: &str) -> Result<Option<String>, String> {
+    async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
         let mut request = self.request.write().await;
-        let prev = request.insert_header(key, value);
+        if request.header(key).is_some() {
+            let msg = format!("Header '{}' already exists", key);
+            warn!("{}", msg);
+            return Ok(false);
+        }
+
+        request.insert_header(key, value.try_as_str()?);
+        Ok(true)
+    }
+
+    async fn insert(
+        &self,
+        key: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
+        let mut request = self.request.write().await;
+        let prev = request.insert_header(key, value.try_as_str()?);
         if let Some(prev_value) = prev {
-            Ok(Some(prev_value.to_string()))
+            Ok(Some(CollectionValue::String(prev_value.to_string())))
         } else {
             Ok(None)
         }
     }
 
-    async fn get(&self, key: &str) -> Result<Option<String>, String> {
+    async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         let request = self.request.read().await;
-        Ok(request.header(key).map(|h| h.to_string()))
+        let prev = request.header(key).map(|h| h.to_string());
+        Ok(prev.map(|v| CollectionValue::String(v)))
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
@@ -83,11 +96,11 @@ impl MapCollection for HttpRequestHeaderMap {
         Ok(request.header(key).is_some())
     }
 
-    async fn remove(&self, key: &str) -> Result<Option<String>, String> {
+    async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         let mut request = self.request.write().await;
         let prev = request.remove_header(key);
         if let Some(prev_value) = prev {
-            Ok(Some(prev_value.to_string()))
+            Ok(Some(CollectionValue::String(prev_value.to_string())))
         } else {
             Ok(None)
         }
@@ -109,21 +122,25 @@ impl HttpRequestUrlVisitor {
 
 #[async_trait::async_trait]
 impl VariableVisitor for HttpRequestUrlVisitor {
-    async fn get(&self, _id: &str) -> Result<String, String> {
+    async fn get(&self, _id: &str) -> Result<CollectionValue, String> {
         let request = self.request.read().await;
         let ret = request.url().to_string();
 
-        Ok(ret)
+        Ok(CollectionValue::String(ret))
     }
 
-    async fn set(&self, id: &str, value: &str) -> Result<Option<String>, String> {
+    async fn set(
+        &self,
+        id: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
         if self.read_only {
             let msg = format!("Cannot set read-only variable '{}'", id);
             warn!("{}", msg);
             return Err(msg);
         }
 
-        let new_url = Url::parse(value).map_err(|e| {
+        let new_url = Url::parse(value.try_as_str()?).map_err(|e| {
             let msg = format!("Invalid URL '{}': {}", value, e);
             warn!("{}", msg);
             msg
@@ -134,6 +151,6 @@ impl VariableVisitor for HttpRequestUrlVisitor {
         *request.url_mut() = new_url;
 
         info!("Set request url variable '{}' to '{}'", id, value);
-        Ok(Some(old_value))
+        Ok(Some(CollectionValue::String(old_value)))
     }
 }

@@ -48,7 +48,7 @@ impl SetCollection for MemorySetCollection {
 }
 
 pub struct MemoryMapCollection {
-    data: RwLock<HashMap<String, String>>,
+    data: RwLock<HashMap<String, CollectionValue>>,
 }
 
 impl MemoryMapCollection {
@@ -58,28 +58,93 @@ impl MemoryMapCollection {
         }
     }
 
-    pub(crate) fn from_map(map: HashMap<String, String>) -> Self {
+    pub(crate) fn from_map(map: HashMap<String, CollectionValue>) -> Self {
         Self {
             data: RwLock::new(map),
         }
     }
 
-    pub fn data(&self) -> &RwLock<HashMap<String, String>> {
+    pub fn data(&self) -> &RwLock<HashMap<String, CollectionValue>> {
         &self.data
     }
 }
 
 #[async_trait::async_trait]
 impl MapCollection for MemoryMapCollection {
-    async fn insert(&self, key: &str, value: &str) -> Result<Option<String>, String> {
+    async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
         let mut data = self.data.write().unwrap();
-        let prev = data.insert(key.to_string(), value.to_string());
-        Ok(prev)
+        match data.entry(key.to_string()) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                let msg = format!("Key '{}' already exists in the collection", key);
+                warn!("{}", msg);
+                Ok(false)
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(value);
+                Ok(true)
+            }
+        }
     }
 
-    async fn get(&self, key: &str) -> Result<Option<String>, String> {
-        let data = self.data.read().unwrap();
-        Ok(data.get(key).cloned())
+    async fn insert(
+        &self,
+        key: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
+        let visitor;
+        {
+            let mut data = self.data.write().unwrap();
+            match data.entry(key.to_string()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => match entry.get() {
+                    CollectionValue::Visitor(v) => {
+                        visitor = Some(v.clone());
+                    }
+                    _ => {
+                        let prev = entry.insert(value);
+                        return Ok(Some(prev));
+                    }
+                },
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(value);
+                    return Ok(None);
+                }
+            }
+        };
+
+        let visitor = visitor.unwrap();
+        visitor.set(key, value).await
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        let mut visitor;
+        {
+            let data = self.data.read().unwrap();
+            if let Some(value) = data.get(key) {
+                if let CollectionValue::Visitor(v) = value {
+                    visitor = Some(v.clone());
+                } else {
+                    return Ok(Some(value.clone()));
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+
+        loop {
+            let current = visitor.unwrap();
+            let ret = current.get(key).await?;
+
+            match ret {
+                CollectionValue::Visitor(v) => {
+                    // If the value is a visitor, we need to call get again
+                    visitor = Some(v);
+                }
+                _ => {
+                    // If it's not a visitor, we can return the value
+                    return Ok(Some(ret));
+                }
+            }
+        }
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
@@ -87,7 +152,7 @@ impl MapCollection for MemoryMapCollection {
         Ok(data.contains_key(key))
     }
 
-    async fn remove(&self, key: &str) -> Result<Option<String>, String> {
+    async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         let mut data = self.data.write().unwrap();
         Ok(data.remove(key))
     }

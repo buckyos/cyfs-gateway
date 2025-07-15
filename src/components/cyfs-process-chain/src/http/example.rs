@@ -105,7 +105,7 @@ async fn pre_process_request(
         // Register visitors for the request headers in the chain environment
         let chain_env = exec.chain_env();
         req_map
-            .register_visitors(&chain_env.variable_visitor_manager())
+            .register_visitors(&chain_env)
             .await
             .unwrap();
 

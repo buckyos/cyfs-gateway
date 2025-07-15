@@ -1,8 +1,8 @@
 use super::cmd::{CommandExecutor, CommandExecutorRef, CommandParser, CommandResult};
 use super::helper::CommandArgHelper;
 use crate::block::CommandArgs;
-use crate::chain::Context;
-use crate::collection::{CollectionLevel, CollectionResult, MapCollectionResult};
+use crate::chain::{Context, EnvLevel};
+use crate::collection::{CollectionType, CollectionValue};
 use std::sync::Arc;
 
 /*
@@ -21,7 +21,7 @@ map-remove map_id key value	// for multi map
 map-get map_id key	// for both map, return value or value collection
 */
 
-// match_include <collection_id> <var> // for normal set/map or multi map
+// match-include <collection_id> <var> // for normal set/map or multi map
 
 // Check if the variable is included in the specified collection
 pub struct MatchIncludeCommandParser {}
@@ -87,18 +87,16 @@ impl MatchIncludeCommandExecutor {
 impl CommandExecutor for MatchIncludeCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Get the collection from the context
-        let ret = context
-            .collection_manager()
-            .get_collection(&self.collection_id)
-            .await;
+        let ret = context.env().get(&self.collection_id, None).await?;
         if ret.is_none() {
             let msg = format!("Collection with id '{}' not found", self.collection_id);
             warn!("{}", msg);
             return Ok(CommandResult::error_with_value(msg));
         }
 
-        match ret.unwrap() {
-            CollectionResult::Set(collection) => {
+        let ret = ret.unwrap();
+        match ret {
+            CollectionValue::Set(collection) => {
                 // For set collection, we check if the key is included
                 let contains = collection.contains(&self.key).await?;
                 info!(
@@ -111,7 +109,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                     Ok(CommandResult::error())
                 }
             }
-            CollectionResult::Map(collection) => {
+            CollectionValue::Map(collection) => {
                 // For map collection, we check if the key exists and matches the value
                 let value = collection.get(&self.key).await?;
                 if let Some(value) = value {
@@ -131,12 +129,17 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                         }
 
                         // Only check if the first value matches
-                        if self.values[0] == value {
-                            info!(
-                                "MatchInclude command: key='{}', collection_id='{}', value='{}' found",
-                                self.key, self.collection_id, value
-                            );
-                            return Ok(CommandResult::success());
+                        match value {
+                            CollectionValue::String(ref v) if self.values[0] == *v => {
+                                info!(
+                                    "MatchInclude command: key='{}', collection_id='{}', value='{}' found",
+                                    self.key, self.collection_id, v
+                                );
+                                return Ok(CommandResult::success());
+                            }
+                            _ => {
+                                todo!("Handle other value types or multiple values");
+                            }
                         }
                     }
                 }
@@ -149,7 +152,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                 Ok(CommandResult::error())
             }
 
-            CollectionResult::MultiMap(collection) => {
+            CollectionValue::MultiMap(collection) => {
                 // For multi-map collection, we check if the key exists and matches any of the values
                 let values = collection.get_many(&self.key).await?;
                 if let Some(values) = values {
@@ -187,6 +190,15 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                     self.key, self.collection_id
                 );
                 Ok(CommandResult::error())
+            }
+
+            _ => {
+                let msg = format!(
+                    "Expected CollectionValue::Set, CollectionValue::Map or CollectionValue::MultiMap, found {}",
+                    ret,
+                );
+                warn!("{}", msg);
+                Err(msg)
             }
         }
     }
@@ -226,16 +238,16 @@ impl CommandParser for SetCreateCommandParser {
         );
 
         // Parse options
-        let mut level = CollectionLevel::Chain; // Default to chain level
+        let mut level = EnvLevel::Chain; // Default to chain level
         if args.len() > 1 {
             let options = CommandArgHelper::parse_options(args, &[&["global", "chain"]])?;
             for option in options {
                 if option == "global" {
                     // Set level to Global
-                    level = CollectionLevel::Global;
+                    level = EnvLevel::Global;
                 } else if option == "chain" {
                     // Set level to Chain
-                    level = CollectionLevel::Chain;
+                    level = EnvLevel::Chain;
                 } else {
                     let msg = format!("Invalid option '{}' in set-create command", option);
                     error!("{}", msg);
@@ -251,12 +263,12 @@ impl CommandParser for SetCreateCommandParser {
 
 // SetCreateCommandExecutor
 pub struct SetCreateCommandExecutor {
-    level: CollectionLevel, // Chain or Global
+    level: EnvLevel, // Chain or Global
     set_id: String,
 }
 
 impl SetCreateCommandExecutor {
-    pub fn new(level: CollectionLevel, set_id: &str) -> Self {
+    pub fn new(level: EnvLevel, set_id: &str) -> Self {
         Self {
             level,
             set_id: set_id.to_owned(),
@@ -269,9 +281,9 @@ impl CommandExecutor for SetCreateCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Create a new set collection with the given id
         match context
-            .collection_manager()
-            .create_set_collection(self.level, &self.set_id)
-            .await
+            .env()
+            .create_collection(&self.set_id, CollectionType::Set, Some(self.level))
+            .await?
         {
             Some(_) => {
                 info!(
@@ -343,17 +355,16 @@ impl SetAddCommandExecutor {
 impl CommandExecutor for SetAddCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Add the value to the specified set collection
-        let ret = context
-            .collection_manager()
-            .get_set_collection(&self.set_id)
-            .await;
+        let ret = context.env().get(&self.set_id, None).await?;
         if ret.is_none() {
             let msg = format!("Set collection with id '{}' not found", self.set_id);
             warn!("{}", msg);
             return Ok(CommandResult::error_with_value(msg));
         }
 
-        let collection = ret.unwrap();
+        let ret = ret.unwrap();
+        let collection = ret.try_as_set()?;
+
         match collection.insert(&self.value).await? {
             true => {
                 info!(
@@ -428,17 +439,16 @@ impl SetRemoveCommandExecutor {
 impl CommandExecutor for SetRemoveCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Remove the value from the specified set collection
-        let ret = context
-            .collection_manager()
-            .get_set_collection(&self.set_id)
-            .await;
+        let ret = context.env().get(&self.set_id, None).await?;
         if ret.is_none() {
             let msg = format!("Set collection with id '{}' not found", self.set_id);
             warn!("{}", msg);
             return Ok(CommandResult::error_with_value(msg));
         }
 
-        let collection = ret.unwrap();
+        let ret = ret.unwrap();
+        let collection = ret.try_as_set()?;
+
         match collection.remove(&self.value).await? {
             true => {
                 info!(
@@ -495,7 +505,7 @@ impl CommandParser for MapCreateCommandParser {
 
         // Parse options
         let mut is_multi = false; // Default to single map
-        let mut level = CollectionLevel::Chain; // Default to chain level
+        let mut level = EnvLevel::Chain; // Default to chain level
         if args.len() > 1 {
             let options =
                 CommandArgHelper::parse_options(args, &[&["multi"], &["global", "chain"]])?;
@@ -505,10 +515,10 @@ impl CommandParser for MapCreateCommandParser {
                     is_multi = true;
                 } else if option == "global" {
                     // Set level to Global
-                    level = CollectionLevel::Global;
+                    level = EnvLevel::Global;
                 } else if option == "chain" {
                     // Set level to Chain
-                    level = CollectionLevel::Chain;
+                    level = EnvLevel::Chain;
                 } else {
                     let msg = format!("Invalid option '{}' in map-create command", option);
                     error!("{}", msg);
@@ -528,13 +538,13 @@ impl CommandParser for MapCreateCommandParser {
 
 // MapCreateCommandExecutor
 pub struct MapCreateCommandExecutor {
-    level: CollectionLevel, // Chain or Global
-    is_multi: bool,         // Indicates if this is a multi-map
+    level: EnvLevel, // Chain or Global
+    is_multi: bool,  // Indicates if this is a multi-map
     map_id: String,
 }
 
 impl MapCreateCommandExecutor {
-    pub fn new(is_multi: bool, level: CollectionLevel, map_id: &str) -> Self {
+    pub fn new(is_multi: bool, level: EnvLevel, map_id: &str) -> Self {
         Self {
             level,
             is_multi,
@@ -549,27 +559,25 @@ impl CommandExecutor for MapCreateCommandExecutor {
         // Create a new map collection with the given id
         let ret = if self.is_multi {
             context
-                .collection_manager()
-                .create_multi_map_collection(self.level, &self.map_id)
+                .env()
+                .create_collection(&self.map_id, CollectionType::MultiMap, Some(self.level))
                 .await
-                .is_some()
         } else {
             context
-                .collection_manager()
-                .create_map_collection(self.level, &self.map_id)
+                .env()
+                .create_collection(&self.map_id, CollectionType::Map, Some(self.level))
                 .await
-                .is_some()
-        };
+        }?;
 
         match ret {
-            true => {
+            Some(_) => {
                 info!(
                     "Map collection with id '{}' multi={} level={:?}, created successfully",
                     self.map_id, self.is_multi, self.level,
                 );
                 Ok(CommandResult::success())
             }
-            false => {
+            None => {
                 let msg = format!(
                     "Failed to create map collection with id '{}' multi={} level={:?}",
                     self.map_id, self.is_multi, self.level
@@ -638,10 +646,7 @@ impl MapAddCommandExecutor {
 impl CommandExecutor for MapAddCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Add the key-value pair to the specified map collection
-        let ret = context
-            .collection_manager()
-            .get_map_collection(&self.map_id)
-            .await;
+        let ret = context.env().get(&self.map_id, None).await?;
         if ret.is_none() {
             let msg = format!("Map collection with id '{}' not found", self.map_id);
             warn!("{}", msg);
@@ -650,7 +655,7 @@ impl CommandExecutor for MapAddCommandExecutor {
 
         let ret = ret.unwrap();
         match ret {
-            MapCollectionResult::Map(collection) => {
+            CollectionValue::Map(collection) => {
                 // For normal map, we expect only one value
                 if self.value.len() != 1 {
                     warn!(
@@ -662,7 +667,10 @@ impl CommandExecutor for MapAddCommandExecutor {
                     // FIXME: What should we do if there is more than one value? We now only use the first value
                 }
 
-                match collection.insert(&self.key, &self.value[0]).await? {
+                match collection
+                    .insert(&self.key, CollectionValue::String(self.value[0].clone()))
+                    .await?
+                {
                     None => {
                         info!(
                             "Key '{}' with value '{}' added to map collection with id '{}'",
@@ -679,7 +687,7 @@ impl CommandExecutor for MapAddCommandExecutor {
                     }
                 }
             }
-            MapCollectionResult::MultiMap(collection) => {
+            CollectionValue::MultiMap(collection) => {
                 let ret = if self.value.len() == 1 {
                     collection.insert(&self.key, &self.value[0]).await?
                 } else {
@@ -711,6 +719,15 @@ impl CommandExecutor for MapAddCommandExecutor {
                         Ok(CommandResult::error_with_value(msg))
                     }
                 }
+            }
+
+            _ => {
+                let msg = format!(
+                    "Expected CollectionValue::Map or CollectionValue::MultiMap, found {}",
+                    ret,
+                );
+                warn!("{}", msg);
+                Err(msg)
             }
         }
     }
@@ -780,10 +797,7 @@ impl MapRemoveCommandExecutor {
 impl CommandExecutor for MapRemoveCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Remove the key from the specified map collection
-        let ret = context
-            .collection_manager()
-            .get_map_collection(&self.map_id)
-            .await;
+        let ret = context.env().get(&self.map_id, None).await?;
         if ret.is_none() {
             let msg = format!("Map collection with id '{}' not found", self.map_id);
             warn!("{}", msg);
@@ -792,7 +806,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
 
         let ret = ret.unwrap();
         match ret {
-            MapCollectionResult::Map(collection) => {
+            CollectionValue::Map(collection) => {
                 // For normal map, we expect only one value
                 if self.values.len() > 1 {
                     warn!(
@@ -808,7 +822,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                             "Key '{}' removed from map collection with id '{}': {}",
                             self.key, self.map_id, value
                         );
-                        Ok(CommandResult::success_with_value(value))
+                        Ok(CommandResult::success_with_value(value.treat_as_str()))
                     }
                     None => {
                         warn!(
@@ -819,7 +833,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                     }
                 }
             }
-            MapCollectionResult::MultiMap(collection) => {
+            CollectionValue::MultiMap(collection) => {
                 if self.values.is_empty() {
                     return Ok(CommandResult::error_with_value(
                         "No values provided for multi-map remove".to_string(),
@@ -852,6 +866,14 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                     );
                     Ok(CommandResult::error())
                 }
+            }
+            _ => {
+                let msg = format!(
+                    "Expected CollectionValue::Map or CollectionValue::MultiMap, found {}",
+                    ret,
+                );
+                warn!("{}", msg);
+                Err(msg)
             }
         }
     }
@@ -909,25 +931,25 @@ impl MapGetCommandExecutor {
 impl CommandExecutor for MapGetCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Get the value of the key from the specified map collection
-        let ret = context
-            .collection_manager()
-            .get_map_collection(&self.map_id)
-            .await;
+        let ret = context.env().get(&self.map_id, None).await?;
         if ret.is_none() {
             let msg = format!("Map collection with id '{}' not found", self.map_id);
             warn!("{}", msg);
             return Ok(CommandResult::error_with_value(msg));
         }
-
         let ret = ret.unwrap();
+
         match ret {
-            MapCollectionResult::Map(collection) => match collection.get(&self.key).await? {
+            CollectionValue::Map(collection) => match collection.get(&self.key).await? {
                 Some(value) => {
                     info!(
                         "Key '{}' found in map collection with id '{}': {}",
                         self.key, self.map_id, value
                     );
-                    Ok(CommandResult::success_with_value(value))
+
+                    // FIXME: We assume the value is a string, if not, we return an empty string
+                    let s = value.treat_as_str();
+                    Ok(CommandResult::success_with_value(s))
                 }
                 None => {
                     warn!(
@@ -937,34 +959,40 @@ impl CommandExecutor for MapGetCommandExecutor {
                     Ok(CommandResult::success_with_value(""))
                 }
             },
-            MapCollectionResult::MultiMap(collection) => {
-                match collection.get_many(&self.key).await? {
-                    Some(values) => {
-                        let values = values.get_all().await?;
-                        if values.is_empty() {
-                            warn!(
-                                "Key '{}' not found in multi-map collection with id '{}'",
-                                self.key, self.map_id
-                            );
-                            Ok(CommandResult::success_with_value(""))
-                        } else {
-                            info!(
-                                "Key '{}' found in multi-map collection with id '{}': {:?}",
-                                self.key, self.map_id, values
-                            );
-
-                            let values = values.join(" ");
-                            Ok(CommandResult::success_with_value(values))
-                        }
-                    }
-                    None => {
+            CollectionValue::MultiMap(collection) => match collection.get_many(&self.key).await? {
+                Some(values) => {
+                    let values = values.get_all().await?;
+                    if values.is_empty() {
                         warn!(
                             "Key '{}' not found in multi-map collection with id '{}'",
                             self.key, self.map_id
                         );
                         Ok(CommandResult::success_with_value(""))
+                    } else {
+                        info!(
+                            "Key '{}' found in multi-map collection with id '{}': {:?}",
+                            self.key, self.map_id, values
+                        );
+
+                        let values = values.join(" ");
+                        Ok(CommandResult::success_with_value(values))
                     }
                 }
+                None => {
+                    warn!(
+                        "Key '{}' not found in multi-map collection with id '{}'",
+                        self.key, self.map_id
+                    );
+                    Ok(CommandResult::success_with_value(""))
+                }
+            },
+            _ => {
+                let msg = format!(
+                    "Expected CollectionValue::Map or CollectionValue::MultiMap, found {}",
+                    ret,
+                );
+                warn!("{}", msg);
+                Err(msg)
             }
         }
     }

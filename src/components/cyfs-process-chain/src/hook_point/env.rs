@@ -8,21 +8,18 @@ use std::sync::Arc;
 pub struct HookPointEnv {
     id: String,
     data_dir: PathBuf,
-    global_collections: Collections,
     global_env: EnvRef,
     pipe: SharedMemoryPipe,
 }
 
 impl HookPointEnv {
     pub fn new(id: impl Into<String>, data_dir: PathBuf) -> Self {
-        let global_collections = Collections::new();
         let pipe: SharedMemoryPipe = SharedMemoryPipe::new_empty();
 
         let global_env = Arc::new(Env::new(EnvLevel::Global, None));
         Self {
             id: id.into(),
             data_dir,
-            global_collections,
             global_env,
             pipe,
         }
@@ -36,17 +33,8 @@ impl HookPointEnv {
         &self.data_dir
     }
 
-    pub fn global_collections(&self) -> &Collections {
-        &self.global_collections
-    }
-
     pub fn global_env(&self) -> &EnvRef {
         &self.global_env
-    }
-
-    // Return variable visitor manager in global env
-    pub fn variable_visitor_manager(&self) -> &VariableVisitorManager {
-        &self.global_env.variable_visitor_manager()
     }
 
     pub fn pipe(&self) -> &SharedMemoryPipe {
@@ -54,7 +42,8 @@ impl HookPointEnv {
     }
 
     pub async fn flush_collections(&self) -> Result<(), String> {
-        self.global_collections.flush().await
+        todo!("Implement flush_collections for HookPointEnv");
+        // self.global_collections.flush().await
     }
 
     pub async fn load_collection(
@@ -91,10 +80,10 @@ impl HookPointEnv {
                 };
 
                 let ret = self
-                    .global_collections
-                    .add_set_collection(id, Arc::new(set))
-                    .await;
-                if ret.is_none() {
+                    .global_env
+                    .create(id, CollectionValue::Set(Arc::new(set)))
+                    .await?;
+                if !ret {
                     let msg = format!(
                         "Failed to add set collection with id '{}', already exists",
                         id
@@ -115,10 +104,10 @@ impl HookPointEnv {
                 };
 
                 let ret = self
-                    .global_collections
-                    .add_map_collection(id, Arc::new(map))
-                    .await;
-                if ret.is_none() {
+                    .global_env
+                    .create(id, CollectionValue::Map(Arc::new(map)))
+                    .await?;
+                if !ret {
                     let msg = format!(
                         "Failed to add map collection with id '{}', already exists",
                         id
@@ -139,10 +128,10 @@ impl HookPointEnv {
                 };
 
                 let ret = self
-                    .global_collections
-                    .add_multi_map_collection(id, Arc::new(multi_map))
-                    .await;
-                if ret.is_none() {
+                    .global_env
+                    .create(id, CollectionValue::MultiMap(Arc::new(multi_map)))
+                    .await?;
+                if !ret {
                     let msg = format!(
                         "Failed to add multi-map collection with id '{}', already exists",
                         id
@@ -166,7 +155,6 @@ impl HookPointEnv {
         ProcessChainListExecutor::new(
             hook_point.process_chain_manager(),
             self.global_env.clone(),
-            self.global_collections.clone(),
             self.pipe.pipe().clone(),
         )
     }
@@ -192,7 +180,6 @@ impl HookPointEnv {
         ProcessChainsExecutor::new(
             hook_point.process_chain_manager().clone(),
             self.global_env.clone(),
-            self.global_collections.clone(),
             self.pipe.pipe().clone(),
         )
     }

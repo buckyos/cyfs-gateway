@@ -4,7 +4,6 @@ use super::env::EnvRef;
 use crate::GotoCounter;
 use crate::block::BlockExecuter;
 use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
-use crate::collection::Collections;
 use crate::pipe::CommandPipe;
 use std::sync::Arc;
 
@@ -103,7 +102,6 @@ impl ProcessChainExecutor {
 pub struct ProcessChainsExecutor {
     process_chain_manager: ProcessChainManagerRef,
     global_env: EnvRef,
-    global_collections: Collections,
     pipe: CommandPipe,
     context: Context,
 }
@@ -112,13 +110,11 @@ impl ProcessChainsExecutor {
     pub fn new(
         process_chain_manager: ProcessChainManagerRef,
         global_env: EnvRef,
-        global_collections: Collections,
         pipe: CommandPipe,
     ) -> Self {
         let counter = Arc::new(GotoCounter::new());
         let context = Context::new(
             global_env.clone(),
-            global_collections.clone(),
             counter,
             pipe.clone(),
         );
@@ -126,7 +122,6 @@ impl ProcessChainsExecutor {
         Self {
             process_chain_manager,
             global_env,
-            global_collections,
             pipe,
             context,
         }
@@ -230,7 +225,6 @@ impl ProcessChainsExecutor {
 pub struct ProcessChainListExecutor {
     process_chain_list: Vec<ProcessChainRef>,
     global_env: EnvRef,
-    global_collections: Collections,
     pipe: CommandPipe,
     context: Context,
 }
@@ -239,7 +233,6 @@ impl ProcessChainListExecutor {
     pub fn new(
         process_chain_manager: &ProcessChainManager,
         global_env: EnvRef,
-        global_collections: Collections,
         pipe: CommandPipe,
     ) -> Self {
         let mut process_chain_list = process_chain_manager.clone_process_chain_list();
@@ -250,7 +243,6 @@ impl ProcessChainListExecutor {
         let counter = Arc::new(GotoCounter::new());
         let context = Context::new(
             global_env.clone(),
-            global_collections.clone(),
             counter,
             pipe.clone(),
         );
@@ -258,7 +250,6 @@ impl ProcessChainListExecutor {
         Self {
             process_chain_list,
             global_env,
-            global_collections,
             pipe,
             context,
         }
@@ -274,14 +265,6 @@ impl ProcessChainListExecutor {
 
     pub fn global_env(&self) -> &EnvRef {
         &self.global_env
-    }
-
-    pub fn chain_collections(&self) -> &Collections {
-        self.context.chain_collections()
-    }
-
-    pub fn global_collections(&self) -> &Collections {
-        &self.global_collections
     }
 
     pub fn get_chain(&self, id: &str) -> Option<(usize, &ProcessChainRef)> {

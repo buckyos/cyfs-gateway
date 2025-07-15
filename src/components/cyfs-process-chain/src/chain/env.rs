@@ -1,4 +1,7 @@
-use crate::collection::VariableVisitorManager;
+use crate::collection::{
+    CollectionType, CollectionValue, MapCollection, MapCollectionRef, MemoryMapCollection,
+    MemoryMultiMapCollection, MemorySetCollection, MultiMapCollection, SetCollection,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -27,24 +30,21 @@ impl EnvLevel {
 
 pub struct Env {
     level: EnvLevel,
-    values: RwLock<HashMap<String, String>>,
+    values: MapCollectionRef,
     parent: Option<EnvRef>,
-
-    variable_visitor_manager: VariableVisitorManager,
 }
 
 pub type EnvRef = Arc<Env>;
 
 impl Env {
     pub fn new(level: EnvLevel, parent: Option<EnvRef>) -> Self {
-        let variable_visitor_manager = VariableVisitorManager::new();
+        let values = MemoryMapCollection::new();
+        let values: MapCollectionRef = Arc::new(Box::new(values) as Box<dyn MapCollection>);
 
         Self {
             level,
-            values: RwLock::new(HashMap::new()),
+            values,
             parent,
-
-            variable_visitor_manager,
         }
     }
 
@@ -56,52 +56,28 @@ impl Env {
         self.parent.as_ref()
     }
 
-    pub fn variable_visitor_manager(&self) -> &VariableVisitorManager {
-        &self.variable_visitor_manager
+    /// Register the environment to the given variable visitor manager.
+    /// The key must not already exist in the environment.
+    pub async fn create(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
+        self.values.insert_new(key, value).await
     }
 
-    pub async fn set(&self, key: &str, value: &str) -> Result<Option<String>, String> {
-        // First check if the key in visitor manager
-        let (exists, ret) = self.variable_visitor_manager.set_value(key, value).await?;
-        if exists {
-            return Ok(ret);
-        }
-
-        // Then set it in the environment
-        let mut values = self.values.write().unwrap();
-        if let Some(prev) = values.insert(key.to_string(), value.to_string()) {
-            info!(
-                "Env {} key {} already exists, will be replaced, old value: {}",
-                self.level.as_str(),
-                key,
-                prev
-            );
-            Ok(Some(prev))
-        } else {
-            debug!(
-                "Set {} env key {} to value {}",
-                self.level.as_str(),
-                key,
-                value
-            );
-            Ok(None)
-        }
+    pub async fn set(
+        &self,
+        key: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
+        self.values.insert(key, value).await
     }
 
     #[async_recursion::async_recursion]
-    pub async fn get(&self, key: &str) -> Result<Option<String>, String> {
-        // First check if the key in visitor manager
-        if let Some(value) = self.variable_visitor_manager.get_value(key).await? {
+    pub async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        // First check local values
+        if let Some(value) = self.values.get(key).await? {
             return Ok(Some(value));
         }
 
-        {
-            let values = self.values.read().unwrap();
-            if let Some(value) = values.get(key) {
-                return Ok(Some(value.clone()));
-            }
-        }
-
+        // Then check parent environment if exists
         if let Some(parent) = &self.parent {
             return parent.get(key).await;
         }
@@ -109,36 +85,8 @@ impl Env {
         Ok(None)
     }
 
-    pub async fn delete(&self, key: &str) -> Result<Option<String>, String> {
-        // First check if the key in visitor manager
-        if let Some(_) = self.variable_visitor_manager.get_value(key).await? {
-            let msg = format!("Cannot delete visitor variable '{}'", key);
-            warn!("{}", msg);
-            return Err(msg);
-        }
-
-        // Then delete it from the environment
-        let mut values = self.values.write().unwrap();
-        if let Some(prev) = values.remove(key) {
-            info!(
-                "Env {} key {} removed, old value: {}",
-                self.level.as_str(),
-                key,
-                prev
-            );
-            Ok(Some(prev))
-        } else {
-            info!("Env {} key {} not found", self.level.as_str(), key);
-            Ok(None)
-        }
-    }
-
-    pub fn dump(&self) {
-        let values = self.values.read().unwrap();
-        info!("Env level: {}", self.level.as_str());
-        for (key, value) in values.iter() {
-            info!("{}: {}", key, value);
-        }
+    pub async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        self.values.remove(key).await
     }
 }
 
@@ -253,13 +201,94 @@ impl EnvManager {
         &self.block
     }
 
+    pub async fn create(
+        &self,
+        key: &str,
+        value: CollectionValue,
+        level: Option<EnvLevel>,
+    ) -> Result<bool, String> {
+        let level = level.unwrap_or_default();
+        let ret = self.create_inner(level, key, value).await?;
+
+        if ret {
+            // Track the variable's level
+            self.change_var_level(key, Some(level));
+        }
+
+        Ok(ret)
+    }
+
+    async fn create_inner(
+        &self,
+        level: EnvLevel,
+        key: &str,
+        value: CollectionValue,
+    ) -> Result<bool, String> {
+        match level {
+            EnvLevel::Global => self.global.create(key, value).await,
+            EnvLevel::Chain => self.chain.create(key, value).await,
+            EnvLevel::Block => self.block.create(key, value).await,
+        }
+    }
+
+    pub async fn create_collection(
+        &self,
+        key: &str,
+        collection_type: CollectionType,
+        level: Option<EnvLevel>,
+    ) -> Result<Option<CollectionValue>, String> {
+        match collection_type {
+            CollectionType::Set => {
+                let collection =
+                    Arc::new(Box::new(MemorySetCollection::new()) as Box<dyn SetCollection>);
+                match self
+                    .create(key, CollectionValue::Set(collection.clone()), level)
+                    .await?
+                {
+                    true => Ok(Some(CollectionValue::Set(collection))),
+                    false => {
+                        Ok(None) // Collection already exists, return None
+                    }
+                }
+            }
+            CollectionType::Map => {
+                let collection =
+                    Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+                match self
+                    .create(key, CollectionValue::Map(collection.clone()), level)
+                    .await?
+                {
+                    true => Ok(Some(CollectionValue::Map(collection))),
+                    false => {
+                        Ok(None) // Collection already exists, return None
+                    }
+                }
+            }
+
+            CollectionType::MultiMap => {
+                let collection = Arc::new(
+                    Box::new(MemoryMultiMapCollection::new()) as Box<dyn MultiMapCollection>
+                );
+                match self
+                    .create(key, CollectionValue::MultiMap(collection.clone()), level)
+                    .await?
+                {
+                    true => Ok(Some(CollectionValue::MultiMap(collection))),
+                    false => {
+                        Ok(None) // Collection already exists, return None
+                    }
+                }
+            }
+        }
+    }
+
     // Set a value in the environment, level can be specified or default to chain level
     pub async fn set(
         &self,
         key: &str,
-        value: &str,
+        value: CollectionValue,
         level: Option<EnvLevel>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<CollectionValue>, String> {
         let level = level.unwrap_or_default();
         let ret = self.set_inner(level, key, value).await?;
         self.change_var_level(key, Some(level));
@@ -271,8 +300,8 @@ impl EnvManager {
         &self,
         level: EnvLevel,
         key: &str,
-        value: &str,
-    ) -> Result<Option<String>, String> {
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
         match level {
             EnvLevel::Global => self.global.set(key, value).await,
             EnvLevel::Chain => self.chain.set(key, value).await,
@@ -280,7 +309,11 @@ impl EnvManager {
         }
     }
 
-    pub async fn get(&self, key: &str, level: Option<EnvLevel>) -> Result<Option<String>, String> {
+    pub async fn get(
+        &self,
+        key: &str,
+        level: Option<EnvLevel>,
+    ) -> Result<Option<CollectionValue>, String> {
         let level = match level {
             Some(l) => l,
             None => self.get_var_level(key),
@@ -289,7 +322,11 @@ impl EnvManager {
         self.get_inner(level, key).await
     }
 
-    async fn get_inner(&self, level: EnvLevel, key: &str) -> Result<Option<String>, String> {
+    async fn get_inner(
+        &self,
+        level: EnvLevel,
+        key: &str,
+    ) -> Result<Option<CollectionValue>, String> {
         match level {
             EnvLevel::Global => self.global.get(key).await,
             EnvLevel::Chain => self.chain.get(key).await,
@@ -297,30 +334,28 @@ impl EnvManager {
         }
     }
 
-    pub async fn delete(
+    pub async fn remove(
         &self,
         key: &str,
         level: Option<EnvLevel>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<CollectionValue>, String> {
         let level = match level {
             Some(l) => l,
             None => self.get_var_level(key),
         };
 
-        self.delete_inner(level, key).await
+        self.remove_inner(level, key).await
     }
 
-    async fn delete_inner(&self, level: EnvLevel, key: &str) -> Result<Option<String>, String> {
+    async fn remove_inner(
+        &self,
+        level: EnvLevel,
+        key: &str,
+    ) -> Result<Option<CollectionValue>, String> {
         match level {
-            EnvLevel::Global => self.global.delete(key).await,
-            EnvLevel::Chain => self.chain.delete(key).await,
-            EnvLevel::Block => self.block.delete(key).await,
+            EnvLevel::Global => self.global.remove(key).await,
+            EnvLevel::Chain => self.chain.remove(key).await,
+            EnvLevel::Block => self.block.remove(key).await,
         }
-    }
-
-    pub fn dump(&self) {
-        self.global.dump();
-        self.chain.dump();
-        self.block.dump();
     }
 }

@@ -3,6 +3,7 @@ use super::block::{CommandArg, CommandArgs};
 use crate::chain::Context;
 use crate::cmd::CommandResult;
 use crate::cmd::{CommandExecutor, CommandParser};
+use crate::collection::CollectionValue;
 use std::sync::Arc;
 
 pub const MAX_GOTO_COUNT_IN_BLOCK: u32 = 128;
@@ -181,7 +182,12 @@ impl CommandExecutor for DynamicCommandExecutor {
                 CommandArg::Var(var) => {
                     // Resolve variable from context
                     if let Some(value) = context.env().get(&var, None).await? {
-                        resolved_args.push(value.clone());
+                        match value {
+                            CollectionValue::String(s) => resolved_args.push(s),
+                            _ => {
+                                todo!("Variable '{}' is not a string", var);
+                            }
+                        }
                     } else {
                         // If variable is not found, push an empty string
                         warn!(

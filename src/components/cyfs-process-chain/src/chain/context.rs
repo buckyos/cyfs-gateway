@@ -1,6 +1,5 @@
 use super::env::{Env, EnvLevel};
 use crate::chain::{EnvManager, EnvRef, ProcessChainRef};
-use crate::collection::{CollectionManager, Collections};
 use crate::pipe::CommandPipe;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, RwLock};
@@ -44,26 +43,18 @@ pub type GotoCounterRef = Arc<GotoCounter>;
 pub struct Context {
     current_chain: RwLock<Option<ProcessChainRef>>, // The chain that this context is executing
     env: EnvManager,
-    collection_manager: CollectionManager,
     goto_counter: GotoCounterRef, // Counter for goto command executions
     pipe: CommandPipe,            // Pipe for command execution
 }
 
 impl Context {
-    pub fn new(
-        global_env: EnvRef,
-        global_collections: Collections,
-        goto_counter: GotoCounterRef,
-        pipe: CommandPipe,
-    ) -> Self {
+    pub fn new(global_env: EnvRef, goto_counter: GotoCounterRef, pipe: CommandPipe) -> Self {
         let chain_env = Arc::new(Env::new(EnvLevel::Chain, Some(global_env.clone())));
         let env_manager = EnvManager::new(global_env, chain_env);
-        let collection_manager = CollectionManager::new(global_collections);
 
         Self {
             current_chain: RwLock::new(None),
             env: env_manager,
-            collection_manager,
             goto_counter,
             pipe,
         }
@@ -81,14 +72,6 @@ impl Context {
 
     pub fn chain_env(&self) -> &EnvRef {
         self.env.get_chain()
-    }
-
-    pub fn collection_manager(&self) -> &CollectionManager {
-        &self.collection_manager
-    }
-
-    pub fn chain_collections(&self) -> &Collections {
-        self.collection_manager.get_chain_collections()
     }
 
     pub fn env(&self) -> &EnvManager {
@@ -125,7 +108,6 @@ impl Context {
         Self {
             current_chain: RwLock::new(current_chain), // Use the current chain for the block context
             env,
-            collection_manager: self.collection_manager.clone(), // Use the same collection manager for the block context
             goto_counter: self.goto_counter.clone(), // Use the same goto counter for the block context
             pipe: self.pipe.clone(),
         }
