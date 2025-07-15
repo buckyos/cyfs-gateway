@@ -1,8 +1,8 @@
 use super::hyper_req::HyperHttpRequestHeaderMap;
+use hyper::Client;
 use hyper::body::to_bytes;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
-use hyper::{Client, Uri};
 use hyper::{Method, StatusCode};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -104,16 +104,11 @@ async fn pre_process_request(
 
         // Register visitors for the request headers in the chain environment
         let chain_env = exec.chain_env();
-        req_map
-            .register_visitors(&chain_env)
-            .await
-            .unwrap();
+        req_map.register_visitors(&chain_env).await.unwrap();
 
-        exec.chain_collections()
-            .add_map_collection(
-                "REQ",
-                Arc::new(Box::new(req_map.clone()) as Box<dyn MapCollection>),
-            )
+        let req_collection = Arc::new(Box::new(req_map.clone()) as Box<dyn MapCollection>);
+        chain_env
+            .create("REQ", CollectionValue::Map(req_collection))
             .await
             .unwrap();
 

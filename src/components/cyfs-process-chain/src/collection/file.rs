@@ -385,24 +385,37 @@ mod tests {
         println!("Using file: {:?}", file_path);
         std::fs::remove_file(&file_path).ok(); // Clean up before test
         let collection = JsonMapCollection::new(file_path.clone()).unwrap();
-        assert_eq!(collection.insert("key1", "value1").await.unwrap(), None);
         assert_eq!(
-            collection.insert("key1", "value1").await.unwrap(),
-            Some("value1".to_string())
+            collection
+                .insert("key1", CollectionValue::String("value1".to_string()))
+                .await
+                .unwrap(),
+            None
+        );
+
+        assert_eq!(
+            collection
+                .insert("key1", CollectionValue::String("value1".to_string()))
+                .await
+                .unwrap(),
+            Some(CollectionValue::String("value1".to_string()))
         );
         assert_eq!(
             collection.get("key1").await.unwrap(),
-            Some("value1".to_string())
+            Some(CollectionValue::String("value1".to_string()))
         );
         assert_eq!(
             collection.remove("key1").await.unwrap(),
-            Some("value1".to_string())
+            Some(CollectionValue::String("value1".to_string()))
         );
         assert_eq!(collection.get("key1").await.unwrap(), None);
 
         for i in 0..10 {
             collection
-                .insert(&format!("key{}", i), &format!("value{}", i))
+                .insert(
+                    &format!("key{}", i),
+                    CollectionValue::String(format!("value{}", i)),
+                )
                 .await
                 .unwrap();
         }
@@ -413,7 +426,7 @@ mod tests {
         let loaded_collection = JsonMapCollection::new(file_path).unwrap();
         assert_eq!(
             loaded_collection.get("key5").await.unwrap(),
-            Some("value5".to_string())
+            Some(CollectionValue::String("value5".to_string()))
         );
         assert_eq!(loaded_collection.get("non_existent").await.unwrap(), None);
     }

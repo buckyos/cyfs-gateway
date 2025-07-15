@@ -74,8 +74,6 @@ async fn test_process_chain() -> Result<(), String> {
         manager.add_chain(chain).unwrap();
     }
 
-    let global_collections = Collections::new();
-
     // Load host db and ip db from file
     let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -84,16 +82,18 @@ async fn test_process_chain() -> Result<(), String> {
     let host_db_file = data_dir.join("host.json");
     let host_db = JsonMultiMapCollection::new(host_db_file.clone()).unwrap();
 
-    global_collections
-        .add_multi_map_collection("host", Arc::new(Box::new(host_db.clone())))
+    let host_collections = Arc::new(Box::new(host_db.clone()) as Box<dyn MultiMapCollection>);
+    global_env
+        .create("host", CollectionValue::MultiMap(host_collections))
         .await
         .unwrap();
 
     // Load ip db, if not exists, it create a new one
     let ip_db_file = data_dir.join("ip.json");
     let ip_db = JsonMultiMapCollection::new(ip_db_file.clone()).unwrap();
-    global_collections
-        .add_multi_map_collection("ip", Arc::new(Box::new(ip_db.clone())))
+    let ip_collections = Arc::new(Box::new(ip_db.clone()) as Box<dyn MultiMapCollection>);
+    global_env
+        .create("ip", CollectionValue::MultiMap(ip_collections))
         .await
         .unwrap();
 
@@ -103,7 +103,6 @@ async fn test_process_chain() -> Result<(), String> {
     let exec = ProcessChainsExecutor::new(
         manager.clone(),
         global_env.clone(),
-        global_collections.clone(),
         pipe.pipe().clone(),
     );
 
@@ -113,9 +112,9 @@ async fn test_process_chain() -> Result<(), String> {
     assert!(ret.is_accept());
 
     // Check the environment variables set by the first block
-    assert_eq!(global_env.get("key1").await.unwrap(), Some("key12".to_string()));
-    assert_eq!(global_env.get("key2").await.unwrap(), Some("key1_value2".to_string()));
-    assert_eq!(global_env.get("key3").await.unwrap(), Some("key12_value2".to_string()));
+    assert_eq!(global_env.get("key1").await.unwrap().unwrap().as_str(), Some("key12"));
+    assert_eq!(global_env.get("key2").await.unwrap().unwrap().as_str(), Some("key1_value2"));
+    assert_eq!(global_env.get("key3").await.unwrap().unwrap().as_str(), Some("key12_value2"));
 
     // Execute the second chain
     exec.execute_chain_by_id("chain2").await.unwrap();
@@ -135,14 +134,13 @@ impl TestVisitor {
         }
     }
 
-    pub async fn register(&self, manager: &VariableVisitorManager) -> Result<(), String> {
+    pub async fn register(&self, env: &Env) -> Result<(), String> {
         let visitor = Arc::new(Box::new(self.clone()) as Box<dyn VariableVisitor>);
-        manager
-            .add_visitor("PROTOCOL", visitor.clone())
+        env.create("PROTOCOL", CollectionValue::Visitor(visitor.clone()))
             .await?;
 
-        manager.add_visitor("REQ_from_ip", visitor.clone()).await?;
-        manager.add_visitor("REQ_url", visitor.clone()).await?;
+        env.create("REQ_from_ip", CollectionValue::Visitor(visitor.clone())).await?;
+        env.create("REQ_url", CollectionValue::Visitor(visitor.clone())).await?;
 
         info!("TestVisitor registered successfully");
         Ok(())
@@ -151,16 +149,16 @@ impl TestVisitor {
 
 #[async_trait::async_trait]
 impl VariableVisitor for TestVisitor {
-    async fn get(&self, id: &str) -> Result<String, String> {
+    async fn get(&self, id: &str) -> Result<CollectionValue, String> {
         match id {
-            "PROTOCOL" => Ok("https".to_string()),
-            "REQ_from_ip" => Ok("127.0.0.1".to_string()),
-            "REQ_url" => Ok(self.url.read().unwrap().clone()),
+            "PROTOCOL" => Ok(CollectionValue::String("https".to_string())),
+            "REQ_from_ip" => Ok(CollectionValue::String("127.0.0.1".to_string())),
+            "REQ_url" => Ok(CollectionValue::String(self.url.read().unwrap().clone())),
             _ => Err(format!("Variable '{}' not found", id)),
         }
     }
 
-    async fn set(&self, id: &str, value: &str) -> Result<Option<String>, String> {
+    async fn set(&self, id: &str, value: CollectionValue) -> Result<Option<CollectionValue>, String> {
         match id {
             "$PROTOCOL" | "REQ_from_ip" => {
                 let msg = format!("Cannot set read-only variable '{}'", id);
@@ -170,10 +168,10 @@ impl VariableVisitor for TestVisitor {
             "REQ_url" => {
                 let mut url = self.url.write().unwrap();
                 let old_value = url.clone();
-                *url = value.to_string();
+                *url = value.try_as_str()?.to_string();
 
                 info!("Set variable '{}' to '{}'", id, value);
-                return Ok(Some(old_value));
+                return Ok(Some(CollectionValue::String(old_value)));
             }
             _ => Err(format!("Variable '{}' is read-only", id)),
         }
@@ -217,7 +215,7 @@ async fn test_hook_point() -> Result<(), String> {
 
     // Init some visitors
     let test_visitor = TestVisitor::new();
-    test_visitor.register(hook_point_env.variable_visitor_manager()).await.unwrap();
+    test_visitor.register(hook_point_env.global_env()).await.unwrap();
 
     let exec = hook_point_env.prepare_exec_list(&hook_point);
     let ret = exec.execute_all().await.unwrap();
@@ -231,7 +229,7 @@ async fn test_hook_point() -> Result<(), String> {
     info!("Hook point output: {}", output);
 
     let global_env = hook_point_env.global_env();
-    assert_eq!(global_env.get("key2").await.unwrap(), Some("value1_value2".to_string()));
+    assert_eq!(global_env.get("key2").await.unwrap().unwrap().as_str(), Some("value1_value2"));
 
     Ok(())
 }

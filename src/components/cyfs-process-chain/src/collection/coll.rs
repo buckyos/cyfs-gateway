@@ -30,6 +30,24 @@ impl std::fmt::Display for CollectionValue {
     } 
 }
 
+impl std::fmt::Debug for CollectionValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Call the Display implementation for a cleaner output
+        write!(f, "{}", self)
+    }
+}
+
+impl PartialEq for CollectionValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (CollectionValue::String(a), CollectionValue::String(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CollectionValue {}
+
 impl CollectionValue {
     pub fn compare_string(&self, other: &Self) -> Option<bool> {
         match (self, other) {
