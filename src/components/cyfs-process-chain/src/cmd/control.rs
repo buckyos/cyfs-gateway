@@ -1,4 +1,5 @@
 use super::cmd::*;
+use super::helper::CommandArgHelper;
 use crate::block::{BlockExecuter, CommandArgs};
 use crate::chain::Context;
 use std::sync::Arc;
@@ -75,7 +76,14 @@ enum GotoTarget {
     Chain(String),
 }
 
-// goto command, like: goto block1; goto --chain chain1; goto --block block2;
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GotoTargetLevel {
+    Block,
+    Chain,
+}
+
+// goto command goto [--chain|--block] <target>
+// like: goto block1; goto --chain chain1; goto --block block2;
 pub struct GotoCommandParser {}
 
 impl GotoCommandParser {
@@ -87,29 +95,20 @@ impl GotoCommandParser {
 impl CommandParser for GotoCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args must be either one or two elements
-        if args.len() < 1 || args.len() > 2 {
+        if args.len() < 1 {
             let msg = format!("Invalid goto command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
-        // If two arguments are provided, the first one must be --chain or --block
-        if args.len() == 2 {
-            if !args[0].is_literal() {
+        
+        // If there are options, they must be valid
+        if args.len() >= 2 {
+            let option_count =
+                CommandArgHelper::check_origin_options(args, &[&["chain", "block"]])?;
+            if option_count + 1 != args.len() {
                 let msg = format!(
-                    "Invalid goto command: expected --chain or --block, got {:?}",
-                    args[0]
-                );
-                error!("{}", msg);
-                return Err(msg);
-            }
-
-            let t = args[0].as_literal_str().unwrap();
-
-            // Check if the first argument is either --chain or --block
-            if t != "--chain" && t != "--block" {
-                let msg = format!(
-                    "Invalid goto command: expected --chain or --block, got {}",
-                    t
+                    "Invalid goto command: expected 1 target after options, but found {} options",
+                    option_count
                 );
                 error!("{}", msg);
                 return Err(msg);
@@ -120,31 +119,51 @@ impl CommandParser for GotoCommandParser {
     }
 
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
-        assert!(
-            args.len() >= 1 && args.len() <= 2,
-            "Goto command should have 1 or 2 args"
-        );
+        assert!(args.len() >= 1, "Goto command should have at least 1 arg");
 
         // Parse the command arguments
         // If only one argument is provided, it is considered a chain name
         // If two arguments are provided, the first one must be --chain or --block
         // and the second one is the target name
-        let name = args.last().unwrap().to_string();
-        let target = if args.len() == 2 {
-            match args[0] {
-                "--chain" => GotoTarget::Chain(name),
-                "--block" => GotoTarget::Block(name),
-                _ => {
-                    let msg = format!(
-                        "Invalid goto command: expected --chain or --block, got {}",
-                        args[0]
-                    );
-                    error!("{}", msg);
-                    return Err(msg);
+
+        let mut target_level = GotoTargetLevel::Chain;
+        let mut option_count = 0;
+        if args.len() >= 2 {
+            let options = CommandArgHelper::parse_options(args, &[&["chain", "block"]])?;
+            option_count = options.len();
+
+            for option in options {
+                match option {
+                    "block" => {
+                        // Set target to Block
+                        target_level = GotoTargetLevel::Block;
+                    }
+                    "chain" => {
+                        // Set target to Chain
+                        target_level = GotoTargetLevel::Chain;
+                    }
+                    _ => {
+                        let msg = format!("Invalid option '{}' in goto command", option);
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
                 }
             }
-        } else {
-            GotoTarget::Chain(name)
+        };
+
+        if option_count + 1 != args.len() {
+            let msg = format!(
+                "Invalid goto command: expected 1 target after options, but found {} options",
+                option_count
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let name = args[option_count].to_string();
+        let target = match target_level {
+            GotoTargetLevel::Block => GotoTarget::Block(name),
+            GotoTargetLevel::Chain => GotoTarget::Chain(name),
         };
 
         let cmd = GotoCommandExecutor::new(target);

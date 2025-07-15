@@ -48,8 +48,10 @@ impl CommandArgHelper {
         Ok(ret)
     }
 
-    pub fn check_origin_options(args: &CommandArgs, options: &[&[&str]]) -> Result<(), String> {
+    pub fn check_origin_options(args: &CommandArgs, options: &[&[&str]]) -> Result<usize, String> {
         let mut group_index = vec![];
+        let mut option_count = 0;
+
         for arg in args.iter() {
             if !arg.is_literal() {
                 break;
@@ -61,6 +63,7 @@ impl CommandArgHelper {
             }
 
             let opt = arg.trim_start_matches('-');
+            option_count += 1;
 
             // Check by group
             let mut found = false;
@@ -88,6 +91,6 @@ impl CommandArgHelper {
             }
         }
 
-        Ok(())
+        Ok(option_count)
     }
 }

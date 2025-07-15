@@ -1,4 +1,5 @@
 use super::cmd::*;
+use super::helper::CommandArgHelper;
 use crate::block::CommandArgs;
 use crate::chain::Context;
 use std::sync::Arc;
@@ -15,8 +16,11 @@ impl EchoCommandParser {
 }
 
 impl CommandParser for EchoCommandParser {
-    fn check(&self, _args: &CommandArgs) -> Result<(), String> {
-        // Accept any arguments, so no specific check is needed
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        // Accept any arguments, but we should check the options
+        if !args.is_empty() {
+            CommandArgHelper::check_origin_options(args, &[&["n"]])?;
+        }
 
         Ok(())
     }
@@ -24,19 +28,29 @@ impl CommandParser for EchoCommandParser {
     fn parse(&self, args: &[&str]) -> Result<CommandExecutorRef, String> {
         // Check first argument is not empty
         let mut suppress_newline = true;
-        let mut arg_index = 0;
+        let mut option_count = 0;
         if !args.is_empty() {
-            match args[0] {
-                "-n" | "--n" => {
+            let options = CommandArgHelper::parse_options(args, &[&["n"]])?;
+            option_count = options.len();
+
+            for option in options {
+                if option == "n" {
                     suppress_newline = false;
-                    arg_index += 1;
+                } else {
+                    let msg = format!("Invalid option '{}', expected one of ['-n']", option);
+                    error!("{}", msg);
+                    return Err(msg);
                 }
-                _ => {}
             }
         }
 
         // For better performance, we just join the rest of the arguments on parser
-        let mut output = args[arg_index..].join(" ");
+        let mut output = if option_count < args.len() {
+            args[option_count..].join(" ")
+        } else {
+            String::from("")
+        };
+
         if !suppress_newline {
             output.push('\n');
         }

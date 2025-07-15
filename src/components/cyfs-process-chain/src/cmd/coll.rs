@@ -204,7 +204,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
     }
 }
 
-/// set-create [-global|-chain] <set_id>
+/// set-create [-global|-chain|-block] <set_id>
 /// Create a new set collection with the given id.
 pub struct SetCreateCommandParser {}
 
@@ -225,7 +225,15 @@ impl CommandParser for SetCreateCommandParser {
 
         // Check options
         if args.len() > 1 {
-            CommandArgHelper::check_origin_options(args, &[&["global", "chain"]])?;
+            let option_count = CommandArgHelper::check_origin_options(args, &[&["global", "chain"]])?;
+            if option_count + 1 != args.len() {
+                let msg = format!(
+                    "Invalid set-create command: expected 1 set-id, but found {} options",
+                    option_count
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
         }
 
         Ok(())
@@ -239,8 +247,11 @@ impl CommandParser for SetCreateCommandParser {
 
         // Parse options
         let mut level = EnvLevel::Chain; // Default to chain level
+        let mut option_count = 0;
         if args.len() > 1 {
-            let options = CommandArgHelper::parse_options(args, &[&["global", "chain"]])?;
+            let options = CommandArgHelper::parse_options(args, &[&["global", "chain", "block"]])?;
+            option_count = options.len();
+
             for option in options {
                 if option == "global" {
                     // Set level to Global
@@ -248,6 +259,9 @@ impl CommandParser for SetCreateCommandParser {
                 } else if option == "chain" {
                     // Set level to Chain
                     level = EnvLevel::Chain;
+                } else if option == "block" {
+                    // Set level to Block
+                    level = EnvLevel::Block;
                 } else {
                     let msg = format!("Invalid option '{}' in set-create command", option);
                     error!("{}", msg);
@@ -256,7 +270,16 @@ impl CommandParser for SetCreateCommandParser {
             }
         }
 
-        let cmd = SetCreateCommandExecutor::new(level, args[0]);
+        if option_count + 1 != args.len() {
+            let msg = format!(
+                "Invalid set-create command: set-id is required, but found {} options",
+                option_count
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let cmd = SetCreateCommandExecutor::new(level, args[option_count]);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -469,7 +492,7 @@ impl CommandExecutor for SetRemoveCommandExecutor {
     }
 }
 
-/// map-create [-multi] [-global|-chain] <map_id>
+/// map-create [-multi] [-global|-chain|-block] <map_id>
 /// Create a new map collection with the given id, default is chain level.
 /// If the map already exists, it will fail
 pub struct MapCreateCommandParser {}
@@ -491,7 +514,15 @@ impl CommandParser for MapCreateCommandParser {
 
         // If there is options start with "-", it should be "-multi""-global" or "-chain"
         if args.len() > 1 {
-            CommandArgHelper::check_origin_options(args, &[&["multi"], &["global", "chain"]])?;
+            let option_count = CommandArgHelper::check_origin_options(args, &[&["multi"], &["global", "chain"]])?;
+            if option_count + 1 != args.len() {
+                let msg = format!(
+                    "Invalid map-create command: expected 1 map-id, but found {} options",
+                    option_count
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
         }
 
         Ok(())
@@ -506,9 +537,12 @@ impl CommandParser for MapCreateCommandParser {
         // Parse options
         let mut is_multi = false; // Default to single map
         let mut level = EnvLevel::Chain; // Default to chain level
+        let mut option_count = 0;
         if args.len() > 1 {
             let options =
-                CommandArgHelper::parse_options(args, &[&["multi"], &["global", "chain"]])?;
+                CommandArgHelper::parse_options(args, &[&["multi"], &["global", "chain", "block"]])?;
+            option_count = options.len();
+            
             for option in options {
                 if option == "multi" {
                     // Set is_multi to true
@@ -519,6 +553,9 @@ impl CommandParser for MapCreateCommandParser {
                 } else if option == "chain" {
                     // Set level to Chain
                     level = EnvLevel::Chain;
+                } else if option == "block" {
+                    // Set level to Block
+                    level = EnvLevel::Block;
                 } else {
                     let msg = format!("Invalid option '{}' in map-create command", option);
                     error!("{}", msg);
@@ -526,11 +563,20 @@ impl CommandParser for MapCreateCommandParser {
                 }
             }
         }
+        
+        if option_count + 1 != args.len() {
+            let msg = format!(
+                "Invalid map-create command: map-id is required, but found {} options",
+                option_count
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
 
         let cmd = MapCreateCommandExecutor::new(
             is_multi,
             level,
-            if is_multi { args[1] } else { args[0] },
+            args[option_count],
         );
         Ok(Arc::new(Box::new(cmd)))
     }
