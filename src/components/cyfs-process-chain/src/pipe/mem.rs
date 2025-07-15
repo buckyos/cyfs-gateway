@@ -29,6 +29,11 @@ impl SharedMemoryOutput {
         String::from_utf8_lossy(&buffer).to_string()
     }
 
+    pub fn reset_buffer(&self) {
+        let mut buffer = self.buffer.lock().unwrap();
+        *buffer.get_mut() = Cursor::new(Vec::new());
+    }
+
     pub async fn into_buffer(self) -> Result<Vec<u8>, String> {
         let out = Arc::try_unwrap(self.buffer)
             .map_err(|_| "Failed to unwrap SharedMemoryOutput buffer".to_string())?;
