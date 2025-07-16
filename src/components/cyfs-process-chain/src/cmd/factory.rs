@@ -33,6 +33,11 @@ impl CommandParserFactory {
         parsers.get(name).cloned()
     }
 
+    pub fn get_command_list(&self) -> Vec<String> {
+        let parsers = self.parsers.lock().unwrap();
+        parsers.keys().cloned().collect()
+    }
+    
     pub fn init(&self) {
         // control command
         self.register("goto", Arc::new(Box::new(GotoCommandParser::new())));

@@ -1,6 +1,8 @@
+use super::complete::ProcessChainCommandCompleter;
 use crate::*;
-use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
+use rustyline::history::DefaultHistory;
+use rustyline::{DefaultEditor, Editor, Helper};
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicUsize};
 
@@ -9,7 +11,7 @@ pub struct ProcessChainREPL {
     env: HookPointEnvRef,
     line_index: AtomicUsize,
     pipe: SharedMemoryPipe, // Pipe for command execution
-    context: Context, // Context for the REPL chain
+    context: Context,       // Context for the REPL chain
 }
 
 impl ProcessChainREPL {
@@ -28,12 +30,8 @@ impl ProcessChainREPL {
         let env = HookPointEnv::new("repl-default", data_dir);
 
         let pipe = SharedMemoryPipe::new_empty();
-         let counter = Arc::new(GotoCounter::new());
-        let context = Context::new(
-            env.global_env().clone(),
-            counter,
-            pipe.pipe().clone(),
-        );
+        let counter = Arc::new(GotoCounter::new());
+        let context = Context::new(env.global_env().clone(), counter, pipe.pipe().clone());
 
         Ok(Self {
             env: Arc::new(env),
@@ -70,13 +68,19 @@ impl ProcessChainREPL {
     }
 
     pub async fn run(&self) -> Result<(), String> {
-        let config = rustyline::Config::builder().build();
+        let config = rustyline::Config::builder()
+            .completion_type(rustyline::CompletionType::List)
+            .build();
 
-        let mut rl = DefaultEditor::with_config(config).map_err(|e| {
-            let msg = format!("Failed to create REPL editor: {}", e);
-            error!("{}", msg);
-            msg
-        })?;
+        let mut rl = Editor::<ProcessChainCommandCompleter, DefaultHistory>::with_config(config)
+            .map_err(|e| {
+                let msg = format!("Failed to create REPL editor: {}", e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let completer = ProcessChainCommandCompleter::new();
+        rl.set_helper(Some(completer));
 
         println!(
             "Welcome to the interactive console for cyfs-process-chain tool! Type 'exit' to quit."
@@ -91,7 +95,7 @@ impl ProcessChainREPL {
                         println!("Exiting REPL.");
                         break;
                     }
-                    
+
                     if let Err(e) = rl.add_history_entry(line.as_str()) {
                         let msg = format!("Failed to add history entry: {}", e);
                         error!("{}", msg);
@@ -150,7 +154,7 @@ impl ProcessChainREPL {
         }
 
         let block_executer = BlockExecuter::new(&block_id);
-        let block_context =self.context.fork_block();
+        let block_context = self.context.fork_block();
         let result = block_executer.execute_block(&item, &block_context).await?;
         match result {
             CommandResult::Success(value) => {
@@ -160,14 +164,14 @@ impl ProcessChainREPL {
                 println!("Command execution failed: {}", value);
             }
             CommandResult::Control(action) => {
-                println!("Control action not used in REPL: {:?}", action);
+                eprintln!("Control action not used in REPL: {:?}", action);
             }
         }
 
         // Get output from pipe
         let output = self.pipe.stdout.clone_string();
         self.pipe.stdout.reset_buffer();
-        if !output.is_empty() { 
+        if !output.is_empty() {
             println!("{}", output);
         }
 
