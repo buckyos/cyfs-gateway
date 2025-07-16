@@ -3,9 +3,22 @@ use crate::chain::Context;
 use crate::collection::CollectionValue;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandHelpType {
+    Usage,
+    Short,
+    Long,
+}
+
 pub type CommandParserRef = Arc<Box<dyn CommandParser>>;
 
 pub trait CommandParser: Send + Sync {
+    /// Display command usage information.
+    /// This is used to show help information for the command.
+    fn help(&self, name: &str, _help_type: CommandHelpType) -> String {
+        format!("Usage: {}", name)
+    }
+
     // To check if the command is valid at first parse, such as checking if the params count is correct.
     // This is used to validate the command before load params if needed and executing it.
     fn check(&self, args: &CommandArgs) -> Result<(), String>;

@@ -1,8 +1,8 @@
 use super::complete::ProcessChainCommandCompleter;
 use crate::*;
+use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
-use rustyline::{DefaultEditor, Editor, Helper};
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicUsize};
 
@@ -102,6 +102,17 @@ impl ProcessChainREPL {
                         return Err(msg);
                     }
 
+                    // Check if help is requested
+                    let ret = self.process_help(&line).await;
+                    match ret {
+                        Ok(true) => continue, // Help was processed, skip execution
+                        Ok(false) => {}
+                        Err(e) => {
+                            eprintln!("Error processing help: {}", e);
+                            continue;
+                        }
+                    }
+
                     if let Err(e) = self.execute_line(&line).await {
                         eprint!("Error executing command: {}", e);
                     }
@@ -129,6 +140,47 @@ impl ProcessChainREPL {
         // Implement the REPL logic here
         // This could involve reading commands, executing them, and returning results
         Ok(())
+    }
+
+    async fn process_help(&self, line: &str) -> Result<bool, String> {
+        // Check if help is requested
+        let args: Vec<&str> = line.split_whitespace().collect();
+        if args.len() < 1 {
+            return Ok(false);
+        }
+
+        if args[0] == "help" || args[0] == "?" {
+            if args.len() > 1 {
+                let cmd = args[1];
+                if let Some(parser) = COMMAND_PARSER_FACTORY.get_parser(cmd) {
+                    println!("{}", parser.help(cmd, CommandHelpType::Long));
+                } else {
+                    println!("No such command: {}", cmd);
+                }
+            } else {
+                // List all commands
+                let commands = COMMAND_PARSER_FACTORY.get_command_list();
+                println!("Available commands: {}", commands.join(", "));
+            }
+        } else if args.len() >= 2 {
+            // command with --help or -h
+            let help_type = if args[1] == "--help" {
+                CommandHelpType::Long
+            } else if args[1] == "-h" {
+                CommandHelpType::Short
+            } else {
+                return Ok(false);
+            };
+
+            let cmd = args[0];
+            if let Some(parser) = COMMAND_PARSER_FACTORY.get_parser(cmd) {
+                println!("{}", parser.help(cmd, help_type));
+            } else {
+                println!("No such command: {}", cmd);
+            }
+        }
+
+        Ok(true)
     }
 
     async fn execute_line(&self, line: &str) -> Result<(), String> {

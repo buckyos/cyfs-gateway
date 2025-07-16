@@ -3,18 +3,57 @@ use crate::block::{AssignKind, CommandArgs};
 use crate::chain::Context;
 use crate::chain::EnvLevel;
 use crate::collection::CollectionValue;
+use clap::Command;
 use std::sync::Arc;
 
-pub struct AssignCommandParser {}
+pub struct AssignCommandParser {
+    cmd: Command,
+}
 
 impl AssignCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("env")
+            .about("Manage variable definitions and scope preferences.")
+            .override_usage(
+                r#"
+    [SCOPE] VAR=VALUE     Define or update a variable in the specified scope.
+    VAR=VALUE             Define a variable in the default (chain) scope.
+    SCOPE VAR             Set the default scope for future references to VAR.
+    "#,
+            )
+            .after_help(
+                r#"
+Scope:
+  export, global        Global scope (shared across chains)
+  chain                 Chain-level scope (default)
+  block, local          Block-level scope
+
+Notes:
+  - If a variable already exists, its value will be overwritten.
+  - When assigning (VAR=VALUE), scope defaults to 'chain' unless explicitly specified.
+  - When only VAR is given after a scope, it sets default lookup scope for VAR.
+
+Examples:
+  my_var=123
+  global my_var=456
+  block my_var
+"#,
+            );
+        Self { cmd }
     }
 }
 
 impl CommandParser for AssignCommandParser {
-    // export KEY=VALUE or export KEY
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        let mut cmd = self.cmd.clone();
+        match help_type {
+            CommandHelpType::Usage => cmd.render_usage().to_string(),
+            CommandHelpType::Short => cmd.render_help().to_string(),
+            CommandHelpType::Long => cmd.render_long_help().to_string(),
+        }
+    }
+
+    // [export|global|chain|block|local] KEY=VALUE or [export|global|chain|block|local]  KEY
     // The first param is the kind of assignment, which can be "block", "chain" or "global"
     // The second param is the key, and the third param is the value (optional)
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
@@ -35,7 +74,11 @@ impl CommandParser for AssignCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         // Args must not be checked before calling parse
         assert!(
             args.len() >= 2 && args.len() <= 3,
@@ -85,7 +128,11 @@ impl CommandExecutor for AssignCommand {
                 // Handle assignment with value
                 context
                     .env()
-                    .set(self.key.as_str(), CollectionValue::String(value.clone()), Some(env_level))
+                    .set(
+                        self.key.as_str(),
+                        CollectionValue::String(value.clone()),
+                        Some(env_level),
+                    )
                     .await?;
 
                 Ok(CommandResult::success_with_value(value))
