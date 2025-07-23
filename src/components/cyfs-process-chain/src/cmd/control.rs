@@ -1,33 +1,74 @@
 use super::cmd::*;
-use super::helper::CommandArgHelper;
 use crate::block::{BlockExecuter, CommandArgs};
 use crate::chain::Context;
+use clap::{Arg, Command, ArgAction};
 use std::sync::Arc;
 
-// exec command, like: EXEC block1
-pub struct ExecCommandParser {}
+// exec command, exec a block by block_id, like: EXEC block1
+pub struct ExecCommandParser {
+    cmd: Command,
+}
 
 impl ExecCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("exec")
+            .about("Execute a block by its identifier within the current process chain.")
+            .override_usage("exec <block_id>")
+            .after_help(
+                r#"
+Arguments:
+  <block_id>    The ID of the block to execute.
+
+Behavior:
+  - The specified block must exist in the current process chain.
+  - The block will be executed immediately, and its result is returned.
+  - Execution then continues with the next command in the current block.
+  - If the block does not exist, an error will occur.
+
+Examples:
+  exec verify_token
+  exec block_login && drop
+"#,
+            )
+            .arg(
+                Arg::new("block_id")
+                    .required(true)
+                    .value_name("block_id")
+                    .help("The ID of the block to execute"),
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for ExecCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        if args.len() != 1 {
-            let msg = format!("Invalid exec command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        let arg_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&arg_list)
+            .map_err(|e| e.to_string())?;
 
         Ok(())
     }
 
-    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
-        assert!(args.len() == 1, "Exec command should have exactly 1 arg");
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid exec command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
 
-        let cmd = ExecCommandExecutor::new(args[0].clone());
+        let block_id = matches
+            .get_one::<String>("block_id")
+            .expect("block_id is required")
+            .clone();
+
+        let cmd = ExecCommandExecutor::new(block_id);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -39,9 +80,7 @@ pub struct ExecCommandExecutor {
 
 impl ExecCommandExecutor {
     pub fn new(block: String) -> Self {
-        ExecCommandExecutor {
-            block,
-        }
+        ExecCommandExecutor { block }
     }
 }
 
@@ -84,84 +123,96 @@ enum GotoTargetLevel {
 
 // goto command goto [--chain|--block] <target>
 // like: goto block1; goto --chain chain1; goto --block block2;
-pub struct GotoCommandParser {}
+pub struct GotoCommandParser {
+    cmd: Command,
+}
 
 impl GotoCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("goto")
+            .about("Jump to a block or another chain within the process flow.")
+            .override_usage("goto [--chain | --block] <target>")
+            .after_help(
+                r#"
+Arguments:
+  <target>     The name of the target block or chain.
+
+Options:
+  --chain      Jump to a chain by name.
+  --block      Jump to a block in the current chain (default).
+
+Behavior:
+  - Without options, defaults to jumping to a chain.
+  - When using `--chain`, execution switches to the specified chain.
+  - When using `--block`, jumps to a block inside the current chain.
+  - The next command of the current command will not be executed any more.
+  - Fails if the target block/chain does not exist.
+
+Examples:
+  goto login_retry
+  goto --block validate_input
+  goto --chain fallback_chain
+"#,
+            )
+            .arg(
+                Arg::new("chain")
+                    .long("chain")
+                    .conflicts_with("block")
+                    .help("Jump to another chain")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("block")
+                    .long("block")
+                    .conflicts_with("chain")
+                    .help("Jump to a block in the current chain (default)")
+                    .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("target")
+                    .required(true)
+                    .help("The name of the target block or chain"),
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for GotoCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args must be either one or two elements
-        if args.len() < 1 {
-            let msg = format!("Invalid goto command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
-        // If there are options, they must be valid
-        if args.len() >= 2 {
-            let option_count =
-                CommandArgHelper::check_origin_options(args, &[&["chain", "block"]])?;
-            if option_count + 1 != args.len() {
-                let msg = format!(
-                    "Invalid goto command: expected 1 target after options, but found {} options",
-                    option_count
-                );
-                error!("{}", msg);
-                return Err(msg);
-            }
-        }
+        let arg_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&arg_list)
+            .map_err(|e| e.to_string())?;
 
         Ok(())
     }
 
-    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
-        assert!(args.len() >= 1, "Goto command should have at least 1 arg");
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid goto command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
 
-        // Parse the command arguments
-        // If only one argument is provided, it is considered a chain name
-        // If two arguments are provided, the first one must be --chain or --block
-        // and the second one is the target name
-
-        let mut target_level = GotoTargetLevel::Chain;
-        let mut option_count = 0;
-        if args.len() >= 2 {
-            let str_args = args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
-            let options = CommandArgHelper::parse_options(&str_args, &[&["chain", "block"]])?;
-            option_count = options.len();
-
-            for option in options {
-                match option {
-                    "block" => {
-                        // Set target to Block
-                        target_level = GotoTargetLevel::Block;
-                    }
-                    "chain" => {
-                        // Set target to Chain
-                        target_level = GotoTargetLevel::Chain;
-                    }
-                    _ => {
-                        let msg = format!("Invalid option '{}' in goto command", option);
-                        error!("{}", msg);
-                        return Err(msg);
-                    }
-                }
-            }
+        let target_level = if matches.get_flag("chain") {
+            GotoTargetLevel::Chain
+        } else if matches.get_flag("block") {
+            GotoTargetLevel::Block
+        } else {
+            GotoTargetLevel::Chain // Default to chain if no option is provided
         };
 
-        if option_count + 1 != args.len() {
-            let msg = format!(
-                "Invalid goto command: expected 1 target after options, but found {} options",
-                option_count
-            );
-            error!("{}", msg);
-            return Err(msg);
-        }
+        let name = matches
+            .get_one::<String>("target")
+            .expect("target is required")
+            .clone();
 
-        let name = args[option_count].to_string();
         let target = match target_level {
             GotoTargetLevel::Block => GotoTarget::Block(name),
             GotoTargetLevel::Chain => GotoTarget::Chain(name),
@@ -195,31 +246,70 @@ impl CommandExecutor for GotoCommandExecutor {
     }
 }
 
-// Return command parser: like: return; return value;
-pub struct ReturnCommandParser {}
+// Return command parser, return from current block, like: return; return value;
+pub struct ReturnCommandParser {
+    cmd: Command,
+}
 
 impl ReturnCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("return")
+            .about("Return from the current block with success, optionally with a value.")
+            .override_usage("return [value]")
+            .after_help(
+                r#"
+Usage:
+  return           Return with no value.
+  return <value>   Return the specified string value.
+
+Behavior:
+  - Ends execution of the current block immediately with success.
+  - The return value (if any) is passed to the parent or caller.
+  - Used for control flow inside process chain blocks.
+
+Examples:
+  return
+  return ok
+  return "user input accepted"
+"#,
+            )
+            .arg(
+                Arg::new("value")
+                    .help("Optional return value")
+                    .required(false)
+                    .num_args(0..=1),
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for ReturnCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should be empty or have exactly one element
-        if args.len() > 1 {
-            let msg = format!("Invalid return command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        let arg_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&arg_list)
+            .map_err(|e| e.to_string())?;
 
         Ok(())
     }
 
-    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
-        assert!(args.len() <= 1, "Return command should have at most 1 arg");
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid return command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
 
-        let cmd = ReturnCommandExecutor::new(args.get(0).cloned());
+        // Get the optional return value
+        let value = matches.get_one::<String>("value").cloned();
+
+        let cmd = ReturnCommandExecutor::new(value);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -231,9 +321,7 @@ pub struct ReturnCommandExecutor {
 
 impl ReturnCommandExecutor {
     pub fn new(value: Option<String>) -> Self {
-        Self {
-            value,
-        }
+        Self { value }
     }
 }
 
@@ -251,30 +339,69 @@ impl CommandExecutor for ReturnCommandExecutor {
 }
 
 // Error command parser: like: error; error value;
-pub struct ErrorCommandParser {}
+pub struct ErrorCommandParser {
+    cmd: Command,
+}
 
 impl ErrorCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("return")
+            .about("Return from the current block with error, optionally with a value.")
+            .override_usage("error [value]")
+            .after_help(
+                r#"
+Usage:
+  error           Return with no value.
+  error <value>   Return the specified string value.
+
+Behavior:
+  - Ends execution of the current block immediately with error.
+  - The return value (if any) is passed to the parent or caller.
+  - Used for control flow inside process chain blocks.
+
+Examples:
+  error
+  error ok
+  error "invalid input"
+"#,
+            )
+            .arg(
+                Arg::new("value")
+                    .help("Optional return value")
+                    .required(false)
+                    .num_args(0..=1),
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for ErrorCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should be empty or have exactly one element
-        if args.len() > 1 {
-            let msg = format!("Invalid error command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        let arg_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&arg_list)
+            .map_err(|e| e.to_string())?;
 
         Ok(())
     }
 
-    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
-        assert!(args.len() <= 1, "Error command should have at most 1 arg");
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid error command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
 
-        let cmd = ErrorCommandExecutor::new(args.get(0).cloned());
+        // Get the optional error value
+        let value = matches.get_one::<String>("value").cloned();
+
+        let cmd = ErrorCommandExecutor::new(value);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -286,9 +413,7 @@ pub struct ErrorCommandExecutor {
 
 impl ErrorCommandExecutor {
     pub fn new(value: Option<String>) -> Self {
-        Self {
-            value,
-        }
+        Self { value }
     }
 }
 
@@ -306,30 +431,68 @@ impl CommandExecutor for ErrorCommandExecutor {
 }
 
 // Exit command parser: like: exit; exit value;
-pub struct ExitCommandParser {}
+pub struct ExitCommandParser {
+    cmd: Command,
+}
 
 impl ExitCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("return")
+            .about("Return from the current process chain list, optionally with a value.")
+            .override_usage("exit [value]")
+            .after_help(
+                r#"
+Usage:
+  exit           Exit with no value.
+  exit <value>   Exit with the specified string value.
+
+Behavior:
+  - Ends execution of the current process chain list to top caller.
+  - The return value (if any) is passed to caller.
+
+Examples:
+  exit
+  exit accept
+  exit "invalid input"
+"#,
+            )
+            .arg(
+                Arg::new("value")
+                    .help("Optional return value")
+                    .required(false)
+                    .num_args(0..=1),
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for ExitCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should be empty or have exactly one element
-        if args.len() > 1 {
-            let msg = format!("Invalid exit command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        let arg_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&arg_list)
+            .map_err(|e| e.to_string())?;
 
         Ok(())
     }
 
-    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
-        assert!(args.len() <= 1, "Exit command should have at most 1 arg");
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid exit command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
 
-        let cmd = ExitCommandExecutor::new(args.get(0).cloned());
+        // Get the optional exit value
+        let value = matches.get_one::<String>("value").cloned();
+
+        let cmd = ExitCommandExecutor::new(value);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -341,9 +504,7 @@ pub struct ExitCommandExecutor {
 
 impl ExitCommandExecutor {
     pub fn new(value: Option<String>) -> Self {
-        Self {
-            value,
-        }
+        Self { value }
     }
 }
 

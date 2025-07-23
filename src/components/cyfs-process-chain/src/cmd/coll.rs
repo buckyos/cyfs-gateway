@@ -1,7 +1,6 @@
 use super::cmd::{
     CommandExecutor, CommandExecutorRef, CommandHelpType, CommandParser, CommandResult,
 };
-use super::helper::CommandArgHelper;
 use crate::block::CommandArgs;
 use crate::chain::{Context, EnvLevel};
 use crate::collection::{CollectionType, CollectionValue};
@@ -96,11 +95,14 @@ impl CommandParser for MatchIncludeCommandParser {
 
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let str_list = args.as_str_list();
-        self.cmd.clone().try_get_matches_from(&str_list).map_err(|e| {
-            let msg = format!("Invalid match-include command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
+        self.cmd
+            .clone()
+            .try_get_matches_from(&str_list)
+            .map_err(|e| {
+                let msg = format!("Invalid match-include command: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         // Args should have at least two elements
         if args.len() < 2 {
@@ -117,11 +119,6 @@ impl CommandParser for MatchIncludeCommandParser {
         args: Vec<String>,
         _origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        assert!(
-            args.len() >= 2,
-            "match-include command should have at least 2 args"
-        );
-
         let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
             let msg = format!("Invalid match-include command: {:?}, {}", args, e);
             error!("{}", msg);
@@ -288,36 +285,83 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
 
 /// set-create [-global|-chain|-block] <set_id>
 /// Create a new set collection with the given id.
-pub struct SetCreateCommandParser {}
+pub struct SetCreateCommandParser {
+    cmd: Command,
+}
 
 impl SetCreateCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("set-create")
+            .about("Create a new set collection with a given identifier and scope.")
+            .override_usage("set-create [-global | -export | -chain | -block | -local] <set_id>")
+            .after_help(
+                r#"
+Arguments:
+  <set_id>    The identifier of the set collection to create.
+
+Scope Options:
+  -global, -export    Create the set in the global scope.
+  -chain              Create the set in the current process chain scope (default).
+  -block, -local      Create the set in the current execution block (local) scope.
+
+Notes:
+  - If no scope is specified, the default is chain-level.
+  - A set is a collection of unique string items.
+  - Sets can later be queried using match-include or modified using set-add/set-remove.
+
+Examples:
+  set-create -global trusted_hosts
+  set-create -export trusted_hosts
+  set-create session_flags
+  set-create -block temp_set
+  set-create -local temp_set
+"#,
+            )
+            .arg(
+                Arg::new("global")
+                    .long("global")
+                    .visible_alias("export")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with_all(&["chain", "block"])
+                    .help("Use global scope"),
+            )
+            .arg(
+                Arg::new("chain")
+                    .long("chain")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with_all(&["global", "block"])
+                    .help("Use chain scope (default)"),
+            )
+            .arg(
+                Arg::new("block")
+                    .visible_alias("local")
+                    .long("block")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with_all(&["global", "chain"])
+                    .help("Use block scope"),
+            )
+            .arg(
+                Arg::new("set_id")
+                    .required(true)
+                    .value_name("set_id")
+                    .help("The ID of the set to create"),
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for SetCreateCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have at least one element
-        if args.len() < 1 {
-            let msg = format!("Invalid set-create command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
-        // Check options
-        if args.len() > 1 {
-            let option_count =
-                CommandArgHelper::check_origin_options(args, &[&["global", "chain"]])?;
-            if option_count + 1 != args.len() {
-                let msg = format!(
-                    "Invalid set-create command: expected 1 set-id, but found {} options",
-                    option_count
-                );
+        let str_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&str_list)
+            .map_err(|e| {
+                let msg = format!("Invalid set-create command: {:?}, {}", args, e);
                 error!("{}", msg);
-                return Err(msg);
-            }
-        }
+                msg
+            })?;
 
         Ok(())
     }
@@ -327,48 +371,27 @@ impl CommandParser for SetCreateCommandParser {
         args: Vec<String>,
         _origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        assert!(
-            args.len() >= 1,
-            "set-create command should have at least 1 arg"
-        );
-
-        // Parse options
-        let mut level = EnvLevel::Chain; // Default to chain level
-        let mut option_count = 0;
-        if args.len() > 1 {
-            let str_args = args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
-            let options =
-                CommandArgHelper::parse_options(&str_args, &[&["global", "chain", "block"]])?;
-            option_count = options.len();
-
-            for option in options {
-                if option == "global" {
-                    // Set level to Global
-                    level = EnvLevel::Global;
-                } else if option == "chain" {
-                    // Set level to Chain
-                    level = EnvLevel::Chain;
-                } else if option == "block" {
-                    // Set level to Block
-                    level = EnvLevel::Block;
-                } else {
-                    let msg = format!("Invalid option '{}' in set-create command", option);
-                    error!("{}", msg);
-                    return Err(msg);
-                }
-            }
-        }
-
-        if option_count + 1 != args.len() {
-            let msg = format!(
-                "Invalid set-create command: set-id is required, but found {} options",
-                option_count
-            );
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid set-create command: {:?}, {}", args, e);
             error!("{}", msg);
-            return Err(msg);
-        }
+            msg
+        })?;
 
-        let cmd = SetCreateCommandExecutor::new(level, args[option_count].clone());
+        let level = if matches.get_flag("global") || matches.get_flag("export") {
+            EnvLevel::Global
+        } else if matches.get_flag("block") || matches.get_flag("local") {
+            EnvLevel::Block
+        } else {
+            EnvLevel::Chain // Default to chain level
+        };
+
+        // Get the set_id from the matches
+        let set_id = matches
+            .get_one::<String>("set_id")
+            .expect("set_id is required")
+            .clone();
+
+        let cmd = SetCreateCommandExecutor::new(level, set_id);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -417,22 +440,59 @@ impl CommandExecutor for SetCreateCommandExecutor {
 /// Add a value to the specified set collection.
 /// If the value not exists, it will be added and the command will succeed.
 /// If the value already exists, the command will fail.
-pub struct SetAddCommandParser {}
+pub struct SetAddCommandParser {
+    cmd: Command,
+}
 
 impl SetAddCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("set-add")
+            .about("Add a value to a set collection.")
+            .override_usage("set-add <set_id> <value>")
+            .after_help(
+                r#"
+Arguments:
+  <set_id>    The identifier of the target set.
+  <value>     The value to insert into the set.
+
+Notes:
+  - If the set does not exist, the operation fails.
+  - Sets only store unique values.
+  - Use `set-create` to initialize a set before using this command.
+
+Examples:
+  set-add trusted_hosts "192.168.1.1"
+  set-add temp_set "flag_enabled"
+"#,
+            )
+            .arg(
+                Arg::new("set_id")
+                    .required(true)
+                    .value_name("set_id")
+                    .help("The ID of the target set"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .value_name("value")
+                    .help("The value to insert into the set"),
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for SetAddCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have exactly two elements
-        if args.len() != 2 {
-            let msg = format!("Invalid set-add command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        let str_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&str_list)
+            .map_err(|e| {
+                let msg = format!("Invalid set-add command: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         Ok(())
     }
@@ -442,9 +502,23 @@ impl CommandParser for SetAddCommandParser {
         args: Vec<String>,
         _origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        assert!(args.len() == 2, "SetAdd command should have exactly 2 args");
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid set-add command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
 
-        let cmd = SetAddCommandExecutor::new(args[0].clone(), args[1].clone());
+        let set_id = matches
+            .get_one::<String>("set_id")
+            .expect("set_id is required")
+            .clone();
+
+        let value = matches
+            .get_one::<String>("value")
+            .expect("value is required")
+            .clone();
+
+        let cmd = SetAddCommandExecutor::new(set_id, value);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -499,22 +573,59 @@ impl CommandExecutor for SetAddCommandExecutor {
 /// Remove a value from the specified set collection.
 /// If the value exists, it will be removed and the command will succeed.
 /// If the value does not exist, the command will fail.
-pub struct SetRemoveCommandParser {}
+pub struct SetRemoveCommandParser {
+    cmd: Command,
+}
 
 impl SetRemoveCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("set-remove")
+            .about("Remove a value from a set collection.")
+            .override_usage("set-remove <set_id> <value>")
+            .after_help(
+                r#"
+Arguments:
+  <set_id>    The identifier of the target set.
+  <value>     The value to remove from the set.
+
+Notes:
+  - If the set does not exist, the operation fails.
+  - If the value is not in the set, it is ignored.
+  - Sets only store unique values.
+
+Examples:
+  set-remove trusted_hosts "192.168.1.1"
+  set-remove temp_set "flag_enabled"
+"#,
+            )
+            .arg(
+                Arg::new("set_id")
+                    .required(true)
+                    .value_name("set_id")
+                    .help("The ID of the set to remove from"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .value_name("value")
+                    .help("The value to remove"),
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for SetRemoveCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have exactly two elements
-        if args.len() != 2 {
-            let msg = format!("Invalid set_remove command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        let str_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&str_list)
+            .map_err(|e| {
+                let msg = format!("Invalid set-remove command: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         Ok(())
     }
@@ -524,12 +635,23 @@ impl CommandParser for SetRemoveCommandParser {
         args: Vec<String>,
         _origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        assert!(
-            args.len() == 2,
-            "SetRemove command should have exactly 2 args"
-        );
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid set-remove command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
 
-        let cmd = SetRemoveCommandExecutor::new(args[0].clone(), args[1].clone());
+        let set_id = matches
+            .get_one::<String>("set_id")
+            .expect("set_id is required")
+            .clone();
+
+        let value = matches
+            .get_one::<String>("value")
+            .expect("value is required")
+            .clone();
+
+        let cmd = SetRemoveCommandExecutor::new(set_id, value);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -583,36 +705,85 @@ impl CommandExecutor for SetRemoveCommandExecutor {
 /// map-create [-multi] [-global|-chain|-block] <map_id>
 /// Create a new map collection with the given id, default is chain level.
 /// If the map already exists, it will fail
-pub struct MapCreateCommandParser {}
+pub struct MapCreateCommandParser {
+    cmd: Command,
+}
 
 impl MapCreateCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("map-create")
+            .about("Create a new map or multimap collection with a given ID and scope.")
+            .override_usage("map-create [-multi] [-export | -chain | -local] <map_id>")
+            .after_help(
+                r#"
+Options:
+  -multi                Create a multimap (key → multiple values allowed).
+  -global, -export      Global scope (same as -global).
+  -chain                Process chain scope (default).
+  -block, -local        Block-local scope (same as -block).
+
+Notes:
+  - If no scope is specified, the default is chain-level.
+  - Use -multi to create a multimap instead of a regular map.
+
+Examples:
+  map-create trusted_hosts
+  map-create -global user_token_map
+  map-create -multi -local ip_event_map
+"#,
+            )
+            .arg(
+                Arg::new("multi")
+                    .long("multi")
+                    .short('m')
+                    .help("Create a multimap")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("global")
+                    .long("global")
+                    .visible_alias("export")
+                    .conflicts_with_all(&["chain", "block"])
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Use global scope"),
+            )
+            .arg(
+                Arg::new("chain")
+                    .long("chain")
+                    .conflicts_with_all(&["global", "block"])
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Use chain scope (default)"),
+            )
+            .arg(
+                Arg::new("block")
+                    .long("block")
+                    .visible_alias("local")
+                    .conflicts_with_all(&["global", "chain"])
+                    .action(clap::ArgAction::SetTrue)
+                    .help("Use block scope"),
+            )
+            .arg(
+                Arg::new("map_id")
+                    .required(true)
+                    .value_name("map_id")
+                    .help("The ID of the map/multimap to create"),
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for MapCreateCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have exactly one elements
-        if args.len() < 1 {
-            let msg = format!("Invalid map-create command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
-        // If there is options start with "-", it should be "-multi""-global" or "-chain"
-        if args.len() > 1 {
-            let option_count =
-                CommandArgHelper::check_origin_options(args, &[&["multi"], &["global", "chain"]])?;
-            if option_count + 1 != args.len() {
-                let msg = format!(
-                    "Invalid map-create command: expected 1 map-id, but found {} options",
-                    option_count
-                );
+        let str_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&str_list)
+            .map_err(|e| {
+                let msg = format!("Invalid map-create command: {:?}, {}", args, e);
                 error!("{}", msg);
-                return Err(msg);
-            }
-        }
+                msg
+            })?;
 
         Ok(())
     }
@@ -622,54 +793,28 @@ impl CommandParser for MapCreateCommandParser {
         args: Vec<String>,
         _origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        assert!(
-            args.len() >= 1,
-            "map-create command should have at least 1 arg"
-        );
-
-        // Parse options
-        let mut is_multi = false; // Default to single map
-        let mut level = EnvLevel::Chain; // Default to chain level
-        let mut option_count = 0;
-        if args.len() > 1 {
-            let str_args = args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
-            let options = CommandArgHelper::parse_options(
-                &str_args,
-                &[&["multi"], &["global", "chain", "block"]],
-            )?;
-            option_count = options.len();
-
-            for option in options {
-                if option == "multi" {
-                    // Set is_multi to true
-                    is_multi = true;
-                } else if option == "global" {
-                    // Set level to Global
-                    level = EnvLevel::Global;
-                } else if option == "chain" {
-                    // Set level to Chain
-                    level = EnvLevel::Chain;
-                } else if option == "block" {
-                    // Set level to Block
-                    level = EnvLevel::Block;
-                } else {
-                    let msg = format!("Invalid option '{}' in map-create command", option);
-                    error!("{}", msg);
-                    return Err(msg);
-                }
-            }
-        }
-
-        if option_count + 1 != args.len() {
-            let msg = format!(
-                "Invalid map-create command: map-id is required, but found {} options",
-                option_count
-            );
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid map-create command: {:?}, {}", args, e);
             error!("{}", msg);
-            return Err(msg);
-        }
+            msg
+        })?;
 
-        let cmd = MapCreateCommandExecutor::new(is_multi, level, args[option_count].clone());
+        let is_multi = matches.get_flag("multi");
+        let level = if matches.get_flag("global") || matches.get_flag("export") {
+            EnvLevel::Global
+        } else if matches.get_flag("block") || matches.get_flag("local") {
+            EnvLevel::Block
+        } else {
+            EnvLevel::Chain // Default to chain level
+        };
+
+        // Get the map_id from the matches
+        let map_id = matches
+            .get_one::<String>("map_id")
+            .expect("map_id is required")
+            .clone();
+
+        let cmd = MapCreateCommandExecutor::new(is_multi, level, map_id);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -732,22 +877,64 @@ impl CommandExecutor for MapCreateCommandExecutor {
 /// Set a key-value pair in the specified map collection.
 /// If the key already exists, it will be updated and the command will succeed.
 /// If the key does not exist, it will be added and the command will succeed.
-pub struct MapAddCommandParser {}
+pub struct MapAddCommandParser {
+    cmd: Command,
+}
 
 impl MapAddCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("map-add")
+            .about("Add or update key-value pairs in a map or multimap collection.")
+            .override_usage("map-add <map_id> <key> <value>...")
+            .after_help(
+                r#"
+Arguments:
+  <map_id>    The identifier of the map or multimap.
+  <key>       The key to insert or update.
+  <value>...  One or more values to associate with the key.
+
+Notes:
+  - For normal maps, only one value is allowed.
+  - For multimaps, multiple values are accepted.
+  - Use `map-create` to define the collection before adding items.
+
+Examples:
+  map-add session_map session123 user1
+  map-add multi_ip_map 192.168.0.1 login blocked
+"#,
+            )
+            .arg(
+                Arg::new("map_id")
+                    .required(true)
+                    .help("The ID of the target map collection"),
+            )
+            .arg(
+                Arg::new("key")
+                    .required(true)
+                    .help("The key to insert or update"),
+            )
+            .arg(
+                Arg::new("values")
+                    .required(true)
+                    .num_args(1..)
+                    .help("One or more values to associate with the key"),
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for MapAddCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have at least three elements
-        if args.len() < 3 {
-            let msg = format!("Invalid map-add command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        let str_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&str_list)
+            .map_err(|e| {
+                let msg = format!("Invalid map-add command: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         Ok(())
     }
@@ -757,13 +944,28 @@ impl CommandParser for MapAddCommandParser {
         args: Vec<String>,
         _origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        assert!(
-            args.len() >= 3,
-            "MapAdd command should have at least 3 args"
-        );
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid map-add command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
 
-        let cmd =
-            MapAddCommandExecutor::new(args[0].clone(), args[1].clone(), args[2..].to_owned());
+        let map_id = matches
+            .get_one::<String>("map_id")
+            .expect("map_id is required")
+            .clone();
+
+        let key = matches
+            .get_one::<String>("key")
+            .expect("key is required")
+            .clone();
+
+        let values = matches
+            .get_many::<String>("values")
+            .map(|v| v.map(|s| s.clone()).collect::<Vec<String>>())
+            .expect("values are required");
+
+        let cmd = MapAddCommandExecutor::new(map_id, key, values);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -877,24 +1079,71 @@ impl CommandExecutor for MapAddCommandExecutor {
 }
 
 /// map-remove <map_id> <key>; // for normal map and multi map
-/// map-remove <map_id> <key> value value1;    // for multi map only, accept multi value
+/// map-remove <map_id> <key> <value>;  // for normal map only, accept only one value
+/// map-remove <map_id> <key> <value> <value1> ...;   // for multi map only, accept multi value
 /// Remove a key from the specified map collection.
-pub struct MapRemoveCommandParser {}
+pub struct MapRemoveCommandParser {
+    cmd: Command,
+}
 
 impl MapRemoveCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("map-remove")
+            .about("Remove a key or key-value pair(s) from a map or multimap collection.")
+            .override_usage("map-remove <map_id> <key> [value]...")
+            .after_help(
+                r#"
+Usage:
+  map-remove <map_id> <key>
+  map-remove <map_id> <key> <value>...
+  
+Arguments:
+  <map_id>    ID of the map or multimap.
+  <key>       The key to remove or modify.
+  <value>...  Optional. One or more values to remove.
+
+Behavior:
+  - If only key is provided, remove the whole entry.
+  - If values are given:
+      - In map: only one value is allowed.
+      - In multimap: all values under the key will be removed.
+
+Examples:
+  map-remove session_map session123
+  map-remove multi_map 127.0.0.1 login_failed blocked
+"#,
+            )
+            .arg(
+                Arg::new("map_id")
+                    .required(true)
+                    .help("The ID of the map or multimap"),
+            )
+            .arg(
+                Arg::new("key")
+                    .required(true)
+                    .help("The key to remove or update"),
+            )
+            .arg(
+                Arg::new("values")
+                    .num_args(0..)
+                    .help("Optional value(s) to remove under the key"),
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for MapRemoveCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have at least two elements
-        if args.len() < 2 {
-            let msg = format!("Invalid map-remove command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        let str_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&str_list)
+            .map_err(|e| {
+                let msg = format!("Invalid map-remove command: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         Ok(())
     }
@@ -904,18 +1153,28 @@ impl CommandParser for MapRemoveCommandParser {
         args: Vec<String>,
         _origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        assert!(
-            args.len() >= 2,
-            "map-remove command should have at least 2 args"
-        );
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid map-remove command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
 
-        let values = if args.len() > 2 {
-            args[2..].iter().map(|s| s.clone()).collect::<Vec<String>>()
-        } else {
-            vec![]
-        };
+        let map_id = matches
+            .get_one::<String>("map_id")
+            .expect("map_id is required")
+            .clone();
 
-        let cmd = MapRemoveCommandExecutor::new(args[0].clone(), args[1].clone(), values);
+        let key = matches
+            .get_one::<String>("key")
+            .expect("key is required")
+            .clone();
+
+        let values = matches
+            .get_many::<String>("values")
+            .map(|v| v.map(|s| s.clone()).collect::<Vec<String>>())
+            .unwrap_or_default();
+
+        let cmd = MapRemoveCommandExecutor::new(map_id, key, values);
         Ok(Arc::new(Box::new(cmd)))
     }
 }

@@ -70,7 +70,7 @@ impl CommandArg {
         match self {
             CommandArg::Literal(s) => s.as_str(),
             CommandArg::Var(s) => s.as_str(),
-            CommandArg::CommandSubstitution(_) => "",
+            CommandArg::CommandSubstitution(_) => "[command substitution]",
         }
     }
 }

@@ -1,62 +1,89 @@
 use super::cmd::*;
-use super::helper::CommandArgHelper;
 use crate::block::CommandArgs;
 use crate::chain::Context;
+use clap::{Arg, ArgAction, Command};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
 // Echo command parser, which simply echoes the input arguments, such as: echo "Hello, World!"; echo -n "Hello," "World!"
 // Echo command accepts any arguments and output them as a string with space concat.
-pub struct EchoCommandParser;
+pub struct EchoCommandParser {
+    cmd: Command,
+}
 
 impl EchoCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("echo")
+            .about("Display a line of text or output the given arguments.")
+            .override_usage("echo [-n] [args...]")
+            .after_help(
+                r#"
+Options:
+  -n          Do not print the trailing newline.
+
+Behavior:
+  - Joins all arguments with spaces and prints them.
+  - By default, a newline is printed at the end.
+
+Examples:
+  echo "Hello, World!"
+  echo -n "Hello," "World!"
+"#,
+            )
+            .arg(
+                Arg::new("no_newline")
+                    .short('n')
+                    .action(ArgAction::SetTrue)
+                    .help("Do not print the trailing newline"),
+            )
+            .arg(
+                Arg::new("args")
+                    .help("Text arguments to display")
+                    .num_args(0..)
+                    .trailing_var_arg(true), // important: accepts any values
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for EchoCommandParser {
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Accept any arguments, but we should check the options
-        if !args.is_empty() {
-            CommandArgHelper::check_origin_options(args, &[&["n"]])?;
-        }
+        let arg_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&arg_list)
+            .map_err(|e| e.to_string())?;
 
         Ok(())
     }
 
-    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
-        // Check first argument is not empty
-        let mut suppress_newline = true;
-        let mut option_count = 0;
-        if !args.is_empty() {
-            let str_args = args.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
-            let options = CommandArgHelper::parse_options(&str_args, &[&["n"]])?;
-            option_count = options.len();
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid echo command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
 
-            for option in options {
-                if option == "n" {
-                    suppress_newline = false;
-                } else {
-                    let msg = format!("Invalid option '{}', expected one of ['-n']", option);
-                    error!("{}", msg);
-                    return Err(msg);
-                }
-            }
+        // Get the optional no_newline flag
+        let suppress_newline = matches.get_flag("no_newline");
+
+        // Get the arguments to echo
+        let parts: Vec<&str> = matches
+            .get_many::<String>("args")
+            .map(|vals| vals.map(|v| v.as_str()).collect())
+            .unwrap_or_else(Vec::new);
+
+        let mut result = parts.join(" ");
+        if suppress_newline {
+            result.push('\n'); // Use '\n' to ensure the output is consistent with echo behavior
         }
 
-        // For better performance, we just join the rest of the arguments on parser
-        let mut output = if option_count < args.len() {
-            args[option_count..].join(" ")
-        } else {
-            String::from("")
-        };
-
-        if !suppress_newline {
-            output.push('\n');
-        }
-
-        let cmd = EchoCommandExecutor::new(suppress_newline, output);
+        let cmd = EchoCommandExecutor::new(suppress_newline, result);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
