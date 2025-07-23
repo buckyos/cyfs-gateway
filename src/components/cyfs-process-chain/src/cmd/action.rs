@@ -1,20 +1,57 @@
 use super::cmd::*;
 use crate::block::CommandArgs;
 use crate::chain::Context;
+use clap::Command;
 use std::sync::Arc;
-
 // some action commands, DROP/ACCEPT/REJECT
 pub struct ActionCommandParser {
     action: CommandAction,
+    cmd: Command,
 }
 
 impl ActionCommandParser {
     pub fn new(action: CommandAction) -> Self {
-        Self { action }
+        let cmd = Command::new("action")
+            .about("Perform a control action that terminates the current process chain execution.")
+            .override_usage(
+                r#"
+    [expression] && drop
+    match $ip "192.168.0.*" && accept
+    match $uid "blacklist" && reject
+"#,
+            )
+            .after_help(
+                r#"
+Available Actions:
+    drop      Equivalent to `exit drop`. Terminates with result 'drop'.
+    accept    Equivalent to `exit accept`. Terminates with result 'accept'.
+    reject    Equivalent to `exit reject`. Terminates with result 'reject'.
+
+Notes:
+    - All actions immediately stop the entire process chain list.
+    - The return value is passed to the outer caller (e.g., dispatcher, protocol stack).
+    - Actions are often used after condition expressions such as `match`, `eq`, or `range`.
+
+Examples:
+    match $user "admin" && accept
+    match $ip "10.0.*.*" && drop
+    range $port 1000 2000 && reject
+"#,
+            );
+        Self { action, cmd }
     }
 }
 
 impl CommandParser for ActionCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        let mut cmd = self.cmd.clone();
+        match help_type {
+            CommandHelpType::Usage => cmd.render_usage().to_string(),
+            CommandHelpType::Short => cmd.render_help().to_string(),
+            CommandHelpType::Long => cmd.render_long_help().to_string(),
+        }
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args must be empty
         if !args.is_empty() {
@@ -26,7 +63,11 @@ impl CommandParser for ActionCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         // Args must be empty
         assert!(args.is_empty(), "Action command should not have any args");
 

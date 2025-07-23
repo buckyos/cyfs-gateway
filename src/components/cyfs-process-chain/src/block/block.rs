@@ -130,6 +130,10 @@ impl CommandArgs {
             .map(|arg| arg.as_literal_str().unwrap())
             .collect()
     }
+
+    pub fn as_str_list(&self) -> Vec<&str> {
+        self.0.iter().map(|arg| arg.as_str()).collect()
+    }
 }
 
 // Single command

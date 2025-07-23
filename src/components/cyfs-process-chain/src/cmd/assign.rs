@@ -12,7 +12,7 @@ pub struct AssignCommandParser {
 
 impl AssignCommandParser {
     pub fn new() -> Self {
-        let cmd = Command::new("env")
+        let cmd = Command::new("assign")
             .about("Manage variable definitions and scope preferences.")
             .override_usage(
                 r#"
@@ -24,19 +24,19 @@ impl AssignCommandParser {
             .after_help(
                 r#"
 Scope:
-  export, global        Global scope (shared across chains)
-  chain                 Chain-level scope (default)
-  block, local          Block-level scope
+    export, global        Global scope (shared across chains)
+    chain                 Chain-level scope (default)
+    block, local          Block-level scope
 
 Notes:
-  - If a variable already exists, its value will be overwritten.
-  - When assigning (VAR=VALUE), scope defaults to 'chain' unless explicitly specified.
-  - When only VAR is given after a scope, it sets default lookup scope for VAR.
+    - If a variable already exists, its value will be overwritten.
+    - When assigning (VAR=VALUE), scope defaults to 'chain' unless explicitly specified.
+    - When only VAR is given after a scope, it sets default lookup scope for VAR.
 
 Examples:
-  my_var=123
-  global my_var=456
-  block my_var
+    my_var=123
+    global my_var=456
+    block my_var
 "#,
             );
         Self { cmd }

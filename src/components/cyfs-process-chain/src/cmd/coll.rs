@@ -1,8 +1,11 @@
-use super::cmd::{CommandExecutor, CommandExecutorRef, CommandParser, CommandResult};
+use super::cmd::{
+    CommandExecutor, CommandExecutorRef, CommandHelpType, CommandParser, CommandResult,
+};
 use super::helper::CommandArgHelper;
 use crate::block::CommandArgs;
 use crate::chain::{Context, EnvLevel};
 use crate::collection::{CollectionType, CollectionValue};
+use clap::{Arg, Command};
 use std::sync::Arc;
 
 /*
@@ -24,16 +27,81 @@ map-get map_id key	// for both map, return value or value collection
 // match-include <collection_id> <var> // for normal set/map or multi map
 
 // Check if the variable is included in the specified collection
-pub struct MatchIncludeCommandParser {}
+pub struct MatchIncludeCommandParser {
+    cmd: Command,
+}
 
 impl MatchIncludeCommandParser {
     pub fn new() -> Self {
-        Self {}
+        let cmd = Command::new("match-include")
+            .about("Match keys or key-value pairs within a collection.")
+            .after_help(
+                r#"
+Match inclusion of a key or key-value(s) in a target collection.
+This command supports set, map, and multi-map collection types.
+
+Behavior:
+    - match-include <collection> <key>
+        Succeeds if <key> exists in a set or map or multi-map collection.
+
+    - match-include <collection> <key> <value>
+        Succeeds if the map or multi-map contains the exact (key, value) pair.
+
+    - match-include <collection> <key> <value1> <value2> ...
+        For multi-map: succeeds only if ALL (key, valueN) pairs exist in the collection.
+
+Notes:
+    - If the target collection does not exist, the match fails.
+    - Only exact matches are supported. Glob or regex patterns are NOT supported.
+    - Values must be listed as separate arguments (not as a single list).
+
+Examples:
+    match-include $HOST $REQ_host "www.test.com" && drop
+    match-include $IP $REQ_ip "127.0.0.1" "192.168.100.1" && accept
+"#,
+            )
+            .arg(
+                Arg::new("collection")
+                    .help("Target collection variable name")
+                    .required(true)
+                    .value_name("collection"),
+            )
+            .arg(
+                Arg::new("key")
+                    .help("Key to match in the collection")
+                    .required(true)
+                    .value_name("key"),
+            )
+            .arg(
+                Arg::new("values")
+                    .help("One or more values to match with the key")
+                    .value_name("value")
+                    .num_args(0..)
+                    .required(false),
+            );
+
+        Self { cmd }
     }
 }
 
 impl CommandParser for MatchIncludeCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        let mut cmd = self.cmd.clone();
+        match help_type {
+            CommandHelpType::Usage => cmd.render_usage().to_string(),
+            CommandHelpType::Short => cmd.render_help().to_string(),
+            CommandHelpType::Long => cmd.render_long_help().to_string(),
+        }
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        let str_list = args.as_str_list();
+        self.cmd.clone().try_get_matches_from(&str_list).map_err(|e| {
+            let msg = format!("Invalid match-include command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
+
         // Args should have at least two elements
         if args.len() < 2 {
             let msg = format!("Invalid match-include command: {:?}", args);
@@ -54,14 +122,26 @@ impl CommandParser for MatchIncludeCommandParser {
             "match-include command should have at least 2 args"
         );
 
-        let collection_id = args[0].clone();
-        let key = args[1].clone();
-        let values = if args.len() > 2 {
-            // If there are more than 2 args, we treat them as values
-            args[2..].iter().map(|s| s.clone()).collect::<Vec<String>>()
-        } else {
-            vec![]
-        };
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid match-include command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let collection_id = matches
+            .get_one::<String>("collection")
+            .expect("collection is required")
+            .clone();
+
+        let key = matches
+            .get_one::<String>("key")
+            .expect("key is required")
+            .clone();
+
+        let values = matches
+            .get_many::<String>("values")
+            .map(|v| v.map(|s| s.clone()).collect::<Vec<String>>())
+            .unwrap_or_default();
 
         let cmd = MatchIncludeCommandExecutor::new(collection_id, key, values);
         Ok(Arc::new(Box::new(cmd)))
@@ -965,7 +1045,11 @@ impl CommandParser for MapGetCommandParser {
         Ok(())
     }
 
-    fn parse(&self, args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         assert!(
             args.len() == 2,
             "map-get command should have exactly 2 args"
@@ -984,10 +1068,7 @@ pub struct MapGetCommandExecutor {
 
 impl MapGetCommandExecutor {
     pub fn new(map_id: String, key: String) -> Self {
-        Self {
-            map_id,
-            key,
-        }
+        Self { map_id, key }
     }
 }
 

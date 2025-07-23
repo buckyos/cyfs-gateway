@@ -75,7 +75,7 @@ pub enum CommandControlLevel {
 pub enum CommandControl {
     Return(String),                      // Return to the block caller with ok
     Error(String),                       // Return to the block caller with error
-    Exit(String),                        // Exit current chain with ok
+    Exit(String),                        // Exit process chain list with value(string)
     Goto((CommandControlLevel, String)), // Goto a specific block or chain
 }
 
