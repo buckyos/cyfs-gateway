@@ -17,7 +17,6 @@ impl MatchCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("match")
             .about("Match a value using glob pattern.")
-            .override_usage("match <value> <pattern>")
             .after_help(
                 r#"
 Arguments:
@@ -424,7 +423,6 @@ impl RangeCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("range")
             .about("Check if a variable's value is within a numeric range.")
-            .override_usage("range <value> <begin> <end>")
             .after_help(
                 r#"
 Arguments:

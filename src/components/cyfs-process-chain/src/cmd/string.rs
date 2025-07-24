@@ -251,7 +251,6 @@ impl RewriteRegexCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("rewrite-regex")
             .about("Rewrite a variable using a regular expression and a replacement template.")
-            .override_usage("rewrite-regex <var> <regex> <template>")
             .after_help(
                 r#"
 Arguments:
@@ -699,7 +698,6 @@ impl StringAppendCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("append")
             .about("Append two string parameters and return the result.")
-            .override_usage("append <param1> <param2>")
             .after_help(
                 r#"
 Arguments:
@@ -840,7 +838,6 @@ impl StringSliceCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("slice")
             .about("Slice a string by byte range and return the result.")
-            .override_usage("slice <string> <start:end>")
             .after_help(
                 r#"
 Arguments:
@@ -979,7 +976,6 @@ impl StringLengthCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("strlen")
             .about("Return the character length of a string.")
-            .override_usage("strlen <string>")
             .after_help(
                 r#"
 Arguments:
@@ -1058,7 +1054,6 @@ impl StringStartsWithCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("starts-with")
             .about("Check if a string starts with the given prefix.")
-            .override_usage("starts-with <string> <prefix>")
             .after_help(
                 r#"
 Arguments:
@@ -1153,7 +1148,6 @@ impl StringEndsWithCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("ends-with")
             .about("Check if a string ends with the given suffix.")
-            .override_usage("ends-with <string> <suffix>")
             .after_help(
                 r#"
 Arguments:

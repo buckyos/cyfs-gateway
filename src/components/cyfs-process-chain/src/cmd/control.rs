@@ -13,7 +13,6 @@ impl ExecCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("exec")
             .about("Execute a block by its identifier within the current process chain.")
-            .override_usage("exec <block_id>")
             .after_help(
                 r#"
 Arguments:
@@ -135,7 +134,6 @@ impl GotoCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("goto")
             .about("Jump to a block or another chain within the process flow.")
-            .override_usage("goto [--chain | --block] <target>")
             .after_help(
                 r#"
 Arguments:
@@ -263,7 +261,6 @@ impl ReturnCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("return")
             .about("Return from the current block with success, optionally with a value.")
-            .override_usage("return [value]")
             .after_help(
                 r#"
 Usage:
@@ -359,7 +356,6 @@ impl ErrorCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("return")
             .about("Return from the current block with error, optionally with a value.")
-            .override_usage("error [value]")
             .after_help(
                 r#"
 Usage:
@@ -455,7 +451,6 @@ impl ExitCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("return")
             .about("Return from the current process chain list, optionally with a value.")
-            .override_usage("exit [value]")
             .after_help(
                 r#"
 Usage:
@@ -487,7 +482,7 @@ impl CommandParser for ExitCommandParser {
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
-    
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let arg_list = args.as_str_list();
         self.cmd

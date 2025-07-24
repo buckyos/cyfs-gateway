@@ -15,7 +15,6 @@ impl EchoCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("echo")
             .about("Display a line of text or output the given arguments.")
-            .override_usage("echo [-n] [args...]")
             .after_help(
                 r#"
 Options:
@@ -51,7 +50,7 @@ impl CommandParser for EchoCommandParser {
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
-    
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let arg_list = args.as_str_list();
         self.cmd

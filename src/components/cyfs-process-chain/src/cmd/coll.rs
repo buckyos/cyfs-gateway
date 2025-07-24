@@ -288,7 +288,6 @@ impl SetCreateCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("set-create")
             .about("Create a new set collection with a given identifier and scope.")
-            .override_usage("set-create [-global | -export | -chain | -block | -local] <set_id>")
             .after_help(
                 r#"
 Arguments:
@@ -447,7 +446,6 @@ impl SetAddCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("set-add")
             .about("Add a value to a set collection.")
-            .override_usage("set-add <set_id> <value>")
             .after_help(
                 r#"
 Arguments:
@@ -584,7 +582,6 @@ impl SetRemoveCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("set-remove")
             .about("Remove a value from a set collection.")
-            .override_usage("set-remove <set_id> <value>")
             .after_help(
                 r#"
 Arguments:
@@ -720,7 +717,6 @@ impl MapCreateCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("map-create")
             .about("Create a new map or multimap collection with a given ID and scope.")
-            .override_usage("map-create [-multi] [-export | -chain | -local] <map_id>")
             .after_help(
                 r#"
 Options:
@@ -896,7 +892,6 @@ impl MapAddCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("map-add")
             .about("Add or update key-value pairs in a map or multimap collection.")
-            .override_usage("map-add <map_id> <key> <value>...")
             .after_help(
                 r#"
 Arguments:
@@ -1105,7 +1100,6 @@ impl MapRemoveCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("map-remove")
             .about("Remove a key or key-value pair(s) from a map or multimap collection.")
-            .override_usage("map-remove <map_id> <key> [value]...")
             .after_help(
                 r#"
 Usage:
