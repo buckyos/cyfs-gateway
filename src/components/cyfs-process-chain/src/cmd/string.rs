@@ -689,7 +689,6 @@ impl CommandExecutor for StringReplaceCommand {
 
 // append <param1> <param2>
 // This command appends param2 to param1, and return the result
-// If param1 is a variable, it will modify the variable to hold the new value
 pub struct StringAppendCommandParser {
     cmd: Command,
 }
@@ -707,7 +706,7 @@ Arguments:
 Behavior:
   - Joins param1 and param2 with no delimiter.
   - Output is returned with success.
-  - If param1 is a variable, it will be modified to hold the new value.
+  - The command will not modify any env variables 
 
 Examples:
   append "abc" "123"
@@ -795,7 +794,8 @@ impl StringAppendCommand {
 
 #[async_trait::async_trait]
 impl CommandExecutor for StringAppendCommand {
-    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+    async fn exec(&self, _context: &Context) -> Result<super::CommandResult, String> {
+        /*
         if let Some(var) = &self.var {
             // If a variable is specified, set it in the environment
             context
@@ -804,6 +804,7 @@ impl CommandExecutor for StringAppendCommand {
                 .await?;
             info!("Set variable {} to {}", var, self.result);
         }
+        */
 
         // Return the result as a command result
         Ok(super::CommandResult::success_with_value(&self.result))
