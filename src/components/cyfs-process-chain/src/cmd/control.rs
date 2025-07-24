@@ -42,6 +42,10 @@ Examples:
 }
 
 impl CommandParser for ExecCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let arg_list = args.as_str_list();
         self.cmd
@@ -179,6 +183,10 @@ Examples:
 }
 
 impl CommandParser for GotoCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let arg_list = args.as_str_list();
         self.cmd
@@ -285,6 +293,10 @@ Examples:
 }
 
 impl CommandParser for ReturnCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let arg_list = args.as_str_list();
         self.cmd
@@ -377,6 +389,10 @@ Examples:
 }
 
 impl CommandParser for ErrorCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let arg_list = args.as_str_list();
         self.cmd
@@ -468,6 +484,10 @@ Examples:
 }
 
 impl CommandParser for ExitCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+    
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let arg_list = args.as_str_list();
         self.cmd

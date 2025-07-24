@@ -2,6 +2,7 @@ use crate::block::CommandArgs;
 use crate::chain::Context;
 use crate::collection::CollectionValue;
 use std::sync::Arc;
+use clap::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandHelpType {
@@ -11,6 +12,15 @@ pub enum CommandHelpType {
 }
 
 pub type CommandParserRef = Arc<Box<dyn CommandParser>>;
+
+pub fn command_help(help_type: CommandHelpType, cmd: &Command) -> String {
+    let mut cmd = cmd.clone();
+    match help_type {
+        CommandHelpType::Usage => cmd.render_usage().to_string(),
+        CommandHelpType::Short => cmd.render_help().to_string(),
+        CommandHelpType::Long => cmd.render_long_help().to_string(),
+    }
+}
 
 pub trait CommandParser: Send + Sync {
     /// Display command usage information.

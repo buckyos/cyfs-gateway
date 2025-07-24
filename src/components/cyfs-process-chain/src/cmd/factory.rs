@@ -83,9 +83,9 @@ impl CommandParserFactory {
         );
         self.register(
             "starts-with",
-            Arc::new(Box::new(StringStartsWithCommandParser)),
+            Arc::new(Box::new(StringStartsWithCommandParser::new())),
         );
-        self.register("ends_with", Arc::new(Box::new(StringEndsWithCommandParser)));
+        self.register("ends_with", Arc::new(Box::new(StringEndsWithCommandParser::new())));
 
         // collection commands
         self.register(

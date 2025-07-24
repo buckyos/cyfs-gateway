@@ -44,12 +44,7 @@ Examples:
 
 impl CommandParser for ActionCommandParser {
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
-        let mut cmd = self.cmd.clone();
-        match help_type {
-            CommandHelpType::Usage => cmd.render_usage().to_string(),
-            CommandHelpType::Short => cmd.render_help().to_string(),
-            CommandHelpType::Long => cmd.render_long_help().to_string(),
-        }
+        command_help(help_type, &self.cmd)
     }
 
     fn check(&self, args: &CommandArgs) -> Result<(), String> {

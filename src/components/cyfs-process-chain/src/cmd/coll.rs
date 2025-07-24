@@ -1,5 +1,5 @@
 use super::cmd::{
-    CommandExecutor, CommandExecutorRef, CommandHelpType, CommandParser, CommandResult,
+    CommandExecutor, CommandExecutorRef, CommandHelpType, CommandParser, CommandResult, command_help,
 };
 use crate::block::CommandArgs;
 use crate::chain::{Context, EnvLevel};
@@ -85,12 +85,7 @@ Examples:
 
 impl CommandParser for MatchIncludeCommandParser {
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
-        let mut cmd = self.cmd.clone();
-        match help_type {
-            CommandHelpType::Usage => cmd.render_usage().to_string(),
-            CommandHelpType::Short => cmd.render_help().to_string(),
-            CommandHelpType::Long => cmd.render_long_help().to_string(),
-        }
+        command_help(help_type, &self.cmd)
     }
 
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
@@ -352,6 +347,10 @@ Examples:
 }
 
 impl CommandParser for SetCreateCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let str_list = args.as_str_list();
         self.cmd
@@ -483,6 +482,10 @@ Examples:
 }
 
 impl CommandParser for SetAddCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let str_list = args.as_str_list();
         self.cmd
@@ -616,6 +619,10 @@ Examples:
 }
 
 impl CommandParser for SetRemoveCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let str_list = args.as_str_list();
         self.cmd
@@ -774,6 +781,10 @@ Examples:
 }
 
 impl CommandParser for MapCreateCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let str_list = args.as_str_list();
         self.cmd
@@ -925,6 +936,10 @@ Examples:
 }
 
 impl CommandParser for MapAddCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let str_list = args.as_str_list();
         self.cmd
@@ -1134,6 +1149,10 @@ Examples:
 }
 
 impl CommandParser for MapRemoveCommandParser {
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let str_list = args.as_str_list();
         self.cmd
@@ -1293,6 +1312,10 @@ impl MapGetCommandParser {
 }
 
 impl CommandParser for MapGetCommandParser {
+    //fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+    //    command_help(help_type, &self.cmd)
+    //}
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should have exactly two elements
         if args.len() != 2 {
