@@ -4,7 +4,7 @@ use crate::chain::Context;
 use crate::collection::CollectionValue;
 use clap::{Arg, ArgAction, Command};
 use globset::{GlobBuilder, GlobMatcher};
-use std::{sync::Arc};
+use std::sync::Arc;
 
 // rewrite <var> <pattern> <template>
 // rewrite $REQ.url /kapi/my-service/* /kapi/*
@@ -594,8 +594,9 @@ impl CommandExecutor for StringReplaceCommand {
     }
 }
 
-// append param1 param2
-// This command appends param2 to param1 and not effect the env, just return the result
+// append <param1> <param2>
+// This command appends param2 to param1, and return the result
+// If param1 is a variable, it will modify the variable to hold the new value
 pub struct StringAppendCommandParser {
     cmd: Command,
 }
@@ -613,7 +614,8 @@ Arguments:
 
 Behavior:
   - Joins param1 and param2 with no delimiter.
-  - Output is returned directly, no variable is modified.
+  - Output is returned with success.
+  - If param1 is a variable, it will be modified to hold the new value.
 
 Examples:
   append "abc" "123"
@@ -652,7 +654,7 @@ impl CommandParser for StringAppendCommandParser {
     fn parse(
         &self,
         args: Vec<String>,
-        _origin_args: &CommandArgs,
+        origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
         let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
             let msg = format!("Invalid string append command: {:?}, {}", args, e);
@@ -671,12 +673,48 @@ impl CommandParser for StringAppendCommandParser {
             msg
         })?;
 
+        let param1_index = matches.index_of("param1").unwrap();
+        let var = if origin_args[param1_index].is_var() {
+            // If param1 is a variable, we should modify it
+            Some(origin_args[param1_index].as_var_str().unwrap().to_owned())
+        } else {
+            None
+        };
+
         let result = param1.to_string() + param2;
         info!("String append {} + {} = {}", param1, param2, result);
 
-        let cmd = StringConstCommand::new(result);
+        let cmd = StringAppendCommand::new(var, result);
 
         Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct StringAppendCommand {
+    var: Option<String>,
+    result: String,
+}
+
+impl StringAppendCommand {
+    pub fn new(var: Option<String>, result: String) -> Self {
+        Self { var, result }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for StringAppendCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        if let Some(var) = &self.var {
+            // If a variable is specified, set it in the environment
+            context
+                .env()
+                .set(var, CollectionValue::String(self.result.clone()), None)
+                .await?;
+            info!("Set variable {} to {}", var, self.result);
+        }
+
+        // Return the result as a command result
+        Ok(super::CommandResult::success_with_value(&self.result))
     }
 }
 
@@ -694,7 +732,6 @@ impl StringConstCommand {
 impl CommandExecutor for StringConstCommand {
     async fn exec(&self, _context: &Context) -> Result<super::CommandResult, String> {
         // Just return the result without modifying the context
-
         Ok(super::CommandResult::success_with_value(&self.result))
     }
 }
