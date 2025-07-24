@@ -4,7 +4,7 @@ use crate::chain::Context;
 use crate::collection::CollectionValue;
 use clap::{Arg, ArgAction, Command};
 use globset::{GlobBuilder, GlobMatcher};
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use std::sync::Arc;
 
 // Match command use glob, like: match REQ_HEADER.host "*.local"
@@ -24,6 +24,9 @@ Arguments:
   <value>     The string or variable to match.
   <pattern>   A glob pattern (e.g. *.domain.com, home.*.site.org)
 
+Options:
+  --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
+
 Behavior:
   - Uses shell-style glob pattern matching.
   - Case-insensitive by default.
@@ -36,6 +39,12 @@ Examples:
   match $REQ_HEADER.host "*.local"
   match username "admin*"
 "#,
+            )
+            .arg(
+                Arg::new("no_ignore_case")
+                    .long("no-ignore-case")
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-sensitive matching (default is case-insensitive)"),
             )
             .arg(
                 Arg::new("value")
@@ -89,8 +98,9 @@ impl CommandParser for MatchCommandParser {
             .get_one::<String>("pattern")
             .expect("Pattern argument is required");
 
+        let no_ignore_case = matches.get_flag("no_ignore_case");
         let pattern = GlobBuilder::new(pattern_str)
-            .case_insensitive(true)
+            .case_insensitive(!no_ignore_case)
             .build()
             .map_err(|e| {
                 let msg = format!("Invalid glob pattern: {}: {}", args[1], e);
@@ -138,7 +148,6 @@ impl MatchRegexCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("match-regex")
             .about("Match a value against a regular expression. Supports optional named capture.")
-            .override_usage("match-regex [--capture name] <value> <pattern>")
             .after_help(
                 r#"
 Arguments:
@@ -147,6 +156,7 @@ Arguments:
 
 Options:
   --capture name   Capture groups into environment variables like name[0], name[1], ...
+  --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
 
 Behavior:
   - Uses Rust-style regular expressions.
@@ -154,11 +164,18 @@ Behavior:
   - If --capture is provided, matched groups are saved into environment as:
       name[0] is the first capture group,
       name[1] is the second capture group, etc.
+  - Default behavior is case-insensitive matching.
 
 Examples:
   match-regex $REQ_HEADER.host "^(.*)\.local$"
   match-regex --capture parts $REQ_HEADER.host "^(.+)\.(local|dev)$"
 "#,
+            )
+            .arg(
+                Arg::new("no_ignore_case")
+                    .long("no-ignore-case")
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-sensitive matching (default is case-insensitive)"),
             )
             .arg(
                 Arg::new("capture")
@@ -220,11 +237,15 @@ impl CommandParser for MatchRegexCommandParser {
             .get_one::<String>("pattern")
             .expect("Pattern argument is required");
 
-        let pattern = Regex::new(pattern_str).map_err(|e| {
-            let msg = format!("Invalid regex pattern: {}: {}", args[1], e);
-            error!("{}", msg);
-            msg
-        })?;
+        let no_ignore_case = matches.get_flag("no_ignore_case");
+        let pattern = RegexBuilder::new(pattern_str)
+            .case_insensitive(!no_ignore_case)
+            .build()
+            .map_err(|e| {
+                let msg = format!("Invalid regex pattern: {}: {}", args[1], e);
+                error!("{}", msg);
+                msg
+            })?;
 
         let cmd = MatchRegexCommandExecutor {
             capture,
