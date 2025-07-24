@@ -1,6 +1,7 @@
-use super::block::{Block, CommandItem, Expression, CommandArg};
+use super::block::{Block, CommandArg, CommandItem, Expression};
 use super::exec::DynamicCommandExecutor;
 use crate::cmd::{CommandExecutor, CommandParserFactory};
+use crate::collection::CollectionValue;
 use std::sync::Arc;
 
 pub struct BlockCommandTranslator {
@@ -25,10 +26,7 @@ impl BlockCommandTranslator {
         Ok(())
     }
 
-    fn translate_expression(
-        &self,
-        expr: &mut Expression,
-    ) -> Result<(), String> {
+    fn translate_expression(&self, expr: &mut Expression) -> Result<(), String> {
         match expr {
             Expression::Command(cmd) => {
                 self.translate_command(cmd)?;
@@ -44,10 +42,7 @@ impl BlockCommandTranslator {
         Ok(())
     }
 
-    fn translate_command(
-        &self,
-        cmd: &mut CommandItem,
-    ) -> Result<(), String> {
+    fn translate_command(&self, cmd: &mut CommandItem) -> Result<(), String> {
         let parser = self.parser.get_parser(&cmd.command.name);
         if parser.is_none() {
             let msg = format!("No parser for command: {}", cmd.command.name);
@@ -67,8 +62,11 @@ impl BlockCommandTranslator {
         // Try parse args to executor
         let executer = if cmd.command.args.is_literal() {
             let args = cmd.command.args.as_literal_list();
-            let args = args.iter().map(|s| s.to_string()).collect();
-            parser.parse(args, &cmd.command.args).map_err(|e| {
+            let args = args
+                .iter()
+                .map(|s| CollectionValue::String(s.to_string()))
+                .collect();
+            parser.parse_origin(args, &cmd.command.args).map_err(|e| {
                 let msg = format!("Parse command error: {:?}, {:?}", cmd.command, e);
                 error!("{}", msg);
                 msg

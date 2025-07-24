@@ -61,11 +61,17 @@ impl CommandParser for EchoCommandParser {
         Ok(())
     }
 
-    fn parse(
+    fn parse_origin(
         &self,
-        args: Vec<String>,
+        args: Vec<crate::CollectionValue>,
         _origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
+        // Convert CollectionValue to String for clap parsing
+        let args = args
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<String>>();
+
         let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
             let msg = format!("Invalid echo command: {:?}, {}", args, e);
             error!("{}", msg);
@@ -82,7 +88,7 @@ impl CommandParser for EchoCommandParser {
             .unwrap_or_else(Vec::new);
 
         let mut result = parts.join(" ");
-        if suppress_newline {
+        if !suppress_newline {
             result.push('\n'); // Use '\n' to ensure the output is consistent with echo behavior
         }
 

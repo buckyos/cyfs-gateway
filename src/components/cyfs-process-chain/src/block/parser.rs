@@ -389,8 +389,9 @@ impl BlockParser {
     }
 
     fn parse_var_braced(input: &str) -> IResult<&str, CommandArg> {
+        debug!("Parsing var braced: {}", input);
         // ${var}
-        map(
+        let ret = map(
             preceded(
                 tag("${"),
                 terminated(
@@ -400,7 +401,10 @@ impl BlockParser {
             ),
             |var: &str| CommandArg::Var(var.to_string()),
         )
-        .parse(input)
+        .parse(input)?;
+
+        debug!("Parsed var braced: {}, {:?}", ret.0, ret.1);
+        Ok(ret)
     }
 
     fn parse_command_subst(input: &str) -> IResult<&str, CommandArg> {
