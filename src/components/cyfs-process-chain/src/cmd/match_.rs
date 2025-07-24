@@ -280,7 +280,6 @@ impl EQCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("eq")
         .about("Compare two strings for equality.")
-        .override_usage("eq [--ignore-case] <value1> <value2>")
         .after_help(
             r#"
 Compare two strings for equality.
@@ -302,6 +301,7 @@ Examples:
         .arg(
             Arg::new("ignore_case")
                 .long("ignore-case")
+                .short('i')
                 .action(ArgAction::SetTrue)
                 .help("Enable case-insensitive comparison"),
         )
@@ -442,7 +442,7 @@ impl CommandParser for RangeCommandParser {
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
-    
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let matches = self
             .cmd

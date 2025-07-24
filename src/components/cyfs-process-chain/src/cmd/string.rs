@@ -4,6 +4,7 @@ use crate::chain::Context;
 use crate::collection::CollectionValue;
 use clap::{Arg, ArgAction, Command};
 use globset::{GlobBuilder, GlobMatcher};
+use regex::Regex;
 use std::sync::Arc;
 
 // rewrite <var> <pattern> <template>
@@ -469,13 +470,15 @@ impl StringReplaceCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("replace")
             .about("Replace all occurrences of a substring in a variable’s value.")
-            .override_usage("replace <var> <match> <replacement>")
             .after_help(
                 r#"
 Arguments:
   <var>         The name of the variable to modify (e.g. $REQ.host)
   <match>       The substring to search for
   <replacement> The string to replace it with
+
+Options:
+  --ignore-case   Perform case-insensitive comparison
 
 Behavior:
   - Replaces all (non-overlapping) occurrences of <match> with <replacement>.
@@ -486,6 +489,13 @@ Examples:
   replace $REQ.host "io" "ai"
   replace $PATH "/old/" "/new/"
 "#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .short('i')
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-insensitive comparison"),
             )
             .arg(
                 Arg::new("var")
@@ -553,8 +563,8 @@ impl CommandParser for StringReplaceCommandParser {
                 msg
             })?
             .to_owned();
-        let key_index = matches.index_of("var").unwrap();
 
+        let key_index = matches.index_of("var").unwrap();
         let key_arg = &origin_args.as_slice()[key_index];
         if !key_arg.is_var() {
             let msg = format!(
@@ -584,13 +594,21 @@ impl CommandParser for StringReplaceCommandParser {
             })?
             .to_owned();
 
-        let cmd = StringReplaceCommand::new(key.to_string(), key_value, match_text, new_text);
+        let ignore_case = matches.get_flag("ignore_case");
+        let cmd = StringReplaceCommand::new(
+            ignore_case,
+            key.to_string(),
+            key_value,
+            match_text,
+            new_text,
+        );
 
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 pub struct StringReplaceCommand {
+    ignore_case: bool,
     key: String,
     key_value: String,
     match_text: String,
@@ -598,13 +616,30 @@ pub struct StringReplaceCommand {
 }
 
 impl StringReplaceCommand {
-    pub fn new(key: String, key_value: String, match_text: String, new_text: String) -> Self {
+    pub fn new(
+        ignore_case: bool,
+        key: String,
+        key_value: String,
+        match_text: String,
+        new_text: String,
+    ) -> Self {
         Self {
+            ignore_case,
             key,
             key_value,
             match_text,
             new_text,
         }
+    }
+
+    fn replace_case_insensitive(text: &str, match_text: &str, new_text: &str) -> String {
+        let pattern = format!(r"(?i){}", regex::escape(match_text));
+        let re = Regex::new(&pattern).unwrap();
+        re.replace_all(text, new_text).into_owned()
+    }
+
+    fn replace_case_sensitive(text: &str, match_text: &str, new_text: &str) -> String {
+        text.replace(match_text, new_text)
     }
 }
 
@@ -615,8 +650,27 @@ impl CommandExecutor for StringReplaceCommand {
         let match_text = &self.match_text;
         let new_text = &self.new_text;
 
-        if key_value.contains(match_text) {
-            let rewritten = key_value.replace(match_text, new_text);
+        let rewritten = if self.ignore_case {
+            if key_value
+                .to_lowercase()
+                .contains(&match_text.to_lowercase())
+            {
+                let rewritten = Self::replace_case_insensitive(key_value, match_text, new_text);
+                Some(rewritten)
+            } else {
+                None
+            }
+        } else {
+            if key_value.contains(match_text) {
+                let rewritten = Self::replace_case_sensitive(key_value, match_text, new_text);
+                Some(rewritten)
+            } else {
+                None
+            }
+        };
+
+        // If a rewritten value is found, set it in the environment
+        if let Some(rewritten) = rewritten {
             context
                 .env()
                 .set(
