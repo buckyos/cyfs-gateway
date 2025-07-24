@@ -412,7 +412,7 @@ impl CommandExecutor for SetCreateCommandExecutor {
         // Create a new set collection with the given id
         match context
             .env()
-            .create_collection(&self.set_id, CollectionType::Set, Some(self.level))
+            .create_collection(&self.set_id, CollectionType::Set, self.level)
             .await?
         {
             Some(_) => {
@@ -850,12 +850,12 @@ impl CommandExecutor for MapCreateCommandExecutor {
         let ret = if self.is_multi {
             context
                 .env()
-                .create_collection(&self.map_id, CollectionType::MultiMap, Some(self.level))
+                .create_collection(&self.map_id, CollectionType::MultiMap, self.level)
                 .await
         } else {
             context
                 .env()
-                .create_collection(&self.map_id, CollectionType::Map, Some(self.level))
+                .create_collection(&self.map_id, CollectionType::Map, self.level)
                 .await
         }?;
 

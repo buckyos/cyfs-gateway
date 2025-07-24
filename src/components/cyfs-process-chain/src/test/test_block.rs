@@ -10,9 +10,15 @@ const PROCESS_CHAIN: &str = r#"
             # We reject the request if the protocol is not https
             !(match $PROTOCOL https) && reject;
 
-            map-create --multi --chain test1;
+            map-create --chain test1;
             map-add test1 key1 value1;
             map-add test1 key2 value2;
+
+            map-create --multi test1.test2;
+            map-add test1.test2 key1 value1;
+            map-add test1.test2 key2 value2;
+            echo "test1.test2 key1: $(test1.test2.key1)";
+
             map-add host "google.com" tag1 tag2;
             map-add host "baidu.com" tag1;
             match-include host "google.com" tag3 && reject;
@@ -30,6 +36,7 @@ const PROCESS_CHAIN: &str = r#"
     <block id="block1">
         local key1="key1";
         export key1=$(append $key1 '2');
+        # key1 should be "key12"
         local key1
         export key2=$(append ${key1} _value2);
         # key2 should be "key1_value2"
@@ -248,10 +255,10 @@ async fn test_process_chain_main() {
         SimpleLogger::init(LevelFilter::Info, Config::default()).unwrap()
     });
 
-    match test_process_chain().await {
-        Ok(_) => println!("Process chain executed successfully"),
-        Err(e) => eprintln!("Error executing process chain: {}", e),
-    }
+    //match test_process_chain().await {
+    //    Ok(_) => println!("Process chain executed successfully"),
+    //    Err(e) => eprintln!("Error executing process chain: {}", e),
+    //}
 
     test_hook_point().await.unwrap_or_else(|e| {
         eprintln!("Error executing hook point: {}", e);

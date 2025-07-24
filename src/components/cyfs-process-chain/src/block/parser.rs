@@ -345,11 +345,11 @@ impl BlockParser {
             char('\''),
         );
 
-        // Unquoted string, must start with a letter or underscore, followed by letters, digits, or underscores
+        // Unquoted string, must start with a letter or underscore, followed by letters, digits, underscores, hyphens, or dots
         let unquoted = map(
             recognize(pair(
                 alt((nom::character::complete::alpha1, tag("_"))),
-                many0(alt((nom::character::complete::alphanumeric1, tag("_"), tag("-")))),
+                many0(alt((nom::character::complete::alphanumeric1, tag("_"), tag("-"), tag(".")))),
             )),
             |s: &str| s.to_string(),
         );
@@ -367,7 +367,7 @@ impl BlockParser {
             char('$'),
             recognize(pair(
                 alt((alpha1, tag("_"))),               // Variable must start with a letter or underscore
-                many0(alt((alphanumeric1, tag("_")))), // followed by letters, digits, or underscores
+                many0(alt((alphanumeric1, tag("_"), tag(".")))), // followed by letters, digits, underscores, or dot
             )),
         )
         .parse(input)?;
@@ -394,7 +394,7 @@ impl BlockParser {
             preceded(
                 tag("${"),
                 terminated(
-                    take_while1(|c: char| c.is_alphanumeric() || c == '_'),
+                    take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '.'),
                     char('}'),
                 ),
             ),

@@ -52,6 +52,7 @@ impl Env {
         self.level
     }
 
+
     pub fn parent(&self) -> Option<&EnvRef> {
         self.parent.as_ref()
     }
@@ -59,7 +60,17 @@ impl Env {
     /// Register the environment to the given variable visitor manager.
     /// The key must not already exist in the environment.
     pub async fn create(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
-        self.values.insert_new(key, value).await
+        let ret = self.values.insert_new(key, value.clone()).await?;
+        if ret {
+            info!("Created variable '{}' with value: {}", key, value);
+        } else {
+            info!(
+                "Replacing existing variable '{}' with value: {}",
+                key, value
+            );
+        }
+
+        Ok(ret)
     }
 
     pub async fn set(
@@ -92,6 +103,41 @@ impl Env {
     pub async fn flush(&self) -> Result<(), String> {
         // Flush the current environment's values
         self.values.flush().await
+    }
+}
+
+enum PathCollection {
+    Root(EnvRef),
+    Map(MapCollectionRef),
+}
+
+impl PathCollection {
+    pub async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        match self {
+            PathCollection::Root(env) => env.get(key).await,
+            PathCollection::Map(map) => map.get(key).await,
+        }
+    }
+
+    pub async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
+        match self {
+            PathCollection::Root(env) => env.create(key, value).await,
+            PathCollection::Map(map) => map.insert_new(key, value).await,
+        }
+    }
+
+    pub async fn insert(&self, key: &str, value: CollectionValue) -> Result<Option<CollectionValue>, String> {
+        match self {
+            PathCollection::Root(env) => env.set(key, value).await,
+            PathCollection::Map(map) => map.insert(key, value).await,
+        }
+    }
+
+    pub async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        match self {
+            PathCollection::Root(env) => env.remove(key).await,
+            PathCollection::Map(map) => map.remove(key).await,
+        }
     }
 }
 
@@ -139,12 +185,22 @@ impl EnvManager {
         }
     }
 
+    fn parse_var(key: &str) -> Vec<&str> {
+        key.split('.').collect()
+    }
+
     pub fn get_var_level(&self, key: &str) -> EnvLevel {
+        // Use the first part of the key to determine the level
+        let key = Self::parse_var(key)[0];
+
         let tracker = self.var_level_tracker.read().unwrap();
         tracker.get(key).cloned().unwrap_or_default()
     }
 
     pub fn change_var_level(&self, key: &str, level: Option<EnvLevel>) {
+        // Use the first part of the key to determine the level
+        let key = Self::parse_var(key)[0];
+
         let level = level.unwrap_or_default();
         let mut tracker = self.var_level_tracker.write().unwrap();
         match tracker.entry(key.to_string()) {
@@ -210,10 +266,12 @@ impl EnvManager {
         &self,
         key: &str,
         value: CollectionValue,
-        level: Option<EnvLevel>,
+        level: EnvLevel,
     ) -> Result<bool, String> {
-        let level = level.unwrap_or_default();
-        let ret = self.create_inner(level, key, value).await?;
+        let key_list = Self::parse_var(key);
+
+        // let level = level.unwrap_or_default();
+        let ret = self.create_inner(level, &key_list, value).await?;
 
         if ret {
             // Track the variable's level
@@ -223,80 +281,107 @@ impl EnvManager {
         Ok(ret)
     }
 
+    // Get the parent collection by path, returns None if not found
+    // The middle part of the key_list must be a map collection
+    async fn get_parent_collection_by_path(
+        &self,
+        key_list: &[&str],
+        level: EnvLevel,
+    ) -> Result<Option<PathCollection>, String> {
+        let env = match level {
+            EnvLevel::Global => self.global.clone(),
+            EnvLevel::Chain => self.chain.clone(),
+            EnvLevel::Block => self.block.clone(),
+        };
+
+        let mut current = PathCollection::Root(env);
+        for part in key_list[0..key_list.len() - 1].iter() {
+            if let Some(value) = current.get(part).await? {
+                if let CollectionValue::Map(map) = value {
+                    current = PathCollection::Map(map);
+                } else {
+                    let msg = format!("Expected a map at '{}', found: {}", part, value);
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+            } else {
+                return Ok(None); // Not found, return None
+            }
+        }
+
+        Ok(Some(current))
+    }
+
     async fn create_inner(
         &self,
         level: EnvLevel,
-        key: &str,
+        key_list: &[&str],
         value: CollectionValue,
     ) -> Result<bool, String> {
-        match level {
-            EnvLevel::Global => self.global.create(key, value).await,
-            EnvLevel::Chain => self.chain.create(key, value).await,
-            EnvLevel::Block => self.block.create(key, value).await,
+        let parent = self.get_parent_collection_by_path(&key_list, level).await?;
+        if parent.is_none() {
+            // If parent is None, caller need to create the collection on the path
+            let msg = format!(
+                "Parent collection not found for key list '{:?}', please create the collection first",
+                key_list
+            );
+            warn!("{}", msg);
+            return Err(msg);
         }
+
+        let coll = parent.unwrap();
+        let key = key_list.last().unwrap();
+        coll.insert_new(key, value).await
     }
 
     pub async fn create_collection(
         &self,
         key: &str,
         collection_type: CollectionType,
-        level: Option<EnvLevel>,
+        level: EnvLevel,
     ) -> Result<Option<CollectionValue>, String> {
-        match collection_type {
+        let value = match collection_type {
             CollectionType::Set => {
                 let collection =
                     Arc::new(Box::new(MemorySetCollection::new()) as Box<dyn SetCollection>);
-                match self
-                    .create(key, CollectionValue::Set(collection.clone()), level)
-                    .await?
-                {
-                    true => Ok(Some(CollectionValue::Set(collection))),
-                    false => {
-                        Ok(None) // Collection already exists, return None
-                    }
-                }
+                CollectionValue::Set(collection)
             }
             CollectionType::Map => {
                 let collection =
                     Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
-                match self
-                    .create(key, CollectionValue::Map(collection.clone()), level)
-                    .await?
-                {
-                    true => Ok(Some(CollectionValue::Map(collection))),
-                    false => {
-                        Ok(None) // Collection already exists, return None
-                    }
-                }
+                CollectionValue::Map(collection)
             }
 
             CollectionType::MultiMap => {
                 let collection = Arc::new(
                     Box::new(MemoryMultiMapCollection::new()) as Box<dyn MultiMapCollection>
                 );
-                match self
-                    .create(key, CollectionValue::MultiMap(collection.clone()), level)
-                    .await?
-                {
-                    true => Ok(Some(CollectionValue::MultiMap(collection))),
-                    false => {
-                        Ok(None) // Collection already exists, return None
-                    }
-                }
+                CollectionValue::MultiMap(collection)
             }
+        };
+
+        match self.create(key, value.clone(), level).await? {
+            true => Ok(Some(value)),
+            false => Ok(None),
         }
     }
 
-    // Set a value in the environment, level can be specified or default to chain level
+    // Set a value in the environment, level can be specified or depends on the variable's current level in the tracker
     pub async fn set(
         &self,
         key: &str,
         value: CollectionValue,
         level: Option<EnvLevel>,
     ) -> Result<Option<CollectionValue>, String> {
-        let level = level.unwrap_or_default();
-        let ret = self.set_inner(level, key, value).await?;
-        self.change_var_level(key, Some(level));
+        info!("Setting variable '{}' to value: {:?}", key, value);
+        let key_list = Self::parse_var(key);
+        let level = match level {
+            Some(l) => l,
+            None => self.get_var_level(key_list[0]),
+        };
+
+        let ret = self.set_inner(level, &key_list, value).await?;
+        self.change_var_level(key_list[0], Some(level));
 
         Ok(ret)
     }
@@ -304,14 +389,22 @@ impl EnvManager {
     async fn set_inner(
         &self,
         level: EnvLevel,
-        key: &str,
+        key_list: &[&str],
         value: CollectionValue,
     ) -> Result<Option<CollectionValue>, String> {
-        match level {
-            EnvLevel::Global => self.global.set(key, value).await,
-            EnvLevel::Chain => self.chain.set(key, value).await,
-            EnvLevel::Block => self.block.set(key, value).await,
+        let parent = self.get_parent_collection_by_path(key_list, level).await?;
+        if parent.is_none() {
+            let msg = format!(
+                "Parent collection not found for key list '{:?}', please create the collection first",
+                key_list
+            );
+            warn!("{}", msg);
+            return Err(msg);
         }
+
+        let coll = parent.unwrap();
+        let key = key_list.last().unwrap();
+        coll.insert(key, value).await
     }
 
     pub async fn get(
@@ -319,24 +412,38 @@ impl EnvManager {
         key: &str,
         level: Option<EnvLevel>,
     ) -> Result<Option<CollectionValue>, String> {
+        let key_list = Self::parse_var(key);
         let level = match level {
             Some(l) => l,
-            None => self.get_var_level(key),
+            None => self.get_var_level(key_list[0]),
         };
 
-        self.get_inner(level, key).await
+        self.get_inner(level, &key_list).await
     }
 
     async fn get_inner(
         &self,
         level: EnvLevel,
-        key: &str,
+        key_list: &[&str],
     ) -> Result<Option<CollectionValue>, String> {
-        match level {
-            EnvLevel::Global => self.global.get(key).await,
-            EnvLevel::Chain => self.chain.get(key).await,
-            EnvLevel::Block => self.block.get(key).await,
+        info!(
+            "Getting variable '{}' at level '{}'",
+            key_list.join("."),
+            level.as_str()
+        );
+        let parent = self.get_parent_collection_by_path(key_list, level).await?;
+        if parent.is_none() {
+            let msg = format!(
+                "Parent collection not found for key list '{:?}', please create the collection first",
+                key_list
+            );
+            warn!("{}", msg);
+            return Err(msg);
         }
+
+        let coll = parent.unwrap();
+        let key = key_list.last().unwrap();
+        coll.get(key).await
     }
 
     pub async fn remove(
@@ -344,23 +451,32 @@ impl EnvManager {
         key: &str,
         level: Option<EnvLevel>,
     ) -> Result<Option<CollectionValue>, String> {
+        let key_list = Self::parse_var(key);
         let level = match level {
             Some(l) => l,
-            None => self.get_var_level(key),
+            None => self.get_var_level(key_list[0]),
         };
 
-        self.remove_inner(level, key).await
+        self.remove_inner(level, &key_list).await
     }
 
     async fn remove_inner(
         &self,
         level: EnvLevel,
-        key: &str,
+        key_list: &[&str],
     ) -> Result<Option<CollectionValue>, String> {
-        match level {
-            EnvLevel::Global => self.global.remove(key).await,
-            EnvLevel::Chain => self.chain.remove(key).await,
-            EnvLevel::Block => self.block.remove(key).await,
+        let parent = self.get_parent_collection_by_path(key_list, level).await?;
+        if parent.is_none() {
+            let msg = format!(
+                "Parent collection not found for key list '{:?}', please create the collection first",
+                key_list
+            );
+            warn!("{}", msg);
+            return Err(msg);
         }
+
+        let coll = parent.unwrap();
+        let key = key_list.last().unwrap();
+        coll.remove(key).await
     }
 }
