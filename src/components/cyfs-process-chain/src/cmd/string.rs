@@ -69,10 +69,11 @@ impl CommandParser for RewriteCommandParser {
                 msg
             })?;
 
-        // The first argument must be a variable
-        if !args[0].is_var() {
+        // The var must be a variable
+        let var_index = matches.index_of("var").unwrap();
+        if !args[var_index].is_var() {
             let msg = format!(
-                "Invalid rewrite command: {:?}, the first argument must be a variable",
+                "Invalid rewrite command: {:?}, the var argument must be a variable",
                 args
             );
             error!("{}", msg);
@@ -104,7 +105,6 @@ impl CommandParser for RewriteCommandParser {
             msg
         })?;
 
-        let key = origin_args[0].as_var_str().unwrap();
         let key_value = matches
             .get_one::<String>("var")
             .ok_or_else(|| {
@@ -113,6 +113,10 @@ impl CommandParser for RewriteCommandParser {
                 msg
             })?
             .to_owned();
+
+        let key_index = matches.index_of("var").unwrap();
+        let key = &origin_args[key_index].as_var_str().unwrap();
+
         let pattern_value = matches
             .get_one::<String>("pattern")
             .ok_or_else(|| {
@@ -289,15 +293,19 @@ impl CommandParser for RewriteRegexCommandParser {
     }
 
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have exactly three elements
-        if args.len() != 3 {
-            let msg = format!("Invalid rewrite-regex command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(args.as_str_list())
+            .map_err(|e| {
+                let msg = format!("Invalid rewrite-regex command: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
-        // The first argument must be a variable
-        if !args[0].is_var() {
+        // The var argument must be a variable
+        let var_index = matches.index_of("var").unwrap();
+        if !args[var_index].is_var() {
             let msg = format!(
                 "Invalid rewrite-regex command: {:?}, the first argument must be a variable",
                 args
@@ -306,9 +314,10 @@ impl CommandParser for RewriteRegexCommandParser {
             return Err(msg);
         }
 
-        // The second argument must be a valid regex pattern if is literal
-        if args[1].is_literal() {
-            let pattern = args[1].as_literal_str().unwrap();
+        // The regex argument must be a valid regex pattern if is literal
+        let regex_index = matches.index_of("regex").unwrap();
+        if args[regex_index].is_literal() {
+            let pattern = args[regex_index].as_literal_str().unwrap();
             if let Err(e) = regex::Regex::new(pattern) {
                 let msg = format!("Invalid regex pattern: {}, {}", pattern, e);
                 error!("{}", msg);
@@ -324,12 +333,22 @@ impl CommandParser for RewriteRegexCommandParser {
         args: Vec<String>,
         origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        assert!(
-            args.len() == 3,
-            "Rewrite-regex command should have exactly 3 args"
-        );
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid rewrite-regex command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
 
-        let key_arg = &origin_args.as_slice()[0];
+        let key_value = matches
+            .get_one::<String>("var")
+            .ok_or_else(|| {
+                let msg = format!("Variable name is required, but got: {:?}", args);
+                error!("{}", msg);
+                msg
+            })?
+            .to_owned();
+        let key_index = matches.index_of("var").unwrap();
+        let key_arg = &origin_args[key_index];
         if !key_arg.is_var() {
             let msg = format!(
                 "Invalid rewrite-regex command: {:?}, the first argument must be a variable",
@@ -340,13 +359,28 @@ impl CommandParser for RewriteRegexCommandParser {
         }
         let key = key_arg.as_var_str().unwrap();
 
-        let regex = regex::Regex::new(&args[1]).map_err(|e| {
-            let msg = format!("Invalid regex pattern: {}: {}", args[1], e);
+        let regex = matches.get_one::<String>("regex").ok_or_else(|| {
+            let msg = format!("Regex pattern is required, but got: {:?}", args);
             error!("{}", msg);
             msg
         })?;
 
-        let cmd = RewriteRegexCommand::new(key.to_string(), regex, args);
+        let regex = regex::Regex::new(&regex).map_err(|e| {
+            let msg = format!("Invalid regex pattern: {}: {}", regex, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let template = matches
+            .get_one::<String>("template")
+            .ok_or_else(|| {
+                let msg = format!("Template is required, but got: {:?}", args);
+                error!("{}", msg);
+                msg
+            })?
+            .to_owned();
+
+        let cmd = RewriteRegexCommand::new(key.to_string(), key_value, regex, template);
 
         Ok(Arc::new(Box::new(cmd)))
     }
@@ -354,21 +388,27 @@ impl CommandParser for RewriteRegexCommandParser {
 
 pub struct RewriteRegexCommand {
     key: String,
+    key_value: String,
     regex: regex::Regex,
-    args: Vec<String>,
+    template: String,
 }
 
 impl RewriteRegexCommand {
-    pub fn new(key: String, regex: regex::Regex, args: Vec<String>) -> Self {
-        Self { key, regex, args }
+    pub fn new(key: String, key_value: String, regex: regex::Regex, template: String) -> Self {
+        Self {
+            key,
+            key_value,
+            regex,
+            template,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for RewriteRegexCommand {
     async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
-        let key_value = self.args[0].as_str();
-        let template = self.args[2].as_str();
+        let key_value = &self.key_value;
+        let template = &self.template;
 
         if let Some(captures) = self.regex.captures(key_value) {
             // Replace template variables like $1, $2, etc. with captured groups
