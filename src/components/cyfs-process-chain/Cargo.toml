@@ -20,6 +20,6 @@ tokio = { version = "*", features = ["full"] }
 simplelog = "*"
 lazy_static = "*"
 hyper = { version = "0.14", features = ["full"] }
-clap = "*"
+clap =  { version = "*", features = ["string"]}
 rustyline = "*"
 dirs-next = "*"

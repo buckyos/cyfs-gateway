@@ -375,9 +375,9 @@ impl CommandParser for SetCreateCommandParser {
             msg
         })?;
 
-        let level = if matches.get_flag("global") || matches.get_flag("export") {
+        let level = if matches.get_flag("global") {
             EnvLevel::Global
-        } else if matches.get_flag("block") || matches.get_flag("local") {
+        } else if matches.get_flag("block") {
             EnvLevel::Block
         } else {
             EnvLevel::Chain // Default to chain level
@@ -807,9 +807,9 @@ impl CommandParser for MapCreateCommandParser {
         })?;
 
         let is_multi = matches.get_flag("multi");
-        let level = if matches.get_flag("global") || matches.get_flag("export") {
+        let level = if matches.get_flag("global") {
             EnvLevel::Global
-        } else if matches.get_flag("block") || matches.get_flag("local") {
+        } else if matches.get_flag("block") {
             EnvLevel::Block
         } else {
             EnvLevel::Chain // Default to chain level

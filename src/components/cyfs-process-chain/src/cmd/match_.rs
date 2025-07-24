@@ -102,7 +102,7 @@ impl CommandParser for MatchCommandParser {
             .case_insensitive(!no_ignore_case)
             .build()
             .map_err(|e| {
-                let msg = format!("Invalid glob pattern: {}: {}", args[1], e);
+                let msg = format!("Invalid glob pattern: {}: {}", pattern_str, e);
                 error!("{}", msg);
                 msg
             })?
@@ -241,7 +241,7 @@ impl CommandParser for MatchRegexCommandParser {
             .case_insensitive(!no_ignore_case)
             .build()
             .map_err(|e| {
-                let msg = format!("Invalid regex pattern: {}: {}", args[1], e);
+                let msg = format!("Invalid regex pattern: {}: {}", pattern_str, e);
                 error!("{}", msg);
                 msg
             })?;
@@ -504,7 +504,7 @@ impl CommandParser for RangeCommandParser {
             .expect("Value argument is required");
 
         let value = value.parse::<f64>().map_err(|e| {
-            let msg = format!("Invalid range value: {}: {}", args[1], e);
+            let msg = format!("Invalid range value: {}: {}", value, e);
             error!("{}", msg);
             msg
         })?;
@@ -514,7 +514,7 @@ impl CommandParser for RangeCommandParser {
             .get_one::<String>("begin")
             .expect("Begin argument is required");
         let min = begin.parse::<f64>().map_err(|e| {
-            let msg = format!("Invalid range min value: {}: {}", args[1], e);
+            let msg = format!("Invalid range min value: {}: {}", begin, e);
             error!("{}", msg);
             msg
         })?;
@@ -523,7 +523,7 @@ impl CommandParser for RangeCommandParser {
             .get_one::<String>("end")
             .expect("End argument is required");
         let max = end.parse::<f64>().map_err(|e| {
-            let msg = format!("Invalid range max value: {}: {}", args[2], e);
+            let msg = format!("Invalid range max value: {}: {}", end, e);
             error!("{}", msg);
             msg
         })?;

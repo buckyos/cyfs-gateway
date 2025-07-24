@@ -10,7 +10,7 @@ const PROCESS_CHAIN: &str = r#"
             # We reject the request if the protocol is not https
             !(match $PROTOCOL https) && reject;
 
-            map-create -multi -chain test1;
+            map-create --multi --chain test1;
             map-add test1 key1 value1;
             map-add test1 key2 value2;
             map-add host "google.com" tag1 tag2;
@@ -41,7 +41,7 @@ const PROCESS_CHAIN: &str = r#"
         map-add test key1 value1;
         map-add test key2 $key2;
 
-        map-create -multi test_multi;
+        map-create --multi test_multi;
         map-add test_multi key1 value1 value2 value3;
         map-add test_multi key2 value2;
         map-remove test_multi key1 value1;

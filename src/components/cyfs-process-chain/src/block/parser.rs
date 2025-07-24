@@ -287,7 +287,12 @@ impl BlockParser {
                 )));
             }
 
-            Expression::Command(CommandItem::new(name.to_owned(), CommandArgs::new(args)))
+            // For normal commands, we use the full command line with both name and args
+            let name = name.to_owned();
+            let mut full_args = vec![cmd_name];
+            full_args.extend(args);
+
+            Expression::Command(CommandItem::new(name, CommandArgs::new(full_args)))
         } else {
             let msg = format!("Command name must be a literal string, got: {:?}", args[0]);
             error!("{}", msg);

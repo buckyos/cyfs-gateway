@@ -131,7 +131,7 @@ impl CommandParser for RewriteCommandParser {
             .case_insensitive(true)
             .build()
             .map_err(|e| {
-                let msg = format!("Invalid glob pattern: {}: {}", args[1], e);
+                let msg = format!("Invalid glob pattern: {}: {}", pattern_value, e);
                 error!("{}", msg);
                 msg
             })?
@@ -958,7 +958,7 @@ impl CommandParser for StringSliceCommandParser {
         };
 
         let ret = ret.unwrap_or_default().to_string();
-        info!("String slice {}[{}:{}] = {}", args[0], start, end, ret);
+        info!("String slice {}[{}:{}] = {}", string_value, start, end, ret);
 
         let cmd = StringConstCommand::new(ret);
 
@@ -1129,7 +1129,7 @@ impl CommandParser for StringStartsWithCommandParser {
         let starts_with = string_value.starts_with(prefix);
         info!(
             "String '{}' starts with '{}': {}",
-            args[0], args[1], starts_with
+            string_value, prefix, starts_with
         );
 
         let cmd = StringConstCommand::new(starts_with.to_string());
@@ -1223,7 +1223,7 @@ impl CommandParser for StringEndsWithCommandParser {
         let ends_with = string_value.ends_with(suffix);
         info!(
             "String '{}' ends with '{}': {}",
-            args[0], args[1], ends_with
+            string_value, suffix, ends_with
         );
 
         let cmd = StringConstCommand::new(ends_with.to_string());

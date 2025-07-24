@@ -11,7 +11,7 @@ pub struct ActionCommandParser {
 
 impl ActionCommandParser {
     pub fn new(action: CommandAction) -> Self {
-        let cmd = Command::new("action")
+        let cmd = Command::new(action.as_str().to_owned())
             .about("Perform a control action that terminates the current process chain execution.")
             .override_usage(
                 r#"
@@ -48,23 +48,23 @@ impl CommandParser for ActionCommandParser {
     }
 
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args must be empty
-        if !args.is_empty() {
-            let msg = format!("Invalid action command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
+        self.cmd
+            .clone()
+            .try_get_matches_from(args.as_str_list())
+            .map_err(|e| {
+                let msg = format!("Invalid action command: {}", e);
+                error!("{}", msg);
+                msg
+            })?;
 
         Ok(())
     }
 
     fn parse(
         &self,
-        args: Vec<String>,
+        _args: Vec<String>,
         _origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        // Args must be empty
-        assert!(args.is_empty(), "Action command should not have any args");
 
         let cmd = ActionCommandExecutor {
             action: self.action.clone(),
