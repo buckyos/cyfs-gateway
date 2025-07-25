@@ -1,9 +1,9 @@
 mod action;
-mod assign;
+mod var;
 mod cmd;
 mod coll;
 mod control;
-mod echo;
+mod debug;
 mod external;
 mod factory;
 mod helper;

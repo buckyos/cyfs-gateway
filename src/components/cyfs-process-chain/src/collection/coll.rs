@@ -291,7 +291,7 @@ pub trait MultiMapCollection: Send + Sync {
 
     /// Removes all values for the given key from the collection.
     /// If the key is not found, it returns false.
-    async fn remove_all(&self, key: &str) -> Result<bool, String>;
+    async fn remove_all(&self, key: &str) -> Result<Option<SetCollectionRef>, String>;
 
     /// Checks if the collection is flushable.
     fn is_flushable(&self) -> bool {

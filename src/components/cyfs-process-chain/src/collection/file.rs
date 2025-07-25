@@ -345,9 +345,9 @@ impl MultiMapCollection for JsonMultiMapCollection {
         Ok(ret)
     }
 
-    async fn remove_all(&self, key: &str) -> Result<bool, String> {
+    async fn remove_all(&self, key: &str) -> Result<Option<SetCollectionRef>, String> {
         let ret = self.data.remove_all(key).await?;
-        if ret {
+        if ret.is_some() {
             self.file.mark_dirty();
         }
 
@@ -520,7 +520,7 @@ mod tests {
             assert!(values.is_some());
 
             // remove all values for the key
-            assert!(loaded_collection.remove_all(&key).await.unwrap());
+            assert!(loaded_collection.remove_all(&key).await.unwrap().is_some());
             assert!(!loaded_collection.contains_key(&key).await.unwrap());
         }
     }

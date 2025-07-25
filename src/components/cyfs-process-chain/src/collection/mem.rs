@@ -315,9 +315,16 @@ impl MultiMapCollection for MemoryMultiMapCollection {
         Ok(false)
     }
 
-    async fn remove_all(&self, key: &str) -> Result<bool, String> {
+    async fn remove_all(&self, key: &str) -> Result<Option<SetCollectionRef>, String> {
         let mut data = self.data.write().unwrap();
-        Ok(data.remove(key).is_some())
+        if let Some(set) = data.remove(key) {
+            let collection = Arc::new(Box::new(MemorySetCollection {
+                data: RwLock::new(set),
+            }) as Box<dyn SetCollection>);
+            Ok(Some(collection))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn dump(&self) -> Result<Vec<(String, HashSet<String>)>, String> {

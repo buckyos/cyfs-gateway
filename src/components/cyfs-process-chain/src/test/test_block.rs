@@ -10,9 +10,15 @@ const PROCESS_CHAIN: &str = r#"
             # We reject the request if the protocol is not https
             !(match $PROTOCOL https) && reject;
 
+            local key1 = "value1";
+            delete key1;
+            echo $(eq $key1 "");
+
             map-create --chain test1;
             map-add test1 key1 value1;
             map-add test1 key2 value2;
+            echo --verbose test1 $test1;
+            delete test1.key1;
             echo --verbose test1 $test1;
 
             map-create --multi test1.test2;

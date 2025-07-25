@@ -1,8 +1,4 @@
-use crate::collection::{
-    CollectionType, CollectionValue, MapCollection, MapCollectionRef, MemoryMapCollection,
-    MemoryMultiMapCollection, MemorySetCollection, MultiMapCollection, MultiMapCollectionRef,
-    SetCollection,
-};
+use crate::collection::*;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -109,6 +105,7 @@ impl Env {
 enum PathCollection {
     Root(EnvRef),
     Map(MapCollectionRef),
+    Set(SetCollectionRef),           // Only for the last part of the path
     MultiMap(MultiMapCollectionRef), // Only for the last part of the path
 }
 
@@ -117,9 +114,14 @@ impl PathCollection {
         match self {
             PathCollection::Root(env) => env.get(key).await,
             PathCollection::Map(map) => map.get(key).await,
-            PathCollection::MultiMap(multi_map) => multi_map.get_many(key).await.map(|value| {
-                value.map(|set| CollectionValue::Set(set))
-            }),
+            PathCollection::Set(set) => match set.contains(key).await? {
+                true => Ok(Some(CollectionValue::String(key.to_string()))),
+                false => Ok(None),
+            },
+            PathCollection::MultiMap(multi_map) => multi_map
+                .get_many(key)
+                .await
+                .map(|value| value.map(|set| CollectionValue::Set(set))),
         }
     }
 
@@ -127,6 +129,15 @@ impl PathCollection {
         match self {
             PathCollection::Root(env) => env.create(key, value).await,
             PathCollection::Map(map) => map.insert_new(key, value).await,
+            PathCollection::Set(set) => {
+                if let CollectionValue::String(s) = value {
+                    set.insert(&s).await
+                } else {
+                    let msg = format!("Expected a string value for Set collection at '{}'", key);
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            }
             PathCollection::MultiMap(_multi_map) => {
                 let msg = format!(
                     "Cannot insert new value into MultiMap collection at '{}'",
@@ -146,13 +157,29 @@ impl PathCollection {
         match self {
             PathCollection::Root(env) => env.set(key, value).await,
             PathCollection::Map(map) => map.insert(key, value).await,
-            PathCollection::MultiMap(_multi_map) => {
-                let msg = format!(
-                    "Cannot insert value into MultiMap collection at '{}'",
-                    key
-                );
-                warn!("{}", msg);
-                Err(msg)
+            PathCollection::Set(set) => {
+                if let CollectionValue::String(s) = value {
+                    match set.insert(&s).await? {
+                        true => Ok(None),
+                        false => Ok(Some(CollectionValue::String(s))),
+                    }
+                } else {
+                    let msg = format!("Expected a string value for Set collection at '{}'", key);
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            }
+            PathCollection::MultiMap(multi_map) => {
+                if let CollectionValue::String(s) = value {
+                    match multi_map.insert(key,&s).await? {
+                        true => Ok(None),
+                        false => Ok(Some(CollectionValue::String(s))),
+                    }
+                } else {
+                    let msg = format!("Expected a Set value for MultiMap collection at '{}'", key);
+                    warn!("{}", msg);
+                    Err(msg)
+                }
             }
         }
     }
@@ -161,13 +188,21 @@ impl PathCollection {
         match self {
             PathCollection::Root(env) => env.remove(key).await,
             PathCollection::Map(map) => map.remove(key).await,
-            PathCollection::MultiMap(_multi_map) => {
-                let msg = format!(
-                    "Cannot remove value from MultiMap collection at '{}'",
-                    key
-                );
-                warn!("{}", msg);
-                Err(msg)
+            PathCollection::Set(set) => {
+                if set.contains(key).await? {
+                    set.remove(key).await?;
+                    Ok(Some(CollectionValue::String(key.to_string())))
+                } else {
+                    Ok(None)
+                }
+            }
+            PathCollection::MultiMap(multi_map) => {
+                let ret = multi_map.remove_all(key).await?;
+                if ret.is_some() {
+                    Ok(Some(CollectionValue::Set(ret.unwrap())))
+                } else {
+                    Ok(None)
+                }
             }
         }
     }
@@ -337,8 +372,13 @@ impl EnvManager {
                         if i == sub_key_list.len() - 1 {
                             // Last part can be a multi-map
                             return Ok(Some(PathCollection::MultiMap(multi_map.clone())));
-                        } 
-                    } 
+                        }
+                    } else if let CollectionValue::Set(set) = &value {
+                        if i == sub_key_list.len() - 1 {
+                            // Last part can be a set
+                            return Ok(Some(PathCollection::Set(set.clone())));
+                        }
+                    }
 
                     let msg = format!("Expected a map at '{}', found: {}", part, value);
                     warn!("{}", msg);

@@ -1,9 +1,9 @@
 use super::action::ActionCommandParser;
-use super::assign::AssignCommandParser;
+use super::var::*;
 use super::cmd::*;
 use super::coll::*;
 use super::control::*;
-use super::echo::EchoCommandParser;
+use super::debug::EchoCommandParser;
 use super::match_::*;
 use super::string::*;
 use std::collections::HashMap;
@@ -72,8 +72,9 @@ impl CommandParserFactory {
         let reject_action = ActionCommandParser::new(CommandAction::Reject);
         self.register("reject", Arc::new(Box::new(reject_action)));
 
-        // assign command
+        // env command
         self.register("assign", Arc::new(Box::new(AssignCommandParser::new())));
+        self.register("delete", Arc::new(Box::new(DeleteCommandParser::new())));
 
         // match command
         self.register("match", Arc::new(Box::new(MatchCommandParser::new())));

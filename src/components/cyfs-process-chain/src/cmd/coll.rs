@@ -1168,7 +1168,7 @@ impl CommandParser for MapRemoveCommandParser {
     fn group(&self) -> CommandGroup {
         CommandGroup::Collection
     }
-    
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -1283,7 +1283,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                 }
 
                 let ret = if self.values.len() == 0 {
-                    collection.remove_all(&self.key).await?
+                    collection.remove_all(&self.key).await?.is_some()
                 } else if self.values.len() == 1 {
                     collection.remove(&self.key, &self.values[0]).await?
                 } else {
