@@ -152,7 +152,24 @@ impl ProcessChainREPL {
         if args[0] == "help" || args[0] == "?" {
             if args.len() > 1 {
                 let cmd = args[1];
-                if let Some(parser) = COMMAND_PARSER_FACTORY.get_parser(cmd) {
+                if cmd == "doc" {
+                    // Generate and print documentation
+                    let doc = self.gen_doc();
+
+                    if args.len() > 2 {
+                        // Save to file if specified
+                        let file_path = PathBuf::from(args[2]);
+                        std::fs::write(&file_path, doc).map_err(|e| {
+                            let msg = format!("Failed to write documentation to file: {}", e);
+                            error!("{}", msg);
+                            msg
+                        })?;
+                        println!("Documentation saved to {}", file_path.display());
+                    } else {
+                        // Print to console
+                        println!("{}", doc);
+                    }
+                } else if let Some(parser) = COMMAND_PARSER_FACTORY.get_parser(cmd) {
                     println!("{}", parser.help(cmd, CommandHelpType::Long));
                 } else {
                     println!("No such command: {}", cmd);
@@ -234,5 +251,28 @@ impl ProcessChainREPL {
         }
 
         Ok(())
+    }
+
+    fn gen_doc(&self) -> String {
+        let mut doc = String::new();
+        let commands = COMMAND_PARSER_FACTORY.get_group_list();
+
+        doc.push_str("# Command reference documentation\n\n");
+
+        for (group, cmds) in commands {
+            doc.push_str(&format!("## {}\n\n", group.as_str()));
+
+            for cmd in cmds {
+                let parser = COMMAND_PARSER_FACTORY.get_parser(&cmd).unwrap();
+                let help = parser.help(&cmd, CommandHelpType::Long);
+
+                doc.push_str(&format!("### `{}`\n", cmd));
+                doc.push_str("```\n");
+                doc.push_str(help.trim());
+                doc.push_str("\n```\n\n");
+            }
+        }
+
+        doc
     }
 }
