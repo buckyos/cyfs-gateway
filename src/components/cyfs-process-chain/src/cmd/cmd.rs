@@ -289,11 +289,13 @@ impl CommandResult {
     }
 
     pub fn is_substitution_value(&self) -> bool {
-        matches!(self, CommandResult::Success(_))
+        matches!(self, CommandResult::Success(_) | CommandResult::Error(_))
     }
 
     pub fn into_substitution_value(self) -> Option<String> {
         if let CommandResult::Success(value) = self {
+            Some(value)
+        } else if let CommandResult::Error(value) = self {
             Some(value)
         } else {
             None
