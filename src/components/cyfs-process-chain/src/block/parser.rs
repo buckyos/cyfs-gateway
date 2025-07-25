@@ -321,27 +321,32 @@ impl BlockParser {
     fn parse_literal(input: &str) -> IResult<&str, CommandArg> {
         debug!("Parsing literal: {}", input);
 
-        // double quoted string with escapes
+        // double quoted string with escapes, also accept "" as empty string
         let double_quoted = delimited(
             char('"'),
-            escaped_transform(
-                is_not("\\\""),
-                '\\',
-                alt((
-                    value("\\", tag("\\")),
-                    value("\"", tag("\"")),
-                    value("\n", tag("n")),
-                    value("\t", tag("t")),
-                    value(" ", tag(" ")),
+            map(
+                opt(escaped_transform(
+                    is_not("\\\""),
+                    '\\',
+                    alt((
+                        value("\\", tag("\\")),
+                        value("\"", tag("\"")),
+                        value("\n", tag("n")),
+                        value("\t", tag("t")),
+                        value(" ", tag(" ")),
+                    )),
                 )),
+                |s: Option<String>| s.unwrap_or_default(), // Empty string if no content
             ),
             char('"'),
         );
 
-        // single quoted string
+        // single quoted string, also accept '' as empty string
         let single_quoted = delimited(
             char('\''),
-            map(is_not("'"), |s: &str| s.to_string()),
+            map(opt(is_not("'")), |s: Option<&str>| {
+                s.unwrap_or("").to_string()
+            }),
             char('\''),
         );
 
@@ -349,7 +354,12 @@ impl BlockParser {
         let unquoted = map(
             recognize(pair(
                 alt((nom::character::complete::alpha1, tag("_"))),
-                many0(alt((nom::character::complete::alphanumeric1, tag("_"), tag("-"), tag(".")))),
+                many0(alt((
+                    nom::character::complete::alphanumeric1,
+                    tag("_"),
+                    tag("-"),
+                    tag("."),
+                ))),
             )),
             |s: &str| s.to_string(),
         );
@@ -366,7 +376,7 @@ impl BlockParser {
         let (input, var) = preceded(
             char('$'),
             recognize(pair(
-                alt((alpha1, tag("_"))),               // Variable must start with a letter or underscore
+                alt((alpha1, tag("_"))), // Variable must start with a letter or underscore
                 many0(alt((alphanumeric1, tag("_"), tag("."), tag("-")))), // followed by letters, digits, underscores, dot or hyphen
             )),
         )
