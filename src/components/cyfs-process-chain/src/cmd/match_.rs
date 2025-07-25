@@ -130,9 +130,9 @@ pub struct MatchCommandExecutor {
 impl CommandExecutor for MatchCommandExecutor {
     async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
         if self.pattern.is_match(&self.value) {
-            Ok(CommandResult::success())
+            Ok(CommandResult::success_with_value("true"))
         } else {
-            Ok(CommandResult::error())
+            Ok(CommandResult::error_with_value("false"))
         }
     }
 }
@@ -292,9 +292,9 @@ impl CommandExecutor for MatchRegexCommandExecutor {
                 }
             }
 
-            Ok(CommandResult::success())
+            Ok(CommandResult::success_with_value("true"))
         } else {
-            Ok(CommandResult::error())
+            Ok(CommandResult::error_with_value("false"))
         }
     }
 }
@@ -418,10 +418,16 @@ impl CommandExecutor for EQCommandExecutor {
             self.value1 == self.value2
         };
 
+        /*
+        info!(
+            "EQ command: comparing '{}' with '{}' (ignore_case: {})",
+            self.value1, self.value2, self.ignore_case
+        );
+        */
         if is_eq {
-            Ok(CommandResult::success())
+            Ok(CommandResult::success_with_value("true"))
         } else {
-            Ok(CommandResult::error())
+            Ok(CommandResult::error_with_value("false"))
         }
     }
 }
@@ -560,9 +566,9 @@ pub struct RangeCommandExecutor {
 impl CommandExecutor for RangeCommandExecutor {
     async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
         if self.value >= self.min && self.value <= self.max {
-            Ok(CommandResult::success())
+            Ok(CommandResult::success_with_value("true"))
         } else {
-            Ok(CommandResult::error())
+            Ok(CommandResult::error_with_value("false"))
         }
     }
 }
