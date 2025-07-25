@@ -67,6 +67,10 @@ impl CollectionValue {
         }
     }
 
+    pub fn is_string(&self) -> bool {
+        matches!(self, CollectionValue::String(_))
+    }
+    
     pub fn as_ref(&self) -> CollectionValueRef {
         match self {
             CollectionValue::String(s) => CollectionValueRef::String(s.as_str()),
