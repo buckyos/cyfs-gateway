@@ -15,8 +15,17 @@ const PROCESS_CHAIN: &str = r#"
             echo $(eq $key1 "");
 
             map-create --chain test1;
+            # should not reject
+            match-include test1 key1 && exit reject;
+            match-include $test1 key1 && exit reject;
+
             map-add test1 key1 value1;
             map-add test1 key2 value2;
+
+            !match-include test1 key1 && exit reject;
+            !match-include test1 key1 value1 && exit reject;
+            match-include test1 key1 value2 && exit reject;
+
             echo --verbose test1 $test1;
             delete test1.key1;
             echo --verbose test1 $test1;
@@ -24,7 +33,11 @@ const PROCESS_CHAIN: &str = r#"
             map-create --multi test1.test2;
             map-add test1.test2 key1 value1;
             map-add test1.test2 key2 value2;
+            map-add test1.test2 key2 value22;
             echo --verbose $test1.test2 "key1:" ${test1.test2.key1};
+            !match-include test1.test2 key1 value1 && exit reject;
+            match-include $test1.test1 key2 value2 value3 && exit reject;
+            !match-include $test1.test2 key2 value2 value22 && exit reject;
 
             map-add host "google.com" tag1 tag2;
             map-add host "baidu.com" tag1;

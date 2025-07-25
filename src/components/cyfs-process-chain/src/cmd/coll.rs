@@ -53,13 +53,14 @@ Notes:
     - Values must be listed as separate arguments (not as a single list).
 
 Examples:
+    match-include test.coll "test_value"
     match-include $HOST $REQ_host "www.test.com" && drop
     match-include $IP $REQ_ip "127.0.0.1" "192.168.100.1" && accept
 "#,
             )
             .arg(
                 Arg::new("collection")
-                    .help("Target collection variable name")
+                    .help("Target collection variable name or collection id")
                     .required(true)
                     .value_name("collection"),
             )
@@ -111,6 +112,46 @@ impl CommandParser for MatchIncludeCommandParser {
         Ok(())
     }
 
+    fn parse_origin(
+        &self,
+        args: Vec<CollectionValue>,
+        origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        // Convert CollectionValue to String for clap parsing
+        let str_args = args
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<String>>();
+
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid match-include command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let collection_index = matches.index_of("collection").unwrap();
+        let collection = args[collection_index].clone();
+        let collection_id = origin_args[collection_index].as_str().to_string();
+
+        let key = matches
+            .get_one::<String>("key")
+            .expect("key is required")
+            .clone();
+
+        let values = matches
+            .get_many::<String>("values")
+            .map(|v| v.map(|s| s.clone()).collect::<Vec<String>>())
+            .unwrap_or_default();
+
+        let cmd = MatchIncludeCommandExecutor::new(collection_id, collection, key, values);
+        Ok(Arc::new(Box::new(cmd)))
+    }
+
+    /*
     fn parse(
         &self,
         args: Vec<String>,
@@ -140,19 +181,27 @@ impl CommandParser for MatchIncludeCommandParser {
         let cmd = MatchIncludeCommandExecutor::new(collection_id, key, values);
         Ok(Arc::new(Box::new(cmd)))
     }
+    */
 }
 
 // MatchIncludeCommandExecutor
-pub struct MatchIncludeCommandExecutor {
-    pub collection_id: String,
-    pub key: String,
-    pub values: Vec<String>,
+struct MatchIncludeCommandExecutor {
+    collection_id: String,
+    collection: CollectionValue,
+    key: String,
+    values: Vec<String>,
 }
 
 impl MatchIncludeCommandExecutor {
-    pub fn new(collection_id: String, key: String, values: Vec<String>) -> Self {
+    pub fn new(
+        collection_id: String,
+        collection: CollectionValue,
+        key: String,
+        values: Vec<String>,
+    ) -> Self {
         Self {
             collection_id,
+            collection,
             key,
             values,
         }
@@ -163,15 +212,38 @@ impl MatchIncludeCommandExecutor {
 impl CommandExecutor for MatchIncludeCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Get the collection from the context
-        let ret = context.env().get(&self.collection_id, None).await?;
-        if ret.is_none() {
-            let msg = format!("Collection with id '{}' not found", self.collection_id);
-            warn!("{}", msg);
-            return Ok(CommandResult::error_with_value(msg));
-        }
+        let collection = match &self.collection {
+            CollectionValue::String(collection_id) => {
+                let ret = context.env().get(&collection_id, None).await?;
+                if ret.is_none() {
+                    let msg = format!("Collection with id '{}' not found", self.collection_id);
+                    warn!("{}", msg);
+                    return Ok(CommandResult::error_with_value(msg));
+                }
+                let coll = ret.unwrap();
+                if !coll.is_collection() {
+                    let msg = format!(
+                        "Expected CollectionValue::Set, CollectionValue::Map or CollectionValue::MultiMap, found {}",
+                        coll.get_type(),
+                    );
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
 
-        let ret = ret.unwrap();
-        match ret {
+                coll
+            }
+            CollectionValue::Set(_) | CollectionValue::Map(_) | CollectionValue::MultiMap(_) => {
+                self.collection.clone()
+            }
+            CollectionValue::Visitor(_) => {
+                let msg =
+                    "Collection cannot be a visitor type for match-include command".to_string();
+                warn!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        match collection {
             CollectionValue::Set(collection) => {
                 // For set collection, we check if the key is included
                 let contains = collection.contains(&self.key).await?;
@@ -206,22 +278,31 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
 
                         // Only check if the first value matches
                         match value {
-                            CollectionValue::String(ref v) if self.values[0] == *v => {
-                                info!(
-                                    "MatchInclude command: key='{}', collection_id='{}', value='{}' found",
-                                    self.key, self.collection_id, v
-                                );
-                                return Ok(CommandResult::success());
+                            CollectionValue::String(ref v) => {
+                                if self.values[0] == *v {
+                                    info!(
+                                        "match-include command: key='{}', collection_id='{}', value='{}' found",
+                                        self.key, self.collection_id, v
+                                    );
+                                    return Ok(CommandResult::success());
+                                } else {
+                                    // value is string but not match
+                                }
                             }
                             _ => {
-                                todo!("Handle other value types or multiple values");
+                                warn!(
+                                    "match-include command: value is not string! key='{}', collection_id='{}', value_type='{}'",
+                                    self.key,
+                                    self.collection_id,
+                                    value.get_type()
+                                );
                             }
                         }
                     }
                 }
 
                 info!(
-                    "MatchInclude command: key='{}', collection_id='{}', no matching key or value found",
+                    "match-include command: key='{}', collection_id='{}', no matching key or value found",
                     self.key, self.collection_id
                 );
 
@@ -269,12 +350,10 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
             }
 
             _ => {
-                let msg = format!(
-                    "Expected CollectionValue::Set, CollectionValue::Map or CollectionValue::MultiMap, found {}",
-                    ret,
+                unreachable!(
+                    "Collection type should be Set, Map or MultiMap, found {}",
+                    collection.get_type()
                 );
-                warn!("{}", msg);
-                Err(msg)
             }
         }
     }

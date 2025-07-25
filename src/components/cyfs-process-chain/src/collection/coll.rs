@@ -169,6 +169,13 @@ impl CollectionValue {
         }
     }
 
+    pub fn is_collection(&self) -> bool {
+        matches!(
+            self,
+            CollectionValue::Set(_) | CollectionValue::Map(_) | CollectionValue::MultiMap(_)
+        )
+    }
+    
     pub fn as_visitor(&self) -> Option<&VariableVisitorRef> {
         if let CollectionValue::Visitor(v) = self {
             Some(v)
