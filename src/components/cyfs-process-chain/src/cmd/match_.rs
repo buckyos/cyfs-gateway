@@ -61,6 +61,10 @@ Examples:
 }
 
 impl CommandParser for MatchCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Match
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -133,7 +137,7 @@ impl CommandExecutor for MatchCommandExecutor {
     }
 }
 
-// Match regex command, like: match-regex REQ_HEADER.host "^(.*)\.local$"
+// Match regex command, like: match-reg REQ_HEADER.host "^(.*)\.local$"
 // If capture is provided, it will capture the matched groups into the environment with name `name[i]`
 /*
 * match-reg some_input "^pattern$"
@@ -145,7 +149,7 @@ pub struct MatchRegexCommandParser {
 
 impl MatchRegexCommandParser {
     pub fn new() -> Self {
-        let cmd = Command::new("match-regex")
+        let cmd = Command::new("match-reg")
             .about("Match a value against a regular expression. Supports optional named capture.")
             .after_help(
                 r#"
@@ -166,8 +170,8 @@ Behavior:
   - Default behavior is case-insensitive matching.
 
 Examples:
-  match-regex $REQ_HEADER.host "^(.*)\.local$"
-  match-regex --capture parts $REQ_HEADER.host "^(.+)\.(local|dev)$"
+  match-reg $REQ_HEADER.host "^(.*)\.local$"
+  match-reg --capture parts $REQ_HEADER.host "^(.+)\.(local|dev)$"
 "#,
             )
             .arg(
@@ -198,6 +202,10 @@ Examples:
 }
 
 impl CommandParser for MatchRegexCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Match
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -207,7 +215,7 @@ impl CommandParser for MatchRegexCommandParser {
             .clone()
             .try_get_matches_from(args.as_str_list())
             .map_err(|e| {
-                let msg = format!("Invalid match-regex command: {:?}, {}", args, e);
+                let msg = format!("Invalid match-reg command: {:?}, {}", args, e);
                 error!("{}", msg);
                 msg
             })?;
@@ -221,7 +229,7 @@ impl CommandParser for MatchRegexCommandParser {
         _origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
         let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid match-regex command: {:?}, {}", args, e);
+            let msg = format!("Invalid match-reg command: {:?}, {}", args, e);
             error!("{}", msg);
             msg
         })?;
@@ -341,6 +349,10 @@ Examples:
 }
 
 impl CommandParser for EQCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Match
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -458,6 +470,10 @@ Examples:
 }
 
 impl CommandParser for RangeCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Match
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }

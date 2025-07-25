@@ -43,6 +43,10 @@ Examples:
 }
 
 impl CommandParser for ActionCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Control
+    }
+    
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }

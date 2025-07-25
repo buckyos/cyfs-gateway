@@ -2,12 +2,12 @@ use super::action::ActionCommandParser;
 use super::assign::AssignCommandParser;
 use super::cmd::*;
 use super::coll::*;
-use super::match_::MatchCommandParser;
+use super::control::*;
+use super::echo::EchoCommandParser;
+use super::match_::*;
 use super::string::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use super::control::*;
-use super::echo::EchoCommandParser;
 
 #[derive(Clone)]
 pub struct CommandParserFactory {
@@ -37,7 +37,23 @@ impl CommandParserFactory {
         let parsers = self.parsers.lock().unwrap();
         parsers.keys().cloned().collect()
     }
-    
+
+    pub fn get_group_list(&self) -> HashMap<CommandGroup, Vec<String>> {
+        let parsers = self.parsers.lock().unwrap();
+        let mut group_map: HashMap<CommandGroup, Vec<String>> = HashMap::new();
+        for (name, parser) in parsers.iter() {
+            let group = parser.group();
+            group_map.entry(group).or_default().push(name.clone());
+        }
+
+        // Sort each group
+        for group in group_map.iter_mut() {
+            group.1.sort();
+        }
+
+        group_map
+    }
+
     pub fn init(&self) {
         // control command
         self.register("goto", Arc::new(Box::new(GotoCommandParser::new())));
@@ -58,8 +74,15 @@ impl CommandParserFactory {
 
         // assign command
         self.register("assign", Arc::new(Box::new(AssignCommandParser::new())));
+
         // match command
         self.register("match", Arc::new(Box::new(MatchCommandParser::new())));
+        self.register(
+            "match-reg",
+            Arc::new(Box::new(MatchRegexCommandParser::new())),
+        );
+        self.register("eq", Arc::new(Box::new(EQCommandParser::new())));
+        self.register("range", Arc::new(Box::new(RangeCommandParser::new())));
 
         // string command
         self.register("rewrite", Arc::new(Box::new(RewriteCommandParser::new())));
@@ -85,7 +108,10 @@ impl CommandParserFactory {
             "starts-with",
             Arc::new(Box::new(StringStartsWithCommandParser::new())),
         );
-        self.register("ends_with", Arc::new(Box::new(StringEndsWithCommandParser::new())));
+        self.register(
+            "ends-with",
+            Arc::new(Box::new(StringEndsWithCommandParser::new())),
+        );
 
         // collection commands
         self.register(
@@ -99,7 +125,7 @@ impl CommandParserFactory {
         );
         self.register("set-add", Arc::new(Box::new(SetAddCommandParser::new())));
         self.register(
-            "set_remove",
+            "set-remove",
             Arc::new(Box::new(SetRemoveCommandParser::new())),
         );
 
@@ -113,7 +139,7 @@ impl CommandParserFactory {
             Arc::new(Box::new(MapRemoveCommandParser::new())),
         );
 
-        // echo
+        // debug
         self.register("echo", Arc::new(Box::new(EchoCommandParser::new())));
     }
 }

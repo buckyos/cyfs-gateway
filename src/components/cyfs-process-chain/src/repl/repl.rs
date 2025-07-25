@@ -159,8 +159,14 @@ impl ProcessChainREPL {
                 }
             } else {
                 // List all commands
-                let commands = COMMAND_PARSER_FACTORY.get_command_list();
-                println!("Available commands: {}", commands.join(", "));
+                let commands = COMMAND_PARSER_FACTORY.get_group_list();
+                println!("Available commands:\n");
+
+                for (group, cmds) in commands {
+                    println!("[{}]", group.as_str());
+                    println!("{}", cmds.join(" "));
+                    println!();
+                }
             }
         } else if args.len() >= 2 {
             // command with --help or -h

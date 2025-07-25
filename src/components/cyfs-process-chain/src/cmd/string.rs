@@ -55,6 +55,10 @@ Examples:
 }
 
 impl CommandParser for RewriteCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
     fn help(&self, _name: &str, help_type: super::CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -288,6 +292,10 @@ Examples:
 }
 
 impl CommandParser for RewriteRegexCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
     fn help(&self, _name: &str, help_type: super::CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -513,6 +521,10 @@ Examples:
 }
 
 impl CommandParser for StringReplaceCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -725,6 +737,10 @@ Examples:
 }
 
 impl CommandParser for StringAppendCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -890,6 +906,10 @@ Examples:
 }
 
 impl CommandParser for StringSliceCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -1003,6 +1023,10 @@ Examples:
 }
 
 impl CommandParser for StringLengthCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+    
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -1088,6 +1112,10 @@ Examples:
 }
 
 impl CommandParser for StringStartsWithCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -1182,6 +1210,10 @@ Examples:
 }
 
 impl CommandParser for StringEndsWithCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }

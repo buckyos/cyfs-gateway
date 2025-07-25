@@ -13,6 +13,10 @@ impl ExternalCommandParser {
 }
 
 impl CommandParser for ExternalCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::External
+    }
+
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         // Args should not be empty
         if args.is_empty() {

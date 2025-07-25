@@ -44,6 +44,10 @@ Examples:
 }
 
 impl CommandParser for AssignCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Variable
+    }
+    
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }

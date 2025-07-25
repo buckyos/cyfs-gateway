@@ -4,6 +4,31 @@ use crate::collection::CollectionValue;
 use std::sync::Arc;
 use clap::Command;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommandGroup {
+    Match,
+    Control,
+    String,
+    Collection,
+    Variable,
+    Debug,
+    External,
+}
+
+impl CommandGroup {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CommandGroup::Match => "match",
+            CommandGroup::Control => "control",
+            CommandGroup::String => "string",
+            CommandGroup::Collection => "collection",
+            CommandGroup::Variable => "variable",
+            CommandGroup::Debug => "debug",
+            CommandGroup::External => "external",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandHelpType {
     Usage,
@@ -23,6 +48,9 @@ pub fn command_help(help_type: CommandHelpType, cmd: &Command) -> String {
 }
 
 pub trait CommandParser: Send + Sync {
+    /// Get the command group.
+    fn group(&self) -> CommandGroup;
+
     /// Display command usage information.
     /// This is used to show help information for the command.
     fn help(&self, name: &str, _help_type: CommandHelpType) -> String {

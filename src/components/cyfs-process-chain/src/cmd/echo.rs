@@ -57,6 +57,10 @@ Examples:
 }
 
 impl CommandParser for EchoCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Debug
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }

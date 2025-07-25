@@ -1,6 +1,4 @@
-use super::cmd::{
-    CommandExecutor, CommandExecutorRef, CommandHelpType, CommandParser, CommandResult, command_help,
-};
+use super::cmd::*;
 use crate::block::CommandArgs;
 use crate::chain::{Context, EnvLevel};
 use crate::collection::{CollectionType, CollectionValue};
@@ -84,6 +82,10 @@ Examples:
 }
 
 impl CommandParser for MatchIncludeCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -346,6 +348,10 @@ Examples:
 }
 
 impl CommandParser for SetCreateCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -480,6 +486,10 @@ Examples:
 }
 
 impl CommandParser for SetAddCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -570,7 +580,7 @@ impl CommandExecutor for SetAddCommandExecutor {
     }
 }
 
-/// set_remove <set_id> <value>
+/// set-remove <set_id> <value>
 /// Remove a value from the specified set collection.
 /// If the value exists, it will be removed and the command will succeed.
 /// If the value does not exist, the command will fail.
@@ -616,6 +626,10 @@ Examples:
 }
 
 impl CommandParser for SetRemoveCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -777,6 +791,10 @@ Examples:
 }
 
 impl CommandParser for MapCreateCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -931,6 +949,10 @@ Examples:
 }
 
 impl CommandParser for MapAddCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -1143,6 +1165,10 @@ Examples:
 }
 
 impl CommandParser for MapRemoveCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+    
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }

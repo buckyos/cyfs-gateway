@@ -41,6 +41,10 @@ Examples:
 }
 
 impl CommandParser for ExecCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Control
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -181,6 +185,10 @@ Examples:
 }
 
 impl CommandParser for GotoCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Control
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -290,6 +298,10 @@ Examples:
 }
 
 impl CommandParser for ReturnCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Control
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -385,6 +397,10 @@ Examples:
 }
 
 impl CommandParser for ErrorCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Control
+    }
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -479,6 +495,10 @@ Examples:
 }
 
 impl CommandParser for ExitCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Control
+    }
+    
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
