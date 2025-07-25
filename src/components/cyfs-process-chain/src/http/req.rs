@@ -105,6 +105,15 @@ impl MapCollection for HttpRequestHeaderMap {
             Ok(None)
         }
     }
+
+    async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
+        let request = self.request.read().await;
+        let mut result = Vec::new();
+        for (key, value) in request.iter() {
+            result.push((key.to_string(), CollectionValue::String(value.to_string())));
+        }
+        Ok(result)
+    }
 }
 
 // Url visitor for HTTP requests

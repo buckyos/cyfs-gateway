@@ -150,6 +150,19 @@ impl MapCollection for HyperHttpRequestHeaderMap {
             Ok(None)
         }
     }
+
+    async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
+        let request = self.request.read().await;
+        let mut result = Vec::new();
+        for (key, value) in request.headers().iter() {
+            if let Ok(value_str) = value.to_str() {
+                result.push((key.as_str().to_string(), CollectionValue::String(value_str.to_string())));
+            } else {
+                warn!("Header value for '{}' is not valid UTF-8", key);
+            }
+        }
+        Ok(result)
+    }
 }
 
 // Url visitor for HTTP requests

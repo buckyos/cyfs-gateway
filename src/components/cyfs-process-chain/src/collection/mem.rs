@@ -206,6 +206,11 @@ impl MapCollection for MemoryMapCollection {
 
         Ok(())
     }
+
+    async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
+        let data = self.data.read().unwrap();
+        Ok(data.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
 }
 
 pub struct MemoryMultiMapCollection {
@@ -309,8 +314,17 @@ impl MultiMapCollection for MemoryMultiMapCollection {
 
         Ok(false)
     }
+
     async fn remove_all(&self, key: &str) -> Result<bool, String> {
         let mut data = self.data.write().unwrap();
         Ok(data.remove(key).is_some())
+    }
+
+    async fn dump(&self) -> Result<Vec<(String, HashSet<String>)>, String> {
+        let data = self.data.read().unwrap();
+        Ok(data
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_owned()))
+            .collect())
     }
 }

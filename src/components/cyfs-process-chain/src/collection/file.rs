@@ -262,6 +262,10 @@ impl MapCollection for JsonMapCollection {
     async fn flush(&self) -> Result<(), String> {
         self.flush()
     }
+
+    async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
+        self.data.dump().await
+    }
 }
 
 #[derive(Clone)]
@@ -356,6 +360,10 @@ impl MultiMapCollection for JsonMultiMapCollection {
 
     async fn flush(&self) -> Result<(), String> {
         self.flush()
+    }
+
+    async fn dump(&self) -> Result<Vec<(String, HashSet<String>)>, String> {
+        self.data.dump().await
     }
 }
 

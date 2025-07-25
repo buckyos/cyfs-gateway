@@ -1,5 +1,6 @@
 use super::var::VariableVisitorRef;
 use std::sync::Arc;
+use std::collections::HashSet;
 
 #[derive(Clone)]
 pub enum CollectionValue {
@@ -215,6 +216,10 @@ pub trait SetCollection: Send + Sync {
         // Default implementation does nothing, can be overridden by specific collections
         Ok(())
     }
+
+    async fn dump(&self) -> Result<Vec<String>, String> {
+        self.get_all().await
+    }
 }
 
 pub type SetCollectionRef = Arc<Box<dyn SetCollection>>;
@@ -252,6 +257,9 @@ pub trait MapCollection: Send + Sync {
         // Default implementation does nothing, can be overridden by specific collections
         Ok(())
     }
+
+    /// Dumps the collection to a vector of strings.
+    async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String>;
 }
 
 pub type MapCollectionRef = Arc<Box<dyn MapCollection>>;
@@ -296,6 +304,9 @@ pub trait MultiMapCollection: Send + Sync {
         // Default implementation does nothing, can be overridden by specific collections
         Ok(())
     }
+
+    /// Dumps the collection to a vector of key-value pairs.
+    async fn dump(&self) -> Result<Vec<(String, HashSet<String>)>, String>;
 }
 
 pub type MultiMapCollectionRef = Arc<Box<dyn MultiMapCollection>>;

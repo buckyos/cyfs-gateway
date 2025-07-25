@@ -13,11 +13,12 @@ const PROCESS_CHAIN: &str = r#"
             map-create --chain test1;
             map-add test1 key1 value1;
             map-add test1 key2 value2;
+            echo --verbose test1 $test1;
 
             map-create --multi test1.test2;
             map-add test1.test2 key1 value1;
             map-add test1.test2 key2 value2;
-            echo "test1.test2 key1: $(test1.test2.key1)";
+            echo --verbose $test1.test2 "key1:" ${test1.test2.key1};
 
             map-add host "google.com" tag1 tag2;
             map-add host "baidu.com" tag1;
@@ -245,7 +246,7 @@ async fn test_hook_point() -> Result<(), String> {
 async fn test_process_chain_main() {
     use simplelog::*;
     TermLogger::init(
-        LevelFilter::Info,
+        LevelFilter::Debug,
         Config::default(),
         TerminalMode::Mixed,
         ColorChoice::Auto,
@@ -255,10 +256,10 @@ async fn test_process_chain_main() {
         SimpleLogger::init(LevelFilter::Info, Config::default()).unwrap()
     });
 
-    //match test_process_chain().await {
-    //    Ok(_) => println!("Process chain executed successfully"),
-    //    Err(e) => eprintln!("Error executing process chain: {}", e),
-    //}
+    match test_process_chain().await {
+        Ok(_) => println!("Process chain executed successfully"),
+        Err(e) => eprintln!("Error executing process chain: {}", e),
+    }
 
     test_hook_point().await.unwrap_or_else(|e| {
         eprintln!("Error executing hook point: {}", e);

@@ -1,6 +1,7 @@
 use super::cmd::*;
 use crate::block::CommandArgs;
 use crate::chain::Context;
+use crate::collection::CollectionValue;
 use clap::{Arg, ArgAction, Command};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -19,14 +20,16 @@ impl EchoCommandParser {
                 r#"
 Options:
   -n          Do not print the trailing newline.
+  --verbose   Print additional information about the command execution, such as collections's contents.
 
 Behavior:
   - Joins all arguments with spaces and prints them.
   - By default, a newline is printed at the end.
 
 Examples:
-  echo "Hello, World!"
-  echo -n "Hello," "World!"
+  echo "Hello, World!";
+  echo -n "Hello," "World!";
+  echo --verbose $REQ;
 "#,
             )
             .arg(
@@ -34,6 +37,13 @@ Examples:
                     .short('n')
                     .action(ArgAction::SetTrue)
                     .help("Do not print the trailing newline"),
+            )
+            .arg(
+                Arg::new("verbose")
+                    .long("verbose")
+                    .short('v')
+                    .action(ArgAction::SetTrue)
+                    .help("Print additional information about the command execution, such as collections' contents"),
             )
             .arg(
                 Arg::new("args")
@@ -56,72 +66,141 @@ impl CommandParser for EchoCommandParser {
         self.cmd
             .clone()
             .try_get_matches_from(&arg_list)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                let msg = format!("Invalid echo command: {:?}, {}", arg_list, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         Ok(())
     }
 
     fn parse_origin(
         &self,
-        args: Vec<crate::CollectionValue>,
+        args: Vec<CollectionValue>,
         _origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
         // Convert CollectionValue to String for clap parsing
-        let args = args
-            .into_iter()
+        let str_args = args
+            .iter()
             .map(|value| value.to_string())
             .collect::<Vec<String>>();
 
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid echo command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid echo command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         // Get the optional no_newline flag
         let suppress_newline = matches.get_flag("no_newline");
+        let verbose = matches.get_flag("verbose");
 
         // Get the arguments to echo
-        let parts: Vec<&str> = matches
-            .get_many::<String>("args")
-            .map(|vals| vals.map(|v| v.as_str()).collect())
-            .unwrap_or_else(Vec::new);
+        let output_args = match matches.indices_of("args") {
+            Some(indices) => indices.map(|i| args[i].clone()).collect(),
+            None => Vec::new(),
+        };
 
-        let mut result = parts.join(" ");
-        if !suppress_newline {
-            result.push('\n'); // Use '\n' to ensure the output is consistent with echo behavior
-        }
-
-        let cmd = EchoCommandExecutor::new(suppress_newline, result);
+        let cmd = EchoCommandExecutor::new(output_args, suppress_newline, verbose);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // Echo command executor, which simply echoes the input arguments
 pub struct EchoCommandExecutor {
+    output_args: Vec<CollectionValue>,
     suppress_newline: bool,
-    output: String,
+    verbose: bool,
 }
 
 impl EchoCommandExecutor {
-    pub fn new(suppress_newline: bool, output: String) -> Self {
+    pub fn new(output_args: Vec<CollectionValue>, suppress_newline: bool, verbose: bool) -> Self {
         Self {
+            output_args,
             suppress_newline,
-            output,
+            verbose,
         }
+    }
+
+    async fn print_verbose_output(&self, value: &CollectionValue) -> Result<String, String> {
+        let ret = match value {
+            CollectionValue::String(s) => s.clone(),
+            CollectionValue::Set(set) => {
+                let values = set.dump().await?;
+                format!("{{ {} }}", values.join(" "))
+            }
+            CollectionValue::Map(map) => {
+                let values = map.dump().await?;
+                values
+                    .iter()
+                    .map(|(k, v)| format!("{} = {}", k, v))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            CollectionValue::MultiMap(mmap) => {
+                let values = mmap.dump().await?;
+                values
+                    .iter()
+                    .map(|(k, v)| {
+                        if v.len() == 1 {
+                            format!("{} = {}", k, v.iter().next().unwrap())
+                        } else {
+                            format!(
+                                "{} = {{ {} }}",
+                                k,
+                                v.iter().cloned().collect::<Vec<_>>().join(", ")
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            CollectionValue::Visitor(_visitor) => {
+                // TODO: Implement visitor output
+                "[Visitor]".to_string()
+            }
+        };
+
+        Ok(ret)
     }
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for EchoCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
-        if !self.output.is_empty() {
+        let output_str;
+        if !self.output_args.is_empty() {
+            let mut output = Vec::with_capacity(self.output_args.len());
+            for value in &self.output_args {
+                if self.verbose {
+                    let v = self.print_verbose_output(value).await?;
+                    output.push(v);
+                } else {
+                    output.push(value.to_string());
+                }
+            }
+            output_str = output.join(" ");
+
             let mut stdout = context.pipe().stdout.lock().await;
             // Write the output to stdout
-            if let Err(e) = stdout.write_all(self.output.as_bytes()).await {
+            if let Err(e) = stdout.write_all(output_str.as_bytes()).await {
                 let msg = format!("Failed to write output to stdout: {}", e);
                 error!("{}", msg);
                 return Err(msg);
+            }
+
+            // If suppress_newline is false, append a newline
+            if !self.suppress_newline {
+                if let Err(e) = stdout.write_all(b"\n").await {
+                    let msg = format!("Failed to write newline to stdout: {}", e);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
             }
 
             // Flush the output to ensure it is written immediately
@@ -130,8 +209,10 @@ impl CommandExecutor for EchoCommandExecutor {
                 error!("{}", msg);
                 return Err(msg);
             }
+        } else {
+            output_str = String::new();
         }
 
-        Ok(CommandResult::success_with_value(self.output.as_str()))
+        Ok(CommandResult::success_with_value(output_str))
     }
 }
