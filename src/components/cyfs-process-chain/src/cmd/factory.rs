@@ -112,10 +112,6 @@ impl CommandParserFactory {
             "map-remove",
             Arc::new(Box::new(MapRemoveCommandParser::new())),
         );
-        self.register(
-            "map-get",
-            Arc::new(Box::new(MapGetCommandParser::new())),
-        );
 
         // echo
         self.register("echo", Arc::new(Box::new(EchoCommandParser::new())));
