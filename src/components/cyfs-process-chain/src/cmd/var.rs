@@ -164,13 +164,14 @@ Deletes a variable or collection value from the specified scope.
 
 Scope Options:
   --export, --global   Global scope
-  --chain              Chain scope (default)
+  --chain              Chain scope
   --block, --local     Block scope
 
 Variable Names:
   - Variable names can include dot-separated paths to access nested values,
     especially for structured collections like set/map/multimap.
   - For example: $REQ.header, $REQ.headers.Host, $USER.config.theme
+  - If scope is not specified, defaults to the variable's current scope.
 
 Delete Modes:
   - If the full name refers to a top-level variable (e.g., $REQ, $temp), the entire
@@ -250,14 +251,14 @@ impl CommandParser for DeleteCommandParser {
 
         // Determine the scope level based on the flags
         let level = if matches.get_flag("global") {
-            EnvLevel::Global
+            Some(EnvLevel::Global)
         } else if matches.get_flag("chain") {
-            EnvLevel::Chain
+            Some(EnvLevel::Chain)
         } else if matches.get_flag("block") {
-            EnvLevel::Block
+            Some(EnvLevel::Block)
         } else {
-            // Default to chain scope if no flags are set
-            EnvLevel::Chain
+            // Default to current scope in env manager
+            None
         };
 
         let var = matches
@@ -271,12 +272,12 @@ impl CommandParser for DeleteCommandParser {
 }
 
 struct DeleteCommand {
-    level: EnvLevel,
+    level: Option<EnvLevel>,
     var: String,
 }
 
 impl DeleteCommand {
-    pub fn new(level: EnvLevel, var: String) -> Self {
+    pub fn new(level: Option<EnvLevel>, var: String) -> Self {
         Self { level, var }
     }
 }
@@ -285,7 +286,7 @@ impl DeleteCommand {
 impl CommandExecutor for DeleteCommand {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Attempt to delete the variable from the specified scope
-        let result = context.env().remove(&self.var, Some(self.level)).await;
+        let result = context.env().remove(&self.var, self.level).await;
 
         match result {
             Ok(Some(ret)) => Ok(CommandResult::success_with_value(ret.to_string())),
