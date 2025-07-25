@@ -367,7 +367,7 @@ impl BlockParser {
             char('$'),
             recognize(pair(
                 alt((alpha1, tag("_"))),               // Variable must start with a letter or underscore
-                many0(alt((alphanumeric1, tag("_"), tag(".")))), // followed by letters, digits, underscores, or dot
+                many0(alt((alphanumeric1, tag("_"), tag("."), tag("-")))), // followed by letters, digits, underscores, dot or hyphen
             )),
         )
         .parse(input)?;
@@ -395,7 +395,7 @@ impl BlockParser {
             preceded(
                 tag("${"),
                 terminated(
-                    take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '.'),
+                    take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '.' || c == '-'),
                     char('}'),
                 ),
             ),
