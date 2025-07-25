@@ -140,8 +140,8 @@ Arguments:
   <target>     The name of the target block or chain.
 
 Options:
-  --chain      Jump to a chain by name.
-  --block      Jump to a block in the current chain (default).
+  --chain      Jump to a chain by name (default).
+  --block      Jump to a block in the current chain.
 
 Behavior:
   - Without options, defaults to jumping to a chain.
