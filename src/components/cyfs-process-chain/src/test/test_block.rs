@@ -1,3 +1,4 @@
+use super::external::*;
 use crate::*;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -10,6 +11,7 @@ const PROCESS_CHAIN: &str = r#"
             # We reject the request if the protocol is not https
             !(match $PROTOCOL https) && reject;
 
+            echo $(call add 1 2);
             local key1 = "value1";
             delete key1;
             echo $(eq $key1 "");
@@ -127,11 +129,7 @@ async fn test_process_chain() -> Result<(), String> {
     let pipe = SharedMemoryPipe::new_empty();
 
     // Create a context with global and chain environment
-    let exec = ProcessChainsExecutor::new(
-        manager.clone(),
-        global_env.clone(),
-        pipe.pipe().clone(),
-    );
+    let exec = ProcessChainsExecutor::new(manager.clone(), global_env.clone(), pipe.pipe().clone());
 
     // Execute the first chain
     let ret: CommandResult = exec.execute_chain_by_id("chain1").await.unwrap();
@@ -139,9 +137,18 @@ async fn test_process_chain() -> Result<(), String> {
     assert!(ret.is_accept());
 
     // Check the environment variables set by the first block
-    assert_eq!(global_env.get("key1").await.unwrap().unwrap().as_str(), Some("key12"));
-    assert_eq!(global_env.get("key2").await.unwrap().unwrap().as_str(), Some("key1_value2"));
-    assert_eq!(global_env.get("key3").await.unwrap().unwrap().as_str(), Some("key12_value2"));
+    assert_eq!(
+        global_env.get("key1").await.unwrap().unwrap().as_str(),
+        Some("key12")
+    );
+    assert_eq!(
+        global_env.get("key2").await.unwrap().unwrap().as_str(),
+        Some("key1_value2")
+    );
+    assert_eq!(
+        global_env.get("key3").await.unwrap().unwrap().as_str(),
+        Some("key12_value2")
+    );
 
     // Execute the second chain
     exec.execute_chain_by_id("chain2").await.unwrap();
@@ -166,8 +173,10 @@ impl TestVisitor {
         env.create("PROTOCOL", CollectionValue::Visitor(visitor.clone()))
             .await?;
 
-        env.create("REQ_from_ip", CollectionValue::Visitor(visitor.clone())).await?;
-        env.create("REQ_url", CollectionValue::Visitor(visitor.clone())).await?;
+        env.create("REQ_from_ip", CollectionValue::Visitor(visitor.clone()))
+            .await?;
+        env.create("REQ_url", CollectionValue::Visitor(visitor.clone()))
+            .await?;
 
         info!("TestVisitor registered successfully");
         Ok(())
@@ -185,7 +194,11 @@ impl VariableVisitor for TestVisitor {
         }
     }
 
-    async fn set(&self, id: &str, value: CollectionValue) -> Result<Option<CollectionValue>, String> {
+    async fn set(
+        &self,
+        id: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
         match id {
             "$PROTOCOL" | "REQ_from_ip" => {
                 let msg = format!("Cannot set read-only variable '{}'", id);
@@ -203,7 +216,7 @@ impl VariableVisitor for TestVisitor {
             _ => Err(format!("Variable '{}' is read-only", id)),
         }
     }
-} 
+}
 
 async fn test_hook_point() -> Result<(), String> {
     // Create a hook point
@@ -242,7 +255,10 @@ async fn test_hook_point() -> Result<(), String> {
 
     // Init some visitors
     let test_visitor = TestVisitor::new();
-    test_visitor.register(hook_point_env.global_env()).await.unwrap();
+    test_visitor
+        .register(hook_point_env.global_env())
+        .await
+        .unwrap();
 
     let exec = hook_point_env.prepare_exec_list(&hook_point);
     let ret = exec.execute_all().await.unwrap();
@@ -256,7 +272,10 @@ async fn test_hook_point() -> Result<(), String> {
     info!("Hook point output: {}", output);
 
     let global_env = hook_point_env.global_env();
-    assert_eq!(global_env.get("key2").await.unwrap().unwrap().as_str(), Some("value1_value2"));
+    assert_eq!(
+        global_env.get("key2").await.unwrap().unwrap().as_str(),
+        Some("value1_value2")
+    );
 
     Ok(())
 }
@@ -265,7 +284,7 @@ async fn test_hook_point() -> Result<(), String> {
 async fn test_process_chain_main() {
     use simplelog::*;
     TermLogger::init(
-        LevelFilter::Debug,
+        LevelFilter::Info,
         Config::default(),
         TerminalMode::Mixed,
         ColorChoice::Auto,
@@ -274,6 +293,10 @@ async fn test_process_chain_main() {
         // If TermLogger is not available (e.g., in some environments), fall back to SimpleLogger
         SimpleLogger::init(LevelFilter::Info, Config::default()).unwrap()
     });
+
+    EXTERNAL_COMMAND_FACTORY
+        .register("add", Arc::new(Box::new(AddCommand::new())))
+        .unwrap();
 
     match test_process_chain().await {
         Ok(_) => println!("Process chain executed successfully"),

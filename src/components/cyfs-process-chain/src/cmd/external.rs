@@ -130,7 +130,7 @@ impl CommandParser for ExternalCommandParser {
             msg
         })?;
 
-        let command_args = match matches.index_of("args") {
+        let command_args = match matches.index_of("command") {
             Some(index) => {
                 let args = args.as_slice().get(index..).unwrap();
                 CommandArgs::new(args.to_owned())
@@ -180,7 +180,7 @@ impl CommandParser for ExternalCommandParser {
             msg
         })?;
 
-        let (args, origin_args) = match matches.index_of("args") {
+        let (args, origin_args) = match matches.index_of("command") {
             Some(index) => {
                 let args = args.as_slice().get(index..).unwrap();
                 let origin_args = origin_args.as_slice().get(index..).unwrap();

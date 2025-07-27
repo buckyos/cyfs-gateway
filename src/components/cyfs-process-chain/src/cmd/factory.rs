@@ -1,11 +1,12 @@
 use super::action::ActionCommandParser;
-use super::var::*;
 use super::cmd::*;
 use super::coll::*;
 use super::control::*;
 use super::debug::EchoCommandParser;
+use super::external::*;
 use super::match_::*;
 use super::string::*;
+use super::var::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -142,6 +143,9 @@ impl CommandParserFactory {
 
         // debug
         self.register("echo", Arc::new(Box::new(EchoCommandParser::new())));
+
+        // external commands
+        self.register("call", Arc::new(Box::new(ExternalCommandParser::new())));
     }
 }
 
