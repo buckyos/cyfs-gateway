@@ -353,7 +353,7 @@ impl BlockParser {
         // Unquoted string, must start with a letter or underscore, followed by letters, digits, underscores, hyphens, or dots
         let unquoted = map(
             recognize(pair(
-                alt((nom::character::complete::alpha1, tag("_"))),
+                alt((nom::character::complete::alphanumeric1, tag("_"))),
                 many0(alt((
                     nom::character::complete::alphanumeric1,
                     tag("_"),
