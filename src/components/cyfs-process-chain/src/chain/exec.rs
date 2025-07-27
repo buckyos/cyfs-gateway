@@ -1,4 +1,4 @@
-use super::chain::{ProcessChain, ProcessChainManager, ProcessChainManagerRef, ProcessChainRef};
+use super::chain::{ProcessChain, ProcessChainManagerRef, ProcessChainRef};
 use super::context::{Context, GotoCounter};
 use super::env::EnvRef;
 use crate::block::BlockExecuter;
@@ -112,11 +112,7 @@ impl ProcessChainsExecutor {
         pipe: CommandPipe,
     ) -> Self {
         let counter = Arc::new(GotoCounter::new());
-        let context = Context::new(
-            global_env.clone(),
-            counter,
-            pipe.clone(),
-        );
+        let context = Context::new(global_env.clone(), counter, pipe.clone());
 
         Self {
             process_chain_manager,
@@ -230,21 +226,15 @@ pub struct ProcessChainListExecutor {
 
 impl ProcessChainListExecutor {
     pub fn new(
-        process_chain_manager: &ProcessChainManager,
+        mut process_chain_list: Vec<ProcessChainRef>,
         global_env: EnvRef,
         pipe: CommandPipe,
     ) -> Self {
-        let mut process_chain_list = process_chain_manager.clone_process_chain_list();
-
         // Ensure the process chain list is sorted by priority
         process_chain_list.sort_by_key(|chain| chain.priority());
 
         let counter = Arc::new(GotoCounter::new());
-        let context = Context::new(
-            global_env.clone(),
-            counter,
-            pipe.clone(),
-        );
+        let context = Context::new(global_env.clone(), counter, pipe.clone());
 
         Self {
             process_chain_list,
@@ -277,6 +267,18 @@ impl ProcessChainListExecutor {
         self.process_chain_list
             .iter()
             .position(|chain| chain.id() == id)
+    }
+
+    pub fn fork(&self) -> Self {
+        let counter = Arc::new(GotoCounter::new());
+        let context = Context::new(self.global_env.clone(), counter, self.pipe.clone());
+
+        Self {
+            process_chain_list: self.process_chain_list.clone(),
+            global_env: self.global_env.clone(),
+            pipe: self.pipe.clone(),
+            context,
+        }
     }
 
     pub async fn execute_all(&self) -> Result<CommandResult, String> {
@@ -343,3 +345,5 @@ impl ProcessChainListExecutor {
         Ok(final_result)
     }
 }
+
+pub type ProcessChainsExecutorRef = Arc<ProcessChainsExecutor>;

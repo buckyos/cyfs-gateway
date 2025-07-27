@@ -1,5 +1,5 @@
 use crate::block::CommandArgs;
-use crate::chain::Context;
+use crate::chain::{Context, ParserContext};
 use crate::collection::CollectionValue;
 use std::sync::Arc;
 use clap::Command;
@@ -57,9 +57,27 @@ pub trait CommandParser: Send + Sync {
         format!("Usage: {}", name)
     }
 
+    fn check_with_context(
+        &self,
+        _context: &ParserContext,
+        args: &CommandArgs,
+    ) -> Result<(), String> {
+        // Default implementation, can be overridden by specific command parsers
+        self.check(args)
+    }
+
     // To check if the command is valid at first parse, such as checking if the params count is correct.
     // This is used to validate the command before load params if needed and executing it.
     fn check(&self, args: &CommandArgs) -> Result<(), String>;
+
+    fn parse_origin_with_context(
+        &self,
+        _context: &ParserContext,
+        args: Vec<CollectionValue>,
+        origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        self.parse_origin(args, origin_args)
+    }
 
     fn parse_origin(
         &self,

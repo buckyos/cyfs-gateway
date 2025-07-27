@@ -1,5 +1,5 @@
 use super::hook_point::HookPoint;
-use crate::chain::{Env, EnvLevel, EnvRef, ProcessChainListExecutor, ProcessChainsExecutor};
+use crate::chain::*;
 use crate::collection::*;
 use crate::pipe::SharedMemoryPipe;
 use std::path::{Path, PathBuf};
@@ -10,6 +10,7 @@ pub struct HookPointEnv {
     data_dir: PathBuf,
     global_env: EnvRef,
     pipe: SharedMemoryPipe,
+    parser_context: ParserContextRef,
 }
 
 impl HookPointEnv {
@@ -17,11 +18,14 @@ impl HookPointEnv {
         let pipe: SharedMemoryPipe = SharedMemoryPipe::new_empty();
 
         let global_env = Arc::new(Env::new(EnvLevel::Global, None));
+        let parser_context = ParserContext::new();
+
         Self {
             id: id.into(),
             data_dir,
             global_env,
             pipe,
+            parser_context: Arc::new(parser_context),
         }
     }
 
@@ -31,6 +35,10 @@ impl HookPointEnv {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn parser_context(&self) -> &ParserContextRef {
+        &self.parser_context
     }
 
     pub fn global_env(&self) -> &EnvRef {
@@ -148,14 +156,40 @@ impl HookPointEnv {
         Ok(())
     }
 
+    async fn prepare_chain_list(
+        &self,
+        hook_point: &HookPoint,
+    ) -> Result<Vec<ProcessChainRef>, String> {
+        let list = hook_point
+            .process_chain_manager()
+            .clone_process_chain_list();
+        let mut chains = Vec::with_capacity(list.len());
+
+        for chain in &list {
+            let mut chain = (chain.as_ref()).clone();
+            chain.translate(&self.parser_context).await.map_err(|e| {
+                let msg = format!("Failed to translate process chain '{}': {}", chain.id(), e);
+                error!("{}", msg);
+                msg
+            })?;
+
+            chains.push(Arc::new(chain));
+        }
+
+        Ok(chains)
+    }
+
     // Prepare execute the chain list defined in the hook point, will return a ProcessChainListExecutor
     // which can be used to execute the chain list.
-    pub fn prepare_exec_list(&self, hook_point: &HookPoint) -> ProcessChainListExecutor {
-        ProcessChainListExecutor::new(
-            hook_point.process_chain_manager(),
+    pub async fn prepare_exec_list(
+        &self,
+        hook_point: &HookPoint,
+    ) -> Result<ProcessChainListExecutor, String> {
+        Ok(ProcessChainListExecutor::new(
+            self.prepare_chain_list(hook_point).await?,
             self.global_env.clone(),
             self.pipe.pipe().clone(),
-        )
+        ))
     }
 
     /*
@@ -175,12 +209,18 @@ impl HookPointEnv {
 
     // Prepare a ProcessChainsExecutor to execute the chain in the hook point
     // This executor can be used to execute a single chain or multiple chains.
-    pub fn prepare_exec_chain(&self, hook_point: &HookPoint) -> ProcessChainsExecutor {
-        ProcessChainsExecutor::new(
-            hook_point.process_chain_manager().clone(),
+    pub async fn prepare_exec_chain(
+        &self,
+        hook_point: &HookPoint,
+    ) -> Result<ProcessChainsExecutor, String> {
+        let list = self.prepare_chain_list(hook_point).await?;
+        let process_chain_manager = Arc::new(ProcessChainManager::new_with_chains(list));
+
+        Ok(ProcessChainsExecutor::new(
+            process_chain_manager,
             self.global_env.clone(),
             self.pipe.pipe().clone(),
-        )
+        ))
     }
 
     /*

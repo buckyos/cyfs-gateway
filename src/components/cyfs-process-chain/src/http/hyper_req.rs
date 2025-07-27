@@ -21,7 +21,11 @@ impl HyperHttpRequestHeaderMap {
 
     pub fn into_request(self) -> Result<Request, String> {
         let req = Arc::try_unwrap(self.request)
-            .map_err(|_| "Failed to unwrap HyperHttpRequestHeaderMap".to_string())?
+            .map_err(|_| {
+                let msg = "Failed to unwrap HyperHttpRequestHeaderMap".to_string();
+                error!("{}", msg);
+                msg
+            })?
             .into_inner();
 
         Ok(req)

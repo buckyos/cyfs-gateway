@@ -10,8 +10,9 @@ pub struct ProcessChainREPL {
     root_dir: PathBuf,
     env: HookPointEnvRef,
     line_index: AtomicUsize,
-    pipe: SharedMemoryPipe, // Pipe for command execution
-    context: Context,       // Context for the REPL chain
+    pipe: SharedMemoryPipe,        // Pipe for command execution
+    context: Context,              // Context for the REPL chain
+    parser_context: ParserContextRef, // Context for parsing commands
 }
 
 impl ProcessChainREPL {
@@ -39,6 +40,7 @@ impl ProcessChainREPL {
             line_index: AtomicUsize::new(0),
             pipe,
             context,
+            parser_context: Arc::new(ParserContext::new()),
         })
     }
 
@@ -221,7 +223,10 @@ impl ProcessChainREPL {
         })?;
 
         // Translate the block
-        let translator = BlockCommandTranslator::new(COMMAND_PARSER_FACTORY.clone());
+        let translator = BlockCommandTranslator::new(
+            self.parser_context.clone(),
+            COMMAND_PARSER_FACTORY.clone(),
+        );
         if let Err(e) = translator.translate(&mut item).await {
             let msg = format!("Translate block error: {}, {}", line, e);
             error!("{}", msg);

@@ -90,7 +90,7 @@ async fn process_request(req: Request<Body>) -> Result<Response<Body>, Infallibl
 
 async fn pre_process_request(
     req: Request<Body>,
-    hook_manager: &HttpHookManagerRef,
+    exec: ProcessChainListExecutor,
 ) -> Result<Request<Body>, Response<Body>> {
     info!("Pre-processing request: {:?}", req);
 
@@ -98,10 +98,6 @@ async fn pre_process_request(
     let req_map = HyperHttpRequestHeaderMap::new(req);
 
     {
-        let exec = hook_manager
-            .hook_point_env
-            .prepare_exec_list(&hook_manager.hook_point);
-
         // Register visitors for the request headers in the chain environment
         let chain_env = exec.chain_env();
         req_map.register_visitors(&chain_env).await.unwrap();
@@ -131,17 +127,18 @@ async fn pre_process_request(
         }
     }
 
+    drop(exec); // Ensure the executor is dropped before we unwrap the request
     let req = req_map.into_request().unwrap();
     Ok(req)
 }
 
 async fn handle(
     req: Request<Body>,
-    hook_manager: HttpHookManagerRef,
+    exec: ProcessChainListExecutor,
 ) -> Result<Response<Body>, Infallible> {
     info!("Handling request: {:?}", req);
 
-    let req = match pre_process_request(req, &hook_manager).await {
+    let req = match pre_process_request(req, exec).await {
         Ok(req) => req,
         Err(response) => return Ok(response),
     };
@@ -152,13 +149,17 @@ async fn handle(
 }
 
 async fn server_main() {
-    let hok_manager = HttpHookManager::create(PROCESS_CHAIN).await.unwrap();
-    let hook_manager = Arc::new(hok_manager);
+    let hook_manager = HttpHookManager::create(PROCESS_CHAIN).await.unwrap();
+    let hook_manager = Arc::new(hook_manager);
+
+    let exec = hook_manager.hook_point_env.prepare_exec_list(&hook_manager.hook_point).await.unwrap();
+    let exec = Arc::new(exec);
 
     let addr = ([127, 0, 0, 1], 3000).into();
     let make_svc = make_service_fn(move |_conn| {
-        let hook_manager = hook_manager.clone();
-        async move { Ok::<_, Infallible>(service_fn(move |req| handle(req, hook_manager.clone()))) }
+        // For each connection, we should fork the exec to ensure it is available for the request handler
+        let exec = exec.clone();
+        async move { Ok::<_, Infallible>(service_fn(move |req| handle(req, exec.fork()))) }
     });
 
     let server = Server::bind(&addr).serve(make_svc);

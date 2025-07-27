@@ -4,6 +4,7 @@ use crate::block::*;
 use crate::cmd::{COMMAND_PARSER_FACTORY, CommandResult};
 use std::sync::{Arc, RwLock};
 
+#[derive(Debug, Clone)]
 pub struct ProcessChain {
     id: String,
     priority: i32,
@@ -52,8 +53,9 @@ impl ProcessChain {
         &self.blocks
     }
 
-    pub async fn translate(&mut self) -> Result<(), String> {
-        let translator = BlockCommandTranslator::new(COMMAND_PARSER_FACTORY.clone());
+    pub async fn translate(&mut self, context: &ParserContextRef) -> Result<(), String> {
+        let translator =
+            BlockCommandTranslator::new(context.clone(), COMMAND_PARSER_FACTORY.clone());
         // Translate each block in the chain
         for block in &mut self.blocks {
             translator.translate(block).await?;
@@ -71,6 +73,46 @@ impl ProcessChain {
 
 pub type ProcessChainRef = Arc<ProcessChain>;
 
+use crate::cmd::{EXTERNAL_COMMAND_FACTORY, ExternalCommandFactory, ExternalCommandRef};
+
+pub struct ParserContext {
+    external_commands: ExternalCommandFactory,
+}
+
+impl ParserContext {
+    pub fn new() -> Self {
+        Self {
+            external_commands: ExternalCommandFactory::new(),
+        }
+    }
+
+    pub fn register_external_command(
+        &self,
+        name: &str,
+        command: ExternalCommandRef,
+    ) -> Result<(), String> {
+        // First check if the command already exists in global factory
+        if EXTERNAL_COMMAND_FACTORY.get_command(name).is_some() {
+            let msg = format!("External command '{}' already exists in global", name);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        self.external_commands.register(name, command)
+    }
+
+    pub fn get_external_command(&self, name: &str) -> Option<ExternalCommandRef> {
+        if let Some(cmd) = self.external_commands.get_command(name) {
+            return Some(cmd);
+        }
+
+        // If not found, check the global factory
+        EXTERNAL_COMMAND_FACTORY.get_command(name)
+    }
+}
+
+pub type ParserContextRef = Arc<ParserContext>;
+
 // Manager for process chain with ids
 pub struct ProcessChainManager {
     chains: RwLock<Vec<ProcessChainRef>>,
@@ -80,6 +122,12 @@ impl ProcessChainManager {
     pub fn new() -> Self {
         ProcessChainManager {
             chains: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub fn new_with_chains(chains: Vec<ProcessChainRef>) -> Self {
+        ProcessChainManager {
+            chains: RwLock::new(chains),
         }
     }
 

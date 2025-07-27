@@ -35,8 +35,7 @@ impl HookPoint {
         let chains = ProcessChainXMLLoader::parse(content)?;
 
         // Append all chains to the manager
-        for mut chain in chains {
-            chain.translate().await?;
+        for chain in chains {
             self.add_process_chain(chain)?;
         }
 

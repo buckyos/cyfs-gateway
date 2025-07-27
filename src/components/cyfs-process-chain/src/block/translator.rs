@@ -1,16 +1,19 @@
-use super::block::{Block, CommandArg, CommandItem, Expression};
-use super::exec::DynamicCommandExecutor;
-use crate::cmd::{CommandExecutor, CommandParserFactory};
+use super::block::{Block, CommandArg, CommandArgs, CommandItem, Expression};
+use super::exec::BlockExecuter;
+use crate::chain::{Context, ParserContextRef};
+use crate::cmd::{CommandExecutor, CommandParser, CommandParserFactory, CommandResult};
 use crate::collection::CollectionValue;
 use std::sync::Arc;
 
+
 pub struct BlockCommandTranslator {
+    context: ParserContextRef,
     parser: CommandParserFactory,
 }
 
 impl BlockCommandTranslator {
-    pub fn new(parser: CommandParserFactory) -> Self {
-        Self { parser }
+    pub fn new(context: ParserContextRef, parser: CommandParserFactory) -> Self {
+        Self { context, parser }
     }
 
     pub async fn translate(&self, block: &mut Block) -> Result<(), String> {
@@ -53,7 +56,7 @@ impl BlockCommandTranslator {
         let parser = parser.unwrap();
 
         // First check if the command is valid
-        if let Err(e) = parser.check(&cmd.command.args) {
+        if let Err(e) = parser.check_with_context(&self.context, &cmd.command.args) {
             let msg = format!("Invalid command: {:?} {}", cmd.command, e);
             error!("{}", msg);
             return Err(msg);
@@ -66,11 +69,13 @@ impl BlockCommandTranslator {
                 .iter()
                 .map(|s| CollectionValue::String(s.to_string()))
                 .collect();
-            parser.parse_origin(args, &cmd.command.args).map_err(|e| {
-                let msg = format!("Parse command error: {:?}, {:?}", cmd.command, e);
-                error!("{}", msg);
-                msg
-            })?
+            parser
+                .parse_origin_with_context(&self.context, args, &cmd.command.args)
+                .map_err(|e| {
+                    let msg = format!("Parse command error: {:?}, {:?}", cmd.command, e);
+                    error!("{}", msg);
+                    msg
+                })?
         } else {
             for arg in cmd.command.args.iter_mut() {
                 match arg {
@@ -81,7 +86,7 @@ impl BlockCommandTranslator {
                 }
             }
 
-            let exec = DynamicCommandExecutor::new(parser, cmd.take_args());
+            let exec = DelayedCommandExecutor::new(self.context.clone(), parser, cmd.take_args());
 
             Arc::new(Box::new(exec) as Box<dyn CommandExecutor>)
         };
@@ -89,5 +94,72 @@ impl BlockCommandTranslator {
         cmd.executor = Some(executer);
 
         Ok(())
+    }
+}
+
+pub struct DelayedCommandExecutor {
+    context: ParserContextRef,
+    parser: Arc<Box<dyn CommandParser>>,
+    args: CommandArgs,
+}
+
+impl DelayedCommandExecutor {
+    pub fn new(
+        context: ParserContextRef,
+        parser: Arc<Box<dyn CommandParser>>,
+        args: CommandArgs,
+    ) -> Self {
+        Self {
+            context,
+            parser,
+            args,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for DelayedCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        // First exec embedded commands in args to got their values
+        let mut resolved_args = Vec::with_capacity(self.args.len());
+        for arg in &*self.args {
+            match arg {
+                CommandArg::Literal(value) => {
+                    resolved_args.push(CollectionValue::String(value.clone()))
+                }
+                CommandArg::Var(var) => {
+                    // Resolve variable from context
+                    if let Some(value) = context.env().get(&var, None).await? {
+                        resolved_args.push(value);
+                    } else {
+                        // If variable is not found, push an empty string
+                        warn!(
+                            "Variable '{}' not found in context, using empty string",
+                            var
+                        );
+                        resolved_args.push(CollectionValue::String(String::new()));
+                    }
+                }
+                CommandArg::CommandSubstitution(cmd) => {
+                    // Execute the command and get its result
+                    let ret = BlockExecuter::execute_expression(&cmd, context).await?;
+                    if !ret.is_substitution_value() {
+                        let msg = format!("Command substitution did not return a value: {:?}", cmd);
+                        warn!("{}", msg);
+                        return Err(msg);
+                    }
+
+                    resolved_args.push(CollectionValue::String(
+                        ret.into_substitution_value().unwrap(),
+                    ));
+                }
+            }
+        }
+
+        // Parse the command using the dynamic parser
+        let executor =
+            self.parser
+                .parse_origin_with_context(&self.context, resolved_args, &self.args)?;
+        executor.exec(context).await
     }
 }

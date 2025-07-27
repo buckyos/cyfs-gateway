@@ -1,6 +1,6 @@
 use super::cmd::*;
 use crate::block::CommandArgs;
-use crate::chain::Context;
+use crate::chain::{Context, ParserContext};
 use crate::collection::CollectionValue;
 use clap::{Arg, Command};
 use std::collections::HashMap;
@@ -24,6 +24,7 @@ pub trait ExternalCommand: Send + Sync {
 
 pub type ExternalCommandRef = Arc<Box<dyn ExternalCommand>>;
 
+#[derive(Clone)]
 pub struct ExternalCommandFactory {
     commands: Arc<Mutex<HashMap<String, ExternalCommandRef>>>,
 }
@@ -112,7 +113,11 @@ impl CommandParser for ExternalCommandParser {
         CommandGroup::External
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+    fn check_with_context(
+            &self,
+            context: &ParserContext,
+            args: &CommandArgs,
+        ) -> Result<(), String> {
         let matches = self
             .cmd
             .clone()
@@ -124,7 +129,7 @@ impl CommandParser for ExternalCommandParser {
             })?;
 
         let cmd = matches.get_one::<String>("command").unwrap();
-        let command = EXTERNAL_COMMAND_FACTORY.get_command(cmd).ok_or_else(|| {
+        let command = context.get_external_command(cmd).ok_or_else(|| {
             let msg = format!("External command '{}' not found", cmd);
             error!("{}", msg);
             msg
@@ -143,11 +148,17 @@ impl CommandParser for ExternalCommandParser {
         Ok(())
     }
 
-    fn parse_origin(
-        &self,
-        args: Vec<CollectionValue>,
-        origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
+    fn check(&self, _args: &CommandArgs) -> Result<(), String> {
+        unreachable!("Should not be called, use check_with_context instead");
+    }
+
+    fn parse_origin_with_context(
+            &self,
+            context: &ParserContext,
+            args: Vec<CollectionValue>,
+            origin_args: &CommandArgs,
+        ) -> Result<CommandExecutorRef, String> {
+
         let str_args = args
             .iter()
             .map(|value| value.to_string())
@@ -174,7 +185,7 @@ impl CommandParser for ExternalCommandParser {
         }
 
         let cmd = matches.get_one::<String>("command").unwrap();
-        let command = EXTERNAL_COMMAND_FACTORY.get_command(cmd).ok_or_else(|| {
+        let command = context.get_external_command(cmd).ok_or_else(|| {
             let msg = format!("External command '{}' not found", cmd);
             error!("{}", msg);
             msg

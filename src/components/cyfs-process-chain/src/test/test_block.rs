@@ -88,6 +88,8 @@ const PROCESS_CHAIN: &str = r#"
 "#;
 
 async fn test_process_chain() -> Result<(), String> {
+    let parser_context = Arc::new(ParserContext::new());
+
     // Parse the process chain
     let chains = ProcessChainXMLLoader::parse(PROCESS_CHAIN)?;
     assert_eq!(chains.len(), 2);
@@ -99,7 +101,7 @@ async fn test_process_chain() -> Result<(), String> {
 
     // Append all chains to the manager
     for mut chain in chains {
-        chain.translate().await.unwrap();
+        chain.translate(&parser_context).await.unwrap();
         manager.add_chain(chain).unwrap();
     }
 
@@ -260,7 +262,7 @@ async fn test_hook_point() -> Result<(), String> {
         .await
         .unwrap();
 
-    let exec = hook_point_env.prepare_exec_list(&hook_point);
+    let exec = hook_point_env.prepare_exec_list(&hook_point).await.unwrap();
     let ret = exec.execute_all().await.unwrap();
     assert!(ret.is_accept());
 
