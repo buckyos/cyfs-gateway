@@ -1,4 +1,11 @@
 [workspace]
 members = [
     "components/cyfs-process-chain",
+    "components/cyfs-dns",
+    "components/cyfs-warp",
+    "components/cyfs-socks",
+    "components/cyfs-gateway-lib",
+    "components/cyfs-sn",
+
+    "apps/cyfs_gateway",
 ]
