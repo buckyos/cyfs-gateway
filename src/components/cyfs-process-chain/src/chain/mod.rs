@@ -1,9 +1,11 @@
 mod chain;
-mod env;
-mod exec;
 mod context;
+mod env;
+mod env_manager;
+mod exec;
 
 pub use chain::*;
-pub use env::*;
-pub use exec::*;
 pub use context::*;
+pub use env::*;
+pub use env_manager::*;
+pub use exec::*;
