@@ -11,7 +11,7 @@ mod socks;
 mod selector;
 mod acme_client;
 mod cert_mgr;
-
+mod server;
 
 pub use aes_stream::*;
 pub use config::*;
@@ -23,6 +23,7 @@ pub use socks::*;
 pub use selector::*;
 pub use cert_mgr::*;
 pub use acme_client::*;
+pub use server::*;
 
 use once_cell::sync::OnceCell;
 use thiserror::Error;

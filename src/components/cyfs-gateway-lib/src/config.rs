@@ -2,7 +2,9 @@
 
 use tokio::fs;
 use std::collections::HashMap;
-use serde::Deserialize;
+use std::net::{IpAddr, Ipv4Addr};
+use std::str::FromStr;
+use serde::{Deserialize, Serialize};
 use url::Url;
 use cyfs_socks::SocksProxyConfig;
 
@@ -255,6 +257,325 @@ impl DispatcherConfig {
     }
 }
 
+
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Copy)]
+pub enum CyfsServerProtocol {
+    #[serde(rename = "tcp")]
+    TCP,
+    #[serde(rename = "udp")]
+    UDP,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BlockConfig {
+    pub id: String,
+    pub block: String,
+}
+
+impl BlockConfig {
+    pub fn create_block(&self) -> ConfigResult<Block> {
+        let parser = BlockParser::new(self.id.as_str());
+        parser.parse(self.block.as_str()).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "{}",
+                e
+            )
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ProcessChainConfig {
+    pub id: String,
+    pub priority: i32,
+    pub blocks: Vec<BlockConfig>,
+}
+
+impl ProcessChainConfig {
+    pub fn create_process_chain(&self) -> ConfigResult<ProcessChain> {
+        let mut chain = ProcessChain::new(self.id.clone(), self.priority);
+        for block in self.blocks.iter() {
+            chain.add_block(block.create_block()?).map_err(|e| {
+                config_err!(
+                    ConfigErrorCode::InvalidConfig,
+                    "{}",
+                    e
+                )
+            })?;
+        }
+        Ok(chain)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CyfsServerConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<CyfsServerProtocol>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bind: Option<IpAddr>,
+    port: u16,
+    process_chains: Vec<ProcessChainConfig>,
+}
+
+impl CyfsServerConfig {
+    pub fn new(listen: u16) -> Self {
+        CyfsServerConfig {
+            protocol: None,
+            bind: None,
+            port: listen,
+            process_chains: vec![],
+        }
+    }
+
+    pub fn set_protocol(&mut self, protocol: CyfsServerProtocol) {
+        self.protocol = Some(protocol);
+    }
+
+    pub fn set_bind(&mut self, bind: IpAddr) {
+        self.bind = Some(bind);
+    }
+
+    pub fn add_process_chain(&mut self, process_chain: ProcessChainConfig) {
+        self.process_chains.push(process_chain);
+    }
+
+    pub fn get_protocol(&self) -> CyfsServerProtocol {
+        self.protocol.unwrap_or(CyfsServerProtocol::TCP)
+    }
+
+    pub fn get_bind(&self) -> IpAddr {
+        self.bind.unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)))
+    }
+
+    pub fn get_port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn get_process_chains(&self) -> &Vec<ProcessChainConfig> {
+        &self.process_chains
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum ConfigErrorCode {
+    InvalidConfig,
+}
+pub type ConfigResult<T> = sfo_result::Result<T, ConfigErrorCode>;
+pub type ConfigError = sfo_result::Error<ConfigErrorCode>;
+use sfo_result::err as config_err;
+use cyfs_process_chain::{Block, BlockParser, ProcessChain};
+
+pub trait CyfsServerConfigParser {
+    fn parse(config: &str) -> ConfigResult<Vec<CyfsServerConfig>>;
+}
+
+pub trait CyfsServerConfigDumps {
+    fn dumps(config: &[CyfsServerConfig]) -> ConfigResult<String>;
+}
+
+#[derive(Serialize, Deserialize)]
+struct YamlServers {
+    servers: Vec<YamlServer>
+}
+
+#[derive(Serialize, Deserialize)]
+struct YamlServer {
+    server: CyfsServerConfig,
+}
+
+pub struct YamlCyfsServerConfigParser;
+impl CyfsServerConfigParser for YamlCyfsServerConfigParser {
+    fn parse(config: &str) -> ConfigResult<Vec<CyfsServerConfig>> {
+        let config: YamlServers = serde_pretty_yaml::from_str(config).map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{:?}", e))?;
+        Ok(config.servers.into_iter().map(|s| s.server).collect())
+    }
+}
+
+pub struct YamlCyfsServerConfigDumps;
+impl CyfsServerConfigDumps for YamlCyfsServerConfigDumps {
+    fn dumps(config: &[CyfsServerConfig]) -> ConfigResult<String> {
+        let servers: Vec<YamlServer> = config.iter().map(|s| YamlServer {
+            server: s.clone(),
+        }).collect();
+        Ok(serde_pretty_yaml::to_string(&YamlServers {
+            servers,
+        }).map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{:?}", e))?)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::net::IpAddr;
+    use std::str::FromStr;
+    use crate::{CyfsServerConfigParser, YamlCyfsServerConfigParser};
+
+    #[test]
+    fn test_cyfs_server_config_parse() {
+        let yaml_config = r#"
+servers:
+- server:
+    protocol: tcp
+    bind: 0.0.0.0
+    port: 8080
+    process_chains:
+      - id: main
+        priority: 1
+        blocks:
+            # 根据host匹配的规则
+           - id: default
+             block: |
+                probe_http || probe_https;
+                match $REQ.host "*.buckyos.com" && return "forward tcp://127.0.0.1:8081"";
+                match $REQ.host "*.buckyos.cc" && return "forward tcp://127.0.0.1:8082"";
+
+- server:
+    port: 8085
+    process_chains:
+    - id: main
+      priority: 1
+      blocks:
+        - id: default
+          block: |
+              return "forward tcp://127.0.0.1:8020"";
+
+- server:
+    protocol: udp
+    port: 8081
+    process_chains:
+      - id: main
+        priority: 1
+        blocks:
+            - id: default
+              block: |
+                return "forward udp://127.0.0.1:8082"";
+
+- server:
+    port: 80
+    process_chains:
+    - id: main
+      priority: 1
+      blocks:
+        - id: default
+          block: |
+              probe_http;
+              match $REQ.host "www.buckyos.com" && goto www.buckyos.com;
+    - id: www.buckyos.com
+      priority: 2
+      blocks:
+        - id: default
+          block: |
+              match $REQ.url "/api" && return "forward http://127.0.0.1:8082"";
+
+- server:
+    port: 443
+    process_chains:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              probe_https;
+              match $REQ.host "www.buckyos.com" && resp_tls www.buckyos.com.cert www.buckyos.com.key && goto www.buckyos.com;
+      - id: www.buckyos.com
+        priority: 2
+        blocks:
+          - id: default
+            block: |
+              match $REQ.url "/api" && return "forward https://127.0.0.1:8082"";
+
+"#;
+        let config = YamlCyfsServerConfigParser::parse(yaml_config).unwrap();
+        assert_eq!(config.len(), 5);
+        assert_eq!(config[0].protocol, Some(super::CyfsServerProtocol::TCP));
+        assert_eq!(config[0].bind, Some(IpAddr::from_str("0.0.0.0").unwrap()));
+        assert_eq!(config[0].port, 8080);
+        assert_eq!(config[0].process_chains.len(), 1);
+        assert_eq!(config[0].process_chains[0].id, "main");
+        assert_eq!(config[0].process_chains[0].priority, 1);
+        assert_eq!(config[0].process_chains[0].blocks.len(), 1);
+        assert_eq!(config[0].process_chains[0].blocks[0].id, "default");
+        assert_eq!(
+            config[0].process_chains[0].blocks[0].block,
+            r#"probe_http || probe_https;
+match $REQ.host "*.buckyos.com" && return "forward tcp://127.0.0.1:8081"";
+match $REQ.host "*.buckyos.cc" && return "forward tcp://127.0.0.1:8082"";
+"#
+        );
+        assert_eq!(config[1].protocol, None);
+        assert_eq!(config[1].bind, None);
+        assert_eq!(config[1].port, 8085);
+        assert_eq!(config[1].process_chains.len(), 1);
+        assert_eq!(config[1].process_chains[0].id, "main");
+        assert_eq!(config[1].process_chains[0].priority, 1);
+        assert_eq!(config[1].process_chains[0].blocks.len(), 1);
+        assert_eq!(config[1].process_chains[0].blocks[0].id, "default");
+        assert_eq!(
+            config[1].process_chains[0].blocks[0].block,
+            r#"return "forward tcp://127.0.0.1:8020"";
+"#
+        );
+        assert_eq!(config[2].protocol, Some(super::CyfsServerProtocol::UDP));
+        assert_eq!(config[2].bind, None);
+        assert_eq!(config[2].port, 8081);
+        assert_eq!(config[2].process_chains.len(), 1);
+        assert_eq!(config[2].process_chains[0].id, "main");
+        assert_eq!(config[2].process_chains[0].priority, 1);
+        assert_eq!(config[2].process_chains[0].blocks.len(), 1);
+        assert_eq!(config[2].process_chains[0].blocks[0].id, "default");
+        assert_eq!(
+            config[2].process_chains[0].blocks[0].block,
+            r#"return "forward udp://127.0.0.1:8082"";
+"#
+        );
+        assert_eq!(config[3].protocol, None);
+        assert_eq!(config[3].bind, None);
+        assert_eq!(config[3].port, 80);
+        assert_eq!(config[3].process_chains.len(), 2);
+        assert_eq!(config[3].process_chains[0].id, "main");
+        assert_eq!(config[3].process_chains[0].priority, 1);
+        assert_eq!(config[3].process_chains[0].blocks.len(), 1);
+        assert_eq!(config[3].process_chains[0].blocks[0].id, "default");
+        assert_eq!(
+            config[3].process_chains[0].blocks[0].block,
+            r#"probe_http;
+match $REQ.host "www.buckyos.com" && goto www.buckyos.com;
+"#
+        );
+        assert_eq!(config[3].process_chains[1].id, "www.buckyos.com");
+        assert_eq!(config[3].process_chains[1].priority, 2);
+        assert_eq!(config[3].process_chains[1].blocks.len(), 1);
+        assert_eq!(config[3].process_chains[1].blocks[0].id, "default");
+        assert_eq!(
+            config[3].process_chains[1].blocks[0].block,
+            r#"match $REQ.url "/api" && return "forward http://127.0.0.1:8082"";
+"#
+        );
+        assert_eq!(config[4].protocol, None);
+        assert_eq!(config[4].bind, None);
+        assert_eq!(config[4].port, 443);
+        assert_eq!(config[4].process_chains.len(), 2);
+        assert_eq!(config[4].process_chains[0].id, "main");
+        assert_eq!(config[4].process_chains[0].priority, 1);
+        assert_eq!(config[4].process_chains[0].blocks.len(), 1);
+        assert_eq!(config[4].process_chains[0].blocks[0].id, "default");
+        assert_eq!(
+            config[4].process_chains[0].blocks[0].block,
+            r#"probe_https;
+match $REQ.host "www.buckyos.com" && resp_tls www.buckyos.com.cert www.buckyos.com.key && goto www.buckyos.com;
+"#
+        );
+        assert_eq!(config[4].process_chains[1].id, "www.buckyos.com");
+        assert_eq!(config[4].process_chains[1].priority, 2);
+        assert_eq!(config[4].process_chains[1].blocks.len(), 1);
+        assert_eq!(config[4].process_chains[1].blocks[0].id, "default");
+        assert_eq!(
+            config[4].process_chains[1].blocks[0].block,
+            r#"match $REQ.url "/api" && return "forward https://127.0.0.1:8082"";
+"#
+        );
+    }
+}
 
 pub fn gen_demo_gateway_json_config() -> String {
     let result = r#"
