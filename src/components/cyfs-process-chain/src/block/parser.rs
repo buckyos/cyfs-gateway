@@ -72,13 +72,13 @@ impl BlockParser {
         }
 
         let (rest, statements) = Self::parse_statements(trimmed).map_err(|e| {
-            let msg = format!("Parse expressions error: {}, {:?}", trimmed, e);
+            let msg = format!("Parse statements error: {}, {:?}", trimmed, e);
             error!("{}", msg);
             msg
         })?;
 
         if !rest.trim().is_empty() {
-            let msg = format!("Unexpected content after statements: '{}'", rest);
+            let msg = format!("Unexpected content after statements: {}, rest='{}'", trimmed, rest);
             error!("{}", msg);
             return Err(msg);
         }
@@ -151,7 +151,7 @@ impl BlockParser {
         if exprs.len() > 1 {
             for expr in &exprs[..exprs.len() - 1] {
                 if expr.2.is_none() {
-                    let msg = format!("Expression without operator: {:?}", expr);
+                    let msg = format!("Expression without operator: {}, expr={:?}", input, expr);
                     error!("{}", msg);
                     return Err(nom::Err::Failure(nom::error::Error::from_error_kind(
                         i,
@@ -279,7 +279,7 @@ impl BlockParser {
 
         let cmd = if let Some(name) = cmd_name.as_literal_str() {
             if name.starts_with('-') {
-                let msg = format!("Command name cannot start with '-', got: {}", name);
+                let msg = format!("Command name cannot start with '-', got: {}, {}", name, input);
                 error!("{}", msg);
                 return Err(nom::Err::Error(nom::error::Error::from_error_kind(
                     input,
