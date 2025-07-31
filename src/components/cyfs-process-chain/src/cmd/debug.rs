@@ -168,6 +168,14 @@ impl EchoCommandExecutor {
                 // TODO: Implement visitor output
                 "[Visitor]".to_string()
             }
+            CollectionValue::Any(any) => {
+                // If it's an Any type, we can try to downcast it to a known type
+                if let Some(s) = any.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    format!("[Any: {:?}]", any)
+                }
+            }
         };
 
         Ok(ret)

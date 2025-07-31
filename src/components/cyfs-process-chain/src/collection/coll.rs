@@ -1,7 +1,9 @@
 use super::var::VariableVisitorRef;
 use std::sync::Arc;
 use std::collections::HashSet;
+use std::any::Any;
 
+pub type AnyRef = Arc<dyn Any + Send + Sync>;
 #[derive(Clone)]
 pub enum CollectionValue {
     String(String),
@@ -9,6 +11,7 @@ pub enum CollectionValue {
     Map(MapCollectionRef),
     MultiMap(MultiMapCollectionRef),
     Visitor(VariableVisitorRef),
+    Any(AnyRef),
 }
 
 pub enum CollectionValueRef<'a> {
@@ -17,6 +20,7 @@ pub enum CollectionValueRef<'a> {
     Map(&'a MapCollectionRef),
     MultiMap(&'a MultiMapCollectionRef),
     Visitor(&'a VariableVisitorRef),
+    Any(&'a AnyRef),
 }
 
 impl std::fmt::Display for CollectionValue {
@@ -27,6 +31,7 @@ impl std::fmt::Display for CollectionValue {
             CollectionValue::Map(_) => write!(f, "[Map]"),
             CollectionValue::MultiMap(_) => write!(f, "[MultiMap]"),
             CollectionValue::Visitor(_) => write!(f, "[Visitor]"),
+            CollectionValue::Any(_) => write!(f, "[Any]"),
         }
     }
 }
@@ -64,6 +69,7 @@ impl CollectionValue {
             CollectionValue::Map(_) => "Map",
             CollectionValue::MultiMap(_) => "MultiMap",
             CollectionValue::Visitor(_) => "Visitor",
+            CollectionValue::Any(_) => "Any",
         }
     }
 
@@ -78,6 +84,7 @@ impl CollectionValue {
             CollectionValue::Map(m) => CollectionValueRef::Map(m),
             CollectionValue::MultiMap(mm) => CollectionValueRef::MultiMap(mm),
             CollectionValue::Visitor(v) => CollectionValueRef::Visitor(v),
+            CollectionValue::Any(a) => CollectionValueRef::Any(a),
         }
     }
 
@@ -183,6 +190,34 @@ impl CollectionValue {
     pub fn as_visitor(&self) -> Option<&VariableVisitorRef> {
         if let CollectionValue::Visitor(v) = self {
             Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_any(&self) -> bool {
+        matches!(self, CollectionValue::Any(_))
+    }
+
+    pub fn as_any(&self) -> Option<&AnyRef> {
+        if let CollectionValue::Any(a) = self {
+            Some(a)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_any_type<T: Any + Send + Sync + 'static>(&self) -> Option<Arc<T>> {
+        if let CollectionValue::Any(a) = self {
+            a.clone().downcast::<T>().ok()
+        } else {
+            None
+        }
+    }
+
+    pub fn to_any_type<T: Any + Send + Sync + 'static>(self) -> Option<Arc<T>> {
+        if let CollectionValue::Any(a) = self {
+            a.downcast::<T>().ok()
         } else {
             None
         }

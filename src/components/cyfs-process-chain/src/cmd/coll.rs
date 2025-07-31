@@ -235,9 +235,9 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
             CollectionValue::Set(_) | CollectionValue::Map(_) | CollectionValue::MultiMap(_) => {
                 self.collection.clone()
             }
-            CollectionValue::Visitor(_) => {
+            CollectionValue::Visitor(_) | CollectionValue::Any(_) => {
                 let msg =
-                    "Collection cannot be a visitor type for match-include command".to_string();
+                    "Collection cannot be a visitor or any type for match-include command".to_string();
                 warn!("{}", msg);
                 return Err(msg);
             }
