@@ -3,7 +3,6 @@
 use tokio::fs;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use url::Url;
 use cyfs_socks::SocksProxyConfig;
