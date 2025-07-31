@@ -8,8 +8,10 @@ mod chain;
 mod cmd;
 mod collection;
 mod hook_point;
-mod pipe;
 mod http;
+mod pipe;
+mod tcp;
+//mod js;
 
 #[cfg(test)]
 mod test;
@@ -19,4 +21,6 @@ pub use chain::*;
 pub use cmd::*;
 pub use collection::*;
 pub use hook_point::*;
+pub use http::*;
 pub use pipe::*;
+pub use tcp::*;

@@ -23,3 +23,9 @@ hyper = { version = "0.14", features = ["full"] }
 clap =  { version = "*", features = ["string"]}
 rustyline = "*"
 dirs-next = "*"
+boa_engine = "0.20.0"
+boa_runtime  = "0.20.0"
+boa_gc = "0.20.0"
+futures = "*"
+buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
+pin-project-lite = "*"

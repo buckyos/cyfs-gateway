@@ -7,10 +7,12 @@ mod block;
 mod chain;
 mod cmd;
 mod collection;
+//mod js;
 mod hook_point;
 mod http;
 mod pipe;
 mod repl;
+mod tcp;
 
 #[cfg(test)]
 mod test;
@@ -20,14 +22,17 @@ pub use chain::*;
 pub use cmd::*;
 pub use collection::*;
 pub use hook_point::*;
+pub use http::*;
 pub use pipe::*;
+pub use tcp::*;
 
 use repl::*;
 
 #[tokio::main]
 async fn main() {
     // Initialize logging
-    simplelog::SimpleLogger::init(simplelog::LevelFilter::Info, simplelog::Config::default()).unwrap();
+    simplelog::SimpleLogger::init(simplelog::LevelFilter::Info, simplelog::Config::default())
+        .unwrap();
 
     let ret = ProcessChainREPL::new();
     let repl = match ret {
