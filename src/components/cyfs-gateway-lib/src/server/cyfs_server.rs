@@ -3,6 +3,7 @@ use std::io::{BufReader, Cursor};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use buckyos_kit::AsyncStream;
 use hyper::{Request};
 use rustls::{ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -27,7 +28,7 @@ use tokio::net::{TcpStream};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use url::Url;
-use cyfs_process_chain::{CollectionValue, CommandControl, HookPoint, HookPointEnv, ProcessChainListExecutor};
+use cyfs_process_chain::{CollectionValue, CommandControl, ExternalCommand, HookPoint, HookPointEnv, HttpsSniProbeCommand, ProcessChainListExecutor, StreamRequest, StreamRequestMap};
 
 pub struct CyfsTcpServer {
     executor: Arc<Mutex<ProcessChainListExecutor>>,
@@ -67,6 +68,16 @@ impl CyfsTcpServer {
                 .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{}", e))?;
         }
         let hook_point_env = HookPointEnv::new("cyfs_server_hook_point_env", PathBuf::new());
+
+        let https_sni_probe_command = HttpsSniProbeCommand::new();
+        let name = https_sni_probe_command.name().to_owned();
+        hook_point_env
+            .register_external_command(
+                &name,
+                Arc::new(Box::new(https_sni_probe_command) as Box<dyn ExternalCommand>),
+            )
+            .unwrap();
+
         let executor = hook_point_env.prepare_exec_list(&hook_point).await
             .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
         let executor = Arc::new(Mutex::new(executor));
@@ -78,7 +89,7 @@ impl CyfsTcpServer {
         let locked_executor = executor.clone();
         let handle = tokio::spawn(async move {
             loop {
-                let (socket, _) = match listener.accept().await {
+                let (socket, local_addr) = match listener.accept().await {
                     Ok(pair) => pair,
                     Err(err) => {
                         log::error!("accept error: {}", err);
@@ -91,7 +102,7 @@ impl CyfsTcpServer {
                 };
 
                 tokio::spawn(async move {
-                    if let Err(e) = Self::handle_connect(socket, executor).await {
+                    if let Err(e) = Self::handle_connect(socket, local_addr, executor).await {
                         log::error!("handle connect error: {}", e);
                     }
                 });
@@ -137,15 +148,25 @@ impl CyfsTcpServer {
         )
     }
 
-    async fn handle_connect(socket: TcpStream, executor: ProcessChainListExecutor) -> ServerResult<()> {
+    async fn handle_connect(socket: TcpStream, local_addr: SocketAddr, executor: ProcessChainListExecutor) -> ServerResult<()> {
+        let request = StreamRequest::new(Box::new(socket), local_addr);
+        let request_map = StreamRequestMap::new(request);
         let chain_env = executor.chain_env();
-        let addr = socket.peer_addr().map_err(into_server_err!(ServerErrorCode::StreamError))?;
-        chain_env.create("src_ip", CollectionValue::String(addr.to_string())).await
-            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-        chain_env.create("src_port", CollectionValue::String(format!("{}", addr.port()))).await
-            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+        request_map.register(&chain_env).await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
         let ret = executor.execute_all().await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+        let executor = {
+            let exe = executor.fork();
+            drop(executor);
+            exe
+        };
+        let request = request_map.into_request().map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+        let socket = request.incoming_stream.lock().unwrap().take();
+        if socket.is_none() {
+            return Err(server_err!(ServerErrorCode::ProcessChainError, "socket is none"))
+        }
+        let socket = socket.unwrap();
+
         if ret.is_control() {
             if ret.is_drop() {
                 return Ok(())
@@ -208,7 +229,7 @@ impl CyfsTcpServer {
         Ok(())
     }
 
-    async fn forward(mut socket: TcpStream, target: &str) -> ServerResult<()> {
+    async fn forward(mut socket: Box<dyn AsyncStream>, target: &str) -> ServerResult<()> {
         if let Some(tunnel_manager) = GATEWAY_TUNNEL_MANAGER.get() {
             let url = Url::parse(target).map_err(into_server_err!(ServerErrorCode::InvalidConfig, "invalid forward url {}", target))?;
             let mut forward_stream = tunnel_manager.open_stream_by_url(&url).await
@@ -224,7 +245,7 @@ impl CyfsTcpServer {
         Ok(())
     }
 
-    async fn http_server(socket: TcpStream, executor: ProcessChainListExecutor, domain: &str) -> ServerResult<()> {
+    async fn http_server(socket: Box<dyn AsyncStream>, executor: ProcessChainListExecutor, domain: &str) -> ServerResult<()> {
         hyper::server::conn::http1::Builder::new().serve_connection(
             socket,
             hyper::service::service_fn(move |_req| {
@@ -243,7 +264,7 @@ impl CyfsTcpServer {
         Ok(())
     }
 
-    async fn http2_server(socket: TcpStream, executor: ProcessChainListExecutor, domain: &str) -> ServerResult<()> {
+    async fn http2_server(socket: Box<dyn AsyncStream>, executor: ProcessChainListExecutor, domain: &str) -> ServerResult<()> {
         let domain = domain.to_string();
         hyper::server::conn::http2::Builder::new(TokioExecutor)
             .serve_connection(socket, hyper::service::service_fn(move |_req: Request<hyper::body::Body>| {
@@ -263,7 +284,7 @@ impl CyfsTcpServer {
         Ok(())
     }
 
-    async fn https_server(socket: TcpStream, executor: ProcessChainListExecutor, cert_path: &str, key_path: &str, domain: &str) -> ServerResult<()> {
+    async fn https_server(socket: Box<dyn AsyncStream>, executor: ProcessChainListExecutor, cert_path: &str, key_path: &str, domain: &str) -> ServerResult<()> {
         let config = Self::create_server_config(cert_path, key_path).await?;
         let tls_acceptor = TlsAcceptor::from(config);
         let tls_stream = tls_acceptor.accept(socket).await.map_err(into_server_err!(ServerErrorCode::StreamError))?;
@@ -285,7 +306,7 @@ impl CyfsTcpServer {
         Ok(())
     }
 
-    async fn https2_server(socket: TcpStream, executor: ProcessChainListExecutor, cert_path: &str, key_path: &str, domain: &str) -> ServerResult<()> {
+    async fn https2_server(socket: Box<dyn AsyncStream>, executor: ProcessChainListExecutor, cert_path: &str, key_path: &str, domain: &str) -> ServerResult<()> {
         let config = Self::create_server_config(cert_path, key_path).await?;
         let tls_acceptor = TlsAcceptor::from(config);
         let tls_stream = tls_acceptor.accept(socket).await.map_err(into_server_err!(ServerErrorCode::StreamError))?;

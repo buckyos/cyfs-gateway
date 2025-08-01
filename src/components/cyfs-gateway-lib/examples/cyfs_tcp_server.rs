@@ -19,7 +19,11 @@ servers:
             # 根据host匹配的规则
            - id: default
              block: |
-                return "forward tcp:///www.baidu.com:80";
+                call https-sni-probe;
+                echo ${REQ.dest_host};
+                eq ${REQ.dest_host} "www.baidu.com" && return "forward tcp:///www.baidu.com:443";
+                eq ${REQ.dest_host} "www.google.com" && return "forward tcp:///www.google.com:443";
+                reject;
 - server:
     port: 80
     process_chains:
