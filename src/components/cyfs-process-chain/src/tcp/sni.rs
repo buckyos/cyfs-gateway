@@ -155,11 +155,14 @@ impl ExternalCommand for HttpsSniProbeCommand {
     }
 
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        if !args.is_empty() {
-            let msg = "Https SNI probe command does not take any arguments".to_string();
-            error!("{}", msg);
-            return Err(msg);
-        }
+        self.cmd
+            .clone()
+            .try_get_matches_from(args.as_str_list())
+            .map_err(|e| {
+                let msg = format!("Invalid command arguments: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         Ok(())
     }

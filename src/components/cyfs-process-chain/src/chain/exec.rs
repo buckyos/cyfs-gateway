@@ -269,6 +269,7 @@ impl ProcessChainListExecutor {
             .position(|chain| chain.id() == id)
     }
 
+    /// Fork the executor to create a new context to execute the process chain
     pub fn fork(&self) -> Self {
         let counter = Arc::new(GotoCounter::new());
         let context = Context::new(self.global_env.clone(), counter, self.pipe.clone());

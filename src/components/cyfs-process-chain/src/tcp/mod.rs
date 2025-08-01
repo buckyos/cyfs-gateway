@@ -5,3 +5,6 @@ mod stream;
 pub use sni::*;
 pub use stream::*;
 pub use req::*;
+
+#[cfg(test)]
+mod example;

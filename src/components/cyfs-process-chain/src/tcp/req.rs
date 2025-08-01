@@ -1,4 +1,5 @@
 use crate::collection::*;
+use crate::chain::*;
 use buckyos_kit::AsyncStream;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,42 @@ pub struct StreamRequest {
     pub incoming_stream: Arc<Mutex<Option<Box<dyn AsyncStream>>>>,
 }
 
+impl Default for StreamRequest {
+    fn default() -> Self {
+        StreamRequest {
+            dest_port: 0,
+            dest_host: None,
+            dest_addr: None,
+            app_protocol: None,
+            dest_url: None,
+            source_addr: None,
+            source_mac: None,
+            source_device_id: None,
+            source_app_id: None,
+            source_user_id: None,
+            incoming_stream: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl StreamRequest {
+    pub fn new(stream: Box<dyn AsyncStream>, peer_addr: SocketAddr) -> Self {
+        StreamRequest {
+            dest_port: 0,
+            dest_host: None,
+            dest_addr: Some(peer_addr),
+            app_protocol: None,
+            dest_url: None,
+            source_addr: Some(peer_addr),
+            source_mac: None,
+            source_device_id: None,
+            source_app_id: None,
+            source_user_id: None,
+            incoming_stream: Arc::new(Mutex::new(Some(stream))),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StreamRequestMap {
     request: Arc<RwLock<StreamRequest>>,
@@ -39,6 +76,11 @@ impl StreamRequestMap {
             .into_inner();
 
         Ok(req)
+    }
+
+    pub async fn register(&self, env: &EnvRef) -> Result<bool, String> {
+        let coll = Arc::new(Box::new(self.clone()) as Box<dyn MapCollection>);
+        env.create("REQ", CollectionValue::Map(coll)).await
     }
 }
 

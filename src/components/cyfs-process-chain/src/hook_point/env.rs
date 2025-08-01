@@ -1,5 +1,6 @@
 use super::hook_point::HookPoint;
 use crate::chain::*;
+use crate::cmd::ExternalCommandRef;
 use crate::collection::*;
 use crate::pipe::SharedMemoryPipe;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,18 @@ impl HookPointEnv {
 
     pub fn pipe(&self) -> &SharedMemoryPipe {
         &self.pipe
+    }
+
+    pub fn register_external_command(
+        &self,
+        name: &str,
+        command: ExternalCommandRef,
+    ) -> Result<(), String> {
+        self.parser_context.register_external_command(name, command)
+    }
+
+    pub fn get_external_command(&self, name: &str) -> Option<ExternalCommandRef> {
+        self.parser_context.get_external_command(name)
     }
 
     pub async fn flush_collections(&self) -> Result<(), String> {

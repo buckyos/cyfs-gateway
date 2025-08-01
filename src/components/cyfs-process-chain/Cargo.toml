@@ -2,6 +2,7 @@
 name = "cyfs-process-chain"
 version = "0.1.0"
 edition = "2024"
+resolver = "3"
 
 [dependencies]
 log = "*"
@@ -29,3 +30,9 @@ boa_gc = "0.20.0"
 futures = "*"
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
 pin-project-lite = "*"
+url = "*"
+
+[dev-dependencies]
+rcgen = "*"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring", "tls12", "std"] }
