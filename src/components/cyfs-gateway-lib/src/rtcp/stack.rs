@@ -239,7 +239,7 @@ impl RTcpStack {
 
                 let this = this.clone();
                 task::spawn(async move {
-                    this.process_new_income_stream(stream, addr).await;
+                    this.serve_connection(stream, addr).await;
                 });
             }
         });
@@ -247,7 +247,7 @@ impl RTcpStack {
         Ok(())
     }
 
-    async fn process_new_income_stream(&self, mut stream: TcpStream, addr: SocketAddr) {
+    pub async fn serve_connection(&self, mut stream: TcpStream, addr: SocketAddr) {
         let source_info = addr.to_string();
         let first_package =
             RTcpTunnelPackage::read_package(Pin::new(&mut stream), true, source_info.as_str())

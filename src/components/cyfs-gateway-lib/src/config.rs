@@ -308,6 +308,20 @@ impl ProcessChainConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+pub struct CyfsRtcpServiceConfig {
+    pub device_name: String,
+    pub device_key: String,
+    pub process_chains: Vec<ProcessChainConfig>,
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CyfsHttpServiceConfig {
+    pub process_chains: Vec<ProcessChainConfig>,
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CyfsServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     protocol: Option<CyfsServerProtocol>,
@@ -315,6 +329,10 @@ pub struct CyfsServerConfig {
     bind: Option<IpAddr>,
     port: u16,
     process_chains: Vec<ProcessChainConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rtcp_service: Option<CyfsRtcpServiceConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_services: Option<HashMap<String, CyfsHttpServiceConfig>>,
 }
 
 impl CyfsServerConfig {
@@ -324,6 +342,8 @@ impl CyfsServerConfig {
             bind: None,
             port: listen,
             process_chains: vec![],
+            rtcp_service: None,
+            http_services: None,
         }
     }
 
@@ -353,6 +373,14 @@ impl CyfsServerConfig {
 
     pub fn get_process_chains(&self) -> &Vec<ProcessChainConfig> {
         &self.process_chains
+    }
+
+    pub fn get_rtcp_service(&self) -> &Option<CyfsRtcpServiceConfig> {
+        &self.rtcp_service
+    }
+
+    pub fn get_http_services(&self) -> &Option<HashMap<String, CyfsHttpServiceConfig>> {
+        &self.http_services
     }
 }
 
@@ -465,6 +493,24 @@ servers:
         - id: default
           block: |
               match $REQ.url "/api" && return "forward http://127.0.0.1:8082"";
+    rtcp_service:
+      device_key: ./identity.json
+      process_chains:
+        - id: main
+          priority: 1
+          blocks:
+            - id: default
+              block: |
+                  return "forward tcp:///127.0.0.1:2981";
+    http_services:
+      www.buckyos.com:
+        process_chains:
+          - id: main
+            priority: 2
+            blocks:
+              - id: default
+                block: |
+                    echo "hello world";
 
 - server:
     port: 443
@@ -550,6 +596,10 @@ match $REQ.host "www.buckyos.com" && goto www.buckyos.com;
             r#"match $REQ.url "/api" && return "forward http://127.0.0.1:8082"";
 "#
         );
+        assert_eq!(config[3].rtcp_service.is_some(), true);
+        assert_eq!(config[3].rtcp_service.as_ref().unwrap().device_key, "./identity.json");
+        assert_eq!(config[3].rtcp_service.as_ref().unwrap().process_chains.len(), 1);
+        assert_eq!(config[3].http_services.is_some(), true);
         assert_eq!(config[4].protocol, None);
         assert_eq!(config[4].bind, None);
         assert_eq!(config[4].port, 443);

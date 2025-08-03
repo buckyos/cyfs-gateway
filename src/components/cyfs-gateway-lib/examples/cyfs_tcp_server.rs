@@ -33,13 +33,45 @@ servers:
           - id: default
             block: |
                 return "http www.buckyos.com";
-      - id: www.buckyos.com
-        priority: 2
+    http_services:
+      www.buckyos.com:
+        process_chains:
+          - id: main
+            priority: 2
+            blocks:
+              - id: default
+                block: |
+                    reject;
+
+- server:
+    port: 2980
+    process_chains:
+      - id: main
+        priority: 1
         blocks:
           - id: default
             block: |
-                echo "hello world";
-                "#;
+                return "rtcp";
+#    rtcp_service:
+#      device_name: "web3.buckyos.com"
+#      device_key: ./identity.json
+#      process_chains:
+#        - id: main
+#          priority: 1
+#          blocks:
+#            - id: default
+#              block: |
+#                  return "forward tcp:///127.0.0.1:2981";
+    http_services:
+      www.buckyos.com:
+        process_chains:
+          - id: main
+            priority: 2
+            blocks:
+              - id: default
+                block: |
+                    echo "hello world";
+                  "#;
 
     let config = YamlCyfsServerConfigParser::parse(yaml_config).unwrap();
 
