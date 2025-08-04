@@ -699,8 +699,8 @@ impl CommandExecutor for StringReplaceCommand {
     }
 }
 
-// append <param1> <param2>
-// This command appends param2 to param1, and return the result
+// append <param1> <param2> ... <param_n>
+// This command appends two or more string parameters and returns the result
 pub struct StringAppendCommandParser {
     cmd: Command,
 }
@@ -708,28 +708,28 @@ pub struct StringAppendCommandParser {
 impl StringAppendCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("append")
-            .about("Append two string parameters and return the result.")
+            .about("Append two or more string parameters and return the result.")
             .after_help(
                 r#"
 Arguments:
-  <param1>     First string or variable
-  <param2>     Second string to append
+  <params>...  Two or more strings or variables to append
 
 Behavior:
-  - Joins param1 and param2 with no delimiter.
+  - Joins all parameters with no delimiter.
   - Output is returned with success.
-  - The command will not modify any env variables 
+  - The command will not modify any env variables unless specified.
 
 Examples:
   append "abc" "123"
-  append $REQ.host ".internal"
+  append $REQ.host ".internal" ".com"
+  append "prefix-" $VAR "-suffix"
 "#,
             )
-            .arg(Arg::new("param1").required(true).help("First value"))
             .arg(
-                Arg::new("param2")
+                Arg::new("params")
                     .required(true)
-                    .help("Second value to append"),
+                    .num_args(2..) // Require at least two parameters
+                    .help("Two or more values to append"),
             );
 
         Self { cmd }
@@ -769,27 +769,35 @@ impl CommandParser for StringAppendCommandParser {
             msg
         })?;
 
-        let param1 = matches.get_one::<String>("param1").ok_or_else(|| {
-            let msg = format!("First parameter is required, but got: {:?}", args);
-            error!("{}", msg);
-            msg
-        })?;
-        let param2 = matches.get_one::<String>("param2").ok_or_else(|| {
-            let msg = format!("Second parameter is required, but got: {:?}", args);
-            error!("{}", msg);
-            msg
-        })?;
+        // Try to get all parameters
+        let params: Vec<String> = matches
+            .get_many::<String>("params")
+            .ok_or_else(|| {
+                let msg = format!("At least two parameters are required, but got: {:?}", args);
+                error!("{}", msg);
+                msg
+            })?
+            .map(|s| s.to_string())
+            .collect();
 
-        let param1_index = matches.index_of("param1").unwrap();
+        // Check if we have at least two parameters
+        if params.len() < 2 {
+            let msg = format!("At least two parameters are required, but got: {:?}", params);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        // Check if the first parameter is a variable
+        let param1_index = matches.index_of("params").unwrap();
         let var = if origin_args[param1_index].is_var() {
-            // If param1 is a variable, we should modify it
             Some(origin_args[param1_index].as_var_str().unwrap().to_owned())
         } else {
             None
         };
 
-        let result = param1.to_string() + param2;
-        info!("String append {} + {} = {}", param1, param2, result);
+        // Concatenate all parameters into a single string
+        let result = params.join("");
+        info!("String append {:?} = {}", params, result);
 
         let cmd = StringAppendCommand::new(var, result);
 

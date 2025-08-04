@@ -89,7 +89,7 @@ pub trait CommandParser: Send + Sync {
             match value {
                 CollectionValue::String(s) => str_args.push(s),
                 _ => {
-                    let msg = format!("Invalid command argument: {}", value);
+                    let msg = format!("Invalid command argument type: {}", value);
                     error!("{}", msg);
                     return Err(msg);
                 }
