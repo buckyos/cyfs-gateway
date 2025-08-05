@@ -1,3 +1,4 @@
+use std::env::current_dir;
 use std::sync::Arc;
 use buckyos_kit::init_logging;
 use name_lib::DeviceConfig;
@@ -6,93 +7,36 @@ use cyfs_gateway_lib::{CyfsServerConfigParser, CyfsServerManager, GatewayDevice,
 #[tokio::main]
 async fn main() {
     init_logging("cyfs_tcp_server",false);
-    let yaml_config = r#"
-servers:
-- server:
-    protocol: tcp
-    bind: 0.0.0.0
-    port: 8080
-    process_chains:
-      - id: main
-        priority: 1
-        blocks:
-            # 根据host匹配的规则
-           - id: default
-             block: |
-                call https-sni-probe;
-                echo ${REQ.dest_host};
-                eq ${REQ.dest_host} "www.baidu.com" && return "forward tcp:///www.baidu.com:443";
-                eq ${REQ.dest_host} "www.google.com" && return "forward tcp:///www.google.com:443";
-                reject;
-- server:
-    protocol: tcp
-    bind: 0.0.0.0
-    port: 8081
-    process_chains:
-      - id: main
-        priority: 1
-        blocks:
-           - id: default
-             block: |
-                call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
-                call http-probe && return "forward tcp:///${REQ.dest_host}:80";
-                reject;
-- server:
-    port: 80
-    process_chains:
-      - id: main
-        priority: 1
-        blocks:
-          - id: default
-            block: |
-                return "http www.buckyos.com";
-    http_services:
-      www.buckyos.com:
-        process_chains:
-          - id: main
-            priority: 2
-            blocks:
-              - id: default
-                block: |
-                    reject;
 
-- server:
-    port: 2980
-    process_chains:
-      - id: main
-        priority: 1
-        blocks:
-          - id: default
-            block: |
-                return "rtcp";
-#    rtcp_service:
-#      device_name: "web3.buckyos.com"
-#      device_key: ./identity.json
-#      process_chains:
-#        - id: main
-#          priority: 1
-#          blocks:
-#            - id: default
-#              block: |
-#                  return "forward tcp:///127.0.0.1:2981";
-    http_services:
-      www.buckyos.com:
-        process_chains:
-          - id: main
-            priority: 2
-            blocks:
-              - id: default
-                block: |
-                    echo "hello world";
-                  "#;
+    let path = current_dir().unwrap().join("cyfs_tcp_server.yaml");
+    let config = if path.exists() {
+        let yaml_config = std::fs::read_to_string(path).unwrap();
+        let config = match YamlCyfsServerConfigParser::parse(yaml_config.as_str()) {
+            Ok(config) => config,
+            Err(e) => {
+                println!("parse config error: {}", e);
+                return;
+            }
+        };
+        config
+    } else {
+        let yaml_config = include_str!("cyfs_tcp_server.yaml");
+        let config = match YamlCyfsServerConfigParser::parse(yaml_config) {
+            Ok(config) => config,
+            Err(e) => {
+                println!("parse config error: {}", e);
+                return;
+            }
+        };
+        config
+    };
 
-    let config = YamlCyfsServerConfigParser::parse(yaml_config).unwrap();
 
     let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
         config: DeviceConfig::new("test", "MC4CAQAwBQYDK2VwBCIEICCrQGVPIZGLTbmhPi9K3Sv3L7P+W+O7RdnVxx5y7Rvb".to_string()),
         private_key: [0u8; 48],
     }));
-    GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
+    let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
     let server_manager = CyfsServerManager::new();
     server_manager.start_server(config).await.unwrap();
     std::future::pending::<()>().await;

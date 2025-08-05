@@ -1,0 +1,77 @@
+servers:
+  - server:
+      protocol: tcp
+      bind: 0.0.0.0
+      port: 8080
+      process_chains:
+        - id: main
+          priority: 1
+          blocks:
+            # 根据host匹配的规则
+            - id: default
+              block: |
+                call https-sni-probe;
+                echo ${REQ.dest_host};
+                eq ${REQ.dest_host} "www.baidu.com" && return "forward tcp:///www.baidu.com:443";
+                eq ${REQ.dest_host} "www.google.com" && return "forward tcp:///www.google.com:443";
+                reject;
+  - server:
+      protocol: tcp
+      bind: 0.0.0.0
+      port: 8081
+      process_chains:
+        - id: main
+          priority: 1
+          blocks:
+            - id: default
+              block: |
+                call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
+                call http-probe && return "forward tcp:///${REQ.dest_host}:80";
+                reject;
+  - server:
+      port: 80
+      process_chains:
+        - id: main
+          priority: 1
+          blocks:
+            - id: default
+              block: |
+                return "http www.buckyos.com";
+      http_services:
+        www.buckyos.com:
+          process_chains:
+            - id: main
+              priority: 2
+              blocks:
+                - id: default
+                  block: |
+                    reject;
+
+  - server:
+      port: 2980
+      process_chains:
+        - id: main
+          priority: 1
+          blocks:
+            - id: default
+              block: |
+                return "rtcp";
+      #    rtcp_service:
+      #      device_name: "web3.buckyos.com"
+      #      device_key: ./identity.json
+      #      process_chains:
+      #        - id: main
+      #          priority: 1
+      #          blocks:
+      #            - id: default
+      #              block: |
+      #                  return "forward tcp:///127.0.0.1:2981";
+      http_services:
+        www.buckyos.com:
+          process_chains:
+            - id: main
+              priority: 2
+              blocks:
+                - id: default
+                  block: |
+                    echo "hello world";
