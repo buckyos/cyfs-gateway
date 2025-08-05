@@ -109,6 +109,10 @@ impl ParserContext {
         // If not found, check the global factory
         EXTERNAL_COMMAND_FACTORY.get_command(name)
     }
+
+    pub fn get_external_command_list(&self) -> Vec<String> {
+        self.external_commands.get_command_list()
+    }
 }
 
 pub type ParserContextRef = Arc<ParserContext>;

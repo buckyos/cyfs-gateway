@@ -10,8 +10,8 @@ pub struct ProcessChainREPL {
     root_dir: PathBuf,
     env: HookPointEnvRef,
     line_index: AtomicUsize,
-    pipe: SharedMemoryPipe,        // Pipe for command execution
-    context: Context,              // Context for the REPL chain
+    pipe: SharedMemoryPipe,           // Pipe for command execution
+    context: Context,                 // Context for the REPL chain
     parser_context: ParserContextRef, // Context for parsing commands
 }
 
@@ -64,6 +64,23 @@ impl ProcessChainREPL {
                 true,
             )
             .await?;
+
+        // Init some external commands
+        // Register the external command for HTTPS SNI probing
+        let https_sni_probe_command = HttpsSniProbeCommand::new();
+        let name = https_sni_probe_command.name().to_owned();
+        self.env.register_external_command(
+            &name,
+            Arc::new(Box::new(https_sni_probe_command) as Box<dyn ExternalCommand>),
+        )?;
+
+        // Register the external command for HTTP probing
+        let http_probe_command = HttpProbeCommand::new();
+        let name = http_probe_command.name().to_owned();
+        self.env.register_external_command(
+            &name,
+            Arc::new(Box::new(http_probe_command) as Box<dyn ExternalCommand>),
+        )?;
 
         info!("REPL environment initialized successfully");
         Ok(())
@@ -173,6 +190,8 @@ impl ProcessChainREPL {
                     }
                 } else if let Some(parser) = COMMAND_PARSER_FACTORY.get_parser(cmd) {
                     println!("{}", parser.help(cmd, CommandHelpType::Long));
+                } else if let Some(ext_cmd) = self.env.parser_context().get_external_command(cmd) {
+                    println!("{}", ext_cmd.help(cmd, CommandHelpType::Long));
                 } else {
                     println!("No such command: {}", cmd);
                 }
@@ -185,6 +204,14 @@ impl ProcessChainREPL {
                     println!("[{}]", group.as_str());
                     println!("{}", cmds.join(" "));
                     println!();
+                }
+
+                let external_commands = self.env.parser_context().get_external_command_list();
+                if !external_commands.is_empty() {
+                    println!("[external]");
+                    println!("{}", external_commands.join(" "));
+                } else {
+                    println!("No external commands registered.");
                 }
             }
         } else if args.len() >= 2 {
@@ -200,6 +227,8 @@ impl ProcessChainREPL {
             let cmd = args[0];
             if let Some(parser) = COMMAND_PARSER_FACTORY.get_parser(cmd) {
                 println!("{}", parser.help(cmd, help_type));
+            } else if let Some(ext_cmd) = self.env.parser_context().get_external_command(cmd) {
+                println!("{}", ext_cmd.help(cmd, help_type));
             } else {
                 println!("No such command: {}", cmd);
             }
@@ -276,6 +305,22 @@ impl ProcessChainREPL {
                 doc.push_str(help.trim());
                 doc.push_str("\n```\n\n");
             }
+        }
+
+        let external_commands = self.env.parser_context().get_external_command_list();
+        if !external_commands.is_empty() {
+            doc.push_str("## External Commands\n\n");
+            for cmd in external_commands {
+                if let Some(ext_cmd) = self.env.parser_context().get_external_command(&cmd) {
+                    let help = ext_cmd.help(&cmd, CommandHelpType::Long);
+                    doc.push_str(&format!("### `{}`\n", cmd));
+                    doc.push_str("```\n");
+                    doc.push_str(help.trim());
+                    doc.push_str("\n```\n\n");
+                }
+            }
+        } else {
+            doc.push_str("No external commands registered.\n");
         }
 
         doc
