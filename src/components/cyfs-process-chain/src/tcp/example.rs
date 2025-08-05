@@ -1,4 +1,5 @@
 use super::sni::HttpsSniProbeCommand;
+use super::http::HttpProbeCommand;
 use crate::*;
 use buckyos_kit::AsyncStream;
 use rcgen::{CertifiedKey, generate_simple_self_signed};
@@ -12,17 +13,25 @@ use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use url::Url;
+use hyper::Client;
+use hyper::body::to_bytes;
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Request, Response, Server};
+use hyper::{Method, StatusCode};
+use std::convert::Infallible;
 
 const PROCESS_CHAIN: &str = r#"
 <root>
 <process_chain id="chain1" priority="1">
     <block id="block1">
         <![CDATA[
-            # We first check if the protocol is https
+            # We first check if the protocol is https or http
+            call http-probe;
             call https-sni-probe;
 
             echo ${REQ.dest_host};
-            return "127.0.0.1:1000";
+            match ${REQ.app_protocol} "https" && return "tcp://127.0.0.1:1000";
+            match ${REQ.app_protocol} "http" && return "tcp://127.0.0.1:1100";
         ]]>
     </block>
 </process_chain>
@@ -53,6 +62,16 @@ impl HttpConnHookManager {
             .register_external_command(
                 &name,
                 Arc::new(Box::new(https_sni_probe_command) as Box<dyn ExternalCommand>),
+            )
+            .unwrap();
+
+        // Register the external command for HTTP probing
+        let http_probe_command = HttpProbeCommand::new();
+        let name = http_probe_command.name().to_owned();
+        hook_point_env
+            .register_external_command(
+                &name,
+                Arc::new(Box::new(http_probe_command) as Box<dyn ExternalCommand>),
             )
             .unwrap();
 
@@ -118,7 +137,11 @@ async fn on_new_connection(
     let url = match &ret {
         CommandResult::Control(CommandControl::Return(forward)) => {
             // If the command was successful, we can get a URL to forward the request
-            let url = Url::parse(&forward).unwrap();
+            let url = Url::parse(&forward).map_err(|e| {
+                let msg = format!("Failed to parse URL from process chain: {}, {}", e, forward);
+                error!("{}", msg);
+                msg
+            })?;
             info!("Request processed successfully {}", url);
 
             url
@@ -135,7 +158,16 @@ async fn on_new_connection(
 
     // Try check the destination host from the request
     assert_eq!(request.dest_host.as_deref().unwrap(), "buckyos.com");
-    assert_eq!(request.app_protocol.as_deref().unwrap(), "https");
+    // Check the protocol is http or https
+    assert!(request.app_protocol.is_some());
+    if request.app_protocol.as_deref() != Some("http") && request.app_protocol.as_deref() != Some("https") {
+        let msg = format!(
+            "Process chain did not return a valid protocol, got: {:?}",
+            request.app_protocol
+        );
+        error!("{}", msg);
+        return Err(msg);
+    }
 
     // Return the stream
     info!("Forwarding request to {}", url);
@@ -162,7 +194,7 @@ fn generate_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
 }
 
 async fn start_forward_server() {
-    let hook_manager = HttpConnHookManager::create(PROCESS_CHAIN).await.unwrap();
+    let hook_manager: HttpConnHookManager = HttpConnHookManager::create(PROCESS_CHAIN).await.unwrap();
     let hook_manager = Arc::new(hook_manager);
 
     let exec = hook_manager
@@ -271,4 +303,65 @@ async fn test_https_sni_probe() {
 
     // Wait for the servers to finish
     backend.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_http_probe() {
+    TermLogger::init(
+        LevelFilter::Info,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        // If TermLogger is not available (e.g., in some environments), fall back to SimpleLogger
+        SimpleLogger::init(LevelFilter::Info, Config::default()).unwrap()
+    });
+
+    // Start a simple HTTP server to test the HTTP probing
+    let addr = ([127, 0, 0, 1], 1100).into();
+    let make_svc = make_service_fn(move |_conn| {
+        // Write a simple service that responds with "Hello, World!"
+        async move {
+            Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
+                async move {
+                    if req.method() == Method::GET && req.uri().path() == "/index.html" {
+                        Ok::<_, Infallible>(Response::new(Body::from("Hello, World!")))
+                    } else {
+                        Ok::<_, Infallible>(Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Body::empty())
+                            .unwrap())
+                    }
+                }
+            }))
+        }
+    });
+
+    let server = Server::bind(&addr).serve(make_svc);
+    tokio::spawn(async move {
+        if let Err(e) = server.await {
+            eprintln!("server error: {}", e);
+        }
+    });
+
+    // Start the forward server to handle incoming connections
+    start_forward_server().await;
+
+    let client = Client::new();
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .header("content-type", "text/html")
+        .uri("http://127.0.0.1:1001/index.html")
+        .header("HOST", "buckyos.com")
+        .body(Body::empty())
+        .expect("Failed to build request");
+
+    let resp = client.request(req).await.unwrap();
+
+    assert!(resp.status().is_success());
+
+    let bytes = to_bytes(resp).await.unwrap();
+    assert_eq!(&*bytes, b"Hello, World!");
 }

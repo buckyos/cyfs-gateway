@@ -2,15 +2,15 @@ use super::block::*;
 use nom::{
     IResult, Parser,
     branch::alt,
-    bytes::complete::{is_not, escaped_transform},
     bytes::complete::tag,
+    bytes::complete::{escaped_transform, is_not},
     bytes::streaming::take_while1,
     character::complete::{alpha1, alphanumeric1, char},
     character::complete::{space0, space1},
     combinator::{complete, map, opt, recognize, value},
     error::{ErrorKind, ParseError},
+    multi::many0,
     multi::separated_list0,
-    multi::{many0, many1},
     sequence::{delimited, pair, preceded, terminated},
 };
 
@@ -336,21 +336,21 @@ impl BlockParser {
                     map(Self::parse_var_braced, |var| var),
                     // Literal with escapes
                     map(
-                    escaped_transform(
-                        take_while1(|c: char| c != '\\' && c != '$' && c != '"'),
-                        '\\',
-                        alt((
-                            value("\\", tag("\\")),
-                            value("\"", tag("\"")),
-                            value("\n", tag("n")),
-                            value("\t", tag("t")),
-                            value("\r", tag("r")),
-                            value(" ", tag(" ")),
-                            value("$", tag("$")),
-                        )),
+                        escaped_transform(
+                            take_while1(|c: char| c != '\\' && c != '$' && c != '"'),
+                            '\\',
+                            alt((
+                                value("\\", tag("\\")),
+                                value("\"", tag("\"")),
+                                value("\n", tag("n")),
+                                value("\t", tag("t")),
+                                value("\r", tag("r")),
+                                value(" ", tag(" ")),
+                                value("$", tag("$")),
+                            )),
+                        ),
+                        |s: String| CommandArg::Literal(s),
                     ),
-                    |s: String| CommandArg::Literal(s),
-                ),
                 ))),
                 |args: Vec<CommandArg>| {
                     debug!("Parsed double quoted args: {:?}", args);
@@ -638,7 +638,6 @@ mod tests {
         let block = parser.parse(block_str).unwrap();
         assert_eq!(block.id, "test_block");
         assert_eq!(block.lines.len(), 3);
-
 
         // Test string literal with escapes and substitution
         let block_str = r#"

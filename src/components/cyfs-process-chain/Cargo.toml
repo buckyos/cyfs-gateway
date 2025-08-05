@@ -31,6 +31,7 @@ futures = "*"
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
 pin-project-lite = "*"
 url = "*"
+httparse = "*"
 
 [dev-dependencies]
 rcgen = "*"
