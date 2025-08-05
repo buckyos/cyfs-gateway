@@ -11,6 +11,7 @@ const PROCESS_CHAIN: &str = r#"
             # We reject the request if the protocol is not https
             !(match $PROTOCOL https) && reject;
 
+            echo "\$get request url: ${REQ_url} \n ${PROTOCOL}";
             echo $(call add 1 2);
             local key1 = "value1";
             delete key1;

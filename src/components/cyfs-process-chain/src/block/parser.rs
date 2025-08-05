@@ -2,15 +2,15 @@ use super::block::*;
 use nom::{
     IResult, Parser,
     branch::alt,
+    bytes::complete::{is_not, escaped_transform},
     bytes::complete::tag,
-    bytes::complete::{escaped_transform, is_not},
     bytes::streaming::take_while1,
     character::complete::{alpha1, alphanumeric1, char},
     character::complete::{space0, space1},
     combinator::{complete, map, opt, recognize, value},
     error::{ErrorKind, ParseError},
-    multi::many0,
     multi::separated_list0,
+    multi::{many0, many1},
     sequence::{delimited, pair, preceded, terminated},
 };
 
@@ -78,7 +78,10 @@ impl BlockParser {
         })?;
 
         if !rest.trim().is_empty() {
-            let msg = format!("Unexpected content after statements: {}, rest='{}'", trimmed, rest);
+            let msg = format!(
+                "Unexpected content after statements: {}, rest='{}'",
+                trimmed, rest
+            );
             error!("{}", msg);
             return Err(msg);
         }
@@ -279,7 +282,10 @@ impl BlockParser {
 
         let cmd = if let Some(name) = cmd_name.as_literal_str() {
             if name.starts_with('-') {
-                let msg = format!("Command name cannot start with '-', got: {}, {}", name, input);
+                let msg = format!(
+                    "Command name cannot start with '-', got: {}, {}",
+                    name, input
+                );
                 error!("{}", msg);
                 return Err(nom::Err::Error(nom::error::Error::from_error_kind(
                     input,
@@ -325,18 +331,57 @@ impl BlockParser {
         let double_quoted = delimited(
             char('"'),
             map(
-                opt(escaped_transform(
-                    is_not("\\\""),
-                    '\\',
-                    alt((
-                        value("\\", tag("\\")),
-                        value("\"", tag("\"")),
-                        value("\n", tag("n")),
-                        value("\t", tag("t")),
-                        value(" ", tag(" ")),
-                    )),
-                )),
-                |s: Option<String>| s.unwrap_or_default(), // Empty string if no content
+                many0(alt((
+                    // Variable with ${var}
+                    map(Self::parse_var_braced, |var| var),
+                    // Literal with escapes
+                    map(
+                    escaped_transform(
+                        take_while1(|c: char| c != '\\' && c != '$' && c != '"'),
+                        '\\',
+                        alt((
+                            value("\\", tag("\\")),
+                            value("\"", tag("\"")),
+                            value("\n", tag("n")),
+                            value("\t", tag("t")),
+                            value("\r", tag("r")),
+                            value(" ", tag(" ")),
+                            value("$", tag("$")),
+                        )),
+                    ),
+                    |s: String| CommandArg::Literal(s),
+                ),
+                ))),
+                |args: Vec<CommandArg>| {
+                    debug!("Parsed double quoted args: {:?}", args);
+
+                    // Filter out empty strings
+                    let args = args
+                        .into_iter()
+                        .filter(|arg| match arg {
+                            CommandArg::Literal(s) => !s.is_empty(),
+                            _ => true,
+                        })
+                        .collect::<Vec<_>>();
+
+                    // If no args, return empty string
+                    if args.is_empty() {
+                        CommandArg::Literal("".to_string())
+                    }
+                    // If there's only one argument, return it directly
+                    else if args.len() == 1 {
+                        args.into_iter().next().unwrap()
+                    } else {
+                        // Wrap multiple args into a command substitution
+                        let args = vec![CommandArg::Literal("append".to_string())]
+                            .into_iter()
+                            .chain(args.into_iter())
+                            .collect::<Vec<_>>();
+                        CommandArg::CommandSubstitution(Box::new(Expression::Command(
+                            CommandItem::new("append".to_string(), CommandArgs::new(args)),
+                        )))
+                    }
+                },
             ),
             char('"'),
         );
@@ -345,7 +390,7 @@ impl BlockParser {
         let single_quoted = delimited(
             char('\''),
             map(opt(is_not("'")), |s: Option<&str>| {
-                s.unwrap_or("").to_string()
+                CommandArg::Literal(s.unwrap_or("").to_string())
             }),
             char('\''),
         );
@@ -361,14 +406,13 @@ impl BlockParser {
                     tag("."),
                 ))),
             )),
-            |s: &str| s.to_string(),
+            |s: &str| CommandArg::Literal(s.to_string()),
         );
 
         let (input, arg) = complete(alt((double_quoted, single_quoted, unquoted))).parse(input)?;
 
-        debug!("Parsed literal: {}, {:?}", input, arg);
-        // Return as CommandArg::Literal
-        Ok((input, CommandArg::Literal(arg)))
+        info!("Parsed literal: {}, {:?}", input, arg);
+        Ok((input, arg))
     }
 
     fn parse_var_dollar(input: &str) -> IResult<&str, CommandArg> {
@@ -411,7 +455,12 @@ impl BlockParser {
             ),
             |var: &str| CommandArg::Var(var.to_string()),
         )
-        .parse(input)?;
+        .parse(input)
+        .map_err(|e| {
+            let msg = format!("Parse var braced error: {}, {:?}", input, e);
+            debug!("{}", msg);
+            e
+        })?;
 
         debug!("Parsed var braced: {}, {:?}", ret.0, ret.1);
         Ok(ret)
@@ -589,5 +638,18 @@ mod tests {
         let block = parser.parse(block_str).unwrap();
         assert_eq!(block.id, "test_block");
         assert_eq!(block.lines.len(), 3);
+
+
+        // Test string literal with escapes and substitution
+        let block_str = r#"
+            local VAR = "test_string1";
+            echo "a dollar sign: \$ and a variable: ${VAR}";
+            echo "This is a test string with a newline\nand a tab\tand a quote\" and a dollar sign \$ and a variable ${VAR}";
+            echo 'This is another test string with single quotes';
+            echo "This is a test with an escaped quote: \" and a variable: ${VAR}";
+        "#;
+        let block = parser.parse(block_str).unwrap();
+        assert_eq!(block.id, "test_block");
+        assert_eq!(block.lines.len(), 5);
     }
 }
