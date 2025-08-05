@@ -35,6 +35,7 @@ servers:
            - id: default
              block: |
                 call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
+                call http-probe && return "forward tcp:///${REQ.dest_host}:80";
                 reject;
 - server:
     port: 80

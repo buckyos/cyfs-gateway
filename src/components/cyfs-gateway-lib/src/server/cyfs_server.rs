@@ -23,7 +23,7 @@ pub enum ServerErrorCode {
 }
 pub type ServerResult<T> = sfo_result::Result<T, ServerErrorCode>;
 pub type ServerError = sfo_result::Error<ServerErrorCode>;
-use cyfs_process_chain::{CollectionValue, CommandControl, CommandResult, ExternalCommand, HookPoint, HookPointEnv, HttpsSniProbeCommand, HyperHttpRequestHeaderMap, MapCollection, ProcessChainListExecutor, StreamRequest, StreamRequestMap};
+use cyfs_process_chain::{CollectionValue, CommandControl, CommandResult, ExternalCommand, HookPoint, HookPointEnv, HttpProbeCommand, HttpsSniProbeCommand, HyperHttpRequestHeaderMap, MapCollection, ProcessChainListExecutor, StreamRequest, StreamRequestMap};
 use sfo_result::err as server_err;
 use sfo_result::into_err as into_server_err;
 use tokio::net::TcpStream;
@@ -94,6 +94,15 @@ async fn create_process_chain_executor(
         )
         .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
+    let http_probe_command = HttpProbeCommand::new();
+    let name = http_probe_command.name().to_owned();
+    hook_point_env
+        .register_external_command(
+            &name,
+            Arc::new(Box::new(http_probe_command) as Box<dyn ExternalCommand>),
+        )
+        .unwrap();
+    
     let executor = hook_point_env
         .prepare_exec_list(&hook_point)
         .await
