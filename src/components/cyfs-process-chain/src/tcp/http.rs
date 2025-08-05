@@ -124,7 +124,7 @@ Requirements:
 
 Examples:
   http-probe && match $REQ.dest_host "api.example.com" && accept
-  http-probe && match $REQ.path "/admin/*" && drop
+  http-probe && match $REQ.ext.path "/admin/*" && drop
 "#,
             );
 
@@ -265,7 +265,9 @@ impl ExternalCommand for HttpProbeCommand {
                     })?;
             } else {
                 warn!("No Host header found in the request, may not be valid HTTP/1.1");
-                host = Some("".to_string());
+                // FIXME: Handle HTTP/1.0 or requests without Host header
+                // host = Some("".to_string());
+                host = None;
             }
 
             ext.insert("path", CollectionValue::String(headers.path))
