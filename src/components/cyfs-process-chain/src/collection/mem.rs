@@ -58,6 +58,10 @@ impl MemoryMapCollection {
         }
     }
 
+    pub fn new_ref() -> MapCollectionRef {
+        Arc::new(Box::new(Self::new()) as Box<dyn MapCollection>)
+    }
+
     pub(crate) fn from_map(map: HashMap<String, CollectionValue>) -> Self {
         Self {
             data: RwLock::new(map),

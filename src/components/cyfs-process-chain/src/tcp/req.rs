@@ -19,6 +19,8 @@ pub struct StreamRequest {
     pub source_app_id: Option<String>,
     pub source_user_id: Option<String>,
 
+    pub ext: Option<MapCollectionRef>,
+
     pub incoming_stream: Arc<Mutex<Option<Box<dyn AsyncStream>>>>,
 }
 
@@ -35,6 +37,7 @@ impl Default for StreamRequest {
             source_device_id: None,
             source_app_id: None,
             source_user_id: None,
+            ext: None,
             incoming_stream: Arc::new(Mutex::new(None)),
         }
     }
@@ -53,6 +56,7 @@ impl StreamRequest {
             source_device_id: None,
             source_app_id: None,
             source_user_id: None,
+            ext: None,
             incoming_stream: Arc::new(Mutex::new(Some(stream))),
         }
     }
@@ -247,6 +251,16 @@ impl MapCollection for StreamRequestMap {
                     return Err(msg);
                 }
             }
+            "ext" => {
+                if let CollectionValue::Map(ext) = value {
+                    prev = request.ext.clone().map(CollectionValue::Map);
+                    request.ext = Some(ext);
+                } else {
+                    let msg = format!("ext must be a Map, got {:?}", value);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
             _ => {
                 let msg = format!("Unknown key: {}", key);
                 error!("{}", msg);
@@ -277,6 +291,7 @@ impl MapCollection for StreamRequestMap {
                 .map(CollectionValue::String)),
             "source_app_id" => Ok(request.source_app_id.clone().map(CollectionValue::String)),
             "source_user_id" => Ok(request.source_user_id.clone().map(CollectionValue::String)),
+            "ext" => Ok(request.ext.clone().map(CollectionValue::Map)),
             "incoming_stream" => {
                 let stream = request.incoming_stream.lock().unwrap();
                 if stream.is_some() {
@@ -306,6 +321,7 @@ impl MapCollection for StreamRequestMap {
             "source_device_id" => Ok(request.source_device_id.is_some()),
             "source_app_id" => Ok(request.source_app_id.is_some()),
             "source_user_id" => Ok(request.source_user_id.is_some()),
+            "ext" => Ok(request.ext.is_some()),
             "incoming_stream" => {
                 let stream = request.incoming_stream.lock().unwrap();
                 Ok(stream.is_some())
@@ -337,6 +353,7 @@ impl MapCollection for StreamRequestMap {
             "source_device_id" => Ok(request.source_device_id.take().map(CollectionValue::String)),
             "source_app_id" => Ok(request.source_app_id.take().map(CollectionValue::String)),
             "source_user_id" => Ok(request.source_user_id.take().map(CollectionValue::String)),
+            "ext" => Ok(request.ext.take().map(CollectionValue::Map)),
             "incoming_stream" => {
                 let stream = request.incoming_stream.lock().unwrap().take();
                 if let Some(s) = stream {
@@ -406,6 +423,9 @@ impl MapCollection for StreamRequestMap {
                 "source_user_id".to_string(),
                 CollectionValue::String(user_id.clone()),
             ));
+        }
+        if let Some(ext) = &request.ext {
+            result.push(("ext".to_string(), CollectionValue::Map(ext.clone())));
         }
 
         Ok(result)

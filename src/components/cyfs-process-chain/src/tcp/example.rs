@@ -30,6 +30,7 @@ const PROCESS_CHAIN: &str = r#"
             call https-sni-probe;
 
             echo ${REQ.dest_host};
+            match ${REQ.app_protocol} "http" && echo ${REQ.ext.url};
             match ${REQ.app_protocol} "https" && return "tcp://127.0.0.1:1000";
             match ${REQ.app_protocol} "http" && return "tcp://127.0.0.1:1100";
         ]]>

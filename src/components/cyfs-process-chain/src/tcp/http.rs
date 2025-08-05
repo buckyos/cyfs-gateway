@@ -2,7 +2,7 @@ use super::stream::PrefixedStream;
 use crate::block::CommandArgs;
 use crate::chain::Context;
 use crate::cmd::*;
-use crate::collection::CollectionValue;
+use crate::collection::{CollectionValue, MemoryMapCollection};
 use buckyos_kit::AsyncStream;
 use clap::Command;
 use httparse::{EMPTY_HEADER, Request, Status};
@@ -109,12 +109,12 @@ Usage:
 Behavior:
   - This command reads the beginning of an incoming stream to determine whether it contains a valid HTTP request.
   - If valid, it extracts the following information and updates the environment:
-      $REQ.method       ← HTTP method (e.g., GET, POST)
-      $REQ.path         ← Request path (e.g., /index.html)
-      $REQ.version      ← HTTP version string (e.g., HTTP/1.1)
-      $REQ.dest_host    ← Host from the `Host:` header
-      $REQ.app_protocol ← "http"
-      $REQ.url          ← Full URL constructed from the host and path
+      $REQ.dest_host        ← Host from the `Host:` header
+      $REQ.app_protocol     ← "http"
+      $REQ.ext.method       ← HTTP method (e.g., GET, POST)
+      $REQ.ext.path         ← Request path (e.g., /index.html)
+      $REQ.ext.version      ← HTTP version string (e.g., HTTP/1.1)
+      $REQ.ext.url          ← Full URL constructed from the host and path
   - Returns success(host) if parsing is successful and a host is found.
   - Returns error if the request is invalid or a Host: header is missing (required for HTTP/1.1).
 
@@ -212,9 +212,23 @@ impl ExternalCommand for HttpProbeCommand {
         if let Some(headers) = ret.headers {
             info!("HTTP header found: {:?}", headers);
 
-            /*
+            let ext = match req.get("ext").await? {
+                Some(CollectionValue::Map(ext)) => ext,
+                _ => {
+                    let ext = MemoryMapCollection::new_ref();
+                    req.insert("ext", CollectionValue::Map(ext.clone()))
+                        .await
+                        .map_err(|e| {
+                            let msg = format!("Failed to insert ext into request: {}", e);
+                            error!("{}", msg);
+                            msg
+                        })?;
+                    ext
+                }
+            };
+
             // Update the method, path, version, and host in the request
-            req.insert("method", CollectionValue::String(headers.method))
+            ext.insert("method", CollectionValue::String(headers.method))
                 .await
                 .map_err(|e| {
                     let msg = format!("Failed to insert method into request: {}", e);
@@ -222,29 +236,25 @@ impl ExternalCommand for HttpProbeCommand {
                     msg
                 })?;
 
-            req.insert("version", CollectionValue::String(headers.version))
+            ext.insert("version", CollectionValue::String(headers.version))
                 .await
                 .map_err(|e| {
                     let msg = format!("Failed to insert version into request: {}", e);
                     error!("{}", msg);
                     msg
                 })?;
-            */
 
             if let Some(value) = headers.host {
                 host = Some(value.clone());
 
-                /*
                 let url = format!("http://{}{}", value, headers.path);
-                req.insert("url", CollectionValue::String(url))
+                ext.insert("url", CollectionValue::String(url))
                     .await
                     .map_err(|e| {
                         let msg = format!("Failed to insert url into request: {}", e);
                         error!("{}", msg);
                         msg
                     })?;
-
-                */
 
                 req.insert("dest_host", CollectionValue::String(value))
                     .await
@@ -258,15 +268,13 @@ impl ExternalCommand for HttpProbeCommand {
                 host = Some("".to_string());
             }
 
-            /*
-            req.insert("path", CollectionValue::String(headers.path))
+            ext.insert("path", CollectionValue::String(headers.path))
                 .await
                 .map_err(|e| {
                     let msg = format!("Failed to insert path into request: {}", e);
                     error!("{}", msg);
                     msg
                 })?;
-            */
 
             // Update the protocol to HTTPS
             req.insert("app_protocol", CollectionValue::String("http".to_string()))
