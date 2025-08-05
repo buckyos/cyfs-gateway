@@ -25,6 +25,18 @@ servers:
                 eq ${REQ.dest_host} "www.google.com" && return "forward tcp:///www.google.com:443";
                 reject;
 - server:
+    protocol: tcp
+    bind: 0.0.0.0
+    port: 8081
+    process_chains:
+      - id: main
+        priority: 1
+        blocks:
+           - id: default
+             block: |
+                call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
+                reject;
+- server:
     port: 80
     process_chains:
       - id: main

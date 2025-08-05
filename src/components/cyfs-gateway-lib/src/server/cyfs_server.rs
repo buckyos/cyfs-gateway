@@ -418,7 +418,6 @@ impl CyfsTcpServer {
                 service.clone()
             })
         };
-        let domain = domain.to_string();
         hyper::server::conn::http2::Builder::new(TokioExecutor)
             .serve_connection(
                 socket,
@@ -578,6 +577,24 @@ impl CyfsTcpServer {
         Ok(hyper::Response::new(hyper::Body::from(
             "Hello, World!",
         )))
+    }
+
+    async fn rtcp_server(
+        state: CyfsTcpServerStateRef,
+        stream: TcpStream,
+        addr: SocketAddr,
+    ) -> ServerResult<()> {
+        let rtcp_service = {
+            let state = state.lock().unwrap();
+            if state.rtcp_service.is_none() {
+                return Ok(());
+            }
+            state.rtcp_service.as_ref().unwrap().clone()
+        };
+
+        rtcp_service.stack.serve_connection(stream, addr).await;
+
+        Ok(())
     }
 
     pub fn update_server(&self, _config: CyfsServerConfig) -> ServerResult<()> {

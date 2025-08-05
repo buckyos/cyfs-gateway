@@ -16,7 +16,13 @@ impl CyfsServerManager {
     
     pub async fn start_server(&self, servers: Vec<CyfsServerConfig>) -> ServerResult<()> { 
         for server in servers.iter() {
-            let server = CyfsServer::create_server(server.clone()).await?;
+            let server = match CyfsServer::create_server(server.clone()).await {
+                Ok(server) => server,
+                Err(err) => {
+                    log::error!("create server failed: {}", err);
+                    continue;
+                }
+            };
             self.servers.lock().unwrap().push(server);
         }
         Ok(())
