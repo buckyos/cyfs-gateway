@@ -13,12 +13,15 @@ use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use url::Url;
-use hyper::Client;
-use hyper::body::to_bytes;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server};
+use hyper::body::{Bytes};
+use hyper::service::{service_fn};
+use hyper::{Request, Response};
 use hyper::{Method, StatusCode};
-use std::convert::Infallible;
+use http_body_util::Full;
+use hyper::server::conn::http1;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use http_body_util::BodyExt;
 
 const PROCESS_CHAIN: &str = r#"
 <root>
@@ -194,7 +197,7 @@ fn generate_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
     (rustls_cert, rustls_private_key)
 }
 
-async fn start_forward_server() {
+async fn start_forward_server(port: u16) {
     let hook_manager: HttpConnHookManager = HttpConnHookManager::create(PROCESS_CHAIN).await.unwrap();
     let hook_manager = Arc::new(hook_manager);
 
@@ -206,7 +209,7 @@ async fn start_forward_server() {
     let exec = Arc::new(exec);
 
     // Start the forward server to handle incoming connections
-    let forward_listener = TcpListener::bind("127.0.0.1:1001").await.unwrap();
+    let forward_listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
 
     tokio::spawn(async move {
         loop {
@@ -242,7 +245,7 @@ async fn test_https_sni_probe() {
     )
     .unwrap_or_else(|_| {
         // If TermLogger is not available (e.g., in some environments), fall back to SimpleLogger
-        SimpleLogger::init(LevelFilter::Info, Config::default()).unwrap()
+        let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
     });
 
     rustls::crypto::ring::default_provider()
@@ -275,7 +278,7 @@ async fn test_https_sni_probe() {
     });
 
     // Start the forward server to handle incoming connections
-    start_forward_server().await;
+    start_forward_server(1001).await;
 
     // Now we can create a client to test the HTTPS SNI probing
     let mut root_store = rustls::RootCertStore::empty();
@@ -316,53 +319,57 @@ async fn test_http_probe() {
     )
     .unwrap_or_else(|_| {
         // If TermLogger is not available (e.g., in some environments), fall back to SimpleLogger
-        SimpleLogger::init(LevelFilter::Info, Config::default()).unwrap()
+        let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
     });
 
     // Start a simple HTTP server to test the HTTP probing
-    let addr = ([127, 0, 0, 1], 1100).into();
-    let make_svc = make_service_fn(move |_conn| {
-        // Write a simple service that responds with "Hello, World!"
-        async move {
-            Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
-                async move {
-                    if req.method() == Method::GET && req.uri().path() == "/index.html" {
-                        Ok::<_, Infallible>(Response::new(Body::from("Hello, World!")))
-                    } else {
-                        Ok::<_, Infallible>(Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(Body::empty())
-                            .unwrap())
-                    }
-                }
-            }))
-        }
-    });
+    let addr: SocketAddr = ([127, 0, 0, 1], 1100).into();
 
-    let server = Server::bind(&addr).serve(make_svc);
+
+    let listener = TcpListener::bind(&addr).await.unwrap();
+    log::info!("Listening on http://{}", addr);
     tokio::spawn(async move {
-        if let Err(e) = server.await {
-            eprintln!("server error: {}", e);
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+
+            tokio::task::spawn(async move {
+                let service = service_fn(move |req|
+                    async move {
+                        if req.method() == Method::GET && req.uri().path() == "/index.html" {
+                            Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("Hello, World!"))))
+                        } else {
+                            Ok::<_, hyper::Error>(Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap())
+                        }
+                    });
+
+                if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+                    log::info!("Failed to serve connection: {:?}", err);
+                }
+            });
         }
     });
 
     // Start the forward server to handle incoming connections
-    start_forward_server().await;
+    start_forward_server(1002).await;
 
-    let client = Client::new();
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
 
     let req = Request::builder()
         .method(Method::GET)
         .header("content-type", "text/html")
-        .uri("http://127.0.0.1:1001/index.html")
+        .uri("http://127.0.0.1:1002/index.html")
         .header("HOST", "buckyos.com")
-        .body(Body::empty())
+        .body(Full::new(Bytes::new()))
         .expect("Failed to build request");
 
     let resp = client.request(req).await.unwrap();
 
     assert!(resp.status().is_success());
 
-    let bytes = to_bytes(resp).await.unwrap();
+    let bytes = resp.collect().await.unwrap().to_bytes();
     assert_eq!(&*bytes, b"Hello, World!");
 }

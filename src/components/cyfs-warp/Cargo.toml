@@ -13,7 +13,9 @@ lazy_static = "*"
 tokio = { version = "*", features = ["full"] }
 tokio-util = { version = "*", features = ["io"] }
 tokio-stream = { version = "*", features = ["full"] }
-hyper = { version = "0.14", features = ["full"] }
+hyper = { version = "1.6", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"]}
+http-body-util ="0.1"
 rustls = "0.21"
 rustls-pemfile = "1"
 tokio-rustls = "0.24"

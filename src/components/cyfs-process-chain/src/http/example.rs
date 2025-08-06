@@ -1,12 +1,16 @@
 use super::hyper_req::HyperHttpRequestHeaderMap;
-use hyper::Client;
-use hyper::body::to_bytes;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server};
+use hyper::body::{Bytes, Incoming};
+use hyper::service::{service_fn};
+use hyper::{Request, Response};
 use hyper::{Method, StatusCode};
-use std::convert::Infallible;
+use std::net::SocketAddr;
 use std::sync::Arc;
-
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full};
+use hyper::server::conn::http1;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::net::TcpListener;
 use crate::*;
 
 const PROCESS_CHAIN: &str = r#"
@@ -74,14 +78,14 @@ impl HttpHookManager {
 
 type HttpHookManagerRef = Arc<HttpHookManager>;
 
-async fn process_request(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+async fn process_request(req: Request<Incoming>) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/buckyos/index.html") => {
             info!("Received a GET request {}", req.uri());
-            Ok(Response::new(Body::from("Hello, World!")))
+            Ok(Response::new(Full::new(hyper::body::Bytes::from("Hello, World!")).map_err(|e| match e {}).boxed()))
         }
         _ => {
-            let mut not_found = Response::default();
+            let mut not_found = Response::<BoxBody<Bytes, hyper::Error>>::default();
             *not_found.status_mut() = StatusCode::NOT_FOUND;
             Ok(not_found)
         }
@@ -89,9 +93,9 @@ async fn process_request(req: Request<Body>) -> Result<Response<Body>, Infallibl
 }
 
 async fn pre_process_request(
-    req: Request<Body>,
+    req: Request<Incoming>,
     exec: ProcessChainListExecutor,
-) -> Result<Request<Body>, Response<Body>> {
+) -> Result<Request<Incoming>, Response<BoxBody<Bytes, hyper::Error>>> {
     info!("Pre-processing request: {:?}", req);
 
     // Create a HyperHttpRequestHeaderMap from the request
@@ -115,10 +119,10 @@ async fn pre_process_request(
         if ret.is_control() {
             if ret.is_drop() {
                 info!("Request dropped by the process chain");
-                return Err(Response::new(Body::from("Request dropped")));
+                return Err(Response::new(Full::new(Bytes::from("Request dropped")).map_err(|e| match e {}).boxed()));
             } else if ret.is_reject() {
                 info!("Request rejected by the process chain");
-                let mut response = Response::new(Body::from("Request rejected"));
+                let mut response = Response::new(Full::new(Bytes::from("Request rejected")).map_err(|e| match e {}).boxed());
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 return Err(response);
             } else {
@@ -133,9 +137,9 @@ async fn pre_process_request(
 }
 
 async fn handle(
-    req: Request<Body>,
+    req: Request<Incoming>,
     exec: ProcessChainListExecutor,
-) -> Result<Response<Body>, Infallible> {
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     info!("Handling request: {:?}", req);
 
     let req = match pre_process_request(req, exec).await {
@@ -155,35 +159,37 @@ async fn server_main() {
     let exec = hook_manager.hook_point_env.prepare_exec_list(&hook_manager.hook_point).await.unwrap();
     let exec = Arc::new(exec);
 
-    let addr = ([127, 0, 0, 1], 3000).into();
-    let make_svc = make_service_fn(move |_conn| {
-        // For each connection, we should fork the exec to ensure it is available for the request handler
+    let addr: SocketAddr = ([127, 0, 0, 1], 3000).into();
+
+    let listener = TcpListener::bind(&addr).await.unwrap();
+    log::info!("Listening on http://{}", addr);
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let io = TokioIo::new(stream);
+
         let exec = exec.clone();
-        async move { Ok::<_, Infallible>(service_fn(move |req| handle(req, exec.fork()))) }
-    });
+        tokio::task::spawn(async move {
+            let service = service_fn(move |req| handle(req, exec.fork()));
 
-    let server = Server::bind(&addr).serve(make_svc);
-
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
+            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+                log::info!("Failed to serve connection: {:?}", err);
+            }
+        });
     }
 }
 
 async fn client_main() {
-    let client = Client::new();
-
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
     let req = Request::builder()
         .method(Method::GET)
         .header("content-type", "text/html")
-        .uri("http://127.0.0.1:3000/index.html")
-        .body(Body::empty())
-        .expect("Failed to build request");
+        .uri("http://127.0.0.1:3000/index.html").body(Full::new(Bytes::new())).unwrap();
 
     let resp = client.request(req).await.unwrap();
 
     assert!(resp.status().is_success());
 
-    let bytes = to_bytes(resp).await.unwrap();
+    let bytes = resp.collect().await.unwrap().to_bytes();
     assert_eq!(&*bytes, b"Hello, World!");
 }
 
@@ -198,7 +204,7 @@ async fn test_main() {
     )
     .unwrap_or_else(|_| {
         // If TermLogger is not available (e.g., in some environments), fall back to SimpleLogger
-        SimpleLogger::init(LevelFilter::Info, Config::default()).unwrap()
+        let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
     });
 
     tokio::spawn(async {

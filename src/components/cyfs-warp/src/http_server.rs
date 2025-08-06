@@ -2,10 +2,8 @@
 use crate::router::*;
 use anyhow::Result;//TODO need build a new Result type for cyfs-warp
 use cyfs_gateway_lib::*;
-use futures::stream::StreamExt;
-use hyper::server::accept::from_stream;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server};
+use hyper::service::{service_fn};
+use hyper::{Request, Response};
 use log::*;
 use rustls::Certificate;
 use rustls::ServerConfig;
@@ -15,10 +13,13 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
-use tokio_stream::wrappers::TcpListenerStream;
 use rustls_pemfile::pkcs8_private_keys;
 use std::fs::File;
 use std::io::BufReader;
+use http_body_util::combinators::{UnsyncBoxBody};
+use hyper::body::{Bytes, Incoming};
+use hyper_util::rt::TokioIo;
+
 pub struct CyfsWarpServer {
     config: WarpServerConfig,
 
@@ -177,9 +178,9 @@ impl CyfsWarpServer {
 
     async fn handle_request(
         router: Router,
-        req: Request<Body>,
+        req: Request<Incoming>,
         client_ip: SocketAddr,
-    ) -> Result<Response<Body>, hyper::Error> {
+    ) -> Result<Response<UnsyncBoxBody<Bytes, anyhow::Error>>, hyper::Error> {
         match router.route(req, client_ip).await {
             Ok(response) => Ok(response),
             Err(e) => {
@@ -200,32 +201,30 @@ impl CyfsWarpServer {
                     error!("bind http server {} failed,  {}", http_bind_addr, e);
                     anyhow::anyhow!("bind http server {} failed, {}", http_bind_addr, e)
                 })?;
-        let listener_stream_http = TcpListenerStream::new(listener);
-        let http_acceptor = from_stream(listener_stream_http);
-
-        let make_svc = make_service_fn(move |conn: &tokio::net::TcpStream| {
-            let client_ip = conn.peer_addr().unwrap();
-            let http_router = http_router.clone();
-            async move {
-                Ok::<_, hyper::Error>(service_fn(move |req| {
-                    Self::handle_request(http_router.clone(), req, client_ip)
-                }))
-            }
-        });
-
-        let server_http = Server::builder(http_acceptor).serve(make_svc);
-        info!("cyfs-warp HTTP Server running on http://{}", http_bind_addr);
 
         let server_task = tokio::task::spawn(async move {
-            match server_http.await {
-                Ok(_) => {
-                    info!("cyfs-warp HTTP Server stopped: {}", http_bind_addr);
-                }
-                Err(e) => {
-                    error!(
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let http_router = http_router.clone();
+                        let client_ip = stream.peer_addr().unwrap();
+                        let io = TokioIo::new(stream);
+                        tokio::spawn(async move {
+                            let service = service_fn(move |req| {
+                                Self::handle_request(http_router.clone(), req, client_ip)
+                            });
+                            if let Err(err) = hyper::server::conn::http1::Builder::new()
+                                .serve_connection(io, service).await {
+                                error!("cyfs-warp failed to serve connection:{:?}", err);
+                            }
+                        });
+                    },
+                    Err(e) => {
+                        error!(
                         "cyfs-warp HTTP Server stopped with error: {:?}, {}",
                         e, http_bind_addr
                     );
+                    }
                 }
             }
         });
@@ -297,60 +296,42 @@ impl CyfsWarpServer {
             ));
         }
         let listener = listener.unwrap();
-        let listener_stream = TcpListenerStream::new(listener);
-        let incoming_tls_stream = listener_stream.filter_map(move |conn| {
-            debug!("tls accept a new tcp stream ...");
-            let tls_acceptor = tls_acceptor.clone();
-            async move {
-                match conn {
-                    Ok(stream) => {
+
+        let server_task = tokio::task::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let tls_acceptor = tls_acceptor.clone();
+                        let client_ip = stream.peer_addr().unwrap();
                         match tls_acceptor.accept(stream).await {
                             Ok(tls_stream) => {
                                 debug!("tls accept a new tls from tcp stream OK!");
-                                Some(Ok::<_, std::io::Error>(tls_stream))
+
+                                let http_router = https_router.clone();
+                                let io = TokioIo::new(tls_stream);
+                                tokio::spawn(async move {
+                                    let service = service_fn(move |req| {
+                                        Self::handle_request(http_router.clone(), req, client_ip)
+                                    });
+                                    if let Err(err) = hyper::server::conn::http1::Builder::new()
+                                        .serve_connection(io, service).await {
+                                        error!("cyfs-warp failed to serve connection:{:?}", err);
+                                    }
+                                });
                             }
                             Err(e) => {
                                 warn!("TLS handshake failed: {:?}", e);
-                                None // Ignore failed connections
+                                continue;
                             }
                         }
-                    }
+
+                    },
                     Err(e) => {
-                        warn!("TLS Connection acceptance failed: {:?}", e);
-                        None
-                    }
-                }
-            }
-        });
-        let acceptor = from_stream(incoming_tls_stream);
-        let make_svc = make_service_fn(
-            move |conn: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>| {
-                let client_ip = conn.get_ref().0.peer_addr().unwrap();
-                let https_router = https_router.clone();
-                async move {
-                    Ok::<_, hyper::Error>(service_fn(move |req| {
-                        Self::handle_request(https_router.clone(), req, client_ip)
-                    }))
-                }
-            },
-        );
-
-        let server = Server::builder(acceptor).serve(make_svc);
-        info!(
-            "cyfs-warp HTTPS Server running on https://{}",
-            https_bind_addr
-        );
-
-        let server_task = tokio::task::spawn(async move {
-            match server.await {
-                Ok(_) => {
-                    info!("cyfs-warp HTTPS Server stopped: {}", https_bind_addr);
-                }
-                Err(e) => {
-                    error!(
-                        "cyfs-warp HTTPS Server stopped with error: {:?}, {}",
+                        error!(
+                        "cyfs-warp HTTP Server stopped with error: {:?}, {}",
                         e, https_bind_addr
                     );
+                    }
                 }
             }
         });

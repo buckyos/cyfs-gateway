@@ -20,7 +20,9 @@ globset = "*"
 tokio = { version = "*", features = ["full"] }
 simplelog = "*"
 lazy_static = "*"
-hyper = { version = "0.14", features = ["full"] }
+hyper = { version = "1.6", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"]}
+http-body-util ="0.1"
 clap =  { version = "*", features = ["string"]}
 rustyline = "*"
 dirs-next = "*"

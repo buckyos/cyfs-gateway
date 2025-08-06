@@ -1,6 +1,6 @@
 use crate::{CyfsServerConfig, CyfsServerProtocol, DatagramClientBox, ProcessChainConfig, RTcpStack, GATEWAY_TUNNEL_MANAGER};
 use buckyos_kit::AsyncStream;
-use hyper::{Body, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, pkcs8_private_keys};
@@ -9,6 +9,9 @@ use std::io::{BufReader, Cursor};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use name_lib::{encode_ed25519_pkcs8_sk_to_pk, load_raw_private_key, DeviceConfig};
 
 #[derive(Debug, Copy, Clone)]
@@ -30,6 +33,15 @@ use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use url::Url;
+
+type GenericError = Box<dyn std::error::Error + Send + Sync>;
+type Result<T> = std::result::Result<T, GenericError>;
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+fn full<T: Into<Bytes>>(chunk: T) -> BoxBody {
+    Full::new(chunk.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
 
 pub struct CyfsHttpService {
     pub executor: ProcessChainListExecutor,
@@ -55,18 +67,6 @@ pub struct CyfsTcpServer {
 impl Drop for CyfsTcpServer {
     fn drop(&mut self) {
         self.server_handle.abort();
-    }
-}
-#[derive(Clone)]
-pub struct TokioExecutor;
-
-impl<F> hyper::rt::Executor<F> for TokioExecutor
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    fn execute(&self, fut: F) {
-        tokio::task::spawn(fut);
     }
 }
 
@@ -102,7 +102,7 @@ async fn create_process_chain_executor(
             Arc::new(Box::new(http_probe_command) as Box<dyn ExternalCommand>),
         )
         .unwrap();
-    
+
     let executor = hook_point_env
         .prepare_exec_list(&hook_point)
         .await
@@ -388,7 +388,7 @@ impl CyfsTcpServer {
         };
         hyper::server::conn::http1::Builder::new()
             .serve_connection(
-                socket,
+                TokioIo::new(socket),
                 hyper::service::service_fn(move |req| {
                     let http_service = http_service.clone();
                     async move {
@@ -399,14 +399,14 @@ impl CyfsTcpServer {
                                     log::error!("handle http request error: {}", e);
                                     Ok::<_, hyper::Error>(Response::builder()
                                         .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                        .body(Body::empty())
+                                        .body(full(Bytes::new()))
                                         .unwrap())
                                 }
                             }
                         } else {
                             Ok::<_, hyper::Error>(Response::builder()
                                 .status(StatusCode::NOT_FOUND)
-                                .body(Body::empty()).unwrap()
+                                .body(full(Bytes::new())).unwrap()
                             )
                         }
                     }
@@ -427,10 +427,10 @@ impl CyfsTcpServer {
                 service.clone()
             })
         };
-        hyper::server::conn::http2::Builder::new(TokioExecutor)
+        hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .serve_connection(
-                socket,
-                hyper::service::service_fn(move |req: Request<hyper::body::Body>| {
+                TokioIo::new(socket),
+                hyper::service::service_fn(move |req| {
                     let http_service = http_service.clone();
                     async move {
                         if let Some(http_service) = http_service {
@@ -440,14 +440,14 @@ impl CyfsTcpServer {
                                     log::error!("handle http request error: {}", e);
                                     Ok::<_, hyper::Error>(Response::builder()
                                         .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                        .body(Body::empty())
+                                        .body(full(Bytes::new()))
                                         .unwrap())
                                 }
                             }
                         } else {
                             Ok::<_, hyper::Error>(Response::builder()
                                 .status(StatusCode::NOT_FOUND)
-                                .body(Body::empty()).unwrap()
+                                .body(full(Bytes::new())).unwrap()
                             )
                         }
                     }
@@ -478,7 +478,7 @@ impl CyfsTcpServer {
             .map_err(into_server_err!(ServerErrorCode::StreamError))?;
         hyper::server::conn::http1::Builder::new()
             .serve_connection(
-                tls_stream,
+                TokioIo::new(tls_stream),
                 hyper::service::service_fn(move |req| {
                     let http_service = http_service.clone();
                     async move {
@@ -489,14 +489,14 @@ impl CyfsTcpServer {
                                     log::error!("handle http request error: {}", e);
                                     Ok::<_, hyper::Error>(Response::builder()
                                         .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                        .body(Body::empty())
+                                        .body(full(Bytes::new()))
                                         .unwrap())
                                 }
                             }
                         } else {
                             Ok::<_, hyper::Error>(Response::builder()
                                 .status(StatusCode::NOT_FOUND)
-                                .body(Body::empty()).unwrap()
+                                .body(full(Bytes::new())).unwrap()
                             )
                         }
                     }
@@ -525,9 +525,9 @@ impl CyfsTcpServer {
             .accept(socket)
             .await
             .map_err(into_server_err!(ServerErrorCode::StreamError))?;
-        hyper::server::conn::http2::Builder::new(TokioExecutor)
+        hyper::server::conn::http2::Builder::new(TokioExecutor::new())
             .serve_connection(
-                tls_stream,
+                TokioIo::new(tls_stream),
                 hyper::service::service_fn(move |req| {
                     let http_service = http_service.clone();
                     async move {
@@ -538,14 +538,14 @@ impl CyfsTcpServer {
                                     log::error!("handle http request error: {}", e);
                                     Ok::<_, hyper::Error>(Response::builder()
                                         .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                        .body(Body::empty())
+                                        .body(full(Bytes::new()))
                                         .unwrap())
                                 }
                             }
                         } else {
                             Ok::<_, hyper::Error>(Response::builder()
                                 .status(StatusCode::NOT_FOUND)
-                                .body(Body::empty()).unwrap()
+                                 .body(full(Bytes::new())).unwrap()
                             )
                         }
                     }
@@ -557,9 +557,9 @@ impl CyfsTcpServer {
     }
 
     async fn handle_http_request(
-        request: Request<Body>,
+        request: Request<Incoming>,
         executor: ProcessChainListExecutor,
-    ) -> ServerResult<Response<Body>> {
+    ) -> ServerResult<Response<BoxBody>> {
         let req_map = HyperHttpRequestHeaderMap::new(request);
         let chain_env = executor.chain_env();
         req_map.register_visitors(&chain_env).await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
@@ -571,10 +571,10 @@ impl CyfsTcpServer {
         if ret.is_control() {
             if ret.is_drop() {
                 info!("Request dropped by the process chain");
-                return Ok(Response::new(Body::from("Request dropped")));
+                return Ok(Response::new(Full::new(Bytes::from("Request dropped")).map_err(|e| match e {}).boxed()));
             } else if ret.is_reject() {
                 info!("Request rejected by the process chain");
-                let mut response = Response::new(Body::empty());
+                let mut response = Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 return Ok(response);
             } else {
@@ -583,9 +583,9 @@ impl CyfsTcpServer {
         }
         drop(executor);
 
-        Ok(hyper::Response::new(hyper::Body::from(
+        Ok(hyper::Response::new(Full::new(Bytes::from(
             "Hello, World!",
-        )))
+        )).map_err(|e| match e {}).boxed()))
     }
 
     async fn rtcp_server(

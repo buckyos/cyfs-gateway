@@ -1,4 +1,3 @@
-use hyper::client::connect::{Connected, Connection};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use url::Url;
 use std::error::Error as StdError;
@@ -18,12 +17,6 @@ pub struct TunnelStreamConnection {
 impl TunnelStreamConnection {
     pub fn new(inner: Box<dyn AsyncStream>) -> Self {
         TunnelStreamConnection { inner }
-    }
-}
-
-impl Connection for TunnelStreamConnection {
-    fn connected(&self) -> Connected {
-        Connected::new()
     }
 }
 
@@ -79,11 +72,7 @@ impl Service<Uri> for TunnelConnector {
     type Error = Box<dyn StdError + Send + Sync>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, _uri: Uri) -> Self::Future {
+    fn call(&self, _uri: Uri) -> Self::Future {
         let target_stream_url = self.target_stream_url.clone();
         Box::pin(async move {
             debug!("TunnelConnector call uri: {}", target_stream_url.as_str());

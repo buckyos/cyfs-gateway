@@ -4,7 +4,7 @@
 
 use thiserror::Error;
 use hyper::header::HeaderValue;
-use hyper::{Body, Client, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use log::*;
 use rustls::ServerConfig;
 use url::Url;
@@ -18,16 +18,22 @@ use tokio::{
 use std::{net::SocketAddr, sync::Arc};
 use std::path::Path;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use cyfs_gateway_lib::*;
 use tokio::sync::{Mutex, OnceCell};
 use serde_json::json;
 use ::kRPC::*;
 use lazy_static::lazy_static;
 use std::io::BufReader;
+use futures_util::TryStreamExt;
+use http_body_util::combinators::{BoxBody, UnsyncBoxBody};
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Bytes, Frame, Incoming};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use cyfs_sn::*;
 use ndn_lib::*;
-
 use crate::ndn_router::*;
 use crate::*;
 
@@ -58,10 +64,10 @@ pub enum RouterError {
 }
 
 impl RouterError {
-    pub fn build_response(&self)->Response<Body> {
+    pub fn build_response(&self)->Response<UnsyncBoxBody<Bytes, anyhow::Error>> {
         Response::builder()
             .status(self.status_code())
-            .body(Body::empty())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap()
     }
 
@@ -134,7 +140,7 @@ impl Router {
                             break;
                         }
                     }
-                    
+
                     //appid.* 这种格式，通过SN转发的时候 appid.username.web3.buckyos.io 可以转发到特定appid的upstream
                     if key.ends_with(".*") {
                         if host.starts_with(&key[..key.len()-1]) {
@@ -186,15 +192,15 @@ impl Router {
 
     pub async fn route(
         &self,
-        req: Request<Body>,
+        req: Request<Incoming>,
         client_ip:SocketAddr,
-    ) -> RouterResult<Response<Body>> { 
-        let mut host = req 
-            .headers() 
-            .get("host") 
-            .and_then(|h| h.to_str().ok()) 
-            .unwrap_or_default() 
-            .to_string(); 
+    ) -> RouterResult<Response<UnsyncBoxBody<Bytes, anyhow::Error>>> {
+        let mut host = req
+            .headers()
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
 
         if host.len() > 1 {
             let result = host.split_once(':');
@@ -212,7 +218,7 @@ impl Router {
             warn!("Route Config not found: {}", host);
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
-                .body(Body::from("Route not found")).unwrap());
+                .body(Full::new(Bytes::from("Route not found")).map_err(|never| match never {}).boxed_unsync()).unwrap());
         }
 
         let (route_path, route_config) = route_config.unwrap();
@@ -231,7 +237,7 @@ impl Router {
                     }
                 }
                 let body = response.body.clone().unwrap_or_default();
-                let resp = builder.body(Body::from(body)).unwrap();
+                let resp = builder.body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed_unsync()).unwrap();
                 Ok(resp)
             }
             RouteConfig {
@@ -249,7 +255,7 @@ impl Router {
                 if route_config.enable_cors && req.method() == hyper::Method::OPTIONS {
                     Ok(Response::builder()
                         .status(StatusCode::OK)
-                        .body(Body::empty()).unwrap())
+                        .body(Full::new(Bytes::new()).map_err(|never| match never {}).boxed_unsync()).unwrap())
                 } else {
                     self.handle_inner_service(inner_service.as_str(),req,client_ip).await
                 }
@@ -267,7 +273,7 @@ impl Router {
             if route_config.enable_cors {
                 //info!("enable cors for route: {}",route_path);
                 let header = resp.headers_mut();
-                
+
                 header.insert(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
                 header.insert(hyper::header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
                 header.insert(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type, Authorization"));
@@ -278,7 +284,7 @@ impl Router {
         if real_resp.is_err() {
             let err_msg = real_resp.as_ref().unwrap_err().to_string();
             error!("{} <==| {}",client_ip.to_string(),err_msg);
-            
+
         } else {
             info!("{} <==| {}",client_ip.to_string(),real_resp.as_ref().unwrap().status());
         }
@@ -288,7 +294,7 @@ impl Router {
 
 
 
-    async fn handle_inner_service(&self, inner_service_name: &str, req: Request<Body>, client_ip:IpAddr) -> RouterResult<Response<Body>> {
+    async fn handle_inner_service(&self, inner_service_name: &str, req: Request<Incoming>, client_ip:IpAddr) -> RouterResult<Response<UnsyncBoxBody<Bytes, anyhow::Error>>> {
         let inner_service = self.inner.inner_service.get();
         let true_service;
         if inner_service.is_none() {
@@ -310,9 +316,9 @@ impl Router {
         let method = req.method();
         match *method {
             hyper::Method::POST => {
-                let body_bytes = hyper::body::to_bytes(req.into_body()).await.map_err(|e| {
+                let body_bytes = req.collect().await.map_err(|e| {
                     RouterError::BadRequest(format!("Failed to read body: {}", e))
-                })?;
+                })?.to_bytes();
 
                 let body_str = String::from_utf8(body_bytes.to_vec()).map_err(|e| {
                     RouterError::BadRequest(format!("Failed to convert body to string: {}", e))
@@ -330,9 +336,9 @@ impl Router {
                 })?;
 
                 //parse resp to Response<Body>
-                Ok(Response::new(Body::from(serde_json::to_string(&resp).map_err(|e| {
+                Ok(Response::new(Full::new(Bytes::from(serde_json::to_string(&resp).map_err(|e| {
                     RouterError::Internal(format!("Failed to convert response to string: {}", e))
-                })?)))
+                })?)).map_err(|never| match never {}).boxed_unsync()))
             }
             hyper::Method::GET => {
                 let resp = true_service.handle_http_get(req.uri().path(),client_ip).await;
@@ -341,16 +347,16 @@ impl Router {
                     return Err(RouterError::Internal(format!("Failed to handle http get: {}", resp.as_ref().unwrap_err())));
                 }
                 let resp = resp.unwrap();
-                Ok(Response::new(Body::from(resp)))
+                Ok(Response::new(Full::new(Bytes::from(resp)).map_err(|never| match never {}).boxed_unsync()))
             }
             _ => {
                 return Err(RouterError::BadRequest(format!("Not supported request method: {}", req.method())));
             }
         }
-        
+
     }
 
-    async fn handle_upstream_selector(&self, selector_id:&str,req: Request<Body>,host:&str, client_ip:IpAddr) -> RouterResult<Response<Body>> {
+    async fn handle_upstream_selector(&self, selector_id:&str,req: Request<Incoming>,host:&str, client_ip:IpAddr) -> RouterResult<Response<UnsyncBoxBody<Bytes, anyhow::Error>>> {
         //in early stage, only support sn server id
         let sn_server = get_sn_server_by_id(selector_id).await;
         if sn_server.is_some() {
@@ -369,7 +375,7 @@ impl Router {
         return Err(RouterError::BadGateway("No tunnel selected".to_string()));
     }
 
-    async fn handle_upstream(&self, req: Request<Body>, upstream: &UpstreamRouteConfig) -> RouterResult<Response<Body>> {
+    async fn handle_upstream(&self, req: Request<Incoming>, upstream: &UpstreamRouteConfig) -> RouterResult<Response<UnsyncBoxBody<Bytes, anyhow::Error>>> {
         let org_url = req.uri().to_string();
         let url = format!("{}{}", upstream.target, org_url);
         info!("handle_upstream url: {}", url);
@@ -384,34 +390,35 @@ impl Router {
             "tcp"|"http"|"https" => {
                 match &upstream.redirect {
                     RedirectType::None => {
-                        let client = Client::new();
+                        let client: Client<_, BoxBody<Bytes, hyper::Error>> = Client::builder(TokioExecutor::new()).build_http();
                         let header = req.headers().clone();
                         let mut upstream_req = Request::builder()
                         .method(req.method())
                         .uri(&url)
-                        .body(req.into_body()).map_err(|e| {
+                        .body(req.into_body().boxed()).map_err(|e| {
                             RouterError::Internal(format!("Failed to build request: {}", e))
                         })?;
 
                         *upstream_req.headers_mut() = header;
-                    
+
                         let resp = client.request(upstream_req).await.map_err(|e| {
                             RouterError::Internal(format!("Failed to request upstream: {}", e))
                         })?;
+                        let resp = resp.map(|body| body.map_err(|e| anyhow::Error::from(e)).boxed_unsync());
                         return Ok(resp)
-                    }, 
+                    },
                     RedirectType::Permanent => {
                         let resp = Response::builder()
                             .status(StatusCode::PERMANENT_REDIRECT)
                             .header(hyper::header::LOCATION, url)
-                            .body(Body::empty()).unwrap();
+                            .body(Full::new(Bytes::new()).map_err(|never| match never {}).boxed_unsync()).unwrap();
                         return Ok(resp);
                     },
                     RedirectType::Temporary => {
                         let resp = Response::builder()
                         .status(StatusCode::TEMPORARY_REDIRECT)
                         .header(hyper::header::LOCATION, url)
-                        .body(Body::empty()).unwrap();
+                        .body(Full::new(Bytes::new()).map_err(|never| match never {}).boxed_unsync()).unwrap();
                         return Ok(resp);
                     }
                 }
@@ -421,8 +428,7 @@ impl Router {
                     target_stream_url: upstream.target.clone(),
                 };
 
-                let client: Client<TunnelConnector, Body> = Client::builder()
-                    .build::<_, hyper::Body>(tunnel_connector);
+                let client: Client<_, BoxBody<Bytes, hyper::Error>> = Client::builder(TokioExecutor::new()).build_http();
 
                 let header = req.headers().clone();
                 let mut host_name = "127.0.0.1".to_string();
@@ -434,7 +440,7 @@ impl Router {
                 let mut upstream_req = Request::builder()
                     .method(req.method())
                     .uri(fake_url)
-                    .body(req.into_body()).map_err(|e| {
+                    .body(req.into_body().boxed()).map_err(|e| {
                         RouterError::BadGateway(format!("Failed to build upstream_req: {}", e))
                     })?;
 
@@ -442,13 +448,13 @@ impl Router {
                 let resp = client.request(upstream_req).await.map_err(|e| {
                     RouterError::Internal(format!("Failed to request upstream: {}", e))
                 })?;
+                let resp = resp.map(|body| body.map_err(|e| anyhow::Error::from(e)).boxed_unsync());
                 return Ok(resp)
             }
         }
 
     }
-
-    async fn handle_local_dir(&self, req: Request<Body>, local_dir: &str, route_path: &str) -> RouterResult<Response<Body>> {
+    async fn handle_local_dir(&self, req: Request<Incoming>, local_dir: &str, route_path: &str) -> RouterResult<Response<UnsyncBoxBody<Bytes, anyhow::Error>>> {
         let path = req.uri().path();
         let sub_path = buckyos_kit::get_relative_path(route_path, path);
         let file_path = if sub_path.starts_with("/") {
@@ -471,7 +477,6 @@ impl Router {
             })?;
             let file_size = file_meta.len();
             let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
-
             // 处理Range请求
             if let Some(range_header) = req.headers().get(hyper::header::RANGE) {
                 if let Ok(range_str) = range_header.to_str() {
@@ -487,6 +492,7 @@ impl Router {
                             file.take(content_length),
                             content_length as usize
                         );
+                        let stream_body = StreamBody::new(stream.map_ok(Frame::data));
 
                         return Ok(Response::builder()
                             .status(StatusCode::PARTIAL_CONTENT)
@@ -494,7 +500,7 @@ impl Router {
                             .header("Content-Length", content_length)
                             .header("Content-Range", format!("bytes {}-{}/{}", start, end, file_size))
                             .header("Accept-Ranges", "bytes")
-                            .body(Body::wrap_stream(stream)).map_err(|e| {
+                            .body(BodyExt::map_err(stream_body, |e| anyhow::Error::from(e)).boxed_unsync()).map_err(|e| {
                                 RouterError::Internal(format!("Failed to build response: {}", e))
                             })?);
                     }
@@ -503,13 +509,13 @@ impl Router {
 
             // 非Range请求返回完整文件
             let stream = tokio_util::io::ReaderStream::with_capacity(file, file_size as usize);
-
+            let stream_body = StreamBody::new(stream.map_ok(Frame::data));
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", mime_type.as_ref())
                 .header("Content-Length", file_size)
                 .header("Accept-Ranges", "bytes")
-                .body(Body::wrap_stream(stream)).map_err(|e| {
+                .body(BodyExt::map_err(stream_body, |e| anyhow::Error::from(e)).boxed_unsync()).map_err(|e| {
                     RouterError::Internal(format!("Failed to build response: {}", e))
                 })?)
         } else {

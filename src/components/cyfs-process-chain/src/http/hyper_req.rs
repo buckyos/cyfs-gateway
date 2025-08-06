@@ -5,7 +5,7 @@ use hyper::{Uri, header::HeaderName};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-type Request = hyper::Request<hyper::Body>;
+type Request = hyper::Request<hyper::body::Incoming>;
 
 #[derive(Clone)]
 pub struct HyperHttpRequestHeaderMap {

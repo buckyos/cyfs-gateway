@@ -294,7 +294,7 @@ async fn test_process_chain_main() {
     )
     .unwrap_or_else(|_| {
         // If TermLogger is not available (e.g., in some environments), fall back to SimpleLogger
-        SimpleLogger::init(LevelFilter::Info, Config::default()).unwrap()
+        let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
     });
 
     EXTERNAL_COMMAND_FACTORY
