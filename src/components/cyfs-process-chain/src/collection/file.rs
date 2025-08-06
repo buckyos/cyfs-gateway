@@ -339,6 +339,10 @@ impl MultiMapCollection for JsonMultiMapCollection {
         self.data.contains_key(key).await
     }
 
+    async fn contains_value(&self, key: &str, value: &[&str]) -> Result<bool, String> {
+        self.data.contains_value(key, value).await
+    }
+
     async fn remove(&self, key: &str, value: &str) -> Result<bool, String> {
         let ret = self.data.remove(key, value).await?;
         if ret {

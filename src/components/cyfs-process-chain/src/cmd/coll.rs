@@ -236,8 +236,8 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                 self.collection.clone()
             }
             CollectionValue::Visitor(_) | CollectionValue::Any(_) => {
-                let msg =
-                    "Collection cannot be a visitor or any type for match-include command".to_string();
+                let msg = "Collection cannot be a visitor or any type for match-include command"
+                    .to_string();
                 warn!("{}", msg);
                 return Err(msg);
             }
@@ -252,9 +252,9 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                     self.key, self.collection_id, contains
                 );
                 if contains {
-                    Ok(CommandResult::success())
+                    Ok(CommandResult::success_with_value("true"))
                 } else {
-                    Ok(CommandResult::error())
+                    Ok(CommandResult::error_with_value("false"))
                 }
             }
             CollectionValue::Map(collection) => {
@@ -266,7 +266,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                             "MatchInclude command: key='{}', collection_id='{}', value='{}' found",
                             self.key, self.collection_id, value
                         );
-                        return Ok(CommandResult::success());
+                        return Ok(CommandResult::success_with_value("true"));
                     } else {
                         if self.values.len() > 1 {
                             warn!(
@@ -284,7 +284,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                                         "match-include command: key='{}', collection_id='{}', value='{}' found",
                                         self.key, self.collection_id, v
                                     );
-                                    return Ok(CommandResult::success());
+                                    return Ok(CommandResult::success_with_value("true"));
                                 } else {
                                     // value is string but not match
                                 }
@@ -306,47 +306,37 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                     self.key, self.collection_id
                 );
 
-                Ok(CommandResult::error())
+                Ok(CommandResult::error_with_value("false"))
             }
 
             CollectionValue::MultiMap(collection) => {
-                // For multi-map collection, we check if the key exists and matches any of the values
-                let values = collection.get_many(&self.key).await?;
-                if let Some(values) = values {
-                    if self.values.is_empty() {
-                        info!(
-                            "MatchInclude command: key='{}', collection_id='{}'",
-                            self.key, self.collection_id
-                        );
+                // For multi-map collection, we check if the key exists and matches all of the values
+                let ret = if self.values.is_empty() {
+                    collection.contains_key(&self.key).await?
+                } else {
+                    let values = self
+                        .values
+                        .iter()
+                        .map(|v| v.as_str())
+                        .collect::<Vec<&str>>();
+                    collection.contains_value(&self.key, &values).await?
+                };
 
-                        return Ok(CommandResult::success());
-                    } else {
-                        // Check if all values match
-                        let mut all_match = false;
-                        for value in &self.values {
-                            if !values.contains(value).await? {
-                                all_match = false;
-                                break;
-                            } else {
-                                all_match = true;
-                            }
-                        }
+                if ret {
+                    info!(
+                        "MatchInclude command: key='{}', collection_id='{}' exists",
+                        self.key, self.collection_id
+                    );
+                    
+                    Ok(CommandResult::success_with_value("true"))
+                } else {
+                    info!(
+                        "MatchInclude command: key='{}', collection_id='{}' does not exist",
+                        self.key, self.collection_id
+                    );
 
-                        if all_match {
-                            info!(
-                                "MatchInclude command: key='{}', collection_id='{}', values match",
-                                self.key, self.collection_id
-                            );
-                            return Ok(CommandResult::success());
-                        }
-                    }
+                    Ok(CommandResult::error_with_value("false"))
                 }
-
-                info!(
-                    "MatchInclude command: key='{}', collection_id='{}', no matching key or values found",
-                    self.key, self.collection_id
-                );
-                Ok(CommandResult::error())
             }
 
             _ => {
@@ -1363,12 +1353,8 @@ impl CommandExecutor for MapRemoveCommandExecutor {
 
                 let ret = if self.values.len() == 0 {
                     match collection.remove_all(&self.key).await? {
-                        Some(ret) => {
-                            Some(ret.get_all().await?.join(" "))
-                        }
-                        None => {
-                            None
-                        }
+                        Some(ret) => Some(ret.get_all().await?.join(" ")),
+                        None => None,
                     }
                 } else if self.values.len() == 1 {
                     let ret = collection.remove(&self.key, &self.values[0]).await?;
@@ -1384,12 +1370,8 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                         .map(|s| s.as_str())
                         .collect::<Vec<&str>>();
                     match collection.remove_many(&self.key, &values).await? {
-                        Some(ret) => {
-                            Some(ret.get_all().await?.join(" "))
-                        }
-                        None => {
-                            None
-                        }
+                        Some(ret) => Some(ret.get_all().await?.join(" ")),
+                        None => None,
                     }
                 };
 

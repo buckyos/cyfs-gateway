@@ -336,6 +336,11 @@ pub trait MultiMapCollection: Send + Sync {
     /// Checks if the collection contains the given key.
     async fn contains_key(&self, key: &str) -> Result<bool, String>;
 
+    /// Checks if the collection contains the given values for the key.
+    /// If all values are present, it returns true.
+    /// If any value is missing, it returns false.
+    async fn contains_value(&self, key: &str, value: &[&str]) -> Result<bool, String>;
+
     /// Removes the value for the given key from the collection.
     /// If the key or value is not found, it returns false.
     async fn remove(&self, key: &str, value: &str) -> Result<bool, String>;

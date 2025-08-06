@@ -300,6 +300,25 @@ impl MultiMapCollection for MemoryMultiMapCollection {
         Ok(data.contains_key(key))
     }
 
+    async fn contains_value(&self, key: &str, value: &[&str]) -> Result<bool, String> {
+        let data = self.data.read().unwrap();
+        if let Some(set) = data.get(key) {
+            let mut exists = false;
+            for v in value {
+                if !set.contains(*v) {
+                    exists = false;
+                    break;
+                } else {
+                    exists = true;
+                }
+            }
+
+            Ok(exists)
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn remove(&self, key: &str, value: &str) -> Result<bool, String> {
         let mut data = self.data.write().unwrap();
         if let Some(set) = data.get_mut(key) {
