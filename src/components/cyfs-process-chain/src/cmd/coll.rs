@@ -1362,24 +1362,43 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                 }
 
                 let ret = if self.values.len() == 0 {
-                    collection.remove_all(&self.key).await?.is_some()
+                    match collection.remove_all(&self.key).await? {
+                        Some(ret) => {
+                            Some(ret.get_all().await?.join(" "))
+                        }
+                        None => {
+                            None
+                        }
+                    }
                 } else if self.values.len() == 1 {
-                    collection.remove(&self.key, &self.values[0]).await?
+                    let ret = collection.remove(&self.key, &self.values[0]).await?;
+                    if ret {
+                        Some(self.values[0].clone())
+                    } else {
+                        None
+                    }
                 } else {
                     let values = self
                         .values
                         .iter()
                         .map(|s| s.as_str())
                         .collect::<Vec<&str>>();
-                    collection.remove_many(&self.key, &values).await?
+                    match collection.remove_many(&self.key, &values).await? {
+                        Some(ret) => {
+                            Some(ret.get_all().await?.join(" "))
+                        }
+                        None => {
+                            None
+                        }
+                    }
                 };
 
-                if ret {
+                if let Some(value) = ret {
                     info!(
-                        "Key '{}' with values '{:?}' removed from multi-map collection with id '{}'",
-                        self.key, self.values, self.map_id
+                        "Key '{}' with values '{}' removed from multi-map collection with id '{}'",
+                        self.key, value, self.map_id
                     );
-                    Ok(CommandResult::success())
+                    Ok(CommandResult::success_with_value(value))
                 } else {
                     warn!(
                         "Key '{}' with values '{:?}' not found in multi-map collection with id '{}'",
