@@ -494,6 +494,7 @@ servers:
           block: |
               match $REQ.url "/api" && return "forward http://127.0.0.1:8082"";
     rtcp_service:
+      device_name: test
       device_key: ./identity.json
       process_chains:
         - id: main
