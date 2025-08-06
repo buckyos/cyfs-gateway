@@ -2,19 +2,15 @@ use crate::collection::*;
 use boa_engine::{
     Context as JsContext, Finalize, JsData, JsError, JsNativeError, JsObject, JsResult, JsString,
     JsValue, NativeFunction, Trace,
-    builtins::promise::PromiseState,
     class::{Class, ClassBuilder},
-    job::{JobQueue, NativeJob},
     js_string,
     object::{
-        Object,
-        builtins::{JsArray, JsPromise},
+        builtins::{JsArray},
     },
-    value::{self, TryFromJs},
+    value::{TryFromJs},
 };
 use boa_gc::Tracer;
 use futures::future::BoxFuture;
-use std::future::Future;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -36,7 +32,8 @@ impl CollectionWrapperHelper {
                 wrapper.into_js_object(context).map(JsValue::Object)
             }
             CollectionValue::MultiMap(map) => {
-                todo!("MultiMap is not yet supported in JS wrapper");
+                let wrapper = MultiMapCollectionWrapper::new(map);
+                wrapper.into_js_object(context).map(JsValue::Object)
             }
             _ => {
                 let msg = format!("Unsupported CollectionValue type: {:?}", value);
@@ -790,7 +787,7 @@ impl MultiMapCollectionWrapper {
     fn get(
         this: &JsValue,
         args: &[JsValue],
-        context: &mut JsContext,
+        _context: &mut JsContext,
     ) -> BoxFuture<'static, JsResult<JsValue>> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
@@ -962,22 +959,22 @@ impl MultiMapCollectionWrapper {
     pub fn remove_many(
         this: &JsValue,
         args: &[JsValue],
-        _context: &mut JsContext,
-    ) -> BoxFuture<'static, JsResult<JsValue>> {
+        context: &mut JsContext,
+    ) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
                 let msg = format!("Failed to get MultiMapCollectionWrapper from this");
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         if args.len() < 2 {
             let msg = "Expected at least 2 argument: key".to_string();
             error!("{}", msg);
-            return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+            return Err(JsNativeError::error().with_message(msg).into());
         }
 
         let key = if args[0].is_string() {
@@ -985,28 +982,35 @@ impl MultiMapCollectionWrapper {
         } else {
             let msg = "Expected a string key".to_string();
             error!("{}", msg);
-            return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+            return Err(JsNativeError::error().with_message(msg).into());
         };
 
-        let value = match CollectionWrapperHelper::js_value_to_string_list(&args[1], _context) {
+        let value = match CollectionWrapperHelper::js_value_to_string_list(&args[1], context) {
             Ok(v) => v,
             Err(e) => {
                 let msg = format!("Invalid value argument: {}", e);
                 error!("{}", msg);
-                return Box::pin(async move { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
-        let ft = async move {
-            let list = value.iter().map(|v| v.as_str()).collect::<Vec<&str>>();
-            collection
-                .remove_many(&key, &list)
-                .await
-                .map(JsValue::Boolean)
-                .map_err(|e| JsError::from_native(JsNativeError::error().with_message(e)))
-        };
-
-        Box::pin(ft)
+        let rt = Runtime::new().map_err(|e| JsNativeError::error().with_message(e.to_string()))?;
+        let value = value.iter().map(|v| v.as_str()).collect::<Vec<&str>>();
+        match rt.block_on(collection.remove_many(&key, &value)) {
+            Ok(ret) => match ret {
+                Some(values) => {
+                    let set = SetCollectionWrapper::new(values);
+                    let value = set.into_js_object(context).map(JsValue::Object)?;
+                    Ok(value)
+                }
+                None => Ok(JsValue::Null),
+            }
+            Err(e) => {
+                let msg = format!("Failed to remove all from multi-map collection: {}", e);
+                error!("{}", msg);
+                Err(JsNativeError::error().with_message(msg).into())
+            }
+        }
     }
 
     pub fn remove_all(
@@ -1096,7 +1100,7 @@ impl Class for MultiMapCollectionWrapper {
         let remove_fn = NativeFunction::from_async_fn(Self::remove);
         class.method(js_string!("remove"), 2, remove_fn);
 
-        let remove_many_fn = NativeFunction::from_async_fn(Self::remove_many);
+        let remove_many_fn = NativeFunction::from_fn_ptr(Self::remove_many);
         class.method(js_string!("remove_many"), 2, remove_many_fn);
 
         let remove_all_fn = NativeFunction::from_fn_ptr(Self::remove_all);

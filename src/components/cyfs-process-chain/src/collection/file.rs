@@ -104,6 +104,10 @@ impl JsonSetCollection {
 
 #[async_trait::async_trait]
 impl SetCollection for JsonSetCollection {
+    async fn len(&self) -> Result<usize, String> {
+        self.data.len().await
+    }
+
     async fn insert(&self, value: &str) -> Result<bool, String> {
         let ret = self.data.insert(value).await?;
         if ret {
@@ -213,6 +217,10 @@ impl JsonMapCollection {
 
 #[async_trait::async_trait]
 impl MapCollection for JsonMapCollection {
+    async fn len(&self) -> Result<usize, String> {
+        self.data.len().await
+    }
+
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
         let ret = self.data.insert_new(key, value).await?;
         if ret {
@@ -297,6 +305,10 @@ impl JsonMultiMapCollection {
 
 #[async_trait::async_trait]
 impl MultiMapCollection for JsonMultiMapCollection {
+    async fn len(&self) -> Result<usize, String> {
+        self.data.len().await
+    }
+
     async fn insert(&self, key: &str, value: &str) -> Result<bool, String> {
         let ret = self.data.insert(key, value).await?;
         if ret {
@@ -336,9 +348,9 @@ impl MultiMapCollection for JsonMultiMapCollection {
         Ok(ret)
     }
 
-    async fn remove_many(&self, key: &str, values: &[&str]) -> Result<bool, String> {
+    async fn remove_many(&self, key: &str, values: &[&str]) -> Result<Option<SetCollectionRef>, String> {
         let ret = self.data.remove_many(key, values).await?;
-        if ret {
+        if ret.is_some() && ret.as_ref().unwrap().len().await? > 0 {
             self.file.mark_dirty();
         }
 

@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
+pub const STREAM_REQUEST_LEN: usize = 11;
+
 #[derive(Clone)]
 pub struct StreamRequest {
     pub dest_port: u16,
@@ -90,6 +92,10 @@ impl StreamRequestMap {
 
 #[async_trait::async_trait]
 impl MapCollection for StreamRequestMap {
+    async fn len(&self) -> Result<usize, String> {
+        Ok(STREAM_REQUEST_LEN)
+    }
+
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
         self.insert(key, value).await.map(|prev| prev.is_none())
     }

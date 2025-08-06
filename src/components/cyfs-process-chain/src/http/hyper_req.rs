@@ -58,6 +58,11 @@ impl HyperHttpRequestHeaderMap {
 
 #[async_trait::async_trait]
 impl MapCollection for HyperHttpRequestHeaderMap {
+    async fn len(&self) -> Result<usize, String> {
+        let request = self.request.read().await;
+        Ok(request.headers().len())
+    }
+
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
         let mut request = self.request.write().await;
         let header = value.try_as_str()?.parse().map_err(|e| {

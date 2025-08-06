@@ -26,6 +26,11 @@ impl MemorySetCollection {
 
 #[async_trait::async_trait]
 impl SetCollection for MemorySetCollection {
+    async fn len(&self) -> Result<usize, String> {
+        let data = self.data.read().unwrap();
+        Ok(data.len())
+    }
+
     async fn insert(&self, value: &str) -> Result<bool, String> {
         let mut data = self.data.write().unwrap();
         Ok(data.insert(value.to_string()))
@@ -75,6 +80,11 @@ impl MemoryMapCollection {
 
 #[async_trait::async_trait]
 impl MapCollection for MemoryMapCollection {
+    async fn len(&self) -> Result<usize, String> {
+        let data = self.data.read().unwrap();
+        Ok(data.len())
+    }
+
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
         let mut data = self.data.write().unwrap();
         match data.entry(key.to_string()) {
@@ -241,6 +251,11 @@ impl MemoryMultiMapCollection {
 
 #[async_trait::async_trait]
 impl MultiMapCollection for MemoryMultiMapCollection {
+    async fn len(&self) -> Result<usize, String> {
+        let data = self.data.read().unwrap();
+        Ok(data.len())
+    }
+
     async fn insert(&self, key: &str, value: &str) -> Result<bool, String> {
         let mut data = self.data.write().unwrap();
         let entry = data.entry(key.to_string()).or_insert_with(HashSet::new);
@@ -300,32 +315,34 @@ impl MultiMapCollection for MemoryMultiMapCollection {
         Ok(false)
     }
 
-    async fn remove_many(&self, key: &str, values: &[&str]) -> Result<bool, String> {
+    async fn remove_many(&self, key: &str, values: &[&str]) -> Result<Option<SetCollectionRef>, String> {
         let mut data = self.data.write().unwrap();
         if let Some(set) = data.get_mut(key) {
-            let initial_len = set.len();
+            let mut removed_set = HashSet::new();
             for value in values {
-                set.remove(*value);
+                if set.remove(*value) {
+                    removed_set.insert(value.to_string());
+                }
             }
 
-            let changed = set.len() < initial_len;
             if set.is_empty() {
                 data.remove(key);
             }
 
-            return Ok(changed);
+            let coll = MemorySetCollection::from_set(removed_set);
+            let coll = Arc::new(Box::new(coll) as Box<dyn SetCollection>);
+            return Ok(Some(coll));
         }
 
-        Ok(false)
+        Ok(None)
     }
 
     async fn remove_all(&self, key: &str) -> Result<Option<SetCollectionRef>, String> {
         let mut data = self.data.write().unwrap();
         if let Some(set) = data.remove(key) {
-            let collection = Arc::new(Box::new(MemorySetCollection {
-                data: RwLock::new(set),
-            }) as Box<dyn SetCollection>);
-            Ok(Some(collection))
+            let coll = MemorySetCollection::from_set(set);
+            let coll = Arc::new(Box::new(coll) as Box<dyn SetCollection>);
+            Ok(Some(coll))
         } else {
             Ok(None)
         }

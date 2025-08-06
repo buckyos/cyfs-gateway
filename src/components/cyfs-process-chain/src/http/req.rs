@@ -59,6 +59,13 @@ impl HttpRequestHeaderMap {
 
 #[async_trait::async_trait]
 impl MapCollection for HttpRequestHeaderMap {
+    async fn len(&self) -> Result<usize, String> {
+        // FIXME: The performance of this is not optimal, as it reads the entire request, and is O(n).
+        // Consider optimizing this if necessary. maybe we just return a constant value such as 0?
+        let request = self.request.read().await;
+        Ok(request.header_names().count())
+    }
+
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
         let mut request = self.request.write().await;
         if request.header(key).is_some() {

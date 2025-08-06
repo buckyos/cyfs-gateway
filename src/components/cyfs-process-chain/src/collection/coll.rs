@@ -239,6 +239,9 @@ pub enum CollectionFileFormat {
 
 #[async_trait::async_trait]
 pub trait SetCollection: Send + Sync {
+    /// Returns the number of elements in the collection.
+    async fn len(&self) -> Result<usize, String>;
+
     /// Sets the collection with the given value.
     async fn insert(&self, value: &str) -> Result<bool, String>;
 
@@ -272,6 +275,9 @@ pub type SetCollectionRef = Arc<Box<dyn SetCollection>>;
 
 #[async_trait::async_trait]
 pub trait MapCollection: Send + Sync {
+    /// Returns the number of elements in the collection.
+    async fn len(&self) -> Result<usize, String>;
+
     /// Inserts a key-value pair into the collection.
     /// If the key already exists, it will return false.
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String>;
@@ -312,6 +318,9 @@ pub type MapCollectionRef = Arc<Box<dyn MapCollection>>;
 
 #[async_trait::async_trait]
 pub trait MultiMapCollection: Send + Sync {
+    /// Returns the number of elements in the collection.
+    async fn len(&self) -> Result<usize, String>;
+
     /// Sets the value for the given key in the collection.
     async fn insert(&self, key: &str, value: &str) -> Result<bool, String>;
 
@@ -333,7 +342,7 @@ pub trait MultiMapCollection: Send + Sync {
 
     /// Removes the values for the given key from the collection.
     /// if any value is removed, it returns true
-    async fn remove_many(&self, key: &str, values: &[&str]) -> Result<bool, String>;
+    async fn remove_many(&self, key: &str, values: &[&str]) -> Result<Option<SetCollectionRef>, String>;
 
     /// Removes all values for the given key from the collection.
     /// If the key is not found, it returns false.
