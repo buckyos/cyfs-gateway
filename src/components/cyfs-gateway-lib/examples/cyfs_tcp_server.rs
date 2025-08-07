@@ -3,7 +3,7 @@ use std::env::current_dir;
 use std::sync::Arc;
 use buckyos_kit::init_logging;
 use name_client::init_name_lib;
-use name_lib::{encode_ed25519_sk_to_pk, generate_ed25519_key, DeviceConfig};
+use name_lib::{generate_ed25519_key_pair, load_raw_private_key, DeviceConfig};
 use cyfs_gateway_lib::{CyfsServerConfigParser, CyfsServerManager, GatewayDevice, TunnelManager, YamlCyfsServerConfigParser, GATEWAY_TUNNEL_MANAGER};
 
 #[tokio::main]
@@ -33,9 +33,21 @@ async fn main() {
         config
     };
 
-    let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+    let key_path = current_dir().unwrap().join("device_key.pem");
+    let device_path = current_dir().unwrap().join("device.doc.json");
+    if !key_path.exists() || !device_path.exists() {
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key_pair();
+        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(pkcs8_bytes).unwrap());
+        let device_doc = serde_json::to_string(&device_config).unwrap();
+        std::fs::write(key_path.as_path(), signing_key).unwrap();
+        std::fs::write(device_path.as_path(), device_doc).unwrap();
+    }
+
+    let pkcs8_bytes = load_raw_private_key(key_path.as_path()).unwrap();
+    let device = std::fs::read_to_string(device_path.as_path()).unwrap();
+    let device_config = serde_json::from_str::<DeviceConfig>(device.as_str()).unwrap();
     let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
-        config: DeviceConfig::new("test", encode_ed25519_sk_to_pk(&signing_key)),
+        config: device_config,
         private_key: pkcs8_bytes,
     }));
     tunnel_manager.get_tunnel_builder_by_protocol("rtcp").await.unwrap();
