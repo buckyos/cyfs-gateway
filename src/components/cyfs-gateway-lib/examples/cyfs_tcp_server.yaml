@@ -48,7 +48,7 @@ servers:
                     reject;
 
   - server:
-      port: 2980
+      port: 2981
       process_chains:
         - id: main
           priority: 1

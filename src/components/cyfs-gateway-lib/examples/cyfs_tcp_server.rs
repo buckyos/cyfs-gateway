@@ -1,7 +1,7 @@
 use std::env::current_dir;
 use std::sync::Arc;
 use buckyos_kit::init_logging;
-use name_lib::DeviceConfig;
+use name_lib::{encode_ed25519_sk_to_pk, generate_ed25519_key, DeviceConfig};
 use cyfs_gateway_lib::{CyfsServerConfigParser, CyfsServerManager, GatewayDevice, TunnelManager, YamlCyfsServerConfigParser, GATEWAY_TUNNEL_MANAGER};
 
 #[tokio::main]
@@ -31,11 +31,12 @@ async fn main() {
         config
     };
 
-
+    let (signing_key, pkcs8_bytes) = generate_ed25519_key();
     let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
-        config: DeviceConfig::new("test", "MC4CAQAwBQYDK2VwBCIEICCrQGVPIZGLTbmhPi9K3Sv3L7P+W+O7RdnVxx5y7Rvb".to_string()),
-        private_key: [0u8; 48],
+        config: DeviceConfig::new("test", encode_ed25519_sk_to_pk(&signing_key)),
+        private_key: pkcs8_bytes,
     }));
+    tunnel_manager.get_tunnel_builder_by_protocol("rtcp").await.unwrap();
     let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
     let server_manager = CyfsServerManager::new();
     server_manager.start_server(config).await.unwrap();
