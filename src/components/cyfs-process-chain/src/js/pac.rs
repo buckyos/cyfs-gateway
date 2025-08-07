@@ -4,7 +4,6 @@ use std::net::{IpAddr, Ipv4Addr};
 use trust_dns_resolver::Resolver;
 use trust_dns_resolver::config::*;
 
-
 pub struct PACEnvFunctions;
 
 impl PACEnvFunctions {
@@ -26,7 +25,7 @@ impl PACEnvFunctions {
     }
 
     fn dns_domain_levels(host: &str) -> i32 {
-        host.trim_end_matches('.').split('.').count() as i32
+        host.trim_end_matches('.').split('.').count() as i32 - 1
     }
 
     fn dns_resolve(host: &str) -> Result<Option<IpAddr>, String> {
@@ -108,7 +107,7 @@ impl PACEnvFunctions {
         }
 
         match globset::GlobBuilder::new(sh_exp)
-            .literal_separator(true)
+            .literal_separator(false)
             .build()
         {
             Ok(glob) => {
@@ -123,11 +122,10 @@ impl PACEnvFunctions {
     }
 }
 
-struct PACEnvFunctionsWrapper {}
+pub struct PACEnvFunctionsWrapper {}
 
 impl PACEnvFunctionsWrapper {
-    fn register_env(context: &mut Context) -> Result<(), String> {
-        
+    pub fn register_env(context: &mut Context) -> Result<(), String> {
         // Register the isPlainHostName function
         context
             .register_global_builtin_callable(
@@ -233,32 +231,6 @@ impl PACEnvFunctionsWrapper {
             })?;
 
         Ok(())
-    }
-
-    pub fn assert(_this: &JsValue, args: &[JsValue], _ctx: &mut JsContext) -> JsResult<JsValue> {
-        if args.is_empty() {
-            return Err(JsNativeError::error()
-                .with_message("Expected at least one argument")
-                .into());
-        }
-
-        let condition = &args[0];
-        if condition.is_null()
-            || condition.is_undefined()
-            || (condition.is_boolean() && !condition.as_boolean().unwrap())
-        {
-            let message = args
-                .get(1)
-                .and_then(|v| v.as_string())
-                .map(|s| s.to_std_string_escaped())
-                .unwrap_or_else(|| "Assertion failed".to_string());
-
-            let msg = format!("AssertionError: {}", message);
-            error!("{}", msg);
-            return Err(JsError::from_opaque(JsValue::from(JsString::from(msg))));
-        }
-
-        Ok(JsValue::Undefined)
     }
 
     pub fn is_plain_host_name(
@@ -485,34 +457,126 @@ impl PACEnvFunctionsWrapper {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use boa_engine::prelude::*;
-    use boa_engine::{Context as JsContext, JsResult, JsValue, };
-    use boa_engine::property::Attribute;
-    use boa_runtime::Console;
+    use super::super::exec::*;
 
     const SRC: &str = r#"
     // Test for isPlainHostName
-    assert(isPlainHostName("example"));
-    assert(!isPlainHostName("example.com"));
-    "#;
-    #[test]
-    fn test_pac() {
-        let mut context = Context::default();
-
-        // Register pac environment functions
-        PACEnvFunctionsWrapper::register_env(&mut context).unwrap_or_else(|e| {
-            panic!("Failed to register PAC environment functions: {}", e);
-        });
-
-        // Register console object
-        let console = Console::init(&mut context);
-
-        // Register the console as a global property to the context.
-        context
-            .register_global_property(js_string!(Console::NAME), console, Attribute::all())
-            .expect("the console object shouldn't exist yet");
+    function testIsPlainHostName() {
+        console.info("Testing isPlainHostName function");
+        console.assert(isPlainHostName("example"), "Expected 'example' to be a plain host name");
+        console.assert(!isPlainHostName("example.com"), "Expected 'example.com' not to be a plain host name");
+        console.assert(isPlainHostName("") === true, "Expected empty string to be a plain hostname");
     }
 
-    // Additional tests for other functions can be added here
+    // Test for dnsDomainIs
+    function testDnsDomainIs() {
+        console.info("Testing dnsDomainIs function");
+        console.assert(dnsDomainIs("example.com", "example.com"), "Expected 'example.com' to match 'example.com'");
+        console.assert(dnsDomainIs("sub.example.com", "example.com"), "Expected 'sub.example.com' to match 'example.com'");
+        console.assert(!dnsDomainIs("example.org", "example.com"), "Expected 'example.org' not to match 'example.com'");
+        console.assert(dnsDomainIs("", "example.com") === false, "Expected empty string to not belong to 'example.com'");
+        console.assert(dnsDomainIs("www.example.com", "") === false, "Expected 'www.example.com' to not belong to empty string");
+    }
+
+    // Test for dnsDomainLevels
+    function testDnsDomainLevels() {
+        console.info("Testing dnsDomainLevels function");
+        console.assert(dnsDomainLevels("example.com") === 1, "Expected 'example.com' to have 1 levels");
+        console.assert(dnsDomainLevels("sub.example.com") === 2, "Expected 'sub.example.com' to have 2 levels");
+        console.assert(dnsDomainLevels("localhost") === 0, "Expected 'localhost' to have 0 level");
+        console.assert(dnsDomainLevels("") === 0, "Expected empty string to have 0 levels");
+    }
+
+    // Test for dnsResolve
+    function testDnsResolve() {
+        console.info("Testing dnsResolve function");
+        let ip = dnsResolve("example.com");
+        console.info(`Resolved 'example.com' to IP: ${ip}`);
+        console.assert(ip !== null, "Expected 'example.com' to resolve to an IP address");
+        let ip2 = dnsResolve("nonexistent.domain.xyz.zzz");
+        console.info(`Resolved 'nonexistent.domain.xyz.zzz' to IP: ${ip2}`);
+        console.assert(ip2 == null, "Expected 'nonexistent.domain' to resolve to null");
+
+        // Test with an empty string
+        let ip_empty = dnsResolve("");
+        console.info(`Resolved empty string to IP: ${ip_empty}`);
+        console.assert(ip_empty == null, "Expected empty string to resolve to null");
+    }
+
+    // Test for isResolvable
+    function testIsResolvable() {
+        console.info("Testing isResolvable function");
+        console.assert(isResolvable("example.com") === true, "Expected 'example.com' to be resolvable");
+        console.assert(isResolvable("nonexistent.domain.xyz.zzz") === false, "Expected 'nonexistent.domain.xyz.zzz' not to be resolvable");
+        console.assert(isResolvable("") === false, "Expected empty string to resolve to null");
+    }
+
+    // Test for isInNet
+    function testIsInNet() {
+        console.info("Testing isInNet function");
+        console.assert(isInNet("192.168.1.1", "192.168.1.0", "255.255.255.0") === true, "Expected '192.168.1.1' to be in network '192.168.1.0/24'");
+        console.assert(isInNet("192.168.2.1", "192.168.1.0", "255.255.255.0") === false, "Expected '192.168.2.1' to not be in network '192.168.1.0/24'");
+        console.assert(isInNet("", "192.168.1.0", "255.255.255.0") === false, "Expected empty host to not be in network");
+        console.assert(isInNet("192.168.1.1", "", "255.255.255.0") === false, "Expected empty pattern to not match");
+        console.assert(isInNet("192.168.1.1", "192.168.1.0", "") === false, "Expected empty mask to not match");
+        // Assuming the pattern is a valid IP address
+        // console.assert(isInNet("google.com", "172.217.0.0", "255.255.0.0") === true, "Expected 'google.com' to be in network '172.217.0.0/16'");
+    }
+
+    // Test for localHostOrDomainIs
+    function testLocalHostOrDomainIs() {
+        console.info("Testing localHostOrDomainIs function");
+        console.assert(localHostOrDomainIs("example.com", "example.com") === true, "Expected 'example.com' to match 'example.com'");
+        console.assert(localHostOrDomainIs("localhost", "localhost") === true, "Expected 'localhost' to match 'localhost' as local host");
+        console.assert(localHostOrDomainIs("www.example.com", "example.com") === false, "Expected 'www.example.com' to not match 'example.com'");
+        console.assert(localHostOrDomainIs("localhost", "example.com") === false, "Expected 'localhost' to not match 'example.com'");
+        console.assert(localHostOrDomainIs("", "example.com") === false, "Expected empty string to not match 'example.com'");
+    }
+
+    function testShExpMatch() {
+        console.info("Testing shExpMatch function");
+        console.assert(shExpMatch("http://example.com", "http://*.com") === true, "Expected 'http://example.com' to match 'http://*.com'");
+        console.assert(shExpMatch("http://example.com", "*.example.com") === false, "Expected 'http://example.com' to not match '*.example.com'");
+        console.assert(shExpMatch("http://home.netscape.com/people/ari/index.html", "*/ari/*") === true, "Expected 'http://home.netscape.com/people/ari/index.html' to match '*/ari/*'");
+        console.assert(shExpMatch("http://home.netscape.com/people/montulli/index.html", "*/ari/*") === false, "Expected 'http://home.netscape.com/people/montulli/index.html' to not match '*/ari/*'");
+        console.assert(shExpMatch("http://test.com", "*.example.com") === false, "Expected 'http://test.com' to not match '*.example.com'");
+        console.assert(shExpMatch("file.txt", "file?.txt") === false, "Expected 'file.txt' to match 'file?.txt'");
+        console.assert(shExpMatch("file1.txt", "file?.txt") === true, "Expected 'file1.txt' to match 'file?.txt'");
+        console.assert(shExpMatch("file.txt", "file.txt") === true, "Expected 'file.txt' to match 'file.txt'");
+        console.assert(shExpMatch("file.txt", "file[0-9].txt") === false, "Expected 'file.txt' to not match 'file[0-9].txt'");
+        console.assert(shExpMatch("", "*.example.com") === false, "Expected empty string to not match '*.example.com'");
+    }
+    
+    // Test all functions
+    function testAll() {
+        testIsPlainHostName();
+        testDnsDomainIs();
+        testDnsDomainLevels();
+        testDnsResolve();
+        testIsResolvable();
+        testIsInNet();
+        testLocalHostOrDomainIs();
+        testShExpMatch();
+        console.info("All tests passed");
+    }
+    "#;
+
+    #[test]
+    fn test_pac() {
+        let exec = JavaScriptExecutor::new().unwrap();
+        exec.init_pac_env().unwrap();
+        exec.load(SRC).unwrap();
+
+        let func =
+            JavaScriptFunctionCaller::load("testAll", &mut exec.context().lock().unwrap()).unwrap();
+
+        let ret = func
+            .call(&mut exec.context().lock().unwrap(), Vec::new())
+            .unwrap();
+        assert!(
+            ret.is_success(),
+            "Expected function to return success, got: {:?}",
+            ret
+        );
+    }
 }

@@ -1,4 +1,5 @@
 use super::coll_wrapper::CollectionWrapperHelper;
+use super::pac::PACEnvFunctionsWrapper;
 use crate::CommandResult;
 use crate::collection::CollectionValue;
 use boa_engine::{Context as JsContext, JsObject, JsValue, Source, js_string, property::Attribute};
@@ -35,8 +36,23 @@ impl JavaScriptExecutor {
         &self.context
     }
 
+    pub fn init_pac_env(&self) -> Result<(), String> {
+        let mut context = self.context.lock().unwrap();
+
+        // Register PAC environment functions
+        PACEnvFunctionsWrapper::register_env(&mut context).map_err(|e| {
+            let msg = format!("Failed to register PAC environment functions: {}", e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        info!("PAC environment functions registered successfully");
+
+        Ok(())
+    }
+
     // Evaluate the PAC script
-    fn load(&self, src: &str) -> Result<(), String> {
+    pub fn load(&self, src: &str) -> Result<(), String> {
         let mut context = self.context.lock().unwrap();
 
         let src = Source::from_bytes(src.as_bytes());
@@ -122,11 +138,30 @@ impl JavaScriptFunctionCaller {
             })?;
 
         /*
+        return; // as success
+        return true; // as success
+        return false; // as error
         return {
             state: bool,
             result: CollectionValue,
         };
          */
+        if result.is_null_or_undefined() {
+            let msg = format!("Function {} returned null or undefined", self.name);
+            info!("{}", msg);
+            return Ok(CommandResult::success())
+        }
+
+        // Check if the result is boolean
+        if let Some(boolean) = result.as_boolean() {
+            if boolean {
+                return Ok(CommandResult::success_with_value("true"));
+            } else {
+                return Ok(CommandResult::error_with_value("false"));
+            }
+        }
+
+        // Then check if the result is an object
         let return_object = result.as_object().ok_or_else(|| {
             let msg = format!("Function {} did not return an object", self.name);
             error!("{}", msg);
