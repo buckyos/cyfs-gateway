@@ -4,10 +4,8 @@ use boa_engine::{
     JsValue, NativeFunction, Trace,
     class::{Class, ClassBuilder},
     js_string,
-    object::{
-        builtins::{JsArray},
-    },
-    value::{TryFromJs},
+    object::builtins::JsArray,
+    value::TryFromJs,
 };
 use boa_gc::Tracer;
 use futures::future::BoxFuture;
@@ -768,7 +766,9 @@ impl MultiMapCollectionWrapper {
             Err(e) => {
                 let msg = format!("Invalid value argument: {}", e);
                 error!("{}", msg);
-                return Box::pin(async move { Err(JsNativeError::error().with_message(msg).into()) });
+                return Box::pin(
+                    async move { Err(JsNativeError::error().with_message(msg).into()) },
+                );
             }
         };
 
@@ -1004,7 +1004,7 @@ impl MultiMapCollectionWrapper {
                     Ok(value)
                 }
                 None => Ok(JsValue::Null),
-            }
+            },
             Err(e) => {
                 let msg = format!("Failed to remove all from multi-map collection: {}", e);
                 error!("{}", msg);
@@ -1042,7 +1042,6 @@ impl MultiMapCollectionWrapper {
             return Err(JsNativeError::error().with_message(msg).into());
         };
 
-
         let rt = Runtime::new().map_err(|e| JsNativeError::error().with_message(e.to_string()))?;
         match rt.block_on(collection.remove_all(&key)) {
             Ok(ret) => match ret {
@@ -1052,7 +1051,7 @@ impl MultiMapCollectionWrapper {
                     Ok(value)
                 }
                 None => Ok(JsValue::Null),
-            }
+            },
             Err(e) => {
                 let msg = format!("Failed to remove all from multi-map collection: {}", e);
                 error!("{}", msg);

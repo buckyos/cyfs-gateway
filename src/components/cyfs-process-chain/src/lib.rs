@@ -11,7 +11,7 @@ mod hook_point;
 mod http;
 mod pipe;
 mod tcp;
-//mod js;
+mod js;
 
 #[cfg(test)]
 mod test;

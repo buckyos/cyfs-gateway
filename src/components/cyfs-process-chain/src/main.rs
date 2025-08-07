@@ -7,7 +7,7 @@ mod block;
 mod chain;
 mod cmd;
 mod collection;
-//mod js;
+mod js;
 mod hook_point;
 mod http;
 mod pipe;
