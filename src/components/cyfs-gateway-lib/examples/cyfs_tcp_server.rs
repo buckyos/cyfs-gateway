@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::env::current_dir;
 use std::sync::Arc;
 use buckyos_kit::init_logging;
+use name_client::init_name_lib;
 use name_lib::{encode_ed25519_sk_to_pk, generate_ed25519_key, DeviceConfig};
 use cyfs_gateway_lib::{CyfsServerConfigParser, CyfsServerManager, GatewayDevice, TunnelManager, YamlCyfsServerConfigParser, GATEWAY_TUNNEL_MANAGER};
 
@@ -38,6 +40,7 @@ async fn main() {
     }));
     tunnel_manager.get_tunnel_builder_by_protocol("rtcp").await.unwrap();
     let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
+    init_name_lib(&HashMap::new()).await.unwrap();
     let server_manager = CyfsServerManager::new();
     server_manager.start_server(config).await.unwrap();
     std::future::pending::<()>().await;
