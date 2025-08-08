@@ -1,20 +1,67 @@
 use super::coll_wrapper::CollectionWrapperHelper;
+use super::context_wrapper::ContextWrapper;
+use super::env_wrapper::EnvManagerWrapper;
 use super::pac::PACEnvFunctionsWrapper;
 use crate::CommandResult;
+use crate::chain::EnvManager;
 use crate::collection::CollectionValue;
-use boa_engine::{Context as JsContext, JsObject, JsValue, Source, js_string, property::Attribute};
+use boa_engine::prelude::*;
+use boa_engine::{
+    Context as JsContext, JsObject, JsValue, Source, Trace, js_string, property::Attribute,
+};
+use boa_gc::Tracer;
 use boa_runtime::Console;
 use std::error::Error;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-
 
 pub struct JavaScriptExecutor {
     context: Arc<Mutex<JsContext>>,
 }
 
+#[derive(Clone, JsData, Finalize)]
+pub struct RuntimeHandleWrapper(tokio::runtime::Handle);
+
+impl RuntimeHandleWrapper {
+    pub fn new(handle: tokio::runtime::Handle) -> Self {
+        Self(handle)
+    }
+}
+
+impl Default for RuntimeHandleWrapper {
+    fn default() -> Self {
+        Self(tokio::runtime::Handle::current())
+    }
+}
+
+impl Deref for RuntimeHandleWrapper {
+    type Target = tokio::runtime::Handle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe impl Trace for RuntimeHandleWrapper {
+    unsafe fn trace(&self, _tracer: &mut Tracer) {
+        // No need to trace any JavaScript objects, as collection is Arc<dyn SetCollection>
+        // Arc itself manages memory, garbage collector does not need to intervene
+    }
+
+    unsafe fn trace_non_roots(&self) {
+        // No need to trace non-root objects, as there are no references to JavaScript objects
+    }
+
+    fn run_finalizer(&self) {
+        // No special finalization needed, Arc will handle memory management
+    }
+}
+
 impl JavaScriptExecutor {
-    pub fn new() -> Result<Self, String> {
+    pub fn new(runtime_handle: RuntimeHandleWrapper) -> Result<Self, String> {
         let mut context = JsContext::default();
+
+        context.insert_data(runtime_handle);
 
         // Register console object
         let console = Console::init(&mut context);
@@ -35,6 +82,13 @@ impl JavaScriptExecutor {
             msg
         })?;
 
+        // Register collection wrappers
+        CollectionWrapperHelper::register_all(&mut context)?;
+        
+        // Register ContextWrapper
+        ContextWrapper::register(&mut context)?;
+        EnvManagerWrapper::register(&mut context)?;
+
         let context = Arc::new(Mutex::new(context));
 
         Ok(Self { context })
@@ -44,23 +98,6 @@ impl JavaScriptExecutor {
         &self.context
     }
 
-    /*
-    pub fn init_pac_env(&self) -> Result<(), String> {
-        let mut context = self.context.lock().unwrap();
-
-        // Register PAC environment functions
-        PACEnvFunctionsWrapper::register_env(&mut context).map_err(|e| {
-            let msg = format!("Failed to register PAC environment functions: {}", e);
-            error!("{}", msg);
-            msg
-        })?;
-
-        info!("PAC environment functions registered successfully");
-
-        Ok(())
-    }
-    */
-    
     // Evaluate the PAC script
     pub fn load(&self, src: &str) -> Result<(), String> {
         let mut context = self.context.lock().unwrap();
@@ -119,15 +156,16 @@ impl JavaScriptFunctionCaller {
         Ok(ret)
     }
 
-    pub fn load_option(
-        name: &str,
-        context: &mut JsContext,
-    ) -> Result<Option<Self>, String> {
-        if context.global_object().has_own_property(js_string!(name), context).map_err(|e| {
-            let msg = format!("Failed to check if function {} exists: {}", name, e);
-            error!("{}", msg);
-            msg
-        })? {
+    pub fn load_option(name: &str, context: &mut JsContext) -> Result<Option<Self>, String> {
+        if context
+            .global_object()
+            .has_own_property(js_string!(name), context)
+            .map_err(|e| {
+                let msg = format!("Failed to check if function {} exists: {}", name, e);
+                error!("{}", msg);
+                msg
+            })?
+        {
             Self::load(name, context).map(Some)
         } else {
             Ok(None)
@@ -138,12 +176,73 @@ impl JavaScriptFunctionCaller {
         &self,
         context: &mut JsContext,
         args: Vec<CollectionValue>,
-    ) -> Result<CommandResult, String> {
-        assert!(args.len() > 0, "JavaScript function must have at least one argument");
-
-        // The first argument is the command name, which is not used here
+    ) -> Result<Option<String>, String> {
         // Convert args to JsValue
         let mut js_args: Vec<_> = Vec::with_capacity(args.len());
+
+        for arg in args.into_iter() {
+            let js_value = CollectionWrapperHelper::collection_value_to_js_value(arg, context)
+                .map_err(|e| {
+                    let msg = format!("Failed to convert argument to JsValue: {:?}", e);
+                    error!("{}", msg);
+                    msg
+                })?;
+
+            js_args.push(js_value);
+        }
+
+        info!("Calling function {} with args: {:?}", self.name, js_args);
+
+        let caller = self.caller.lock().unwrap();
+        // Call the function
+        let result = caller
+            .call(&JsValue::undefined(), &js_args, context)
+            .map_err(|e| {
+                let msg = format!("Failed to call function {}: {:?}", self.name, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        if result.is_null_or_undefined() {
+            let msg = format!("Function {} returned null or undefined", self.name);
+            info!("{}", msg);
+            return Ok(None);
+        }
+
+        // Check if the result is a string
+        let result_str = result.as_string().ok_or_else(|| {
+            let msg = format!("Function {} did not return a string", self.name);
+            error!("{}", msg);
+            msg
+        })?;
+
+        Ok(Some(result_str.to_std_string_escaped()))
+    }
+
+    pub fn exec_call(
+        &self,
+        context: &mut JsContext,
+        env_manager: EnvManager,
+        args: Vec<CollectionValue>,
+    ) -> Result<CommandResult, String> {
+        assert!(
+            args.len() > 0,
+            "JavaScript function must have at least one argument"
+        );
+
+        // Convert args to JsValue
+        let mut js_args: Vec<_> = Vec::with_capacity(args.len());
+
+        // First put context include env_manager
+        let context_wrapper = ContextWrapper::new(env_manager);
+        let js_context: JsObject = context_wrapper.into_js_object(context).map_err(|e| {
+            let msg = format!("Failed to convert ContextWrapper to JsObject: {:?}", e);
+            error!("{}", msg);
+            msg
+        })?;
+        js_args.push(js_context.into());
+
+        // The first argument is the command name, which is not used here
         for arg in args.into_iter().skip(1) {
             let js_value = CollectionWrapperHelper::collection_value_to_js_value(arg, context)
                 .map_err(|e| {
@@ -155,11 +254,7 @@ impl JavaScriptFunctionCaller {
             js_args.push(js_value);
         }
 
-        info!(
-            "Calling function {} with args: {:?}",
-            self.name,
-            js_args
-        );
+        info!("Calling function {} with args: {:?}", self.name, js_args);
 
         let caller = self.caller.lock().unwrap();
         // Call the function
@@ -183,7 +278,7 @@ impl JavaScriptFunctionCaller {
         if result.is_null_or_undefined() {
             let msg = format!("Function {} returned null or undefined", self.name);
             info!("{}", msg);
-            return Ok(CommandResult::success())
+            return Ok(CommandResult::success());
         }
 
         // Check if the result is boolean
@@ -238,4 +333,3 @@ impl JavaScriptFunctionCaller {
         Ok(ret)
     }
 }
-

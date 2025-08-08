@@ -411,7 +411,7 @@ impl BlockParser {
 
         let (input, arg) = complete(alt((double_quoted, single_quoted, unquoted))).parse(input)?;
 
-        info!("Parsed literal: {}, {:?}", input, arg);
+        debug!("Parsed literal: {}, {:?}", input, arg);
         Ok((input, arg))
     }
 

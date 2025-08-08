@@ -1,3 +1,4 @@
+use super::exec::RuntimeHandleWrapper;
 use crate::collection::*;
 use boa_engine::{
     Context as JsContext, Finalize, JsData, JsError, JsNativeError, JsObject, JsResult, JsString,
@@ -10,11 +11,17 @@ use boa_engine::{
 use boa_gc::Tracer;
 use futures::future::BoxFuture;
 use std::sync::Arc;
-use tokio::runtime::Runtime;
 
 pub struct CollectionWrapperHelper {}
 
 impl CollectionWrapperHelper {
+    pub fn register_all(context: &mut JsContext) -> Result<(), String> {
+        SetCollectionWrapper::register(context)?;
+        MapCollectionWrapper::register(context)?;
+        MultiMapCollectionWrapper::register(context)?;
+        return Ok(());
+    }
+
     pub fn collection_value_to_js_value(
         value: CollectionValue,
         context: &mut JsContext,
@@ -124,6 +131,14 @@ pub struct SetCollectionWrapper {
 impl SetCollectionWrapper {
     pub fn new(collection: SetCollectionRef) -> Self {
         Self { collection }
+    }
+
+    pub fn register(context: &mut JsContext) -> Result<(), String> {
+        context.register_global_class::<Self>().map_err(|e| {
+            let msg = format!("Failed to register SetCollectionWrapper: {}", e);
+            error!("{}", msg);
+            msg
+        })
     }
 
     pub fn into_js_object(self, context: &mut JsContext) -> JsResult<JsObject> {
@@ -275,8 +290,7 @@ impl SetCollectionWrapper {
             }
         };
 
-        let rt = Runtime::new().map_err(|e| JsNativeError::error().with_message(e.to_string()))?;
-
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.get_all()) {
             Ok(values) => {
                 let values_iter = values
@@ -344,6 +358,14 @@ pub struct MapCollectionWrapper {
 impl MapCollectionWrapper {
     pub fn new(collection: MapCollectionRef) -> Self {
         Self { collection }
+    }
+
+    pub fn register(context: &mut JsContext) -> Result<(), String> {
+        context.register_global_class::<Self>().map_err(|e| {
+            let msg = format!("Failed to register MapCollectionWrapper: {}", e);
+            error!("{}", msg);
+            msg
+        })
     }
 
     pub fn into_js_object(self, context: &mut JsContext) -> JsResult<JsObject> {
@@ -440,7 +462,7 @@ impl MapCollectionWrapper {
 
         let value = CollectionWrapperHelper::js_value_to_collection_value(value)?;
 
-        let rt = Runtime::new().map_err(|e| JsNativeError::error().with_message(e.to_string()))?;
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.insert(&key, value)) {
             Ok(prev_value) => {
                 // Convert previous value to JsValue
@@ -476,7 +498,7 @@ impl MapCollectionWrapper {
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
 
-        let rt = Runtime::new().map_err(|e| JsNativeError::error().with_message(e.to_string()))?;
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.get(&key)) {
             Ok(value) => match value {
                 Some(v) => CollectionWrapperHelper::collection_value_to_js_value(v, context),
@@ -550,7 +572,7 @@ impl MapCollectionWrapper {
                 JsError::from(err)
             })?;
 
-        let rt = Runtime::new().map_err(|e| JsNativeError::error().with_message(e.to_string()))?;
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.remove(&key)) {
             Ok(prev_value) => {
                 // Convert previous value to JsValue
@@ -627,6 +649,14 @@ pub struct MultiMapCollectionWrapper {
 impl MultiMapCollectionWrapper {
     pub fn new(collection: MultiMapCollectionRef) -> Self {
         Self { collection }
+    }
+
+    pub fn register(context: &mut JsContext) -> Result<(), String> {
+        context.register_global_class::<Self>().map_err(|e| {
+            let msg = format!("Failed to register MultiMapCollectionWrapper: {}", e);
+            error!("{}", msg);
+            msg
+        })
     }
 
     pub fn into_js_object(self, context: &mut JsContext) -> JsResult<JsObject> {
@@ -821,7 +851,7 @@ impl MultiMapCollectionWrapper {
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
 
-        let rt = Runtime::new().map_err(|e| JsNativeError::error().with_message(e.to_string()))?;
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.get_many(&key)) {
             Ok(ret) => match ret {
                 Some(set) => {
@@ -965,7 +995,7 @@ impl MultiMapCollectionWrapper {
             }
         };
 
-        let rt = Runtime::new().map_err(|e| JsNativeError::error().with_message(e.to_string()))?;
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         let value = value.iter().map(|v| v.as_str()).collect::<Vec<&str>>();
         match rt.block_on(collection.remove_many(&key, &value)) {
             Ok(ret) => match ret {
@@ -987,7 +1017,7 @@ impl MultiMapCollectionWrapper {
     pub fn remove_all(
         this: &JsValue,
         args: &[JsValue],
-        _context: &mut JsContext,
+        context: &mut JsContext,
     ) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
@@ -1013,12 +1043,12 @@ impl MultiMapCollectionWrapper {
             return Err(JsNativeError::error().with_message(msg).into());
         };
 
-        let rt = Runtime::new().map_err(|e| JsNativeError::error().with_message(e.to_string()))?;
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.remove_all(&key)) {
             Ok(ret) => match ret {
                 Some(values) => {
                     let set = SetCollectionWrapper::new(values);
-                    let value = set.into_js_object(_context).map(JsValue::Object)?;
+                    let value = set.into_js_object(context).map(JsValue::Object)?;
                     Ok(value)
                 }
                 None => Ok(JsValue::Null),

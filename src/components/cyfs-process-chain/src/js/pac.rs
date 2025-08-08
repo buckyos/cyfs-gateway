@@ -458,8 +458,8 @@ impl PACEnvFunctionsWrapper {
 
 #[cfg(test)]
 mod tests {
-    use crate::CollectionValue;
     use super::super::exec::*;
+    use crate::CollectionValue;
 
     const SRC: &str = r#"
     // Test for isPlainHostName
@@ -565,7 +565,13 @@ mod tests {
 
     #[test]
     fn test_pac() {
-        let exec = JavaScriptExecutor::new().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
+        let exec = JavaScriptExecutor::new(RuntimeHandleWrapper::default()).unwrap();
         exec.load(SRC).unwrap();
 
         let func =
@@ -577,8 +583,8 @@ mod tests {
             .call(&mut exec.context().lock().unwrap(), args)
             .unwrap();
         assert!(
-            ret.is_success(),
-            "Expected function to return success, got: {:?}",
+            ret.is_none(),
+            "Expected function to return None, got: {:?}",
             ret
         );
     }

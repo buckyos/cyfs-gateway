@@ -1,4 +1,5 @@
 use super::coll_wrapper::CollectionWrapperHelper;
+use super::exec::RuntimeHandleWrapper;
 use crate::EnvLevel;
 use crate::chain::EnvManager;
 use boa_engine::prelude::*;
@@ -8,9 +9,7 @@ use boa_engine::{
     js_string,
 };
 use boa_gc::Tracer;
-use futures::future::BoxFuture;
 use std::str::FromStr;
-use tokio::runtime::Runtime;
 
 #[derive(Clone, JsData, Finalize)]
 pub struct EnvManagerWrapper {
@@ -20,6 +19,14 @@ pub struct EnvManagerWrapper {
 impl EnvManagerWrapper {
     pub fn new(env_manager: EnvManager) -> Self {
         Self { env_manager }
+    }
+
+    pub fn register(context: &mut JsContext) -> Result<(), String> {
+        context.register_global_class::<Self>().map_err(|e| {
+            let msg = format!("Failed to register EnvManagerWrapper: {}", e);
+            error!("{}", msg);
+            msg
+        })
     }
 
     pub fn into_js_object(self, context: &mut JsContext) -> JsResult<JsObject> {
@@ -36,106 +43,60 @@ impl EnvManagerWrapper {
         Ok(js_obj)
     }
 
-
-    pub fn create(
-        this: &JsValue,
-        args: &[JsValue],
-        _context: &mut JsContext,
-    ) -> BoxFuture<'static, JsResult<JsValue>> {
+    pub fn create(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let env_manager = match this {
             Some(this) => this.env_manager.clone(),
             None => {
                 let msg = format!("Failed to get EnvManagerWrapper from this");
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         if args.len() < 2 {
             let msg = "EnvManagerWrapper.create requires at least 2 arguments".to_string();
             error!("{}", msg);
-            return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+            return Err(JsNativeError::error().with_message(msg).into());
         }
 
         // Get first argument as key
         let key = args
             .get(0)
-            .map(|v| {
-                v.as_string()
-                    .map(|s| s.to_std_string_escaped())
-                    .ok_or_else(|| "Expected a string value")
-            })
-            .unwrap_or_else(|| Err("No value provided"));
-        let key = match key {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = format!("Invalid key argument: {}", e);
-                error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
-            }
-        };
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_std_string_escaped())
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
 
-        let value = match CollectionWrapperHelper::js_value_to_collection_value(&args[1]) {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = format!("Invalid value argument: {}", e);
-                return Box::pin(
-                    async move { Err(JsNativeError::error().with_message(msg).into()) },
-                );
-            }
-        };
+        let value = CollectionWrapperHelper::js_value_to_collection_value(&args[1])?;
 
         let env_level = if args.len() > 2 {
             let level = args
-                .get(2)
-                .map(|v| {
-                    v.as_string()
-                        .map(|s| s.to_std_string_escaped())
-                        .ok_or_else(|| "Expected a string value")
-                })
-                .unwrap_or_else(|| Err("No value provided"));
-            let level = match level {
-                Ok(v) => v,
-                Err(e) => {
-                    let msg = format!("Invalid env level argument: {}", e);
-                    error!("{}", msg);
-                    return Box::pin(async {
-                        Err(JsNativeError::error().with_message(msg).into())
-                    });
-                }
-            };
+                .get(0)
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped())
+                .ok_or_else(|| JsNativeError::error().with_message("Expected a string level"))?;
 
             match EnvLevel::from_str(&level) {
                 Ok(v) => v,
                 Err(e) => {
                     let msg = format!("Invalid environment level: {}", e);
                     error!("{}", msg);
-                    return Box::pin(async {
-                        Err(JsNativeError::error().with_message(msg).into())
-                    });
+                    return Err(JsNativeError::error().with_message(msg).into());
                 }
             }
         } else {
             EnvLevel::default()
         };
 
-        let ft = async move {
-            env_manager
-                .create(&key, value, env_level)
-                .await
-                .map(JsValue::Boolean)
-                .map_err(|e| JsError::from_native(JsNativeError::error().with_message(e)))
-        };
-
-        Box::pin(ft)
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match rt.block_on(env_manager.create(&key, value, env_level)) {
+            Ok(ret) => Ok(JsValue::Boolean(ret)),
+            Err(e) => Err(JsNativeError::error().with_message(e).into()),
+        }
     }
 
-    pub fn set(
-        this: &JsValue,
-        args: &[JsValue],
-        context: &mut JsContext,
-    ) -> JsResult<JsValue> {
+    pub fn set(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
+        info!("Calling EnvManagerWrapper.set");
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let env_manager = match this {
             Some(this) => this.env_manager.clone(),
@@ -159,7 +120,6 @@ impl EnvManagerWrapper {
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
 
-
         let value = CollectionWrapperHelper::js_value_to_collection_value(&args[1])?;
 
         let env_level = if args.len() > 2 {
@@ -167,7 +127,9 @@ impl EnvManagerWrapper {
                 .get(2)
                 .and_then(|v| v.as_string())
                 .map(|s| s.to_std_string_escaped())
-                .ok_or_else(|| JsNativeError::error().with_message("Expected a string env level"))?;
+                .ok_or_else(|| {
+                    JsNativeError::error().with_message("Expected a string env level")
+                })?;
 
             let level = match EnvLevel::from_str(&level) {
                 Ok(v) => v,
@@ -182,7 +144,7 @@ impl EnvManagerWrapper {
             None
         };
 
-        let rt = Runtime::new().map_err(|e| JsNativeError::error().with_message(e.to_string()))?;
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(env_manager.set(&key, value, env_level)) {
             Ok(Some(v)) => CollectionWrapperHelper::collection_value_to_js_value(v, context),
             Ok(None) => Ok(JsValue::Null),
@@ -190,11 +152,7 @@ impl EnvManagerWrapper {
         }
     }
 
-    pub fn get(
-        this: &JsValue,
-        args: &[JsValue],
-        context: &mut JsContext,
-    ) -> JsResult<JsValue> {
+    pub fn get(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let env_manager = match this {
             Some(this) => this.env_manager.clone(),
@@ -223,7 +181,9 @@ impl EnvManagerWrapper {
                 .get(1)
                 .and_then(|v| v.as_string())
                 .map(|s| s.to_std_string_escaped())
-                .ok_or_else(|| JsNativeError::error().with_message("Expected a string env level"))?;
+                .ok_or_else(|| {
+                    JsNativeError::error().with_message("Expected a string env level")
+                })?;
 
             let level = match EnvLevel::from_str(&level) {
                 Ok(v) => v,
@@ -239,19 +199,20 @@ impl EnvManagerWrapper {
             None
         };
 
-        let rt = Runtime::new().map_err(|e| JsNativeError::error().with_message(e.to_string()))?;
-        match rt.block_on(env_manager.get(&key, env_level)) {
+        info!(
+            "Getting value for key: {} with env level: {:?}",
+            key, env_level
+        );
+
+        let runtime_handle = context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match runtime_handle.block_on(env_manager.get(&key, env_level)) {
             Ok(Some(v)) => CollectionWrapperHelper::collection_value_to_js_value(v, context),
             Ok(None) => Ok(JsValue::Null),
             Err(e) => Err(JsNativeError::error().with_message(e).into()),
         }
     }
 
-    pub fn remove(
-        this: &JsValue,
-        args: &[JsValue],
-        context: &mut JsContext,
-    ) -> JsResult<JsValue> {
+    pub fn remove(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let env_manager = match this {
             Some(this) => this.env_manager.clone(),
@@ -280,7 +241,9 @@ impl EnvManagerWrapper {
                 .get(1)
                 .and_then(|v| v.as_string())
                 .map(|s| s.to_std_string_escaped())
-                .ok_or_else(|| JsNativeError::error().with_message("Expected a string env level"))?;
+                .ok_or_else(|| {
+                    JsNativeError::error().with_message("Expected a string env level")
+                })?;
 
             let level = match EnvLevel::from_str(&level) {
                 Ok(v) => v,
@@ -296,7 +259,7 @@ impl EnvManagerWrapper {
             None
         };
 
-        let rt = Runtime::new().map_err(|e| JsNativeError::error().with_message(e.to_string()))?;
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(env_manager.remove(&key, env_level)) {
             Ok(Some(v)) => CollectionWrapperHelper::collection_value_to_js_value(v, context),
             Ok(None) => Ok(JsValue::Null),
@@ -325,7 +288,7 @@ impl Class for EnvManagerWrapper {
     const LENGTH: usize = 0;
 
     fn init(class: &mut ClassBuilder) -> JsResult<()> {
-        let create_fn = NativeFunction::from_async_fn(Self::create);
+        let create_fn = NativeFunction::from_fn_ptr(Self::create);
         class.method(js_string!("create"), 1, create_fn);
 
         let set_fn = NativeFunction::from_fn_ptr(Self::set);

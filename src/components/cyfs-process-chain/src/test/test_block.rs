@@ -9,7 +9,19 @@ const host_list = [
     { host: "*.buckyos.com", },
 ];
 
-function check_host(host) {
+function check_host(context, host) {
+    console.log(`Checking host: ${host}`);
+    let set = new SetCollection();
+    set.insert("google.com");
+    set.insert("buckyos.com");
+    console.log(`Set contains google.com: ${set.contains("google.com")}`);
+    console.log(`Set contains buckyos.com: ${set.contains("buckyos.com")}`);
+
+    if (context.env().get("test_var") == null) {
+        console.log("test_var not found in context.env, setting it now");
+        context.env().set("test_var", "test_value");
+    }
+
     for (const item of host_list) {
         console.log(`Checking host: ${host} against pattern: ${item.host}`);
         if (shExpMatch(host, item.host)) {

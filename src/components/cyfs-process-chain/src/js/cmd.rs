@@ -1,15 +1,16 @@
-use super::exec::{JavaScriptExecutor, JavaScriptFunctionCaller};
+use super::exec::{JavaScriptExecutor, JavaScriptFunctionCaller, RuntimeHandleWrapper};
 use crate::block::CommandArgs;
 use crate::chain::Context;
 use crate::cmd::CommandResult;
-use crate::cmd::*;
 use crate::collection::CollectionValue;
+use crate::{EnvManager, cmd::*};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
 use tokio::sync::OnceCell;
+use tokio::sync::oneshot;
 
 struct JavaScriptExternalCommand {
     name: String,
@@ -24,8 +25,12 @@ impl JavaScriptExternalCommand {
         &self.name
     }
 
-    pub fn load(name: &str, src: &str) -> Result<Self, String> {
-        let context: JavaScriptExecutor = JavaScriptExecutor::new()?;
+    pub fn load(
+        runtime_handle: RuntimeHandleWrapper,
+        name: &str,
+        src: &str,
+    ) -> Result<Self, String> {
+        let context: JavaScriptExecutor = JavaScriptExecutor::new(runtime_handle)?;
         context.load(src).map_err(|e| {
             let msg = format!("Failed to load JavaScript source: {}, {}", name, e);
             error!("{}", msg);
@@ -57,15 +62,8 @@ impl JavaScriptExternalCommand {
             ];
 
             match help.call(&mut context, args) {
-                Ok(result) => match result {
-                    CommandResult::Success(s) => s,
-                    CommandResult::Error(e) => {
-                        let msg = format!("Help function returned with error: {}, {}", name, e);
-                        error!("{}", msg);
-                        msg
-                    }
-                    _ => format!("Help function did not return a string: {:?}", result),
-                },
+                Ok(Some(result)) => result,
+                Ok(None) => format!("No help available for command: {}", name),
                 Err(e) => {
                     let msg = format!("Failed to call help function: {}, {}", name, e);
                     error!("{}", msg);
@@ -77,24 +75,40 @@ impl JavaScriptExternalCommand {
         }
     }
 
-    pub fn exec(&self, args: Vec<CollectionValue>) -> Result<CommandResult, String> {
+    pub fn exec(
+        &self,
+        env_manager: EnvManager,
+        args: Vec<CollectionValue>,
+    ) -> Result<CommandResult, String> {
         let mut js_context = self.context.context().lock().unwrap();
-        self.exec.call(&mut js_context, args).map_err(|e| {
-            let msg = format!("Failed to execute command: {}, {}", self.name, e);
-            error!("{}", msg);
-            msg
-        })
+        self.exec
+            .exec_call(&mut js_context, env_manager, args)
+            .map_err(|e| {
+                let msg = format!("Failed to execute command: {}, {}", self.name, e);
+                error!("{}", msg);
+                msg
+            })
+            .map(|ret| {
+                info!("Command {} executed successfully {:?}", self.name, ret);
+                ret
+            })
     }
 }
 
 enum AsyncRequest {
     Exit(()),
-    Load(String, String, oneshot::Sender<Result<(), String>>),
+    Load(
+        RuntimeHandleWrapper,
+        String,
+        String,
+        oneshot::Sender<Result<(), String>>,
+    ),
     Help(String, CommandHelpType, oneshot::Sender<String>),
     // FIXME: The Check command is not used in the current implementation, but it can be added later if needed.
     // Check(String, CommandArgs, oneshot::Sender<Result<(), String>>),
     Exec(
         String,
+        EnvManager,
         Vec<CollectionValue>,
         oneshot::Sender<Result<CommandResult, String>>,
     ),
@@ -108,10 +122,10 @@ impl AsyncRequest {
     pub fn _type(&self) -> &'static str {
         match self {
             AsyncRequest::Exit(_) => "Exit",
-            AsyncRequest::Load(_, _, _) => "Load",
+            AsyncRequest::Load(_, _, _, _) => "Load",
             AsyncRequest::Help(_, _, _) => "Help",
             // AsyncRequest::Check(_, _, _) => "Check",
-            AsyncRequest::Exec(_, _, _) => "Exec",
+            AsyncRequest::Exec(_, _, _, _) => "Exec",
         }
     }
 }
@@ -149,7 +163,8 @@ impl AsyncJavaScriptCommandExecutor {
                 let (tx, rx) = mpsc::channel::<AsyncRequest>();
                 Self::start(rx);
                 Arc::new(Mutex::new(tx))
-            }).await
+            })
+            .await
     }
 
     pub async fn load_command(
@@ -166,33 +181,42 @@ impl AsyncJavaScriptCommandExecutor {
 
     fn start(rx: mpsc::Receiver<AsyncRequest>) {
         let thread = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
+            let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap()
-                .block_on(async move {
-                    loop {
-                        match rx.recv() {
-                            Ok(request) => {
-                                if request.is_exit() {
-                                    info!("AsyncJavaScriptCommandExecutor received exit request");
-                                    break;
-                                }
-                                Self::handle_request(request);
-                            }
-                            Err(e) => {
-                                error!("Failed to receive request: {}", e);
-                                break;
-                            }
+                .unwrap();
+            let _guard = rt.enter();
+            loop {
+                match rx.recv() {
+                    Ok(request) => {
+                        if request.is_exit() {
+                            info!("AsyncJavaScriptCommandExecutor received exit request");
+                            break;
+                        }
+
+                        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                            Self::handle_request(request);
+                        }));
+
+                        if let Err(e) = result {
+                            error!("AsyncJavaScriptCommandExecutor panicked: {:?}", e);
                         }
                     }
+                    Err(e) => {
+                        error!("Failed to receive request: {}", e);
+                        break;
+                    }
+                }
+            }
 
-                    COMMANDS.with(|cmds| {
-                        info!("Stopping AsyncJavaScriptCommandExecutor, clearing commands: {}", cmds.borrow().len());
-                        cmds.borrow_mut().clear();
-                    });
-                    info!("AsyncJavaScriptCommandExecutor stopped");
-                });
+            COMMANDS.with(|cmds| {
+                info!(
+                    "Stopping AsyncJavaScriptCommandExecutor, clearing commands: {}",
+                    cmds.borrow().len()
+                );
+                cmds.borrow_mut().clear();
+            });
+            info!("AsyncJavaScriptCommandExecutor stopped");
         });
 
         tokio::task::spawn_blocking(move || {
@@ -212,16 +236,20 @@ impl AsyncJavaScriptCommandExecutor {
 
     fn handle_request(request: AsyncRequest) {
         match request {
-            AsyncRequest::Load(name, src, responder) => Self::on_load(name, src, responder),
+            AsyncRequest::Load(runtime_handle, name, src, responder) => {
+                Self::on_load(runtime_handle, name, src, responder)
+            }
             AsyncRequest::Help(name, help_type, responder) => {
                 Self::on_help(name, help_type, responder)
             }
-            AsyncRequest::Exec(name, args, responder) => Self::on_exec(name, args, responder),
+            AsyncRequest::Exec(name, env_manager, args, responder) => {
+                Self::on_exec(name, env_manager, args, responder)
+            }
             _ => unreachable!("Unexpected request type: {:?}", request._type()),
         }
     }
 
-    fn on_load(name: String, src: String, responder: oneshot::Sender<Result<(), String>>) {
+    fn on_load(runtime_handle: RuntimeHandleWrapper, name: String, src: String, responder: oneshot::Sender<Result<(), String>>) {
         let contains = COMMANDS.with(|cmds| cmds.borrow().contains_key(&name));
         if contains {
             let msg = format!("Command {} already loaded", name);
@@ -232,7 +260,7 @@ impl AsyncJavaScriptCommandExecutor {
             return;
         }
 
-        match JavaScriptExternalCommand::load(&name, &src) {
+        match JavaScriptExternalCommand::load(runtime_handle, &name, &src) {
             Ok(cmd) => {
                 COMMANDS.with(|cmds| {
                     cmds.borrow_mut().insert(name.clone(), cmd);
@@ -252,11 +280,7 @@ impl AsyncJavaScriptCommandExecutor {
         }
     }
 
-    fn on_help(
-        name: String,
-        help_type: CommandHelpType,
-        responder: oneshot::Sender<String>,
-    ) {
+    fn on_help(name: String, help_type: CommandHelpType, responder: oneshot::Sender<String>) {
         COMMANDS.with(|cmds| {
             if let Some(cmd) = cmds.borrow().get(&name) {
                 let help = cmd.help(&name, help_type);
@@ -273,12 +297,13 @@ impl AsyncJavaScriptCommandExecutor {
 
     fn on_exec(
         name: String,
+        env_manager: EnvManager,
         args: Vec<CollectionValue>,
         responder: oneshot::Sender<Result<CommandResult, String>>,
     ) {
         COMMANDS.with(|cmds| {
             if let Some(cmd) = cmds.borrow().get(&name) {
-                match cmd.exec(args) {
+                match cmd.exec(env_manager, args) {
                     Ok(result) => {
                         if let Err(_) = responder.send(Ok(result)) {
                             error!("Failed to send exec result for {}", name);
@@ -310,8 +335,10 @@ impl AsyncJavaScriptExternalCommand {
     }
 
     pub async fn load(&self, src: String) -> Result<(), String> {
+        let runtime_handle = RuntimeHandleWrapper::default();
+
         let (tx, rx) = oneshot::channel();
-        let request = AsyncRequest::Load(self.name.clone(), src, tx);
+        let request = AsyncRequest::Load(runtime_handle, self.name.clone(), src, tx);
         let ret = self.sender.lock().unwrap().send(request);
         if ret.is_ok() {
             match rx.await {
@@ -335,7 +362,7 @@ impl AsyncJavaScriptExternalCommand {
 #[async_trait::async_trait]
 impl ExternalCommand for AsyncJavaScriptExternalCommand {
     fn help(&self, name: &str, help_type: CommandHelpType) -> String {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Handle::current();
         let (tx, rx) = oneshot::channel();
         let request = AsyncRequest::Help(name.to_string(), help_type, tx);
         if let Ok(_) = self.sender.lock().unwrap().send(request) {
@@ -357,12 +384,13 @@ impl ExternalCommand for AsyncJavaScriptExternalCommand {
 
     async fn exec(
         &self,
-        _context: &Context,
+        context: &Context,
         args: &[CollectionValue],
         _origin_args: &CommandArgs,
     ) -> Result<CommandResult, String> {
         let (tx, rx) = oneshot::channel();
-        let request = AsyncRequest::Exec(self.name.clone(), args.to_vec(), tx);
+        let request =
+            AsyncRequest::Exec(self.name.clone(), context.env().clone(), args.to_vec(), tx);
 
         let ret = self.sender.lock().unwrap().send(request);
         if ret.is_ok() {
