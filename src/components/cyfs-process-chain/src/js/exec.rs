@@ -7,6 +7,7 @@ use boa_runtime::Console;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 
+
 pub struct JavaScriptExecutor {
     context: Arc<Mutex<JsContext>>,
 }
@@ -27,6 +28,13 @@ impl JavaScriptExecutor {
                 msg
             })?;
 
+        // Register PAC environment functions
+        PACEnvFunctionsWrapper::register_env(&mut context).map_err(|e| {
+            let msg = format!("Failed to register PAC environment functions: {}", e);
+            error!("{}", msg);
+            msg
+        })?;
+
         let context = Arc::new(Mutex::new(context));
 
         Ok(Self { context })
@@ -36,6 +44,7 @@ impl JavaScriptExecutor {
         &self.context
     }
 
+    /*
     pub fn init_pac_env(&self) -> Result<(), String> {
         let mut context = self.context.lock().unwrap();
 
@@ -50,7 +59,8 @@ impl JavaScriptExecutor {
 
         Ok(())
     }
-
+    */
+    
     // Evaluate the PAC script
     pub fn load(&self, src: &str) -> Result<(), String> {
         let mut context = self.context.lock().unwrap();
@@ -109,14 +119,32 @@ impl JavaScriptFunctionCaller {
         Ok(ret)
     }
 
+    pub fn load_option(
+        name: &str,
+        context: &mut JsContext,
+    ) -> Result<Option<Self>, String> {
+        if context.global_object().has_own_property(js_string!(name), context).map_err(|e| {
+            let msg = format!("Failed to check if function {} exists: {}", name, e);
+            error!("{}", msg);
+            msg
+        })? {
+            Self::load(name, context).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn call(
         &self,
         context: &mut JsContext,
         args: Vec<CollectionValue>,
     ) -> Result<CommandResult, String> {
+        assert!(args.len() > 0, "JavaScript function must have at least one argument");
+
+        // The first argument is the command name, which is not used here
         // Convert args to JsValue
         let mut js_args: Vec<_> = Vec::with_capacity(args.len());
-        for arg in args {
+        for arg in args.into_iter().skip(1) {
             let js_value = CollectionWrapperHelper::collection_value_to_js_value(arg, context)
                 .map_err(|e| {
                     let msg = format!("Failed to convert argument to JsValue: {:?}", e);
@@ -126,6 +154,12 @@ impl JavaScriptFunctionCaller {
 
             js_args.push(js_value);
         }
+
+        info!(
+            "Calling function {} with args: {:?}",
+            self.name,
+            js_args
+        );
 
         let caller = self.caller.lock().unwrap();
         // Call the function
@@ -204,3 +238,4 @@ impl JavaScriptFunctionCaller {
         Ok(ret)
     }
 }
+

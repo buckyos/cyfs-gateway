@@ -429,6 +429,7 @@ impl PACEnvFunctionsWrapper {
         args: &[JsValue],
         _ctx: &mut JsContext,
     ) -> JsResult<JsValue> {
+        // info!("Executing shExpMatch function {:?}", args);
         if args.len() < 2 {
             return Err(JsNativeError::error()
                 .with_message("Expected two string arguments for string and shell expression")
@@ -564,7 +565,6 @@ mod tests {
     #[test]
     fn test_pac() {
         let exec = JavaScriptExecutor::new().unwrap();
-        exec.init_pac_env().unwrap();
         exec.load(SRC).unwrap();
 
         let func =

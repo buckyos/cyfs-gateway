@@ -36,6 +36,16 @@ pub enum CommandHelpType {
     Long,
 }
 
+impl CommandHelpType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CommandHelpType::Usage => "usage",
+            CommandHelpType::Short => "short",
+            CommandHelpType::Long => "long",
+        }
+    }
+}
+
 pub type CommandParserRef = Arc<Box<dyn CommandParser>>;
 
 pub fn command_help(help_type: CommandHelpType, cmd: &Command) -> String {

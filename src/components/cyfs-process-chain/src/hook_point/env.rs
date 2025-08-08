@@ -1,7 +1,8 @@
 use super::hook_point::HookPoint;
 use crate::chain::*;
-use crate::cmd::ExternalCommandRef;
+use crate::cmd::{ExternalCommand, ExternalCommandRef};
 use crate::collection::*;
+use crate::js::AsyncJavaScriptCommandExecutor;
 use crate::pipe::SharedMemoryPipe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,6 +13,10 @@ pub struct HookPointEnv {
     global_env: EnvRef,
     pipe: SharedMemoryPipe,
     parser_context: ParserContextRef,
+
+    // Each hook point env has its own JavaScript command executor, which is used to execute JavaScript commands in the hook point
+    // This allows the hook point to execute JavaScript commands independently in its own thread
+    js_command_executor: AsyncJavaScriptCommandExecutor,
 }
 
 impl HookPointEnv {
@@ -20,6 +25,7 @@ impl HookPointEnv {
 
         let global_env = Arc::new(Env::new(EnvLevel::Global, None));
         let parser_context = ParserContext::new();
+        let js_command_executor = AsyncJavaScriptCommandExecutor::new();
 
         Self {
             id: id.into(),
@@ -27,6 +33,7 @@ impl HookPointEnv {
             global_env,
             pipe,
             parser_context: Arc::new(parser_context),
+            js_command_executor,
         }
     }
 
@@ -56,6 +63,27 @@ impl HookPointEnv {
         command: ExternalCommandRef,
     ) -> Result<(), String> {
         self.parser_context.register_external_command(name, command)
+    }
+
+    pub async fn register_js_external_command(
+        &self,
+        name: &str,
+        source: String,
+    ) -> Result<(), String> {
+        let cmd = self
+            .js_command_executor
+            .load_command(name.to_owned(), source)
+            .await
+            .map_err(|e| {
+                let msg = format!(
+                    "Failed to register JavaScript external command '{}': {}",
+                    name, e
+                );
+                error!("{}", msg);
+                msg
+            })?;
+
+        self.register_external_command(name, Arc::new(Box::new(cmd) as Box<dyn ExternalCommand>))
     }
 
     pub fn get_external_command(&self, name: &str) -> Option<ExternalCommandRef> {

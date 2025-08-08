@@ -3,6 +3,26 @@ use crate::*;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+const JS_COMMAND: &str = r#"
+const host_list = [
+    { host: "*.google.com" },
+    { host: "*.buckyos.com", },
+];
+
+function check_host(host) {
+    for (const item of host_list) {
+        console.log(`Checking host: ${host} against pattern: ${item.host}`);
+        if (shExpMatch(host, item.host)) {
+            console.log(`Host ${host} matches ${item.host}`);
+            return true;
+        }
+    }
+
+    console.log(`Host ${host} does not match any patterns`);
+    return false;
+}
+"#;
+
 const PROCESS_CHAIN: &str = r#"
 <root>
 <process_chain id="chain2">
@@ -11,6 +31,7 @@ const PROCESS_CHAIN: &str = r#"
             # We reject the request if the protocol is not https
             !(match $PROTOCOL https) && reject;
 
+            call check_host "www.buckyos.com" && reject;
             echo "\$get request url: ${REQ_url} \n ${PROTOCOL}";
             echo $(call add 1 2);
             local key1 = "value1";
@@ -265,7 +286,8 @@ async fn test_hook_point() -> Result<(), String> {
 
     let exec = hook_point_env.prepare_exec_list(&hook_point).await.unwrap();
     let ret = exec.execute_all().await.unwrap();
-    assert!(ret.is_accept());
+    info!("Hook point execution result: {:?}", ret);
+    assert!(ret.is_accept(), "Hook point execution failed: {:?}", ret);
 
     // Try save the collections to disk if they are persistent and there is changes
     hook_point_env.flush_collections().await.unwrap();
@@ -296,6 +318,11 @@ async fn test_process_chain_main() {
         // If TermLogger is not available (e.g., in some environments), fall back to SimpleLogger
         let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
     });
+
+    EXTERNAL_COMMAND_FACTORY
+        .register_js_external_command("check_host", JS_COMMAND.to_owned())
+        .await
+        .unwrap();
 
     EXTERNAL_COMMAND_FACTORY
         .register("add", Arc::new(Box::new(AddCommand::new())))

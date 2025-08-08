@@ -2,6 +2,7 @@ use super::cmd::*;
 use crate::block::CommandArgs;
 use crate::chain::{Context, ParserContext};
 use crate::collection::CollectionValue;
+use crate::js::AsyncJavaScriptCommandExecutor;
 use clap::{Arg, Command};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -27,12 +28,14 @@ pub type ExternalCommandRef = Arc<Box<dyn ExternalCommand>>;
 #[derive(Clone)]
 pub struct ExternalCommandFactory {
     commands: Arc<Mutex<HashMap<String, ExternalCommandRef>>>,
+    js_command_executor: AsyncJavaScriptCommandExecutor,
 }
 
 impl ExternalCommandFactory {
     pub fn new() -> Self {
         Self {
             commands: Arc::new(Mutex::new(HashMap::new())),
+            js_command_executor: AsyncJavaScriptCommandExecutor::new(),
         }
     }
 
@@ -48,6 +51,27 @@ impl ExternalCommandFactory {
 
         info!("Registered external command: {}", name);
         Ok(())
+    }
+
+    pub async fn register_js_external_command(
+        &self,
+        name: &str,
+        source: String,
+    ) -> Result<(), String> {
+        let cmd = self
+            .js_command_executor
+            .load_command(name.to_owned(), source)
+            .await
+            .map_err(|e| {
+                let msg = format!(
+                    "Failed to register JavaScript external command '{}': {}",
+                    name, e
+                );
+                error!("{}", msg);
+                msg
+            })?;
+
+        self.register(name, Arc::new(Box::new(cmd) as Box<dyn ExternalCommand>))
     }
 
     pub fn get_command(&self, name: &str) -> Option<ExternalCommandRef> {
@@ -114,10 +138,10 @@ impl CommandParser for ExternalCommandParser {
     }
 
     fn check_with_context(
-            &self,
-            context: &ParserContext,
-            args: &CommandArgs,
-        ) -> Result<(), String> {
+        &self,
+        context: &ParserContext,
+        args: &CommandArgs,
+    ) -> Result<(), String> {
         let matches = self
             .cmd
             .clone()
@@ -153,12 +177,11 @@ impl CommandParser for ExternalCommandParser {
     }
 
     fn parse_origin_with_context(
-            &self,
-            context: &ParserContext,
-            args: Vec<CollectionValue>,
-            origin_args: &CommandArgs,
-        ) -> Result<CommandExecutorRef, String> {
-
+        &self,
+        context: &ParserContext,
+        args: Vec<CollectionValue>,
+        origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         let str_args = args
             .iter()
             .map(|value| value.to_string())

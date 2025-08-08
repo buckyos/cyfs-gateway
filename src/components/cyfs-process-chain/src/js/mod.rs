@@ -1,6 +1,6 @@
 mod coll_wrapper;
 mod pac;
 mod exec;
-//mod test;
+mod cmd;
 
-//pub use wrapper::*;
+pub use cmd::*;
