@@ -31,7 +31,7 @@ const PROCESS_CHAIN: &str = r#"
             # We reject the request if the protocol is not https
             !(match $PROTOCOL https) && reject;
 
-            call check_host "www.buckyos.com" && reject;
+            call check_host "www.buckyos1.com" && reject;
             echo "\$get request url: ${REQ_url} \n ${PROTOCOL}";
             echo $(call add 1 2);
             local key1 = "value1";
@@ -336,4 +336,6 @@ async fn test_process_chain_main() {
     test_hook_point().await.unwrap_or_else(|e| {
         eprintln!("Error executing hook point: {}", e);
     });
+
+    EXTERNAL_COMMAND_FACTORY.finalize();
 }

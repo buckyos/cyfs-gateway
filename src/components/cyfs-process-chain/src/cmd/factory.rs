@@ -147,6 +147,12 @@ impl CommandParserFactory {
         // external commands
         self.register("call", Arc::new(Box::new(ExternalCommandParser::new())));
     }
+
+    pub fn clear(&self) {
+        let mut parsers = self.parsers.lock().unwrap();
+        info!("Clearing all command parsers {}", parsers.len());
+        parsers.clear();
+    }
 }
 
 lazy_static::lazy_static! {

@@ -83,6 +83,15 @@ impl ExternalCommandFactory {
         let commands = self.commands.lock().unwrap();
         commands.keys().cloned().collect()
     }
+
+    pub fn finalize(&self) {
+        self.js_command_executor.stop();
+        
+        // Clear all commands
+        let mut commands = self.commands.lock().unwrap();
+        info!("Unregistering all external commands, count: {}", commands.len());
+        commands.clear();
+    }
 }
 
 lazy_static::lazy_static! {

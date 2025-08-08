@@ -88,6 +88,7 @@ impl JavaScriptExternalCommand {
 }
 
 enum AsyncRequest {
+    Exit(()),
     Load(String, String, oneshot::Sender<Result<(), String>>),
     Help(String, CommandHelpType, oneshot::Sender<String>),
     // FIXME: The Check command is not used in the current implementation, but it can be added later if needed.
@@ -99,6 +100,22 @@ enum AsyncRequest {
     ),
 }
 
+impl AsyncRequest {
+    pub fn is_exit(&self) -> bool {
+        matches!(self, AsyncRequest::Exit(_))
+    }
+
+    pub fn _type(&self) -> &'static str {
+        match self {
+            AsyncRequest::Exit(_) => "Exit",
+            AsyncRequest::Load(_, _, _) => "Load",
+            AsyncRequest::Help(_, _, _) => "Help",
+            // AsyncRequest::Check(_, _, _) => "Check",
+            AsyncRequest::Exec(_, _, _) => "Exec",
+        }
+    }
+}
+
 type AsyncRequestSenderRef = Arc<Mutex<mpsc::Sender<AsyncRequest>>>;
 
 thread_local! {
@@ -108,6 +125,13 @@ thread_local! {
 #[derive(Clone)]
 pub struct AsyncJavaScriptCommandExecutor {
     sender: Arc<OnceCell<AsyncRequestSenderRef>>,
+}
+
+impl Drop for AsyncJavaScriptCommandExecutor {
+    fn drop(&mut self) {
+        // Stop the executor when it is dropped
+        self.stop();
+    }
 }
 
 impl AsyncJavaScriptCommandExecutor {
@@ -150,6 +174,10 @@ impl AsyncJavaScriptCommandExecutor {
                     loop {
                         match rx.recv() {
                             Ok(request) => {
+                                if request.is_exit() {
+                                    info!("AsyncJavaScriptCommandExecutor received exit request");
+                                    break;
+                                }
                                 Self::handle_request(request);
                             }
                             Err(e) => {
@@ -159,6 +187,10 @@ impl AsyncJavaScriptCommandExecutor {
                         }
                     }
 
+                    COMMANDS.with(|cmds| {
+                        info!("Stopping AsyncJavaScriptCommandExecutor, clearing commands: {}", cmds.borrow().len());
+                        cmds.borrow_mut().clear();
+                    });
                     info!("AsyncJavaScriptCommandExecutor stopped");
                 });
         });
@@ -170,6 +202,14 @@ impl AsyncJavaScriptCommandExecutor {
         });
     }
 
+    pub fn stop(&self) {
+        if let Some(sender) = self.sender.get() {
+            if let Err(e) = sender.lock().unwrap().send(AsyncRequest::Exit(())) {
+                error!("Failed to send exit request: {}", e);
+            }
+        }
+    }
+
     fn handle_request(request: AsyncRequest) {
         match request {
             AsyncRequest::Load(name, src, responder) => Self::on_load(name, src, responder),
@@ -177,6 +217,7 @@ impl AsyncJavaScriptCommandExecutor {
                 Self::on_help(name, help_type, responder)
             }
             AsyncRequest::Exec(name, args, responder) => Self::on_exec(name, args, responder),
+            _ => unreachable!("Unexpected request type: {:?}", request._type()),
         }
     }
 
