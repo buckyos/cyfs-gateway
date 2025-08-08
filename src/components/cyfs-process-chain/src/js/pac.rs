@@ -458,6 +458,7 @@ impl PACEnvFunctionsWrapper {
 
 #[cfg(test)]
 mod tests {
+    use crate::CollectionValue;
     use super::super::exec::*;
 
     const SRC: &str = r#"
@@ -570,8 +571,10 @@ mod tests {
         let func =
             JavaScriptFunctionCaller::load("testAll", &mut exec.context().lock().unwrap()).unwrap();
 
+        let args = vec![CollectionValue::String("testAll".to_string())];
+
         let ret = func
-            .call(&mut exec.context().lock().unwrap(), Vec::new())
+            .call(&mut exec.context().lock().unwrap(), args)
             .unwrap();
         assert!(
             ret.is_success(),
