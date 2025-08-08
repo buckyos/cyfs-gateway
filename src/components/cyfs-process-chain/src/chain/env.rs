@@ -1,5 +1,5 @@
 use crate::collection::*;
-use std::sync::{Arc, RwLock};
+use std::{str::FromStr, sync::{Arc, RwLock}};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum EnvLevel {
@@ -20,6 +20,19 @@ impl EnvLevel {
             EnvLevel::Global => "global",
             EnvLevel::Chain => "chain",
             EnvLevel::Block => "block",
+        }
+    }
+}
+
+impl FromStr for EnvLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "global" => Ok(EnvLevel::Global),
+            "chain" => Ok(EnvLevel::Chain),
+            "block" => Ok(EnvLevel::Block),
+            _ => Err(format!("Invalid environment level: {}", s)),
         }
     }
 }

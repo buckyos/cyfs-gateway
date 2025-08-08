@@ -140,35 +140,6 @@ impl SetCollectionWrapper {
         Ok(js_obj)
     }
 
-    /*
-    fn create(_this: &JsValue, _args: &[JsValue], context: &mut JsContext) -> JsObject {
-        use boa_engine::object::ObjectInitializer;
-
-        ObjectInitializer::new(context)
-            .function(
-                NativeFunction::from_async_fn(Self::insert),
-                js_string!("insert"),
-                1,
-            )
-            .function(
-                NativeFunction::from_async_fn(Self::contains),
-                js_string!("contains"),
-                1,
-            )
-            .function(
-                NativeFunction::from_async_fn(Self::remove),
-                js_string!("remove"),
-                1,
-            )
-            .function(
-                NativeFunction::from_fn_ptr(Self::get_all),
-                js_string!("get_all"),
-                0,
-            )
-            .build()
-    }
-    */
-
     fn insert(
         this: &JsValue,
         args: &[JsValue],
