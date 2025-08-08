@@ -9,7 +9,6 @@ use boa_engine::{
     value::TryFromJs,
 };
 use boa_gc::Tracer;
-use futures::future::BoxFuture;
 use std::sync::Arc;
 
 pub struct CollectionWrapperHelper {}
@@ -19,7 +18,8 @@ impl CollectionWrapperHelper {
         SetCollectionWrapper::register(context)?;
         MapCollectionWrapper::register(context)?;
         MultiMapCollectionWrapper::register(context)?;
-        return Ok(());
+
+        Ok(())
     }
 
     pub fn collection_value_to_js_value(
@@ -155,62 +155,47 @@ impl SetCollectionWrapper {
         Ok(js_obj)
     }
 
-    fn insert(
-        this: &JsValue,
-        args: &[JsValue],
-        _context: &mut JsContext,
-    ) -> BoxFuture<'static, JsResult<JsValue>> {
+    fn insert(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
                 let msg = format!("Failed to get SetCollectionWrapper from this");
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
-        let value = args
-            .get(0)
-            .map(|v| {
-                v.as_string()
-                    .map(|s| s.to_std_string_escaped())
-                    .ok_or_else(|| "Expected a string value")
-            })
-            .unwrap_or_else(|| Err("No value provided"));
-        let value = match value {
-            Ok(v) => v,
+        if args.is_empty() {
+            let msg = "Expected at least one argument".to_string();
+            error!("{}", msg);
+            return Err(JsNativeError::error().with_message(msg).into());
+        }
+
+        let value = args[0]
+            .as_string()
+            .map(|s| s.to_std_string_escaped())
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string value"))?;
+
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match rt.block_on(collection.insert(&value)) {
+            Ok(inserted) => Ok(JsValue::Boolean(inserted)),
             Err(e) => {
-                let msg = format!("Invalid argument: {}", e);
+                let msg = format!("Failed to insert into set collection: {}", e);
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                Err(JsNativeError::error().with_message(msg).into())
             }
-        };
-
-        let ft = async move {
-            //let this = this?;
-            collection
-                .insert(&value)
-                .await
-                .map(|inserted| JsValue::Boolean(inserted))
-                .map_err(|e| JsError::from_native(JsNativeError::error().with_message(e)))
-        };
-
-        Box::pin(ft)
+        }
     }
 
-    fn contains(
-        this: &JsValue,
-        args: &[JsValue],
-        _context: &mut JsContext,
-    ) -> BoxFuture<'static, JsResult<JsValue>> {
+    fn contains(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
                 let msg = format!("Failed to get SetCollectionWrapper from this");
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
@@ -218,39 +203,27 @@ impl SetCollectionWrapper {
             .get(0)
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
-            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"));
-        let key = match key {
-            Ok(k) => k,
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
+
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match rt.block_on(collection.contains(&key)) {
+            Ok(contains) => Ok(JsValue::Boolean(contains)),
             Err(e) => {
-                let msg = format!("Invalid argument: {}", e);
+                let msg = format!("Failed to check if set contains key '{}': {}", key, e);
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                Err(JsNativeError::error().with_message(msg).into())
             }
-        };
-
-        let ft = async move {
-            collection
-                .contains(&key)
-                .await
-                .map(JsValue::Boolean)
-                .map_err(|e| JsError::from_native(JsNativeError::error().with_message(e)))
-        };
-
-        Box::pin(ft)
+        }
     }
 
-    fn remove(
-        this: &JsValue,
-        args: &[JsValue],
-        _context: &mut JsContext,
-    ) -> BoxFuture<'static, JsResult<JsValue>> {
+    fn remove(this: &JsValue, args: &[JsValue], _context: &mut JsContext) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
                 let msg = format!("Failed to get SetCollectionWrapper from this");
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
@@ -258,25 +231,17 @@ impl SetCollectionWrapper {
             .get(0)
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
-            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"));
-        let key = match key {
-            Ok(k) => k,
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
+
+        let rt = _context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match rt.block_on(collection.remove(&key)) {
+            Ok(removed) => Ok(JsValue::Boolean(removed)),
             Err(e) => {
-                let msg = format!("Invalid argument: {}", e);
+                let msg = format!("Failed to remove key '{}' from set collection: {}", key, e);
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                Err(JsNativeError::error().with_message(msg).into())
             }
-        };
-
-        let ft = async move {
-            collection
-                .remove(&key)
-                .await
-                .map(|removed| JsValue::Boolean(removed))
-                .map_err(|e| JsError::from_native(JsNativeError::error().with_message(e)))
-        };
-
-        Box::pin(ft)
+        }
     }
 
     fn get_all(this: &JsValue, _args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
@@ -324,13 +289,13 @@ impl Class for SetCollectionWrapper {
     const LENGTH: usize = 0;
 
     fn init(class: &mut ClassBuilder) -> JsResult<()> {
-        let insert_fn = NativeFunction::from_async_fn(Self::insert);
+        let insert_fn = NativeFunction::from_fn_ptr(Self::insert);
         class.method(js_string!("insert"), 1, insert_fn);
 
-        let contains_fn = NativeFunction::from_async_fn(Self::contains);
+        let contains_fn = NativeFunction::from_fn_ptr(Self::contains);
         class.method(js_string!("contains"), 1, contains_fn);
 
-        let remove_fn = NativeFunction::from_async_fn(Self::remove);
+        let remove_fn = NativeFunction::from_fn_ptr(Self::remove);
         class.method(js_string!("remove"), 1, remove_fn);
 
         let get_all_fn = NativeFunction::from_fn_ptr(Self::get_all);
@@ -382,58 +347,39 @@ impl MapCollectionWrapper {
         Ok(js_obj)
     }
 
-    fn insert_new(
-        this: &JsValue,
-        args: &[JsValue],
-        _context: &mut JsContext,
-    ) -> BoxFuture<'static, JsResult<JsValue>> {
+    fn insert_new(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
                 let msg = format!("Failed to get MapCollectionWrapper from this");
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         if args.len() < 2 {
             let msg = "Expected at least 2 arguments: key and value".to_string();
             error!("{}", msg);
-            return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+            return Err(JsNativeError::error().with_message(msg).into());
         }
 
-        let key = args
-            .get(0)
-            .and_then(|v| v.as_string())
+        let key = args[0]
+            .as_string()
             .map(|s| s.to_std_string_escaped())
-            .ok_or_else(|| "Expected a string key");
-        let key = match key {
-            Ok(k) => k,
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
+
+        let value = CollectionWrapperHelper::js_value_to_collection_value(&args[1])?;
+
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match rt.block_on(collection.insert_new(&key, value)) {
+            Ok(prev) => Ok(JsValue::Boolean(prev)),
             Err(e) => {
-                return Box::pin(async move { Err(JsNativeError::error().with_message(e).into()) });
+                let msg = format!("Failed to insert into map collection: {}", e);
+                error!("{}", msg);
+                Err(JsNativeError::error().with_message(msg).into())
             }
-        };
-
-        let value = match CollectionWrapperHelper::js_value_to_collection_value(&args[1]) {
-            Ok(v) => v,
-            Err(e) => {
-                let msg = format!("Invalid value argument: {}", e);
-                return Box::pin(
-                    async move { Err(JsNativeError::error().with_message(msg).into()) },
-                );
-            }
-        };
-
-        let ft = async move {
-            collection
-                .insert_new(&key, value)
-                .await
-                .map(JsValue::Boolean)
-                .map_err(|e| JsError::from_native(JsNativeError::error().with_message(e)))
-        };
-
-        Box::pin(ft)
+        }
     }
 
     fn insert(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
@@ -512,18 +458,14 @@ impl MapCollectionWrapper {
         }
     }
 
-    fn contains(
-        this: &JsValue,
-        args: &[JsValue],
-        _context: &mut JsContext,
-    ) -> BoxFuture<'static, JsResult<JsValue>> {
+    fn contains_key(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
                 let msg = format!("Failed to get MapCollectionWrapper from this");
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
@@ -531,25 +473,17 @@ impl MapCollectionWrapper {
             .get(0)
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
-            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"));
-        let key = match key {
-            Ok(k) => k,
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
+
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match rt.block_on(collection.contains_key(&key)) {
+            Ok(contains) => Ok(JsValue::Boolean(contains)),
             Err(e) => {
-                let msg = format!("Invalid argument: {}", e);
+                let msg = format!("Failed to check if map contains key '{}': {}", key, e);
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                Err(JsNativeError::error().with_message(msg).into())
             }
-        };
-
-        let ft = async move {
-            collection
-                .contains_key(&key)
-                .await
-                .map(JsValue::Boolean)
-                .map_err(|e| JsError::from_native(JsNativeError::error().with_message(e)))
-        };
-
-        Box::pin(ft)
+        }
     }
 
     fn remove(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
@@ -612,7 +546,7 @@ impl Class for MapCollectionWrapper {
     const LENGTH: usize = 0;
 
     fn init(class: &mut ClassBuilder) -> JsResult<()> {
-        let insert_new_fn = NativeFunction::from_async_fn(Self::insert_new);
+        let insert_new_fn = NativeFunction::from_fn_ptr(Self::insert_new);
         class.method(js_string!("insert_new"), 2, insert_new_fn);
 
         let insert_fn = NativeFunction::from_fn_ptr(Self::insert);
@@ -621,8 +555,8 @@ impl Class for MapCollectionWrapper {
         let get_fn = NativeFunction::from_fn_ptr(Self::get);
         class.method(js_string!("get"), 1, get_fn);
 
-        let contains_fn = NativeFunction::from_async_fn(Self::contains);
-        class.method(js_string!("contains"), 1, contains_fn);
+        let contains_fn = NativeFunction::from_fn_ptr(Self::contains_key);
+        class.method(js_string!("contains_key"), 1, contains_fn);
 
         let remove_fn = NativeFunction::from_fn_ptr(Self::remove);
         class.method(js_string!("remove"), 1, remove_fn);
@@ -673,165 +607,118 @@ impl MultiMapCollectionWrapper {
         Ok(js_obj)
     }
 
-    pub fn insert(
-        this: &JsValue,
-        args: &[JsValue],
-        _context: &mut JsContext,
-    ) -> BoxFuture<'static, JsResult<JsValue>> {
+    pub fn insert(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
                 let msg = format!("Failed to get MultiMapCollectionWrapper from this");
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         if args.len() < 2 {
             let msg = "Expected at least 2 arguments: key and value".to_string();
             error!("{}", msg);
-            return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+            return Err(JsNativeError::error().with_message(msg).into());
         }
 
-        let key = args
-            .get(0)
-            .and_then(|v| v.as_string())
+        let key = args[0]
+            .as_string()
             .map(|s| s.to_std_string_escaped())
-            .ok_or_else(|| "Expected a string key");
-        let key = match key {
-            Ok(k) => k,
-            Err(msg) => {
-                return Box::pin(
-                    async move { Err(JsNativeError::error().with_message(msg).into()) },
-                );
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
+
+        let value = args[1]
+            .as_string()
+            .map(|s| s.to_std_string_escaped())
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string value"))?;
+
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match rt.block_on(collection.insert(&key, &value)) {
+            Ok(inserted) => Ok(JsValue::Boolean(inserted)),
+            Err(e) => {
+                let msg = format!("Failed to insert into multi-map collection: {}", e);
+                error!("{}", msg);
+                Err(JsNativeError::error().with_message(msg).into())
             }
-        };
-
-        let value = if args[1].is_string() {
-            args[1].as_string().unwrap().to_std_string_escaped()
-        } else {
-            let msg = "Expected a string value".to_string();
-            error!("{}", msg);
-            return Box::pin(async move { Err(JsNativeError::error().with_message(msg).into()) });
-        };
-
-        let ft = async move {
-            collection
-                .insert(&key, &value)
-                .await
-                .map(JsValue::Boolean)
-                .map_err(|e| JsError::from_native(JsNativeError::error().with_message(e)))
-        };
-
-        Box::pin(ft)
+        }
     }
 
     pub fn insert_many(
         this: &JsValue,
         args: &[JsValue],
         context: &mut JsContext,
-    ) -> BoxFuture<'static, JsResult<JsValue>> {
+    ) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
                 let msg = format!("Failed to get MultiMapCollectionWrapper from this");
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         if args.len() < 2 {
             let msg = "Expected at least 2 arguments: key and value".to_string();
             error!("{}", msg);
-            return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+            return Err(JsNativeError::error().with_message(msg).into());
         }
 
-        let key = args
-            .get(0)
-            .and_then(|v| v.as_string())
+        let key = args[0]
+            .as_string()
             .map(|s| s.to_std_string_escaped())
-            .ok_or_else(|| "Expected a string key");
-        let key = match key {
-            Ok(k) => k,
-            Err(msg) => {
-                return Box::pin(
-                    async move { Err(JsNativeError::error().with_message(msg).into()) },
-                );
-            }
-        };
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
 
-        let value = match CollectionWrapperHelper::js_value_to_string_list(&args[1], context) {
-            Ok(v) => v,
+        let value = CollectionWrapperHelper::js_value_to_string_list(&args[1], context)?;
+        let value = value.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match rt.block_on(collection.insert_many(&key, &value)) {
+            Ok(changed) => Ok(JsValue::Boolean(changed)),
             Err(e) => {
-                let msg = format!("Invalid value argument: {}", e);
+                let msg = format!("Failed to insert many into multi-map collection: {}", e);
                 error!("{}", msg);
-                return Box::pin(
-                    async move { Err(JsNativeError::error().with_message(msg).into()) },
-                );
+                Err(JsNativeError::error().with_message(msg).into())
             }
-        };
-
-        let ft = async move {
-            let value = value.iter().map(|v| v.as_str()).collect::<Vec<&str>>();
-            let changed = collection
-                .insert_many(&key, &value)
-                .await
-                .map_err(|e| JsError::from_native(JsNativeError::error().with_message(e)))?;
-            Ok(JsValue::Boolean(changed))
-        };
-
-        Box::pin(ft)
+        }
     }
 
-    fn get(
-        this: &JsValue,
-        args: &[JsValue],
-        _context: &mut JsContext,
-    ) -> BoxFuture<'static, JsResult<JsValue>> {
+    fn get(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
                 let msg = format!("Failed to get MultiMapCollectionWrapper from this");
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         if args.is_empty() {
             let msg = "Expected at least 1 argument: key".to_string();
             error!("{}", msg);
-            return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+            return Err(JsNativeError::error().with_message(msg).into());
         }
 
-        let key = args
-            .get(0)
-            .and_then(|v| v.as_string())
+        let key = args[0]
+            .as_string()
             .map(|s| s.to_std_string_escaped())
-            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"));
-        let key = match key {
-            Ok(k) => k,
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
+
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match rt.block_on(collection.get(&key)) {
+            Ok(value) => match value {
+                Some(v) => Ok(JsValue::String(JsString::from(v))),
+                None => Ok(JsValue::Null),
+            },
             Err(e) => {
-                let msg = format!("Invalid argument: {}", e);
+                let msg = format!("Failed to get from multi-map collection: {}", e);
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                Err(JsNativeError::error().with_message(msg).into())
             }
-        };
-
-        let ft = async move {
-            collection
-                .get(&key)
-                .await
-                .map(|ret: Option<String>| match ret {
-                    Some(value) => JsValue::String(JsString::from(value)),
-                    None => JsValue::Null,
-                })
-                .map_err(|e| JsError::from_native(JsNativeError::error().with_message(e)))
-        };
-
-        Box::pin(ft)
+        }
     }
 
     fn get_many(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
@@ -872,89 +759,116 @@ impl MultiMapCollectionWrapper {
     pub fn contains_key(
         this: &JsValue,
         args: &[JsValue],
-        _context: &mut JsContext,
-    ) -> BoxFuture<'static, JsResult<JsValue>> {
+        context: &mut JsContext,
+    ) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
                 let msg = format!("Failed to get MultiMapCollectionWrapper from this");
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
-        let key = args
-            .get(0)
-            .and_then(|v| v.as_string())
+        if args.is_empty() {
+            let msg = "Expected at least 1 argument: key".to_string();
+            error!("{}", msg);
+            return Err(JsNativeError::error().with_message(msg).into());
+        }
+
+        let key = args[0]
+            .as_string()
             .map(|s| s.to_std_string_escaped())
-            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"));
-        let key = match key {
-            Ok(k) => k,
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
+
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match rt.block_on(collection.contains_key(&key)) {
+            Ok(contains) => Ok(JsValue::Boolean(contains)),
             Err(e) => {
-                let msg = format!("Invalid argument: {}", e);
+                let msg = format!("Failed to check if multi-map contains key '{}': {}", key, e);
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                Err(JsNativeError::error().with_message(msg).into())
             }
-        };
-
-        let ft = async move {
-            collection
-                .contains_key(&key)
-                .await
-                .map(JsValue::Boolean)
-                .map_err(|e| JsError::from_native(JsNativeError::error().with_message(e)))
-        };
-
-        Box::pin(ft)
+        }
     }
 
-    pub fn remove(
+    pub fn contains_value(
         this: &JsValue,
         args: &[JsValue],
-        _context: &mut JsContext,
-    ) -> BoxFuture<'static, JsResult<JsValue>> {
+        context: &mut JsContext,
+    ) -> JsResult<JsValue> {
         let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
                 let msg = format!("Failed to get MultiMapCollectionWrapper from this");
                 error!("{}", msg);
-                return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+                return Err(JsNativeError::error().with_message(msg).into());
+            }
+        };
+
+        if args.len() < 2 {
+            let msg = "Expected at least 2 arguments: key and value".to_string();
+            error!("{}", msg);
+            return Err(JsNativeError::error().with_message(msg).into());
+        }
+
+        let key = args[0]
+            .as_string()
+            .map(|s| s.to_std_string_escaped())
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
+
+        let value = CollectionWrapperHelper::js_value_to_string_list(&args[1], context)?;
+        let value = value.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match rt.block_on(collection.contains_value(&key, &value)) {
+            Ok(contains) => Ok(JsValue::Boolean(contains)),
+            Err(e) => {
+                let msg = format!("Failed to check if multi-map contains value '{:?}': {}", value, e);
+                error!("{}", msg);
+                Err(JsNativeError::error().with_message(msg).into())
+            }
+        }
+    }
+
+    pub fn remove(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
+        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let collection = match this {
+            Some(this) => this.collection.clone(),
+            None => {
+                let msg = format!("Failed to get MultiMapCollectionWrapper from this");
+                error!("{}", msg);
+                return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         if args.len() < 2 {
             let msg = "Expected at least 2 argument: key".to_string();
             error!("{}", msg);
-            return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
+            return Err(JsNativeError::error().with_message(msg).into());
         }
 
-        let key = if args[0].is_string() {
-            args[0].as_string().unwrap().to_std_string_escaped()
-        } else {
-            let msg = "Expected a string key".to_string();
-            error!("{}", msg);
-            return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
-        };
+        let key = args[0]
+            .as_string()
+            .map(|s| s.to_std_string_escaped())
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
 
-        let value = if args[1].is_string() {
-            args[1].as_string().unwrap().to_std_string_escaped()
-        } else {
-            let msg = "Expected a string value".to_string();
-            error!("{}", msg);
-            return Box::pin(async { Err(JsNativeError::error().with_message(msg).into()) });
-        };
+        let value = args[1]
+            .as_string()
+            .map(|s| s.to_std_string_escaped())
+            .ok_or_else(|| JsNativeError::error().with_message("Expected a string value"))?;
 
-        let ft = async move {
-            collection
-                .remove(&key, &value)
-                .await
-                .map(JsValue::Boolean)
-                .map_err(|e| JsError::from_native(JsNativeError::error().with_message(e)))
-        };
-
-        Box::pin(ft)
+        let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
+        match rt.block_on(collection.remove(&key, &value)) {
+            Ok(removed) => Ok(JsValue::Boolean(removed)),
+            Err(e) => {
+                let msg = format!("Failed to remove from multi-map collection: {}", e);
+                error!("{}", msg);
+                Err(JsNativeError::error().with_message(msg).into())
+            }
+        }
     }
 
     pub fn remove_many(
@@ -1082,22 +996,25 @@ impl Class for MultiMapCollectionWrapper {
     const LENGTH: usize = 0;
 
     fn init(class: &mut ClassBuilder) -> JsResult<()> {
-        let insert_fn = NativeFunction::from_async_fn(Self::insert);
+        let insert_fn = NativeFunction::from_fn_ptr(Self::insert);
         class.method(js_string!("insert"), 2, insert_fn);
 
-        let insert_many_fn = NativeFunction::from_async_fn(Self::insert_many);
+        let insert_many_fn = NativeFunction::from_fn_ptr(Self::insert_many);
         class.method(js_string!("insert_many"), 2, insert_many_fn);
 
-        let get_fn = NativeFunction::from_async_fn(Self::get);
+        let get_fn = NativeFunction::from_fn_ptr(Self::get);
         class.method(js_string!("get"), 1, get_fn);
 
         let get_many_fn = NativeFunction::from_fn_ptr(Self::get_many);
         class.method(js_string!("get_many"), 1, get_many_fn);
 
-        let contains_key_fn = NativeFunction::from_async_fn(Self::contains_key);
+        let contains_key_fn = NativeFunction::from_fn_ptr(Self::contains_key);
         class.method(js_string!("contains_key"), 1, contains_key_fn);
 
-        let remove_fn = NativeFunction::from_async_fn(Self::remove);
+        let contains_value_fn = NativeFunction::from_fn_ptr(Self::contains_value);
+        class.method(js_string!("contains_value"), 2, contains_value_fn);
+
+        let remove_fn = NativeFunction::from_fn_ptr(Self::remove);
         class.method(js_string!("remove"), 2, remove_fn);
 
         let remove_many_fn = NativeFunction::from_fn_ptr(Self::remove_many);

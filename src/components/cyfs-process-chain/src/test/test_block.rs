@@ -9,14 +9,84 @@ const host_list = [
     { host: "*.buckyos.com", },
 ];
 
-function check_host(context, host) {
-    console.log(`Checking host: ${host}`);
+function test_set_coll() {
     let set = new SetCollection();
-    set.insert("google.com");
+    let ret = set.insert("google.com");
+    console.assert(ret, "Insert google.com failed");
     set.insert("buckyos.com");
+    
+    let exists = set.contains("google.com");
+    console.assert(exists, "Set should contain google.com");
+    exists = set.contains("buckyos.com");
+    console.assert(exists, "Set should contain buckyos.com");
+
     console.log(`Set contains google.com: ${set.contains("google.com")}`);
     console.log(`Set contains buckyos.com: ${set.contains("buckyos.com")}`);
 
+    set.remove("google.com");
+    console.assert(!set.contains("google.com"), "Set should not contain google.com after removal");
+    console.log(`Set contains google.com after removal: ${set.contains("google.com")}`);
+}
+
+function test_map_coll() {
+    let map = new MapCollection();
+    let ret = map.insert("google.com", "tag1");
+    console.assert(ret == null, "MapCollection insert google.com tag1 failed");
+
+    ret = map.insert("google.com", "tag2");
+    console.assert(ret == "tag1", "MapCollection insert google.com tag2 failed");
+
+    ret = map.insert("baidu.com", "tag1");
+    console.assert(ret == null, "MapCollection insert baidu.com tag1 failed");
+
+    ret = map.contains_key("google.com");
+    console.assert(ret, "MapCollection should contain google.com");
+    ret = map.contains_key("baidu.com");
+    console.assert(ret, "MapCollection should contain baidu.com");
+
+    let value = map.get("google.com");
+    console.assert(value == "tag2", "MapCollection get google.com failed, expected tag2, got " + value);
+
+    value = map.get("baidu.com");
+    console.assert(value == "tag1", "MapCollection get baidu.com failed, expected tag1, got " + value);
+
+    value = map.get("not-exist.com");
+    console.assert(value == null, "MapCollection get not-exist.com should return null");
+
+    value = map.remove("google.com");
+    console.assert(value == "tag2", "MapCollection remove google.com failed, expected tag2, got " + value);
+
+    console.log(`MapCollection contains google.com: ${map.contains_key("google.com")}`);
+    console.log(`MapCollection contains baidu.com: ${map.contains_key("baidu.com")}`);
+}
+
+function test_multi_map_coll() {
+    let coll = new MultiMapCollection();
+    let ret = coll.insert_many("google.com", ["tag1", "tag2"]);
+    console.assert(ret, "MultiMapCollection insert_many google.com tag1 tag2 failed");
+    ret = coll.insert("baidu.com", "tag1");
+    console.assert(ret, "MultiMapCollection insert baidu.com tag1 failed");
+
+    let set = coll.get_many("google.com");
+    console.log(`MultiMapCollection google.com tags`);
+    console.assert(set.contains("tag1"), "MultiMapCollection should contain google.com with tag1");
+    console.assert(set.contains("tag2"), "MultiMapCollection should contain google.com with tag2");
+
+    let tag = coll.get("google.com");
+    console.assert(set.contains(tag), "MultiMapCollection should contain google.com with ${tag}");
+    console.log(`MultiMapCollection contains google.com: ${coll.contains_key("google.com")}`);
+    console.log(`MultiMapCollection contains baidu.com: ${coll.contains_key("baidu.com")}`);
+}
+
+function test_coll() {
+    test_set_coll();
+    test_map_coll();
+    test_multi_map_coll();
+}
+
+function check_host(context, host) {
+    console.log(`Checking host: ${host}`);
+    test_coll();
     if (context.env().get("test_var") == null) {
         console.log("test_var not found in context.env, setting it now");
         context.env().set("test_var", "test_value");
