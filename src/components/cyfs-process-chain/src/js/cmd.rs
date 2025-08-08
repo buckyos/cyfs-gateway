@@ -335,13 +335,11 @@ impl AsyncJavaScriptExternalCommand {
 #[async_trait::async_trait]
 impl ExternalCommand for AsyncJavaScriptExternalCommand {
     fn help(&self, name: &str, help_type: CommandHelpType) -> String {
-        todo!();
-        /*
-        assert_eq!(self.name, name);
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let (tx, rx) = oneshot::channel();
         let request = AsyncRequest::Help(name.to_string(), help_type, tx);
-        if let Ok(sender) = self.sender.lock().send(request) {
-            match rx.recv() {
+        if let Ok(_) = self.sender.lock().unwrap().send(request) {
+            match rt.block_on(rx) {
                 Ok(help) => help,
                 Err(e) => {
                     error!("Failed to receive help response: {}", e);
@@ -351,7 +349,6 @@ impl ExternalCommand for AsyncJavaScriptExternalCommand {
         } else {
             format!("Failed to send help request for command {}", name)
         }
-        */
     }
 
     fn check(&self, _args: &CommandArgs) -> Result<(), String> {
