@@ -73,6 +73,18 @@ impl CommandArg {
             CommandArg::CommandSubstitution(_) => "[command substitution]",
         }
     }
+
+    pub fn is_command_substitution(&self) -> bool {
+        matches!(self, CommandArg::CommandSubstitution(_))
+    }
+
+    pub fn as_command_substitution(&self) -> Option<&Box<Expression>> {
+        if let CommandArg::CommandSubstitution(cmd) = self {
+            Some(cmd)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -13,6 +13,7 @@ pub enum CommandGroup {
     Variable,
     Debug,
     External,
+    MapReduce,
 }
 
 impl CommandGroup {
@@ -25,6 +26,7 @@ impl CommandGroup {
             CommandGroup::Variable => "variable",
             CommandGroup::Debug => "debug",
             CommandGroup::External => "external",
+            CommandGroup::MapReduce => "map-reduce",
         }
     }
 }

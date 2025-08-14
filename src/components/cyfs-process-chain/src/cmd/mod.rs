@@ -9,6 +9,7 @@ mod factory;
 mod helper;
 mod match_;
 mod string;
+mod map;
 
 pub use cmd::*;
 pub use factory::*;

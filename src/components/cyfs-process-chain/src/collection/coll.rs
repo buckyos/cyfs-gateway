@@ -112,14 +112,11 @@ impl CollectionValue {
     pub fn treat_as_str(&self) -> &str {
         match self {
             CollectionValue::String(s) => s.as_str(),
-            _ => {
-                let msg = format!(
-                    "Expected CollectionValue::String, found {}",
-                    self.get_type(),
-                );
-                warn!("{}", msg);
-                ""
-            }
+            CollectionValue::Set(_) => "[Set]",
+            CollectionValue::Map(_) => "[Map]",
+            CollectionValue::MultiMap(_) => "[MultiMap]",
+            CollectionValue::Visitor(_) => "[Visitor]",
+            CollectionValue::Any(_) => "[Any]",
         }
     }
 
