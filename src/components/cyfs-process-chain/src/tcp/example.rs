@@ -34,8 +34,8 @@ const PROCESS_CHAIN: &str = r#"
 
             echo ${REQ.dest_host};
             match ${REQ.app_protocol} "http" && echo ${REQ.ext.url};
-            match ${REQ.app_protocol} "https" && return "tcp://127.0.0.1:1000";
-            match ${REQ.app_protocol} "http" && return "tcp://127.0.0.1:1100";
+            match ${REQ.app_protocol} "https" && return "tcp://127.0.0.1:10000";
+            match ${REQ.app_protocol} "http" && return "tcp://127.0.0.1:11000";
         ]]>
     </block>
 </process_chain>
@@ -263,7 +263,7 @@ async fn test_https_sni_probe() {
 
     // Simulate a backend TLS server for buckyos.com
     let tls_acceptor = TlsAcceptor::from(Arc::new(backend_config));
-    let backend_listener = TcpListener::bind("127.0.0.1:1000").await.unwrap();
+    let backend_listener = TcpListener::bind("127.0.0.1:10000").await.unwrap();
 
     let backend = tokio::spawn(async move {
         let (stream, _) = backend_listener.accept().await.unwrap();
@@ -278,7 +278,7 @@ async fn test_https_sni_probe() {
     });
 
     // Start the forward server to handle incoming connections
-    start_forward_server(1001).await;
+    start_forward_server(10010).await;
 
     // Now we can create a client to test the HTTPS SNI probing
     let mut root_store = rustls::RootCertStore::empty();
@@ -291,7 +291,7 @@ async fn test_https_sni_probe() {
     let connector = TlsConnector::from(Arc::new(client_config));
     let server_name = ServerName::try_from("buckyos.com").unwrap();
 
-    let client_stream = TcpStream::connect("127.0.0.1:1001").await.unwrap();
+    let client_stream = TcpStream::connect("127.0.0.1:10010").await.unwrap();
     let mut tls_stream = connector.connect(server_name, client_stream).await.unwrap();
 
     // Try read the response from the server
@@ -323,7 +323,7 @@ async fn test_http_probe() {
     });
 
     // Start a simple HTTP server to test the HTTP probing
-    let addr: SocketAddr = ([127, 0, 0, 1], 1100).into();
+    let addr: SocketAddr = ([127, 0, 0, 1], 11000).into();
 
 
     let listener = TcpListener::bind(&addr).await.unwrap();

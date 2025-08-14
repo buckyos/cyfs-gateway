@@ -3,6 +3,7 @@ use crate::chain::EnvRef;
 use crate::collection::*;
 use hyper::{Uri, header::HeaderName};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use tokio::sync::RwLock;
 
 type Request = hyper::Request<hyper::body::Incoming>;
@@ -10,13 +11,21 @@ type Request = hyper::Request<hyper::body::Incoming>;
 #[derive(Clone)]
 pub struct HyperHttpRequestHeaderMap {
     request: Arc<RwLock<Request>>,
+    transverse_counter: Arc<AtomicU32>, // Indicates if a traversal is currently happening
 }
 
 impl HyperHttpRequestHeaderMap {
     pub fn new(request: Request) -> Self {
         Self {
             request: Arc::new(RwLock::new(request)),
+            transverse_counter: Arc::new(AtomicU32::new(0)), // Initialize counter to 0
         }
+    }
+
+    fn is_during_traversal(&self) -> bool {
+        self.transverse_counter
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
     }
 
     pub fn into_request(self) -> Result<Request, String> {
@@ -64,6 +73,12 @@ impl MapCollection for HyperHttpRequestHeaderMap {
     }
 
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot insert new header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
         let mut request = self.request.write().await;
         let header = value.try_as_str()?.parse().map_err(|e| {
             let msg = format!("Invalid header value '{}': {}", value, e);
@@ -92,6 +107,12 @@ impl MapCollection for HyperHttpRequestHeaderMap {
         key: &str,
         value: CollectionValue,
     ) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot insert header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
         let mut request = self.request.write().await;
         let header = value.try_as_str()?.parse().map_err(|e| {
             let msg = format!("Invalid header value '{}': {}", value, e);
@@ -143,6 +164,12 @@ impl MapCollection for HyperHttpRequestHeaderMap {
     }
 
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot remove header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
         let mut request = self.request.write().await;
         let prev = request.headers_mut().remove(key);
         if let Some(prev_value) = prev {
@@ -160,12 +187,34 @@ impl MapCollection for HyperHttpRequestHeaderMap {
         }
     }
 
+    async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String> {
+        let _guard = TraverseGuard::new(&self.transverse_counter);
+
+        let request = self.request.read().await;
+        for (key, value) in request.headers().iter() {
+            if let Ok(value_str) = value.to_str() {
+                if !callback
+                    .call(key.as_str(), &CollectionValue::String(value_str.to_owned()))
+                    .await?
+                {
+                    break; // Stop traversal if callback returns false
+                }
+            } else {
+                warn!("Header value for '{}' is not valid UTF-8", key);
+            }
+        }
+        Ok(())
+    }
+
     async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
         let request = self.request.read().await;
         let mut result = Vec::new();
         for (key, value) in request.headers().iter() {
             if let Ok(value_str) = value.to_str() {
-                result.push((key.as_str().to_string(), CollectionValue::String(value_str.to_string())));
+                result.push((
+                    key.as_str().to_string(),
+                    CollectionValue::String(value_str.to_string()),
+                ));
             } else {
                 warn!("Header value for '{}' is not valid UTF-8", key);
             }

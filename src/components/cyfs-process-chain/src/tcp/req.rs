@@ -1,7 +1,8 @@
-use crate::collection::*;
 use crate::chain::*;
+use crate::collection::*;
 use buckyos_kit::AsyncStream;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
@@ -67,13 +68,21 @@ impl StreamRequest {
 #[derive(Clone)]
 pub struct StreamRequestMap {
     request: Arc<RwLock<StreamRequest>>,
+    transverse_counter: Arc<AtomicU32>, // Indicates if a traversal is currently happening
 }
 
 impl StreamRequestMap {
     pub fn new(request: StreamRequest) -> Self {
         Self {
             request: Arc::new(RwLock::new(request)),
+            transverse_counter: Arc::new(AtomicU32::new(0)), // Initialize counter to 0
         }
+    }
+
+    fn is_during_traversal(&self) -> bool {
+        self.transverse_counter
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
     }
 
     pub fn into_request(self) -> Result<StreamRequest, String> {
@@ -97,6 +106,12 @@ impl MapCollection for StreamRequestMap {
     }
 
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
+        if self.is_during_traversal() {
+            let msg = "Cannot insert new key during traversal".to_string();
+            error!("{}", msg);
+            return Err(msg);
+        }
+
         self.insert(key, value).await.map(|prev| prev.is_none())
     }
 
@@ -105,6 +120,12 @@ impl MapCollection for StreamRequestMap {
         key: &str,
         value: CollectionValue,
     ) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = "Cannot insert key during traversal".to_string();
+            error!("{}", msg);
+            return Err(msg);
+        }
+
         let mut request = self.request.write().await;
         let prev;
 
@@ -341,6 +362,12 @@ impl MapCollection for StreamRequestMap {
     }
 
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = "Cannot remove key during traversal".to_string();
+            error!("{}", msg);
+            return Err(msg);
+        }
+
         let mut request = self.request.write().await;
         match key {
             "dest_port" => Ok(Some(CollectionValue::String(request.dest_port.to_string()))),
@@ -370,6 +397,58 @@ impl MapCollection for StreamRequestMap {
             }
             _ => Err(format!("Unknown key: {}", key)),
         }
+    }
+
+    async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String> {
+        let _guard = TraverseGuard::new(&self.transverse_counter);
+
+        let request = self.request.read().await;
+        for (key, value) in [
+            ("dest_port", request.dest_port.to_string()),
+            ("dest_host", request.dest_host.clone().unwrap_or_default()),
+            (
+                "dest_addr",
+                request
+                    .dest_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "app_protocol",
+                request.app_protocol.clone().unwrap_or_default(),
+            ),
+            ("dest_url", request.dest_url.clone().unwrap_or_default()),
+            (
+                "source_addr",
+                request
+                    .source_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_default(),
+            ),
+            ("source_mac", request.source_mac.clone().unwrap_or_default()),
+            (
+                "source_device_id",
+                request.source_device_id.clone().unwrap_or_default(),
+            ),
+            (
+                "source_app_id",
+                request.source_app_id.clone().unwrap_or_default(),
+            ),
+            (
+                "source_user_id",
+                request.source_user_id.clone().unwrap_or_default(),
+            ),
+        ] {
+            if !callback.call(key, &CollectionValue::String(value)).await? {
+                break;
+            }
+        }
+
+        if let Some(ext) = &request.ext {
+            ext.traverse(callback).await?;
+        }
+
+        Ok(())
     }
 
     async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {

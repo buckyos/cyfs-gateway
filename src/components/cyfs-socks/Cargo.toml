@@ -25,3 +25,4 @@ once_cell = "*"
 chrono = "*"
 
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
+cyfs-process-chain = { path = "../cyfs-process-chain" }

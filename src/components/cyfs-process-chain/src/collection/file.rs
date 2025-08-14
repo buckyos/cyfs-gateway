@@ -92,9 +92,9 @@ impl JsonSetCollection {
         })
     }
 
-    pub fn flush(&self) -> Result<(), String> {
+    pub async fn flush(&self) -> Result<(), String> {
         if self.file.is_dirty() {
-            self.file.save(&self.data.data().read().unwrap())?;
+            self.file.save(&*self.data.data().read().await)?;
             self.file.clear_dirty();
         }
 
@@ -134,12 +134,16 @@ impl SetCollection for JsonSetCollection {
         self.data.get_all().await
     }
 
+    async fn traverse(&self, callback: SetCollectionTraverseCallBackRef) -> Result<(), String> {
+        self.data.traverse(callback).await
+    }
+
     fn is_flushable(&self) -> bool {
         self.file.is_dirty()
     }
-    
+
     async fn flush(&self) -> Result<(), String> {
-        self.flush()
+        self.flush().await
     }
 }
 
@@ -205,9 +209,9 @@ impl JsonMapCollection {
         })
     }
 
-    pub fn flush(&self) -> Result<(), String> {
+    pub async fn flush(&self) -> Result<(), String> {
         if self.file.is_dirty() {
-            self.file.save(&self.data.data().read().unwrap())?;
+            self.file.save(&*self.data.data().read().await)?;
             self.file.clear_dirty();
         }
 
@@ -263,12 +267,19 @@ impl MapCollection for JsonMapCollection {
         Ok(ret)
     }
 
+    async fn traverse(
+        &self,
+        callback: MapCollectionTraverseCallBackRef,
+    ) -> Result<(), String> {
+        self.data.traverse(callback).await
+    }
+
     fn is_flushable(&self) -> bool {
         self.file.is_dirty()
     }
 
     async fn flush(&self) -> Result<(), String> {
-        self.flush()
+        self.flush().await
     }
 
     async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
@@ -293,9 +304,9 @@ impl JsonMultiMapCollection {
         })
     }
 
-    pub fn flush(&self) -> Result<(), String> {
+    pub async fn flush(&self) -> Result<(), String> {
         if self.file.is_dirty() {
-            self.file.save(&self.data.data().read().unwrap())?;
+            self.file.save(&*self.data.data().read().await)?;
             self.file.clear_dirty();
         }
 
@@ -352,7 +363,11 @@ impl MultiMapCollection for JsonMultiMapCollection {
         Ok(ret)
     }
 
-    async fn remove_many(&self, key: &str, values: &[&str]) -> Result<Option<SetCollectionRef>, String> {
+    async fn remove_many(
+        &self,
+        key: &str,
+        values: &[&str],
+    ) -> Result<Option<SetCollectionRef>, String> {
         let ret = self.data.remove_many(key, values).await?;
         if ret.is_some() && ret.as_ref().unwrap().len().await? > 0 {
             self.file.mark_dirty();
@@ -370,12 +385,19 @@ impl MultiMapCollection for JsonMultiMapCollection {
         Ok(ret)
     }
 
+    async fn traverse(
+        &self,
+        callback: MultiMapCollectionTraverseCallBackRef,
+    ) -> Result<(), String> {
+        self.data.traverse(callback).await
+    }
+
     fn is_flushable(&self) -> bool {
         self.file.is_dirty()
     }
 
     async fn flush(&self) -> Result<(), String> {
-        self.flush()
+        self.flush().await
     }
 
     async fn dump(&self) -> Result<Vec<(String, HashSet<String>)>, String> {

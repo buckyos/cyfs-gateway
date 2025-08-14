@@ -3,7 +3,7 @@ use crate::block::{CommandArgs, Expression, BlockExecuter};
 use crate::chain::Context;
 use clap::{Arg, Command};
 use std::sync::Arc;
-use crate::collection::CollectionValue;
+use crate::collection::{CollectionValue, SetCollectionTraverseCallBack};
 
 // map ${collection} $(sub command) reduce $(sub command)
 // map ${collection} $(sub command)
@@ -326,11 +326,27 @@ impl CommandParser for MapReduceCommandParser {
     }
 }
 
-pub struct MapReduceCommand {
+struct MapReduceCommandInner {
     collection: String,
     begin_cmd: Option<Box<Expression>>,
     map_cmd: Box<Expression>,
     reduce_cmd: Option<Box<Expression>>,
+}
+
+type MapReduceCommandInnerRef = Arc<MapReduceCommandInner>;
+
+impl MapReduceCommandInner {
+    async fn on_set_traverse(
+        &self,
+        key: &str,
+        context: &Context,
+    ) -> Result<bool, String> {
+        todo!("Implement set traversal logic for map-reduce command");
+    }
+}
+
+pub struct MapReduceCommand {
+    inner: MapReduceCommandInnerRef,
 }
 
 impl MapReduceCommand {
@@ -340,11 +356,13 @@ impl MapReduceCommand {
         map_cmd: Box<Expression>,
         reduce_cmd: Option<Box<Expression>>,
     ) -> Self {
-        Self {
-            collection,
-            begin_cmd,
-            map_cmd,
-            reduce_cmd,
+       Self {
+            inner: Arc::new(MapReduceCommandInner {
+                collection,
+                begin_cmd,
+                map_cmd,
+                reduce_cmd,
+            }),
         }
     }
 }
@@ -355,10 +373,10 @@ impl CommandExecutor for MapReduceCommand {
         // Get coll from context
         let coll = context
             .env()
-            .get(&self.collection, None)
+            .get(&self.inner.collection, None)
             .await?
             .ok_or_else(|| {
-                let msg = format!("Collection '{}' not found in context", self.collection);
+                let msg = format!("Collection '{}' not found in context", self.inner.collection);
                 error!("{}", msg);
                 msg
             })?;
@@ -366,7 +384,7 @@ impl CommandExecutor for MapReduceCommand {
         if !coll.is_collection() {
             let msg = format!(
                 "Expected a collection for '{}', found: {}",
-                self.collection,
+                self.inner.collection,
                 coll.get_type()
             );
             error!("{}", msg);
@@ -375,7 +393,7 @@ impl CommandExecutor for MapReduceCommand {
 
         let exec = BlockExecuter::new("map-reduce");
         // Execute begin command if provided
-        if let Some(begin_cmd) = &self.begin_cmd {
+        if let Some(begin_cmd) = &self.inner.begin_cmd {
             let ret = BlockExecuter::execute_expression(begin_cmd, context).await?;
             if !ret.is_success() {
                 let msg = format!(
@@ -388,14 +406,18 @@ impl CommandExecutor for MapReduceCommand {
         }
 
         match coll {
+            CollectionValue::Set(set) => {
+                let cb = SetCollectionMapReducer {
+                    inner: self.inner.clone(),
+                };
+                let cb = Arc::new(Box::new(cb) as Box<dyn SetCollectionTraverseCallBack>);
+                set.traverse(cb).await?;
+            }
             CollectionValue::Map(map) => {
                 todo!("Implement map command execution for Map collection");
             }
             CollectionValue::MultiMap(multi_map) => {
                 todo!("Implement map command execution for MultiMap collection");
-            }
-            CollectionValue::Set(set) => {
-                todo!("Implement map command execution for Set collection");
             }
             _ => {
                 let msg = format!(
@@ -408,7 +430,7 @@ impl CommandExecutor for MapReduceCommand {
         }
 
         // Execute reduce command if provided
-        let ret = if let Some(reduce_cmd) = &self.reduce_cmd {
+        let ret = if let Some(reduce_cmd) = &self.inner.reduce_cmd {
             BlockExecuter::execute_expression(reduce_cmd, context).await?
         } else {
             CommandResult::success()
@@ -416,4 +438,16 @@ impl CommandExecutor for MapReduceCommand {
 
         Ok(ret)
     }
+}
+
+struct SetCollectionMapReducer {
+    inner: MapReduceCommandInnerRef,
+}
+
+#[async_trait::async_trait]
+impl SetCollectionTraverseCallBack for SetCollectionMapReducer {
+     async fn call(&self, key: &str) -> Result<bool, String> {
+        todo!("Implement set traversal logic for map-reduce command");
+        //self.inner.on_set_traverse(key, context).await
+     }
 }

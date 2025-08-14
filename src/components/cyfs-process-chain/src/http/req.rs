@@ -3,6 +3,7 @@ use crate::collection::*;
 use http_types::{Request, Url};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use std::sync::atomic::AtomicU32;
 
 pub const HTTP_REQUEST_HEADER_VARS: &[(&str, &str, bool)] = &[
     ("REQ_host", "host", true),
@@ -15,13 +16,19 @@ pub const HTTP_REQUEST_HEADER_VARS: &[(&str, &str, bool)] = &[
 #[derive(Clone)]
 pub struct HttpRequestHeaderMap {
     request: Arc<RwLock<Request>>,
+    transverse_counter: Arc<AtomicU32>, // Indicates if a traversal is currently happening
 }
 
 impl HttpRequestHeaderMap {
     pub fn new(request: Request) -> Self {
         Self {
             request: Arc::new(RwLock::new(request)),
+            transverse_counter: Arc::new(AtomicU32::new(0)), // Initialize counter to 0
         }
+    }
+
+    fn is_during_traversal(&self) -> bool {
+        self.transverse_counter.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
 
     pub fn into_request(self) -> Result<Request, String> {
@@ -67,6 +74,12 @@ impl MapCollection for HttpRequestHeaderMap {
     }
 
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot insert new header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
         let mut request = self.request.write().await;
         if request.header(key).is_some() {
             let msg = format!("Header '{}' already exists", key);
@@ -83,6 +96,12 @@ impl MapCollection for HttpRequestHeaderMap {
         key: &str,
         value: CollectionValue,
     ) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot insert header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
         let mut request = self.request.write().await;
         let prev = request.insert_header(key, value.try_as_str()?);
         if let Some(prev_value) = prev {
@@ -104,6 +123,12 @@ impl MapCollection for HttpRequestHeaderMap {
     }
 
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot remove header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
         let mut request = self.request.write().await;
         let prev = request.remove_header(key);
         if let Some(prev_value) = prev {
@@ -111,6 +136,22 @@ impl MapCollection for HttpRequestHeaderMap {
         } else {
             Ok(None)
         }
+    }
+
+    async fn traverse(
+        &self,
+        callback: MapCollectionTraverseCallBackRef,
+    ) -> Result<(), String> {
+        let _guard = TraverseGuard::new(&self.transverse_counter);
+        
+        let request = self.request.read().await;
+        for (key, value) in request.iter() {
+            if !callback.call(key.as_str(), &CollectionValue::String(value.to_string())).await? {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {

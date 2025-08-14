@@ -1,7 +1,7 @@
 use super::var::VariableVisitorRef;
-use std::sync::Arc;
-use std::collections::HashSet;
 use std::any::Any;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 pub type AnyRef = Arc<dyn Any + Send + Sync>;
 #[derive(Clone)]
@@ -76,7 +76,7 @@ impl CollectionValue {
     pub fn is_string(&self) -> bool {
         matches!(self, CollectionValue::String(_))
     }
-    
+
     pub fn as_ref(&self) -> CollectionValueRef {
         match self {
             CollectionValue::String(s) => CollectionValueRef::String(s.as_str()),
@@ -183,7 +183,7 @@ impl CollectionValue {
             CollectionValue::Set(_) | CollectionValue::Map(_) | CollectionValue::MultiMap(_)
         )
     }
-    
+
     pub fn as_visitor(&self) -> Option<&VariableVisitorRef> {
         if let CollectionValue::Visitor(v) = self {
             Some(v)
@@ -235,6 +235,15 @@ pub enum CollectionFileFormat {
 }
 
 #[async_trait::async_trait]
+pub trait SetCollectionTraverseCallBack: Send + Sync {
+    /// Traverse the collection and apply the callback to each element.
+    /// If the callback returns false, the traversal stops.
+    async fn call(&self, key: &str) -> Result<bool, String>;
+}
+
+pub type SetCollectionTraverseCallBackRef = Arc<Box<dyn SetCollectionTraverseCallBack>>;
+
+#[async_trait::async_trait]
 pub trait SetCollection: Send + Sync {
     /// Returns the number of elements in the collection.
     async fn len(&self) -> Result<usize, String>;
@@ -250,6 +259,9 @@ pub trait SetCollection: Send + Sync {
 
     /// Gets all values in the collection.
     async fn get_all(&self) -> Result<Vec<String>, String>;
+
+    /// Traverses the collection and applies the callback to each element.
+    async fn traverse(&self, callback: SetCollectionTraverseCallBackRef) -> Result<(), String>;
 
     /// Checks if the collection is flushable.
     fn is_flushable(&self) -> bool {
@@ -269,6 +281,15 @@ pub trait SetCollection: Send + Sync {
 }
 
 pub type SetCollectionRef = Arc<Box<dyn SetCollection>>;
+
+#[async_trait::async_trait]
+pub trait MapCollectionTraverseCallBack: Send + Sync {
+    /// Traverse the collection and apply the callback to each key-value pair.
+    /// If the callback returns false, the traversal stops.
+    async fn call(&self, key: &str, value: &CollectionValue) -> Result<bool, String>;
+}
+
+pub type MapCollectionTraverseCallBackRef = Arc<Box<dyn MapCollectionTraverseCallBack>>;
 
 #[async_trait::async_trait]
 pub trait MapCollection: Send + Sync {
@@ -295,6 +316,12 @@ pub trait MapCollection: Send + Sync {
     /// Removes the key from the collection.
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String>;
 
+    // Traverses the collection and applies the callback to each key-value pair.
+    async fn traverse(
+        &self,
+        callback: MapCollectionTraverseCallBackRef,
+    ) -> Result<(), String>;
+
     /// Checks if the collection is flushable.
     fn is_flushable(&self) -> bool {
         // Default implementation returns false, can be overridden by specific collections
@@ -312,6 +339,16 @@ pub trait MapCollection: Send + Sync {
 }
 
 pub type MapCollectionRef = Arc<Box<dyn MapCollection>>;
+
+#[async_trait::async_trait]
+pub trait MultiMapCollectionTraverseCallBack: Send + Sync {
+    /// Traverse the collection and apply the callback to each key-value pair.
+    /// If the callback returns false, the traversal stops.
+    async fn call(&self, key: &str, value: &str) -> Result<bool, String>;
+}
+
+pub type MultiMapCollectionTraverseCallBackRef =
+    Arc<Box<dyn MultiMapCollectionTraverseCallBack>>;
 
 #[async_trait::async_trait]
 pub trait MultiMapCollection: Send + Sync {
@@ -344,11 +381,21 @@ pub trait MultiMapCollection: Send + Sync {
 
     /// Removes the values for the given key from the collection.
     /// if any value is removed, it returns true
-    async fn remove_many(&self, key: &str, values: &[&str]) -> Result<Option<SetCollectionRef>, String>;
+    async fn remove_many(
+        &self,
+        key: &str,
+        values: &[&str],
+    ) -> Result<Option<SetCollectionRef>, String>;
 
     /// Removes all values for the given key from the collection.
     /// If the key is not found, it returns false.
     async fn remove_all(&self, key: &str) -> Result<Option<SetCollectionRef>, String>;
+
+    /// Traverses the collection and applies the callback to each key-value pair.
+    async fn traverse(
+        &self,
+        callback: MultiMapCollectionTraverseCallBackRef,
+    ) -> Result<(), String>;
 
     /// Checks if the collection is flushable.
     fn is_flushable(&self) -> bool {
