@@ -1,9 +1,12 @@
 use super::cmd::*;
-use crate::block::{CommandArgs, Expression, BlockExecuter};
-use crate::chain::Context;
+use crate::block::{BlockExecuter, CommandArgs, Expression};
+use crate::chain::{Context, EnvLevel};
+use crate::collection::{
+    CollectionValue, MapCollectionTraverseCallBack, MultiMapCollectionTraverseCallBack,
+    SetCollectionTraverseCallBack,
+};
 use clap::{Arg, Command};
-use std::sync::Arc;
-use crate::collection::{CollectionValue, SetCollectionTraverseCallBack};
+use std::sync::{Arc, Mutex};
 
 // map ${collection} $(sub command) reduce $(sub command)
 // map ${collection} $(sub command)
@@ -292,7 +295,7 @@ impl CommandParser for MapReduceCommandParser {
             error!("{}", msg);
             return Err(msg);
         }
-        let map_cmd = map_cmd.as_command_substitution().unwrap().clone();    
+        let map_cmd = map_cmd.as_command_substitution().unwrap().clone();
 
         let reduce_cmd = if let Some(reduce_cmd_index) = indexes.3 {
             let reduce_cmd = origin_args.get(reduce_cmd_index).ok_or_else(|| {
@@ -315,12 +318,7 @@ impl CommandParser for MapReduceCommandParser {
             None
         };
 
-        let cmd = MapReduceCommand::new(
-            col,
-            begin_cmd,
-            map_cmd,
-            reduce_cmd,
-        );
+        let cmd = MapReduceCommand::new(col, begin_cmd, map_cmd, reduce_cmd);
 
         Ok(Arc::new(Box::new(cmd) as Box<dyn CommandExecutor>))
     }
@@ -335,16 +333,6 @@ struct MapReduceCommandInner {
 
 type MapReduceCommandInnerRef = Arc<MapReduceCommandInner>;
 
-impl MapReduceCommandInner {
-    async fn on_set_traverse(
-        &self,
-        key: &str,
-        context: &Context,
-    ) -> Result<bool, String> {
-        todo!("Implement set traversal logic for map-reduce command");
-    }
-}
-
 pub struct MapReduceCommand {
     inner: MapReduceCommandInnerRef,
 }
@@ -356,7 +344,7 @@ impl MapReduceCommand {
         map_cmd: Box<Expression>,
         reduce_cmd: Option<Box<Expression>>,
     ) -> Self {
-       Self {
+        Self {
             inner: Arc::new(MapReduceCommandInner {
                 collection,
                 begin_cmd,
@@ -376,7 +364,10 @@ impl CommandExecutor for MapReduceCommand {
             .get(&self.inner.collection, None)
             .await?
             .ok_or_else(|| {
-                let msg = format!("Collection '{}' not found in context", self.inner.collection);
+                let msg = format!(
+                    "Collection '{}' not found in context",
+                    self.inner.collection
+                );
                 error!("{}", msg);
                 msg
             })?;
@@ -391,33 +382,74 @@ impl CommandExecutor for MapReduceCommand {
             return Err(msg);
         }
 
-        let exec = BlockExecuter::new("map-reduce");
         // Execute begin command if provided
         if let Some(begin_cmd) = &self.inner.begin_cmd {
             let ret = BlockExecuter::execute_expression(begin_cmd, context).await?;
             if !ret.is_success() {
-                let msg = format!(
-                    "Begin command failed with result: {:?}",
-                    ret
-                );
+                let msg = format!("Begin command failed with result: {:?}", ret);
                 info!("{}", msg);
                 return Ok(ret);
             }
         }
 
-        match coll {
+        let ret = match coll {
             CollectionValue::Set(set) => {
-                let cb = SetCollectionMapReducer {
-                    inner: self.inner.clone(),
-                };
-                let cb = Arc::new(Box::new(cb) as Box<dyn SetCollectionTraverseCallBack>);
-                set.traverse(cb).await?;
+                context
+                    .env()
+                    .change_var_level("__key", Some(crate::EnvLevel::Block));
+                let cb = CollectionMapReducer::new(self.inner.clone(), context.clone());
+                let ret_item = cb.result.clone();
+                set.traverse(Arc::new(
+                    Box::new(cb) as Box<dyn SetCollectionTraverseCallBack>
+                ))
+                .await?;
+                let result = ret_item
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or(CommandResult::success());
+                result
             }
             CollectionValue::Map(map) => {
-                todo!("Implement map command execution for Map collection");
+                context
+                    .env()
+                    .change_var_level("__key", Some(crate::EnvLevel::Block));
+                context
+                    .env()
+                    .change_var_level("__value", Some(crate::EnvLevel::Block));
+                let cb = CollectionMapReducer::new(self.inner.clone(), context.clone());
+                let ret_item = cb.result.clone();
+                map.traverse(Arc::new(
+                    Box::new(cb) as Box<dyn MapCollectionTraverseCallBack>
+                ))
+                .await?;
+                let result = ret_item
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or(CommandResult::success());
+                result
             }
             CollectionValue::MultiMap(multi_map) => {
-                todo!("Implement map command execution for MultiMap collection");
+                context
+                    .env()
+                    .change_var_level("__key", Some(crate::EnvLevel::Block));
+                context
+                    .env()
+                    .change_var_level("__value", Some(crate::EnvLevel::Block));
+                let cb = CollectionMapReducer::new(self.inner.clone(), context.clone());
+                let ret_item = cb.result.clone();
+                multi_map
+                    .traverse(Arc::new(
+                        Box::new(cb) as Box<dyn MultiMapCollectionTraverseCallBack>
+                    ))
+                    .await?;
+                let result = ret_item
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or(CommandResult::success());
+                result
             }
             _ => {
                 let msg = format!(
@@ -427,27 +459,135 @@ impl CommandExecutor for MapReduceCommand {
                 error!("{}", msg);
                 return Err(msg);
             }
+        };
+
+        if ret.is_control() {
+            info!("Map-reduce command returned control flow: {:?}", ret);
+            return Ok(ret);
         }
 
         // Execute reduce command if provided
         let ret = if let Some(reduce_cmd) = &self.inner.reduce_cmd {
             BlockExecuter::execute_expression(reduce_cmd, context).await?
         } else {
-            CommandResult::success()
+            ret
         };
 
         Ok(ret)
     }
 }
 
-struct SetCollectionMapReducer {
+struct CollectionMapReducer {
     inner: MapReduceCommandInnerRef,
+    context: Context,
+    result: Arc<Mutex<Option<CommandResult>>>,
+}
+
+impl CollectionMapReducer {
+    pub fn new(inner: MapReduceCommandInnerRef, context: Context) -> Self {
+        Self {
+            inner,
+            context,
+            result: Arc::new(Mutex::new(Some(CommandResult::success()))),
+        }
+    }
 }
 
 #[async_trait::async_trait]
-impl SetCollectionTraverseCallBack for SetCollectionMapReducer {
-     async fn call(&self, key: &str) -> Result<bool, String> {
-        todo!("Implement set traversal logic for map-reduce command");
-        //self.inner.on_set_traverse(key, context).await
-     }
+impl SetCollectionTraverseCallBack for CollectionMapReducer {
+    async fn call(&self, key: &str) -> Result<bool, String> {
+        self.context
+            .env()
+            .set(
+                "__key",
+                CollectionValue::String(key.to_string()),
+                Some(EnvLevel::Block),
+            )
+            .await?;
+
+        let ret = BlockExecuter::execute_expression(&self.inner.map_cmd, &self.context).await?;
+        let is_continue = if ret.is_control() {
+            info!(
+                "Map command returned control flow, will stop traversal for key '{}', {:?}",
+                key, ret
+            );
+            false
+        } else {
+            debug!("Map command return for key '{}', {:?}", key, ret);
+            true
+        };
+
+        self.result.lock().unwrap().replace(ret);
+        Ok(is_continue)
+    }
+}
+
+#[async_trait::async_trait]
+impl MapCollectionTraverseCallBack for CollectionMapReducer {
+    async fn call(&self, key: &str, value: &CollectionValue) -> Result<bool, String> {
+        self.context
+            .env()
+            .set(
+                "__key",
+                CollectionValue::String(key.to_string()),
+                Some(EnvLevel::Block),
+            )
+            .await?;
+        self.context
+            .env()
+            .set("__value", value.clone(), Some(EnvLevel::Block))
+            .await?;
+
+        let ret = BlockExecuter::execute_expression(&self.inner.map_cmd, &self.context).await?;
+        let is_continue = if ret.is_control() {
+            info!(
+                "Map command returned control flow, will stop traversal for key '{}': '{}', {:?}",
+                key, value, ret
+            );
+            false
+        } else {
+            debug!("Map command return for key '{}': '{}'", key, value);
+            true
+        };
+
+        self.result.lock().unwrap().replace(ret);
+        Ok(is_continue)
+    }
+}
+
+#[async_trait::async_trait]
+impl MultiMapCollectionTraverseCallBack for CollectionMapReducer {
+    async fn call(&self, key: &str, value: &str) -> Result<bool, String> {
+        self.context
+            .env()
+            .set(
+                "__key",
+                CollectionValue::String(key.to_string()),
+                Some(EnvLevel::Block),
+            )
+            .await?;
+        self.context
+            .env()
+            .set(
+                "__value",
+                CollectionValue::String(value.to_string()),
+                Some(EnvLevel::Block),
+            )
+            .await?;
+
+        let ret = BlockExecuter::execute_expression(&self.inner.map_cmd, &self.context).await?;
+        let is_continue = if ret.is_control() {
+            info!(
+                "Map command returned control flow, will stop traversal for key '{}': '{}', {:?}",
+                key, value, ret
+            );
+            false
+        } else {
+            debug!("Map command return for key '{}': '{}'", key, value);
+            true
+        };
+
+        self.result.lock().unwrap().replace(ret);
+        Ok(is_continue)
+    }
 }

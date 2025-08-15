@@ -40,8 +40,9 @@ impl GotoCounter {
 pub type GotoCounterRef = Arc<GotoCounter>;
 
 // The context in which the block are executed
+#[derive(Clone)]
 pub struct Context {
-    current_chain: RwLock<Option<ProcessChainRef>>, // The chain that this context is executing
+    current_chain: Arc<RwLock<Option<ProcessChainRef>>>, // The chain that this context is executing
     env: EnvManager,
     goto_counter: GotoCounterRef, // Counter for goto command executions
     pipe: CommandPipe,            // Pipe for command execution
@@ -53,7 +54,7 @@ impl Context {
         let env_manager = EnvManager::new(global_env, chain_env);
 
         Self {
-            current_chain: RwLock::new(None),
+            current_chain: Arc::new(RwLock::new(None)),
             env: env_manager,
             goto_counter,
             pipe,
@@ -106,7 +107,7 @@ impl Context {
         let env = EnvManager::new(self.env.get_global().clone(), self.env.get_chain().clone());
         let current_chain = self.current_chain.read().unwrap().clone();
         Self {
-            current_chain: RwLock::new(current_chain), // Use the current chain for the block context
+            current_chain: Arc::new(RwLock::new(current_chain)), // Use the current chain for the block context
             env,
             goto_counter: self.goto_counter.clone(), // Use the same goto counter for the block context
             pipe: self.pipe.clone(),
