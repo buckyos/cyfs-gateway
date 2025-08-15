@@ -219,11 +219,19 @@ impl AsyncJavaScriptCommandExecutor {
             info!("AsyncJavaScriptCommandExecutor stopped");
         });
 
-        tokio::task::spawn_blocking(move || {
-            thread
-                .join()
-                .expect("Failed to join async command executor thread");
-        });
+        // Only wait on release, not on debug version
+        #[cfg(not(debug_assertions))]
+        {
+            tokio::task::spawn_blocking(move || match thread.join() {
+                Ok(_) => info!("AsyncJavaScriptCommandExecutor thread exited successfully"),
+                Err(e) => error!("AsyncJavaScriptCommandExecutor thread panicked: {:?}", e),
+            });
+        }
+        #[cfg(debug_assertions)]
+        {
+            // Ingore the thread handle in debug mode
+            info!("AsyncJavaScriptCommandExecutor thread started, but not waiting for it in debug mode {}", thread.thread().name().unwrap_or("unknown"));
+        }
     }
 
     pub fn stop(&self) {
@@ -249,7 +257,12 @@ impl AsyncJavaScriptCommandExecutor {
         }
     }
 
-    fn on_load(runtime_handle: RuntimeHandleWrapper, name: String, src: String, responder: oneshot::Sender<Result<(), String>>) {
+    fn on_load(
+        runtime_handle: RuntimeHandleWrapper,
+        name: String,
+        src: String,
+        responder: oneshot::Sender<Result<(), String>>,
+    ) {
         let contains = COMMANDS.with(|cmds| cmds.borrow().contains_key(&name));
         if contains {
             let msg = format!("Command {} already loaded", name);
