@@ -427,7 +427,7 @@ mod tests {
             collection.insert(&format!("value{}", i)).await.unwrap();
         }
 
-        collection.flush().unwrap();
+        collection.flush().await.unwrap();
 
         // Test loading from file
         let loaded_collection = JsonSetCollection::new(file_path).unwrap();
@@ -478,7 +478,7 @@ mod tests {
                 .unwrap();
         }
 
-        collection.flush().unwrap();
+        collection.flush().await.unwrap();
 
         // Test loading from file
         let loaded_collection = JsonMapCollection::new(file_path).unwrap();
@@ -540,7 +540,7 @@ mod tests {
                 .unwrap();
         }
 
-        collection.flush().unwrap();
+        collection.flush().await.unwrap();
 
         // Test loading from file
         let loaded_collection = JsonMultiMapCollection::new(file_path).unwrap();

@@ -1,6 +1,6 @@
 use super::cmd::*;
 use crate::block::{BlockExecuter, CommandArgs, Expression};
-use crate::chain::{Context, EnvLevel};
+use crate::chain::{Context, EnvLevel, ParserContext};
 use crate::collection::{
     CollectionValue, MapCollectionTraverseCallBack, MultiMapCollectionTraverseCallBack,
     SetCollectionTraverseCallBack,
@@ -95,7 +95,7 @@ Examples:
     map my_coll $($sum = append ${key} sum') reduce $(echo ${sum})
 "#,
             );
-            
+
         Self { cmd }
     }
 }
@@ -109,6 +109,11 @@ impl CommandParser for MapReduceCommandParser {
         command_help(help_type, &self.cmd)
     }
 
+    fn need_translate_expression(&self) -> bool {
+        false
+    }
+    
+    /*
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let matches = self
             .cmd
@@ -153,15 +158,16 @@ impl CommandParser for MapReduceCommandParser {
 
         Ok(())
     }
+    */
 
-    fn parse_origin(
+    fn parse_without_translate(
         &self,
-        args: Vec<crate::CollectionValue>,
-        origin_args: &CommandArgs,
+        _context: &ParserContext,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
         let str_args = args
             .iter()
-            .map(|value| value.treat_as_str())
+            .map(|value| value.as_str())
             .collect::<Vec<&str>>();
 
         let matches = self
@@ -243,7 +249,7 @@ impl CommandParser for MapReduceCommandParser {
         };
 
         // Get origin args from indexes
-        let coll_var = origin_args.get(indexes.0).ok_or_else(|| {
+        let coll_var = args.get(indexes.0).ok_or_else(|| {
             let msg = format!("Collection name not found at index {}", indexes.0);
             error!("{}", msg);
             msg
@@ -262,7 +268,7 @@ impl CommandParser for MapReduceCommandParser {
             .to_string();
 
         let begin_cmd = if let Some(begin_index) = indexes.1 {
-            let begin_cmd = origin_args.get(begin_index).ok_or_else(|| {
+            let begin_cmd = args.get(begin_index).ok_or_else(|| {
                 let msg = format!("Begin command not found at index {}", begin_index);
                 error!("{}", msg);
                 msg
@@ -282,7 +288,7 @@ impl CommandParser for MapReduceCommandParser {
             None
         };
 
-        let map_cmd = origin_args.get(indexes.2).ok_or_else(|| {
+        let map_cmd = args.get(indexes.2).ok_or_else(|| {
             let msg = format!("Map command not found at index {}", indexes.2);
             error!("{}", msg);
             msg
@@ -298,7 +304,7 @@ impl CommandParser for MapReduceCommandParser {
         let map_cmd = map_cmd.as_command_substitution().unwrap().clone();
 
         let reduce_cmd = if let Some(reduce_cmd_index) = indexes.3 {
-            let reduce_cmd = origin_args.get(reduce_cmd_index).ok_or_else(|| {
+            let reduce_cmd = args.get(reduce_cmd_index).ok_or_else(|| {
                 let msg = format!("Reduce command not found at index {}", reduce_cmd_index);
                 error!("{}", msg);
                 msg

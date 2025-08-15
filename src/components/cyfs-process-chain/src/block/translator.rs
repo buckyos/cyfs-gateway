@@ -55,6 +55,20 @@ impl BlockCommandTranslator {
 
         let parser = parser.unwrap();
 
+        if !parser.need_translate_expression() {
+            // If the parser does not need to translate expressions, we can directly parse the command without check and translation
+            match parser.parse_without_translate(&self.context, &cmd.command.args) {
+                Ok(executor) => {
+                    cmd.executor = Some(executor);
+                }
+                Err(e) => {
+                    let msg = format!("Failed to parse command: {:?} {}", cmd.command, e);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
+        }
+
         // First check if the command is valid
         if let Err(e) = parser.check_with_context(&self.context, &cmd.command.args) {
             let msg = format!("Invalid command: {:?} {}", cmd.command, e);

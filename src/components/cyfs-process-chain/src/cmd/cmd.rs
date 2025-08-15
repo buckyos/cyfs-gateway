@@ -69,6 +69,21 @@ pub trait CommandParser: Send + Sync {
         format!("Usage: {}", name)
     }
 
+    /// Check if the command needs to translate expressions.
+    /// This is used to determine if the command has expressions that need to be evaluated before parsing.
+    /// Default is true, can be overridden by specific command parsers.
+    fn need_translate_expression(&self) -> bool {
+        true
+    }
+
+    fn parse_without_translate(
+        &self,
+        _context: &ParserContext,
+        _args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        unimplemented!("CommandParser::parse_without_translate should be implemented by the command parser");
+    }
+
     fn check_with_context(
         &self,
         _context: &ParserContext,
@@ -80,7 +95,10 @@ pub trait CommandParser: Send + Sync {
 
     // To check if the command is valid at first parse, such as checking if the params count is correct.
     // This is used to validate the command before load params if needed and executing it.
-    fn check(&self, args: &CommandArgs) -> Result<(), String>;
+    // This should be implemented when need_translate_expression is true.
+    fn check(&self, _args: &CommandArgs) -> Result<(), String> {
+        unimplemented!("CommandParser::check should be implemented by the command parser");
+    }
 
     fn parse_origin_with_context(
         &self,
@@ -271,7 +289,7 @@ impl CommandResult {
     pub fn break_with_value(value: impl Into<String>) -> Self {
         Self::Control(CommandControl::Break(value.into()))
     }
-    
+
     // drop is same as exit drop
     pub fn drop() -> Self {
         Self::exit_chain_with_value(CommandAction::Drop.as_str())
