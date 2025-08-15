@@ -555,3 +555,103 @@ impl CommandExecutor for ExitCommandExecutor {
         Ok(ret)
     }
 }
+
+
+// break command parser: like: break; break value; only use to break the current map-reduce command
+pub struct BreakCommandParser {
+    cmd: Command,
+}
+
+impl BreakCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("break")
+            .about("Break the current map-reduce command, optionally with a value.")
+            .after_help(
+                r#"
+Usage:
+  break           Break with no value.
+  break <value>   Break with the specified string value.
+
+Behavior:
+  - Ends execution of the current map-reduce command immediately.
+  - Only used to break the current map-reduce command.
+  - The return value (if any) is passed to the parent or caller.
+
+Examples:
+  break;
+  break "map failed"
+"#,
+            )
+            .arg(
+                Arg::new("value")
+                    .help("Optional break value")
+                    .required(false)
+                    .num_args(0..=1),
+            );
+
+        Self { cmd }
+    }   
+
+}
+
+impl CommandParser for BreakCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Control
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        let arg_list = args.as_str_list();
+        self.cmd
+            .clone()
+            .try_get_matches_from(&arg_list)
+            .map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    fn parse(
+        &self,
+        args: Vec<String>,
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
+            let msg = format!("Invalid break command: {:?}, {}", args, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        // Get the optional break value
+        let value = matches.get_one::<String>("value").cloned();
+
+        let cmd = BreakCommandExecutor::new(value);
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+// Break command executer
+pub struct BreakCommandExecutor {
+    value: Option<String>,
+}
+
+impl BreakCommandExecutor {
+    pub fn new(value: Option<String>) -> Self {
+        Self { value }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for BreakCommandExecutor {
+    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
+        let ret = if let Some(value) = &self.value {
+            CommandResult::break_with_value(value)
+        } else {
+            CommandResult::_break()
+        };
+
+        Ok(ret)
+    }
+}

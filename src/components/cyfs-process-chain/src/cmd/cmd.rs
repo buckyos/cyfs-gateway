@@ -141,6 +141,7 @@ pub enum CommandControlLevel {
 
 #[derive(Debug, Clone)]
 pub enum CommandControl {
+    Break(String),                       // Break the map-reduce loop with a specific value
     Return(String),                      // Return to the block caller with ok
     Error(String),                       // Return to the block caller with error
     Exit(String),                        // Exit process chain list with value(string)
@@ -183,7 +184,20 @@ impl CommandControl {
     pub fn is_exit(&self) -> bool {
         matches!(self, CommandControl::Exit(_))
     }
+
+    pub fn is_break(&self) -> bool {
+        matches!(self, CommandControl::Break(_))
+    }
+
+    pub fn as_break(&self) -> Option<&str> {
+        if let CommandControl::Break(value) = self {
+            Some(value)
+        } else {
+            None
+        }
+    }
 }
+
 #[derive(Debug, Clone)]
 pub enum CommandResult {
     Success(String),
@@ -250,6 +264,14 @@ impl CommandResult {
         )))
     }
 
+    pub fn _break() -> Self {
+        Self::Control(CommandControl::Break("".to_string()))
+    }
+
+    pub fn break_with_value(value: impl Into<String>) -> Self {
+        Self::Control(CommandControl::Break(value.into()))
+    }
+    
     // drop is same as exit drop
     pub fn drop() -> Self {
         Self::exit_chain_with_value(CommandAction::Drop.as_str())

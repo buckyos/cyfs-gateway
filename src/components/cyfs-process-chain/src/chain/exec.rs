@@ -85,6 +85,11 @@ impl ProcessChainExecutor {
                             break;
                         }
                     }
+                    CommandControl::Break(_value) => {
+                        let msg = format!("break action only valid in map-reduce loop, found in block '{}'", block.id);
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
                 }
             } else {
                 // If the block execution result is not a control action, we continue to the next block

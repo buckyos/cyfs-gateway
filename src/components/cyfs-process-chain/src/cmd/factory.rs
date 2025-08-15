@@ -4,6 +4,7 @@ use super::coll::*;
 use super::control::*;
 use super::debug::EchoCommandParser;
 use super::external::*;
+use super::map::*;
 use super::match_::*;
 use super::string::*;
 use super::var::*;
@@ -62,6 +63,7 @@ impl CommandParserFactory {
         self.register("return", Arc::new(Box::new(ReturnCommandParser::new())));
         self.register("error", Arc::new(Box::new(ErrorCommandParser::new())));
         self.register("exit", Arc::new(Box::new(ExitCommandParser::new())));
+        self.register("break", Arc::new(Box::new(BreakCommandParser::new())));
 
         // action command
         let drop_action_parser = ActionCommandParser::new(CommandAction::Drop);
@@ -143,6 +145,9 @@ impl CommandParserFactory {
 
         // debug
         self.register("echo", Arc::new(Box::new(EchoCommandParser::new())));
+
+        // map-reduce command
+        self.register("map", Arc::new(Box::new(MapReduceCommandParser::new())));
 
         // external commands
         self.register("call", Arc::new(Box::new(ExternalCommandParser::new())));

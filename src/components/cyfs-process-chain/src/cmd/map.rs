@@ -12,13 +12,12 @@ use std::sync::{Arc, Mutex};
 // map ${collection} $(sub command)
 // map --begin $(sub command) --map $(sub command) --reduce ${sub command}
 pub struct MapReduceCommandParser {
-    action: CommandAction,
     cmd: Command,
 }
 
 impl MapReduceCommandParser {
-    pub fn new(action: CommandAction) -> Self {
-        let cmd = Command::new(action.as_str().to_owned())
+    pub fn new() -> Self {
+        let cmd = Command::new("map")
             .about("Perform a map-reduce operation on a collection.")
             // Long mode args
             .arg(
@@ -96,7 +95,8 @@ Examples:
     map my_coll $($sum = append ${key} sum') reduce $(echo ${sum})
 "#,
             );
-        Self { action, cmd }
+            
+        Self { cmd }
     }
 }
 
@@ -462,8 +462,13 @@ impl CommandExecutor for MapReduceCommand {
         };
 
         if ret.is_control() {
-            info!("Map-reduce command returned control flow: {:?}", ret);
-            return Ok(ret);
+            let ctl = ret.as_control().unwrap();
+            if !ctl.is_break() {
+                info!("Map-reduce command returned control flow but not break: {:?}", ctl);
+                return Ok(ret);
+            }
+            
+            // If it's a break, we just continue without error
         }
 
         // Execute reduce command if provided
