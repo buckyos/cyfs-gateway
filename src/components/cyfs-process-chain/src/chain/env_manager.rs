@@ -1,4 +1,5 @@
-use super::env::{Env, EnvExternalRef, EnvLevel, EnvRef};
+use super::env::{Env, EnvLevel, EnvRef};
+use super::external::EnvExternalRef;
 use crate::collection::*;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -145,13 +146,34 @@ impl EnvManager {
         Arc::new(Env::new(EnvLevel::Chain, Some(self.global.clone())))
     }
 
-    pub fn set_env_external(
+    pub async fn add_env_external(
         &self,
         level: EnvLevel,
-        external: Option<EnvExternalRef>,
-    ) -> Option<EnvExternalRef> {
+        id: &str,
+        external: EnvExternalRef,
+    ) -> Result<(), String> {
         let env = self.get_env(level);
-        env.set_external(external)
+        env.env_external_manager()
+            .add_external(id, external)
+            .await
+    }
+
+    pub async fn remove_env_external(
+        &self,
+        level: EnvLevel,
+        id: &str,
+    ) -> Result<Option<EnvExternalRef>, String> {
+        let env = self.get_env(level);
+        env.env_external_manager().remove_external(id).await
+    }
+
+    pub async fn get_env_external(
+        &self,
+        level: EnvLevel,
+        id: &str,
+    ) -> Result<Option<EnvExternalRef>, String> {
+        let env = self.get_env(level);
+        env.env_external_manager().get_external(id).await
     }
 
     fn get_env(&self, level: EnvLevel) -> &EnvRef {

@@ -1,5 +1,6 @@
+use super::external::EnvExternalManager;
 use crate::collection::*;
-use std::{str::FromStr, sync::{Arc, RwLock}};
+use std::{str::FromStr, sync::Arc};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum EnvLevel {
@@ -37,46 +38,20 @@ impl FromStr for EnvLevel {
     }
 }
 
-#[async_trait::async_trait]
-pub trait EnvExternal: Send + Sync {
-    /// Check if external env contains the given key.
-    /// This is used to check if the variable exists in the environment.
-    async fn contains(&self, key: &str) -> Result<bool, String>;
-
-    /// Get the value of the given key from the environment.
-    /// If the key does not exist, return None.
-    async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String>;
-
-    /// Create a new variable in the environment.
-    /// If the key already exists, it will be replaced.
-    async fn set(
-        &self,
-        key: &str,
-        value: CollectionValue,
-    ) -> Result<Option<CollectionValue>, String>;
-
-    /// Remove the variable with the given key from the environment.
-    /// If the key does not exist, return None.
-    async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String>;
-}
-
 pub type EnvRef = Arc<Env>;
 
 pub struct Env {
     level: EnvLevel,
     values: MapCollectionRef,
     parent: Option<EnvRef>,
-    external: RwLock<Option<EnvExternalRef>>,
+    external: EnvExternalManager,
 }
-
-pub type EnvExternalRef = Arc<Box<dyn EnvExternal>>;
 
 impl Env {
     pub fn new(level: EnvLevel, parent: Option<EnvRef>) -> Self {
         let values = MemoryMapCollection::new();
-        let values: MapCollectionRef = Arc::new(Box::new(values) as Box<dyn MapCollection>);
-        let external: RwLock<Option<EnvExternalRef>> = RwLock::new(None);
-
+        let values = Arc::new(Box::new(values) as Box<dyn MapCollection>);
+        let external = EnvExternalManager::new();
         Self {
             level,
             values,
@@ -85,17 +60,8 @@ impl Env {
         }
     }
 
-    pub fn set_external(&self, external: Option<EnvExternalRef>) -> Option<EnvExternalRef> {
-        let mut lock = self.external.write().unwrap();
-        let old_external = lock.take();
-        *lock = external;
-
-        old_external
-    }
-
-    pub fn external(&self) -> Option<EnvExternalRef> {
-        let lock = self.external.read().unwrap();
-        lock.clone()
+    pub fn env_external_manager(&self) -> &EnvExternalManager {
+        &self.external
     }
 
     pub fn level(&self) -> EnvLevel {
@@ -104,6 +70,26 @@ impl Env {
 
     pub fn parent(&self) -> Option<&EnvRef> {
         self.parent.as_ref()
+    }
+
+    /// Check if the environment contains the given key.
+    /// This will first check the local environment, then the external environment if set, and will not check parent environment.
+    /// If the key does not exist in the local environment or external environment, it will return false.
+    pub async fn contains(&self, key: &str) -> Result<bool, String> {
+        // First check local values
+        if self.values.contains_key(key).await? {
+            return Ok(true);
+        }
+
+        // If external environment is set, check it
+        if self.external.contains(key).await? {
+            return Ok(true);
+        }
+
+        // Should not check parent environment here, as this is a top-level check
+        // If the key does not exist in the local environment or external environment, return false
+
+        Ok(false)
     }
 
     /// Register the environment to the given variable visitor manager.
@@ -129,10 +115,15 @@ impl Env {
     ) -> Result<Option<CollectionValue>, String> {
         if self.values.contains_key(key).await? {
             return self.values.insert(key, value).await;
-        } else if let Some(external) = self.external() {
-            if external.contains(key).await? {
-                // If the key exists in the external environment, set it there
-                return external.set(key, value).await;
+        } else {
+            // Try to set in external environment if it exists
+            let (handled, old_value) = self.external.set(key, &value).await?;
+            if handled {
+                info!(
+                    "Set variable '{}' in external environment with value: {}",
+                    key, value
+                );
+                return Ok(old_value);
             }
         }
 
@@ -148,10 +139,9 @@ impl Env {
         }
 
         // If external environment is set, check it
-        if let Some(external) = self.external() {
-            if let Some(value) = external.get(key).await? {
-                return Ok(Some(value));
-            }
+        let (handled, value) = self.external.get(key).await?;
+        if handled {
+            return Ok(value);
         }
 
         // Then check parent environment if exists
@@ -169,11 +159,10 @@ impl Env {
         }
 
         // If the key does not exist in the local environment, check external environment
-        if let Some(external) = self.external() {
-            if let Some(value) = external.remove(key).await? {
-                info!("Removed variable '{}' from external environment with value: {}", key, value);
-                return Ok(Some(value));
-            }
+        let (handled, old_value) = self.external.remove(key).await?;
+        if handled {
+            info!("Removed variable '{}' from external environment", key);
+            return Ok(old_value);
         }
 
         Ok(None)
