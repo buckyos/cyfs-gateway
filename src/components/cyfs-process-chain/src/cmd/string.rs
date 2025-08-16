@@ -428,7 +428,7 @@ Arguments:
   <replacement> The string to replace it with
 
 Options:
-  --ignore-case   Perform case-insensitive comparison
+  --ignore-case,-i   Perform case-insensitive comparison
 
 Behavior:
   - Replaces all (non-overlapping) occurrences of <match> with <replacement>.
@@ -1024,6 +1024,9 @@ Arguments:
   <string>     The full input string.
   <prefix>     The prefix to check.
 
+Options:
+  --ignore-case,-i   Perform case-insensitive comparison
+
 Behavior:
   - Returns true if <string> begins with <prefix>.
   - Comparison is case-sensitive by default.
@@ -1034,6 +1037,13 @@ Examples:
   starts-with $REQ.url "/api/"          → true
   starts-with "example.com" "test"      → false
 "#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .short('i')
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-insensitive comparison"),
             )
             .arg(
                 Arg::new("string")
@@ -1075,6 +1085,8 @@ impl CommandParser for StringStartsWithCommandParser {
                 msg
             })?;
 
+        let ignore_case = matches.get_flag("ignore_case");
+
         let string_index = matches.index_of("string").ok_or_else(|| {
             let msg = format!("String value is required, but got: {:?}", args);
             error!("{}", msg);
@@ -1089,20 +1101,25 @@ impl CommandParser for StringStartsWithCommandParser {
         })?;
         let prefix = args[prefix_index].clone();
 
-        let cmd = StringStartsWithCommand::new(string_value, prefix);
+        let cmd = StringStartsWithCommand::new(string_value, prefix, ignore_case);
 
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 pub struct StringStartsWithCommand {
+    ignore_case: bool,
     string: CommandArg,
     prefix: CommandArg,
 }
 
 impl StringStartsWithCommand {
-    pub fn new(string: CommandArg, prefix: CommandArg) -> Self {
-        Self { string, prefix }
+    pub fn new(string: CommandArg, prefix: CommandArg, ignore_case: bool) -> Self {
+        Self {
+            string,
+            prefix,
+            ignore_case,
+        }
     }
 }
 
@@ -1113,7 +1130,14 @@ impl CommandExecutor for StringStartsWithCommand {
         let string_value = self.string.evaluate_string(context).await?;
         let prefix = self.prefix.evaluate_string(context).await?;
 
-        let starts_with = string_value.starts_with(&prefix);
+        let starts_with = if self.ignore_case {
+            string_value
+                .to_lowercase()
+                .starts_with(&prefix.to_lowercase())
+        } else {
+            string_value.starts_with(&prefix)
+        };
+
         info!(
             "String '{}' starts with '{}': {}",
             string_value, prefix, starts_with
@@ -1141,7 +1165,11 @@ impl StringEndsWithCommandParser {
                 r#"
 Arguments:
   <string>   The full input string.
-<suffix>     The suffix to check.
+  <suffix>   The suffix to check.
+
+Options:
+  --ignore-case,-i   Perform case-insensitive comparison
+
 Behavior:
 
     - Returns true if <string> ends with <suffix>.
@@ -1153,6 +1181,13 @@ Examples:
   ends-with $REQ.url ".html"            → false
   ends-with "example.com" ".com"        → true
 "#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .short('i')
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-insensitive comparison"),
             )
             .arg(
                 Arg::new("string")
@@ -1194,6 +1229,8 @@ impl CommandParser for StringEndsWithCommandParser {
                 msg
             })?;
 
+        let ignore_case = matches.get_flag("ignore_case");
+
         let string_index = matches.index_of("string").ok_or_else(|| {
             let msg = format!("String value is required, but got: {:?}", args);
             error!("{}", msg);
@@ -1208,20 +1245,25 @@ impl CommandParser for StringEndsWithCommandParser {
         })?;
         let suffix = args[suffix_index].clone();
 
-        let cmd = StringEndsWithCommand::new(string_value, suffix);
+        let cmd = StringEndsWithCommand::new(string_value, suffix, ignore_case);
 
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 pub struct StringEndsWithCommand {
+    ignore_case: bool,
     string: CommandArg,
     suffix: CommandArg,
 }
 
 impl StringEndsWithCommand {
-    pub fn new(string: CommandArg, suffix: CommandArg) -> Self {
-        Self { string, suffix }
+    pub fn new(string: CommandArg, suffix: CommandArg, ignore_case: bool) -> Self {
+        Self {
+            string,
+            suffix,
+            ignore_case,
+        }
     }
 }
 
@@ -1232,7 +1274,14 @@ impl CommandExecutor for StringEndsWithCommand {
         let string_value = self.string.evaluate_string(context).await?;
         let suffix = self.suffix.evaluate_string(context).await?;
 
-        let ends_with = string_value.ends_with(&suffix);
+        let ends_with = if self.ignore_case {
+            string_value
+                .to_lowercase()
+                .ends_with(&suffix.to_lowercase())
+        } else {
+            string_value.ends_with(&suffix)
+        };
+
         info!(
             "String '{}' ends with '{}': {}",
             string_value, suffix, ends_with
