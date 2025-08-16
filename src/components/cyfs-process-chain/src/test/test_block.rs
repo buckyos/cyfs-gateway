@@ -128,6 +128,8 @@ const PROCESS_CHAIN: &str = r#"
             map-add test1 key1 value1;
             map-add test1 key2 value2;
 
+            map $test1 $(echo ${__key} ${__value});
+
             !match-include test1 key1 && exit reject;
             !match-include test1 key1 value1 && exit reject;
             match-include test1 key1 value2 && exit reject;
@@ -208,7 +210,7 @@ async fn test_process_chain() -> Result<(), String> {
         chain.translate(&parser_context).await.unwrap();
         manager.add_chain(chain).unwrap();
     }
-
+    
     // Load host db and ip db from file
     let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -391,7 +393,7 @@ async fn test_hook_point() -> Result<(), String> {
 async fn test_process_chain_main() {
     use simplelog::*;
     TermLogger::init(
-        LevelFilter::Info,
+        LevelFilter::Debug,
         Config::default(),
         TerminalMode::Mixed,
         ColorChoice::Auto,
@@ -400,6 +402,10 @@ async fn test_process_chain_main() {
         // If TermLogger is not available (e.g., in some environments), fall back to SimpleLogger
         let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
     });
+
+    //std::panic::set_hook(Box::new(|info| {
+    //    eprintln!("Panic occurred: {:?}", info);
+    //}));
 
     EXTERNAL_COMMAND_FACTORY
         .register_js_external_command("check_host", JS_COMMAND.to_owned())
