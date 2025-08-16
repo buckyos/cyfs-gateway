@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use super::coll::CollectionValue;
+use std::any::Any;
 
 #[async_trait::async_trait]
-pub trait VariableVisitor: Send + Sync {
+pub trait VariableVisitor: Any + Send + Sync {
     /// Visits variable with the given id.
     async fn get(&self, id: &str) -> Result<CollectionValue, String>;
 

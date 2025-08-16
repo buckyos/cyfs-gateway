@@ -1,6 +1,6 @@
 use super::cmd::*;
 use crate::block::{BlockExecuter, CommandArgs, Expression};
-use crate::chain::{Context, EnvLevel, ParserContext};
+use crate::chain::{Context, EnvExternal, EnvExternalRef, EnvLevel, ParserContext};
 use crate::collection::{
     CollectionValue, MapCollectionTraverseCallBack, MultiMapCollectionTraverseCallBack,
     SetCollectionTraverseCallBack,
@@ -106,7 +106,7 @@ impl CommandParser for MapReduceCommandParser {
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
-    
+
     /*
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
         let matches = self
@@ -171,7 +171,7 @@ impl CommandParser for MapReduceCommandParser {
                 error!("{}", msg);
                 msg
             })?;
-  
+
         // Determine if the command is in long mode or positional mode
         let is_long_mode = matches.contains_id("begin") || matches.contains_id("map");
         let indexes = if is_long_mode {
@@ -334,6 +334,11 @@ struct MapReduceCommandInner {
 
 type MapReduceCommandInnerRef = Arc<MapReduceCommandInner>;
 
+const MAP_REDUCE_ENV_ID: &str = "__map_reduce__";
+const MAP_REDUCE_ENV_KEY: &str = "__key";
+const MAP_REDUCE_ENV_VALUE: &str = "__value";
+const MAP_REDUCE_ENV_RESULT: &str = "__result";
+
 #[derive(Debug)]
 pub struct MapReduceCommand {
     inner: MapReduceCommandInnerRef,
@@ -354,6 +359,124 @@ impl MapReduceCommand {
                 reduce_cmd,
             }),
         }
+    }
+
+
+    async fn exec_impl(
+        &self,
+        context: &Context,
+        coll: CollectionValue,
+        map_reduce_env: &MapReduceVariableEnv,
+    ) -> Result<CommandResult, String> {
+        // Execute begin command if provided
+        if let Some(begin_cmd) = &self.inner.begin_cmd {
+            let ret = BlockExecuter::execute_expression(begin_cmd, context).await?;
+            if !ret.is_success() {
+                let msg = format!("Begin command failed with result: {:?}", ret);
+                info!("{}", msg);
+                return Ok(ret);
+            }
+        }
+
+        let ret = match coll {
+            CollectionValue::Set(set) => {
+                context
+                    .env()
+                    .change_var_level("__key", Some(crate::EnvLevel::Block));
+
+                let cb = CollectionMapReducer::new(self.inner.clone(), context.clone(), map_reduce_env.clone());
+                let ret_item = cb.result.clone();
+                set.traverse(Arc::new(
+                    Box::new(cb) as Box<dyn SetCollectionTraverseCallBack>
+                ))
+                .await?;
+                let result = ret_item
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or(CommandResult::success());
+                result
+            }
+            CollectionValue::Map(map) => {
+                context
+                    .env()
+                    .change_var_level("__key", Some(crate::EnvLevel::Block));
+                context
+                    .env()
+                    .change_var_level("__value", Some(crate::EnvLevel::Block));
+                let cb = CollectionMapReducer::new(self.inner.clone(), context.clone(), map_reduce_env.clone());
+                let ret_item = cb.result.clone();
+                map.traverse(Arc::new(
+                    Box::new(cb) as Box<dyn MapCollectionTraverseCallBack>
+                ))
+                .await?;
+                let result = ret_item
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or(CommandResult::success());
+                result
+            }
+            CollectionValue::MultiMap(multi_map) => {
+                context
+                    .env()
+                    .change_var_level("__key", Some(crate::EnvLevel::Block));
+                context
+                    .env()
+                    .change_var_level("__value", Some(crate::EnvLevel::Block));
+                let cb = CollectionMapReducer::new(self.inner.clone(), context.clone(), map_reduce_env.clone());
+                let ret_item = cb.result.clone();
+                multi_map
+                    .traverse(Arc::new(
+                        Box::new(cb) as Box<dyn MultiMapCollectionTraverseCallBack>
+                    ))
+                    .await?;
+                let result = ret_item
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or(CommandResult::success());
+                result
+            }
+            _ => {
+                let msg = format!(
+                    "Unsupported collection type for map-reduce: {}",
+                    coll.get_type()
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        if ret.is_control() {
+            let ctl = ret.as_control().unwrap();
+            if !ctl.is_break() {
+                info!(
+                    "Map-reduce command returned control flow but not break: {:?}",
+                    ctl
+                );
+                return Ok(ret);
+            }
+
+            // If it's a break, we just continue without error
+        }
+
+    
+        // Execute reduce command if provided
+        let ret = if let Some(reduce_cmd) = &self.inner.reduce_cmd {
+            // Update reduce command environment with the result
+            let ret_value = ret.into_substitution_value().unwrap_or_default();
+            map_reduce_env
+                .current_env()
+                .set(MAP_REDUCE_ENV_RESULT, CollectionValue::String(ret_value))
+                .await?;
+
+            BlockExecuter::execute_expression(reduce_cmd, context).await?
+        } else {
+            ret
+        };
+
+        Ok(ret)
     }
 }
 
@@ -384,117 +507,83 @@ impl CommandExecutor for MapReduceCommand {
             return Err(msg);
         }
 
-        // Execute begin command if provided
-        if let Some(begin_cmd) = &self.inner.begin_cmd {
-            let ret = BlockExecuter::execute_expression(begin_cmd, context).await?;
-            if !ret.is_success() {
-                let msg = format!("Begin command failed with result: {:?}", ret);
-                info!("{}", msg);
-                return Ok(ret);
+        // Prepare the environment for map-reduce
+        let mut need_remove = false;
+        let map_reduce_env = match context
+            .env()
+            .get_env_external(EnvLevel::Block, MAP_REDUCE_ENV_ID)
+            .await?
+        {
+            Some(env) => {
+                if let Some(map_reduce_env) = MapReduceVariableEnv::try_from_external(&env) {
+                    map_reduce_env.clone()
+                } else {
+                    let msg = format!("Failed to convert external env to MapReduceVariableEnv");
+                    error!("{}", msg);
+                    return Err(msg);
+                }
             }
-        }
+            None => {
+                // Create a new MapReduceVariableEnv
+                let map_reduce_env = MapReduceVariableEnv::new();
+                let external_env =
+                    Arc::new(Box::new(map_reduce_env.clone()) as Box<dyn EnvExternal>);
+                context
+                    .env()
+                    .add_env_external(EnvLevel::Block, MAP_REDUCE_ENV_ID, external_env)
+                    .await
+                    .map_err(|e| {
+                        let msg = format!("Failed to add MapReduceVariableEnv to block env: {}", e);
+                        error!("{}", msg);
+                        msg
+                    })?;
 
-        let ret = match coll {
-            CollectionValue::Set(set) => {
-                context
-                    .env()
-                    .change_var_level("__key", Some(crate::EnvLevel::Block));
-                let cb = CollectionMapReducer::new(self.inner.clone(), context.clone());
-                let ret_item = cb.result.clone();
-                set.traverse(Arc::new(
-                    Box::new(cb) as Box<dyn SetCollectionTraverseCallBack>
-                ))
-                .await?;
-                let result = ret_item
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .unwrap_or(CommandResult::success());
-                result
-            }
-            CollectionValue::Map(map) => {
-                context
-                    .env()
-                    .change_var_level("__key", Some(crate::EnvLevel::Block));
-                context
-                    .env()
-                    .change_var_level("__value", Some(crate::EnvLevel::Block));
-                let cb = CollectionMapReducer::new(self.inner.clone(), context.clone());
-                let ret_item = cb.result.clone();
-                map.traverse(Arc::new(
-                    Box::new(cb) as Box<dyn MapCollectionTraverseCallBack>
-                ))
-                .await?;
-                let result = ret_item
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .unwrap_or(CommandResult::success());
-                result
-            }
-            CollectionValue::MultiMap(multi_map) => {
-                context
-                    .env()
-                    .change_var_level("__key", Some(crate::EnvLevel::Block));
-                context
-                    .env()
-                    .change_var_level("__value", Some(crate::EnvLevel::Block));
-                let cb = CollectionMapReducer::new(self.inner.clone(), context.clone());
-                let ret_item = cb.result.clone();
-                multi_map
-                    .traverse(Arc::new(
-                        Box::new(cb) as Box<dyn MultiMapCollectionTraverseCallBack>
-                    ))
-                    .await?;
-                let result = ret_item
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .unwrap_or(CommandResult::success());
-                result
-            }
-            _ => {
-                let msg = format!(
-                    "Unsupported collection type for map-reduce: {}",
-                    coll.get_type()
-                );
-                error!("{}", msg);
-                return Err(msg);
+                need_remove = true;
+                map_reduce_env
             }
         };
 
-        if ret.is_control() {
-            let ctl = ret.as_control().unwrap();
-            if !ctl.is_break() {
-                info!("Map-reduce command returned control flow but not break: {:?}", ctl);
-                return Ok(ret);
-            }
-            
-            // If it's a break, we just continue without error
+        // Create a new environment for map-reduce
+        map_reduce_env.new_env();
+
+        let ret = self.exec_impl(context, coll, &map_reduce_env).await;
+
+        // Delete the map-reduce environment after execution
+        map_reduce_env.pop_env();
+
+        if need_remove {
+            context
+                .env()
+                .remove_env_external(EnvLevel::Block, MAP_REDUCE_ENV_ID)
+                .await
+                .map_err(|e| {
+                    let msg = format!("Failed to remove MapReduceVariableEnv from block env: {}", e);
+                    error!("{}", msg);
+                    msg
+                })?;
         }
 
-        // Execute reduce command if provided
-        let ret = if let Some(reduce_cmd) = &self.inner.reduce_cmd {
-            BlockExecuter::execute_expression(reduce_cmd, context).await?
-        } else {
-            ret
-        };
-
-        Ok(ret)
+        ret
     }
 }
 
 struct CollectionMapReducer {
     inner: MapReduceCommandInnerRef,
     context: Context,
+    map_reduce_env: MapReduceVariableEnv,
     result: Arc<Mutex<Option<CommandResult>>>,
 }
 
 impl CollectionMapReducer {
-    pub fn new(inner: MapReduceCommandInnerRef, context: Context) -> Self {
+    pub fn new(
+        inner: MapReduceCommandInnerRef,
+        context: Context,
+        map_reduce_env: MapReduceVariableEnv,
+    ) -> Self {
         Self {
             inner,
             context,
+            map_reduce_env,
             result: Arc::new(Mutex::new(Some(CommandResult::success()))),
         }
     }
@@ -503,13 +592,9 @@ impl CollectionMapReducer {
 #[async_trait::async_trait]
 impl SetCollectionTraverseCallBack for CollectionMapReducer {
     async fn call(&self, key: &str) -> Result<bool, String> {
-        self.context
-            .env()
-            .set(
-                "__key",
-                CollectionValue::String(key.to_string()),
-                Some(EnvLevel::Block),
-            )
+        self.map_reduce_env
+            .current_env()
+            .set(MAP_REDUCE_ENV_KEY, CollectionValue::String(key.to_string()))
             .await?;
 
         let ret = BlockExecuter::execute_expression(&self.inner.map_cmd, &self.context).await?;
@@ -532,17 +617,13 @@ impl SetCollectionTraverseCallBack for CollectionMapReducer {
 #[async_trait::async_trait]
 impl MapCollectionTraverseCallBack for CollectionMapReducer {
     async fn call(&self, key: &str, value: &CollectionValue) -> Result<bool, String> {
-        self.context
-            .env()
-            .set(
-                "__key",
-                CollectionValue::String(key.to_string()),
-                Some(EnvLevel::Block),
-            )
+        // First update the environment with the key and value
+        let current_env = self.map_reduce_env.current_env();
+        current_env
+            .set(MAP_REDUCE_ENV_KEY, CollectionValue::String(key.to_string()))
             .await?;
-        self.context
-            .env()
-            .set("__value", value.clone(), Some(EnvLevel::Block))
+        current_env
+            .set(MAP_REDUCE_ENV_VALUE, value.clone())
             .await?;
 
         let ret = BlockExecuter::execute_expression(&self.inner.map_cmd, &self.context).await?;
@@ -565,21 +646,13 @@ impl MapCollectionTraverseCallBack for CollectionMapReducer {
 #[async_trait::async_trait]
 impl MultiMapCollectionTraverseCallBack for CollectionMapReducer {
     async fn call(&self, key: &str, value: &str) -> Result<bool, String> {
-        self.context
-            .env()
-            .set(
-                "__key",
-                CollectionValue::String(key.to_string()),
-                Some(EnvLevel::Block),
-            )
+        // First update the environment with the key and value
+        let current_env = self.map_reduce_env.current_env();
+        current_env
+            .set(MAP_REDUCE_ENV_KEY, CollectionValue::String(key.to_string()))
             .await?;
-        self.context
-            .env()
-            .set(
-                "__value",
-                CollectionValue::String(value.to_string()),
-                Some(EnvLevel::Block),
-            )
+        current_env
+            .set(MAP_REDUCE_ENV_VALUE, CollectionValue::String(value.to_string()))
             .await?;
 
         let ret = BlockExecuter::execute_expression(&self.inner.map_cmd, &self.context).await?;
@@ -597,4 +670,132 @@ impl MultiMapCollectionTraverseCallBack for CollectionMapReducer {
         self.result.lock().unwrap().replace(ret);
         Ok(is_continue)
     }
+}
+
+use crate::chain::{Env, EnvRef};
+use std::sync::RwLock;
+
+#[derive(Clone)]
+struct MapReduceVariableEnv {
+    stack: Arc<RwLock<Vec<EnvRef>>>,
+}
+
+impl MapReduceVariableEnv {
+    pub fn new() -> Self {
+        Self {
+            stack: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    pub fn new_env(&self) {
+        let env = Env::new(EnvLevel::Block, None);
+        let env = Arc::new(env);
+
+        self.stack.write().unwrap().push(env);
+    }
+
+    pub fn pop_env(&self) {
+        let mut stack = self.stack.write().unwrap();
+        if stack.is_empty() {
+            error!("No environment to pop, stack is empty");
+            return;
+        }
+
+        stack.pop();
+    }
+
+    pub fn current_env(&self) -> EnvRef {
+        let stack = self.stack.read().unwrap();
+        stack.last().unwrap().clone()
+    }
+
+    pub fn try_from_external(external: &EnvExternalRef) -> Option<&Self> {
+        let boxed_external: &Box<dyn EnvExternal> = external.as_ref();
+
+        let any_external: &dyn std::any::Any = boxed_external.as_ref();
+        if let Some(env) = any_external.downcast_ref::<Self>() {
+            Some(env)
+        } else {
+            assert!(
+                false,
+                "Expected MapReduceVariableEnv, found: {:?}",
+                any_external.type_id()
+            );
+            None
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl EnvExternal for MapReduceVariableEnv {
+    async fn contains(&self, key: &str) -> Result<bool, String> {
+        self.current_env().contains(key).await
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<CollectionValue>, String> {
+        let ret = self.current_env().get(id).await?;
+
+        if let Some(value) = &ret {
+            debug!(
+                "MapReduceEnv variable '{}' found with value: {:?}",
+                id, value
+            );
+        } else {
+            debug!("MapReduceEnv variable '{}' not found", id);
+        }
+
+        Ok(ret)
+    }
+
+    async fn set(
+        &self,
+        id: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
+        let ret = self.current_env().set(id, value.clone()).await?;
+
+        match &ret {
+            Some(old_value) => {
+                debug!(
+                    "MapReduceEnv variable '{}' set to new value: {:?}, prev: {:?}",
+                    id, value, old_value
+                );
+            }
+            None => {
+                debug!(
+                    "MapReduceEnv variable '{}' created with value: {:?}",
+                    id, value
+                );
+            }
+        }
+
+        Ok(ret)
+    }
+
+    async fn remove(&self, id: &str) -> Result<Option<CollectionValue>, String> {
+        let ret = self.current_env().remove(id).await?;
+
+        match &ret {
+            Some(old_value) => {
+                debug!(
+                    "MapReduceEnv variable '{}' removed with value: {:?}",
+                    id, old_value
+                );
+            }
+            None => {
+                debug!("MapReduceEnv variable '{}' not found to remove", id);
+            }
+        }
+
+        Ok(ret)
+    }
+}
+
+#[test]
+fn test() {
+    let visitor = MapReduceVariableEnv::new();
+    let visitor = Arc::new(Box::new(visitor) as Box<dyn EnvExternal>);
+
+    let env = MapReduceVariableEnv::try_from_external(&visitor);
+    assert!(env.is_some());
 }

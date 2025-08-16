@@ -128,7 +128,7 @@ const PROCESS_CHAIN: &str = r#"
             map-add test1 key1 value1;
             map-add test1 key2 value2;
 
-            map $test1 $(echo ${__key} ${__value});
+            map $test1 $(echo "=====>" ${__key} ${__value});
 
             !match-include test1 key1 && exit reject;
             !match-include test1 key1 value1 && exit reject;
@@ -210,7 +210,7 @@ async fn test_process_chain() -> Result<(), String> {
         chain.translate(&parser_context).await.unwrap();
         manager.add_chain(chain).unwrap();
     }
-    
+
     // Load host db and ip db from file
     let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
     std::fs::create_dir_all(&data_dir).unwrap();
