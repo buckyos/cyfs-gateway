@@ -89,6 +89,14 @@ impl CommandArg {
         }
     }
 
+    pub fn as_command_substitution_mut(&mut self) -> Option<&mut Box<Expression>> {
+        if let CommandArg::CommandSubstitution(cmd) = self {
+            Some(cmd)
+        } else {
+            None
+        }
+    }
+
     pub async fn evaluate(&self, context: &Context) -> Result<CollectionValue, String> {
         CommandArgEvaluator::evaluate(self, context).await
     }

@@ -44,11 +44,25 @@ impl BlockCommandTranslator {
     }
 
     fn translate_command(&self, cmd: &mut CommandItem) -> Result<(), String> {
+        // debug!("Translating command: {:?}", cmd.command);
         let parser = self.parser.get_parser(&cmd.command.name);
         if parser.is_none() {
             let msg = format!("No parser for command: {}", cmd.command.name);
             error!("{}", msg);
             return Err(msg);
+        }
+
+        // Recursively translate the command arguments
+        for arg in &mut cmd.command.args.iter_mut() {
+            match arg.as_command_substitution_mut() {
+                Some(exp) => {
+                    // If it's a command substitution, we need to translate it as well
+                    self.translate_expression(exp)?;
+                }
+                None => {
+                    continue; // Literal or variable, no translation needed
+                }
+            }
         }
 
         let parser = parser.unwrap();
