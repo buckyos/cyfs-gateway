@@ -1,7 +1,7 @@
 use super::cmd::*;
-use crate::block::{AssignKind, CommandArgs};
-use crate::chain::Context;
+use crate::block::{AssignKind, CommandArg, CommandArgs};
 use crate::chain::EnvLevel;
+use crate::chain::{Context, ParserContext};
 use crate::collection::CollectionValue;
 use clap::{Arg, ArgAction, Command};
 use std::sync::Arc;
@@ -55,48 +55,47 @@ impl CommandParser for AssignCommandParser {
     // [export|global|chain|block|local] KEY=VALUE or [export|global|chain|block|local]  KEY
     // The first param is the kind of assignment, which can be "block", "chain" or "global"
     // The second param is the key, and the third param is the value (optional)
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args must not be empty
-        if args.is_empty() {
-            let msg = "Invalid assign command: args cannot be empty".to_string();
-            error!("{}", msg);
-            return Err(msg);
-        }
-
-        // Expect a single argument in the form of KEY=VALUE
+    fn parse_origin(
+        &self,
+        _context: &ParserContext,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        // Expect at least 2 arguments, and at most 3 arguments
         if args.len() < 2 || args.len() > 3 {
             let msg = format!("Invalid assign command: {:?}", args);
             error!("{}", msg);
             return Err(msg);
         }
 
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        // Args must not be checked before calling parse
-        assert!(
-            args.len() >= 2 && args.len() <= 3,
-            "Assign command should have 2 or 3 args"
-        );
-
         // Expect a single argument in the form of KEY=VALUE
-        let kind = &args[0];
-        let kind = AssignKind::from_str(&kind)
-            .map_err(|e| format!("Invalid assign kind: {}. Error: {}", kind, e))?;
+        let kind = args[0].as_literal_str().ok_or_else(|| {
+            let msg = format!("Invalid assign command kind: {:?}", args[0]);
+            error!("{}", msg);
+            msg
+        })?;
 
-        let key = &args[1];
+        let kind = AssignKind::from_str(&kind).map_err(|e| {
+            let msg = format!("Invalid assign command kind: {:?}, {}", args[0], e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let key = args[1]
+            .as_literal_str()
+            .ok_or_else(|| {
+                let msg = format!("Invalid assign command key: {:?}", args[1]);
+                error!("{}", msg);
+                msg
+            })?
+            .to_string();
+
         let value = if args.len() > 2 {
             Some(args[2].clone())
         } else {
             None
         };
 
-        let cmd: AssignCommand = AssignCommand::new(kind.to_owned(), key.to_owned(), value);
+        let cmd: AssignCommand = AssignCommand::new(kind, key, value);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -104,11 +103,11 @@ impl CommandParser for AssignCommandParser {
 pub struct AssignCommand {
     kind: AssignKind,
     key: String,
-    value: Option<String>,
+    value: Option<CommandArg>,
 }
 
 impl AssignCommand {
-    pub fn new(kind: AssignKind, key: String, value: Option<String>) -> Self {
+    pub fn new(kind: AssignKind, key: String, value: Option<CommandArg>) -> Self {
         Self { kind, key, value }
     }
 }
@@ -124,6 +123,8 @@ impl CommandExecutor for AssignCommand {
 
         match self.value {
             Some(ref value) => {
+                let value = value.evaluate_string(context).await?;
+
                 // Handle assignment with value
                 context
                     .env()
@@ -225,29 +226,21 @@ impl CommandParser for DeleteCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        self.cmd
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
             .clone()
-            .try_get_matches_from(args.as_str_list())
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid delete command: {}", e);
+                let msg = format!("Invalid delete command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
-
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid delete command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
 
         // Determine the scope level based on the flags
         let level = if matches.get_flag("global") {
@@ -261,12 +254,20 @@ impl CommandParser for DeleteCommandParser {
             None
         };
 
-        let var = matches
-            .get_one::<String>("variable_name")
-            .expect("variable_name is required")
-            .to_owned();
+        let var_index = matches.index_of("variable_name").ok_or_else(|| {
+            let msg = "variable_name argument is required".to_string();
+            error!("{}", msg);
+            msg
+        })?;
 
-        let cmd = DeleteCommand::new(level, var);
+        let var = &args[var_index];
+        if !var.is_literal() && !var.is_var() {
+            let msg = format!("Invalid variable name: {:?}", var);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let cmd = DeleteCommand::new(level, var.as_str().to_string());
         Ok(Arc::new(Box::new(cmd)))
     }
 }

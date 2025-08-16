@@ -1,6 +1,7 @@
 use super::cmd::*;
-use crate::block::CommandArgs;
-use crate::chain::Context;
+use crate::CommandArgEvaluator;
+use crate::block::{CommandArg, CommandArgs};
+use crate::chain::{Context, ParserContext};
 use crate::collection::CollectionValue;
 use clap::{Arg, ArgAction, Command};
 use std::sync::Arc;
@@ -65,31 +66,13 @@ impl CommandParser for EchoCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let arg_list = args.as_str_list();
-        self.cmd
-            .clone()
-            .try_get_matches_from(&arg_list)
-            .map_err(|e| {
-                let msg = format!("Invalid echo command: {:?}, {}", arg_list, e);
-                error!("{}", msg);
-                msg
-            })?;
 
-        Ok(())
-    }
-
-    fn parse_origin(
+    fn parse(
         &self,
-        args: Vec<CollectionValue>,
-        _origin_args: &CommandArgs,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        // Convert CollectionValue to String for clap parsing
-        let str_args = args
-            .iter()
-            .map(|value| value.to_string())
-            .collect::<Vec<String>>();
-
         let matches = self
             .cmd
             .clone()
@@ -117,13 +100,13 @@ impl CommandParser for EchoCommandParser {
 
 // Echo command executor, which simply echoes the input arguments
 pub struct EchoCommandExecutor {
-    output_args: Vec<CollectionValue>,
+    output_args: Vec<CommandArg>,
     suppress_newline: bool,
     verbose: bool,
 }
 
 impl EchoCommandExecutor {
-    pub fn new(output_args: Vec<CollectionValue>, suppress_newline: bool, verbose: bool) -> Self {
+    pub fn new(output_args: Vec<CommandArg>, suppress_newline: bool, verbose: bool) -> Self {
         Self {
             output_args,
             suppress_newline,
@@ -185,10 +168,12 @@ impl EchoCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for EchoCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        debug!("Executing echo command with args: {:?}", self.output_args);
         let output_str;
         if !self.output_args.is_empty() {
-            let mut output = Vec::with_capacity(self.output_args.len());
-            for value in &self.output_args {
+            let args = CommandArgEvaluator::evaluate_list(&self.output_args, context).await?;
+            let mut output = Vec::with_capacity(args.len());
+            for value in &args {
                 if self.verbose {
                     let v = self.print_verbose_output(value).await?;
                     output.push(v);
@@ -198,7 +183,9 @@ impl CommandExecutor for EchoCommandExecutor {
             }
             output_str = output.join(" ");
 
+            debug!("Echo output: {}", output_str);
             let mut stdout = context.pipe().stdout.lock().await;
+            debug!("Writing output to stdout: {}", output_str);
             // Write the output to stdout
             if let Err(e) = stdout.write_all(output_str.as_bytes()).await {
                 let msg = format!("Failed to write output to stdout: {}", e);

@@ -1,6 +1,6 @@
 use super::cmd::*;
-use crate::block::{BlockExecuter, CommandArgs};
-use crate::chain::Context;
+use crate::block::{BlockExecuter, CommandArgs, CommandArg};
+use crate::chain::{Context, ParserContext};
 use clap::{Arg, Command, ArgAction};
 use std::sync::Arc;
 
@@ -49,44 +49,39 @@ impl CommandParser for ExecCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let arg_list = args.as_str_list();
-        self.cmd
-            .clone()
-            .try_get_matches_from(&arg_list)
-            .map_err(|e| e.to_string())?;
-
-        Ok(())
-    }
 
     fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
+         &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid exec command: {:?}, {}", args, e);
+        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+            let msg = format!("Invalid exec command: {:?}, {}", str_args, e);
             error!("{}", msg);
             msg
         })?;
 
-        let block_id = matches
-            .get_one::<String>("block_id")
-            .expect("block_id is required")
-            .clone();
+        let block_index = matches.index_of("block_id").ok_or_else(|| {
+            let msg = "block_id argument is required for exec command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
 
-        let cmd = ExecCommandExecutor::new(block_id);
+        let block = args[block_index].clone();
+         
+        let cmd = ExecCommandExecutor::new(block);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // exec command executer
 pub struct ExecCommandExecutor {
-    pub block: String,
+    pub block: CommandArg,
 }
 
 impl ExecCommandExecutor {
-    pub fn new(block: String) -> Self {
+    pub fn new(block: CommandArg) -> Self {
         ExecCommandExecutor { block }
     }
 }
@@ -94,6 +89,8 @@ impl ExecCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for ExecCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let block_id = self.block.evaluate_string(context).await?;
+        
         // Get target block from context
         let chain = context.chain().ok_or_else(|| {
             let msg = "Exec command requires a chain context".to_string();
@@ -101,9 +98,9 @@ impl CommandExecutor for ExecCommandExecutor {
             msg
         })?;
 
-        let block = chain.get_block(&self.block);
+        let block = chain.get_block(&block_id);
         if block.is_none() {
-            let msg = format!("Exec target block not found: {}", self.block);
+            let msg = format!("Exec target block not found: {:?}", self.block);
             error!("{}", msg);
             return Err(msg);
         }
@@ -193,23 +190,14 @@ impl CommandParser for GotoCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let arg_list = args.as_str_list();
-        self.cmd
-            .clone()
-            .try_get_matches_from(&arg_list)
-            .map_err(|e| e.to_string())?;
-
-        Ok(())
-    }
-
     fn parse(
         &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid goto command: {:?}, {}", args, e);
+        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+            let msg = format!("Invalid goto command: {:?}, {}", str_args, e);
             error!("{}", msg);
             msg
         })?;
@@ -222,38 +210,46 @@ impl CommandParser for GotoCommandParser {
             GotoTargetLevel::Chain // Default to chain if no option is provided
         };
 
-        let name = matches
-            .get_one::<String>("target")
-            .expect("target is required")
-            .clone();
+        let target_index = matches.index_of("target").ok_or_else(|| {
+            let msg = "target argument is required for goto command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let target = args[target_index].clone();
 
-        let target = match target_level {
-            GotoTargetLevel::Block => GotoTarget::Block(name),
-            GotoTargetLevel::Chain => GotoTarget::Chain(name),
-        };
 
-        let cmd = GotoCommandExecutor::new(target);
+        let cmd = GotoCommandExecutor::new(target, target_level);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // goto command executer
 pub struct GotoCommandExecutor {
-    target: GotoTarget,
+    target: CommandArg,
+    target_level: GotoTargetLevel,
 }
 
 impl GotoCommandExecutor {
-    fn new(target: GotoTarget) -> Self {
-        Self { target }
+    fn new(target: CommandArg, target_level: GotoTargetLevel) -> Self {
+        Self {
+            target,
+            target_level,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for GotoCommandExecutor {
-    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
-        let ret = match &self.target {
-            GotoTarget::Block(block) => CommandResult::goto_block(block),
-            GotoTarget::Chain(chain) => CommandResult::goto_chain(chain),
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let target = self.target.evaluate_string(context).await?;
+
+        let ret = match self.target_level {
+            GotoTargetLevel::Block => {
+                CommandResult::goto_block(target)
+            }
+            GotoTargetLevel::Chain => {
+                CommandResult::goto_chain(target)
+            }
         };
 
         Ok(ret)
@@ -306,29 +302,25 @@ impl CommandParser for ReturnCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let arg_list = args.as_str_list();
-        self.cmd
-            .clone()
-            .try_get_matches_from(&arg_list)
-            .map_err(|e| e.to_string())?;
-
-        Ok(())
-    }
-
     fn parse(
         &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid return command: {:?}, {}", args, e);
+        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+            let msg = format!("Invalid return command: {:?}, {}", str_args, e);
             error!("{}", msg);
             msg
         })?;
 
         // Get the optional return value
-        let value = matches.get_one::<String>("value").cloned();
+        let value_index= matches.index_of("value");
+        let value = if let Some(index) = value_index {
+            Some(args[index].clone())
+        } else {
+            None
+        };
 
         let cmd = ReturnCommandExecutor::new(value);
         Ok(Arc::new(Box::new(cmd)))
@@ -337,11 +329,11 @@ impl CommandParser for ReturnCommandParser {
 
 // Return command executer
 pub struct ReturnCommandExecutor {
-    value: Option<String>,
+    value: Option<CommandArg>,
 }
 
 impl ReturnCommandExecutor {
-    pub fn new(value: Option<String>) -> Self {
+    pub fn new(value: Option<CommandArg>) -> Self {
         Self { value }
     }
 }
@@ -349,7 +341,12 @@ impl ReturnCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for ReturnCommandExecutor {
     async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
-        let ret = if let Some(value) = &self.value {
+        let value = match &self.value {
+            Some(val) => Some(val.evaluate_string(_context).await?),
+            None => None,
+        };
+
+        let ret = if let Some(value) = value {
             CommandResult::return_to_block_with_value(value)
         } else {
             CommandResult::return_to_block()
@@ -405,29 +402,25 @@ impl CommandParser for ErrorCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let arg_list = args.as_str_list();
-        self.cmd
-            .clone()
-            .try_get_matches_from(&arg_list)
-            .map_err(|e| e.to_string())?;
-
-        Ok(())
-    }
-
     fn parse(
         &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid error command: {:?}, {}", args, e);
+        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+            let msg = format!("Invalid error command: {:?}, {}", str_args, e);
             error!("{}", msg);
             msg
         })?;
 
         // Get the optional error value
-        let value = matches.get_one::<String>("value").cloned();
+        let value_index= matches.index_of("value");
+        let value = if let Some(index) = value_index {
+            Some(args[index].clone())
+        } else {
+            None
+        };
 
         let cmd = ErrorCommandExecutor::new(value);
         Ok(Arc::new(Box::new(cmd)))
@@ -436,11 +429,11 @@ impl CommandParser for ErrorCommandParser {
 
 // Error command executer
 pub struct ErrorCommandExecutor {
-    value: Option<String>,
+    value: Option<CommandArg>,
 }
 
 impl ErrorCommandExecutor {
-    pub fn new(value: Option<String>) -> Self {
+    pub fn new(value: Option<CommandArg>) -> Self {
         Self { value }
     }
 }
@@ -448,7 +441,12 @@ impl ErrorCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for ErrorCommandExecutor {
     async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
-        let ret = if let Some(value) = &self.value {
+        let value = match &self.value {
+            Some(val) => Some(val.evaluate_string(_context).await?),
+            None => None,
+        };
+
+        let ret = if let Some(value) = value {
             CommandResult::error_to_block_with_value(value)
         } else {
             CommandResult::error_to_block()
@@ -503,29 +501,25 @@ impl CommandParser for ExitCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let arg_list = args.as_str_list();
-        self.cmd
-            .clone()
-            .try_get_matches_from(&arg_list)
-            .map_err(|e| e.to_string())?;
-
-        Ok(())
-    }
-
     fn parse(
         &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid exit command: {:?}, {}", args, e);
+        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+            let msg = format!("Invalid exit command: {:?}, {}", str_args, e);
             error!("{}", msg);
             msg
         })?;
 
         // Get the optional exit value
-        let value = matches.get_one::<String>("value").cloned();
+        let value_index = matches.index_of("value");
+        let value = if let Some(index) = value_index {
+            Some(args[index].clone())
+        } else {
+            None
+        };
 
         let cmd = ExitCommandExecutor::new(value);
         Ok(Arc::new(Box::new(cmd)))
@@ -534,11 +528,11 @@ impl CommandParser for ExitCommandParser {
 
 // Exit command executer
 pub struct ExitCommandExecutor {
-    value: Option<String>,
+    value: Option<CommandArg>,
 }
 
 impl ExitCommandExecutor {
-    pub fn new(value: Option<String>) -> Self {
+    pub fn new(value: Option<CommandArg>) -> Self {
         Self { value }
     }
 }
@@ -546,7 +540,12 @@ impl ExitCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for ExitCommandExecutor {
     async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
-        let ret = if let Some(value) = &self.value {
+        let value = match &self.value {
+            Some(val) => Some(val.evaluate_string(_context).await?),
+            None => None,
+        };
+
+        let ret = if let Some(value) = value {
             CommandResult::exit_chain_with_value(value)
         } else {
             CommandResult::exit_chain()
@@ -603,29 +602,25 @@ impl CommandParser for BreakCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let arg_list = args.as_str_list();
-        self.cmd
-            .clone()
-            .try_get_matches_from(&arg_list)
-            .map_err(|e| e.to_string())?;
-
-        Ok(())
-    }
-
     fn parse(
         &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid break command: {:?}, {}", args, e);
+        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+            let msg = format!("Invalid break command: {:?}, {}", str_args, e);
             error!("{}", msg);
             msg
         })?;
 
         // Get the optional break value
-        let value = matches.get_one::<String>("value").cloned();
+        let value_index = matches.index_of("value");
+        let value = if let Some(index) = value_index {
+            Some(args[index].clone())
+        } else {
+            None
+        };
 
         let cmd = BreakCommandExecutor::new(value);
         Ok(Arc::new(Box::new(cmd)))
@@ -634,11 +629,11 @@ impl CommandParser for BreakCommandParser {
 
 // Break command executer
 pub struct BreakCommandExecutor {
-    value: Option<String>,
+    value: Option<CommandArg>,
 }
 
 impl BreakCommandExecutor {
-    pub fn new(value: Option<String>) -> Self {
+    pub fn new(value: Option<CommandArg>) -> Self {
         Self { value }
     }
 }
@@ -646,7 +641,12 @@ impl BreakCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for BreakCommandExecutor {
     async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
-        let ret = if let Some(value) = &self.value {
+        let value = match &self.value {
+            Some(val) => Some(val.evaluate_string(_context).await?),
+            None => None,
+        };
+
+        let ret = if let Some(value) = value {
             CommandResult::break_with_value(value)
         } else {
             CommandResult::_break()

@@ -54,6 +54,8 @@ impl ProcessChain {
     }
 
     pub async fn translate(&mut self, context: &ParserContextRef) -> Result<(), String> {
+        info!("Translating process chain: {}", self.id);
+        
         let translator =
             BlockCommandTranslator::new(context.clone(), COMMAND_PARSER_FACTORY.clone());
         // Translate each block in the chain

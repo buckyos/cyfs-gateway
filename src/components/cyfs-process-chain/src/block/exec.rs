@@ -152,6 +152,9 @@ impl BlockExecuter {
     ) -> Result<CommandResult, String> {
         debug!("Executing command: {:?}", cmd);
         let exec = cmd.executor.as_ref().unwrap();
-        exec.exec(context).await
+        let ret = exec.exec(context).await;
+        debug!("Command executed: {:?}, result: {:?}", cmd, ret);
+        
+        ret
     }
 }

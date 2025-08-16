@@ -1,5 +1,5 @@
 use super::cmd::*;
-use crate::block::CommandArgs;
+use crate::block::{CommandArgs, CommandArg};
 use crate::chain::{Context, ParserContext};
 use crate::collection::CollectionValue;
 use crate::js::AsyncJavaScriptCommandExecutor;
@@ -145,95 +145,66 @@ impl CommandParser for ExternalCommandParser {
     fn group(&self) -> CommandGroup {
         CommandGroup::External
     }
+    
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
 
-    fn check_with_context(
+    fn parse(
         &self,
         context: &ParserContext,
+        str_args: Vec<&str>,
         args: &CommandArgs,
-    ) -> Result<(), String> {
-        let matches = self
-            .cmd
-            .clone()
-            .try_get_matches_from(args.as_str_list())
-            .map_err(|e| {
-                let msg = format!("Invalid external command: {:?}, {}", args, e);
-                error!("{}", msg);
-                msg
-            })?;
-
-        let cmd = matches.get_one::<String>("command").unwrap();
-        let command = context.get_external_command(cmd).ok_or_else(|| {
-            let msg = format!("External command '{}' not found", cmd);
-            error!("{}", msg);
-            msg
-        })?;
-
-        let command_args = match matches.index_of("command") {
-            Some(index) => {
-                let args = args.as_slice().get(index..).unwrap();
-                CommandArgs::new(args.to_owned())
-            }
-            None => CommandArgs::new_empty(),
-        };
-
-        command.check(&command_args)?;
-
-        Ok(())
-    }
-
-    fn check(&self, _args: &CommandArgs) -> Result<(), String> {
-        unreachable!("Should not be called, use check_with_context instead");
-    }
-
-    fn parse_origin_with_context(
-        &self,
-        context: &ParserContext,
-        args: Vec<CollectionValue>,
-        origin_args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let str_args = args
-            .iter()
-            .map(|value| value.to_string())
-            .collect::<Vec<String>>();
-
+       
         let matches = self
             .cmd
             .clone()
             .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid external command: {:?}, {}", origin_args, e);
+                let msg = format!("Invalid external command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        let cmd_index = matches.index_of("command").unwrap();
-        if !args[cmd_index].is_string() {
+        let cmd_index = matches.index_of("command").ok_or_else(|| {
+            let msg = "Command argument 'command' is required".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+
+        let cmd = &args[cmd_index];
+
+        // Ensure the command argument is a literal string
+        if !cmd.is_literal() {
             let msg = format!(
                 "Command must be a string, got: {:?}",
-                args[cmd_index].get_type()
+                cmd
             );
             error!("{}", msg);
             return Err(msg);
         }
 
-        let cmd = matches.get_one::<String>("command").unwrap();
+        let cmd = cmd.as_literal_str().unwrap();
         let command = context.get_external_command(cmd).ok_or_else(|| {
             let msg = format!("External command '{}' not found", cmd);
             error!("{}", msg);
             msg
         })?;
 
-        let (args, origin_args) = match matches.index_of("command") {
+        let args= match matches.index_of("command") {
             Some(index) => {
                 let args = args.as_slice().get(index..).unwrap();
-                let origin_args = origin_args.as_slice().get(index..).unwrap();
-                (args.to_owned(), CommandArgs::new(origin_args.to_owned()))
+                 CommandArgs::new(args.to_owned())
             }
-            None => (vec![], CommandArgs::new_empty()),
+            None => CommandArgs::new_empty(),
         };
 
+        // Check the command arguments
+        command.check(&args)?;
+
         let executor =
-            ExternalCommandExecutor::new(cmd.clone(), command.clone(), args, origin_args);
+            ExternalCommandExecutor::new(cmd.to_owned(), command.clone(), args);
         Ok(Arc::new(Box::new(executor)))
     }
 }
@@ -242,22 +213,19 @@ impl CommandParser for ExternalCommandParser {
 pub struct ExternalCommandExecutor {
     name: String,
     command: ExternalCommandRef,
-    args: Vec<CollectionValue>,
-    origin_args: CommandArgs,
+    args: CommandArgs,
 }
 
 impl ExternalCommandExecutor {
     pub fn new(
         name: String,
         command: ExternalCommandRef,
-        args: Vec<CollectionValue>,
-        origin_args: CommandArgs,
+        args: CommandArgs,
     ) -> Self {
         Self {
             name,
             command,
             args,
-            origin_args,
         }
     }
 }
@@ -265,10 +233,19 @@ impl ExternalCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for ExternalCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let args = CommandArg::evaluate_list(
+            &self.args,
+            context,
+        ).await.map_err(|e| {
+            let msg = format!("Failed to evaluate command arguments: {}", e);
+            error!("{}", msg);
+            msg
+        })?;
+
         // Execute the command with the provided arguments
         let ret = self
             .command
-            .exec(context, &self.args, &self.origin_args)
+            .exec(context, &args, &self.args)
             .await
             .map_err(|e| {
                 let msg = format!("Failed to execute external command: {}", e);

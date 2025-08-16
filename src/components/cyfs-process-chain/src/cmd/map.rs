@@ -63,8 +63,6 @@ impl MapReduceCommandParser {
                     .required(false)
                     .help("Reduce command in positional mode (required if 'reduce' is used)"),
             )
-            .allow_hyphen_values(true) // 防止 map/reduce cmd 里出现 --xxx 被解析
-            .trailing_var_arg(true) // 允许 reduce cmd 吃掉后面所有参数
             .override_usage(
                 r#"
     map --begin <init-cmd> --cmd <map-cmd> [--reduce <reduce-cmd>] <coll>
@@ -107,10 +105,6 @@ impl CommandParser for MapReduceCommandParser {
 
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
-    }
-
-    fn need_translate_expression(&self) -> bool {
-        false
     }
     
     /*
@@ -160,26 +154,24 @@ impl CommandParser for MapReduceCommandParser {
     }
     */
 
-    fn parse_without_translate(
+    fn parse(
         &self,
         _context: &ParserContext,
+        str_args: Vec<&str>,
         args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let str_args = args
-            .iter()
-            .map(|value| value.as_str())
-            .collect::<Vec<&str>>();
+        debug!("Parsing map-reduce command: {:?}", args);
 
         let matches = self
             .cmd
             .clone()
             .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid map-reduce command: {}", e);
+                let msg = format!("Invalid map-reduce command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
-
+  
         // Determine if the command is in long mode or positional mode
         let is_long_mode = matches.contains_id("begin") || matches.contains_id("map");
         let indexes = if is_long_mode {
@@ -218,7 +210,7 @@ impl CommandParser for MapReduceCommandParser {
                     error!("{}", msg);
                     msg
                 })?;
-
+            debug!("Collection index in positional mode: {}", coll_index);
             let map_cmd_index = matches
                 .index_of("map_cmd")
                 .ok_or_else(|| {
@@ -228,7 +220,7 @@ impl CommandParser for MapReduceCommandParser {
                     error!("{}", msg);
                     msg
                 })?;
-
+            debug!("Map command index in positional mode: {}", map_cmd_index);
             // If reduce is specified, get its index
             let reduce_kw_index = matches.index_of("reduce_kw");
             let reduce_cmd_index = if reduce_kw_index.is_some() {
@@ -239,7 +231,7 @@ impl CommandParser for MapReduceCommandParser {
                     error!("{}", msg);
                     msg
                 })?;
-
+                debug!("Reduce command index in positional mode: {}", index);
                 Some(index)
             } else {
                 None
@@ -254,6 +246,7 @@ impl CommandParser for MapReduceCommandParser {
             error!("{}", msg);
             msg
         })?;
+        debug!("Collection variable: {}", coll_var.as_str());
 
         let col = coll_var
             .as_var_str()
@@ -301,6 +294,7 @@ impl CommandParser for MapReduceCommandParser {
             error!("{}", msg);
             return Err(msg);
         }
+        debug!("Map command: {}", map_cmd.as_str());
         let map_cmd = map_cmd.as_command_substitution().unwrap().clone();
 
         let reduce_cmd = if let Some(reduce_cmd_index) = indexes.3 {
@@ -325,11 +319,12 @@ impl CommandParser for MapReduceCommandParser {
         };
 
         let cmd = MapReduceCommand::new(col, begin_cmd, map_cmd, reduce_cmd);
-
+        debug!("Created MapReduceCommand: {:?}", cmd);
         Ok(Arc::new(Box::new(cmd) as Box<dyn CommandExecutor>))
     }
 }
 
+#[derive(Debug)]
 struct MapReduceCommandInner {
     collection: String,
     begin_cmd: Option<Box<Expression>>,
@@ -339,6 +334,7 @@ struct MapReduceCommandInner {
 
 type MapReduceCommandInnerRef = Arc<MapReduceCommandInner>;
 
+#[derive(Debug)]
 pub struct MapReduceCommand {
     inner: MapReduceCommandInnerRef,
 }

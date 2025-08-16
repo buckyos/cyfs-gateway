@@ -1,8 +1,9 @@
 use super::cmd::*;
 use crate::block::CommandArgs;
-use crate::chain::Context;
+use crate::chain::{Context, ParserContext};
 use clap::Command;
 use std::sync::Arc;
+
 // some action commands, DROP/ACCEPT/REJECT
 pub struct ActionCommandParser {
     action: CommandAction,
@@ -46,29 +47,25 @@ impl CommandParser for ActionCommandParser {
     fn group(&self) -> CommandGroup {
         CommandGroup::Control
     }
-    
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        _args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         self.cmd
             .clone()
-            .try_get_matches_from(args.as_str_list())
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
                 let msg = format!("Invalid action command: {}", e);
                 error!("{}", msg);
                 msg
             })?;
-
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        _args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
 
         let cmd = ActionCommandExecutor {
             action: self.action.clone(),

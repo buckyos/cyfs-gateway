@@ -1,4 +1,7 @@
+use super::translator::CommandArgEvaluator;
+use crate::chain::Context;
 use crate::cmd::*;
+use crate::collection::CollectionValue;
 use std::fmt;
 use std::ops::Deref;
 
@@ -85,6 +88,50 @@ impl CommandArg {
             None
         }
     }
+
+    pub async fn evaluate(&self, context: &Context) -> Result<CollectionValue, String> {
+        CommandArgEvaluator::evaluate(self, context).await
+    }
+
+    pub async fn evaluate_string(
+        &self,
+        context: &Context,
+    ) -> Result<String, String> {
+        let value = self.evaluate(context).await?;
+        if value.is_string() {
+            Ok(value.into_string().unwrap())
+        } else {
+            let msg = format!("Expected string value, found: {:?}", value);
+            warn!("{}", msg);
+            Err(msg)
+        }
+    }
+
+    pub async fn evaluate_list(
+        args: &[CommandArg],
+        context: &Context,
+    ) -> Result<Vec<CollectionValue>, String> {
+        CommandArgEvaluator::evaluate_list(args, context).await
+    }
+
+    pub async fn evaluate_string_list(
+        args: &[CommandArg],
+        context: &Context,
+    ) -> Result<Vec<String>, String> {
+        let values = Self::evaluate_list(args, context).await?;
+        let mut result = Vec::with_capacity(values.len());
+        for value in values {
+            if value.is_string() {
+                result.push(value.into_string().unwrap());
+            } else {
+                let msg = format!("Expected string value, found: {:?}", value);
+                warn!("{}", msg);
+                return Err(msg);
+            }
+        }
+
+        Ok(result)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +211,7 @@ pub struct CommandItem {
 impl fmt::Debug for CommandItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Use command instead of self
-        write!(f, "{:?}", self.command)
+        write!(f, "{:?}, exec={}", self.command, self.executor.is_some())
     }
 }
 

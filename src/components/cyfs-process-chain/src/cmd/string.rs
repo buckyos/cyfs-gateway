@@ -1,6 +1,6 @@
 use super::cmd::*;
-use crate::block::CommandArgs;
-use crate::chain::Context;
+use crate::block::{CommandArg, CommandArgEvaluator, CommandArgs};
+use crate::chain::{Context, ParserContext};
 use crate::collection::CollectionValue;
 use clap::{Arg, ArgAction, Command};
 use globset::{GlobBuilder, GlobMatcher};
@@ -63,75 +63,52 @@ impl CommandParser for RewriteCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         let matches = self
             .cmd
             .clone()
-            .try_get_matches_from(args.as_str_list())
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid rewrite command: {:?}, {}", args, e);
+                let msg = format!("Invalid rewrite command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        // The var must be a variable
-        let var_index = matches.index_of("var").unwrap();
-        if !args[var_index].is_var() {
+        let key_index = matches.index_of("var").ok_or_else(|| {
+            let msg = format!("Variable name is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let key = args[key_index].clone();
+        if !key.is_var() {
             let msg = format!(
-                "Invalid rewrite command: {:?}, the var argument must be a variable",
+                "Invalid rewrite command: {:?}, the first argument must be a variable",
                 args
             );
             error!("{}", msg);
             return Err(msg);
         }
 
-        // Check the pattern if is a valid glob
-        let pattern_index = matches.index_of("pattern").unwrap();
-        if args[pattern_index].is_literal() {
-            let pattern = args[pattern_index].as_literal_str().unwrap();
-            if let Err(e) = GlobBuilder::new(pattern).case_insensitive(true).build() {
-                let msg = format!("Invalid glob pattern: {}, {}", pattern, e);
-                error!("{}", msg);
-                return Err(msg);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid rewrite command: {:?}, {}", args, e);
+        let pattern_index = matches.index_of("pattern").ok_or_else(|| {
+            let msg = format!("Pattern is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let pattern_value = args[pattern_index].as_literal_str().ok_or_else(|| {
+            let msg = format!(
+                "Pattern must be a literal string, got: {:?}",
+                args[pattern_index]
+            );
             error!("{}", msg);
             msg
         })?;
 
-        let key_value = matches
-            .get_one::<String>("var")
-            .ok_or_else(|| {
-                let msg = format!("Variable name is required, but got: {:?}", args);
-                error!("{}", msg);
-                msg
-            })?
-            .to_owned();
-
-        let key_index = matches.index_of("var").unwrap();
-        let key = &origin_args[key_index].as_var_str().unwrap();
-
-        let pattern_value = matches
-            .get_one::<String>("pattern")
-            .ok_or_else(|| {
-                let msg = format!("Pattern is required, but got: {:?}", args);
-                error!("{}", msg);
-                msg
-            })?
-            .to_owned();
-
-        let pattern = GlobBuilder::new(&pattern_value)
+        let pattern = GlobBuilder::new(pattern_value)
             .case_insensitive(true)
             .build()
             .map_err(|e| {
@@ -141,48 +118,39 @@ impl CommandParser for RewriteCommandParser {
             })?
             .compile_matcher();
 
-        let template = matches
-            .get_one::<String>("template")
-            .ok_or_else(|| {
-                let msg = format!("Template is required, but got: {:?}", args);
-                error!("{}", msg);
-                msg
-            })?
-            .to_owned();
+        let template_index = matches.index_of("template").ok_or_else(|| {
+            let msg = format!("Template is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
 
-        let cmd = RewriteCommand::new(
-            key.to_string(),
-            pattern,
-            key_value,
-            pattern_value.to_owned(),
-            template,
-        );
+        let template = args[template_index].clone();
+
+        let cmd = RewriteCommand::new(key, pattern, pattern_value.to_string(), template);
 
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 pub struct RewriteCommand {
-    key: String,
-    pattern: GlobMatcher,
+    key: CommandArg,
 
-    key_value: String,
+    pattern: GlobMatcher,
     pattern_value: String,
-    template: String,
+
+    template: CommandArg,
 }
 
 impl RewriteCommand {
     pub fn new(
-        key: String,
+        key: CommandArg,
         pattern: GlobMatcher,
-        key_value: String,
         pattern_value: String,
-        template: String,
+        template: CommandArg,
     ) -> Self {
         Self {
             key,
             pattern,
-            key_value,
             pattern_value,
             template,
         }
@@ -192,12 +160,15 @@ impl RewriteCommand {
 #[async_trait::async_trait]
 impl CommandExecutor for RewriteCommand {
     async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
-        if self.pattern.is_match(&self.key_value) {
+        let key_value = self.key.evaluate_string(context).await?;
+        let template_value = self.template.evaluate_string(context).await?;
+
+        if self.pattern.is_match(&key_value) {
             if let Some(prefix) = self.pattern_value.strip_suffix("*") {
-                if self.key_value.starts_with(prefix) && self.template.ends_with('*') {
-                    let tail = &self.key_value[prefix.len()..];
+                if key_value.starts_with(prefix) && template_value.ends_with('*') {
+                    let tail = &key_value[prefix.len()..];
                     let rewritten =
-                        format!("{}{}", &self.template[..self.template.len() - 1], tail);
+                        format!("{}{}", &template_value[..template_value.len() - 1], tail);
                     context
                         .env()
                         .set(
@@ -208,14 +179,16 @@ impl CommandExecutor for RewriteCommand {
                         .await?;
                     info!(
                         "Rewritten value for {}: {} -> {}",
-                        self.key, self.key_value, rewritten
+                        self.key.as_str(),
+                        key_value,
+                        rewritten
                     );
 
                     Ok(CommandResult::success_with_value(rewritten))
                 } else {
                     let msg = format!(
                         "Pattern '{}' did not match '{}', expected prefix '{}'",
-                        self.pattern_value, self.key_value, prefix
+                        self.pattern_value, key_value, prefix
                     );
                     info!("{}", msg);
                     Ok(CommandResult::success())
@@ -223,23 +196,23 @@ impl CommandExecutor for RewriteCommand {
             } else {
                 info!(
                     "Pattern '{}' matched '{}', setting to template '{}'",
-                    self.pattern_value, self.key_value, self.template
+                    self.pattern_value, key_value, template_value
                 );
                 context
                     .env()
                     .set(
                         self.key.as_str(),
-                        CollectionValue::String(self.template.clone()),
+                        CollectionValue::String(template_value.to_owned()),
                         None,
                     )
                     .await?;
 
-                Ok(CommandResult::success_with_value(self.template.clone()))
+                Ok(CommandResult::success_with_value(template_value.to_owned()))
             }
         } else {
             info!(
                 "Pattern '{}' did not match '{}'",
-                self.pattern_value, self.key_value
+                self.pattern_value, key_value
             );
             Ok(CommandResult::error())
         }
@@ -300,64 +273,30 @@ impl CommandParser for RewriteRegexCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         let matches = self
             .cmd
             .clone()
-            .try_get_matches_from(args.as_str_list())
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid rewrite-regex command: {:?}, {}", args, e);
+                let msg = format!("Invalid rewrite-regex command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        // The var argument must be a variable
-        let var_index = matches.index_of("var").unwrap();
-        if !args[var_index].is_var() {
-            let msg = format!(
-                "Invalid rewrite-regex command: {:?}, the first argument must be a variable",
-                args
-            );
-            error!("{}", msg);
-            return Err(msg);
-        }
-
-        // The regex argument must be a valid regex pattern if is literal
-        let regex_index = matches.index_of("regex").unwrap();
-        if args[regex_index].is_literal() {
-            let pattern = args[regex_index].as_literal_str().unwrap();
-            if let Err(e) = regex::Regex::new(pattern) {
-                let msg = format!("Invalid regex pattern: {}, {}", pattern, e);
-                error!("{}", msg);
-                return Err(msg);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid rewrite-regex command: {:?}, {}", args, e);
+        let key_index = matches.index_of("var").ok_or_else(|| {
+            let msg = format!("Variable name is required, but got: {:?}", args);
             error!("{}", msg);
             msg
         })?;
 
-        let key_value = matches
-            .get_one::<String>("var")
-            .ok_or_else(|| {
-                let msg = format!("Variable name is required, but got: {:?}", args);
-                error!("{}", msg);
-                msg
-            })?
-            .to_owned();
-        let key_index = matches.index_of("var").unwrap();
-        let key_arg = &origin_args[key_index];
-        if !key_arg.is_var() {
+        let key_value = args[key_index].clone();
+        if !key_value.is_var() {
             let msg = format!(
                 "Invalid rewrite-regex command: {:?}, the first argument must be a variable",
                 args
@@ -365,47 +304,51 @@ impl CommandParser for RewriteRegexCommandParser {
             error!("{}", msg);
             return Err(msg);
         }
-        let key = key_arg.as_var_str().unwrap();
 
-        let regex = matches.get_one::<String>("regex").ok_or_else(|| {
+        let regex_index = matches.index_of("regex").ok_or_else(|| {
             let msg = format!("Regex pattern is required, but got: {:?}", args);
             error!("{}", msg);
             msg
         })?;
+        let regex = &args[regex_index];
+        if !regex.is_literal() {
+            let msg = format!("Regex pattern must be a literal string, got: {:?}", regex);
+            error!("{}", msg);
+            return Err(msg);
+        }
+        let regex = regex.as_literal_str().unwrap();
 
-        let regex = regex::Regex::new(&regex).map_err(|e| {
+        let regex = regex::Regex::new(regex).map_err(|e| {
             let msg = format!("Invalid regex pattern: {}: {}", regex, e);
             error!("{}", msg);
             msg
         })?;
 
-        let template = matches
-            .get_one::<String>("template")
-            .ok_or_else(|| {
-                let msg = format!("Template is required, but got: {:?}", args);
-                error!("{}", msg);
-                msg
-            })?
-            .to_owned();
+        let template_index = matches.index_of("template").ok_or_else(|| {
+            let msg = format!("Template is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let template = args[template_index].clone();
 
-        let cmd = RewriteRegexCommand::new(key.to_string(), key_value, regex, template);
+        let cmd = RewriteRegexCommand::new(key_value, regex, template);
 
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 pub struct RewriteRegexCommand {
-    key: String,
-    key_value: String,
+    key: CommandArg,
     regex: regex::Regex,
-    template: String,
+    template: CommandArg,
 }
 
 impl RewriteRegexCommand {
-    pub fn new(key: String, key_value: String, regex: regex::Regex, template: String) -> Self {
+    pub fn new(key: CommandArg, regex: regex::Regex, template: CommandArg) -> Self {
+        assert!(key.is_var(), "Key must be a variable");
+
         Self {
             key,
-            key_value,
             regex,
             template,
         }
@@ -415,10 +358,10 @@ impl RewriteRegexCommand {
 #[async_trait::async_trait]
 impl CommandExecutor for RewriteRegexCommand {
     async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
-        let key_value = &self.key_value;
-        let template = &self.template;
+        let key_value = self.key.evaluate_string(context).await?;
+        let template = self.template.evaluate_string(context).await?;
 
-        if let Some(captures) = self.regex.captures(key_value) {
+        if let Some(captures) = self.regex.captures(&key_value) {
             // Replace template variables like $1, $2, etc. with captured groups
             let mut result = String::new();
             let mut chars = template.chars().peekable();
@@ -459,7 +402,7 @@ impl CommandExecutor for RewriteRegexCommand {
                     None,
                 )
                 .await?;
-            info!("Rewritten value for {}: {}", self.key, result);
+            info!("Rewritten value for {:?}: {}", self.key, result);
 
             Ok(CommandResult::success_with_value(result))
         } else {
@@ -529,21 +472,29 @@ impl CommandParser for StringReplaceCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         let matches = self
             .cmd
             .clone()
-            .try_get_matches_from(args.as_str_list())
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid string replace command: {:?}, {}", args, e);
+                let msg = format!("Invalid string replace command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        let var_index = matches.index_of("var").unwrap();
-
-        // The var argument must be a variable
-        if !args[var_index].is_var() {
+        let key_index = matches.index_of("var").ok_or_else(|| {
+            let msg = format!("Variable name is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let key = args[key_index].clone();
+        if !key.is_var() {
             let msg = format!(
                 "Invalid string replace command: {:?}, the first argument must be a variable",
                 args
@@ -552,67 +503,22 @@ impl CommandParser for StringReplaceCommandParser {
             return Err(msg);
         }
 
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid string replace command: {:?}, {}", args, e);
+        let match_text_index = matches.index_of("match").ok_or_else(|| {
+            let msg = format!("Match text is required, but got: {:?}", args);
             error!("{}", msg);
             msg
         })?;
+        let match_text = args[match_text_index].clone();
 
-        let key_value = matches
-            .get_one::<String>("var")
-            .ok_or_else(|| {
-                let msg = format!("Variable name is required, but got: {:?}", args);
-                error!("{}", msg);
-                msg
-            })?
-            .to_owned();
-
-        let key_index = matches.index_of("var").unwrap();
-        let key_arg = &origin_args.as_slice()[key_index];
-        if !key_arg.is_var() {
-            let msg = format!(
-                "Invalid string-replace command: {:?}, the first argument must be a variable",
-                args
-            );
+        let new_text_index = matches.index_of("replacement").ok_or_else(|| {
+            let msg = format!("Replacement text is required, but got: {:?}", args);
             error!("{}", msg);
-            return Err(msg);
-        }
-        let key = key_arg.as_var_str().unwrap();
-
-        let match_text = matches
-            .get_one::<String>("match")
-            .ok_or_else(|| {
-                let msg = format!("Match text is required, but got: {:?}", args);
-                error!("{}", msg);
-                msg
-            })?
-            .to_owned();
-
-        let new_text = matches
-            .get_one::<String>("replacement")
-            .ok_or_else(|| {
-                let msg = format!("Replacement text is required, but got: {:?}", args);
-                error!("{}", msg);
-                msg
-            })?
-            .to_owned();
+            msg
+        })?;
+        let new_text = args[new_text_index].clone();
 
         let ignore_case = matches.get_flag("ignore_case");
-        let cmd = StringReplaceCommand::new(
-            ignore_case,
-            key.to_string(),
-            key_value,
-            match_text,
-            new_text,
-        );
+        let cmd = StringReplaceCommand::new(ignore_case, key, match_text, new_text);
 
         Ok(Arc::new(Box::new(cmd)))
     }
@@ -620,24 +526,21 @@ impl CommandParser for StringReplaceCommandParser {
 
 pub struct StringReplaceCommand {
     ignore_case: bool,
-    key: String,
-    key_value: String,
-    match_text: String,
-    new_text: String,
+    key: CommandArg,
+    match_text: CommandArg,
+    new_text: CommandArg,
 }
 
 impl StringReplaceCommand {
     pub fn new(
         ignore_case: bool,
-        key: String,
-        key_value: String,
-        match_text: String,
-        new_text: String,
+        key: CommandArg,
+        match_text: CommandArg,
+        new_text: CommandArg,
     ) -> Self {
         Self {
             ignore_case,
             key,
-            key_value,
             match_text,
             new_text,
         }
@@ -657,23 +560,24 @@ impl StringReplaceCommand {
 #[async_trait::async_trait]
 impl CommandExecutor for StringReplaceCommand {
     async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
-        let key_value = &self.key_value;
-        let match_text = &self.match_text;
-        let new_text = &self.new_text;
+        // Evaluate the key, match_text, and new_text arguments
+        let key_value = self.key.evaluate_string(context).await?;
+        let match_text = self.match_text.evaluate_string(context).await?;
+        let new_text = self.new_text.evaluate_string(context).await?;
 
         let rewritten = if self.ignore_case {
             if key_value
                 .to_lowercase()
                 .contains(&match_text.to_lowercase())
             {
-                let rewritten = Self::replace_case_insensitive(key_value, match_text, new_text);
+                let rewritten = Self::replace_case_insensitive(&key_value, &match_text, &new_text);
                 Some(rewritten)
             } else {
                 None
             }
         } else {
-            if key_value.contains(match_text) {
-                let rewritten = Self::replace_case_sensitive(key_value, match_text, new_text);
+            if key_value.contains(&match_text) {
+                let rewritten = Self::replace_case_sensitive(&key_value, &match_text, &new_text);
                 Some(rewritten)
             } else {
                 None
@@ -690,7 +594,7 @@ impl CommandExecutor for StringReplaceCommand {
                     None,
                 )
                 .await?;
-            info!("Replace value for {}: {}", self.key, rewritten);
+            info!("Replace value for {:?}: {}", self.key, rewritten);
 
             Ok(super::CommandResult::success_with_value(rewritten))
         } else {
@@ -745,80 +649,58 @@ impl CommandParser for StringAppendCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        self.cmd
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
             .clone()
-            .try_get_matches_from(args.as_str_list())
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid string append command: {:?}, {}", args, e);
+                let msg = format!("Invalid string append command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid string append command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
-
-        // Try to get all parameters
-        let params: Vec<String> = matches
-            .get_many::<String>("params")
-            .ok_or_else(|| {
-                let msg = format!("At least two parameters are required, but got: {:?}", args);
-                error!("{}", msg);
-                msg
-            })?
-            .map(|s| s.to_string())
-            .collect();
+        let params = match matches.indices_of("params") {
+            Some(indices) => indices.map(|i| args[i].clone()).collect(),
+            None => {
+                vec![]
+            }
+        };
 
         // Check if we have at least two parameters
         if params.len() < 2 {
-            let msg = format!("At least two parameters are required, but got: {:?}", params);
+            let msg = format!(
+                "At least two parameters are required, but got: {:?}",
+                params
+            );
             error!("{}", msg);
             return Err(msg);
         }
 
-        // Check if the first parameter is a variable
-        let param1_index = matches.index_of("params").unwrap();
-        let var = if origin_args[param1_index].is_var() {
-            Some(origin_args[param1_index].as_var_str().unwrap().to_owned())
-        } else {
-            None
-        };
-
-        // Concatenate all parameters into a single string
-        let result = params.join("");
-        info!("String append {:?} = {}", params, result);
-
-        let cmd = StringAppendCommand::new(var, result);
+        let cmd = StringAppendCommand::new(params);
 
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 pub struct StringAppendCommand {
-    var: Option<String>,
-    result: String,
+    params: Vec<CommandArg>,
 }
 
 impl StringAppendCommand {
-    pub fn new(var: Option<String>, result: String) -> Self {
-        Self { var, result }
+    pub fn new(params: Vec<CommandArg>) -> Self {
+        Self { params }
     }
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for StringAppendCommand {
-    async fn exec(&self, _context: &Context) -> Result<super::CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
         /*
         if let Some(var) = &self.var {
             // If a variable is specified, set it in the environment
@@ -830,8 +712,18 @@ impl CommandExecutor for StringAppendCommand {
         }
         */
 
+        let args = CommandArgEvaluator::evaluate_list(&self.params, context).await?;
+
+        // TODO: for none string args, we should convert them to string or return an error? now we just treat them as strings
+        // Concatenate all arguments into a single string
+        let result = args
+            .iter()
+            .map(|arg| arg.treat_as_str())
+            .collect::<Vec<&str>>()
+            .join("");
+
         // Return the result as a command result
-        Ok(super::CommandResult::success_with_value(&self.result))
+        Ok(super::CommandResult::success_with_value(&result))
     }
 }
 
@@ -922,54 +814,63 @@ impl CommandParser for StringSliceCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        // Args should have exactly two elements
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
         let matches = self
             .cmd
             .clone()
-            .try_get_matches_from(args.as_str_list())
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid string slice command: {:?}, {}", args, e);
+                let msg = format!("Invalid string slice command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        // Check if range argument is literal and valid
-        let range_index = matches.index_of("range").unwrap();
-        if args[range_index].is_literal() {
-            let range = args[range_index].as_literal_str().unwrap();
-            Self::parse_range(range)?;
-        }
-
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid string slice command: {:?}, {}", args, e);
+        let string_index = matches.index_of("string").ok_or_else(|| {
+            let msg = format!("String value is required, but got: {:?}", args);
             error!("{}", msg);
             msg
         })?;
+        let string_value = args[string_index].clone();
 
-        let string_value = matches
-            .get_one::<String>("string")
-            .ok_or_else(|| {
-                let msg = format!("String value is required, but got: {:?}", args);
-                error!("{}", msg);
-                msg
-            })?
-            .to_owned();
-        let range = matches.get_one::<String>("range").ok_or_else(|| {
+        let range_index = matches.index_of("range").ok_or_else(|| {
             let msg = format!("Range is required, but got: {:?}", args);
             error!("{}", msg);
             msg
         })?;
 
-        let (start, end) = Self::parse_range(&range)?;
+        let range = args[range_index].clone();
+
+        let cmd = StringSliceCommand::new(string_value, range);
+
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct StringSliceCommand {
+    string: CommandArg,
+    range: CommandArg,
+}
+
+impl StringSliceCommand {
+    pub fn new(string: CommandArg, range: CommandArg) -> Self {
+        Self { string, range }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for StringSliceCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        // Evaluate the string and range arguments
+        let string_value = self.string.evaluate_string(context).await?;
+        let range_value = self.range.evaluate_string(context).await?;
+
+        // Parse the range
+        let (start, end) = StringSliceCommandParser::parse_range(&range_value)?;
 
         let ret = if start <= end {
             if string_value.is_char_boundary(start) && string_value.is_char_boundary(end) {
@@ -986,12 +887,23 @@ impl CommandParser for StringSliceCommandParser {
             None
         };
 
-        let ret = ret.unwrap_or_default().to_string();
-        info!("String slice {}[{}:{}] = {}", string_value, start, end, ret);
-
-        let cmd = StringConstCommand::new(ret);
-
-        Ok(Arc::new(Box::new(cmd)))
+        match ret {
+            Some(sliced) => {
+                info!(
+                    "Sliced string: {}[{}:{}] = {}",
+                    string_value, start, end, sliced
+                );
+                Ok(CommandResult::success_with_value(sliced))
+            }
+            None => {
+                let msg = format!(
+                    "Slice range {}:{} is invalid for string '{}'",
+                    start, end, string_value
+                );
+                warn!("{}", msg);
+                Ok(CommandResult::error())
+            }
+        }
     }
 }
 
@@ -1034,45 +946,64 @@ impl CommandParser for StringLengthCommandParser {
     fn group(&self) -> CommandGroup {
         CommandGroup::String
     }
-    
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        self.cmd
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
             .clone()
-            .try_get_matches_from(args.as_str_list())
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid string length command: {:?}, {}", args, e);
+                let msg = format!("Invalid string length command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid string length command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
-
-        let string_value = matches.get_one::<String>("string").ok_or_else(|| {
+        let string_index = matches.index_of("string").ok_or_else(|| {
             let msg = format!("String value is required, but got: {:?}", args);
             error!("{}", msg);
             msg
         })?;
-        let length = string_value.len();
 
-        let cmd = StringConstCommand::new(length.to_string());
+        let string_value = args[string_index].clone();
+
+        let cmd = StringLengthCommand::new(string_value);
 
         Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct StringLengthCommand {
+    string: CommandArg,
+}
+
+impl StringLengthCommand {
+    pub fn new(string: CommandArg) -> Self {
+        Self { string }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for StringLengthCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        // Evaluate the string argument
+        let string_value = self.string.evaluate_string(context).await?;
+
+        // Calculate the length
+        let length = string_value.len();
+
+        info!("String length of '{}': {}", string_value, length);
+
+        // Return the length as a command result
+        Ok(super::CommandResult::success_with_value(length.to_string()))
     }
 }
 
@@ -1128,50 +1059,71 @@ impl CommandParser for StringStartsWithCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        self.cmd
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
             .clone()
-            .try_get_matches_from(args.as_str_list())
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid string starts-with command: {:?}, {}", args, e);
+                let msg = format!("Invalid string starts-with command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid string starts-with command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
-
-        let string_value = matches.get_one::<String>("string").ok_or_else(|| {
+        let string_index = matches.index_of("string").ok_or_else(|| {
             let msg = format!("String value is required, but got: {:?}", args);
             error!("{}", msg);
             msg
         })?;
-        let prefix = matches.get_one::<String>("prefix").ok_or_else(|| {
+        let string_value = args[string_index].clone();
+
+        let prefix_index = matches.index_of("prefix").ok_or_else(|| {
             let msg = format!("Prefix is required, but got: {:?}", args);
             error!("{}", msg);
             msg
         })?;
+        let prefix = args[prefix_index].clone();
 
-        let starts_with = string_value.starts_with(prefix);
+        let cmd = StringStartsWithCommand::new(string_value, prefix);
+
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct StringStartsWithCommand {
+    string: CommandArg,
+    prefix: CommandArg,
+}
+
+impl StringStartsWithCommand {
+    pub fn new(string: CommandArg, prefix: CommandArg) -> Self {
+        Self { string, prefix }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for StringStartsWithCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        // Evaluate the string and prefix arguments
+        let string_value = self.string.evaluate_string(context).await?;
+        let prefix = self.prefix.evaluate_string(context).await?;
+
+        let starts_with = string_value.starts_with(&prefix);
         info!(
             "String '{}' starts with '{}': {}",
             string_value, prefix, starts_with
         );
 
-        let cmd = StringConstCommand::new(starts_with.to_string());
-
-        Ok(Arc::new(Box::new(cmd)))
+        if starts_with {
+            Ok(super::CommandResult::success_with_value("true"))
+        } else {
+            Ok(super::CommandResult::error_with_value("false"))
+        }
     }
 }
 
@@ -1226,49 +1178,70 @@ impl CommandParser for StringEndsWithCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        self.cmd
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
             .clone()
-            .try_get_matches_from(args.as_str_list())
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid string ends-with command: {:?}, {}", args, e);
+                let msg = format!("Invalid string ends-with command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid string ends-with command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
-
-        let string_value = matches.get_one::<String>("string").ok_or_else(|| {
+        let string_index = matches.index_of("string").ok_or_else(|| {
             let msg = format!("String value is required, but got: {:?}", args);
             error!("{}", msg);
             msg
         })?;
-        let suffix = matches.get_one::<String>("suffix").ok_or_else(|| {
+        let string_value = args[string_index].clone();
+
+        let suffix_index = matches.index_of("suffix").ok_or_else(|| {
             let msg = format!("Suffix is required, but got: {:?}", args);
             error!("{}", msg);
             msg
         })?;
+        let suffix = args[suffix_index].clone();
 
-        let ends_with = string_value.ends_with(suffix);
+        let cmd = StringEndsWithCommand::new(string_value, suffix);
+
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct StringEndsWithCommand {
+    string: CommandArg,
+    suffix: CommandArg,
+}
+
+impl StringEndsWithCommand {
+    pub fn new(string: CommandArg, suffix: CommandArg) -> Self {
+        Self { string, suffix }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for StringEndsWithCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        // Evaluate the string and suffix arguments
+        let string_value = self.string.evaluate_string(context).await?;
+        let suffix = self.suffix.evaluate_string(context).await?;
+
+        let ends_with = string_value.ends_with(&suffix);
         info!(
             "String '{}' ends with '{}': {}",
             string_value, suffix, ends_with
         );
 
-        let cmd = StringConstCommand::new(ends_with.to_string());
-
-        Ok(Arc::new(Box::new(cmd)))
+        if ends_with {
+            Ok(super::CommandResult::success_with_value("true"))
+        } else {
+            Ok(super::CommandResult::error_with_value("false"))
+        }
     }
 }

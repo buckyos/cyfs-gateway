@@ -1,6 +1,6 @@
 use super::cmd::*;
-use crate::block::CommandArgs;
-use crate::chain::Context;
+use crate::block::{CommandArgs, CommandArg};
+use crate::chain::{Context, ParserContext};
 use crate::collection::CollectionValue;
 use clap::{Arg, ArgAction, Command};
 use globset::{GlobBuilder, GlobMatcher};
@@ -69,37 +69,39 @@ impl CommandParser for MatchCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        self.cmd
-            .clone()
-            .try_get_matches_from(args.as_str_list())
-            .map_err(|e| {
-                let msg = format!("Invalid match command: {:?}, {}", args, e);
-                error!("{}", msg);
-                msg
-            })?;
-
-        Ok(())
-    }
 
     fn parse(
         &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid match command: {:?}, {}", args, e);
+        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+            let msg = format!("Invalid match command: {:?}, {}", str_args, e);
             error!("{}", msg);
             msg
         })?;
 
-        let value = matches
-            .get_one::<String>("value")
-            .expect("Value argument is required");
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = "Value argument is required for match command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
 
-        let pattern_str = matches
-            .get_one::<String>("pattern")
-            .expect("Pattern argument is required");
+        let pattern_index = matches.index_of("pattern").ok_or_else(|| {
+            let msg = "Pattern argument is required for match command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+
+        let pattern_str = args[pattern_index]
+            .as_literal_str()
+            .ok_or_else(|| {
+                let msg = format!("Pattern argument must be a literal string: {:?}", args[pattern_index]);
+                error!("{}", msg);
+                msg
+            })?;
 
         let no_ignore_case = matches.get_flag("no_ignore_case");
         let pattern = GlobBuilder::new(pattern_str)
@@ -112,24 +114,30 @@ impl CommandParser for MatchCommandParser {
             })?
             .compile_matcher();
 
-        let cmd = MatchCommandExecutor {
-            value: value.clone(),
-            pattern,
-        };
+        let cmd = MatchCommandExecutor::new(value, pattern);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // Match command executer
 pub struct MatchCommandExecutor {
-    pub value: String,
+    pub value: CommandArg,
     pub pattern: GlobMatcher,
+}
+
+impl MatchCommandExecutor {
+    pub fn new(value: CommandArg, pattern: GlobMatcher) -> Self {
+        Self { value, pattern }
+    }
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for MatchCommandExecutor {
-    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
-        if self.pattern.is_match(&self.value) {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        // First evaluate the value
+        let value = self.value.evaluate_string(context).await?;
+
+        if self.pattern.is_match(&value) {
             Ok(CommandResult::success_with_value("true"))
         } else {
             Ok(CommandResult::error_with_value("false"))
@@ -210,39 +218,49 @@ impl CommandParser for MatchRegexCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        self.cmd
-            .clone()
-            .try_get_matches_from(args.as_str_list())
-            .map_err(|e| {
-                let msg = format!("Invalid match-reg command: {:?}, {}", args, e);
-                error!("{}", msg);
-                msg
-            })?;
-
-        Ok(())
-    }
-
     fn parse(
         &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid match-reg command: {:?}, {}", args, e);
+        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+            let msg = format!("Invalid match-reg command: {:?}, {}", str_args, e);
             error!("{}", msg);
             msg
         })?;
 
-        let capture = matches.get_one::<String>("capture").cloned();
-        let value = matches
-            .get_one::<String>("value")
-            .expect("Value argument is required")
-            .to_owned();
+        let capture = match matches.index_of("capture") {
+            Some(index) => {
+                let name = args[index].as_literal_str().ok_or_else(|| {
+                    let msg = format!("Capture name must be a literal string: {:?}", args[index]);
+                    error!("{}", msg);
+                    msg
+                })?;
+                Some(name.to_string())
+            }
+            None => None,
+        };
 
-        let pattern_str = matches
-            .get_one::<String>("pattern")
-            .expect("Pattern argument is required");
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = "Value argument is required for match-reg command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        let pattern_index = matches.index_of("pattern").ok_or_else(|| {
+            let msg = "Pattern argument is required for match-reg command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let pattern_str = args[pattern_index]
+            .as_literal_str()
+            .ok_or_else(|| {
+                let msg = format!("Pattern argument must be a literal string: {:?}", args[pattern_index]);
+                error!("{}", msg);
+                msg
+            })?;
 
         let no_ignore_case = matches.get_flag("no_ignore_case");
         let pattern = RegexBuilder::new(pattern_str)
@@ -254,11 +272,7 @@ impl CommandParser for MatchRegexCommandParser {
                 msg
             })?;
 
-        let cmd = MatchRegexCommandExecutor {
-            capture,
-            value,
-            pattern,
-        };
+        let cmd = MatchRegexCommandExecutor::new(value, pattern, capture);
 
         Ok(Arc::new(Box::new(cmd)))
     }
@@ -267,15 +281,28 @@ impl CommandParser for MatchRegexCommandParser {
 // Match regex command executer
 pub struct MatchRegexCommandExecutor {
     pub capture: Option<String>, // Optional capture group name
-    pub value: String,
+    pub value: CommandArg,
     pub pattern: Regex,
+}
+
+impl MatchRegexCommandExecutor {
+    pub fn new(value: CommandArg, pattern: Regex, capture: Option<String>) -> Self {
+        Self {
+            value,
+            pattern,
+            capture,
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for MatchRegexCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        // First evaluate the value
+        let value = self.value.evaluate_string(context).await?;
+
         // Match the value
-        if let Some(caps) = self.pattern.captures(&self.value) {
+        if let Some(caps) = self.pattern.captures(&value) {
             if let Some(name) = &self.capture {
                 for (i, cap) in caps.iter().enumerate() {
                     if let Some(m) = cap {
@@ -357,40 +384,33 @@ impl CommandParser for EQCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let arg_list = args.as_str_list();
-        self.cmd
-            .clone()
-            .try_get_matches_from(&arg_list)
-            .map_err(|e| {
-                let msg = format!("Invalid eq command: {:?}, {}", args, e);
-                error!("{}", msg);
-                msg
-            })?;
-
-        Ok(())
-    }
-
     fn parse(
         &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid eq command: {:?}, {}", args, e);
+        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+            let msg = format!("Invalid eq command: {:?}, {}", str_args, e);
             error!("{}", msg);
             msg
         })?;
 
         let ignore_case = matches.get_flag("ignore_case");
-        let value1 = matches
-            .get_one::<String>("value1")
-            .expect("Value1 argument is required")
-            .to_owned();
-        let value2 = matches
-            .get_one::<String>("value2")
-            .expect("Value2 argument is required")
-            .to_owned();
+
+        let value_index1 = matches.index_of("value1").ok_or_else(|| {
+            let msg = "Value1 argument is required for eq command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value1 = args[value_index1].clone();
+
+        let value_index2 = matches.index_of("value2").ok_or_else(|| {
+            let msg = "Value2 argument is required for eq command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value2 = args[value_index2].clone();
 
         let cmd = EQCommandExecutor {
             ignore_case,
@@ -405,23 +425,27 @@ impl CommandParser for EQCommandParser {
 // EQ command executer
 pub struct EQCommandExecutor {
     pub ignore_case: bool, // Whether to ignore case, default is false
-    pub value1: String,
-    pub value2: String,
+    pub value1: CommandArg,
+    pub value2: CommandArg,
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for EQCommandExecutor {
-    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        // Evaluate both values
+        let value1 = self.value1.evaluate_string(context).await?;
+        let value2 = self.value2.evaluate_string(context).await?;
+
         let is_eq = if self.ignore_case {
-            self.value1.eq_ignore_ascii_case(&self.value2)
+            value1.eq_ignore_ascii_case(&value2)
         } else {
-            self.value1 == self.value2
+            value1 == value2
         };
 
         /*
         info!(
             "EQ command: comparing '{}' with '{}' (ignore_case: {})",
-            self.value1, self.value2, self.ignore_case
+            value1, value2, self.ignore_case
         );
         */
         if is_eq {
@@ -484,88 +508,111 @@ impl CommandParser for RangeCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let matches = self
-            .cmd
-            .clone()
-            .try_get_matches_from(args.as_str_list())
-            .map_err(|e| {
-                let msg = format!("Invalid range command: {:?}, {}", args, e);
-                error!("{}", msg);
-                msg
-            })?;
-
-        // Check begin and end are valid numbers
-        for arg in ["value", "begin", "end"] {
-            let index = matches.index_of(arg).unwrap();
-            if args[index].is_literal() {
-                if let Err(e) = args[index].as_literal_str().unwrap().parse::<f64>() {
-                    let msg = format!("Invalid range command {}: {:?}: {}", arg, args[index], e);
-                    error!("{}", msg);
-                    return Err(msg);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     fn parse(
         &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid range command: {:?}, {}", args, e);
+        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+            let msg = format!("Invalid range command: {:?}, {}", str_args, e);
             error!("{}", msg);
             msg
         })?;
 
-        let value = matches
-            .get_one::<String>("value")
-            .expect("Value argument is required");
-
-        let value = value.parse::<f64>().map_err(|e| {
-            let msg = format!("Invalid range value: {}: {}", value, e);
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = "Value argument is required for range command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+        if value.is_literal() {
+            if let Err(e) = value.as_literal_str().unwrap().parse::<f64>() {
+                let msg = format!("Invalid range command value: {:?}: {}", value, e);
+                error!("{}", msg);
+                return Err(msg);
+            }
+        }
+       
+        // Get the range bounds and check they are valid numbers if is literal
+        let begin_index = matches.index_of("begin").ok_or_else(|| {
+            let msg = "Begin argument is required for range command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let begin = args[begin_index].clone();
+        if begin.is_literal() {
+            if let Err(e) = begin.as_literal_str().unwrap().parse::<f64>() {
+                let msg = format!("Invalid range command begin value: {:?}: {}", begin, e);
+                error!("{}", msg);
+                return Err(msg);
+            }
+        }
+        let end_index = matches.index_of("end").ok_or_else(|| {
+            let msg = "End argument is required for range command".to_string();
             error!("{}", msg);
             msg
         })?;
 
-        // Get the range bounds
-        let begin = matches
-            .get_one::<String>("begin")
-            .expect("Begin argument is required");
-        let min = begin.parse::<f64>().map_err(|e| {
-            let msg = format!("Invalid range min value: {}: {}", begin, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let end = args[end_index].clone();
+        if end.is_literal() {
+            if let Err(e) = end.as_literal_str().unwrap().parse::<f64>() {
+                let msg = format!("Invalid range command end value: {:?}: {}", end, e);
+                error!("{}", msg);
+                return Err(msg);
+            }
+        }   
 
-        let end = matches
-            .get_one::<String>("end")
-            .expect("End argument is required");
-        let max = end.parse::<f64>().map_err(|e| {
-            let msg = format!("Invalid range max value: {}: {}", end, e);
-            error!("{}", msg);
-            msg
-        })?;
-
-        let cmd = RangeCommandExecutor { value, min, max };
+        let cmd = RangeCommandExecutor::new(
+            value,
+            begin,
+            end,
+        );
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // Range command executer
 pub struct RangeCommandExecutor {
-    pub value: f64,
-    pub min: f64,
-    pub max: f64,
+    pub value: CommandArg,
+    pub min: CommandArg,
+    pub max: CommandArg,
+}
+
+impl RangeCommandExecutor {
+    pub fn new(value: CommandArg, min: CommandArg, max: CommandArg) -> Self {
+        Self { value, min, max }
+    }
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for RangeCommandExecutor {
     async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
-        if self.value >= self.min && self.value <= self.max {
+        // First evaluate the value, min and max
+        let value = self.value.evaluate_string(_context).await?;
+        let min = self.min.evaluate_string(_context).await?;
+        let max = self.max.evaluate_string(_context).await?;
+
+        // Convert to f64 for comparison
+        let value = value.parse::<f64>().map_err(|e| {
+            let msg = format!("Invalid range value: {}: {}", value, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let min = min.parse::<f64>().map_err(|e| {
+            let msg = format!("Invalid range min value: {}: {}", min, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let max = max.parse::<f64>().map_err(|e| {
+            let msg = format!("Invalid range max value: {}: {}", max, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        if value >= min && value <= max {
             Ok(CommandResult::success_with_value("true"))
         } else {
             Ok(CommandResult::error_with_value("false"))

@@ -1,6 +1,5 @@
 use crate::block::CommandArgs;
 use crate::chain::{Context, ParserContext};
-use crate::collection::CollectionValue;
 use std::sync::Arc;
 use clap::Command;
 
@@ -69,68 +68,27 @@ pub trait CommandParser: Send + Sync {
         format!("Usage: {}", name)
     }
 
-    /// Check if the command needs to translate expressions.
-    /// This is used to determine if the command has expressions that need to be evaluated before parsing.
-    /// Default is true, can be overridden by specific command parsers.
-    fn need_translate_expression(&self) -> bool {
-        true
-    }
-
-    fn parse_without_translate(
-        &self,
-        _context: &ParserContext,
-        _args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        unimplemented!("CommandParser::parse_without_translate should be implemented by the command parser");
-    }
-
-    fn check_with_context(
-        &self,
-        _context: &ParserContext,
-        args: &CommandArgs,
-    ) -> Result<(), String> {
-        // Default implementation, can be overridden by specific command parsers
-        self.check(args)
-    }
-
-    // To check if the command is valid at first parse, such as checking if the params count is correct.
-    // This is used to validate the command before load params if needed and executing it.
-    // This should be implemented when need_translate_expression is true.
-    fn check(&self, _args: &CommandArgs) -> Result<(), String> {
-        unimplemented!("CommandParser::check should be implemented by the command parser");
-    }
-
-    fn parse_origin_with_context(
-        &self,
-        _context: &ParserContext,
-        args: Vec<CollectionValue>,
-        origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        self.parse_origin(args, origin_args)
-    }
-
+    /// Parse the command arguments if valid then return a CommandExecutor.
     fn parse_origin(
         &self,
-        args: Vec<CollectionValue>,
-        origin_args: &CommandArgs,
+        context: &ParserContext,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let mut str_args = Vec::with_capacity(args.len());
-        for value in args {
-            match value {
-                CollectionValue::String(s) => str_args.push(s),
-                _ => {
-                    let msg = format!("Invalid command argument type: {}", value);
-                    error!("{}", msg);
-                    return Err(msg);
-                }
-            }
-        }
+        let str_args = args
+            .iter()
+            .map(|value| value.as_str())
+            .collect::<Vec<&str>>();
 
-        self.parse(str_args, origin_args)
+        self.parse(context, str_args, args)
     }
 
-    fn parse(&self, _args: Vec<String>, _origin_args: &CommandArgs) -> Result<CommandExecutorRef, String> {
-        unimplemented!("CommandParser::parse should be implemented by the command parser");
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        _str_args: Vec<&str>,
+        _args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        unimplemented!("CommandParser::parse must be implemented by the parser");
     }
 }
 

@@ -1,6 +1,6 @@
 use super::cmd::*;
-use crate::block::CommandArgs;
-use crate::chain::{Context, EnvLevel};
+use crate::block::{CommandArg, CommandArgs};
+use crate::chain::{Context, EnvLevel, ParserContext};
 use crate::collection::{CollectionType, CollectionValue};
 use clap::{Arg, Command};
 use std::sync::Arc;
@@ -53,7 +53,7 @@ Notes:
     - Values must be listed as separate arguments (not as a single list).
 
 Examples:
-    match-include test.coll "test_value"
+    match-include $test.coll "test_value"
     match-include $HOST $REQ_host "www.test.com" && drop
     match-include $IP $REQ_ip "127.0.0.1" "192.168.100.1" && accept
 "#,
@@ -91,38 +91,12 @@ impl CommandParser for MatchIncludeCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let str_list = args.as_str_list();
-        self.cmd
-            .clone()
-            .try_get_matches_from(&str_list)
-            .map_err(|e| {
-                let msg = format!("Invalid match-include command: {:?}, {}", args, e);
-                error!("{}", msg);
-                msg
-            })?;
-
-        // Args should have at least two elements
-        if args.len() < 2 {
-            let msg = format!("Invalid match-include command: {:?}", args);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
-        Ok(())
-    }
-
-    fn parse_origin(
+    fn parse(
         &self,
-        args: Vec<CollectionValue>,
-        origin_args: &CommandArgs,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        // Convert CollectionValue to String for clap parsing
-        let str_args = args
-            .iter()
-            .map(|value| value.to_string())
-            .collect::<Vec<String>>();
-
         let matches = self
             .cmd
             .clone()
@@ -133,74 +107,40 @@ impl CommandParser for MatchIncludeCommandParser {
                 msg
             })?;
 
-        let collection_index = matches.index_of("collection").unwrap();
-        let collection = args[collection_index].clone();
-        let collection_id = origin_args[collection_index].as_str().to_string();
-
-        let key = matches
-            .get_one::<String>("key")
-            .expect("key is required")
-            .clone();
-
-        let values = matches
-            .get_many::<String>("values")
-            .map(|v| v.map(|s| s.clone()).collect::<Vec<String>>())
-            .unwrap_or_default();
-
-        let cmd = MatchIncludeCommandExecutor::new(collection_id, collection, key, values);
-        Ok(Arc::new(Box::new(cmd)))
-    }
-
-    /*
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid match-include command: {:?}, {}", args, e);
+        let collection_index = matches.index_of("collection").ok_or_else(|| {
+            let msg = "Collection argument is required for match-include command".to_string();
             error!("{}", msg);
             msg
         })?;
+        let collection = args[collection_index].clone();
 
-        let collection_id = matches
-            .get_one::<String>("collection")
-            .expect("collection is required")
-            .clone();
+        let key_index = matches.index_of("key").ok_or_else(|| {
+            let msg = "Key argument is required for match-include command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let key = args[key_index].clone();
 
-        let key = matches
-            .get_one::<String>("key")
-            .expect("key is required")
-            .clone();
+        let values = match matches.indices_of("values") {
+            Some(indices) => indices.map(|i| args[i].clone()).collect(),
+            None => vec![],
+        };
 
-        let values = matches
-            .get_many::<String>("values")
-            .map(|v| v.map(|s| s.clone()).collect::<Vec<String>>())
-            .unwrap_or_default();
-
-        let cmd = MatchIncludeCommandExecutor::new(collection_id, key, values);
+        let cmd = MatchIncludeCommandExecutor::new(collection, key, values);
         Ok(Arc::new(Box::new(cmd)))
     }
-    */
 }
 
 // MatchIncludeCommandExecutor
 struct MatchIncludeCommandExecutor {
-    collection_id: String,
-    collection: CollectionValue,
-    key: String,
-    values: Vec<String>,
+    collection: CommandArg,
+    key: CommandArg,
+    values: Vec<CommandArg>,
 }
 
 impl MatchIncludeCommandExecutor {
-    pub fn new(
-        collection_id: String,
-        collection: CollectionValue,
-        key: String,
-        values: Vec<String>,
-    ) -> Self {
+    pub fn new(collection: CommandArg, key: CommandArg, values: Vec<CommandArg>) -> Self {
         Self {
-            collection_id,
             collection,
             key,
             values,
@@ -211,12 +151,17 @@ impl MatchIncludeCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for MatchIncludeCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        // First evaluate the collection and key arguments
+        let collection = self.collection.evaluate(context).await?;
+        let key = self.key.evaluate_string(context).await?;
+        let values = CommandArg::evaluate_string_list(&self.values, context).await?;
+
         // Get the collection from the context
-        let collection = match &self.collection {
+        let collection = match collection {
             CollectionValue::String(collection_id) => {
                 let ret = context.env().get(&collection_id, None).await?;
                 if ret.is_none() {
-                    let msg = format!("Collection with id '{}' not found", self.collection_id);
+                    let msg = format!("Collection with id '{:?}' not found", self.collection);
                     warn!("{}", msg);
                     return Ok(CommandResult::error_with_value(msg));
                 }
@@ -233,7 +178,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                 coll
             }
             CollectionValue::Set(_) | CollectionValue::Map(_) | CollectionValue::MultiMap(_) => {
-                self.collection.clone()
+                collection
             }
             CollectionValue::Visitor(_) | CollectionValue::Any(_) => {
                 let msg = "Collection cannot be a visitor or any type for match-include command"
@@ -246,10 +191,10 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
         match collection {
             CollectionValue::Set(collection) => {
                 // For set collection, we check if the key is included
-                let contains = collection.contains(&self.key).await?;
+                let contains = collection.contains(&key).await?;
                 info!(
-                    "MatchInclude command: key='{}', collection_id='{}', contains={}",
-                    self.key, self.collection_id, contains
+                    "MatchInclude command: key='{}', collection='{:?}', contains={}",
+                    key, self.collection, contains
                 );
                 if contains {
                     Ok(CommandResult::success_with_value("true"))
@@ -259,19 +204,19 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
             }
             CollectionValue::Map(collection) => {
                 // For map collection, we check if the key exists and matches the value
-                let value = collection.get(&self.key).await?;
+                let value = collection.get(&key).await?;
                 if let Some(value) = value {
-                    if self.values.is_empty() {
+                    if values.is_empty() {
                         info!(
-                            "MatchInclude command: key='{}', collection_id='{}', value='{}' found",
-                            self.key, self.collection_id, value
+                            "MatchInclude command: key='{}', collection='{:?}', value='{}' found",
+                            key, self.collection, value
                         );
                         return Ok(CommandResult::success_with_value("true"));
                     } else {
-                        if self.values.len() > 1 {
+                        if values.len() > 1 {
                             warn!(
-                                "match-include command for map with id '{}' expects at most one value, got {}",
-                                self.collection_id,
+                                "match-include command for map with id '{:?}' expects at most one value, got {}",
+                                self.collection,
                                 self.values.len()
                             );
                         }
@@ -279,10 +224,10 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                         // Only check if the first value matches
                         match value {
                             CollectionValue::String(ref v) => {
-                                if self.values[0] == *v {
+                                if values[0] == *v {
                                     info!(
-                                        "match-include command: key='{}', collection_id='{}', value='{}' found",
-                                        self.key, self.collection_id, v
+                                        "match-include command: key='{}', collection='{:?}', value='{}' found",
+                                        key, self.collection, v
                                     );
                                     return Ok(CommandResult::success_with_value("true"));
                                 } else {
@@ -291,9 +236,9 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                             }
                             _ => {
                                 warn!(
-                                    "match-include command: value is not string! key='{}', collection_id='{}', value_type='{}'",
-                                    self.key,
-                                    self.collection_id,
+                                    "match-include command: value is not string! key='{}', collection='{:?}', value_type='{}'",
+                                    key,
+                                    self.collection,
                                     value.get_type()
                                 );
                             }
@@ -302,8 +247,8 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                 }
 
                 info!(
-                    "match-include command: key='{}', collection_id='{}', no matching key or value found",
-                    self.key, self.collection_id
+                    "match-include command: key='{}', collection='{:?}', no matching key or value found",
+                    key, self.collection
                 );
 
                 Ok(CommandResult::error_with_value("false"))
@@ -311,28 +256,24 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
 
             CollectionValue::MultiMap(collection) => {
                 // For multi-map collection, we check if the key exists and matches all of the values
-                let ret = if self.values.is_empty() {
-                    collection.contains_key(&self.key).await?
+                let ret = if values.is_empty() {
+                    collection.contains_key(&key).await?
                 } else {
-                    let values = self
-                        .values
-                        .iter()
-                        .map(|v| v.as_str())
-                        .collect::<Vec<&str>>();
-                    collection.contains_value(&self.key, &values).await?
+                    let values = values.iter().map(|v| v.as_str()).collect::<Vec<&str>>();
+                    collection.contains_value(&key, &values).await?
                 };
 
                 if ret {
                     info!(
-                        "MatchInclude command: key='{}', collection_id='{}' exists",
-                        self.key, self.collection_id
+                        "MatchInclude command: key='{}', collection='{:?}' exists",
+                        key, self.collection
                     );
-                    
+
                     Ok(CommandResult::success_with_value("true"))
                 } else {
                     info!(
-                        "MatchInclude command: key='{}', collection_id='{}' does not exist",
-                        self.key, self.collection_id
+                        "MatchInclude command: key='{}', collection='{:?}' does not exist",
+                        key, self.collection
                     );
 
                     Ok(CommandResult::error_with_value("false"))
@@ -425,30 +366,21 @@ impl CommandParser for SetCreateCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let str_list = args.as_str_list();
-        self.cmd
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
             .clone()
-            .try_get_matches_from(&str_list)
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid set-create command: {:?}, {}", args, e);
+                let msg = format!("Invalid set-create command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
-
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid set-create command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
 
         let level = if matches.get_flag("global") {
             EnvLevel::Global
@@ -459,10 +391,12 @@ impl CommandParser for SetCreateCommandParser {
         };
 
         // Get the set_id from the matches
-        let set_id = matches
-            .get_one::<String>("set_id")
-            .expect("set_id is required")
-            .clone();
+        let set_index = matches.index_of("set_id").ok_or_else(|| {
+            let msg = "set_id argument is required for set-create command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let set_id = args[set_index].clone();
 
         let cmd = SetCreateCommandExecutor::new(level, set_id);
         Ok(Arc::new(Box::new(cmd)))
@@ -472,11 +406,11 @@ impl CommandParser for SetCreateCommandParser {
 // SetCreateCommandExecutor
 pub struct SetCreateCommandExecutor {
     level: EnvLevel, // Chain or Global
-    set_id: String,
+    set_id: CommandArg,
 }
 
 impl SetCreateCommandExecutor {
-    pub fn new(level: EnvLevel, set_id: String) -> Self {
+    pub fn new(level: EnvLevel, set_id: CommandArg) -> Self {
         Self { level, set_id }
     }
 }
@@ -484,22 +418,25 @@ impl SetCreateCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for SetCreateCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        // Evaluate the set_id argument
+        let set_id = self.set_id.evaluate_string(context).await?;
+
         // Create a new set collection with the given id
         match context
             .env()
-            .create_collection(&self.set_id, CollectionType::Set, self.level)
+            .create_collection(&set_id, CollectionType::Set, self.level)
             .await?
         {
             Some(_) => {
                 info!(
-                    "Set collection with id '{}' {:?} created successfully",
+                    "Set collection with id '{:?}' {:?} created successfully",
                     self.set_id, self.level
                 );
                 Ok(CommandResult::success())
             }
             None => {
                 let msg = format!(
-                    "Failed to create set collection with id '{}' {:?}",
+                    "Failed to create set collection with id '{:?}' {:?}",
                     self.set_id, self.level
                 );
                 warn!("{}", msg);
@@ -563,84 +500,96 @@ impl CommandParser for SetAddCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let str_list = args.as_str_list();
-        self.cmd
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
             .clone()
-            .try_get_matches_from(&str_list)
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
                 let msg = format!("Invalid set-add command: {:?}, {}", args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid set-add command: {:?}, {}", args, e);
+        let set_index = matches.index_of("set_id").ok_or_else(|| {
+            let msg = "set_id argument is required for set-add command".to_string();
             error!("{}", msg);
             msg
         })?;
+        let set = args[set_index].clone();
 
-        let set_id = matches
-            .get_one::<String>("set_id")
-            .expect("set_id is required")
-            .clone();
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = "value argument is required for set-add command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
 
-        let value = matches
-            .get_one::<String>("value")
-            .expect("value is required")
-            .clone();
-
-        let cmd = SetAddCommandExecutor::new(set_id, value);
+        let cmd = SetAddCommandExecutor::new(set, value);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // SetAddCommandExecutor
 pub struct SetAddCommandExecutor {
-    pub set_id: String,
-    pub value: String,
+    pub set: CommandArg,
+    pub value: CommandArg,
 }
 
 impl SetAddCommandExecutor {
-    pub fn new(set_id: String, value: String) -> Self {
-        Self { set_id, value }
+    pub fn new(set: CommandArg, value: CommandArg) -> Self {
+        Self { set, value }
     }
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for SetAddCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
-        // Add the value to the specified set collection
-        let ret = context.env().get(&self.set_id, None).await?;
-        if ret.is_none() {
-            let msg = format!("Set collection with id '{}' not found", self.set_id);
-            warn!("{}", msg);
-            return Ok(CommandResult::error_with_value(msg));
-        }
+        let set = self.set.evaluate(context).await?;
+        let value = self.value.evaluate_string(context).await?;
 
-        let ret = ret.unwrap();
-        let collection = ret.try_as_set()?;
+        let set = match set {
+            CollectionValue::String(set_id) => {
+                let ret = context.env().get(&set_id, None).await?;
+                if ret.is_none() {
+                    let msg = format!("Set collection with id '{}' not found", set_id);
+                    warn!("{}", msg);
+                    return Ok(CommandResult::error_with_value(msg));
+                }
+                let coll = ret.unwrap();
+                if !coll.is_set() {
+                    let msg = format!("Expected CollectionValue::Set, found {}", coll.get_type());
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
 
-        match collection.insert(&self.value).await? {
+                coll.into_set().unwrap()
+            }
+            CollectionValue::Set(set) => set,
+            _ => {
+                let msg = "Collection must be a Set for set-add command".to_string();
+                warn!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        match set.insert(&value).await? {
             true => {
                 info!(
-                    "Value '{}' added to set collection with id '{}'",
-                    self.value, self.set_id
+                    "Value '{}' added to set collection with id '{:?}'",
+                    value, self.set
                 );
                 Ok(CommandResult::success())
             }
             false => {
                 let msg = format!(
-                    "Failed to add value '{}' to set collection with id '{}'",
-                    self.value, self.set_id
+                    "Failed to add value '{}' to set collection with id '{:?}'",
+                    value, self.set
                 );
                 warn!("{}", msg);
                 Ok(CommandResult::error_with_value(msg))
@@ -703,84 +652,97 @@ impl CommandParser for SetRemoveCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let str_list = args.as_str_list();
-        self.cmd
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
             .clone()
-            .try_get_matches_from(&str_list)
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid set-remove command: {:?}, {}", args, e);
+                let msg = format!("Invalid set-remove command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid set-remove command: {:?}, {}", args, e);
+        let set_index = matches.index_of("set_id").ok_or_else(|| {
+            let msg = "set_id argument is required for set-remove command".to_string();
             error!("{}", msg);
             msg
         })?;
+        let set = args[set_index].clone();
 
-        let set_id = matches
-            .get_one::<String>("set_id")
-            .expect("set_id is required")
-            .clone();
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = "value argument is required for set-remove command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
 
-        let value = matches
-            .get_one::<String>("value")
-            .expect("value is required")
-            .clone();
-
-        let cmd = SetRemoveCommandExecutor::new(set_id, value);
+        let cmd = SetRemoveCommandExecutor::new(set, value);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // SetRemoveCommandExecutor
 pub struct SetRemoveCommandExecutor {
-    pub set_id: String,
-    pub value: String,
+    pub set: CommandArg,
+    pub value: CommandArg,
 }
 
 impl SetRemoveCommandExecutor {
-    pub fn new(set_id: String, value: String) -> Self {
-        Self { set_id, value }
+    pub fn new(set: CommandArg, value: CommandArg) -> Self {
+        Self { set, value }
     }
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for SetRemoveCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let set = self.set.evaluate(context).await?;
+        let value = self.value.evaluate_string(context).await?;
+
+        let set = match set {
+            CollectionValue::String(set_id) => {
+                let ret = context.env().get(&set_id, None).await?;
+                if ret.is_none() {
+                    let msg = format!("Set collection with id '{}' not found", set_id);
+                    warn!("{}", msg);
+                    return Ok(CommandResult::error_with_value(msg));
+                }
+                let coll = ret.unwrap();
+                if !coll.is_set() {
+                    let msg = format!("Expected CollectionValue::Set, found {}", coll.get_type());
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+
+                coll.into_set().unwrap()
+            }
+            CollectionValue::Set(set) => set,
+            _ => {
+                let msg = "Collection must be a Set for set-remove command".to_string();
+                warn!("{}", msg);
+                return Err(msg);
+            }
+        };
+
         // Remove the value from the specified set collection
-        let ret = context.env().get(&self.set_id, None).await?;
-        if ret.is_none() {
-            let msg = format!("Set collection with id '{}' not found", self.set_id);
-            warn!("{}", msg);
-            return Ok(CommandResult::error_with_value(msg));
-        }
-
-        let ret = ret.unwrap();
-        let collection = ret.try_as_set()?;
-
-        match collection.remove(&self.value).await? {
+        match set.remove(&value).await? {
             true => {
                 info!(
-                    "Value '{}' removed from set collection with id '{}'",
-                    self.value, self.set_id
+                    "Value '{}' removed from set collection with id '{:?}'",
+                    value, self.set
                 );
                 Ok(CommandResult::success())
             }
             false => {
                 let msg = format!(
-                    "Failed to remove value '{}' from set collection with id '{}'",
-                    self.value, self.set_id
+                    "Failed to remove value '{}' from set collection with id '{:?}'",
+                    value, self.set
                 );
                 warn!("{}", msg);
                 Ok(CommandResult::error_with_value(msg))
@@ -868,30 +830,21 @@ impl CommandParser for MapCreateCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let str_list = args.as_str_list();
-        self.cmd
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
             .clone()
-            .try_get_matches_from(&str_list)
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid map-create command: {:?}, {}", args, e);
+                let msg = format!("Invalid map-create command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
-
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid map-create command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
 
         let is_multi = matches.get_flag("multi");
         let level = if matches.get_flag("global") {
@@ -903,10 +856,12 @@ impl CommandParser for MapCreateCommandParser {
         };
 
         // Get the map_id from the matches
-        let map_id = matches
-            .get_one::<String>("map_id")
-            .expect("map_id is required")
-            .clone();
+        let map_index = matches.index_of("map_id").ok_or_else(|| {
+            let msg = "map_id argument is required for map-create command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let map_id = args[map_index].clone();
 
         let cmd = MapCreateCommandExecutor::new(is_multi, level, map_id);
         Ok(Arc::new(Box::new(cmd)))
@@ -917,11 +872,11 @@ impl CommandParser for MapCreateCommandParser {
 pub struct MapCreateCommandExecutor {
     level: EnvLevel, // Chain or Global
     is_multi: bool,  // Indicates if this is a multi-map
-    map_id: String,
+    map_id: CommandArg,
 }
 
 impl MapCreateCommandExecutor {
-    pub fn new(is_multi: bool, level: EnvLevel, map_id: String) -> Self {
+    pub fn new(is_multi: bool, level: EnvLevel, map_id: CommandArg) -> Self {
         Self {
             level,
             is_multi,
@@ -933,30 +888,33 @@ impl MapCreateCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for MapCreateCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        // Evaluate the map_id argument
+        let map_id = self.map_id.evaluate_string(context).await?;
+
         // Create a new map collection with the given id
         let ret = if self.is_multi {
             context
                 .env()
-                .create_collection(&self.map_id, CollectionType::MultiMap, self.level)
+                .create_collection(&map_id, CollectionType::MultiMap, self.level)
                 .await
         } else {
             context
                 .env()
-                .create_collection(&self.map_id, CollectionType::Map, self.level)
+                .create_collection(&map_id, CollectionType::Map, self.level)
                 .await
         }?;
 
         match ret {
             Some(_) => {
                 info!(
-                    "Map collection with id '{}' multi={} level={:?}, created successfully",
+                    "Map collection with id '{:?}' multi={} level={:?}, created successfully",
                     self.map_id, self.is_multi, self.level,
                 );
                 Ok(CommandResult::success())
             }
             None => {
                 let msg = format!(
-                    "Failed to create map collection with id '{}' multi={} level={:?}",
+                    "Failed to create map collection with id '{:?}' multi={} level={:?}",
                     self.map_id, self.is_multi, self.level
                 );
                 warn!("{}", msg);
@@ -1026,87 +984,107 @@ impl CommandParser for MapAddCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let str_list = args.as_str_list();
-        self.cmd
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
             .clone()
-            .try_get_matches_from(&str_list)
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid map-add command: {:?}, {}", args, e);
+                let msg = format!("Invalid map-add command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid map-add command: {:?}, {}", args, e);
+        let map_index = matches.index_of("map_id").ok_or_else(|| {
+            let msg = "map_id argument is required for map-add command".to_string();
             error!("{}", msg);
             msg
         })?;
+        let map = args[map_index].clone();
 
-        let map_id = matches
-            .get_one::<String>("map_id")
-            .expect("map_id is required")
-            .clone();
+        let key_index = matches.index_of("key").ok_or_else(|| {
+            let msg = "key argument is required for map-add command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let key = args[key_index].clone();
 
-        let key = matches
-            .get_one::<String>("key")
-            .expect("key is required")
-            .clone();
+        let values = match matches.indices_of("values") {
+            Some(indices) => indices.map(|i| args[i].clone()).collect(),
+            None => {
+                let msg = "At least one value is required for map-add command".to_string();
+                error!("{}", msg);
+                return Err(msg);
+            }
+        };
 
-        let values = matches
-            .get_many::<String>("values")
-            .map(|v| v.map(|s| s.clone()).collect::<Vec<String>>())
-            .expect("values are required");
-
-        let cmd = MapAddCommandExecutor::new(map_id, key, values);
+        let cmd = MapAddCommandExecutor::new(map, key, values);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // MapAddCommandExecutor
 pub struct MapAddCommandExecutor {
-    pub map_id: String,
-    pub key: String,
-    pub value: Vec<String>,
+    pub map: CommandArg,
+    pub key: CommandArg,
+    pub value: Vec<CommandArg>,
 }
 
 impl MapAddCommandExecutor {
-    pub fn new(map_id: String, key: String, value: Vec<String>) -> Self {
-        Self {
-            map_id: map_id.to_owned(),
-            key: key.to_owned(),
-            value,
-        }
+    pub fn new(map: CommandArg, key: CommandArg, value: Vec<CommandArg>) -> Self {
+        Self { map, key, value }
     }
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for MapAddCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
-        // Add the key-value pair to the specified map collection
-        let ret = context.env().get(&self.map_id, None).await?;
-        if ret.is_none() {
-            let msg = format!("Map collection with id '{}' not found", self.map_id);
-            warn!("{}", msg);
-            return Ok(CommandResult::error_with_value(msg));
-        }
+        let map = self.map.evaluate(context).await?;
+        let key = self.key.evaluate_string(context).await?;
+        let values = CommandArg::evaluate_string_list(&self.value, context).await?;
 
-        let ret = ret.unwrap();
-        match ret {
+        let map = match map {
+            CollectionValue::String(map_id) => {
+                let ret = context.env().get(&map_id, None).await?;
+                if ret.is_none() {
+                    let msg = format!("Map collection with id '{}' not found", map_id);
+                    warn!("{}", msg);
+                    return Ok(CommandResult::error_with_value(msg));
+                }
+                let coll = ret.unwrap();
+                if !coll.is_map() && !coll.is_multi_map() {
+                    let msg = format!(
+                        "Expected CollectionValue::Map or CollectionValue::MultiMap, found {}",
+                        coll.get_type(),
+                    );
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+
+                coll
+            }
+            CollectionValue::Map(_) => map,
+            CollectionValue::MultiMap(_) => map,
+            _ => {
+                let msg = "Collection must be a Map or MultiMap for map-add command".to_string();
+                warn!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        // Add the key-value pair to the specified map collection
+        match map {
             CollectionValue::Map(collection) => {
                 // For normal map, we expect only one value
                 if self.value.len() != 1 {
                     warn!(
-                        "map-add command for normal map with id '{}' expects exactly one value, got {}",
-                        self.map_id,
+                        "map-add command for normal map with id '{:?}' expects exactly one value, got {}",
+                        self.map,
                         self.value.len()
                     );
 
@@ -1114,20 +1092,20 @@ impl CommandExecutor for MapAddCommandExecutor {
                 }
 
                 match collection
-                    .insert(&self.key, CollectionValue::String(self.value[0].clone()))
+                    .insert(&key, CollectionValue::String(values[0].clone()))
                     .await?
                 {
                     None => {
                         info!(
-                            "Key '{}' with value '{}' added to map collection with id '{}'",
-                            self.key, self.value[0], self.map_id
+                            "Key '{}' with value '{}' added to map collection with id '{:?}'",
+                            key, values[0], self.map
                         );
                         Ok(CommandResult::success())
                     }
                     Some(prev) => {
                         info!(
-                            "Key '{}' updated from value '{}' to '{}' in map collection with id '{}'",
-                            self.key, prev, self.value[0], self.map_id
+                            "Key '{}' updated from value '{}' to '{}' in map collection with id '{:?}'",
+                            key, prev, values[0], self.map
                         );
                         Ok(CommandResult::success())
                     }
@@ -1135,31 +1113,31 @@ impl CommandExecutor for MapAddCommandExecutor {
             }
             CollectionValue::MultiMap(collection) => {
                 let ret = if self.value.len() == 1 {
-                    collection.insert(&self.key, &self.value[0]).await?
+                    collection.insert(&key, &values[0]).await?
                 } else {
                     assert!(
-                        self.value.len() > 1,
-                        "map-add command for multi-map with id '{}' expects at least one value, got {}",
-                        self.map_id,
+                        values.len() > 1,
+                        "map-add command for multi-map with id '{:?}' expects at least one value, got {}",
+                        self.map,
                         self.value.len()
                     );
 
-                    let values: Vec<&str> = self.value.iter().map(|s| s.as_str()).collect();
-                    collection.insert_many(&self.key, &values).await?
+                    let values: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
+                    collection.insert_many(&key, &values).await?
                 };
 
                 match ret {
                     true => {
                         info!(
-                            "Key '{}' with values '{:?}' added to multi-map collection with id '{}'",
-                            self.key, self.value, self.map_id
+                            "Key '{}' with values '{:?}' added to multi-map collection with id '{:?}'",
+                            key, values, self.map
                         );
                         Ok(CommandResult::success())
                     }
                     false => {
                         let msg = format!(
-                            "Key '{}' with values '{:?}' already exists in multi-map collection with id '{}'",
-                            self.key, self.value, self.map_id
+                            "Key '{}' with values '{:?}' already exists in multi-map collection with id '{:?}'",
+                            key, values, self.map
                         );
                         warn!("{}", msg);
                         Ok(CommandResult::error_with_value(msg))
@@ -1170,7 +1148,7 @@ impl CommandExecutor for MapAddCommandExecutor {
             _ => {
                 let msg = format!(
                     "Expected CollectionValue::Map or CollectionValue::MultiMap, found {}",
-                    ret,
+                    map,
                 );
                 warn!("{}", msg);
                 Err(msg)
@@ -1242,134 +1220,146 @@ impl CommandParser for MapRemoveCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-    fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let str_list = args.as_str_list();
-        self.cmd
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
             .clone()
-            .try_get_matches_from(&str_list)
+            .try_get_matches_from(&str_args)
             .map_err(|e| {
-                let msg = format!("Invalid map-remove command: {:?}, {}", args, e);
+                let msg = format!("Invalid map-remove command: {:?}, {}", str_args, e);
                 error!("{}", msg);
                 msg
             })?;
 
-        Ok(())
-    }
-
-    fn parse(
-        &self,
-        args: Vec<String>,
-        _origin_args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&args).map_err(|e| {
-            let msg = format!("Invalid map-remove command: {:?}, {}", args, e);
+        let map_index = matches.index_of("map_id").ok_or_else(|| {
+            let msg = "map_id argument is required for map-remove command".to_string();
             error!("{}", msg);
             msg
         })?;
+        let map = args[map_index].clone();
 
-        let map_id = matches
-            .get_one::<String>("map_id")
-            .expect("map_id is required")
-            .clone();
+        let key_index = matches.index_of("key").ok_or_else(|| {
+            let msg = "key argument is required for map-remove command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let key = args[key_index].clone();
 
-        let key = matches
-            .get_one::<String>("key")
-            .expect("key is required")
-            .clone();
+        let values = match matches.indices_of("values") {
+            Some(indices) => indices.map(|i| args[i].clone()).collect(),
+            None => Vec::new(), // No values provided, just remove the key
+        };
 
-        let values = matches
-            .get_many::<String>("values")
-            .map(|v| v.map(|s| s.clone()).collect::<Vec<String>>())
-            .unwrap_or_default();
-
-        let cmd = MapRemoveCommandExecutor::new(map_id, key, values);
+        let cmd = MapRemoveCommandExecutor::new(map, key, values);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // MapRemoveCommandExecutor
 pub struct MapRemoveCommandExecutor {
-    map_id: String,
-    key: String,
-    values: Vec<String>,
+    map: CommandArg,
+    key: CommandArg,
+    values: Vec<CommandArg>,
 }
 
 impl MapRemoveCommandExecutor {
-    pub fn new(map_id: String, key: String, values: Vec<String>) -> Self {
-        Self {
-            map_id,
-            key,
-            values,
-        }
+    pub fn new(map: CommandArg, key: CommandArg, values: Vec<CommandArg>) -> Self {
+        Self { map, key, values }
     }
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for MapRemoveCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
-        // Remove the key from the specified map collection
-        let ret = context.env().get(&self.map_id, None).await?;
-        if ret.is_none() {
-            let msg = format!("Map collection with id '{}' not found", self.map_id);
-            warn!("{}", msg);
-            return Ok(CommandResult::error_with_value(msg));
-        }
+        let map = self.map.evaluate(context).await?;
+        let key = self.key.evaluate_string(context).await?;
+        let values = CommandArg::evaluate_string_list(&self.values, context).await?;
 
-        let ret = ret.unwrap();
-        match ret {
+        let map = match map {
+            CollectionValue::String(map_id) => {
+                let ret = context.env().get(&map_id, None).await?;
+                if ret.is_none() {
+                    let msg = format!("Map collection with id '{}' not found", map_id);
+                    warn!("{}", msg);
+                    return Ok(CommandResult::error_with_value(msg));
+                }
+                let coll = ret.unwrap();
+                if !coll.is_map() && !coll.is_multi_map() {
+                    let msg = format!(
+                        "Expected CollectionValue::Map or CollectionValue::MultiMap, found {}",
+                        coll.get_type(),
+                    );
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+
+                coll
+            }
+            CollectionValue::Map(_) => map,
+            CollectionValue::MultiMap(_) => map,
+            _ => {
+                let msg = "Collection must be a Map or MultiMap for map-remove command".to_string();
+                warn!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        // Remove the key with values from the specified map collection
+        match map {
             CollectionValue::Map(collection) => {
                 // For normal map, we expect only one value
-                if self.values.len() > 1 {
+                if values.len() > 1 {
                     warn!(
-                        "map-remove command for normal map with id '{}' expects at most one value, got {}",
-                        self.map_id,
-                        self.values.len()
+                        "map-remove command for normal map with id '{:?}' expects at most one value, got {}",
+                        self.map,
+                        values.len()
                     );
                 }
 
-                match collection.remove(&self.key).await? {
+                match collection.remove(&key).await? {
                     Some(value) => {
                         info!(
-                            "Key '{}' removed from map collection with id '{}': {}",
-                            self.key, self.map_id, value
+                            "Key '{}' removed from map collection with id '{:?}': {}",
+                            key, self.map, value,
                         );
                         Ok(CommandResult::success_with_value(value.treat_as_str()))
                     }
                     None => {
                         warn!(
-                            "Key '{}' not found in map collection with id '{}'",
-                            self.key, self.map_id
+                            "Key '{}' not found in map collection with id '{:?}'",
+                            key, self.map,
                         );
                         Ok(CommandResult::error())
                     }
                 }
             }
             CollectionValue::MultiMap(collection) => {
-                if self.values.is_empty() {
+                if values.is_empty() {
                     return Ok(CommandResult::error_with_value(
                         "No values provided for multi-map remove".to_string(),
                     ));
                 }
 
-                let ret = if self.values.len() == 0 {
-                    match collection.remove_all(&self.key).await? {
+                let ret = if values.len() == 0 {
+                    match collection.remove_all(&key).await? {
                         Some(ret) => Some(ret.get_all().await?.join(" ")),
                         None => None,
                     }
-                } else if self.values.len() == 1 {
-                    let ret = collection.remove(&self.key, &self.values[0]).await?;
-                    if ret {
-                        Some(self.values[0].clone())
-                    } else {
-                        None
-                    }
+                } else if values.len() == 1 {
+                    let ret = collection.remove(&key, &values[0]).await?;
+                    if ret { Some(values[0].clone()) } else { None }
                 } else {
                     let values = self
                         .values
                         .iter()
                         .map(|s| s.as_str())
                         .collect::<Vec<&str>>();
-                    match collection.remove_many(&self.key, &values).await? {
+                    match collection.remove_many(&key, &values).await? {
                         Some(ret) => Some(ret.get_all().await?.join(" ")),
                         None => None,
                     }
@@ -1377,14 +1367,14 @@ impl CommandExecutor for MapRemoveCommandExecutor {
 
                 if let Some(value) = ret {
                     info!(
-                        "Key '{}' with values '{}' removed from multi-map collection with id '{}'",
-                        self.key, value, self.map_id
+                        "Key '{}' with values '{}' removed from multi-map collection with id '{:?}'",
+                        key, value, self.map
                     );
                     Ok(CommandResult::success_with_value(value))
                 } else {
                     warn!(
-                        "Key '{}' with values '{:?}' not found in multi-map collection with id '{}'",
-                        self.key, self.values, self.map_id
+                        "Key '{}' with values '{:?}' not found in multi-map collection with id '{:?}'",
+                        key, self.values, self.map
                     );
                     Ok(CommandResult::error())
                 }
@@ -1392,7 +1382,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
             _ => {
                 let msg = format!(
                     "Expected CollectionValue::Map or CollectionValue::MultiMap, found {}",
-                    ret,
+                    map,
                 );
                 warn!("{}", msg);
                 Err(msg)

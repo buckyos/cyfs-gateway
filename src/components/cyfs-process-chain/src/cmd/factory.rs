@@ -168,3 +168,22 @@ lazy_static::lazy_static! {
         factory
     };
 }
+
+struct CommandFactoryGuard {
+}
+
+impl CommandFactoryGuard {
+    pub const fn new() -> Self {
+        Self {
+        }
+    }
+}
+
+impl Drop for CommandFactoryGuard {
+    fn drop(&mut self) {
+        info!("Dropping global command parser factory");
+        COMMAND_PARSER_FACTORY.clear();
+    }
+}
+
+// const _GUARD: CommandFactoryGuard = CommandFactoryGuard::new();

@@ -88,6 +88,14 @@ impl CollectionValue {
         }
     }
 
+    pub fn into_string(self) -> Option<String> {
+        if let CollectionValue::String(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         if let CollectionValue::String(s) = self {
             Some(s)
@@ -120,6 +128,10 @@ impl CollectionValue {
         }
     }
 
+    pub fn is_set(&self) -> bool {
+        matches!(self, CollectionValue::Set(_))
+    }
+
     pub fn as_set(&self) -> Option<&SetCollectionRef> {
         if let CollectionValue::Set(s) = self {
             Some(s)
@@ -136,6 +148,18 @@ impl CollectionValue {
             warn!("{}", msg);
             Err(msg)
         }
+    }
+
+    pub fn into_set(self) -> Option<SetCollectionRef> {
+        if let CollectionValue::Set(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_map(&self) -> bool {
+        matches!(self, CollectionValue::Map(_))
     }
 
     pub fn as_map(&self) -> Option<&MapCollectionRef> {
@@ -156,6 +180,18 @@ impl CollectionValue {
         }
     }
 
+    pub fn into_map(self) -> Option<MapCollectionRef> {
+        if let CollectionValue::Map(m) = self {
+            Some(m)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_multi_map(&self) -> bool {
+        matches!(self, CollectionValue::MultiMap(_))
+    }
+
     pub fn as_multi_map(&self) -> Option<&MultiMapCollectionRef> {
         if let CollectionValue::MultiMap(mm) = self {
             Some(mm)
@@ -174,6 +210,14 @@ impl CollectionValue {
             );
             warn!("{}", msg);
             Err(msg)
+        }
+    }
+
+    pub fn into_multi_map(self) -> Option<MultiMapCollectionRef> {
+        if let CollectionValue::MultiMap(mm) = self {
+            Some(mm)
+        } else {
+            None
         }
     }
 
