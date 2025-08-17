@@ -120,6 +120,13 @@ const PROCESS_CHAIN: &str = r#"
             delete key1;
             echo $(eq $key1 "");
 
+            set-create --block test_set1;
+            set-add test_set1 "google.com" "buckyos.com";
+            set-add test_set1 "buckyos.com";
+            set-remove test_set1 "google.com";
+            set-remove test_set1 "google.com" "x.com";
+            map $test_set1 $(echo "=====>" ${__key});
+
             map-create --chain test1;
             # should not reject
             match-include test1 key1 && exit reject;

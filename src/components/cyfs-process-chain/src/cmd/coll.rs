@@ -446,8 +446,8 @@ impl CommandExecutor for SetCreateCommandExecutor {
     }
 }
 
-/// set-add <set_id> <value>
-/// Add a value to the specified set collection.
+/// set-add <set_id> <value1> <value2> ...
+/// Add one value or more values to the specified set collection.
 /// If the value not exists, it will be added and the command will succeed.
 /// If the value already exists, the command will fail.
 pub struct SetAddCommandParser {
@@ -457,12 +457,12 @@ pub struct SetAddCommandParser {
 impl SetAddCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("set-add")
-            .about("Add a value to a set collection.")
+            .about("Add one value or more values to a set collection.")
             .after_help(
                 r#"
 Arguments:
   <set_id>    The identifier of the target set.
-  <value>     The value to insert into the set.
+  <value>...  One or more values to insert into the set.
 
 Notes:
   - If the set does not exist, the operation fails.
@@ -470,7 +470,7 @@ Notes:
   - Use `set-create` to initialize a set before using this command.
 
 Examples:
-  set-add trusted_hosts "192.168.1.1"
+  set-add trusted_hosts "192.168.1.1" "192.168.100.1"
   set-add temp_set "flag_enabled"
 "#,
             )
@@ -481,10 +481,11 @@ Examples:
                     .help("The ID of the target set"),
             )
             .arg(
-                Arg::new("value")
+                Arg::new("values")
                     .required(true)
+                    .num_args(1..)
                     .value_name("value")
-                    .help("The value to insert into the set"),
+                    .help("One or more values to add to the set"),
             );
 
         Self { cmd }
@@ -523,27 +524,29 @@ impl CommandParser for SetAddCommandParser {
         })?;
         let set = args[set_index].clone();
 
-        let value_index = matches.index_of("value").ok_or_else(|| {
-            let msg = "value argument is required for set-add command".to_string();
-            error!("{}", msg);
-            msg
-        })?;
-        let value = args[value_index].clone();
+        let values = match matches.indices_of("values") {
+            Some(indices) => indices.map(|i| args[i].clone()).collect(),
+            None => {
+                let msg = "At least one value is required for map-add command".to_string();
+                error!("{}", msg);
+                return Err(msg);
+            }
+        };
 
-        let cmd = SetAddCommandExecutor::new(set, value);
+        let cmd = SetAddCommandExecutor::new(set, values);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // SetAddCommandExecutor
 pub struct SetAddCommandExecutor {
-    pub set: CommandArg,
-    pub value: CommandArg,
+    set: CommandArg,
+    values: Vec<CommandArg>,
 }
 
 impl SetAddCommandExecutor {
-    pub fn new(set: CommandArg, value: CommandArg) -> Self {
-        Self { set, value }
+    pub fn new(set: CommandArg, values: Vec<CommandArg>) -> Self {
+        Self { set, values }
     }
 }
 
@@ -551,7 +554,7 @@ impl SetAddCommandExecutor {
 impl CommandExecutor for SetAddCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         let set = self.set.evaluate(context).await?;
-        let value = self.value.evaluate_string(context).await?;
+        let values = CommandArg::evaluate_string_list(&self.values, context).await?;
 
         let set = match set {
             CollectionValue::String(set_id) => {
@@ -578,28 +581,23 @@ impl CommandExecutor for SetAddCommandExecutor {
             }
         };
 
-        match set.insert(&value).await? {
-            true => {
-                info!(
-                    "Value '{}' added to set collection with id '{:?}'",
-                    value, self.set
-                );
-                Ok(CommandResult::success())
+        let mut any_inserted = false;
+        for value in values {
+            if set.insert(&value).await? {
+                any_inserted = true;
             }
-            false => {
-                let msg = format!(
-                    "Failed to add value '{}' to set collection with id '{:?}'",
-                    value, self.set
-                );
-                warn!("{}", msg);
-                Ok(CommandResult::error_with_value(msg))
-            }
+        }
+
+        if any_inserted {
+            Ok(CommandResult::success())
+        } else {
+            Ok(CommandResult::error())
         }
     }
 }
 
-/// set-remove <set_id> <value>
-/// Remove a value from the specified set collection.
+/// set-remove <set_id> <value1> <value2> ...
+/// Remove one value or more values from the specified set collection.
 /// If the value exists, it will be removed and the command will succeed.
 /// If the value does not exist, the command will fail.
 pub struct SetRemoveCommandParser {
@@ -614,7 +612,7 @@ impl SetRemoveCommandParser {
                 r#"
 Arguments:
   <set_id>    The identifier of the target set.
-  <value>     The value to remove from the set.
+  <value>...  One or more values to remove from the set.
 
 Notes:
   - If the set does not exist, the operation fails.
@@ -633,10 +631,11 @@ Examples:
                     .help("The ID of the set to remove from"),
             )
             .arg(
-                Arg::new("value")
+                Arg::new("values")
                     .required(true)
                     .value_name("value")
-                    .help("The value to remove"),
+                    .num_args(1..)
+                    .help("One or more values to remove from the set")
             );
 
         Self { cmd }
@@ -675,14 +674,16 @@ impl CommandParser for SetRemoveCommandParser {
         })?;
         let set = args[set_index].clone();
 
-        let value_index = matches.index_of("value").ok_or_else(|| {
-            let msg = "value argument is required for set-remove command".to_string();
-            error!("{}", msg);
-            msg
-        })?;
-        let value = args[value_index].clone();
+        let values = match matches.indices_of("values") {
+            Some(indices) => indices.map(|i| args[i].clone()).collect(),
+            None => {
+                let msg = "At least one value is required for set-remove command".to_string();
+                error!("{}", msg);
+                return Err(msg);
+            }
+        };
 
-        let cmd = SetRemoveCommandExecutor::new(set, value);
+        let cmd = SetRemoveCommandExecutor::new(set, values);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -690,12 +691,12 @@ impl CommandParser for SetRemoveCommandParser {
 // SetRemoveCommandExecutor
 pub struct SetRemoveCommandExecutor {
     pub set: CommandArg,
-    pub value: CommandArg,
+    pub values: Vec<CommandArg>,
 }
 
 impl SetRemoveCommandExecutor {
-    pub fn new(set: CommandArg, value: CommandArg) -> Self {
-        Self { set, value }
+    pub fn new(set: CommandArg, values: Vec<CommandArg>) -> Self {
+        Self { set, values }
     }
 }
 
@@ -703,7 +704,7 @@ impl SetRemoveCommandExecutor {
 impl CommandExecutor for SetRemoveCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         let set = self.set.evaluate(context).await?;
-        let value = self.value.evaluate_string(context).await?;
+        let values = CommandArg::evaluate_string_list(&self.values, context).await?;
 
         let set = match set {
             CollectionValue::String(set_id) => {
@@ -730,23 +731,17 @@ impl CommandExecutor for SetRemoveCommandExecutor {
             }
         };
 
-        // Remove the value from the specified set collection
-        match set.remove(&value).await? {
-            true => {
-                info!(
-                    "Value '{}' removed from set collection with id '{:?}'",
-                    value, self.set
-                );
-                Ok(CommandResult::success())
+        let mut any_removed = false;
+        for value in values {
+            if set.remove(&value).await? {
+                any_removed = true;
             }
-            false => {
-                let msg = format!(
-                    "Failed to remove value '{}' from set collection with id '{:?}'",
-                    value, self.set
-                );
-                warn!("{}", msg);
-                Ok(CommandResult::error_with_value(msg))
-            }
+        }
+
+        if any_removed {
+            Ok(CommandResult::success())
+        } else {
+            Ok(CommandResult::error())
         }
     }
 }
