@@ -2,8 +2,8 @@
 
 use tokio::fs;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
-use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 use cyfs_socks::SocksProxyConfig;
 
@@ -258,11 +258,13 @@ impl DispatcherConfig {
 
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Copy)]
-pub enum CyfsServerProtocol {
-    #[serde(rename = "tcp")]
-    TCP,
-    #[serde(rename = "udp")]
-    UDP,
+#[serde(rename_all = "lowercase")]
+pub enum StackProtocol {
+    Tcp,
+    Udp,
+    Quic,
+    Rtcp,
+    Tls,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -306,6 +308,7 @@ impl ProcessChainConfig {
         Ok(chain)
     }
 }
+pub type ProcessChainConfigs = Vec<ProcessChainConfig>;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CyfsRtcpServiceConfig {
@@ -324,7 +327,7 @@ pub struct CyfsHttpServiceConfig {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CyfsServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    protocol: Option<CyfsServerProtocol>,
+    protocol: Option<StackProtocol>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bind: Option<IpAddr>,
     port: u16,
@@ -347,7 +350,7 @@ impl CyfsServerConfig {
         }
     }
 
-    pub fn set_protocol(&mut self, protocol: CyfsServerProtocol) {
+    pub fn set_protocol(&mut self, protocol: StackProtocol) {
         self.protocol = Some(protocol);
     }
 
@@ -359,8 +362,8 @@ impl CyfsServerConfig {
         self.process_chains.push(process_chain);
     }
 
-    pub fn get_protocol(&self) -> CyfsServerProtocol {
-        self.protocol.unwrap_or(CyfsServerProtocol::TCP)
+    pub fn get_protocol(&self) -> StackProtocol {
+        self.protocol.unwrap_or(StackProtocol::Tcp)
     }
 
     pub fn get_bind(&self) -> IpAddr {
@@ -387,10 +390,11 @@ impl CyfsServerConfig {
 #[derive(Debug, Copy, Clone)]
 pub enum ConfigErrorCode {
     InvalidConfig,
+    ProcessChainError,
 }
 pub type ConfigResult<T> = sfo_result::Result<T, ConfigErrorCode>;
 pub type ConfigError = sfo_result::Error<ConfigErrorCode>;
-use sfo_result::err as config_err;
+pub use sfo_result::err as config_err;
 use cyfs_process_chain::{Block, BlockParser, ProcessChain};
 
 pub trait CyfsServerConfigParser {
@@ -414,7 +418,7 @@ struct YamlServer {
 pub struct YamlCyfsServerConfigParser;
 impl CyfsServerConfigParser for YamlCyfsServerConfigParser {
     fn parse(config: &str) -> ConfigResult<Vec<CyfsServerConfig>> {
-        let config: YamlServers = serde_pretty_yaml::from_str(config).map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{:?}", e))?;
+        let config: YamlServers = serde_yaml_ng::from_str(config).map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{:?}", e))?;
         Ok(config.servers.into_iter().map(|s| s.server).collect())
     }
 }
@@ -425,207 +429,227 @@ impl CyfsServerConfigDumps for YamlCyfsServerConfigDumps {
         let servers: Vec<YamlServer> = config.iter().map(|s| YamlServer {
             server: s.clone(),
         }).collect();
-        Ok(serde_pretty_yaml::to_string(&YamlServers {
+        Ok(serde_yaml_ng::to_string(&YamlServers {
             servers,
         }).map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{:?}", e))?)
     }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TcpConfig {
+    protocol: StackProtocol,
+    bind: SocketAddr,
+    hook_point: Vec<ProcessChainConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct UdpConfig {
+    pub protocol: StackProtocol,
+    pub bind: SocketAddr,
+    pub hook_point: Vec<ProcessChainConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RtcpConfig {
+    pub protocol: StackProtocol,
+    pub bind: SocketAddr,
+    pub device_name: String,
+    pub device_key: String,
+    pub hook_point: Vec<ProcessChainConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct StackCertConfig {
+    pub domain: String,
+    pub cert_file: String,
+    pub key_file: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TlsStackConfig {
+    pub protocol: StackProtocol,
+    pub bind: SocketAddr,
+    pub certs: Vec<StackCertConfig>,
+    pub hook_point: Vec<ProcessChainConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct QuicStackConfig {
+    pub protocol: StackProtocol,
+    pub bind: SocketAddr,
+    pub certs: Vec<StackCertConfig>,
+    pub hook_point: Vec<ProcessChainConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct StackConfigBase {
+    protocol: StackProtocol,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(untagged)]
+pub enum StackConfig {
+    Tcp(TcpConfig),
+    Udp(UdpConfig),
+    Rtcp(RtcpConfig),
+    Tls(TlsStackConfig),
+    Quic(QuicStackConfig),
+}
+
+impl<'de> Deserialize<'de> for StackConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let stack_base = StackConfigBase::deserialize(value.clone()).map_err(|e| serde::de::Error::custom(e))?;
+        match stack_base.protocol {
+            StackProtocol::Tcp => {
+                let config = TcpConfig::deserialize(value).map_err(|e| serde::de::Error::custom(e))?;
+                Ok(StackConfig::Tcp(config))
+            }
+            StackProtocol::Udp => {
+                let config = UdpConfig::deserialize(value).map_err(|e| serde::de::Error::custom(e))?;
+                Ok(StackConfig::Udp(config))
+            }
+            StackProtocol::Quic => {
+                let config = QuicStackConfig::deserialize(value).map_err(|e| serde::de::Error::custom(e))?;
+                Ok(StackConfig::Quic(config))
+            }
+            StackProtocol::Rtcp => {
+                let config = RtcpConfig::deserialize(value).map_err(|e| serde::de::Error::custom(e))?;
+                Ok(StackConfig::Rtcp(config))
+            }
+            StackProtocol::Tls => {
+                let config = TlsStackConfig::deserialize(value).map_err(|e| {
+                    serde::de::Error::custom(e)})?;
+                Ok(StackConfig::Tls(config))
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CyfsConfig {
+    stacks: Vec<StackConfig>,
+}
+
 #[cfg(test)]
 mod test {
     use std::net::IpAddr;
-    use std::str::FromStr;
-    use crate::{CyfsServerConfigParser, YamlCyfsServerConfigParser};
+    use crate::{CyfsConfig};
 
     #[test]
-    fn test_cyfs_server_config_parse() {
+    fn test_stack_config_serialization() {
         let yaml_config = r#"
-servers:
-- server:
+stacks:
+  - bind: 0.0.0.0:8080
     protocol: tcp
-    bind: 0.0.0.0
-    port: 8080
-    process_chains:
+    hook_point:
       - id: main
         priority: 1
         blocks:
-            # 根据host匹配的规则
-           - id: default
-             block: |
-                probe_http || probe_https;
-                match $REQ.host "*.buckyos.com" && return "forward tcp://127.0.0.1:8081"";
-                match $REQ.host "*.buckyos.cc" && return "forward tcp://127.0.0.1:8082"";
+          - id: default
+            block: |
+              call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
+              call http-probe || reject;
+              eq ${REQ.ext.method} "CONNECT" && return "forward tcp:///${REQ.dest_host}";
+              return "forward tcp:///${REQ.dest_host}:80";
 
-- server:
-    port: 8085
-    process_chains:
-    - id: main
-      priority: 1
-      blocks:
-        - id: default
-          block: |
-              return "forward tcp://127.0.0.1:8020"";
-
-- server:
+  - bind: 0.0.0.0:8081
     protocol: udp
-    port: 8081
-    process_chains:
-      - id: main
-        priority: 1
-        blocks:
-            - id: default
-              block: |
-                return "forward udp://127.0.0.1:8082"";
-
-- server:
-    port: 80
-    process_chains:
-    - id: main
-      priority: 1
-      blocks:
-        - id: default
-          block: |
-              probe_http;
-              match $REQ.host "www.buckyos.com" && goto www.buckyos.com;
-    - id: www.buckyos.com
-      priority: 2
-      blocks:
-        - id: default
-          block: |
-              match $REQ.url "/api" && return "forward http://127.0.0.1:8082"";
-    rtcp_service:
-      device_name: test
-      device_key: ./identity.json
-      process_chains:
-        - id: main
-          priority: 1
-          blocks:
-            - id: default
-              block: |
-                  return "forward tcp:///127.0.0.1:2981";
-    http_services:
-      www.buckyos.com:
-        process_chains:
-          - id: main
-            priority: 2
-            blocks:
-              - id: default
-                block: |
-                    echo "hello world";
-
-- server:
-    port: 443
-    process_chains:
+    hook_point:
       - id: main
         priority: 1
         blocks:
           - id: default
             block: |
-              probe_https;
-              match $REQ.host "www.buckyos.com" && resp_tls www.buckyos.com.cert www.buckyos.com.key && goto www.buckyos.com;
-      - id: www.buckyos.com
-        priority: 2
+              reject;
+
+  - bind: 0.0.0.0:8082
+    protocol: rtcp
+    device_name: "web3.buckyos.com"
+    device_key: ./identity.json
+    hook_point:
+      - id: main
+        priority: 1
         blocks:
           - id: default
             block: |
-              match $REQ.url "/api" && return "forward https://127.0.0.1:8082"";
+              reject;
 
-"#;
-        let config = YamlCyfsServerConfigParser::parse(yaml_config).unwrap();
-        assert_eq!(config.len(), 5);
-        assert_eq!(config[0].protocol, Some(super::CyfsServerProtocol::TCP));
-        assert_eq!(config[0].bind, Some(IpAddr::from_str("0.0.0.0").unwrap()));
-        assert_eq!(config[0].port, 8080);
-        assert_eq!(config[0].process_chains.len(), 1);
-        assert_eq!(config[0].process_chains[0].id, "main");
-        assert_eq!(config[0].process_chains[0].priority, 1);
-        assert_eq!(config[0].process_chains[0].blocks.len(), 1);
-        assert_eq!(config[0].process_chains[0].blocks[0].id, "default");
-        assert_eq!(
-            config[0].process_chains[0].blocks[0].block,
-            r#"probe_http || probe_https;
-match $REQ.host "*.buckyos.com" && return "forward tcp://127.0.0.1:8081"";
-match $REQ.host "*.buckyos.cc" && return "forward tcp://127.0.0.1:8082"";
-"#
-        );
-        assert_eq!(config[1].protocol, None);
-        assert_eq!(config[1].bind, None);
-        assert_eq!(config[1].port, 8085);
-        assert_eq!(config[1].process_chains.len(), 1);
-        assert_eq!(config[1].process_chains[0].id, "main");
-        assert_eq!(config[1].process_chains[0].priority, 1);
-        assert_eq!(config[1].process_chains[0].blocks.len(), 1);
-        assert_eq!(config[1].process_chains[0].blocks[0].id, "default");
-        assert_eq!(
-            config[1].process_chains[0].blocks[0].block,
-            r#"return "forward tcp://127.0.0.1:8020"";
-"#
-        );
-        assert_eq!(config[2].protocol, Some(super::CyfsServerProtocol::UDP));
-        assert_eq!(config[2].bind, None);
-        assert_eq!(config[2].port, 8081);
-        assert_eq!(config[2].process_chains.len(), 1);
-        assert_eq!(config[2].process_chains[0].id, "main");
-        assert_eq!(config[2].process_chains[0].priority, 1);
-        assert_eq!(config[2].process_chains[0].blocks.len(), 1);
-        assert_eq!(config[2].process_chains[0].blocks[0].id, "default");
-        assert_eq!(
-            config[2].process_chains[0].blocks[0].block,
-            r#"return "forward udp://127.0.0.1:8082"";
-"#
-        );
-        assert_eq!(config[3].protocol, None);
-        assert_eq!(config[3].bind, None);
-        assert_eq!(config[3].port, 80);
-        assert_eq!(config[3].process_chains.len(), 2);
-        assert_eq!(config[3].process_chains[0].id, "main");
-        assert_eq!(config[3].process_chains[0].priority, 1);
-        assert_eq!(config[3].process_chains[0].blocks.len(), 1);
-        assert_eq!(config[3].process_chains[0].blocks[0].id, "default");
-        assert_eq!(
-            config[3].process_chains[0].blocks[0].block,
-            r#"probe_http;
-match $REQ.host "www.buckyos.com" && goto www.buckyos.com;
-"#
-        );
-        assert_eq!(config[3].process_chains[1].id, "www.buckyos.com");
-        assert_eq!(config[3].process_chains[1].priority, 2);
-        assert_eq!(config[3].process_chains[1].blocks.len(), 1);
-        assert_eq!(config[3].process_chains[1].blocks[0].id, "default");
-        assert_eq!(
-            config[3].process_chains[1].blocks[0].block,
-            r#"match $REQ.url "/api" && return "forward http://127.0.0.1:8082"";
-"#
-        );
-        assert_eq!(config[3].rtcp_service.is_some(), true);
-        assert_eq!(config[3].rtcp_service.as_ref().unwrap().device_key, "./identity.json");
-        assert_eq!(config[3].rtcp_service.as_ref().unwrap().process_chains.len(), 1);
-        assert_eq!(config[3].http_services.is_some(), true);
-        assert_eq!(config[4].protocol, None);
-        assert_eq!(config[4].bind, None);
-        assert_eq!(config[4].port, 443);
-        assert_eq!(config[4].process_chains.len(), 2);
-        assert_eq!(config[4].process_chains[0].id, "main");
-        assert_eq!(config[4].process_chains[0].priority, 1);
-        assert_eq!(config[4].process_chains[0].blocks.len(), 1);
-        assert_eq!(config[4].process_chains[0].blocks[0].id, "default");
-        assert_eq!(
-            config[4].process_chains[0].blocks[0].block,
-            r#"probe_https;
-match $REQ.host "www.buckyos.com" && resp_tls www.buckyos.com.cert www.buckyos.com.key && goto www.buckyos.com;
-"#
-        );
-        assert_eq!(config[4].process_chains[1].id, "www.buckyos.com");
-        assert_eq!(config[4].process_chains[1].priority, 2);
-        assert_eq!(config[4].process_chains[1].blocks.len(), 1);
-        assert_eq!(config[4].process_chains[1].blocks[0].id, "default");
-        assert_eq!(
-            config[4].process_chains[1].blocks[0].block,
-            r#"match $REQ.url "/api" && return "forward https://127.0.0.1:8082"";
-"#
-        );
+  - bind: 0.0.0.0:8083
+    protocol: tls
+    certs:
+      - domain: "web3.buckyos.com"
+        cert_file: ./cert.pem
+        key_file: ./key.pem
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              reject;
+
+  - bind: 0.0.0.0:8083
+    protocol: quic
+    certs:
+      - domain: "web3.buckyos.com"
+        cert_file: ./cert.pem
+        key_file: ./key.pem
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              reject;
+        "#;
+
+        let config: CyfsConfig = serde_yaml_ng::from_str(yaml_config).unwrap();
+        assert_eq!(config.stacks.len(), 5);
+    }
+
+    #[test]
+    fn test_stack_config_deserialization_from_json() {
+        use crate::{StackConfig, StackProtocol};
+        use std::net::{SocketAddr, Ipv4Addr};
+
+        // Test deserializing TcpStackConfig from JSON
+        let tcp_json = r#"{
+            "protocol": "tcp",
+            "bind": "127.0.0.1:8080",
+            "hook_point": []
+        }"#;
+
+        let tcp_config: StackConfig = serde_json::from_str(tcp_json).unwrap();
+        match tcp_config {
+            StackConfig::Tcp(tcp) => {
+                assert_eq!(tcp.protocol, StackProtocol::Tcp);
+                assert_eq!(tcp.bind, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080));
+            }
+            _ => panic!("Expected Tcp variant"),
+        }
+
+        // Test deserializing UdpStackConfig from JSON
+        let udp_json = r#"{
+            "protocol": "udp",
+            "bind": "127.0.0.1:8081",
+            "hook_point": []
+        }"#;
+
+        let udp_config: StackConfig = serde_json::from_str(udp_json).unwrap();
+        match udp_config {
+            StackConfig::Udp(udp) => {
+                assert_eq!(udp.protocol, StackProtocol::Udp);
+                assert_eq!(udp.bind, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081));
+            }
+            _ => panic!("Expected Udp variant"),
+        }
     }
 }
+
 
 pub fn gen_demo_gateway_json_config() -> String {
     let result = r#"

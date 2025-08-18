@@ -1,4 +1,4 @@
-use crate::{CyfsServerConfig, CyfsServerProtocol, DatagramClientBox, ProcessChainConfig, RTcpStack, GATEWAY_TUNNEL_MANAGER};
+use crate::{CyfsServerConfig, StackProtocol, RTcpStack, GATEWAY_TUNNEL_MANAGER, DatagramClientBox};
 use buckyos_kit::AsyncStream;
 use hyper::{Request, Response, StatusCode};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -26,13 +26,14 @@ pub enum ServerErrorCode {
 }
 pub type ServerResult<T> = sfo_result::Result<T, ServerErrorCode>;
 pub type ServerError = sfo_result::Error<ServerErrorCode>;
-use cyfs_process_chain::{CollectionValue, CommandControl, CommandResult, ExternalCommand, HookPoint, HookPointEnv, HttpProbeCommand, HttpsSniProbeCommand, HyperHttpRequestHeaderMap, MapCollection, ProcessChainListExecutor, StreamRequest, StreamRequestMap};
+use cyfs_process_chain::{CollectionValue, CommandControl, CommandResult, HookPoint, HookPointEnv, HyperHttpRequestHeaderMap, MapCollection, ProcessChainListExecutor, StreamRequest, StreamRequestMap};
 use sfo_result::err as server_err;
 use sfo_result::into_err as into_server_err;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use url::Url;
+use crate::global_process_chains::create_process_chain_executor;
 
 type GenericError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, GenericError>;
@@ -70,46 +71,6 @@ impl Drop for CyfsTcpServer {
     }
 }
 
-async fn create_process_chain_executor(
-    chains: &Vec<ProcessChainConfig>,
-) -> ServerResult<ProcessChainListExecutor> {
-    let hook_point = HookPoint::new("cyfs_server_hook_point");
-    for chain_config in chains.iter() {
-        hook_point
-            .add_process_chain(
-                chain_config
-                    .create_process_chain()
-                    .map_err(into_server_err!(ServerErrorCode::InvalidConfig))?,
-            )
-            .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{}", e))?;
-    }
-    let hook_point_env = HookPointEnv::new("cyfs_server_hook_point_env", PathBuf::new());
-
-    let https_sni_probe_command = HttpsSniProbeCommand::new();
-    let name = https_sni_probe_command.name().to_owned();
-    hook_point_env
-        .register_external_command(
-            &name,
-            Arc::new(Box::new(https_sni_probe_command) as Box<dyn ExternalCommand>),
-        )
-        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-
-    let http_probe_command = HttpProbeCommand::new();
-    let name = http_probe_command.name().to_owned();
-    hook_point_env
-        .register_external_command(
-            &name,
-            Arc::new(Box::new(http_probe_command) as Box<dyn ExternalCommand>),
-        )
-        .unwrap();
-
-    let executor = hook_point_env
-        .prepare_exec_list(&hook_point)
-        .await
-        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-    Ok(executor)
-}
-
 async fn execute_chain(executor: ProcessChainListExecutor, stream: Box<dyn AsyncStream>, local_addr: SocketAddr) -> ServerResult<(CommandResult, Box<dyn AsyncStream>)> {
     let request = StreamRequest::new(stream, local_addr);
     let request_map = StreamRequestMap::new(request);
@@ -141,7 +102,8 @@ async fn execute_chain(executor: ProcessChainListExecutor, stream: Box<dyn Async
 
 impl CyfsTcpServer {
     async fn create_server(config: CyfsServerConfig) -> ServerResult<Self> {
-        let executor = create_process_chain_executor(config.get_process_chains()).await?;
+        let (executor, _) = create_process_chain_executor(config.get_process_chains()).await
+            .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
 
         let listener = tokio::net::TcpListener::bind(format!(
             "{}:{}",
@@ -160,7 +122,8 @@ impl CyfsTcpServer {
             let device_config = DeviceConfig::new(rtcp_config.device_name.as_str(), public_key);
 
             let rtcp_stack = RTcpStack::new(device_config.id.clone(), config.get_port(), Some(private_key));
-            let executor = create_process_chain_executor(&rtcp_config.process_chains).await?;
+            let (executor, _) = create_process_chain_executor(&rtcp_config.process_chains).await
+                .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
             Some(Arc::new(CyfsRTcpService {
                 stack: rtcp_stack,
                 executor,
@@ -173,7 +136,8 @@ impl CyfsTcpServer {
         if config.get_http_services().is_some() {
             let http_services_config = config.get_http_services().as_ref().unwrap();
             for (id, service_config) in http_services_config.iter() {
-                let executor = create_process_chain_executor(&service_config.process_chains).await?;
+                let (executor, _) = create_process_chain_executor(&service_config.process_chains).await
+                    .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
                 http_services.insert(id.clone(), Arc::new(CyfsHttpService {
                     executor,
                 }));
@@ -800,13 +764,19 @@ pub enum CyfsServer {
 impl CyfsServer {
     pub async fn create_server(config: CyfsServerConfig) -> ServerResult<Self> {
         match config.get_protocol() {
-            CyfsServerProtocol::TCP => {
+            StackProtocol::Tcp => {
                 let tcp_server = CyfsTcpServer::create_server(config).await?;
                 Ok(CyfsServer::TcpServer(tcp_server))
             }
-            CyfsServerProtocol::UDP => {
+            StackProtocol::Udp => {
                 let udp_server = CyfsUdpServer::create_server(config).await?;
                 Ok(CyfsServer::UdpServer(udp_server))
+            }
+            _ => {
+                return Err(ServerError::new(
+                    ServerErrorCode::InvalidConfig,
+                    format!("invalid protocol: {:?}", config.get_protocol()),
+                ));
             }
         }
     }

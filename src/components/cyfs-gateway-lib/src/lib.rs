@@ -12,6 +12,9 @@ mod selector;
 mod acme_client;
 mod cert_mgr;
 mod server;
+mod inner_service;
+mod stack;
+mod global_process_chains;
 
 pub use aes_stream::*;
 pub use config::*;
@@ -24,6 +27,8 @@ pub use selector::*;
 pub use cert_mgr::*;
 pub use acme_client::*;
 pub use server::*;
+pub use inner_service::*;
+pub use stack::*;
 
 use once_cell::sync::OnceCell;
 use thiserror::Error;

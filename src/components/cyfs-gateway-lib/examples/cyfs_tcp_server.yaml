@@ -18,17 +18,6 @@ servers:
   - server:
       protocol: tcp
       bind: 0.0.0.0
-      port: 8081
-      process_chains:
-        - id: main
-          priority: 1
-          blocks:
-            - id: default
-              block: |
-                call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
-                call http-probe && return "forward tcp:///${REQ.dest_host}:80";
-                reject;
-  - server:
       port: 80
       process_chains:
         - id: main
@@ -36,7 +25,32 @@ servers:
           blocks:
             - id: default
               block: |
-                return "http www.buckyos.com";
+                call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
+                call http-probe || reject;
+                eq ${REQ.ext.method} "CONNECT" && return "forward tcp:///${REQ.dest_host}";
+                return "forward tcp:///${REQ.dest_host}:80";
+                
+  - server:
+      protocol: tcp
+      port: 443
+      process_chains:
+        - id: main
+          priority: 1
+          blocks:
+            - id: default
+              block: |
+                call https-sni-probe && return "forward rtcp://64.176.55.75/${REQ.dest_host}:443";
+                call http-probe && return "forward rtcp://64.176.55.75/${REQ.dest_host}:80";
+                reject;
+  - server:
+      port: 801
+      process_chains:
+        - id: main
+          priority: 1
+          blocks:
+            - id: default
+              block: |
+                return "innerservice sn";
       http_services:
         www.buckyos.com:
           process_chains:
@@ -45,6 +59,25 @@ servers:
               blocks:
                 - id: default
                   block: |
+                    reject;
+  - server:
+      port: 8010
+      process_chains:
+        - id: main
+          priority: 1
+          blocks:
+            - id: default
+              block: |
+                return "socks5";
+      socks5_services:
+        process_chains:
+            - id: main
+              priority: 2
+              blocks:
+                - id: default
+                  block: |
+                    eq ${REQ.dest_host} "www.baidu.com" && accept;
+                    eq ${REQ.dest_host} "www.google.com" && accept;
                     reject;
 
   - server:
