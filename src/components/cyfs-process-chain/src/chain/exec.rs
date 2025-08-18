@@ -15,6 +15,60 @@ impl ProcessChainExecutor {
 }
 
 impl ProcessChainExecutor {
+    pub async fn execute_block(
+        &self,
+        chain: &ProcessChain,
+        block_id: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        // First get the block by ID
+        let block = chain.get_block(block_id);
+        if block.is_none() {
+            let msg = format!(
+                "Block with ID '{}' not found in chain '{}'",
+                block_id,
+                chain.id()
+            );
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let mut target_block = block.unwrap();
+        let ret = loop {
+            let block_executer = BlockExecuter::new(&target_block.id);
+            let block_context = context.fork_block();
+            let result = block_executer
+                .execute_block(target_block, &block_context)
+                .await?;
+            if result.is_control() {
+                let control = result.as_control().unwrap();
+                if control.is_goto_block() {
+                    let target_block_id = control.as_goto_block().unwrap();
+                    let next_block = chain.get_block(target_block_id);
+                    if next_block.is_none() {
+                        let msg = format!(
+                            "Goto target block '{}' not found in chain '{}'",
+                            target_block_id,
+                            chain.id()
+                        );
+                        warn!("{}", msg);
+                        return Err(msg);
+                    }
+
+                    target_block = next_block.unwrap();
+                    context.counter().increment()?;
+                    continue; // Continue to the next block
+                } else {
+                    break result; // If it's not a goto block, we return the result
+                }
+            } else {
+                break result; // If it's not a control action, we return the result
+            }
+        };
+
+        Ok(ret)
+    }
+
     pub async fn execute_chain(
         &self,
         chain: &ProcessChain,
@@ -86,7 +140,10 @@ impl ProcessChainExecutor {
                         }
                     }
                     CommandControl::Break(_value) => {
-                        let msg = format!("break action only valid in map-reduce loop, found in block '{}'", block.id);
+                        let msg = format!(
+                            "break action only valid in map-reduce loop, found in block '{}'",
+                            block.id
+                        );
                         error!("{}", msg);
                         return Err(msg);
                     }
@@ -105,8 +162,6 @@ impl ProcessChainExecutor {
 
 pub struct ProcessChainsExecutor {
     process_chain_manager: ProcessChainManagerRef,
-    global_env: EnvRef,
-    pipe: CommandPipe,
     context: Context,
 }
 
@@ -117,18 +172,59 @@ impl ProcessChainsExecutor {
         pipe: CommandPipe,
     ) -> Self {
         let counter = Arc::new(GotoCounter::new());
-        let context = Context::new(global_env.clone(), counter, pipe.clone());
+        let context = Context::new(
+            process_chain_manager.clone(),
+            global_env.clone(), counter, pipe.clone());
 
         Self {
             process_chain_manager,
-            global_env,
-            pipe,
             context,
         }
     }
 
     pub fn context(&self) -> &Context {
         &self.context
+    }
+
+     pub async fn execute_block_by_id(
+        &self,
+        chain_id: &str,
+        block_id: &str,
+    ) -> Result<CommandResult, String> {
+        let chain = self.process_chain_manager.get_chain(chain_id);
+        if chain.is_none() {
+            let msg = format!("Process chain '{}' not found", chain_id);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let chain = chain.unwrap();
+
+        self.execute_block_by_id2(&chain, block_id).await
+    }
+
+    pub async fn execute_block_by_id2(
+        &self,
+        chain: &ProcessChainRef,
+        block_id: &str,
+    ) -> Result<CommandResult, String> {
+        
+        self.context.bind_chain(chain.clone());
+        let ret = ProcessChainExecutor::new()
+            .execute_block(&chain, block_id, &self.context)
+            .await?;
+
+        if ret.is_control() {
+            let control = ret.as_control().unwrap();
+            if control.is_goto_chain() {
+                self.execute_chain_by_id(control.as_goto_chain().unwrap())
+                    .await
+            } else {
+                Ok(ret)
+            }
+        } else {
+            Ok(ret)
+        }
     }
 
     pub async fn execute_chain_by_id(&self, chain_id: &str) -> Result<CommandResult, String> {
@@ -224,14 +320,13 @@ impl ProcessChainsExecutor {
 
 pub struct ProcessChainListExecutor {
     process_chain_list: Vec<ProcessChainRef>,
-    global_env: EnvRef,
-    pipe: CommandPipe,
     context: Context,
 }
 
 impl ProcessChainListExecutor {
     pub fn new(
         mut process_chain_list: Vec<ProcessChainRef>,
+        process_chain_manager: ProcessChainManagerRef,
         global_env: EnvRef,
         pipe: CommandPipe,
     ) -> Self {
@@ -239,12 +334,10 @@ impl ProcessChainListExecutor {
         process_chain_list.sort_by_key(|chain| chain.priority());
 
         let counter = Arc::new(GotoCounter::new());
-        let context = Context::new(global_env.clone(), counter, pipe.clone());
+        let context = Context::new(process_chain_manager, global_env.clone(), counter, pipe.clone());
 
         Self {
             process_chain_list,
-            global_env,
-            pipe,
             context,
         }
     }
@@ -258,7 +351,7 @@ impl ProcessChainListExecutor {
     }
 
     pub fn global_env(&self) -> &EnvRef {
-        &self.global_env
+        self.context.global_env()
     }
 
     pub fn get_chain(&self, id: &str) -> Option<(usize, &ProcessChainRef)> {
@@ -277,12 +370,15 @@ impl ProcessChainListExecutor {
     /// Fork the executor to create a new context to execute the process chain
     pub fn fork(&self) -> Self {
         let counter = Arc::new(GotoCounter::new());
-        let context = Context::new(self.global_env.clone(), counter, self.pipe.clone());
+        let context = Context::new(
+            self.context.process_chain_manager().clone(),
+            self.context.global_env().clone(),
+            counter,
+            self.context.pipe().clone(),
+        );
 
         Self {
             process_chain_list: self.process_chain_list.clone(),
-            global_env: self.global_env.clone(),
-            pipe: self.pipe.clone(),
             context,
         }
     }

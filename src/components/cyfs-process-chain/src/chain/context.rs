@@ -1,5 +1,5 @@
 use super::env::{Env, EnvLevel};
-use crate::chain::{EnvManager, EnvRef, ProcessChainRef};
+use crate::chain::{EnvManager, EnvRef, ProcessChainRef, ProcessChainManagerRef};
 use crate::pipe::CommandPipe;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, RwLock};
@@ -43,18 +43,20 @@ pub type GotoCounterRef = Arc<GotoCounter>;
 #[derive(Clone)]
 pub struct Context {
     current_chain: Arc<RwLock<Option<ProcessChainRef>>>, // The chain that this context is executing
+    process_chain_manager: ProcessChainManagerRef,
     env: EnvManager,
     goto_counter: GotoCounterRef, // Counter for goto command executions
     pipe: CommandPipe,            // Pipe for command execution
 }
 
 impl Context {
-    pub fn new(global_env: EnvRef, goto_counter: GotoCounterRef, pipe: CommandPipe) -> Self {
+    pub fn new(process_chain_manager: ProcessChainManagerRef, global_env: EnvRef, goto_counter: GotoCounterRef, pipe: CommandPipe) -> Self {
         let chain_env = Arc::new(Env::new(EnvLevel::Chain, Some(global_env.clone())));
         let env_manager = EnvManager::new(global_env, chain_env);
 
         Self {
             current_chain: Arc::new(RwLock::new(None)),
+            process_chain_manager,
             env: env_manager,
             goto_counter,
             pipe,
@@ -66,9 +68,17 @@ impl Context {
         *current_chain = Some(chain);
     }
 
+    pub fn process_chain_manager(&self) -> &ProcessChainManagerRef {
+        &self.process_chain_manager
+    }
+
     pub fn chain(&self) -> Option<ProcessChainRef> {
         let current_chain = self.current_chain.read().unwrap();
         current_chain.clone()
+    }
+
+    pub fn global_env(&self) -> &EnvRef {
+        self.env.get_global()
     }
 
     pub fn chain_env(&self) -> &EnvRef {
@@ -108,6 +118,7 @@ impl Context {
         let current_chain = self.current_chain.read().unwrap().clone();
         Self {
             current_chain: Arc::new(RwLock::new(current_chain)), // Use the current chain for the block context
+            process_chain_manager: self.process_chain_manager.clone(),
             env,
             goto_counter: self.goto_counter.clone(), // Use the same goto counter for the block context
             pipe: self.pipe.clone(),

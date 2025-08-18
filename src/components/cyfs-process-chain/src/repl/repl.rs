@@ -30,9 +30,16 @@ impl ProcessChainREPL {
         }
         let env = HookPointEnv::new("repl-default", data_dir);
 
+        let process_chain_manager = Arc::new(ProcessChainManager::new());
+
         let pipe = SharedMemoryPipe::new_empty();
         let counter = Arc::new(GotoCounter::new());
-        let context = Context::new(env.global_env().clone(), counter, pipe.pipe().clone());
+        let context = Context::new(
+            process_chain_manager,
+            env.global_env().clone(),
+            counter,
+            pipe.pipe().clone(),
+        );
 
         Ok(Self {
             env: Arc::new(env),

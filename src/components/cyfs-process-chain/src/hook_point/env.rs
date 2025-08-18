@@ -228,6 +228,7 @@ impl HookPointEnv {
     ) -> Result<ProcessChainListExecutor, String> {
         Ok(ProcessChainListExecutor::new(
             self.prepare_chain_list(hook_point).await?,
+            hook_point.process_chain_manager().clone(),
             self.global_env.clone(),
             self.pipe.pipe().clone(),
         ))
