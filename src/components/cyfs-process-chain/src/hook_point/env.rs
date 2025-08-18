@@ -220,13 +220,13 @@ impl HookPointEnv {
         Ok(chains)
     }
 
-    // Prepare execute the chain list defined in the hook point, will return a ProcessChainListExecutor
+    // Prepare execute the chain list defined in the hook point, will return a ProcessChainLibExecutor
     // which can be used to execute the chain list.
     pub async fn prepare_exec_list(
         &self,
         hook_point: &HookPoint,
-    ) -> Result<ProcessChainListExecutor, String> {
-        Ok(ProcessChainListExecutor::new(
+    ) -> Result<ProcessChainLibExecutor, String> {
+        Ok(ProcessChainLibExecutor::new(
             self.prepare_chain_list(hook_point).await?,
             hook_point.process_chain_manager().clone(),
             self.global_env.clone(),
@@ -238,7 +238,7 @@ impl HookPointEnv {
     pub async fn exec_list(&self, hook_point: &HookPoint) -> Result<CommandResult, String> {
         info!("Executing hook point chain list: {}", hook_point.id());
 
-        let exec = ProcessChainListExecutor::new(
+        let exec = ProcessChainLibExecutor::new(
             &hook_point.process_chain_manager(),
             self.global_env.clone(),
             self.global_collections.clone(),

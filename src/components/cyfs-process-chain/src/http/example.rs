@@ -1,17 +1,17 @@
 use super::hyper_req::HyperHttpRequestHeaderMap;
-use hyper::body::{Bytes, Incoming};
-use hyper::service::{service_fn};
-use hyper::{Request, Response};
-use hyper::{Method, StatusCode};
-use std::net::SocketAddr;
-use std::sync::Arc;
+use crate::*;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, StatusCode};
+use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
-use crate::*;
 
 const PROCESS_CHAIN: &str = r#"
 <root>
@@ -42,7 +42,7 @@ impl HttpHookManager {
     pub async fn create(process_chain: &str) -> Result<Self, String> {
         // Create a hook point
         let hook_point = HookPoint::new("http-hook-point");
-        hook_point.load_process_chain_list(process_chain).await?;
+        hook_point.load_process_chain_lib(process_chain).await?;
 
         let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -78,11 +78,17 @@ impl HttpHookManager {
 
 type HttpHookManagerRef = Arc<HttpHookManager>;
 
-async fn process_request(req: Request<Incoming>) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+async fn process_request(
+    req: Request<Incoming>,
+) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/buckyos/index.html") => {
             info!("Received a GET request {}", req.uri());
-            Ok(Response::new(Full::new(hyper::body::Bytes::from("Hello, World!")).map_err(|e| match e {}).boxed()))
+            Ok(Response::new(
+                Full::new(hyper::body::Bytes::from("Hello, World!"))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            ))
         }
         _ => {
             let mut not_found = Response::<BoxBody<Bytes, hyper::Error>>::default();
@@ -94,7 +100,7 @@ async fn process_request(req: Request<Incoming>) -> Result<Response<BoxBody<Byte
 
 async fn pre_process_request(
     req: Request<Incoming>,
-    exec: ProcessChainListExecutor,
+    exec: ProcessChainLibExecutor,
 ) -> Result<Request<Incoming>, Response<BoxBody<Bytes, hyper::Error>>> {
     info!("Pre-processing request: {:?}", req);
 
@@ -119,10 +125,18 @@ async fn pre_process_request(
         if ret.is_control() {
             if ret.is_drop() {
                 info!("Request dropped by the process chain");
-                return Err(Response::new(Full::new(Bytes::from("Request dropped")).map_err(|e| match e {}).boxed()));
+                return Err(Response::new(
+                    Full::new(Bytes::from("Request dropped"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                ));
             } else if ret.is_reject() {
                 info!("Request rejected by the process chain");
-                let mut response = Response::new(Full::new(Bytes::from("Request rejected")).map_err(|e| match e {}).boxed());
+                let mut response = Response::new(
+                    Full::new(Bytes::from("Request rejected"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                );
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 return Err(response);
             } else {
@@ -138,7 +152,7 @@ async fn pre_process_request(
 
 async fn handle(
     req: Request<Incoming>,
-    exec: ProcessChainListExecutor,
+    exec: ProcessChainLibExecutor,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
     info!("Handling request: {:?}", req);
 
@@ -156,7 +170,11 @@ async fn server_main() {
     let hook_manager = HttpHookManager::create(PROCESS_CHAIN).await.unwrap();
     let hook_manager = Arc::new(hook_manager);
 
-    let exec = hook_manager.hook_point_env.prepare_exec_list(&hook_manager.hook_point).await.unwrap();
+    let exec = hook_manager
+        .hook_point_env
+        .prepare_exec_list(&hook_manager.hook_point)
+        .await
+        .unwrap();
     let exec = Arc::new(exec);
 
     let addr: SocketAddr = ([127, 0, 0, 1], 3000).into();
@@ -183,7 +201,9 @@ async fn client_main() {
     let req = Request::builder()
         .method(Method::GET)
         .header("content-type", "text/html")
-        .uri("http://127.0.0.1:3000/index.html").body(Full::new(Bytes::new())).unwrap();
+        .uri("http://127.0.0.1:3000/index.html")
+        .body(Full::new(Bytes::new()))
+        .unwrap();
 
     let resp = client.request(req).await.unwrap();
 

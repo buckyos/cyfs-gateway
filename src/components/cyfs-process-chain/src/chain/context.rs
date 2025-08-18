@@ -77,6 +77,10 @@ impl Context {
         current_chain.clone()
     }
 
+    pub fn get_chain(&self, id: &str) -> Result<Option<ProcessChainRef>, String> {
+        self.process_chain_manager.get_chain(id)
+    }
+
     pub fn global_env(&self) -> &EnvRef {
         self.env.get_global()
     }

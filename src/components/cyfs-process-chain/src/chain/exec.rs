@@ -1,7 +1,9 @@
 use super::chain::{ProcessChain, ProcessChainManagerRef, ProcessChainRef};
 use super::context::{Context, GotoCounter};
 use super::env::EnvRef;
+use super::manager::ProcessChainLibRef;
 use crate::block::BlockExecuter;
+use crate::chain;
 use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
 use crate::pipe::CommandPipe;
 use std::sync::Arc;
@@ -174,7 +176,10 @@ impl ProcessChainsExecutor {
         let counter = Arc::new(GotoCounter::new());
         let context = Context::new(
             process_chain_manager.clone(),
-            global_env.clone(), counter, pipe.clone());
+            global_env.clone(),
+            counter,
+            pipe.clone(),
+        );
 
         Self {
             process_chain_manager,
@@ -186,7 +191,7 @@ impl ProcessChainsExecutor {
         &self.context
     }
 
-     pub async fn execute_block_by_id(
+    pub async fn execute_block_by_id(
         &self,
         chain_id: &str,
         block_id: &str,
@@ -208,7 +213,6 @@ impl ProcessChainsExecutor {
         chain: &ProcessChainRef,
         block_id: &str,
     ) -> Result<CommandResult, String> {
-        
         self.context.bind_chain(chain.clone());
         let ret = ProcessChainExecutor::new()
             .execute_block(&chain, block_id, &self.context)
@@ -318,26 +322,28 @@ impl ProcessChainsExecutor {
     }
 }
 
-pub struct ProcessChainListExecutor {
-    process_chain_list: Vec<ProcessChainRef>,
+pub struct ProcessChainLibExecutor {
+    process_chain_lib: ProcessChainLibRef,
     context: Context,
 }
 
-impl ProcessChainListExecutor {
+impl ProcessChainLibExecutor {
     pub fn new(
-        mut process_chain_list: Vec<ProcessChainRef>,
+        process_chain_lib: ProcessChainLibRef,
         process_chain_manager: ProcessChainManagerRef,
         global_env: EnvRef,
         pipe: CommandPipe,
     ) -> Self {
-        // Ensure the process chain list is sorted by priority
-        process_chain_list.sort_by_key(|chain| chain.priority());
-
         let counter = Arc::new(GotoCounter::new());
-        let context = Context::new(process_chain_manager, global_env.clone(), counter, pipe.clone());
+        let context = Context::new(
+            process_chain_manager,
+            global_env.clone(),
+            counter,
+            pipe.clone(),
+        );
 
         Self {
-            process_chain_list,
+            process_chain_lib,
             context,
         }
     }
@@ -354,6 +360,7 @@ impl ProcessChainListExecutor {
         self.context.global_env()
     }
 
+    /*
     pub fn get_chain(&self, id: &str) -> Option<(usize, &ProcessChainRef)> {
         self.process_chain_list
             .iter()
@@ -366,6 +373,7 @@ impl ProcessChainListExecutor {
             .iter()
             .position(|chain| chain.id() == id)
     }
+    */
 
     /// Fork the executor to create a new context to execute the process chain
     pub fn fork(&self) -> Self {
@@ -378,23 +386,26 @@ impl ProcessChainListExecutor {
         );
 
         Self {
-            process_chain_list: self.process_chain_list.clone(),
+            process_chain_lib: self.process_chain_lib.clone(),
             context,
         }
     }
 
     pub async fn execute_all(&self) -> Result<CommandResult, String> {
-        if self.process_chain_list.is_empty() {
-            warn!("No process chains to execute");
-            return Ok(CommandResult::success());
-        }
-
         let mut final_result = CommandResult::success();
 
         // We execute the first chain in the list
         let mut chain_index = 0;
-        while chain_index < self.process_chain_list.len() {
-            let chain = &self.process_chain_list[chain_index];
+        let len = self.process_chain_lib.get_len()?;
+        while chain_index < len {
+            let chain = &self.process_chain_lib.get_chain_by_index(chain_index)?;
+            if chain.is_none() {
+                let msg = format!("Process chain at index {} not found", chain_index);
+                warn!("{}", msg);
+                return Err(msg);
+            }
+
+            let chain = chain.unwrap();
             info!(
                 "Executing process chain: {}:{}, {}",
                 chain_index,
@@ -409,7 +420,7 @@ impl ProcessChainListExecutor {
                 if control.is_goto_chain() {
                     let target_chain_id = control.as_goto_chain().unwrap();
 
-                    let ret = self.get_chain(target_chain_id);
+                    let ret = self.context.get_chain(target_chain_id)?;
                     if ret.is_none() {
                         let msg = format!("Goto process chain '{}' not found", target_chain_id);
                         warn!("{}", msg);

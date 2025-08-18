@@ -1,7 +1,16 @@
-use super::sni::HttpsSniProbeCommand;
 use super::http::HttpProbeCommand;
+use super::sni::HttpsSniProbeCommand;
 use crate::*;
 use buckyos_kit::AsyncStream;
+use http_body_util::BodyExt;
+use http_body_util::Full;
+use hyper::body::Bytes;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Method, StatusCode};
+use hyper::{Request, Response};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::{
     ServerConfig, pki_types::CertificateDer, pki_types::PrivateKeyDer, pki_types::ServerName,
@@ -9,19 +18,10 @@ use rustls::{
 use simplelog::*;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use url::Url;
-use hyper::body::{Bytes};
-use hyper::service::{service_fn};
-use hyper::{Request, Response};
-use hyper::{Method, StatusCode};
-use http_body_util::Full;
-use hyper::server::conn::http1;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use http_body_util::BodyExt;
 
 const PROCESS_CHAIN: &str = r#"
 <root>
@@ -51,7 +51,7 @@ impl HttpConnHookManager {
     pub async fn create(process_chain: &str) -> Result<Self, String> {
         // Create a hook point
         let hook_point = HookPoint::new("http-conn-hook-point");
-        hook_point.load_process_chain_list(process_chain).await?;
+        hook_point.load_process_chain_lib(process_chain).await?;
 
         let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -110,7 +110,7 @@ type HttpHookManagerRef = Arc<HttpConnHookManager>;
 async fn on_new_connection(
     stream: Box<dyn AsyncStream>,
     peer_addr: SocketAddr,
-    exec: ProcessChainListExecutor,
+    exec: ProcessChainLibExecutor,
 ) -> Result<(Url, Box<dyn AsyncStream>), String> {
     // Create a new request map for the incoming stream
     let request = StreamRequest::new(stream, peer_addr);
@@ -151,10 +151,7 @@ async fn on_new_connection(
             url
         }
         _ => {
-            let msg = format!(
-                "Process chain did not return a valid URL, got: {:?}",
-                ret
-            );
+            let msg = format!("Process chain did not return a valid URL, got: {:?}", ret);
             error!("{}", msg);
             return Err(msg);
         }
@@ -164,7 +161,9 @@ async fn on_new_connection(
     assert_eq!(request.dest_host.as_deref().unwrap(), "buckyos.com");
     // Check the protocol is http or https
     assert!(request.app_protocol.is_some());
-    if request.app_protocol.as_deref() != Some("http") && request.app_protocol.as_deref() != Some("https") {
+    if request.app_protocol.as_deref() != Some("http")
+        && request.app_protocol.as_deref() != Some("https")
+    {
         let msg = format!(
             "Process chain did not return a valid protocol, got: {:?}",
             request.app_protocol
@@ -198,7 +197,8 @@ fn generate_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
 }
 
 async fn start_forward_server(port: u16) {
-    let hook_manager: HttpConnHookManager = HttpConnHookManager::create(PROCESS_CHAIN).await.unwrap();
+    let hook_manager: HttpConnHookManager =
+        HttpConnHookManager::create(PROCESS_CHAIN).await.unwrap();
     let hook_manager = Arc::new(hook_manager);
 
     let exec = hook_manager
@@ -209,7 +209,9 @@ async fn start_forward_server(port: u16) {
     let exec = Arc::new(exec);
 
     // Start the forward server to handle incoming connections
-    let forward_listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
+    let forward_listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
 
     tokio::spawn(async move {
         loop {
@@ -303,7 +305,11 @@ async fn test_https_sni_probe() {
     assert!(bytes_read > 0, "No data read from TLS stream");
     let response = String::from_utf8_lossy(&buffer[..bytes_read]);
     info!("Received response: {}", response);
-    assert!(response.contains("Hello, buckyos.com!"), "Unexpected response: {}", response);
+    assert!(
+        response.contains("Hello, buckyos.com!"),
+        "Unexpected response: {}",
+        response
+    );
 
     // Wait for the servers to finish
     backend.await.unwrap();
@@ -325,7 +331,6 @@ async fn test_http_probe() {
     // Start a simple HTTP server to test the HTTP probing
     let addr: SocketAddr = ([127, 0, 0, 1], 11000).into();
 
-
     let listener = TcpListener::bind(&addr).await.unwrap();
     log::info!("Listening on http://{}", addr);
     tokio::spawn(async move {
@@ -334,17 +339,20 @@ async fn test_http_probe() {
             let io = TokioIo::new(stream);
 
             tokio::task::spawn(async move {
-                let service = service_fn(move |req|
-                    async move {
-                        if req.method() == Method::GET && req.uri().path() == "/index.html" {
-                            Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from("Hello, World!"))))
-                        } else {
-                            Ok::<_, hyper::Error>(Response::builder()
+                let service = service_fn(move |req| async move {
+                    if req.method() == Method::GET && req.uri().path() == "/index.html" {
+                        Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
+                            "Hello, World!",
+                        ))))
+                    } else {
+                        Ok::<_, hyper::Error>(
+                            Response::builder()
                                 .status(StatusCode::NOT_FOUND)
                                 .body(Full::new(Bytes::new()))
-                                .unwrap())
-                        }
-                    });
+                                .unwrap(),
+                        )
+                    }
+                });
 
                 if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
                     log::info!("Failed to serve connection: {:?}", err);

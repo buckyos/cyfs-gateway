@@ -55,7 +55,7 @@ impl ProcessChain {
 
     pub async fn translate(&mut self, context: &ParserContextRef) -> Result<(), String> {
         info!("Translating process chain: {}", self.id);
-        
+
         let translator =
             BlockCommandTranslator::new(context.clone(), COMMAND_PARSER_FACTORY.clone());
         // Translate each block in the chain
@@ -118,52 +118,3 @@ impl ParserContext {
 }
 
 pub type ParserContextRef = Arc<ParserContext>;
-
-// Manager for process chain with ids
-pub struct ProcessChainManager {
-    chains: RwLock<Vec<ProcessChainRef>>,
-}
-
-impl ProcessChainManager {
-    pub fn new() -> Self {
-        ProcessChainManager {
-            chains: RwLock::new(Vec::new()),
-        }
-    }
-
-    pub fn new_with_chains(chains: Vec<ProcessChainRef>) -> Self {
-        ProcessChainManager {
-            chains: RwLock::new(chains),
-        }
-    }
-
-    pub fn add_chain(&self, chain: ProcessChain) -> Result<(), String> {
-        let mut chains = self.chains.write().unwrap();
-        // Check if the chain id is unique
-        if chains.iter().any(|c| c.id() == chain.id) {
-            let msg = format!("Process chain with id '{}' already exists", chain.id);
-            error!("{}", msg);
-            return Err(msg);
-        }
-
-        info!("Added process chain with id '{}'", chain.id);
-
-        // Create a reference counted version of the chain
-        let chain_ref = Arc::new(chain);
-        chains.push(chain_ref);
-
-        Ok(())
-    }
-
-    pub fn get_chain(&self, id: &str) -> Option<ProcessChainRef> {
-        let chains = self.chains.read().unwrap();
-        chains.iter().find(|c| c.id() == id).cloned()
-    }
-
-    pub fn clone_process_chain_list(&self) -> Vec<ProcessChainRef> {
-        let chains = self.chains.read().unwrap();
-        chains.clone()
-    }
-}
-
-pub type ProcessChainManagerRef = Arc<ProcessChainManager>;

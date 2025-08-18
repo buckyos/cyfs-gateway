@@ -1,5 +1,5 @@
 use super::loader::ProcessChainXMLLoader;
-use crate::chain::{ProcessChain, ProcessChainManager};
+use crate::chain::{ProcessChain, ProcessChainManager, ProcessChainListLib, ProcessChainLibRef};
 use std::sync::Arc;
 
 pub struct HookPoint {
@@ -26,18 +26,23 @@ impl HookPoint {
         &self.process_chain_manager
     }
 
-    pub fn add_process_chain(&self, chain: ProcessChain) -> Result<(), String> {
-        self.process_chain_manager.add_chain(chain)
+    pub fn add_process_chain_lib(&self, lib: ProcessChainLibRef) -> Result<(), String> {
+        self.process_chain_manager.add_lib(lib)
     }
 
-    // Load process chain list in xml format
-    pub async fn load_process_chain_list(&self, content: &str) -> Result<(), String> {
+    // Load process chain list as lib in xml format
+    pub async fn load_process_chain_lib(&self, id: &str, priority: i32, content: &str) -> Result<(), String> {
         let chains = ProcessChainXMLLoader::parse(content)?;
+        let chains = chains
+            .into_iter()
+            .map(|chain| Arc::new(chain))
+            .collect::<Vec<_>>();
 
-        // Append all chains to the manager
-        for chain in chains {
-            self.add_process_chain(chain)?;
-        }
+        let lib = ProcessChainListLib::new(
+            id,
+            priority,
+            chains
+        );
 
         Ok(())
     }

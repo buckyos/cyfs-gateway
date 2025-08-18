@@ -337,7 +337,7 @@ async fn test_hook_point() -> Result<(), String> {
     // Create a hook point
     let hook_point = HookPoint::new("test_hook_point");
     hook_point
-        .load_process_chain_list(PROCESS_CHAIN)
+        .load_process_chain_lib(PROCESS_CHAIN)
         .await
         .unwrap();
 
