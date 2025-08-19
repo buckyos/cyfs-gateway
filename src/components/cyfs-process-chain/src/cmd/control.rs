@@ -119,6 +119,7 @@ impl CommandExecutor for ExecCommandExecutor {
     }
 }
 
+/*
 enum GotoTarget {
     Block(String),
     Chain(String),
@@ -259,6 +260,7 @@ impl CommandExecutor for GotoCommandExecutor {
         Ok(ret)
     }
 }
+*/
 
 // Return command parser, return from current block, like: return; return value;
 pub struct ReturnCommandParser {

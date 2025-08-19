@@ -121,34 +121,9 @@ pub enum CommandControl {
     Return(String),                      // Return to the block caller with ok
     Error(String),                       // Return to the block caller with error
     Exit(String),                        // Exit process chain list with value(string)
-    Goto((CommandControlLevel, String)), // Goto a specific block or chain
 }
 
 impl CommandControl {
-    pub fn is_goto_block(&self) -> bool {
-        matches!(self, CommandControl::Goto((CommandControlLevel::Block, _)))
-    }
-
-    pub fn as_goto_block(&self) -> Option<&str> {
-        if let CommandControl::Goto((CommandControlLevel::Block, block_id)) = self {
-            Some(block_id)
-        } else {
-            None
-        }
-    }
-
-    pub fn is_goto_chain(&self) -> bool {
-        matches!(self, CommandControl::Goto((CommandControlLevel::Chain, _)))
-    }
-
-    pub fn as_goto_chain(&self) -> Option<&str> {
-        if let CommandControl::Goto((CommandControlLevel::Chain, chain_id)) = self {
-            Some(chain_id)
-        } else {
-            None
-        }
-    }
-
     pub fn is_return(&self) -> bool {
         matches!(self, CommandControl::Return(_))
     }

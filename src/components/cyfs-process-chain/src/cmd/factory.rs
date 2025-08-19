@@ -58,7 +58,7 @@ impl CommandParserFactory {
 
     pub fn init(&self) {
         // control command
-        self.register("goto", Arc::new(Box::new(GotoCommandParser::new())));
+        // self.register("goto", Arc::new(Box::new(GotoCommandParser::new())));
         self.register("exec", Arc::new(Box::new(ExecCommandParser::new())));
         self.register("return", Arc::new(Box::new(ReturnCommandParser::new())));
         self.register("error", Arc::new(Box::new(ErrorCommandParser::new())));
