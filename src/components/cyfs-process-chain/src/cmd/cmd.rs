@@ -1,7 +1,8 @@
 use crate::block::CommandArgs;
 use crate::chain::{Context, ParserContext};
-use std::sync::Arc;
 use clap::Command;
+use std::str::FromStr;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandGroup {
@@ -109,18 +110,64 @@ impl CommandAction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandControlLevel {
     Block,
     Chain,
+    Lib,
+}
+
+impl CommandControlLevel {
+    pub fn as_str(&self) -> &str {
+        match self {
+            CommandControlLevel::Block => "block",
+            CommandControlLevel::Chain => "chain",
+            CommandControlLevel::Lib => "lib",
+        }
+    }
+
+    pub fn is_block(&self) -> bool {
+        matches!(self, CommandControlLevel::Block)
+    }
+
+    pub fn is_chain(&self) -> bool {
+        matches!(self, CommandControlLevel::Chain)
+    }
+
+    pub fn is_lib(&self) -> bool {
+        matches!(self, CommandControlLevel::Lib)
+    }
+}
+
+impl FromStr for CommandControlLevel {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "block" => Ok(CommandControlLevel::Block),
+            "chain" => Ok(CommandControlLevel::Chain),
+            "lib" => Ok(CommandControlLevel::Lib),
+            _ => {
+                let msg = format!("Invalid command control level: {}", s);
+                error!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandControlValue {
+    pub level: CommandControlLevel,
+    pub value: String,
 }
 
 #[derive(Debug, Clone)]
 pub enum CommandControl {
-    Break(String),                       // Break the map-reduce loop with a specific value
-    Return(String),                      // Return to the block caller with ok
-    Error(String),                       // Return to the block caller with error
-    Exit(String),                        // Exit process chain list with value(string)
+    Break(String),               // Break the map-reduce loop with a specific value
+    Return(CommandControlValue), // Return to caller with ok
+    Error(CommandControlValue),  // Return to caller with error
+    Exit(String),                // Exit process chain list with value(string)
 }
 
 impl CommandControl {
@@ -128,8 +175,16 @@ impl CommandControl {
         matches!(self, CommandControl::Return(_))
     }
 
+    pub fn is_return_from_lib(&self) -> bool {
+        matches!(self, CommandControl::Return(value) if value.level == CommandControlLevel::Lib)
+    }
+
     pub fn is_error(&self) -> bool {
         matches!(self, CommandControl::Error(_))
+    }
+
+    pub fn is_error_from_lib(&self) -> bool {
+        matches!(self, CommandControl::Error(value) if value.level == CommandControlLevel::Lib)
     }
 
     pub fn is_exit(&self) -> bool {
@@ -142,7 +197,7 @@ impl CommandControl {
 
     pub fn as_break(&self) -> Option<&str> {
         if let CommandControl::Break(value) = self {
-            Some(value)
+            Some(value.as_str())
         } else {
             None
         }
@@ -177,20 +232,43 @@ impl CommandResult {
         Self::Control(action)
     }
 
-    pub fn return_to_block() -> Self {
-        Self::Control(CommandControl::Return("".to_string()))
+    pub fn _return(level: CommandControlLevel) -> Self {
+        Self::Control(CommandControl::Return(
+            CommandControlValue {
+                level,
+                value: "".to_string(),
+            },
+        ))
     }
 
-    pub fn return_to_block_with_value(value: impl Into<String>) -> Self {
-        Self::Control(CommandControl::Return(value.into()))
+    pub fn return_with_value(level: CommandControlLevel, value: impl Into<String>) -> Self {
+        Self::Control(CommandControl::Return(
+            CommandControlValue {
+                level,
+                value: value.into(),
+            },
+        ))
     }
 
-    pub fn error_to_block() -> Self {
-        Self::Control(CommandControl::Error("".to_string()))
+    pub fn return_error(level: CommandControlLevel) -> Self {
+        Self::Control(CommandControl::Error(
+            CommandControlValue {
+                level,
+                value: "".to_string(),
+            },
+        ))
     }
 
-    pub fn error_to_block_with_value(value: impl Into<String>) -> Self {
-        Self::Control(CommandControl::Error(value.into()))
+    pub fn return_error_with_value(
+        level: CommandControlLevel,
+        value: impl Into<String>,
+    ) -> Self {
+        Self::Control(CommandControl::Error(
+            CommandControlValue {
+                level,
+                value: value.into(),
+            },
+        ))
     }
 
     pub fn exit_chain() -> Self {
@@ -201,26 +279,23 @@ impl CommandResult {
         Self::Control(CommandControl::Exit(value.into()))
     }
 
-    pub fn goto_block(block_id: impl Into<String>) -> Self {
-        Self::Control(CommandControl::Goto((
-            CommandControlLevel::Block,
-            block_id.into(),
-        )))
+
+    pub fn _break(level: CommandControlLevel) -> Self {
+        Self::Control(CommandControl::Break(
+            CommandControlValue {
+                level,
+                value: "".to_string(),
+            },
+        ))
     }
 
-    pub fn goto_chain(chain_id: impl Into<String>) -> Self {
-        Self::Control(CommandControl::Goto((
-            CommandControlLevel::Chain,
-            chain_id.into(),
-        )))
-    }
-
-    pub fn _break() -> Self {
-        Self::Control(CommandControl::Break("".to_string()))
-    }
-
-    pub fn break_with_value(value: impl Into<String>) -> Self {
-        Self::Control(CommandControl::Break(value.into()))
+    pub fn break_with_value(level: CommandControlLevel, value: impl Into<String>) -> Self {
+        Self::Control(CommandControl::Break(
+            CommandControlValue {
+                level,
+                value: value.into(),
+            },
+        ))
     }
 
     // drop is same as exit drop

@@ -3,7 +3,6 @@ use super::context::{Context, GotoCounter};
 use super::env::EnvRef;
 use super::manager::ProcessChainLibRef;
 use crate::block::BlockExecuter;
-use crate::chain;
 use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
 use crate::pipe::CommandPipe;
 use std::sync::Arc;
@@ -70,12 +69,36 @@ impl ProcessChainExecutor {
                 let control = result.as_control().unwrap();
                 match control {
                     CommandControl::Return(value) => {
-                        info!("Returning from block '{}': {}", block.id, value);
-                        chain_result = result;
+                        info!("Returning from block '{}': {:?}", block.id, value);
+
+                        match value.level {
+                            CommandControlLevel::Block => {
+                                // Return from the block with a value, and will continue to the next block
+                               chain_result = result;
+                               continue;
+                            }
+                            CommandControlLevel::Chain | CommandControlLevel::Lib => {
+                                // Return from the entire chain
+                                chain_result = result;
+                                break;
+                            }
+                        }
                     }
                     CommandControl::Error(value) => {
-                        warn!("Error return in block '{}': {}", block.id, value);
-                        chain_result = result
+                        warn!("Error return in block '{}': {:?}", block.id, value);
+                        
+                        match value.level {
+                            CommandControlLevel::Block => {
+                                // Error return from the block, continue to the next block
+                                chain_result = result;
+                                continue;
+                            }
+                            CommandControlLevel::Chain | CommandControlLevel::Lib => {
+                                // Error return from the entire chain
+                                chain_result = result;
+                                break;
+                            }
+                        }
                     }
                     CommandControl::Exit(value) => {
                         info!("Exiting chain from block '{}': {}", block.id, value);
@@ -264,7 +287,21 @@ impl ProcessChainLibExecutor {
                 if control.is_exit() {
                     info!(
                         "Exiting process chain execution from chain '{}'",
-                        chain.id()
+                        chain.id(),
+                    );
+                    final_result = ret;
+                    break;
+                } else if control.is_return_from_lib() {
+                    info!(
+                        "Returning from process chain lib with value: {:?}",
+                        control,
+                    );
+                    final_result = ret;
+                    break;
+                } else if control.is_error_from_lib() {
+                    info!(
+                        "Error return from process chain lib with value: {:?}",
+                        control,
                     );
                     final_result = ret;
                     break;

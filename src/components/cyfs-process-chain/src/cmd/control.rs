@@ -2,6 +2,7 @@ use super::cmd::*;
 use crate::block::{BlockExecuter, CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext, ProcessChainsExecutor};
 use clap::{Arg, ArgAction, Command};
+use std::str::FromStr;
 use std::sync::Arc;
 
 // exec command, exec a block by block_id, like: EXEC block1
@@ -262,7 +263,11 @@ impl CommandExecutor for GotoCommandExecutor {
 }
 */
 
-// Return command parser, return from current block, like: return; return value;
+// Return command to invoker, return from a specified scope (block, chain, or lib).
+// Examples:
+//   return;
+//   return value;
+//   return --from chain "result";
 pub struct ReturnCommandParser {
     cmd: Command,
 }
@@ -270,29 +275,54 @@ pub struct ReturnCommandParser {
 impl ReturnCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("return")
-            .about("Return from the current block with success, optionally with a value.")
-            .after_help(
-                r#"
-Usage:
-  return           Return with no value.
-  return <value>   Return the specified string value.
-
-Behavior:
-  - Ends execution of the current block immediately with success.
-  - The return value (if any) is passed to the parent or caller.
-  - Used for control flow inside process chain blocks.
-
-Examples:
-  return
-  return ok
-  return "user input accepted"
-"#,
-            )
+            .about("Return from the current caller with success, optionally with a value.")
             .arg(
                 Arg::new("value")
                     .help("Optional return value")
                     .required(false)
-                    .num_args(0..=1),
+                    .index(1)
+            )
+            .arg(
+                Arg::new("from")
+                    .long("from")
+                    .help("Specifies the execution scope to return from.")
+                    .value_name("LEVEL")
+                    .value_parser(["block", "chain", "lib"]) // Enforce allowed values
+                    .default_value("block"), // Set the default behavior
+            )
+            .after_help(
+                r#"
+DESCRIPTION:
+  Terminates execution at a specified scope and returns control to the invoker,
+  optionally passing a value. This is the primary mechanism for controlling
+  exec/return flow.
+
+SCOPE LEVELS (--from):
+  block (default): Exits only the current block. Execution continues with the
+                   next block in the process-chain. This is the most common use.
+
+  chain: Exits the entire current process-chain. If the chain was invoked via
+         `exec --chain`, control and the return value are passed back to the
+         caller.
+
+  lib:   Exits the entire current library, no matter how deeply nested the
+         execution is. If the library was invoked via `exec --lib`, control
+         returns to that caller. This is essential for handling early exits
+         from complex, nested library calls.
+
+EXAMPLES:
+  # Return from the current block with no value (default scope)
+  return
+
+  # Return from the current block with the value "done"
+  return done
+
+  # A chain called by `exec --chain` returns its result to the caller
+  return --from chain "authentication successful"
+
+  # A block deep inside a library needs to terminate the entire library's execution
+  return --from lib "FATAL: configuration missing"
+"#,
             );
 
         Self { cmd }
@@ -324,6 +354,17 @@ impl CommandParser for ReturnCommandParser {
                 msg
             })?;
 
+        // Get the optional return scope
+        let from_level = matches
+            .get_one::<String>("from")
+            .map(|s| s.as_str())
+            .unwrap_or("block");
+        let from_level = CommandControlLevel::from_str(from_level).map_err(|e| {
+            let msg = format!("Invalid return scope: {}, {}", from_level, e);
+            error!("{}", msg);
+            msg
+        })?;
+
         // Get the optional return value
         let value_index = matches.index_of("value");
         let value = if let Some(index) = value_index {
@@ -332,19 +373,20 @@ impl CommandParser for ReturnCommandParser {
             None
         };
 
-        let cmd = ReturnCommandExecutor::new(value);
+        let cmd = ReturnCommandExecutor::new(from_level, value);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // Return command executer
 pub struct ReturnCommandExecutor {
+    from_level: CommandControlLevel,
     value: Option<CommandArg>,
 }
 
 impl ReturnCommandExecutor {
-    pub fn new(value: Option<CommandArg>) -> Self {
-        Self { value }
+    pub fn new(from_level: CommandControlLevel, value: Option<CommandArg>) -> Self {
+        Self { from_level, value }
     }
 }
 
@@ -357,16 +399,20 @@ impl CommandExecutor for ReturnCommandExecutor {
         };
 
         let ret = if let Some(value) = value {
-            CommandResult::return_to_block_with_value(value)
+            CommandResult::return_with_value(self.from_level, value)
         } else {
-            CommandResult::return_to_block()
+            CommandResult::_return(self.from_level)
         };
 
         Ok(ret)
     }
 }
 
-// Error command parser: like: error; error value;
+// Error command parser: return from a specified scope with an error value.
+// Examples:
+//   error;
+//   error "a message";
+//   error --from chain "critical failure";
 pub struct ErrorCommandParser {
     cmd: Command,
 }
@@ -375,28 +421,54 @@ impl ErrorCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("return")
             .about("Return from the current block with error, optionally with a value.")
-            .after_help(
-                r#"
-Usage:
-  error           Return with no value.
-  error <value>   Return the specified string value.
-
-Behavior:
-  - Ends execution of the current block immediately with error.
-  - The return value (if any) is passed to the parent or caller.
-  - Used for control flow inside process chain blocks.
-
-Examples:
-  error
-  error ok
-  error "invalid input"
-"#,
-            )
             .arg(
                 Arg::new("value")
                     .help("Optional return value")
                     .required(false)
-                    .num_args(0..=1),
+                    .index(1)
+            )
+            .arg(
+                Arg::new("from")
+                    .long("from")
+                    .help("Specifies the execution scope to exit from.")
+                    .value_name("LEVEL")
+                    .value_parser(["block", "chain", "lib"]) // Enforce allowed values
+                    .default_value("block"), // Set the default behavior
+            )
+            .after_help(
+                r#"
+DESCRIPTION:
+  Terminates execution at a specified scope with an error status, optionally
+  passing a message. This is the primary mechanism for controlling
+  exec/return flow.
+
+SCOPE LEVELS (--from):
+  block (default): Exits only the current block. Execution continues with the
+                   next block in the process-chain. This is the most common use.
+
+  chain: Exits the entire current process-chain. If the chain was invoked via
+         `exec --chain`, control and the return value are passed back to the
+         caller. If the chain was invoked via `exec --lib`, control returns to the 
+         next chain in the library.
+
+  lib:   Exits the entire current library, no matter how deeply nested the
+         execution is. If the library was invoked via `exec --lib`, control
+         returns to that caller. This is essential for handling early exits
+         from complex, nested library calls.
+
+EXAMPLES:
+  # Error the current block with no message (default scope)
+  error
+
+  # Error the current block with a specific message
+  error "invalid input provided"
+
+  # Error the entire process-chain because a required resource is missing
+  error --from chain "permission denied to access file"
+
+  # A block deep inside a library needs to terminate the entire library's execution
+  error --from lib "not found"
+"#,
             );
 
         Self { cmd }
@@ -428,6 +500,17 @@ impl CommandParser for ErrorCommandParser {
                 msg
             })?;
 
+        // Get the optional error scope
+        let from_level = matches
+            .get_one::<String>("from")
+            .map(|s| s.as_str())
+            .unwrap_or("block");
+        let from_level = CommandControlLevel::from_str(from_level).map_err(|e| {
+            let msg = format!("Invalid error scope: {}, {}", from_level, e);
+            error!("{}", msg);
+            msg
+        })?;
+
         // Get the optional error value
         let value_index = matches.index_of("value");
         let value = if let Some(index) = value_index {
@@ -436,19 +519,20 @@ impl CommandParser for ErrorCommandParser {
             None
         };
 
-        let cmd = ErrorCommandExecutor::new(value);
+        let cmd = ErrorCommandExecutor::new(from_lelvel, value);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
 // Error command executer
 pub struct ErrorCommandExecutor {
+    from_level: CommandControlLevel,
     value: Option<CommandArg>,
 }
 
 impl ErrorCommandExecutor {
-    pub fn new(value: Option<CommandArg>) -> Self {
-        Self { value }
+    pub fn new( from_level: CommandControlLevel, value: Option<CommandArg>) -> Self {
+        Self { from_level, value }
     }
 }
 
@@ -461,9 +545,9 @@ impl CommandExecutor for ErrorCommandExecutor {
         };
 
         let ret = if let Some(value) = value {
-            CommandResult::error_to_block_with_value(value)
+            CommandResult::return_error_with_value(self.from_level, value)
         } else {
-            CommandResult::error_to_block()
+            CommandResult::return_error(self.from_level)
         };
 
         Ok(ret)
