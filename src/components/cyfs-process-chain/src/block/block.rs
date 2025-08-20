@@ -1,4 +1,4 @@
-use super::translator::CommandArgEvaluator;
+use super::linker::CommandArgEvaluator;
 use crate::chain::Context;
 use crate::cmd::*;
 use crate::collection::CollectionValue;
@@ -101,10 +101,7 @@ impl CommandArg {
         CommandArgEvaluator::evaluate(self, context).await
     }
 
-    pub async fn evaluate_string(
-        &self,
-        context: &Context,
-    ) -> Result<String, String> {
+    pub async fn evaluate_string(&self, context: &Context) -> Result<String, String> {
         let value = self.evaluate(context).await?;
         if value.is_string() {
             Ok(value.into_string().unwrap())

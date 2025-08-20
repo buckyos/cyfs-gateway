@@ -16,7 +16,7 @@ pub struct ProcessChainREPL {
 }
 
 impl ProcessChainREPL {
-    pub fn new() -> Result<Self, String> {
+    pub async fn new() -> Result<Self, String> {
         let app_data_dir = dirs_next::data_dir()
             .ok_or_else(|| "Failed to get application data directory".to_string())?;
 
@@ -30,7 +30,9 @@ impl ProcessChainREPL {
         }
         let env = HookPointEnv::new("repl-default", data_dir);
 
-        let process_chain_manager = Arc::new(ProcessChainManager::new());
+        let process_chain_manager = ProcessChainManager::new()
+            .link(env.parser_context())
+            .await?;
 
         let pipe = SharedMemoryPipe::new_empty();
         let counter = Arc::new(GotoCounter::new());
@@ -259,11 +261,9 @@ impl ProcessChainREPL {
         })?;
 
         // Translate the block
-        let translator = BlockCommandTranslator::new(
-            self.parser_context.clone(),
-            COMMAND_PARSER_FACTORY.clone(),
-        );
-        if let Err(e) = translator.translate(&mut item).await {
+        let linker =
+            BlockCommandLinker::new(self.parser_context.clone(), COMMAND_PARSER_FACTORY.clone());
+        if let Err(e) = linker.link(&mut item).await {
             let msg = format!("Translate block error: {}, {}", line, e);
             error!("{}", msg);
             return Err(msg);

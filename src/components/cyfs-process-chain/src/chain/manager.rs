@@ -1,5 +1,9 @@
-use super::chain::ProcessChainRef;
-use std::{any::Any, sync::{Arc, RwLock}};
+use super::chain::{ParserContextRef, ProcessChain, ProcessChainRef};
+use std::{
+    any::Any,
+    ops::Deref,
+    sync::{Arc, RwLock},
+};
 
 #[async_trait::async_trait]
 pub trait ProcessChainLib: Any + Send + Sync {
@@ -9,7 +13,7 @@ pub trait ProcessChainLib: Any + Send + Sync {
     fn get_chain(&self, id: &str) -> Result<Option<ProcessChainRef>, String>;
 
     fn get_len(&self) -> Result<usize, String>;
-    fn get_chain_by_index(&self, index: usize) -> Result<Option<ProcessChainRef>, String>;
+    fn get_chain_by_index(&self, index: usize) -> Result<ProcessChainRef, String>;
 }
 
 pub type ProcessChainLibRef = Arc<Box<dyn ProcessChainLib>>;
@@ -29,7 +33,7 @@ impl ProcessChainListLib {
         }
     }
 
-    pub fn new(id: &str,  priority: i32, mut chains: Vec<ProcessChainRef>) -> Self {
+    pub fn new(id: &str, priority: i32, mut chains: Vec<ProcessChainRef>) -> Self {
         // Sort the chains by priority
         chains.sort_by(|a, b| a.priority().cmp(&b.priority()));
 
@@ -39,7 +43,6 @@ impl ProcessChainListLib {
             chains: Arc::new(RwLock::new(chains)),
         }
     }
-
 
     pub fn add_chain(&self, chain: ProcessChainRef) -> Result<(), String> {
         let mut chains = self.chains.write().unwrap();
@@ -51,7 +54,7 @@ impl ProcessChainListLib {
 
         info!("Added process chain with id '{}'", chain.id());
         chains.push(chain);
-        
+
         // Sort the chains by priority
         chains.sort_by(|a, b| a.priority().cmp(&b.priority()));
 
@@ -83,17 +86,89 @@ impl ProcessChainLib for ProcessChainListLib {
         Ok(chains.len())
     }
 
-    fn get_chain_by_index(&self, index: usize) -> Result<Option<ProcessChainRef>, String> {
+    fn get_chain_by_index(&self, index: usize) -> Result<ProcessChainRef, String> {
         let chains = self.chains.read().unwrap();
         if index < chains.len() {
-            Ok(Some(chains[index].clone()))
+            Ok(chains[index].clone())
         } else {
-            Err(format!("No process chain found at index {}", index))
+            let msg = format!("Index {} out of bounds for process chain list", index);
+            error!("{}", msg);
+            Err(msg)
         }
     }
 }
 
-// Manager for process chain libraries
+pub struct ProcessChainConstListLib {
+    id: String,
+    priority: i32,
+    chains: Vec<ProcessChainRef>,
+}
+
+impl ProcessChainConstListLib {
+    pub fn new(id: &str, priority: i32, chains: Vec<ProcessChainRef>) -> Self {
+        Self {
+            id: id.to_owned(),
+            priority,
+            chains,
+        }
+    }
+}
+
+impl ProcessChainLib for ProcessChainConstListLib {
+    fn get_id(&self) -> &str {
+        &self.id
+    }
+
+    fn get_priority(&self) -> i32 {
+        self.priority
+    }
+
+    fn get_chain(&self, id: &str) -> Result<Option<ProcessChainRef>, String> {
+        if let Some(chain) = self.chains.iter().find(|c| c.id() == id) {
+            Ok(Some(chain.clone()))
+        } else {
+            Err(format!("Process chain with id '{}' not found", id))
+        }
+    }
+
+    fn get_len(&self) -> Result<usize, String> {
+        Ok(self.chains.len())
+    }
+
+    fn get_chain_by_index(&self, index: usize) -> Result<ProcessChainRef, String> {
+        if index < self.chains.len() {
+            Ok(self.chains[index].clone())
+        } else {
+            let msg = format!("Index {} out of bounds for process chain list", index);
+            error!("{}", msg);
+            Err(msg)
+        }
+    }
+}
+
+struct ProcessChainClonedLib {
+    id: String,
+    priority: i32,
+    chains: Vec<ProcessChain>,
+}
+
+pub(crate) struct ProcessChainLinkedLib {
+    pub id: String,
+    pub priority: i32,
+    pub chains: Vec<ProcessChainRef>,
+}
+
+impl ProcessChainLinkedLib {
+    fn new(lib: ProcessChainClonedLib) -> Self {
+        Self {
+            id: lib.id,
+            priority: lib.priority,
+            chains: lib.chains.into_iter().map(Arc::new).collect(),
+        }
+    }
+}
+
+/// Manager for process chain libraries
 pub struct ProcessChainManager {
     libs: RwLock<Vec<ProcessChainLibRef>>,
 }
@@ -108,7 +183,10 @@ impl ProcessChainManager {
     pub fn add_lib(&self, lib: ProcessChainLibRef) -> Result<(), String> {
         let mut libs = self.libs.write().unwrap();
         if libs.iter().any(|l| l.get_id() == lib.get_id()) {
-            let msg = format!("Process chain library with id '{}' already exists", lib.get_id());
+            let msg = format!(
+                "Process chain library with id '{}' already exists",
+                lib.get_id()
+            );
             error!("{}", msg);
             return Err(msg);
         }
@@ -151,6 +229,117 @@ impl ProcessChainManager {
         warn!("Process chain with id '{}' not found in any library", id);
         Ok(None)
     }
+
+    /// Clone all chains from all libraries for linking
+    fn clone_chains(&self) -> Result<Vec<ProcessChainClonedLib>, String> {
+        let libs = self.libs.read().unwrap();
+        let mut result = Vec::with_capacity(libs.len());
+        for lib in libs.iter() {
+            let len = lib.get_len()?;
+            let mut chains = Vec::with_capacity(len);
+            for i in 0..len {
+                let chain = lib.get_chain_by_index(i)?;
+                let chain = chain.as_ref().clone();
+                chains.push(chain);
+            }
+
+            let ret = ProcessChainClonedLib {
+                id: lib.get_id().to_string(),
+                priority: lib.get_priority(),
+                chains,
+            };
+
+            result.push(ret);
+        }
+
+        Ok(result)
+    }
+
+    pub async fn link(
+        &self,
+        context: &ParserContextRef,
+    ) -> Result<ProcessChainLinkedManagerRef, String> {
+        let libs = self.clone_chains()?;
+        let mut result = Vec::with_capacity(libs.len());
+        for lib in libs {
+            info!("Linking process chain library: {}", lib.id);
+            let mut linked_chains = Vec::with_capacity(lib.chains.len());
+            for mut chain in lib.chains {
+                chain.link(context).await?;
+
+                linked_chains.push(Arc::new(chain));
+            }
+
+            let linked_lib = ProcessChainConstListLib::new(&lib.id, lib.priority, linked_chains);
+
+            result.push(Arc::new(Box::new(linked_lib) as Box<dyn ProcessChainLib>));
+        }
+
+        let manager = ProcessChainLinkedManager::new_with_libs(result);
+        Ok(Arc::new(manager))
+    }
 }
 
 pub type ProcessChainManagerRef = Arc<ProcessChainManager>;
+
+/// A manager for linked process chains, which can be used to execute multiple chains
+pub struct ProcessChainLinkedManager {
+    libs: Vec<ProcessChainLibRef>,
+}
+
+impl ProcessChainLinkedManager {
+    pub fn new() -> Self {
+        Self { libs: Vec::new() }
+    }
+
+    /// Create a new linked manager with the given libraries, the libraries must be linked first
+    pub fn new_with_libs(libs: Vec<ProcessChainLibRef>) -> Self {
+        Self { libs }
+    }
+
+    /// Add a new library to the linked manager, the library must be linked first
+    pub fn add_lib(&mut self, lib: ProcessChainLibRef) -> Result<(), String> {
+        if self.libs.iter().any(|l| l.get_id() == lib.get_id()) {
+            let msg = format!(
+                "Process chain library with id '{}' already exists",
+                lib.get_id()
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        info!("Added process chain library with id '{}'", lib.get_id());
+        self.libs.push(lib);
+
+        // Sort the libraries by priority
+        self.libs
+            .sort_by(|a, b| a.get_priority().cmp(&b.get_priority()));
+
+        Ok(())
+    }
+
+    pub fn get_lib(&self, id: &str) -> Option<ProcessChainLibRef> {
+        self.libs.iter().find(|l| l.get_id() == id).cloned()
+    }
+
+    pub fn get_chain(&self, id: &str) -> Result<Option<ProcessChainRef>, String> {
+        for lib in &self.libs {
+            if let Some(chain) = lib.get_chain(id)? {
+                return Ok(Some(chain));
+            }
+        }
+
+        warn!("Process chain with id '{}' not found in any linked library", id);
+        Ok(None)
+    }
+}
+
+impl Deref for ProcessChainLinkedManager {
+    type Target = [ProcessChainLibRef];
+
+    fn deref(&self) -> &Self::Target {
+        &self.libs
+    }
+}
+
+pub type ProcessChainLinkedManagerRef = Arc<ProcessChainLinkedManager>;

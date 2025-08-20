@@ -4,22 +4,22 @@ use crate::chain::{Context, ParserContextRef};
 use crate::cmd::{CommandParserFactory};
 use crate::collection::CollectionValue;
 
-pub struct BlockCommandTranslator {
+pub struct BlockCommandLinker {
     context: ParserContextRef,
     parser: CommandParserFactory,
 }
 
-impl BlockCommandTranslator {
+impl BlockCommandLinker {
     pub fn new(context: ParserContextRef, parser: CommandParserFactory) -> Self {
         Self { context, parser }
     }
 
-    pub async fn translate(&self, block: &mut Block) -> Result<(), String> {
+    pub async fn link(&self, block: &mut Block) -> Result<(), String> {
         for line in &mut block.lines {
             for statement in &mut line.statements {
-                // For each statement, we need to translate the expressions
+                // For each statement, we need to link the expressions
                 for (_, expr, _) in &mut statement.expressions {
-                    self.translate_expression(expr)?;
+                    self.link_expression(expr)?;
                 }
             }
         }
@@ -27,15 +27,15 @@ impl BlockCommandTranslator {
         Ok(())
     }
 
-    fn translate_expression(&self, expr: &mut Expression) -> Result<(), String> {
+    fn link_expression(&self, expr: &mut Expression) -> Result<(), String> {
         match expr {
             Expression::Command(cmd) => {
-                self.translate_command(cmd)?;
+                self.link_command(cmd)?;
             }
             Expression::Group(exprs) => {
-                // For group expressions, we need to translate each sub-expression
+                // For group expressions, we need to link each sub-expression
                 for (_, sub_expr, _) in exprs {
-                    self.translate_expression(sub_expr)?;
+                    self.link_expression(sub_expr)?;
                 }
             }
         }
@@ -43,7 +43,7 @@ impl BlockCommandTranslator {
         Ok(())
     }
 
-    fn translate_command(&self, cmd: &mut CommandItem) -> Result<(), String> {
+    fn link_command(&self, cmd: &mut CommandItem) -> Result<(), String> {
         // debug!("Translating command: {:?}", cmd.command);
         let parser = self.parser.get_parser(&cmd.command.name);
         if parser.is_none() {
@@ -52,12 +52,12 @@ impl BlockCommandTranslator {
             return Err(msg);
         }
 
-        // Recursively translate the command arguments
+        // Recursively link the command arguments
         for arg in &mut cmd.command.args.iter_mut() {
             match arg.as_command_substitution_mut() {
                 Some(exp) => {
-                    // If it's a command substitution, we need to translate it as well
-                    self.translate_expression(exp)?;
+                    // If it's a command substitution, we need to link it as well
+                    self.link_expression(exp)?;
                 }
                 None => {
                     continue; // Literal or variable, no translation needed

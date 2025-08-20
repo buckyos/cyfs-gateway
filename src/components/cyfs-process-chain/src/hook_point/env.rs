@@ -1,4 +1,4 @@
-use super::hook_point::HookPoint;
+use super::hook_point::{HookPoint, HookPointExecutor};
 use crate::chain::*;
 use crate::cmd::{ExternalCommand, ExternalCommandRef};
 use crate::collection::*;
@@ -197,93 +197,28 @@ impl HookPointEnv {
         Ok(())
     }
 
-    async fn prepare_chain_list(
+    /// Link the hook point with the current environment.
+    pub async fn link_hook_point(
         &self,
         hook_point: &HookPoint,
-    ) -> Result<Vec<ProcessChainRef>, String> {
-        let list = hook_point
+    ) -> Result<HookPointExecutor, String> {
+        let process_chain_manager = hook_point
             .process_chain_manager()
-            .clone_process_chain_list();
-        let mut chains = Vec::with_capacity(list.len());
-
-        for chain in &list {
-            let mut chain = (chain.as_ref()).clone();
-            chain.translate(&self.parser_context).await.map_err(|e| {
-                let msg = format!("Failed to translate process chain '{}': {}", chain.id(), e);
+            .link(&self.parser_context)
+            .await
+            .map_err(|e| {
+                let msg = format!(
+                    "Failed to link process chain manager for hook point '{}': {}",
+                    hook_point.id(),
+                    e
+                );
                 error!("{}", msg);
                 msg
             })?;
 
-            chains.push(Arc::new(chain));
-        }
-
-        Ok(chains)
+        let executor = HookPointExecutor::new(hook_point.id(), process_chain_manager);
+        Ok(executor)
     }
-
-    // Prepare execute the chain list defined in the hook point, will return a ProcessChainLibExecutor
-    // which can be used to execute the chain list.
-    pub async fn prepare_exec_list(
-        &self,
-        hook_point: &HookPoint,
-    ) -> Result<ProcessChainLibExecutor, String> {
-        Ok(ProcessChainLibExecutor::new(
-            self.prepare_chain_list(hook_point).await?,
-            hook_point.process_chain_manager().clone(),
-            self.global_env.clone(),
-            self.pipe.pipe().clone(),
-        ))
-    }
-
-    /*
-    pub async fn exec_list(&self, hook_point: &HookPoint) -> Result<CommandResult, String> {
-        info!("Executing hook point chain list: {}", hook_point.id());
-
-        let exec = ProcessChainLibExecutor::new(
-            &hook_point.process_chain_manager(),
-            self.global_env.clone(),
-            self.global_collections.clone(),
-            self.pipe.pipe().clone(),
-        );
-
-        exec.execute_all().await
-    }
-    */
-
-    // Prepare a ProcessChainsExecutor to execute the chain in the hook point
-    // This executor can be used to execute a single chain or multiple chains.
-    pub async fn prepare_exec_chain(
-        &self,
-        hook_point: &HookPoint,
-    ) -> Result<ProcessChainsExecutor, String> {
-        let list = self.prepare_chain_list(hook_point).await?;
-        let process_chain_manager = Arc::new(ProcessChainManager::new_with_chains(list));
-
-        Ok(ProcessChainsExecutor::new(
-            process_chain_manager,
-            self.global_env.clone(),
-            self.pipe.pipe().clone(),
-        ))
-    }
-
-    /*
-    // Just execute a single chain by id(maybe exec multi chain if there is one or more goto commands)
-    pub async fn exec_chain(
-        &self,
-        hook_point: &HookPoint,
-        id: &str,
-    ) -> Result<CommandResult, String> {
-        info!("Executing process chain: {}", id);
-
-        let exec = ProcessChainsExecutor::new(
-            hook_point.process_chain_manager().clone(),
-            self.global_env.clone(),
-            self.global_collections.clone(),
-            self.pipe.pipe().clone(),
-        );
-
-        exec.execute_chain_by_id(id).await
-    }
-    */
 }
 
 pub type HookPointEnvRef = Arc<HookPointEnv>;

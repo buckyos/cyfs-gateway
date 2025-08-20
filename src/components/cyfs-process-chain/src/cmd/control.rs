@@ -1,7 +1,7 @@
 use super::cmd::*;
-use crate::block::{BlockExecuter, CommandArg, CommandArgs};
+use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext, ProcessChainsExecutor};
-use clap::{Arg, ArgAction, Command};
+use clap::{Arg, Command};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -519,7 +519,7 @@ impl CommandParser for ErrorCommandParser {
             None
         };
 
-        let cmd = ErrorCommandExecutor::new(from_lelvel, value);
+        let cmd = ErrorCommandExecutor::new(from_level, value);
         Ok(Arc::new(Box::new(cmd)))
     }
 }

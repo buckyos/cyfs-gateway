@@ -214,7 +214,7 @@ async fn test_process_chain() -> Result<(), String> {
 
     // Append all chains to the manager
     for mut chain in chains {
-        chain.translate(&parser_context).await.unwrap();
+        chain.link(&parser_context).await.unwrap();
         manager.add_chain(chain).unwrap();
     }
 

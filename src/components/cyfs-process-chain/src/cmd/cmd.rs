@@ -233,42 +233,31 @@ impl CommandResult {
     }
 
     pub fn _return(level: CommandControlLevel) -> Self {
-        Self::Control(CommandControl::Return(
-            CommandControlValue {
-                level,
-                value: "".to_string(),
-            },
-        ))
+        Self::Control(CommandControl::Return(CommandControlValue {
+            level,
+            value: "".to_string(),
+        }))
     }
 
     pub fn return_with_value(level: CommandControlLevel, value: impl Into<String>) -> Self {
-        Self::Control(CommandControl::Return(
-            CommandControlValue {
-                level,
-                value: value.into(),
-            },
-        ))
+        Self::Control(CommandControl::Return(CommandControlValue {
+            level,
+            value: value.into(),
+        }))
     }
 
     pub fn return_error(level: CommandControlLevel) -> Self {
-        Self::Control(CommandControl::Error(
-            CommandControlValue {
-                level,
-                value: "".to_string(),
-            },
-        ))
+        Self::Control(CommandControl::Error(CommandControlValue {
+            level,
+            value: "".to_string(),
+        }))
     }
 
-    pub fn return_error_with_value(
-        level: CommandControlLevel,
-        value: impl Into<String>,
-    ) -> Self {
-        Self::Control(CommandControl::Error(
-            CommandControlValue {
-                level,
-                value: value.into(),
-            },
-        ))
+    pub fn return_error_with_value(level: CommandControlLevel, value: impl Into<String>) -> Self {
+        Self::Control(CommandControl::Error(CommandControlValue {
+            level,
+            value: value.into(),
+        }))
     }
 
     pub fn exit_chain() -> Self {
@@ -279,23 +268,12 @@ impl CommandResult {
         Self::Control(CommandControl::Exit(value.into()))
     }
 
-
-    pub fn _break(level: CommandControlLevel) -> Self {
-        Self::Control(CommandControl::Break(
-            CommandControlValue {
-                level,
-                value: "".to_string(),
-            },
-        ))
+    pub fn _break() -> Self {
+        Self::Control(CommandControl::Break("".to_string()))
     }
 
-    pub fn break_with_value(level: CommandControlLevel, value: impl Into<String>) -> Self {
-        Self::Control(CommandControl::Break(
-            CommandControlValue {
-                level,
-                value: value.into(),
-            },
-        ))
+    pub fn break_with_value(value: impl Into<String>) -> Self {
+        Self::Control(CommandControl::Break(value.into()))
     }
 
     // drop is same as exit drop

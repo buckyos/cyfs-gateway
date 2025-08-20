@@ -2,7 +2,7 @@ use super::context::Context;
 use super::exec::ProcessChainExecutor;
 use crate::block::*;
 use crate::cmd::{COMMAND_PARSER_FACTORY, CommandResult};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct ProcessChain {
@@ -53,14 +53,13 @@ impl ProcessChain {
         &self.blocks
     }
 
-    pub async fn translate(&mut self, context: &ParserContextRef) -> Result<(), String> {
-        info!("Translating process chain: {}", self.id);
+    pub async fn link(&mut self, context: &ParserContextRef) -> Result<(), String> {
+        info!("Linking process chain: {}", self.id);
 
-        let translator =
-            BlockCommandTranslator::new(context.clone(), COMMAND_PARSER_FACTORY.clone());
-        // Translate each block in the chain
+        let linker = BlockCommandLinker::new(context.clone(), COMMAND_PARSER_FACTORY.clone());
+        // Link each block in the chain
         for block in &mut self.blocks {
-            translator.translate(block).await?;
+            linker.link(block).await?;
         }
 
         Ok(())

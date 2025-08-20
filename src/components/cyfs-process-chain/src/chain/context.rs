@@ -1,5 +1,5 @@
 use super::env::{Env, EnvLevel};
-use crate::chain::{EnvManager, EnvRef, ProcessChainRef, ProcessChainManagerRef};
+use crate::chain::{EnvManager, EnvRef, ProcessChainRef, ProcessChainLinkedManagerRef};
 use crate::pipe::CommandPipe;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, RwLock};
@@ -43,14 +43,14 @@ pub type GotoCounterRef = Arc<GotoCounter>;
 #[derive(Clone)]
 pub struct Context {
     current_chain: Arc<RwLock<Option<ProcessChainRef>>>, // The chain that this context is executing
-    process_chain_manager: ProcessChainManagerRef,
+    process_chain_manager: ProcessChainLinkedManagerRef,
     env: EnvManager,
     goto_counter: GotoCounterRef, // Counter for goto command executions
     pipe: CommandPipe,            // Pipe for command execution
 }
 
 impl Context {
-    pub fn new(process_chain_manager: ProcessChainManagerRef, global_env: EnvRef, goto_counter: GotoCounterRef, pipe: CommandPipe) -> Self {
+    pub fn new(process_chain_manager: ProcessChainLinkedManagerRef, global_env: EnvRef, goto_counter: GotoCounterRef, pipe: CommandPipe) -> Self {
         let chain_env = Arc::new(Env::new(EnvLevel::Chain, Some(global_env.clone())));
         let env_manager = EnvManager::new(global_env, chain_env);
 
@@ -68,7 +68,7 @@ impl Context {
         *current_chain = Some(chain);
     }
 
-    pub fn process_chain_manager(&self) -> &ProcessChainManagerRef {
+    pub fn process_chain_manager(&self) -> &ProcessChainLinkedManagerRef {
         &self.process_chain_manager
     }
 
@@ -100,19 +100,6 @@ impl Context {
     pub fn pipe(&self) -> &CommandPipe {
         &self.pipe
     }
-
-    /*
-    pub fn fork_chain(&self, chain: ProcessChainRef) -> Self {
-        // Call new that will create a new chain environment that inherits from the global environment
-
-        Self::new(
-            self.env.get_global().clone(), // Use independent chain environment, just share global environment
-            self.collection_manager.get_global_collections().clone(), // Use independent chain collections, just share global collections
-            self.goto_counter.clone(), // Use the same goto counter for the chain context
-            self.pipe.clone(),
-        )
-    }
-    */
 
     pub fn fork_block(&self) -> Self {
         // Create a new block environment that inherits from the chain environment

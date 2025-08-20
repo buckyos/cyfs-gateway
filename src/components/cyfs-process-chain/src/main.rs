@@ -34,7 +34,7 @@ async fn main() {
     simplelog::SimpleLogger::init(simplelog::LevelFilter::Info, simplelog::Config::default())
         .unwrap();
 
-    let ret = ProcessChainREPL::new();
+    let ret = ProcessChainREPL::new().await;
     let repl = match ret {
         Ok(repl) => repl,
         Err(e) => {

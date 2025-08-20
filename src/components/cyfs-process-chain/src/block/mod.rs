@@ -1,9 +1,9 @@
 mod block;
-mod parser;
 mod exec;
-mod translator;
+mod linker;
+mod parser;
 
 pub use block::*;
-pub use parser::*;
 pub use exec::*;
-pub use translator::*;
+pub use linker::*;
+pub use parser::*;

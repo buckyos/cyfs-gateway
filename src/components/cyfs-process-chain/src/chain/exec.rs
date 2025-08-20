@@ -1,7 +1,7 @@
-use super::chain::{ProcessChain, ProcessChainManagerRef, ProcessChainRef};
+use super::chain::{ProcessChain, ProcessChainRef};
 use super::context::{Context, GotoCounter};
 use super::env::EnvRef;
-use super::manager::ProcessChainLibRef;
+use super::manager::{ProcessChainLibRef, ProcessChainLinkedManagerRef};
 use crate::block::BlockExecuter;
 use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
 use crate::pipe::CommandPipe;
@@ -74,8 +74,8 @@ impl ProcessChainExecutor {
                         match value.level {
                             CommandControlLevel::Block => {
                                 // Return from the block with a value, and will continue to the next block
-                               chain_result = result;
-                               continue;
+                                chain_result = result;
+                                continue;
                             }
                             CommandControlLevel::Chain | CommandControlLevel::Lib => {
                                 // Return from the entire chain
@@ -86,7 +86,7 @@ impl ProcessChainExecutor {
                     }
                     CommandControl::Error(value) => {
                         warn!("Error return in block '{}': {:?}", block.id, value);
-                        
+
                         match value.level {
                             CommandControlLevel::Block => {
                                 // Error return from the block, continue to the next block
@@ -127,13 +127,13 @@ impl ProcessChainExecutor {
 }
 
 pub struct ProcessChainsExecutor {
-    process_chain_manager: ProcessChainManagerRef,
+    process_chain_manager: ProcessChainLinkedManagerRef,
     context: Context,
 }
 
 impl ProcessChainsExecutor {
     pub fn new(
-        process_chain_manager: ProcessChainManagerRef,
+        process_chain_manager: ProcessChainLinkedManagerRef,
         global_env: EnvRef,
         pipe: CommandPipe,
     ) -> Self {
@@ -160,7 +160,7 @@ impl ProcessChainsExecutor {
         chain_id: &str,
         block_id: &str,
     ) -> Result<CommandResult, String> {
-        let chain = self.process_chain_manager.get_chain(chain_id);
+        let chain = self.process_chain_manager.get_chain(chain_id)?;
         if chain.is_none() {
             let msg = format!("Process chain '{}' not found", chain_id);
             warn!("{}", msg);
@@ -186,7 +186,7 @@ impl ProcessChainsExecutor {
     }
 
     pub async fn execute_chain_by_id(&self, chain_id: &str) -> Result<CommandResult, String> {
-        let chain = self.process_chain_manager.get_chain(chain_id);
+        let chain = self.process_chain_manager.get_chain(chain_id)?;
         if chain.is_none() {
             let msg = format!("Process chain '{}' not found", chain_id);
             warn!("{}", msg);
@@ -212,7 +212,7 @@ pub struct ProcessChainLibExecutor {
 impl ProcessChainLibExecutor {
     pub fn new(
         process_chain_lib: ProcessChainLibRef,
-        process_chain_manager: ProcessChainManagerRef,
+        process_chain_manager: ProcessChainLinkedManagerRef,
         global_env: EnvRef,
         pipe: CommandPipe,
     ) -> Self {
@@ -266,13 +266,6 @@ impl ProcessChainLibExecutor {
         let len = self.process_chain_lib.get_len()?;
         while chain_index < len {
             let chain = self.process_chain_lib.get_chain_by_index(chain_index)?;
-            if chain.is_none() {
-                let msg = format!("Process chain at index {} not found", chain_index);
-                warn!("{}", msg);
-                return Err(msg);
-            }
-
-            let chain = chain.unwrap();
             info!(
                 "Executing process chain: {}:{}, {}",
                 chain_index,
@@ -292,10 +285,7 @@ impl ProcessChainLibExecutor {
                     final_result = ret;
                     break;
                 } else if control.is_return_from_lib() {
-                    info!(
-                        "Returning from process chain lib with value: {:?}",
-                        control,
-                    );
+                    info!("Returning from process chain lib with value: {:?}", control,);
                     final_result = ret;
                     break;
                 } else if control.is_error_from_lib() {
