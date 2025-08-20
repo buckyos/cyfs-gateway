@@ -1,4 +1,4 @@
-use crate::{CyfsServerConfig, StackProtocol, RTcpStack, GATEWAY_TUNNEL_MANAGER, DatagramClientBox};
+use crate::{CyfsServerConfig, StackProtocol, RTcpStack, GATEWAY_TUNNEL_MANAGER, DatagramClientBox, ServerError};
 use buckyos_kit::AsyncStream;
 use hyper::{Request, Response, StatusCode};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -14,26 +14,13 @@ use hyper::body::{Bytes, Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use name_lib::{encode_ed25519_pkcs8_sk_to_pk, load_raw_private_key, DeviceConfig};
 
-#[derive(Debug, Copy, Clone)]
-pub enum ServerErrorCode {
-    BindFailed,
-    InvalidConfig,
-    ProcessChainError,
-    StreamError,
-    TunnelError,
-    InvalidTlsKey,
-    InvalidTlsCert,
-}
-pub type ServerResult<T> = sfo_result::Result<T, ServerErrorCode>;
-pub type ServerError = sfo_result::Error<ServerErrorCode>;
 use cyfs_process_chain::{CollectionValue, CommandControl, CommandResult, HookPoint, HookPointEnv, HyperHttpRequestHeaderMap, MapCollection, ProcessChainListExecutor, StreamRequest, StreamRequestMap};
-use sfo_result::err as server_err;
-use sfo_result::into_err as into_server_err;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use url::Url;
 use crate::global_process_chains::create_process_chain_executor;
+use super::{server_err, into_server_err, ServerResult, ServerErrorCode};
 
 type GenericError = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, GenericError>;

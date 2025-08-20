@@ -13,6 +13,16 @@ pub trait InnerHttpService: Send + Sync {
 pub struct InnerHttpServiceManager {
     services: HashMap<String, Arc<dyn InnerHttpService>>,
 }
+pub type InnerHttpServiceManagerRef = Arc<InnerHttpServiceManager>;
+
+
+impl InnerHttpServiceManager {
+    pub fn new() -> Self {
+        Self {
+            services: HashMap::new(),
+        }
+    }
+}
 
 #[async_trait::async_trait]
 pub trait InnerDnsService: Send + Sync {

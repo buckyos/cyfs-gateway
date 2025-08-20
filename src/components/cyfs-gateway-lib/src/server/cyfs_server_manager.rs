@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
-use crate::CyfsServerConfig;
-use crate::server::cyfs_server::{CyfsServer, ServerResult};
+use crate::{CyfsServer, CyfsServerConfig, ServerResult};
 
 pub struct CyfsServerManager {
     servers: Mutex<Vec<CyfsServer>>
@@ -13,8 +12,8 @@ impl CyfsServerManager {
             servers: Mutex::new(vec![]),
         })
     }
-    
-    pub async fn start_server(&self, servers: Vec<CyfsServerConfig>) -> ServerResult<()> { 
+
+    pub async fn start_server(&self, servers: Vec<CyfsServerConfig>) -> ServerResult<()> {
         for server in servers.iter() {
             let server = match CyfsServer::create_server(server.clone()).await {
                 Ok(server) => server,
