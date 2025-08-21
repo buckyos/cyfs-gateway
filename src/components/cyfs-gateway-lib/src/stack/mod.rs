@@ -10,6 +10,7 @@ pub use rtcp_stack::*;
 pub use udp_stack::*;
 pub use quic_stack::*;
 pub use stack::*;
+pub use tls_stack::*;
 
 #[derive(Debug, Copy, Clone)]
 pub enum StackErrorCode {

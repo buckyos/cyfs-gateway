@@ -5,7 +5,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::{http, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use cyfs_process_chain::{CollectionValue, HookPoint, HyperHttpRequestHeaderMap, MapCollection, ProcessChainListExecutor};
+use cyfs_process_chain::{CollectionValue, HyperHttpRequestHeaderMap, MapCollection, ProcessChainListExecutor};
 use crate::{InnerHttpServiceManagerRef, ProcessChainConfigs, ServerError, ServerErrorCode, ServerResult, StreamServer};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err, into_server_err};
@@ -175,10 +175,8 @@ impl StreamServer for HttpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::io::{AsyncWriteExt, DuplexStream};
-    use crate::{BlockConfig, InnerHttpServiceManager, ProcessChainConfig};
+    use crate::{InnerHttpServiceManager};
 
     #[tokio::test]
     async fn test_http_server_builder_creation() {

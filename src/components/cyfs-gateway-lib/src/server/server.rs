@@ -25,7 +25,7 @@ impl StreamServerManager {
             servers: Mutex::new(HashMap::new()),
         }
     }
-    pub fn add_server(&mut self, name: String, server: Arc<dyn StreamServer>) {
+    pub fn add_server(&self, name: String, server: Arc<dyn StreamServer>) {
         self.servers.lock().unwrap().insert(name, server);
     }
     pub fn get_server(&self, name: &str) -> Option<Arc<dyn StreamServer>> {
