@@ -2,7 +2,7 @@ use super::env::HookPointEnv;
 use super::loader::ProcessChainXMLLoader;
 use crate::chain::{
     ProcessChainLib, ProcessChainLibExecutor, ProcessChainLibRef, ProcessChainLinkedManagerRef,
-    ProcessChainListLib, ProcessChainManager, ProcessChainsExecutor,
+    ProcessChainListLib, ProcessChainManager,
 };
 use std::sync::Arc;
 
@@ -93,20 +93,6 @@ impl HookPointExecutor {
         let process_chain_manager = self.process_chain_manager.clone();
         let exec = ProcessChainLibExecutor::new(
             lib,
-            process_chain_manager,
-            env.global_env().clone(),
-            env.pipe().pipe().clone(),
-        );
-
-        Ok(exec)
-    }
-
-    pub async fn prepare_exec_chain(
-        &self,
-        env: &HookPointEnv,
-    ) -> Result<ProcessChainsExecutor, String> {
-        let process_chain_manager = self.process_chain_manager.clone();
-        let exec = ProcessChainsExecutor::new(
             process_chain_manager,
             env.global_env().clone(),
             env.pipe().pipe().clone(),

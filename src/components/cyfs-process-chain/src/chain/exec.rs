@@ -1,5 +1,7 @@
-use super::chain::{ProcessChain, ProcessChainRef};
-use super::context::{Context, GotoCounter};
+use super::chain::ProcessChainRef;
+use super::context::{
+    Context, ExecPointerBlockGuard, ExecPointerChainGuard, ExecPointerLibGuard, GotoCounter,
+};
 use super::env::EnvRef;
 use super::manager::{ProcessChainLibRef, ProcessChainLinkedManagerRef};
 use crate::block::BlockExecuter;
@@ -7,18 +9,11 @@ use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
 use crate::pipe::CommandPipe;
 use std::sync::Arc;
 
-pub struct ProcessChainExecutor {}
-
-impl ProcessChainExecutor {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
+pub struct ProcessChainExecutor;
 
 impl ProcessChainExecutor {
     pub async fn execute_block(
-        &self,
-        chain: &ProcessChain,
+        chain: &ProcessChainRef,
         block_id: &str,
         context: &Context,
     ) -> Result<CommandResult, String> {
@@ -34,6 +29,8 @@ impl ProcessChainExecutor {
             return Err(msg);
         }
 
+        let _block_guard = ExecPointerBlockGuard::new(&context.current_pointer(), block_id);
+
         let block = block.unwrap();
         let block_executer = BlockExecuter::new(&block.id);
         let block_context = context.fork_block();
@@ -43,8 +40,7 @@ impl ProcessChainExecutor {
     }
 
     pub async fn execute_chain(
-        &self,
-        chain: &ProcessChain,
+        chain: &ProcessChainRef,
         context: &Context,
     ) -> Result<CommandResult, String> {
         let blocks = chain.get_blocks();
@@ -54,11 +50,15 @@ impl ProcessChainExecutor {
             return Ok(CommandResult::success());
         }
 
+        let _chain_guard = ExecPointerChainGuard::new(&context.current_pointer(), chain.clone());
+
         let mut chain_result = CommandResult::success();
 
         let mut i = 0;
         while i < blocks.len() {
             let block = &blocks[i];
+
+            let _block_guard = ExecPointerBlockGuard::new(&context.current_pointer(), &block.id);
 
             let block_executer = BlockExecuter::new(&block.id);
             let block_context = context.fork_block();
@@ -126,84 +126,6 @@ impl ProcessChainExecutor {
     }
 }
 
-pub struct ProcessChainsExecutor {
-    process_chain_manager: ProcessChainLinkedManagerRef,
-    context: Context,
-}
-
-impl ProcessChainsExecutor {
-    pub fn new(
-        process_chain_manager: ProcessChainLinkedManagerRef,
-        global_env: EnvRef,
-        pipe: CommandPipe,
-    ) -> Self {
-        let counter = Arc::new(GotoCounter::new());
-        let context = Context::new(
-            process_chain_manager.clone(),
-            global_env.clone(),
-            counter,
-            pipe.clone(),
-        );
-
-        Self {
-            process_chain_manager,
-            context,
-        }
-    }
-
-    pub fn context(&self) -> &Context {
-        &self.context
-    }
-
-    pub async fn execute_block_by_id(
-        &self,
-        chain_id: &str,
-        block_id: &str,
-    ) -> Result<CommandResult, String> {
-        let chain = self.process_chain_manager.get_chain(chain_id)?;
-        if chain.is_none() {
-            let msg = format!("Process chain '{}' not found", chain_id);
-            warn!("{}", msg);
-            return Err(msg);
-        }
-
-        let chain = chain.unwrap();
-
-        self.execute_block_by_id2(&chain, block_id).await
-    }
-
-    pub async fn execute_block_by_id2(
-        &self,
-        chain: &ProcessChainRef,
-        block_id: &str,
-    ) -> Result<CommandResult, String> {
-        self.context.bind_chain(chain.clone());
-        let ret = ProcessChainExecutor::new()
-            .execute_block(&chain, block_id, &self.context)
-            .await?;
-
-        Ok(ret)
-    }
-
-    pub async fn execute_chain_by_id(&self, chain_id: &str) -> Result<CommandResult, String> {
-        let chain = self.process_chain_manager.get_chain(chain_id)?;
-        if chain.is_none() {
-            let msg = format!("Process chain '{}' not found", chain_id);
-            warn!("{}", msg);
-            return Err(msg);
-        }
-
-        let chain = chain.unwrap();
-        self.execute_chain(&chain).await
-    }
-
-    // If call execute_chain multiple times for one instance, it will shared the same goto counter
-    pub async fn execute_chain(&self, chain: &ProcessChainRef) -> Result<CommandResult, String> {
-        self.context.bind_chain(chain.clone());
-        chain.execute(&self.context).await
-    }
-}
-
 pub struct ProcessChainLibExecutor {
     process_chain_lib: ProcessChainLibRef,
     context: Context,
@@ -224,6 +146,13 @@ impl ProcessChainLibExecutor {
             pipe.clone(),
         );
 
+        Self {
+            process_chain_lib,
+            context,
+        }
+    }
+
+    pub fn new_with_context(process_chain_lib: ProcessChainLibRef, context: Context) -> Self {
         Self {
             process_chain_lib,
             context,
@@ -261,6 +190,11 @@ impl ProcessChainLibExecutor {
     pub async fn execute(&self) -> Result<CommandResult, String> {
         let mut final_result = CommandResult::success();
 
+        let _lib_guard = ExecPointerLibGuard::new(
+            &self.context.current_pointer(),
+            self.process_chain_lib.clone(),
+        );
+
         // We execute the first chain in the list
         let mut chain_index = 0;
         let len = self.process_chain_lib.get_len()?;
@@ -273,8 +207,7 @@ impl ProcessChainLibExecutor {
                 chain.id()
             );
 
-            self.context.bind_chain(chain.clone());
-            let ret = chain.execute(&self.context).await?;
+            let ret = ProcessChainExecutor::execute_chain(&chain, &self.context).await?;
             if ret.is_control() {
                 let control = ret.as_control().unwrap();
                 if control.is_exit() {
@@ -310,5 +243,3 @@ impl ProcessChainLibExecutor {
         Ok(final_result)
     }
 }
-
-pub type ProcessChainsExecutorRef = Arc<ProcessChainsExecutor>;

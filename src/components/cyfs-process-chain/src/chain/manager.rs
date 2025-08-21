@@ -77,7 +77,7 @@ impl ProcessChainLib for ProcessChainListLib {
         if let Some(chain) = chains.iter().find(|c| c.id() == id) {
             Ok(Some(chain.clone()))
         } else {
-            Err(format!("Process chain with id '{}' not found", id))
+            Ok(None)
         }
     }
 
@@ -322,14 +322,101 @@ impl ProcessChainLinkedManager {
         self.libs.iter().find(|l| l.get_id() == id).cloned()
     }
 
-    pub fn get_chain(&self, id: &str) -> Result<Option<ProcessChainRef>, String> {
-        for lib in &self.libs {
-            if let Some(chain) = lib.get_chain(id)? {
-                return Ok(Some(chain));
+    pub fn get_chain(
+        &self,
+        lib_id: Option<&str>,
+        chain_id: &str,
+    ) -> Result<Option<(ProcessChainLibRef, ProcessChainRef)>, String> {
+        // If a specific library is provided, search only in that library
+        if let Some(lib_id) = lib_id {
+            if let Some(lib) = self.get_lib(lib_id) {
+                match lib.get_chain(chain_id)? {
+                    Some(chain) => return Ok(Some((lib, chain))),
+                    None => {
+                        warn!(
+                            "Process chain with id '{}' not found in library '{}'",
+                            chain_id, lib_id
+                        );
+                        return Ok(None);
+                    }
+                }
+            } else {
+                let msg = format!("Process chain library with id '{}' not found", lib_id);
+                error!("{}", msg);
+                return Ok(None);
             }
         }
 
-        warn!("Process chain with id '{}' not found in any linked library", id);
+        // Otherwise, search in all linked libraries
+        for lib in &self.libs {
+            if let Some(chain) = lib.get_chain(chain_id)? {
+                return Ok(Some((lib.clone(), chain)));
+            }
+        }
+
+        warn!(
+            "Process chain with id '{}' not found in any linked library",
+            chain_id
+        );
+        Ok(None)
+    }
+
+    pub fn get_block(
+        &self,
+        lib_id: Option<&str>,
+        chain_id: &str,
+        block_id: &str,
+    ) -> Result<Option<(ProcessChainLibRef, ProcessChainRef)>, String> {
+
+        // If a specific library is provided, search only in that library
+        if let Some(lib_id) = lib_id {
+            if let Some(lib) = self.get_lib(lib_id) {
+                if let Some(chain) = lib.get_chain(chain_id)? {
+                    match chain.get_block(block_id) {
+                        Some(_block) => return Ok(Some((lib.clone(), chain))),
+                        None => {
+                            warn!(
+                                "Block with id '{}' not found in chain '{}'",
+                                block_id, chain_id
+                            );
+                            return Ok(None);
+                        }
+                    }
+                } else {
+                    let msg = format!(
+                        "Process chain with id '{}' not found in library '{}'",
+                        chain_id, lib_id
+                    );
+                    error!("{}", msg);
+                    return Ok(None);
+                }
+            } else {
+                let msg = format!("Process chain library with id '{}' not found", lib_id);
+                error!("{}", msg);
+                return Ok(None);
+            }
+        }
+
+        // Otherwise, search in all linked libraries
+        for lib in &self.libs {
+            if let Some(chain) = lib.get_chain(chain_id)? {
+                match chain.get_block(block_id) {
+                    Some(_block) => return Ok(Some((lib.clone(), chain))),
+                    None => {
+                        warn!(
+                            "Block with id '{}' not found in chain '{}'",
+                            block_id, chain_id
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+
+        warn!(
+            "Process chain '{}' and block with id '{}' not found in any linked library",
+            chain_id, block_id
+        );
         Ok(None)
     }
 }

@@ -1,7 +1,5 @@
-use super::context::Context;
-use super::exec::ProcessChainExecutor;
 use crate::block::*;
-use crate::cmd::{COMMAND_PARSER_FACTORY, CommandResult};
+use crate::cmd::COMMAND_PARSER_FACTORY;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -63,12 +61,6 @@ impl ProcessChain {
         }
 
         Ok(())
-    }
-
-    // Execute the chain with multiple blocks
-    pub async fn execute(&self, context: &Context) -> Result<CommandResult, String> {
-        let executor = ProcessChainExecutor::new();
-        executor.execute_chain(self, context).await
     }
 }
 

@@ -10,6 +10,7 @@ mod helper;
 mod match_;
 mod string;
 mod map;
+mod exec;
 
 pub use cmd::*;
 pub use factory::*;

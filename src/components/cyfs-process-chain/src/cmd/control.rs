@@ -1,124 +1,9 @@
 use super::cmd::*;
 use crate::block::{CommandArg, CommandArgs};
-use crate::chain::{Context, ParserContext, ProcessChainsExecutor};
+use crate::chain::{Context, ParserContext};
 use clap::{Arg, Command};
 use std::str::FromStr;
 use std::sync::Arc;
-
-// exec command, exec a block by block_id, like: EXEC block1
-pub struct ExecCommandParser {
-    cmd: Command,
-}
-
-impl ExecCommandParser {
-    pub fn new() -> Self {
-        let cmd = Command::new("exec")
-            .about("Execute a block by its identifier within the current process chain.")
-            .after_help(
-                r#"
-Arguments:
-  <block_id>    The ID of the block to execute.
-
-Behavior:
-  - The specified block must exist in the current process chain.
-  - The block will be executed immediately, and its result is returned.
-  - Execution then continues with the next command in the current block.
-  - If the block does not exist, an error will occur.
-
-Examples:
-  exec verify_token
-  exec block_login && drop
-"#,
-            )
-            .arg(
-                Arg::new("block_id")
-                    .required(true)
-                    .value_name("block_id")
-                    .help("The ID of the block to execute"),
-            );
-
-        Self { cmd }
-    }
-}
-
-impl CommandParser for ExecCommandParser {
-    fn group(&self) -> CommandGroup {
-        CommandGroup::Control
-    }
-
-    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
-        command_help(help_type, &self.cmd)
-    }
-
-    fn parse(
-        &self,
-        _context: &ParserContext,
-        str_args: Vec<&str>,
-        args: &CommandArgs,
-    ) -> Result<CommandExecutorRef, String> {
-        let matches = self
-            .cmd
-            .clone()
-            .try_get_matches_from(&str_args)
-            .map_err(|e| {
-                let msg = format!("Invalid exec command: {:?}, {}", str_args, e);
-                error!("{}", msg);
-                msg
-            })?;
-
-        let block_index = matches.index_of("block_id").ok_or_else(|| {
-            let msg = "block_id argument is required for exec command".to_string();
-            error!("{}", msg);
-            msg
-        })?;
-
-        let block = args[block_index].clone();
-
-        let cmd = ExecCommandExecutor::new(block);
-        Ok(Arc::new(Box::new(cmd)))
-    }
-}
-
-// exec command executer
-pub struct ExecCommandExecutor {
-    pub block: CommandArg,
-}
-
-impl ExecCommandExecutor {
-    pub fn new(block: CommandArg) -> Self {
-        Self { block }
-    }
-}
-
-#[async_trait::async_trait]
-impl CommandExecutor for ExecCommandExecutor {
-    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
-        let block_id = self.block.evaluate_string(context).await?;
-
-        // Get target block from context
-        let chain = context.chain().ok_or_else(|| {
-            let msg = "Exec command requires a chain context".to_string();
-            error!("{}", msg);
-            msg
-        })?;
-
-        let exec = ProcessChainsExecutor::new(
-            context.process_chain_manager().clone(),
-            context.global_env().clone(),
-            context.pipe().clone(),
-        );
-        let ret = exec
-            .execute_block_by_id2(&chain, &block_id)
-            .await
-            .map_err(|e| {
-                let msg = format!("Failed to execute block '{}': {}", block_id, e);
-                error!("{}", msg);
-                msg
-            })?;
-
-        Ok(ret)
-    }
-}
 
 /*
 enum GotoTarget {
@@ -280,7 +165,7 @@ impl ReturnCommandParser {
                 Arg::new("value")
                     .help("Optional return value")
                     .required(false)
-                    .index(1)
+                    .index(1),
             )
             .arg(
                 Arg::new("from")
@@ -425,7 +310,7 @@ impl ErrorCommandParser {
                 Arg::new("value")
                     .help("Optional return value")
                     .required(false)
-                    .index(1)
+                    .index(1),
             )
             .arg(
                 Arg::new("from")
@@ -531,7 +416,7 @@ pub struct ErrorCommandExecutor {
 }
 
 impl ErrorCommandExecutor {
-    pub fn new( from_level: CommandControlLevel, value: Option<CommandArg>) -> Self {
+    pub fn new(from_level: CommandControlLevel, value: Option<CommandArg>) -> Self {
         Self { from_level, value }
     }
 }

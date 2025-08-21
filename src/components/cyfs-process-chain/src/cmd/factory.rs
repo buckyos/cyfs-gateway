@@ -3,6 +3,7 @@ use super::cmd::*;
 use super::coll::*;
 use super::control::*;
 use super::debug::EchoCommandParser;
+use super::exec::*;
 use super::external::*;
 use super::map::*;
 use super::match_::*;
@@ -169,13 +170,11 @@ lazy_static::lazy_static! {
     };
 }
 
-struct CommandFactoryGuard {
-}
+struct CommandFactoryGuard {}
 
 impl CommandFactoryGuard {
     pub const fn new() -> Self {
-        Self {
-        }
+        Self {}
     }
 }
 
