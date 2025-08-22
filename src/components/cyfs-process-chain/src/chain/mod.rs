@@ -5,6 +5,7 @@ mod env_manager;
 mod exec;
 mod external;
 mod manager;
+mod pointer;
 
 pub use chain::*;
 pub use context::*;
@@ -13,3 +14,4 @@ pub use env_manager::*;
 pub use exec::*;
 pub use external::*;
 pub use manager::*;
+pub use pointer::*;

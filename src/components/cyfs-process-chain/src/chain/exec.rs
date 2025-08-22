@@ -1,9 +1,10 @@
 use super::chain::ProcessChainRef;
-use super::context::{
-    Context, ExecPointerBlockGuard, ExecPointerChainGuard, ExecPointerLibGuard, GotoCounter,
-};
+use super::context::Context;
 use super::env::EnvRef;
 use super::manager::{ProcessChainLibRef, ProcessChainLinkedManagerRef};
+use super::pointer::{
+    ExecPointerBlockGuard, ExecPointerChainGuard, ExecPointerLibGuard, GotoCounter,
+};
 use crate::block::BlockExecuter;
 use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
 use crate::pipe::CommandPipe;
@@ -187,7 +188,7 @@ impl ProcessChainLibExecutor {
         }
     }
 
-    pub async fn execute(&self) -> Result<CommandResult, String> {
+    pub async fn execute_lib(&self) -> Result<CommandResult, String> {
         let mut final_result = CommandResult::success();
 
         let _lib_guard = ExecPointerLibGuard::new(
@@ -241,5 +242,21 @@ impl ProcessChainLibExecutor {
         }
 
         Ok(final_result)
+    }
+
+    pub async fn execute_chain(&self, chain_id: &str) -> Result<CommandResult, String> {
+        let chain = self.process_chain_lib.get_chain(chain_id)?.ok_or_else(|| {
+            let msg = format!("Process chain '{}' not found in lib", chain_id);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let _lib_guard = ExecPointerLibGuard::new(
+            &self.context.current_pointer(),
+            self.process_chain_lib.clone(),
+        );
+
+        let context = self.context.fork_chain();
+        ProcessChainExecutor::execute_chain(&chain, &context).await
     }
 }
