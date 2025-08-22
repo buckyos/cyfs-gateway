@@ -127,7 +127,7 @@ impl ProcessChainConstListLib {
             .collect::<Vec<ProcessChainRef>>();
         // Sort the chains by priority
         chains.sort_by(|a, b| a.priority().cmp(&b.priority()));
-        
+
         Self {
             id: id.to_owned(),
             priority,

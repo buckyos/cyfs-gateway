@@ -44,7 +44,7 @@ impl BlockCommandLinker {
     }
 
     fn link_command(&self, cmd: &mut CommandItem) -> Result<(), String> {
-        // debug!("Translating command: {:?}", cmd.command);
+        // debug!("Linking command: {:?}", cmd.command);
         let parser = self.parser.get_parser(&cmd.command.name);
         if parser.is_none() {
             let msg = format!("No parser for command: {}", cmd.command.name);
@@ -68,6 +68,7 @@ impl BlockCommandLinker {
         let parser = parser.unwrap();
         match parser.parse_origin(&self.context, &cmd.command.args) {
             Ok(executor) => {
+                // debug!("Command linked: {:?}", cmd.command);
                 cmd.executor = Some(executor);
 
                 Ok(())

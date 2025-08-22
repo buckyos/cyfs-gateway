@@ -151,7 +151,12 @@ impl BlockExecuter {
         context: &Context,
     ) -> Result<CommandResult, String> {
         debug!("Executing command: {:?}", cmd);
-        let exec = cmd.executor.as_ref().unwrap();
+        let exec = cmd.executor.as_ref().ok_or_else(|| {
+            let msg = format!("Command not linked: {:?}", cmd);
+            error!("{}", msg);
+            msg
+        })?;
+
         let ret = exec.exec(context).await;
         debug!("Command executed: {:?}, result: {:?}", cmd, ret);
         

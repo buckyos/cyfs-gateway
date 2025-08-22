@@ -36,10 +36,10 @@ impl HookPoint {
         self.process_chain_manager.add_lib(lib)
     }
 
-    // Load process chain list as lib in xml format
+    // Load process chain list as lib in xml format and manage it in the process chain manager
     pub async fn load_process_chain_lib(
         &self,
-        id: &str,
+        lib_id: &str,
         priority: i32,
         content: &str,
     ) -> Result<ProcessChainLibRef, String> {
@@ -49,9 +49,11 @@ impl HookPoint {
             .map(|chain| Arc::new(chain))
             .collect::<Vec<_>>();
 
-        let lib = ProcessChainListLib::new(id, priority, chains);
+        let lib = ProcessChainListLib::new(lib_id, priority, chains);
+        let lib = Arc::new(Box::new(lib) as Box<dyn ProcessChainLib>);
+        self.add_process_chain_lib(lib.clone())?;
 
-        Ok(Arc::new(Box::new(lib) as Box<dyn ProcessChainLib>))
+        Ok(lib)
     }
 }
 

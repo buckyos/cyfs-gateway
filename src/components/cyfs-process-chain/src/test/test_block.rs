@@ -243,11 +243,16 @@ async fn test_process_chain() -> Result<(), String> {
         .await
         .unwrap();
 
+    global_env.create("PROTOCOL", CollectionValue::String("https".to_string()))
+        .await
+        .unwrap();
+    
     let pipe = SharedMemoryPipe::new_empty();
 
+    let linked_lib = manager.get_lib("test_lib").unwrap();
     // Create a context with global and chain environment
     let exec = ProcessChainLibExecutor::new(
-        lib,
+        linked_lib,
         manager.clone(),
         global_env.clone(),
         pipe.pipe().clone(),
