@@ -1,5 +1,6 @@
 use super::external::*;
 use crate::*;
+use simplelog::*;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -203,20 +204,20 @@ const PROCESS_CHAIN: &str = r#"
 async fn test_process_chain() -> Result<(), String> {
     let parser_context = Arc::new(ParserContext::new());
 
-    // Parse the process chain
+    // Parse the process chain to lib
     let chains = ProcessChainXMLLoader::parse(PROCESS_CHAIN)?;
     assert_eq!(chains.len(), 2);
 
-    let global_env = Arc::new(Env::new(EnvLevel::Global, None));
+    let lib = ProcessChainConstListLib::new_raw("test_lib", 0, chains).into_process_chain_lib();
 
+    // Create process chain manager
     let manager = ProcessChainManager::new();
     let manager = Arc::new(manager);
 
-    // Append all chains to the manager
-    for mut chain in chains {
-        chain.link(&parser_context).await.unwrap();
-        manager.add_chain(chain).unwrap();
-    }
+    manager.add_lib(lib.clone()).unwrap();
+
+    // Link the process chain manager with the parser context
+    let manager = manager.link(&parser_context).await?;
 
     // Load host db and ip db from file
     let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
@@ -227,6 +228,7 @@ async fn test_process_chain() -> Result<(), String> {
     let host_db = JsonMultiMapCollection::new(host_db_file.clone()).unwrap();
 
     let host_collections = Arc::new(Box::new(host_db.clone()) as Box<dyn MultiMapCollection>);
+    let global_env = Arc::new(Env::new(EnvLevel::Global, None));
     global_env
         .create("host", CollectionValue::MultiMap(host_collections))
         .await
@@ -244,10 +246,15 @@ async fn test_process_chain() -> Result<(), String> {
     let pipe = SharedMemoryPipe::new_empty();
 
     // Create a context with global and chain environment
-    let exec = ProcessChainsExecutor::new(manager.clone(), global_env.clone(), pipe.pipe().clone());
+    let exec = ProcessChainLibExecutor::new(
+        lib,
+        manager.clone(),
+        global_env.clone(),
+        pipe.pipe().clone(),
+    );
 
-    // Execute the first chain
-    let ret: CommandResult = exec.execute_chain_by_id("chain1").await.unwrap();
+    // Execute the lib
+    let ret: CommandResult = exec.fork().execute_lib().await.unwrap();
     info!("Execution result: {:?}", ret);
     assert!(ret.is_accept());
 
@@ -266,7 +273,7 @@ async fn test_process_chain() -> Result<(), String> {
     );
 
     // Execute the second chain
-    exec.execute_chain_by_id("chain2").await.unwrap();
+    exec.execute_chain("chain2").await.unwrap();
 
     Ok(())
 }
@@ -337,7 +344,7 @@ async fn test_hook_point() -> Result<(), String> {
     // Create a hook point
     let hook_point = HookPoint::new("test_hook_point");
     hook_point
-        .load_process_chain_lib(PROCESS_CHAIN)
+        .load_process_chain_lib("main", 0, PROCESS_CHAIN)
         .await
         .unwrap();
 
@@ -375,8 +382,8 @@ async fn test_hook_point() -> Result<(), String> {
         .await
         .unwrap();
 
-    let exec = hook_point_env.prepare_exec_list(&hook_point).await.unwrap();
-    let ret = exec.execute_all().await.unwrap();
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+    let ret = exec.execute_lib("main").await.unwrap();
     info!("Hook point execution result: {:?}", ret);
     assert!(ret.is_accept(), "Hook point execution failed: {:?}", ret);
 
@@ -398,7 +405,6 @@ async fn test_hook_point() -> Result<(), String> {
 
 #[tokio::test]
 async fn test_process_chain_main() {
-    use simplelog::*;
     TermLogger::init(
         LevelFilter::Debug,
         Config::default(),

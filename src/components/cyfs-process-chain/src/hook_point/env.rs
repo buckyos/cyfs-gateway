@@ -1,4 +1,4 @@
-use super::hook_point::{HookPoint, HookPointExecutor};
+use super::hook_point::{HookPoint, HookPointExecutor, HookPointExecutorRef};
 use crate::chain::*;
 use crate::cmd::{ExternalCommand, ExternalCommandRef};
 use crate::collection::*;
@@ -201,7 +201,7 @@ impl HookPointEnv {
     pub async fn link_hook_point(
         &self,
         hook_point: &HookPoint,
-    ) -> Result<HookPointExecutor, String> {
+    ) -> Result<HookPointExecutorRef, String> {
         let process_chain_manager = hook_point
             .process_chain_manager()
             .link(&self.parser_context)
@@ -216,7 +216,14 @@ impl HookPointEnv {
                 msg
             })?;
 
-        let executor = HookPointExecutor::new(hook_point.id(), process_chain_manager);
+        let executor = HookPointExecutor::new(
+            hook_point.id(),
+            process_chain_manager,
+            self.global_env.clone(),
+            self.pipe.pipe().clone(),
+        );
+        let executor = Arc::new(executor);
+
         Ok(executor)
     }
 }

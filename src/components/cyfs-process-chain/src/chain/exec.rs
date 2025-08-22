@@ -172,7 +172,11 @@ impl ProcessChainLibExecutor {
         self.context.global_env()
     }
 
-    /// Fork the executor to create a new context to execute the process chain
+    pub fn pipe(&self) -> &CommandPipe {
+        self.context.pipe()
+    }
+
+    /// Fork the executor to create a new context to execute the process chain lib or chain.
     pub fn fork(&self) -> Self {
         let counter = Arc::new(GotoCounter::new());
         let context = Context::new(
@@ -188,7 +192,8 @@ impl ProcessChainLibExecutor {
         }
     }
 
-    pub async fn execute_lib(&self) -> Result<CommandResult, String> {
+    // Consume the executor and execute the process chain lib
+    pub async fn execute_lib(self) -> Result<CommandResult, String> {
         let mut final_result = CommandResult::success();
 
         let _lib_guard = ExecPointerLibGuard::new(
@@ -244,7 +249,8 @@ impl ProcessChainLibExecutor {
         Ok(final_result)
     }
 
-    pub async fn execute_chain(&self, chain_id: &str) -> Result<CommandResult, String> {
+    // Consume the executor and execute a specific chain in the process chain lib
+    pub async fn execute_chain(self, chain_id: &str) -> Result<CommandResult, String> {
         let chain = self.process_chain_lib.get_chain(chain_id)?.ok_or_else(|| {
             let msg = format!("Process chain '{}' not found in lib", chain_id);
             error!("{}", msg);
@@ -256,7 +262,6 @@ impl ProcessChainLibExecutor {
             self.process_chain_lib.clone(),
         );
 
-        let context = self.context.fork_chain();
-        ProcessChainExecutor::execute_chain(&chain, &context).await
+        ProcessChainExecutor::execute_chain(&chain, &self.context).await
     }
 }

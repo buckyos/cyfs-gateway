@@ -384,7 +384,7 @@ impl ExecCommandExecutor {
 
         let exec = ProcessChainLibExecutor::new_with_context(lib, context.fork_chain());
 
-        exec.execute().await
+        exec.execute_lib().await
     }
 }
 

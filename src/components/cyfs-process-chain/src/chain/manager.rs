@@ -44,6 +44,10 @@ impl ProcessChainListLib {
         }
     }
 
+    pub fn into_process_chain_lib(self) -> ProcessChainLibRef {
+        Arc::new(Box::new(self) as Box<dyn ProcessChainLib>)
+    }
+
     pub fn add_chain(&self, chain: ProcessChainRef) -> Result<(), String> {
         let mut chains = self.chains.write().unwrap();
         if chains.iter().any(|c| c.id() == chain.id()) {
@@ -105,12 +109,34 @@ pub struct ProcessChainConstListLib {
 }
 
 impl ProcessChainConstListLib {
-    pub fn new(id: &str, priority: i32, chains: Vec<ProcessChainRef>) -> Self {
+    pub fn new(id: &str, priority: i32, mut chains: Vec<ProcessChainRef>) -> Self {
+        // Sort the chains by priority
+        chains.sort_by(|a, b| a.priority().cmp(&b.priority()));
+
         Self {
             id: id.to_owned(),
             priority,
             chains,
         }
+    }
+
+    pub fn new_raw(id: &str, priority: i32, chains: Vec<ProcessChain>) -> Self {
+        let mut chains = chains
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<ProcessChainRef>>();
+        // Sort the chains by priority
+        chains.sort_by(|a, b| a.priority().cmp(&b.priority()));
+        
+        Self {
+            id: id.to_owned(),
+            priority,
+            chains,
+        }
+    }
+
+    pub fn into_process_chain_lib(self) -> ProcessChainLibRef {
+        Arc::new(Box::new(self) as Box<dyn ProcessChainLib>)
     }
 }
 

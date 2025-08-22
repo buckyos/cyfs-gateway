@@ -1,9 +1,11 @@
-use super::env::HookPointEnv;
 use super::loader::ProcessChainXMLLoader;
+use crate::chain::EnvRef;
 use crate::chain::{
     ProcessChainLib, ProcessChainLibExecutor, ProcessChainLibRef, ProcessChainLinkedManagerRef,
     ProcessChainListLib, ProcessChainManager,
 };
+use crate::cmd::CommandResult;
+use crate::pipe::CommandPipe;
 use std::sync::Arc;
 
 pub struct HookPoint {
@@ -58,16 +60,22 @@ pub type HookPointRef = Arc<HookPoint>;
 pub struct HookPointExecutor {
     id: String,
     process_chain_manager: ProcessChainLinkedManagerRef,
+    global_env: EnvRef,
+    pipe: CommandPipe,
 }
 
 impl HookPointExecutor {
     pub(crate) fn new(
         id: impl Into<String>,
         process_chain_manager: ProcessChainLinkedManagerRef,
+        global_env: EnvRef,
+        pipe: CommandPipe,
     ) -> Self {
         Self {
             id: id.into(),
             process_chain_manager,
+            global_env,
+            pipe,
         }
     }
 
@@ -79,13 +87,9 @@ impl HookPointExecutor {
         &self.process_chain_manager
     }
 
-    pub async fn prepare_exec_lib(
-        &self,
-        env: &HookPointEnv,
-        id: &str,
-    ) -> Result<ProcessChainLibExecutor, String> {
-        let lib = self.process_chain_manager.get_lib(id).ok_or_else(|| {
-            let msg = format!("Process chain lib '{}' not found", id);
+    pub fn prepare_exec_lib(&self, lib_id: &str) -> Result<ProcessChainLibExecutor, String> {
+        let lib = self.process_chain_manager.get_lib(lib_id).ok_or_else(|| {
+            let msg = format!("Process chain lib '{}' not found", lib_id);
             error!("{}", msg);
             msg
         })?;
@@ -94,11 +98,26 @@ impl HookPointExecutor {
         let exec = ProcessChainLibExecutor::new(
             lib,
             process_chain_manager,
-            env.global_env().clone(),
-            env.pipe().pipe().clone(),
+            self.global_env.clone(),
+            self.pipe.clone(),
         );
 
         Ok(exec)
+    }
+
+    pub async fn execute_lib(&self, lib_id: &str) -> Result<CommandResult, String> {
+        let exec = self.prepare_exec_lib(lib_id)?;
+        exec.execute_lib().await
+    }
+
+    pub async fn execute_chain(
+        &self,
+        lib_id: &str,
+        chain_id: &str,
+    ) -> Result<CommandResult, String> {
+        let exec = self.prepare_exec_lib(lib_id)?;
+
+        exec.execute_chain(chain_id).await
     }
 }
 

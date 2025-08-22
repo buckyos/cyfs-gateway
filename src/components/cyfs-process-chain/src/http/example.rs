@@ -42,7 +42,7 @@ impl HttpHookManager {
     pub async fn create(process_chain: &str) -> Result<Self, String> {
         // Create a hook point
         let hook_point = HookPoint::new("http-hook-point");
-        hook_point.load_process_chain_lib(process_chain).await?;
+        hook_point.load_process_chain_lib("main", 0, process_chain).await?;
 
         let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -119,7 +119,7 @@ async fn pre_process_request(
             .unwrap();
 
         // Exec the process chain list
-        let ret = exec.execute_all().await.unwrap();
+        let ret = exec.execute_lib().await.unwrap();
 
         info!("Process chain execution result: {:?}", ret);
         if ret.is_control() {
@@ -145,7 +145,6 @@ async fn pre_process_request(
         }
     }
 
-    drop(exec); // Ensure the executor is dropped before we unwrap the request
     let req = req_map.into_request().unwrap();
     Ok(req)
 }
@@ -172,10 +171,9 @@ async fn server_main() {
 
     let exec = hook_manager
         .hook_point_env
-        .prepare_exec_list(&hook_manager.hook_point)
+        .link_hook_point(&hook_manager.hook_point)
         .await
         .unwrap();
-    let exec = Arc::new(exec);
 
     let addr: SocketAddr = ([127, 0, 0, 1], 3000).into();
 
@@ -187,7 +185,10 @@ async fn server_main() {
 
         let exec = exec.clone();
         tokio::task::spawn(async move {
-            let service = service_fn(move |req| handle(req, exec.fork()));
+            let service = service_fn(move |req| {
+                let lib_exec = exec.prepare_exec_lib("main").unwrap();
+                handle(req, lib_exec)
+            });
 
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
                 log::info!("Failed to serve connection: {:?}", err);

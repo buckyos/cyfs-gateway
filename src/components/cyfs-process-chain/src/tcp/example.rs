@@ -51,7 +51,9 @@ impl HttpConnHookManager {
     pub async fn create(process_chain: &str) -> Result<Self, String> {
         // Create a hook point
         let hook_point = HookPoint::new("http-conn-hook-point");
-        hook_point.load_process_chain_lib(process_chain).await?;
+        hook_point
+            .load_process_chain_lib("main", 0, process_chain)
+            .await?;
 
         let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -123,8 +125,7 @@ async fn on_new_connection(
     request_map.register(&env).await.unwrap();
 
     // Execute the hook point
-    let ret = exec.execute_all().await;
-    drop(exec);
+    let ret: Result<CommandResult, String> = exec.execute_lib().await;
 
     let request = request_map.into_request().unwrap();
     let stream = request.incoming_stream.lock().unwrap().take().unwrap();
@@ -141,8 +142,11 @@ async fn on_new_connection(
     let url = match &ret {
         CommandResult::Control(CommandControl::Return(forward)) => {
             // If the command was successful, we can get a URL to forward the request
-            let url = Url::parse(&forward).map_err(|e| {
-                let msg = format!("Failed to parse URL from process chain: {}, {}", e, forward);
+            let url = Url::parse(&forward.value).map_err(|e| {
+                let msg = format!(
+                    "Failed to parse URL from process chain: {}, {}",
+                    e, forward.value
+                );
                 error!("{}", msg);
                 msg
             })?;
@@ -203,10 +207,9 @@ async fn start_forward_server(port: u16) {
 
     let exec = hook_manager
         .hook_point_env
-        .prepare_exec_list(&hook_manager.hook_point)
+        .link_hook_point(&hook_manager.hook_point)
         .await
         .unwrap();
-    let exec = Arc::new(exec);
 
     // Start the forward server to handle incoming connections
     let forward_listener = TcpListener::bind(format!("127.0.0.1:{}", port))
@@ -220,8 +223,8 @@ async fn start_forward_server(port: u16) {
             let exec = exec.clone();
             tokio::spawn(async move {
                 let stream = Box::new(inbound) as Box<dyn AsyncStream>;
-                let req_exec = exec.fork();
-                let (forward, mut stream) = on_new_connection(stream, peer_addr, req_exec)
+                let lib_exec = exec.prepare_exec_lib("main").unwrap();
+                let (forward, mut stream) = on_new_connection(stream, peer_addr, lib_exec)
                     .await
                     .unwrap();
 
