@@ -202,6 +202,15 @@ impl CommandControl {
             None
         }
     }
+
+    pub fn value(&self) -> &String {
+        match self {
+            CommandControl::Return(value) => &value.value,
+            CommandControl::Error(value) => &value.value,
+            CommandControl::Exit(value) => value,
+            CommandControl::Break(value) => value,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +310,14 @@ impl CommandResult {
                 warn!("{}", msg);
                 Err(msg)
             }
+        }
+    }
+
+    pub fn value(&self) -> &String {
+        match self {
+            CommandResult::Success(value) => value,
+            CommandResult::Error(value) => value,
+            CommandResult::Control(control) => control.value(),
         }
     }
 

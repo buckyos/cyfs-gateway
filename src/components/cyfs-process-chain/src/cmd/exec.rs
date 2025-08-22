@@ -147,22 +147,18 @@ impl ExecCommandParser {
                     .value_name("LIB_ID")
                     .help("Execute a library by ID."),
             )
-            .group(
-                ArgGroup::new("target_by_id")
-                    .args(["block", "chain", "lib"])
-                    .required(false),
-            )
             .arg(
                 Arg::new("default_block_id")
                     .value_name("BLOCK_ID")
                     .help("Default: execute a block from the current chain.")
-                    .index(1) // This is the default block ID if no scope param is specified
-                    .required(false),
+                    .index(1),
             )
+            // GROUP 1: Makes the --block, --chain, and --lib flags mutually exclusive.
+            .group(ArgGroup::new("target_by_id").args(["block", "chain", "lib"]))
             .group(
                 ArgGroup::new("execution_mode")
-                    .args(["target_by_id", "default_block_id"])
-                    .required(true), // Ensure one of these is always provided
+                    .args(["block", "chain", "lib", "default_block_id"])
+                    .required(true),
             )
             .after_help(
                 r#"
@@ -399,10 +395,48 @@ impl CommandExecutor for ExecCommandExecutor {
             msg
         })?;
 
-        match self.scope {
+        let cmd_ret = match self.scope {
             ExecScope::Block => Self::execute_block(context, &target_id, target).await,
             ExecScope::Chain => Self::execute_chain(context, &target_id, target).await,
             ExecScope::Lib => Self::execute_lib(context, &target_id, target).await,
-        }
+        }?;
+
+        let ret = if cmd_ret.is_control() {
+            // If the execution result is a control action, we handle it immediately
+            info!("Control action in exec command: {:?}", cmd_ret);
+            let control = cmd_ret.into_control().unwrap();
+            match control {
+                CommandControl::Return(value) => {
+                    info!("Returning value from exec command: {:?}", value);
+                    CommandResult::success_with_value(value.value)
+                }
+                CommandControl::Error(value) => {
+                    info!("Error control in exec command: {:?}", value);
+                    CommandResult::error_with_value(value.value)
+                }
+                CommandControl::Exit(_value) => {
+                    let msg =  format!(
+                        "Exit control action in exec command '{}' is not allowed",
+                        target_id
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+                CommandControl::Break(_value) => {
+                    let msg = format!(
+                        "break action only valid in map-reduce loop, found in exec target '{}'",
+                        target_id
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
+        } else {
+            // If the execution result is not a control action, we return it as is
+            cmd_ret
+        };
+
+
+        Ok(ret)
     }
 }
