@@ -55,8 +55,7 @@ impl ProcessChainExecutor {
 
         let mut chain_result = CommandResult::success();
 
-        let mut i = 0;
-        while i < blocks.len() {
+        for i in 0..blocks.len() {
             let block = &blocks[i];
 
             let _block_guard = ExecPointerBlockGuard::new(&context.current_pointer(), &block.id);
@@ -66,7 +65,8 @@ impl ProcessChainExecutor {
             let result = block_executer.execute_block(block, &block_context).await?;
             if result.is_control() {
                 // If the block execution result is a control action, we handle it immediately
-                info!("Control action in block '{}': {:?}", block.id, result);
+                // info!("Control action in block '{}': {:?}", block.id, result);
+                
                 let control = result.as_control().unwrap();
                 match control {
                     CommandControl::Return(value) => {
@@ -119,8 +119,6 @@ impl ProcessChainExecutor {
                 // If the block execution result is not a control action, we continue to the next block
                 chain_result = result;
             }
-
-            i += 1;
         }
 
         Ok(chain_result)
