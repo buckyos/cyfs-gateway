@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Bytes;
 use std::sync::{Arc, Mutex};
 use buckyos_kit::AsyncStream;
 use crate::ServerResult;
@@ -12,7 +13,7 @@ pub trait StreamServer: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 pub trait DatagramServer: Send + Sync + 'static {
-    async fn serve_datagram(&self, buf: &mut [u8]) -> ServerResult<Vec<u8>>;
+    async fn serve_datagram(&self, buf: &[u8]) -> ServerResult<Vec<u8>>;
 }
 
 pub struct StreamServerManager {
@@ -31,12 +32,26 @@ impl StreamServerManager {
     pub fn get_server(&self, name: &str) -> Option<Arc<dyn StreamServer>> {
         self.servers.lock().unwrap().get(name).cloned()
     }
-    
+
 }
 
 pub type StreamServerManagerRef = Arc<StreamServerManager>;
 
 pub struct DatagramServerManager {
     servers: HashMap<String, Arc<dyn DatagramServer>>,
+}
+
+impl DatagramServerManager {
+    pub fn new() -> Self {
+        DatagramServerManager {
+            servers: HashMap::new(),
+        }
+    }
+    pub fn add_server(&mut self, name: String, server: Arc<dyn DatagramServer>) {
+        self.servers.insert(name, server);
+    }
+    pub fn get_server(&self, name: &str) -> Option<Arc<dyn DatagramServer>> {
+        self.servers.get(name).cloned()
+    }
 }
 pub type DatagramServerManagerRef = Arc<DatagramServerManager>;

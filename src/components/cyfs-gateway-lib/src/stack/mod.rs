@@ -21,6 +21,8 @@ pub enum StackErrorCode {
     StreamError,
     InvalidTlsKey,
     InvalidTlsCert,
+    ServerError,
+    IoError,
 }
 pub type StackResult<T> = sfo_result::Result<T, StackErrorCode>;
 pub type StackError = sfo_result::Error<StackErrorCode>;

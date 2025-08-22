@@ -8,7 +8,7 @@ pub struct DnsServer {
 
 #[async_trait::async_trait]
 impl DatagramServer for DnsServer {
-    async fn serve_datagram(&self, _buf: &mut [u8]) -> ServerResult<Vec<u8>> {
+    async fn serve_datagram(&self, _buf: &[u8]) -> ServerResult<Vec<u8>> {
         Ok(vec![])
     }
 }
