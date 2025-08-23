@@ -1,7 +1,4 @@
-
-use crate::chain::{
-    ProcessChainLibRef, ProcessChainRef,
-};
+use crate::chain::{ProcessChainLibRef, ProcessChainRef};
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, RwLock};
 
@@ -39,6 +36,8 @@ impl GotoCounter {
 }
 
 pub type GotoCounterRef = Arc<GotoCounter>;
+
+pub const MAX_STACK_DEPTH: usize = 64; // Maximum depth of the execution stack
 
 enum ExecPointerInner {
     Lib(ProcessChainLibRef), // The library that this pointer is executing
@@ -90,9 +89,25 @@ struct ExecPointerStack {
 
 impl ExecPointerStack {
     pub fn new() -> Self {
-        Self {
-            stack: Vec::new(),
+        Self { stack: Vec::new() }
+    }
+
+    pub fn depth(&self) -> usize {
+        self.stack.len()
+    }
+
+    pub fn check_depth(&self) -> Result<(), String> {
+        if self.depth() >= MAX_STACK_DEPTH {
+            let msg = format!(
+                "Execution stack depth {} exceeds maximum limit of {}",
+                self.depth(),
+                MAX_STACK_DEPTH
+            );
+            error!("{}", msg);
+            return Err(msg);
         }
+
+        Ok(())
     }
 
     pub fn push_lib(&mut self, lib: ProcessChainLibRef) {
@@ -101,7 +116,8 @@ impl ExecPointerStack {
 
     // The top item must be a lib, so we can safely unwrap
     pub fn pop_lib(&mut self) -> ProcessChainLibRef {
-        self.stack.pop()
+        self.stack
+            .pop()
             .and_then(|item| item.into_lib())
             .expect("Expected the top of the stack to be a library")
     }
@@ -112,7 +128,8 @@ impl ExecPointerStack {
 
     // The top item must be a chain, so we can safely unwrap
     pub fn pop_chain(&mut self) -> ProcessChainRef {
-        self.stack.pop()
+        self.stack
+            .pop()
             .and_then(|item| item.into_chain())
             .expect("Expected the top of the stack to be a chain")
     }
@@ -123,7 +140,8 @@ impl ExecPointerStack {
 
     // The top item must be a block, so we can safely unwrap
     pub fn pop_block(&mut self) -> String {
-        self.stack.pop()
+        self.stack
+            .pop()
             .and_then(|item| item.into_block())
             .expect("Expected the top of the stack to be a block")
     }
@@ -174,9 +192,12 @@ impl ExecPointer {
         }
     }
 
-    fn set_lib(&self, lib: ProcessChainLibRef) {
+    fn set_lib(&self, lib: ProcessChainLibRef) -> Result<(), String> {
         let mut stack = self.stack.write().unwrap();
+        stack.check_depth()?;
         stack.push_lib(lib);
+
+        Ok(())
     }
 
     fn reset_lib(&self) {
@@ -184,9 +205,12 @@ impl ExecPointer {
         stack.pop_lib();
     }
 
-    fn set_chain(&self, chain: ProcessChainRef) {
+    fn set_chain(&self, chain: ProcessChainRef) -> Result<(), String> {
         let mut stack = self.stack.write().unwrap();
+        stack.check_depth()?;
         stack.push_chain(chain);
+
+        Ok(())
     }
 
     fn reset_chain(&self) {
@@ -194,9 +218,12 @@ impl ExecPointer {
         stack.pop_chain();
     }
 
-    fn set_block(&self, block: &str) {
+    fn set_block(&self, block: &str) -> Result<(), String> {
         let mut stack = self.stack.write().unwrap();
+        stack.check_depth()?;
         stack.push_block(block.to_string());
+
+        Ok(())
     }
 
     fn reset_block(&self) {
@@ -228,9 +255,11 @@ pub struct ExecPointerLibGuard<'a> {
 }
 
 impl<'a> ExecPointerLibGuard<'a> {
-    pub fn new(pointer: &'a ExecPointer, lib: ProcessChainLibRef) -> Self {
-        pointer.set_lib(lib);
-        Self { pointer }
+    // Return value must be handled by caller
+    #[must_use]
+    pub fn new(pointer: &'a ExecPointer, lib: ProcessChainLibRef) -> Result<Self, String> {
+        pointer.set_lib(lib)?;
+        Ok(Self { pointer })
     }
 }
 
@@ -245,9 +274,10 @@ pub struct ExecPointerChainGuard<'a> {
 }
 
 impl<'a> ExecPointerChainGuard<'a> {
-    pub fn new(pointer: &'a ExecPointer, chain: ProcessChainRef) -> Self {
-        pointer.set_chain(chain);
-        Self { pointer }
+    #[must_use]
+    pub fn new(pointer: &'a ExecPointer, chain: ProcessChainRef) -> Result<Self, String> {
+        pointer.set_chain(chain)?;
+        Ok(Self { pointer })
     }
 }
 
@@ -262,9 +292,10 @@ pub struct ExecPointerBlockGuard<'a> {
 }
 
 impl<'a> ExecPointerBlockGuard<'a> {
-    pub fn new(pointer: &'a ExecPointer, block: &str) -> Self {
-        pointer.set_block(block);
-        Self { pointer }
+    #[must_use]
+    pub fn new(pointer: &'a ExecPointer, block: &str) -> Result<Self, String> {
+        pointer.set_block(block)?;
+        Ok(Self { pointer })
     }
 }
 

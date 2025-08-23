@@ -2,7 +2,7 @@ use super::chain::ProcessChainRef;
 use super::context::Context;
 use super::env::EnvRef;
 use super::manager::{ProcessChainLibRef, ProcessChainLinkedManagerRef};
-use super::pointer::{
+use super::stack::{
     ExecPointerBlockGuard, ExecPointerChainGuard, ExecPointerLibGuard, GotoCounter,
 };
 use crate::block::BlockExecuter;
@@ -30,7 +30,7 @@ impl ProcessChainExecutor {
             return Err(msg);
         }
 
-        let _block_guard = ExecPointerBlockGuard::new(&context.current_pointer(), block_id);
+        let _block_guard = ExecPointerBlockGuard::new(&context.current_pointer(), block_id)?;
 
         let block = block.unwrap();
         let block_executer = BlockExecuter::new(&block.id);
@@ -51,14 +51,14 @@ impl ProcessChainExecutor {
             return Ok(CommandResult::success());
         }
 
-        let _chain_guard = ExecPointerChainGuard::new(&context.current_pointer(), chain.clone());
+        let _chain_guard = ExecPointerChainGuard::new(&context.current_pointer(), chain.clone())?;
 
         let mut chain_result = CommandResult::success();
 
         for i in 0..blocks.len() {
             let block = &blocks[i];
 
-            let _block_guard = ExecPointerBlockGuard::new(&context.current_pointer(), &block.id);
+            let _block_guard = ExecPointerBlockGuard::new(&context.current_pointer(), &block.id)?;
 
             let block_executer = BlockExecuter::new(&block.id);
             let block_context = context.fork_block();
@@ -66,7 +66,7 @@ impl ProcessChainExecutor {
             if result.is_control() {
                 // If the block execution result is a control action, we handle it immediately
                 // info!("Control action in block '{}': {:?}", block.id, result);
-                
+
                 let control = result.as_control().unwrap();
                 match control {
                     CommandControl::Return(value) => {
@@ -197,7 +197,7 @@ impl ProcessChainLibExecutor {
         let _lib_guard = ExecPointerLibGuard::new(
             &self.context.current_pointer(),
             self.process_chain_lib.clone(),
-        );
+        )?;
 
         // We execute the first chain in the list
         let mut chain_index = 0;
@@ -258,7 +258,7 @@ impl ProcessChainLibExecutor {
         let _lib_guard = ExecPointerLibGuard::new(
             &self.context.current_pointer(),
             self.process_chain_lib.clone(),
-        );
+        )?;
 
         ProcessChainExecutor::execute_chain(&chain, &self.context).await
     }

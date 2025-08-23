@@ -1,5 +1,5 @@
 use super::env::{Env, EnvLevel};
-use super::pointer::*;
+use super::stack::*;
 use crate::chain::{
     EnvManager, EnvRef, ProcessChainLibRef, ProcessChainLinkedManagerRef, ProcessChainRef,
 };

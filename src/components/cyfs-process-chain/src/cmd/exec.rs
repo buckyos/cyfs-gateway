@@ -300,7 +300,7 @@ impl ExecCommandExecutor {
             Some(ExecPointerLibGuard::new(
                 context.current_pointer(),
                 target_lib,
-            ))
+            )?)
         };
 
         let _chain_guard = if ret.same_chain {
@@ -318,7 +318,7 @@ impl ExecCommandExecutor {
             Some(ExecPointerChainGuard::new(
                 context.current_pointer(),
                 target_chain,
-            ))
+            )?)
         };
 
         use std::borrow::Cow;
@@ -354,7 +354,7 @@ impl ExecCommandExecutor {
             Some(ExecPointerLibGuard::new(
                 context.current_pointer(),
                 target_lib,
-            ))
+            )?)
         };
 
         // Always fork new chain context for chain execution, even if the chain is in the same chain as current pointer
