@@ -54,7 +54,46 @@ const PROCESS_CHAIN_LIB2: &str = r#"
         </block>
         <block id="block8">
             <![CDATA[
-                return "test_lib2:chain4:block8";
+                return --from block "test_lib2:chain4:block8";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_RETURN: &str = r#"
+<process_chain_lib id="test_return" priority="300">
+    <process_chain id="chain5">
+        <block id="block9">
+            <![CDATA[
+                return --from block "chain5:block9";
+            ]]>
+        </block>
+        <block id="block10">
+            <![CDATA[
+                return --from chain "test_lib3:chain5:block10";
+            ]]>
+        </block>
+        <block id="block11">
+            <![CDATA[
+                return --from lib "test_return:chain5:block11";
+            ]]>
+        </block>
+    </process_chain>
+    <process_chain id="chain6">
+        <block id="block12">
+            <![CDATA[
+                return "test_lib3:chain6:block12";
+            ]]>
+        </block>
+        <block id="block13">
+            <![CDATA[
+                return --from lib "test_lib3:chain6:block13";
+            ]]>
+        </block>
+        <block id="block14">
+            <![CDATA[
+                return --from chain "test_lib3:chain6:block14";
             ]]>
         </block>
     </process_chain>
@@ -74,21 +113,42 @@ async fn test_exec() -> Result<(), String> {
         .await
         .unwrap();
 
+    hook_point
+        .load_process_chain_lib("test_return", 20, PROCESS_CHAIN_RETURN)
+        .await
+        .unwrap();
+
     let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
     std::fs::create_dir_all(&data_dir).unwrap();
 
     // Create env to execute the hook point
     let hook_point_env = HookPointEnv::new("test-exec", data_dir);
 
-    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
-    let ret = exec.execute_lib("test_lib1").await.unwrap();
-    info!("Hook point execution result: {:?}", ret);
-    let value = ret.value();
-    assert!(value == "test_lib2:chain4:block8", "Expected value from execution is 'test_lib2:chain4:block8', got: {:?}", value);
+    // Test exec cases
+    {
+        let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+        let ret = exec.execute_lib("test_lib1").await.unwrap();
+        info!("Hook point execution result: {:?}", ret);
+        let value = ret.value();
+        assert!(value == "test_lib2:chain4:block8", "Expected value from execution is 'test_lib2:chain4:block8', got: {:?}", value);
 
-    // Get all output into string from the pipe
-    let output = hook_point_env.pipe().stdout.clone_string();
-    info!("Hook point output: {}", output);
+        // Get all output into string from the pipe
+        let output = hook_point_env.pipe().stdout.clone_string();
+        info!("Hook point output: {}", output);
+    }
+
+    // Test return cases
+    {
+        let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+        let ret = exec.execute_lib("test_return").await.unwrap();
+        info!("Hook point execution result: {:?}", ret);
+        let value = ret.value();
+        assert!(value == "test_lib3:chain6:block13", "Expected value from execution is 'test_lib3:chain6:block13', got: {:?}", value);
+
+        // Get all output into string from the pipe
+        let output = hook_point_env.pipe().stdout.clone_string();
+        info!("Hook point output: {}", output);
+    }
 
     Ok(())
 }
