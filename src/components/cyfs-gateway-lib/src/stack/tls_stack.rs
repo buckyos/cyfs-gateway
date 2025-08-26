@@ -122,8 +122,8 @@ impl TlsStack {
                 "servers is required"
             ));
         }
-        let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap())
-            .await
+        let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
+                                                          config.global_process_chains).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let mut certs = HashMap::new();
         for cert_config in config.certs.into_iter() {

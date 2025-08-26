@@ -79,7 +79,8 @@ impl HttpServer {
             None => http::Version::HTTP_11,
         };
 
-        let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap()).await
+        let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
+                                                          builder.global_process_chains).await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
         Ok(HttpServer {
             version,

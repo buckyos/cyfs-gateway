@@ -2,11 +2,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use buckyos_kit::AsyncStream;
-use cyfs_process_chain::{CommandResult, ExternalCommand, HookPoint, HookPointEnv, HttpProbeCommand, HttpsSniProbeCommand, ProcessChainLibExecutor, ProcessChainListLib, ProcessChainRef, StreamRequest, StreamRequestMap};
+use cyfs_process_chain::{CommandResult, ExternalCommand, HookPoint, HookPointEnv, HttpProbeCommand, HttpsSniProbeCommand, ProcessChainLibExecutor, ProcessChainLibRef, ProcessChainListLib, ProcessChainRef, StreamRequest, StreamRequestMap};
 use crate::{config_err, ConfigErrorCode, ConfigResult, ProcessChainConfig};
 
 pub struct GlobalProcessChains {
-    process_chains: Mutex<Vec<ProcessChainRef>>,
+    process_chains: Mutex<Vec<ProcessChainLibRef>>,
 }
 pub type GlobalProcessChainsRef = Arc<GlobalProcessChains>;
 
@@ -18,17 +18,28 @@ impl GlobalProcessChains {
     }
 
     pub fn add_process_chain(&mut self, process_chain: ProcessChainRef) {
-        self.process_chains.lock().unwrap().push(process_chain);
+        let process_chain_lib = ProcessChainListLib::new(process_chain.id().to_string().as_str(), 0, vec![process_chain]);
+        self.process_chains.lock().unwrap().push(process_chain_lib.into_process_chain_lib());
     }
 
-    pub fn get_process_chains(&self) -> Vec<ProcessChainRef> {
+    pub fn get_process_chains(&self) -> Vec<ProcessChainLibRef> {
         self.process_chains.lock().unwrap().clone()
+    }
+
+    pub fn register_global_process_chain(&self, hook_point: &HookPoint) -> ConfigResult<()> {
+        let process_chains = self.process_chains.lock().unwrap();
+        for process_chain_lib in process_chains.iter() {
+            hook_point.add_process_chain_lib(process_chain_lib.clone())
+                .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{}", e))?;
+        }
+        Ok(())
     }
 }
 
 
 pub(crate) async fn create_process_chain_executor(
     chains: &Vec<ProcessChainConfig>,
+    global_process_chains: Option<GlobalProcessChainsRef>,
 ) -> ConfigResult<(ProcessChainLibExecutor, HookPointEnv)> {
     let hook_point = HookPoint::new("cyfs_server_hook_point");
     let process_chain_lib = ProcessChainListLib::new_empty("main", 0);
@@ -38,6 +49,11 @@ pub(crate) async fn create_process_chain_executor(
     }
     hook_point.add_process_chain_lib(process_chain_lib.into_process_chain_lib())
         .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{}", e))?;
+    
+    if let Some(global_process_chains) = global_process_chains {
+        global_process_chains.register_global_process_chain(&hook_point)?;
+    }
+    
     let hook_point_env = HookPointEnv::new("cyfs_server_hook_point_env", PathBuf::new());
 
     let https_sni_probe_command = HttpsSniProbeCommand::new();

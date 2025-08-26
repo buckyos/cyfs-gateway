@@ -37,20 +37,20 @@ impl StreamServerManager {
 pub type StreamServerManagerRef = Arc<StreamServerManager>;
 
 pub struct DatagramServerManager {
-    servers: HashMap<String, Arc<dyn DatagramServer>>,
+    servers: Mutex<HashMap<String, Arc<dyn DatagramServer>>>,
 }
 
 impl DatagramServerManager {
     pub fn new() -> Self {
         DatagramServerManager {
-            servers: HashMap::new(),
+            servers: Mutex::new(HashMap::new()),
         }
     }
-    pub fn add_server(&mut self, name: String, server: Arc<dyn DatagramServer>) {
-        self.servers.insert(name, server);
+    pub fn add_server(&self, name: String, server: Arc<dyn DatagramServer>) {
+        self.servers.lock().unwrap().insert(name, server);
     }
     pub fn get_server(&self, name: &str) -> Option<Arc<dyn DatagramServer>> {
-        self.servers.get(name).cloned()
+        self.servers.lock().unwrap().get(name).cloned()
     }
 }
 pub type DatagramServerManagerRef = Arc<DatagramServerManager>;

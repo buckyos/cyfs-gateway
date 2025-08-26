@@ -1,6 +1,7 @@
 use crate::tunnel::{DatagramClient, DatagramServer, TunnelEndpoint};
 use crate::{TunnelError, TunnelResult};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use url::Url;
@@ -18,9 +19,15 @@ impl UdpClient {
         if bind_addr.is_some() {
             client = UdpSocket::bind(bind_addr.unwrap().as_str()).await?;
         } else {
-            client = UdpSocket::bind("[::]:0").await?;
+            let dest = IpAddr::from_str(dest_addr.as_str())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            if dest.is_ipv4() {
+                client = UdpSocket::bind("0.0.0.0:0").await?;
+            } else {
+                client = UdpSocket::bind("[::]:0").await?;
+            }
         }
-        
+
         Ok(UdpClient {
             client: Arc::new(client),
             dest_port,

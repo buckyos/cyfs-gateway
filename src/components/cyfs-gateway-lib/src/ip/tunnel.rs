@@ -43,7 +43,7 @@ impl Tunnel for IPTunnel {
                 }
             }
         };
-        
+
         let stream;
         if self.ip_stack_id.is_none() {
             debug!("use any tcp client addr for open_stream : {}", dest_addr);
@@ -90,7 +90,7 @@ impl Tunnel for IPTunnel {
         } else {
             real_dest_host = dest_host.unwrap();
         }
-        
+
         let client = UdpClient::new(real_dest_host, dest_port,self.ip_stack_id.clone()).await?;
         Ok(Box::new(client))
     }

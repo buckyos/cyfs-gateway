@@ -56,7 +56,8 @@ impl UdpStackInner {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "hook_point is required"));
         }
 
-        let (executor, _) = create_process_chain_executor(&builder.hook_point.unwrap()).await
+        let (executor, _) = create_process_chain_executor(&builder.hook_point.unwrap(), builder.
+            global_process_chains).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create process chain executor error: {}", e))?;
         Ok(Self {
             bind_addr: builder.bind.unwrap(),
@@ -160,7 +161,11 @@ impl UdpStackInner {
                                 let forward = tunnel_manager
                                     .create_datagram_client_by_url(&url)
                                     .await.map_err(into_stack_err!(StackErrorCode::TunnelError))?;
-                                forward.send_datagram(data).await.map_err(into_stack_err!(StackErrorCode::TunnelError))?;
+                                // forward.send_datagram(data).await.map_err(into_stack_err!(StackErrorCode::TunnelError))?;
+                                forward.send_datagram(data).await.map_err(|e| {
+                                    println!("send datagram error: {}", e);
+                                    stack_err!(StackErrorCode::TunnelError)
+                                })?;
 
                                 let forward_recv = forward.clone();
                                 let back_socket = udp_socket.clone();
@@ -428,5 +433,206 @@ impl UdpStackBuilder {
 
     pub async fn build(self) -> StackResult<UdpStack> {
         UdpStack::create(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
+    use tokio::net::UdpSocket;
+    use crate::{DatagramServerManager, GatewayDevice, ProcessChainConfigs, ServerResult, TunnelManager, UdpStack, GATEWAY_TUNNEL_MANAGER};
+    use crate::global_process_chains::GlobalProcessChains;
+    use crate::server::{DatagramServer};
+
+    #[tokio::test]
+    async fn test_udp_stack_creation() {
+        let result = UdpStack::builder()
+            .build()
+            .await;
+        assert!(result.is_err());
+        let result = UdpStack::builder()
+            .bind("0.0.0.0:8930")
+            .build()
+            .await;
+        assert!(result.is_err());
+        let result = UdpStack::builder()
+            .bind("0.0.0.0:8930")
+            .servers(Arc::new(DatagramServerManager::new()))
+            .build()
+            .await;
+        assert!(result.is_err());
+        let result = UdpStack::builder()
+            .bind("0.0.0.0:8930")
+            .hook_point(vec![])
+            .servers(Arc::new(DatagramServerManager::new()))
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let result = UdpStack::builder()
+            .bind("0.0.0.0:8930")
+            .hook_point(vec![])
+            .servers(Arc::new(DatagramServerManager::new()))
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .build()
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_udp_stack_forward() {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "forward udp:///127.0.0.1:8933";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let result = UdpStack::builder()
+            .bind("0.0.0.0:8930")
+            .hook_point(chains)
+            .servers(Arc::new(DatagramServerManager::new()))
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let mut stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
+
+        let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
+            config: device_config,
+            private_key: pkcs8_bytes,
+        }));
+        let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
+
+        tokio::spawn(async move {
+            let udp_socket = UdpSocket::bind("127.0.0.1:8933").await.unwrap();
+            loop {
+                let mut buf = [0; 1024];
+                let (n, addr) = udp_socket.recv_from(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], b"test");
+                let _ = udp_socket.send_to(b"recv", addr).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                break;
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ret = udp_client.send_to(b"test", "127.0.0.1:8930").await;
+        assert!(ret.is_ok());
+
+        let mut buf = [0; 1024];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(10), udp_client.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], b"recv");
+    }
+    #[tokio::test]
+    async fn test_udp_stack_forward_err() {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "forward udp:///127.0.0.1:8934";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let result = UdpStack::builder()
+            .bind("0.0.0.0:8931")
+            .hook_point(chains)
+            .servers(Arc::new(DatagramServerManager::new()))
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let mut stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
+
+        let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
+            config: device_config,
+            private_key: pkcs8_bytes,
+        }));
+        let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
+
+        let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ret = udp_client.send_to(b"test", "127.0.0.1:8931").await;
+        assert!(ret.is_ok());
+
+        let mut buf = [0; 1024];
+        let ret = tokio::time::timeout(Duration::from_secs(5), udp_client.recv_from(&mut buf)).await;
+        assert!(ret.is_err());
+    }
+
+    struct MockServer;
+
+    #[async_trait::async_trait]
+    impl DatagramServer for MockServer {
+        async fn serve_datagram(&self, buf: &[u8]) -> ServerResult<Vec<u8>> {
+            assert_eq!(buf, b"test_server");
+            Ok("datagram".as_bytes().to_vec())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_udp_stack_serve() {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server mock";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let datagram_server_manager = Arc::new(DatagramServerManager::new());
+        datagram_server_manager.add_server("mock".to_string(), Arc::new(MockServer));
+        let result = UdpStack::builder()
+            .bind("0.0.0.0:8938")
+            .hook_point(chains)
+            .servers(datagram_server_manager)
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let mut stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
+
+        let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
+            config: device_config,
+            private_key: pkcs8_bytes,
+        }));
+        let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
+
+        let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ret = udp_client.send_to(b"test_server", "127.0.0.1:8938").await;
+        assert!(ret.is_ok());
+
+        let mut buf = [0; 1024];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(10), udp_client.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], b"datagram");
     }
 }

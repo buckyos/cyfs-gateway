@@ -58,8 +58,8 @@ impl TcpStack {
                 "servers is required"
             ));
         }
-        let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap())
-            .await
+        let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
+                                                          config.global_process_chains).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
             bind_addr: config.bind.unwrap(),
