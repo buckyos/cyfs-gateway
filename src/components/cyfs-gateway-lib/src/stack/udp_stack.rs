@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap};
 use std::net::SocketAddr;
+use std::ops::Div;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -39,6 +40,7 @@ type DatagramClientSessionMap = Arc<Mutex<BTreeMap<SocketAddr, Arc<tokio::sync::
 struct UdpStackInner {
     bind_addr: String,
     concurrency: u32,
+    session_idle_time: Duration,
     servers: DatagramServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     all_client_session: DatagramClientSessionMap,
@@ -62,6 +64,7 @@ impl UdpStackInner {
         Ok(Self {
             bind_addr: builder.bind.unwrap(),
             concurrency: builder.concurrency,
+            session_idle_time: builder.session_idle_time,
             servers: builder.servers.unwrap(),
             executor: Arc::new(Mutex::new(executor)),
             all_client_session: Arc::new(Mutex::new(BTreeMap::new())),
@@ -265,7 +268,7 @@ impl UdpStackInner {
     async fn clear_idle_sessions(&self, latest_key: Option<SocketAddr>) -> Option<SocketAddr> {
         let mut sessions = self.all_client_session.lock().unwrap();
         let now = chrono::Utc::now().timestamp() as u64;
-        let timeout = 120;
+        let timeout = self.session_idle_time.as_secs();
 
         const MAX_CLEAN_PER_CYCLE: usize = 500;
         let mut count = 0;
@@ -372,11 +375,16 @@ impl UdpStack {
             let mut latest_key = None;
             loop {
                 latest_key = inner.clear_idle_sessions(latest_key).await;
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(inner.session_idle_time.div(2)).await;
             }
         }));
         self.handle = Some(handle);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn get_session_count(&self) -> usize {
+        self.inner.all_client_session.lock().unwrap().len()
     }
 }
 
@@ -392,6 +400,7 @@ impl Stack for UdpStack {
 pub struct UdpStackBuilder {
     bind: Option<String>,
     concurrency: u32,
+    session_idle_time: Duration,
     hook_point: Option<ProcessChainConfigs>,
     servers: Option<DatagramServerManagerRef>,
     global_process_chains: Option<GlobalProcessChainsRef>,
@@ -402,6 +411,7 @@ impl UdpStackBuilder {
         Self {
             bind: None,
             concurrency: 200,
+            session_idle_time: Duration::from_secs(120),
             hook_point: None,
             servers: None,
             global_process_chains: None,
@@ -428,6 +438,11 @@ impl UdpStackBuilder {
 
     pub fn concurrency(mut self, concurrency: u32) -> Self {
         self.concurrency = concurrency;
+        self
+    }
+
+    pub fn session_idle_time(mut self, session_idle_time: Duration) -> Self {
+        self.session_idle_time = session_idle_time;
         self
     }
 
@@ -497,6 +512,7 @@ mod tests {
             .bind("0.0.0.0:8930")
             .hook_point(chains)
             .servers(Arc::new(DatagramServerManager::new()))
+            .session_idle_time(Duration::from_secs(5))
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
             .await;
@@ -536,6 +552,10 @@ mod tests {
         let mut buf = [0; 1024];
         let (n, _) = tokio::time::timeout(Duration::from_secs(10), udp_client.recv_from(&mut buf)).await.unwrap().unwrap();
         assert_eq!(&buf[..n], b"recv");
+
+        assert!(stack.get_session_count() > 0);
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert_eq!(stack.get_session_count(), 0);
     }
     #[tokio::test]
     async fn test_udp_stack_forward_err() {
@@ -553,6 +573,7 @@ mod tests {
         let result = UdpStack::builder()
             .bind("0.0.0.0:8931")
             .hook_point(chains)
+            .session_idle_time(Duration::from_secs(5))
             .servers(Arc::new(DatagramServerManager::new()))
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
@@ -577,8 +598,12 @@ mod tests {
         assert!(ret.is_ok());
 
         let mut buf = [0; 1024];
-        let ret = tokio::time::timeout(Duration::from_secs(5), udp_client.recv_from(&mut buf)).await;
+        let ret = tokio::time::timeout(Duration::from_secs(1), udp_client.recv_from(&mut buf)).await;
         assert!(ret.is_err());
+
+        assert!(stack.get_session_count() > 0);
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert_eq!(stack.get_session_count(), 0);
     }
 
     struct MockServer;
@@ -608,6 +633,7 @@ mod tests {
         let result = UdpStack::builder()
             .bind("0.0.0.0:8938")
             .hook_point(chains)
+            .session_idle_time(Duration::from_secs(5))
             .servers(datagram_server_manager)
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
@@ -634,5 +660,9 @@ mod tests {
         let mut buf = [0; 1024];
         let (n, _) = tokio::time::timeout(Duration::from_secs(10), udp_client.recv_from(&mut buf)).await.unwrap().unwrap();
         assert_eq!(&buf[..n], b"datagram");
+
+        assert!(stack.get_session_count() > 0);
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert_eq!(stack.get_session_count(), 0);
     }
 }
