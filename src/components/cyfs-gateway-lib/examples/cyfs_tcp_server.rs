@@ -4,7 +4,7 @@ use std::sync::Arc;
 use buckyos_kit::init_logging;
 use name_client::init_name_lib;
 use name_lib::{generate_ed25519_key_pair, load_raw_private_key, DeviceConfig};
-use cyfs_gateway_lib::{CyfsServerConfigParser, CyfsServerManager, GatewayDevice, TunnelManager, YamlCyfsServerConfigParser, GATEWAY_TUNNEL_MANAGER};
+use cyfs_gateway_lib::{CyfsServerConfigParser, GatewayDevice, TunnelManager, YamlCyfsServerConfigParser, GATEWAY_TUNNEL_MANAGER};
 
 #[tokio::main]
 async fn main() {
@@ -53,7 +53,5 @@ async fn main() {
     tunnel_manager.get_tunnel_builder_by_protocol("rtcp").await.unwrap();
     let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
     init_name_lib(&HashMap::new()).await.unwrap();
-    let server_manager = CyfsServerManager::new();
-    server_manager.start_server(config).await.unwrap();
     std::future::pending::<()>().await;
 }

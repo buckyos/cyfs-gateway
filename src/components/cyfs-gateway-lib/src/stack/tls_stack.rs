@@ -5,7 +5,7 @@ use crate::{
     into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol,
     StackResult, StreamServerManagerRef,
 };
-use cyfs_process_chain::{CommandControl, ProcessChainListExecutor};
+use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor};
 use rustls::crypto::CryptoProvider;
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -80,7 +80,7 @@ pub struct TlsStack {
     bind_addr: String,
     certs: Arc<Mutex<HashMap<String, Arc<ServerConfig>>>>,
     servers: StreamServerManagerRef,
-    executor: Arc<Mutex<ProcessChainListExecutor>>,
+    executor: Arc<Mutex<ProcessChainLibExecutor>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -188,7 +188,7 @@ impl TlsStack {
         stream: TcpStream,
         local_addr: SocketAddr,
         servers: StreamServerManagerRef,
-        executor: ProcessChainListExecutor,
+        executor: ProcessChainLibExecutor,
         certs: Arc<Mutex<HashMap<String, Arc<ServerConfig>>>>,
     ) -> StackResult<()> {
         let (ret, stream) = execute_chain(executor, Box::new(stream), local_addr)
@@ -202,7 +202,7 @@ impl TlsStack {
             }
 
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret) {
+                if let Some(list) = shlex::split(ret.value.as_str()) {
                     if list.len() == 0 {
                         return Ok(());
                     }
@@ -322,7 +322,7 @@ mod tests {
     use rustls::{ClientConfig, DigitallySignedStruct, Error, SignatureScheme};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::{TcpStream};
     use tokio_rustls::TlsConnector;
 
     #[tokio::test]

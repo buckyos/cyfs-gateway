@@ -7,7 +7,7 @@ use crate::{
     into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol,
     StreamServerManagerRef, GATEWAY_TUNNEL_MANAGER,
 };
-use cyfs_process_chain::{CommandControl, ProcessChainListExecutor};
+use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
@@ -18,7 +18,7 @@ pub struct TcpStack {
     bind_addr: String,
     servers: StreamServerManagerRef,
     handle: Option<JoinHandle<()>>,
-    executor: Arc<Mutex<ProcessChainListExecutor>>,
+    executor: Arc<Mutex<ProcessChainLibExecutor>>,
 }
 
 impl Drop for TcpStack {
@@ -105,7 +105,7 @@ impl TcpStack {
         stream: TcpStream,
         local_addr: SocketAddr,
         servers: StreamServerManagerRef,
-        executor: ProcessChainListExecutor,
+        executor: ProcessChainLibExecutor,
     ) -> StackResult<()> {
         let (ret, mut stream) = execute_chain(executor, Box::new(stream), local_addr)
             .await
@@ -118,7 +118,7 @@ impl TcpStack {
             }
 
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret) {
+                if let Some(list) = shlex::split(ret.value.as_str()) {
                     if list.len() == 0 {
                         return Ok(());
                     }
@@ -377,7 +377,7 @@ mod tests {
                 tcp_stream.read_exact(&mut buf).await.unwrap();
                 assert_eq!(&buf, b"test");
                 tcp_stream.write_all("recv".as_bytes()).await.unwrap();
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 break;
             }
         });
@@ -402,7 +402,7 @@ mod tests {
   blocks:
     - id: main
       block: |
-        return "forward tcp:///127.0.0.1:8083";
+        return "forward tcp:///127.0.0.1:8085";
         "#;
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();

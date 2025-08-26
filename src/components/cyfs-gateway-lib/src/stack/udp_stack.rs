@@ -6,7 +6,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use url::Url;
-use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainListExecutor};
+use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
 use crate::{into_stack_err, stack_err, DatagramClientBox, DatagramServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, GATEWAY_TUNNEL_MANAGER};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 
@@ -40,7 +40,7 @@ struct UdpStackInner {
     bind_addr: String,
     concurrency: u32,
     servers: DatagramServerManagerRef,
-    executor: Arc<Mutex<ProcessChainListExecutor>>,
+    executor: Arc<Mutex<ProcessChainLibExecutor>>,
     all_client_session: DatagramClientSessionMap,
 }
 
@@ -123,7 +123,7 @@ impl UdpStackInner {
             CollectionValue::String(format!("{}", addr.port())),
         ).await.map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create chain env error: {}", e))?;
 
-        let ret = executor.execute_all().await
+        let ret = executor.execute_lib().await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "execute chain error: {}", e))?;
         if ret.is_control() {
             if ret.is_drop() {
@@ -132,7 +132,7 @@ impl UdpStackInner {
                 return Ok(());
             }
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret) {
+                if let Some(list) = shlex::split(ret.value.as_str()) {
                     if list.len() == 0 {
                         return Err(stack_err!(
                                     StackErrorCode::InvalidConfig,

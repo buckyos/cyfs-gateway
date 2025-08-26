@@ -5,7 +5,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::{http, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use cyfs_process_chain::{CollectionValue, HyperHttpRequestHeaderMap, MapCollection, ProcessChainListExecutor};
+use cyfs_process_chain::{CollectionValue, HyperHttpRequestHeaderMap, MapCollection, ProcessChainLibExecutor};
 use crate::{InnerHttpServiceManagerRef, ProcessChainConfigs, ServerError, ServerErrorCode, ServerResult, StreamServer};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err, into_server_err};
@@ -46,7 +46,7 @@ impl HttpServerBuilder {
 pub struct HttpServer {
     version: http::Version,
     inner_services: InnerHttpServiceManagerRef,
-    executor: Arc<Mutex<ProcessChainListExecutor>>,
+    executor: Arc<Mutex<ProcessChainLibExecutor>>,
 }
 
 impl HttpServer {
@@ -130,7 +130,7 @@ impl HttpServer {
 
     async fn handle_http_request(
         request: Request<Incoming>,
-        executor: ProcessChainListExecutor,
+        executor: ProcessChainLibExecutor,
     ) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
         let req_map = HyperHttpRequestHeaderMap::new(request);
         let chain_env = executor.chain_env();
@@ -139,7 +139,7 @@ impl HttpServer {
         let req_collection = Arc::new(Box::new(req_map.clone()) as Box<dyn MapCollection>);
         chain_env.create("REQ", CollectionValue::Map(req_collection)).await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
-        let ret = executor.execute_all().await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+        let ret = executor.execute_lib().await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
         if ret.is_control() {
             if ret.is_drop() {
                 info!("Request dropped by the process chain");
@@ -153,7 +153,6 @@ impl HttpServer {
                 info!("Request accepted by the process chain");
             }
         }
-        drop(executor);
 
         Ok(hyper::Response::new(Full::new(Bytes::from(
             "Hello, World!",
