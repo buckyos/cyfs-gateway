@@ -1,8 +1,7 @@
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use buckyos_kit::AsyncStream;
-use cyfs_process_chain::{CommandResult, ExternalCommand, HookPoint, HookPointEnv, HttpProbeCommand, HttpsSniProbeCommand, ProcessChainLibExecutor, ProcessChainLibRef, ProcessChainListLib, ProcessChainRef, StreamRequest, StreamRequestMap};
+use cyfs_process_chain::{CollectionValue, CommandResult, ExternalCommand, HookPoint, HookPointEnv, HttpProbeCommand, HttpsSniProbeCommand, MapCollectionRef, ProcessChainLibExecutor, ProcessChainLibRef, ProcessChainListLib, ProcessChainRef, StreamRequest, StreamRequestMap};
 use crate::{config_err, ConfigErrorCode, ConfigResult, ProcessChainConfig};
 
 pub struct GlobalProcessChains {
@@ -49,11 +48,11 @@ pub(crate) async fn create_process_chain_executor(
     }
     hook_point.add_process_chain_lib(process_chain_lib.into_process_chain_lib())
         .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{}", e))?;
-    
+
     if let Some(global_process_chains) = global_process_chains {
         global_process_chains.register_global_process_chain(&hook_point)?;
     }
-    
+
     let hook_point_env = HookPointEnv::new("cyfs_server_hook_point_env", PathBuf::new());
 
     let https_sni_probe_command = HttpsSniProbeCommand::new();
@@ -83,15 +82,12 @@ pub(crate) async fn create_process_chain_executor(
 }
 
 
-pub(crate) async fn execute_chain(executor: ProcessChainLibExecutor, stream: Box<dyn AsyncStream>, local_addr: SocketAddr) -> ConfigResult<(CommandResult, Box<dyn AsyncStream>)> {
-    let request = StreamRequest::new(stream, local_addr);
+pub(crate) async fn execute_stream_chain(executor: ProcessChainLibExecutor, request: StreamRequest) -> ConfigResult<(CommandResult, Box<dyn AsyncStream>)> {
     let request_map = StreamRequestMap::new(request);
     let chain_env = executor.chain_env();
-    request_map
-        .register(&chain_env)
+    request_map.register(&chain_env)
         .await
         .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
-
     let ret = executor
         .execute_lib()
         .await
@@ -109,4 +105,16 @@ pub(crate) async fn execute_chain(executor: ProcessChainLibExecutor, stream: Box
     }
     let socket = socket.unwrap();
     Ok((ret, socket))
+}
+
+pub(crate) async fn execute_chain(executor: ProcessChainLibExecutor, coll: MapCollectionRef) -> ConfigResult<CommandResult> {
+    let chain_env = executor.chain_env();
+    chain_env.create("REQ", CollectionValue::Map(coll))
+        .await
+        .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
+    let ret = executor
+        .execute_lib()
+        .await
+        .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
+    Ok(ret)
 }

@@ -1,12 +1,8 @@
 use crate::global_process_chains::{
-    create_process_chain_executor, execute_chain, GlobalProcessChainsRef,
+    create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{
-    into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol,
-    StackResult, StreamServerManagerRef,
-};
-use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor};
-use rustls::crypto::CryptoProvider;
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http};
+use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, pkcs8_private_keys};
@@ -79,7 +75,7 @@ pub async fn create_server_config(
 pub struct TlsStack {
     bind_addr: String,
     certs: Arc<Mutex<HashMap<String, Arc<ServerConfig>>>>,
-    servers: StreamServerManagerRef,
+    servers: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -100,6 +96,7 @@ impl TlsStack {
             servers: None,
             global_process_chains: None,
             certs: Default::default(),
+            concurrency: u32::MAX,
         }
     }
 
@@ -127,18 +124,18 @@ impl TlsStack {
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let mut certs = HashMap::new();
         for cert_config in config.certs.into_iter() {
+            let mut server_config = ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(cert_config.certs, cert_config.key)
+                .map_err(|e| stack_err!(StackErrorCode::InvalidTlsCert, "{}", e))?;
+            server_config.alpn_protocols = vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()];
             certs.insert(
                 cert_config.domain.clone(),
-                Arc::new(
-                    ServerConfig::builder_with_provider(Arc::new(
-                        rustls::crypto::ring::default_provider(),
-                    ))
-                        .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-                        .unwrap()
-                        .with_no_client_auth()
-                        .with_single_cert(cert_config.certs, cert_config.key)
-                        .map_err(|e| stack_err!(StackErrorCode::InvalidTlsCert, "{}", e))?,
-                ),
+                Arc::new(server_config),
             );
         }
 
@@ -187,11 +184,14 @@ impl TlsStack {
     async fn handle_connect(
         stream: TcpStream,
         local_addr: SocketAddr,
-        servers: StreamServerManagerRef,
+        servers: ServerManagerRef,
         executor: ProcessChainLibExecutor,
         certs: Arc<Mutex<HashMap<String, Arc<ServerConfig>>>>,
     ) -> StackResult<()> {
-        let (ret, stream) = execute_chain(executor, Box::new(stream), local_addr)
+        let remote_addr = stream.peer_addr().map_err(into_stack_err!(StackErrorCode::ServerError, "read remote addr failed"))?;
+        let mut request = StreamRequest::new(Box::new(stream), local_addr);
+        request.source_addr = Some(remote_addr);
+        let (ret, stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         if ret.is_control() {
@@ -234,10 +234,22 @@ impl TlsStack {
                                 .map_err(into_stack_err!(StackErrorCode::StreamError))?;
 
                             if let Some(server) = servers.get_server(server_name) {
-                                server
-                                    .serve_connection(Box::new(tls_stream))
-                                    .await
-                                    .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
+                                match server {
+                                    Server::Http(http_server) => {
+                                        if let Err(e) = hyper_serve_http(Box::new(tls_stream), http_server).await {
+                                            log::error!("hyper serve http failed: {}", e);
+                                        }
+                                    }
+                                    Server::Stream(server) => {
+                                        server
+                                            .serve_connection(Box::new(tls_stream))
+                                            .await
+                                            .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
+                                    }
+                                    Server::Datagram(_) => {
+                                        return Err(stack_err!(StackErrorCode::InvalidConfig, "unsupported server type"));
+                                    }
+                                }
                             }
                         }
                         v => {
@@ -270,9 +282,10 @@ pub struct TlsDomainConfig {
 pub struct TlsStackBuilder {
     bind: Option<String>,
     hook_point: Option<ProcessChainConfigs>,
-    servers: Option<StreamServerManagerRef>,
+    servers: Option<ServerManagerRef>,
     global_process_chains: Option<GlobalProcessChainsRef>,
     certs: Vec<TlsDomainConfig>,
+    concurrency: u32,
 }
 
 impl TlsStackBuilder {
@@ -290,7 +303,7 @@ impl TlsStackBuilder {
         self.hook_point = Some(hook_point);
         self
     }
-    pub fn servers(mut self, servers: StreamServerManagerRef) -> Self {
+    pub fn servers(mut self, servers: ServerManagerRef) -> Self {
         self.servers = Some(servers);
         self
     }
@@ -298,6 +311,16 @@ impl TlsStackBuilder {
         self.global_process_chains = Some(global_process_chains);
         self
     }
+
+    pub fn concurrency(mut self, concurrency: u32) -> Self {
+        if concurrency == 0 {
+            self.concurrency = u32::MAX;
+        } else {
+            self.concurrency = concurrency;
+        }
+        self
+    }
+
     pub async fn build(self) -> StackResult<TlsStack> {
         let stack = TlsStack::create(self).await?;
         Ok(stack)
@@ -307,10 +330,7 @@ impl TlsStackBuilder {
 #[cfg(test)]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{
-        GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, StreamServerManager,
-        TunnelManager, GATEWAY_TUNNEL_MANAGER,
-    };
+    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server};
     use crate::{TlsDomainConfig, TlsStack};
     use buckyos_kit::AsyncStream;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
@@ -335,20 +355,20 @@ mod tests {
         assert!(result.is_err());
         let result = TlsStack::builder()
             .bind("127.0.0.1:9080")
-            .servers(Arc::new(StreamServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .build()
             .await;
         assert!(result.is_err());
         let result = TlsStack::builder()
             .bind("127.0.0.1:9080")
-            .servers(Arc::new(StreamServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
             .build()
             .await;
         assert!(result.is_ok());
         let result = TlsStack::builder()
             .bind("127.0.0.1:9080")
-            .servers(Arc::new(StreamServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
             .add_certs(vec![TlsDomainConfig {
                 domain: "localhost".to_string(),
@@ -380,7 +400,7 @@ mod tests {
 
         let result = TlsStack::builder()
             .bind("127.0.0.1:9080")
-            .servers(Arc::new(StreamServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "localhost".to_string(),
@@ -423,7 +443,7 @@ mod tests {
 
         let result = TlsStack::builder()
             .bind("127.0.0.1:9081")
-            .servers(Arc::new(StreamServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "localhost".to_string(),
@@ -529,8 +549,8 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
-        let server_manager = Arc::new(StreamServerManager::new());
-        server_manager.add_server("www.buckyos.com".to_string(), Arc::new(MockServer));
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server("www.buckyos.com".to_string(), Server::Stream(Arc::new(MockServer)));
         let result = TlsStack::builder()
             .bind("127.0.0.1:9085")
             .servers(server_manager)

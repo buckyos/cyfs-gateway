@@ -71,7 +71,7 @@ mod tests {
         let remote_stack_id = format!("{}:9000", dev02_hostname);
         let tunnel = local_stack.create_tunnel(Some(remote_stack_id.as_str())).await.unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let stream = tunnel.open_stream(":8888").await.unwrap();
+        let _stream = tunnel.open_stream(":8888").await.unwrap();
         info!("stream1 ok ");
         tokio::time::sleep(Duration::from_secs(5)).await;
 

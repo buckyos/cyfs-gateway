@@ -8,7 +8,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, DatagramClientBox, DatagramServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, GATEWAY_TUNNEL_MANAGER};
+use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, GATEWAY_TUNNEL_MANAGER, Server};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 
 struct DatagramForwardSession {
@@ -41,7 +41,7 @@ struct UdpStackInner {
     bind_addr: String,
     concurrency: u32,
     session_idle_time: Duration,
-    servers: DatagramServerManagerRef,
+    servers: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     all_client_session: DatagramClientSessionMap,
 }
@@ -98,19 +98,23 @@ impl UdpStackInner {
                 }
                 DatagramSession::Server(server_session) => {
                     if let Some(server) = self.servers.get_server(&server_session.server) {
-                        match server.serve_datagram(data).await {
-                            Ok(resp) => {
-                                if let Err(e) = udp_socket.send_to(resp.as_slice(), &addr).await {
+                        if let Server::Datagram(server) = server {
+                            match server.serve_datagram(data).await {
+                                Ok(resp) => {
+                                    if let Err(e) = udp_socket.send_to(resp.as_slice(), &addr).await {
+                                        log::error!("send datagram error: {}", e);
+                                        *session_guard = None;
+                                    } else {
+                                        server_session.latest_time = chrono::Utc::now().timestamp() as u64;
+                                    }
+                                }
+                                Err(e) => {
                                     log::error!("send datagram error: {}", e);
                                     *session_guard = None;
-                                } else {
-                                    server_session.latest_time = chrono::Utc::now().timestamp() as u64;
                                 }
                             }
-                            Err(e) => {
-                                log::error!("send datagram error: {}", e);
-                                *session_guard = None;
-                            }
+                        } else {
+                            return Err(stack_err!(StackErrorCode::InvalidConfig, "Unsupport server type"));
                         }
                     }
                 }
@@ -212,13 +216,20 @@ impl UdpStackInner {
                             }
                             let server_name = list[1].as_str();
                             if let Some(server) = self.servers.get_server(server_name) {
-                                let buf = server.serve_datagram(data).await.map_err(into_stack_err!(StackErrorCode::ServerError, ""))?;
-                                udp_socket.send_to(buf.as_slice(), addr).await.map_err(into_stack_err!(StackErrorCode::IoError, "send error"))?;
+                                if let Server::Datagram(server) = server {
+                                    let buf = server.serve_datagram(data).await.map_err(into_stack_err!(StackErrorCode::ServerError, ""))?;
+                                    udp_socket.send_to(buf.as_slice(), addr).await.map_err(into_stack_err!(StackErrorCode::IoError, "send error"))?;
 
-                                *session_guard = Some(DatagramSession::Server(DatagramServerSession {
-                                    server: server_name.to_string(),
-                                    latest_time: chrono::Utc::now().timestamp() as u64,
-                                }));
+                                    *session_guard = Some(DatagramSession::Server(DatagramServerSession {
+                                        server: server_name.to_string(),
+                                        latest_time: chrono::Utc::now().timestamp() as u64,
+                                    }));
+                                } else {
+                                    return Err(stack_err!(
+                                        StackErrorCode::InvalidConfig,
+                                        "invalid server command"
+                                    ));
+                                }
                             }
                         }
                         v => {
@@ -402,7 +413,7 @@ pub struct UdpStackBuilder {
     concurrency: u32,
     session_idle_time: Duration,
     hook_point: Option<ProcessChainConfigs>,
-    servers: Option<DatagramServerManagerRef>,
+    servers: Option<ServerManagerRef>,
     global_process_chains: Option<GlobalProcessChainsRef>,
 }
 
@@ -426,7 +437,7 @@ impl UdpStackBuilder {
         self
     }
 
-    pub fn servers(mut self, servers: DatagramServerManagerRef) -> Self {
+    pub fn servers(mut self, servers: ServerManagerRef) -> Self {
         self.servers = Some(servers);
         self
     }
@@ -457,7 +468,7 @@ mod tests {
     use std::time::Duration;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use tokio::net::UdpSocket;
-    use crate::{DatagramServerManager, GatewayDevice, ProcessChainConfigs, ServerResult, TunnelManager, UdpStack, GATEWAY_TUNNEL_MANAGER};
+    use crate::{GatewayDevice, ProcessChainConfigs, Server, ServerManager, ServerResult, TunnelManager, UdpStack, GATEWAY_TUNNEL_MANAGER};
     use crate::global_process_chains::GlobalProcessChains;
     use crate::server::{DatagramServer};
 
@@ -474,21 +485,21 @@ mod tests {
         assert!(result.is_err());
         let result = UdpStack::builder()
             .bind("0.0.0.0:8930")
-            .servers(Arc::new(DatagramServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .build()
             .await;
         assert!(result.is_err());
         let result = UdpStack::builder()
             .bind("0.0.0.0:8930")
             .hook_point(vec![])
-            .servers(Arc::new(DatagramServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .build()
             .await;
         assert!(result.is_ok());
         let result = UdpStack::builder()
             .bind("0.0.0.0:8930")
             .hook_point(vec![])
-            .servers(Arc::new(DatagramServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
             .await;
@@ -511,7 +522,7 @@ mod tests {
         let result = UdpStack::builder()
             .bind("0.0.0.0:8930")
             .hook_point(chains)
-            .servers(Arc::new(DatagramServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .session_idle_time(Duration::from_secs(5))
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
@@ -533,14 +544,11 @@ mod tests {
 
         tokio::spawn(async move {
             let udp_socket = UdpSocket::bind("127.0.0.1:8933").await.unwrap();
-            loop {
-                let mut buf = [0; 1024];
-                let (n, addr) = udp_socket.recv_from(&mut buf).await.unwrap();
-                assert_eq!(&buf[..n], b"test");
-                let _ = udp_socket.send_to(b"recv", addr).await;
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                break;
-            }
+            let mut buf = [0; 1024];
+            let (n, addr) = udp_socket.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"test");
+            let _ = udp_socket.send_to(b"recv", addr).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -574,7 +582,7 @@ mod tests {
             .bind("0.0.0.0:8931")
             .hook_point(chains)
             .session_idle_time(Duration::from_secs(5))
-            .servers(Arc::new(DatagramServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
             .await;
@@ -628,8 +636,8 @@ mod tests {
         "#;
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
-        let datagram_server_manager = Arc::new(DatagramServerManager::new());
-        datagram_server_manager.add_server("mock".to_string(), Arc::new(MockServer));
+        let datagram_server_manager = Arc::new(ServerManager::new());
+        datagram_server_manager.add_server("mock".to_string(), Server::Datagram(Arc::new(MockServer)));
         let result = UdpStack::builder()
             .bind("0.0.0.0:8938")
             .hook_point(chains)

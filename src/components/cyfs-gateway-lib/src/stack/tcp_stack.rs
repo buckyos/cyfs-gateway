@@ -1,22 +1,18 @@
-use super::Stack;
+use super::{stream_forward, Stack};
 use super::StackResult;
 use crate::global_process_chains::{
-    create_process_chain_executor, execute_chain, GlobalProcessChainsRef,
+    create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{
-    into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol,
-    StreamServerManagerRef, GATEWAY_TUNNEL_MANAGER,
-};
-use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http};
+use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest, StreamRequestMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use url::Url;
 
 pub struct TcpStack {
     bind_addr: String,
-    servers: StreamServerManagerRef,
+    servers: ServerManagerRef,
     handle: Option<JoinHandle<()>>,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
 }
@@ -104,10 +100,13 @@ impl TcpStack {
     async fn handle_connect(
         stream: TcpStream,
         local_addr: SocketAddr,
-        servers: StreamServerManagerRef,
+        servers: ServerManagerRef,
         executor: ProcessChainLibExecutor,
     ) -> StackResult<()> {
-        let (ret, mut stream) = execute_chain(executor, Box::new(stream), local_addr)
+        let remote_addr = stream.peer_addr().map_err(into_stack_err!(StackErrorCode::ServerError, "read remote addr failed"))?;
+        let mut request = StreamRequest::new(Box::new(stream), local_addr);
+        request.source_addr = Some(remote_addr);
+        let (ret, stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         if ret.is_control() {
@@ -133,23 +132,7 @@ impl TcpStack {
                                 ));
                             }
                             let target = list[1].as_str();
-                            if let Some(tunnel_manager) = GATEWAY_TUNNEL_MANAGER.get() {
-                                let url = Url::parse(target).map_err(into_stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid forward url {}",
-                                    target
-                                ))?;
-                                let mut forward_stream = tunnel_manager
-                                    .open_stream_by_url(&url)
-                                    .await
-                                    .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
-
-                                tokio::io::copy_bidirectional(&mut stream, forward_stream.as_mut())
-                                    .await
-                                    .map_err(into_stack_err!(StackErrorCode::StreamError))?;
-                            } else {
-                                log::error!("tunnel manager not found");
-                            }
+                            stream_forward(stream, target).await?;
                         }
                         "server" => {
                             if list.len() < 2 {
@@ -160,10 +143,24 @@ impl TcpStack {
                             }
                             let server_name = list[1].as_str();
                             if let Some(server) = servers.get_server(server_name) {
-                                server
-                                    .serve_connection(stream)
-                                    .await
-                                    .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
+                                match server {
+                                    Server::Http(server) => {
+                                        hyper_serve_http(stream, server).await
+                                            .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
+                                    }
+                                    Server::Stream(server) => {
+                                        server
+                                            .serve_connection(stream)
+                                            .await
+                                            .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
+                                    }
+                                    Server::Datagram(_) => {
+                                        return Err(stack_err!(
+                                            StackErrorCode::InvalidConfig,
+                                            "datagram server {server_name} not support"
+                                        ));
+                                    }
+                                }
                             }
                         }
                         v => {
@@ -194,7 +191,7 @@ impl Stack for TcpStack {
 pub struct TcpStackBuilder {
     bind: Option<String>,
     hook_point: Option<ProcessChainConfigs>,
-    servers: Option<StreamServerManagerRef>,
+    servers: Option<ServerManagerRef>,
     global_process_chains: Option<GlobalProcessChainsRef>,
 }
 
@@ -209,7 +206,7 @@ impl TcpStackBuilder {
         self
     }
 
-    pub fn servers(mut self, servers: StreamServerManagerRef) -> Self {
+    pub fn servers(mut self, servers: ServerManagerRef) -> Self {
         self.servers = Some(servers);
         self
     }
@@ -228,10 +225,7 @@ impl TcpStackBuilder {
 #[cfg(test)]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{
-        GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, StreamServerManager,
-        TcpStack, TunnelManager, GATEWAY_TUNNEL_MANAGER,
-    };
+    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server};
     use buckyos_kit::AsyncStream;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use std::sync::Arc;
@@ -246,20 +240,20 @@ mod tests {
         assert!(result.is_err());
         let result = TcpStack::builder()
             .bind("127.0.0.1:8080")
-            .servers(Arc::new(StreamServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .build()
             .await;
         assert!(result.is_err());
         let result = TcpStack::builder()
             .bind("127.0.0.1:8080")
-            .servers(Arc::new(StreamServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
             .build()
             .await;
         assert!(result.is_ok());
         let result = TcpStack::builder()
             .bind("127.0.0.1:8080")
-            .servers(Arc::new(StreamServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
@@ -282,7 +276,7 @@ mod tests {
 
         let result = TcpStack::builder()
             .bind("127.0.0.1:8080")
-            .servers(Arc::new(StreamServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
@@ -316,7 +310,7 @@ mod tests {
 
         let result = TcpStack::builder()
             .bind("127.0.0.1:8081")
-            .servers(Arc::new(StreamServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
@@ -350,7 +344,7 @@ mod tests {
 
         let result = TcpStack::builder()
             .bind("127.0.0.1:8082")
-            .servers(Arc::new(StreamServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
@@ -372,13 +366,12 @@ mod tests {
 
         tokio::spawn(async move {
             let tcp_listener = TcpListener::bind("127.0.0.1:8083").await.unwrap();
-            while let Ok((mut tcp_stream, _)) = tcp_listener.accept().await {
+            if let Ok((mut tcp_stream, _)) = tcp_listener.accept().await {
                 let mut buf = [0u8; 4];
                 tcp_stream.read_exact(&mut buf).await.unwrap();
                 assert_eq!(&buf, b"test");
                 tcp_stream.write_all("recv".as_bytes()).await.unwrap();
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                break;
             }
         });
 
@@ -409,7 +402,7 @@ mod tests {
 
         let result = TcpStack::builder()
             .bind("127.0.0.1:8084")
-            .servers(Arc::new(StreamServerManager::new()))
+            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
@@ -466,8 +459,8 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
-        let server_manager = Arc::new(StreamServerManager::new());
-        server_manager.add_server("www.buckyos.com".to_string(), Arc::new(MockServer));
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server("www.buckyos.com".to_string(), Server::Stream(Arc::new(MockServer)));
         let result = TcpStack::builder()
             .bind("127.0.0.1:8085")
             .servers(server_manager)

@@ -12,13 +12,17 @@ pub use dns_server::*;
 pub enum ServerErrorCode {
     BindFailed,
     InvalidConfig,
+    InvalidParam,
     ProcessChainError,
     StreamError,
     TunnelError,
     InvalidTlsKey,
     InvalidTlsCert,
+    InvalidData,
+    IOError,
+    BadRequest,
 }
 pub type ServerResult<T> = sfo_result::Result<T, ServerErrorCode>;
 pub type ServerError = sfo_result::Error<ServerErrorCode>;
-use sfo_result::err as server_err;
-use sfo_result::into_err as into_server_err;
+pub use sfo_result::err as server_err;
+pub use sfo_result::into_err as into_server_err;
