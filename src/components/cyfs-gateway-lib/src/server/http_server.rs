@@ -144,7 +144,7 @@ impl HttpServer for ProcessChainHttpServer {
     }
 
     fn http3_port(&self) -> Option<u16> {
-        todo!()
+        self.h3_port
     }
 }
 

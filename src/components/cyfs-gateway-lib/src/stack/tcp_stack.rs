@@ -1,40 +1,27 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use super::{stream_forward, Stack};
 use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http};
-use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest, StreamRequestMap};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController};
+use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use sfo_io::StatStream;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 
-pub struct TcpStack {
+struct TcpStackInner {
     bind_addr: String,
     servers: ServerManagerRef,
-    handle: Option<JoinHandle<()>>,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
+    connection_manager: Option<ConnectionManagerRef>,
 }
 
-impl Drop for TcpStack {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
-    }
-}
 
-impl TcpStack {
-    pub fn builder() -> TcpStackBuilder {
-        TcpStackBuilder {
-            bind: None,
-            hook_point: None,
-            servers: None,
-            global_process_chains: None,
-        }
-    }
-
+impl TcpStackInner {
     async fn create(config: TcpStackBuilder) -> StackResult<Self> {
         if config.bind.is_none() {
             return Err(stack_err!(
@@ -60,18 +47,17 @@ impl TcpStack {
         Ok(Self {
             bind_addr: config.bind.unwrap(),
             servers: config.servers.unwrap(),
-            handle: None,
             executor: Arc::new(Mutex::new(executor)),
+            connection_manager: config.connection_manager,
         })
     }
 
-    pub async fn start(&mut self) -> StackResult<()> {
+    pub async fn start(self: &Arc<Self>) -> StackResult<JoinHandle<()>> {
         let bind_addr = self.bind_addr.clone();
-        let servers = self.servers.clone();
-        let executor = self.executor.clone();
         let listener = tokio::net::TcpListener::bind(bind_addr.as_str())
             .await
             .map_err(into_stack_err!(StackErrorCode::BindFailed))?;
+        let this = self.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let (stream, local_addr) = match listener.accept().await {
@@ -82,28 +68,43 @@ impl TcpStack {
                     }
                 };
 
-                let servers = servers.clone();
-                let executor = executor.lock().unwrap().fork();
-                tokio::spawn(async move {
+                let remote_addr = match stream.peer_addr() {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        log::error!("get remote addr failed: {}", e);
+                        continue;
+                    }
+                };
+
+                let this_tmp = this.clone();
+                let statStream = StatStream::new(stream);
+                let speed = statStream.get_speed_stat();
+                let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        Self::handle_connect(stream, local_addr, servers, executor).await
+                        this_tmp.handle_connect(statStream, local_addr).await
                     {
                         log::error!("handle tcp stream failed: {}", e);
                     }
                 });
+                if let Some(manager) = &this.connection_manager {
+                    let controller = HandleConnectionController::new(handle);
+                    manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), local_addr.to_string(), StackProtocol::Tcp, speed, controller));
+                }
             }
         });
-        self.handle = Some(handle);
-        Ok(())
+        Ok(handle)
     }
 
     async fn handle_connect(
-        stream: TcpStream,
+        &self,
+        mut stream: StatStream<TcpStream>,
         local_addr: SocketAddr,
-        servers: ServerManagerRef,
-        executor: ProcessChainLibExecutor,
     ) -> StackResult<()> {
-        let remote_addr = stream.peer_addr().map_err(into_stack_err!(StackErrorCode::ServerError, "read remote addr failed"))?;
+        let executor = {
+            self.executor.lock().unwrap().fork()
+        };
+        let servers = self.servers.clone();
+        let remote_addr = stream.raw_stream().peer_addr().map_err(into_stack_err!(StackErrorCode::ServerError, "read remote addr failed"))?;
         let mut request = StreamRequest::new(Box::new(stream), local_addr);
         request.source_addr = Some(remote_addr);
         let (ret, stream) = execute_stream_chain(executor, request)
@@ -178,21 +179,61 @@ impl TcpStack {
     }
 }
 
+pub struct TcpStack {
+    inner: Arc<TcpStackInner>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TcpStack {
+    pub fn builder() -> TcpStackBuilder {
+        TcpStackBuilder {
+            bind: None,
+            hook_point: None,
+            servers: None,
+            global_process_chains: None,
+            connection_manager: None,
+        }
+    }
+
+    async fn create(config: TcpStackBuilder) -> StackResult<Self> {
+        let inner = TcpStackInner::create(config).await?;
+        Ok(Self {
+            inner: Arc::new(inner),
+            handle: None,
+        })
+    }
+
+    pub async fn start(&mut self) -> StackResult<()> {
+        let handle = self.inner.start().await?;
+        self.handle = Some(handle);
+        Ok(())
+    }
+}
+
+impl Drop for TcpStack {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
 impl Stack for TcpStack {
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Tcp
     }
 
     fn get_bind_addr(&self) -> String {
-        self.bind_addr.clone()
+        self.inner.bind_addr.clone()
     }
 }
+
 
 pub struct TcpStackBuilder {
     bind: Option<String>,
     hook_point: Option<ProcessChainConfigs>,
     servers: Option<ServerManagerRef>,
     global_process_chains: Option<GlobalProcessChainsRef>,
+    connection_manager: Option<ConnectionManagerRef>,
 }
 
 impl TcpStackBuilder {
@@ -216,6 +257,11 @@ impl TcpStackBuilder {
         self
     }
 
+    pub fn connection_manager(mut self, connection_manager: ConnectionManagerRef) -> Self {
+        self.connection_manager = Some(connection_manager);
+        self
+    }
+
     pub async fn build(self) -> StackResult<TcpStack> {
         let stack = TcpStack::create(self).await?;
         Ok(stack)
@@ -223,9 +269,10 @@ impl TcpStackBuilder {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server};
+    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ConnectionManager};
     use buckyos_kit::AsyncStream;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use std::sync::Arc;
@@ -259,6 +306,15 @@ mod tests {
             .build()
             .await;
         assert!(result.is_ok());
+        let result = TcpStack::builder()
+            .bind("127.0.0.1:8080")
+            .servers(Arc::new(ServerManager::new()))
+            .hook_point(vec![])
+            .connection_manager(ConnectionManager::new())
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .build()
+            .await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -274,10 +330,12 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let connection_manager = ConnectionManager::new();
         let result = TcpStack::builder()
             .bind("127.0.0.1:8080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
+            .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
             .await;
@@ -286,13 +344,17 @@ mod tests {
         let result = stack.start().await;
         assert!(result.is_ok());
 
-        let mut stream = TcpStream::connect("127.0.0.1:8080").await.unwrap();
-        let result = stream
-            .write_all(b"GET / HTTP/1.1\r\nHost: httpbin.org\r\n\r\n")
-            .await;
-        assert!(result.is_ok());
-        let ret = stream.read(&mut [0; 1024]).await;
-        assert!(ret.is_err());
+        {
+            let mut stream = TcpStream::connect("127.0.0.1:8080").await.unwrap();
+            let result = stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: httpbin.org\r\n\r\n")
+                .await;
+            assert!(result.is_ok());
+            let ret = stream.read(&mut [0; 1024]).await;
+            assert!(ret.is_err());
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        assert_eq!(connection_manager.get_all_connection_info().len(), 0);
     }
 
     #[tokio::test]
@@ -342,10 +404,12 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let connection_manager = ConnectionManager::new();
         let result = TcpStack::builder()
             .bind("127.0.0.1:8082")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
+            .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
             .await;
@@ -377,14 +441,21 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let mut stream = TcpStream::connect("127.0.0.1:8082").await.unwrap();
-        let result = stream.write_all(b"test").await;
-        assert!(result.is_ok());
+        {
+            let mut stream = TcpStream::connect("127.0.0.1:8082").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            assert_eq!(connection_manager.get_all_connection_info().len(), 1);
+            let result = stream.write_all(b"test").await;
+            assert!(result.is_ok());
 
-        let mut buf = [0u8; 4];
-        let ret = stream.read_exact(&mut buf).await;
-        assert!(ret.is_ok());
-        assert_eq!(&buf, b"recv");
+            let mut buf = [0u8; 4];
+            let ret = stream.read_exact(&mut buf).await;
+            assert!(ret.is_ok());
+            assert_eq!(&buf, b"recv");
+            stream.shutdown().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        assert_eq!(connection_manager.get_all_connection_info().len(), 0);
     }
 
     #[tokio::test]

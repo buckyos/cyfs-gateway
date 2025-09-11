@@ -1,20 +1,91 @@
 use std::collections::{BTreeMap};
 use std::net::SocketAddr;
 use std::ops::Div;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant, SystemTime};
+use sfo_io::{SfoSpeedStat, SpeedStat, SpeedTracker};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, GATEWAY_TUNNEL_MANAGER, Server};
+use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, GATEWAY_TUNNEL_MANAGER, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, SpeedStatRef};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
+
+pub struct UdpStream {
+    socket: Arc<UdpSocket>,
+}
+
+impl UdpStream {
+    pub async fn new(socket: Arc<UdpSocket>) -> StackResult<Self> {
+        Ok(Self {
+            socket,
+        })
+    }
+}
+
+impl AsyncRead for UdpStream {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        self.socket.poll_recv(cx, buf)
+    }
+}
+
+impl AsyncWrite for UdpStream {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        self.socket.poll_send(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+struct UdpSessionController {
+    addr: SocketAddr,
+    client_session: DatagramClientSessionMap,
+    notify: Arc<Notify>,
+}
+
+impl UdpSessionController {
+    fn new(addr: SocketAddr, client_session: DatagramClientSessionMap, notify: Arc<Notify>) -> Arc<Self> {
+        Arc::new(Self {
+            addr,
+            client_session,
+            notify,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ConnectionController for UdpSessionController {
+    fn stop_connection(&self) {
+        let mut all_sessions = self.client_session.lock().unwrap();
+        all_sessions.remove(&self.addr);
+    }
+
+    async fn wait_stop(&self) {
+        self.notify.notified().await;
+    }
+
+    fn is_stopped(&self) -> bool {
+        let all_sessions = self.client_session.lock().unwrap();
+        !all_sessions.contains_key(&self.addr)
+    }
+}
 
 struct DatagramForwardSession {
     client: Box<dyn DatagramClientBox>,
     latest_time: u64,
     receive_handle: Option<JoinHandle<()>>,
+    notify: Arc<Notify>,
+    speed_stat: Arc<dyn SpeedTracker>,
 }
 
 impl Drop for DatagramForwardSession {
@@ -22,12 +93,21 @@ impl Drop for DatagramForwardSession {
         if let Some(handle) = self.receive_handle.take() {
             handle.abort();
         }
+        self.notify.notify_waiters();
     }
 }
 
 struct DatagramServerSession {
     server: String,
     latest_time: u64,
+    notify: Arc<Notify>,
+    speed_stat: Arc<dyn SpeedTracker>,
+}
+
+impl Drop for DatagramServerSession {
+    fn drop(&mut self) {
+        self.notify.notify_waiters();
+    }
 }
 
 enum DatagramSession {
@@ -44,6 +124,7 @@ struct UdpStackInner {
     servers: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     all_client_session: DatagramClientSessionMap,
+    connection_manager: Option<ConnectionManagerRef>,
 }
 
 impl UdpStackInner {
@@ -68,6 +149,7 @@ impl UdpStackInner {
             servers: builder.servers.unwrap(),
             executor: Arc::new(Mutex::new(executor)),
             all_client_session: Arc::new(Mutex::new(BTreeMap::new())),
+            connection_manager: builder.connection_manager,
         })
     }
 
@@ -94,6 +176,7 @@ impl UdpStackInner {
                         *session_guard = None;
                     } else {
                         forward_session.latest_time = chrono::Utc::now().timestamp() as u64;
+                        forward_session.speed_stat.add_read_data_size(data.len() as u64);
                     }
                 }
                 DatagramSession::Server(server_session) => {
@@ -106,6 +189,8 @@ impl UdpStackInner {
                                         *session_guard = None;
                                     } else {
                                         server_session.latest_time = chrono::Utc::now().timestamp() as u64;
+                                        server_session.speed_stat.add_read_data_size(data.len() as u64);
+                                        server_session.speed_stat.add_write_data_size(resp.len() as u64);
                                     }
                                 }
                                 Err(e) => {
@@ -131,6 +216,7 @@ impl UdpStackInner {
             CollectionValue::String(format!("{}", addr.port())),
         ).await.map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create chain env error: {}", e))?;
 
+        let speed_stat = Arc::new(SfoSpeedStat::new());
         let ret = executor.execute_lib().await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "execute chain error: {}", e))?;
         if ret.is_control() {
@@ -173,9 +259,11 @@ impl UdpStackInner {
                                     println!("send datagram error: {}", e);
                                     stack_err!(StackErrorCode::TunnelError)
                                 })?;
+                                speed_stat.add_read_data_size(data.len() as u64);
 
                                 let forward_recv = forward.clone();
                                 let back_socket = udp_socket.clone();
+                                let stat = speed_stat.clone();
                                 let handle = tokio::spawn(async move {
                                     let mut buffer = vec![0u8; 1024 * 4];
                                     loop {
@@ -196,13 +284,22 @@ impl UdpStackInner {
                                             log::error!("send datagram error: {}", e);
                                             break;
                                         }
+                                        stat.add_write_data_size(len as u64);
                                     }
                                 });
+                                let notify = Arc::new(Notify::new());
                                 *session_guard = Some(DatagramSession::Forward(DatagramForwardSession {
                                     client: forward,
                                     latest_time: chrono::Utc::now().timestamp() as u64,
                                     receive_handle: Some(handle),
+                                    notify: notify.clone(),
+                                    speed_stat: speed_stat.clone(),
                                 }));
+                                if let Some(connection_manager) = self.connection_manager.as_ref() {
+                                    let controller = UdpSessionController::new(addr, self.all_client_session.clone(), notify);
+                                    connection_manager.add_connection(ConnectionInfo::new(addr.to_string(), target.to_string(), StackProtocol::Udp, speed_stat, controller));
+                                }
+
                             } else {
                                 log::error!("tunnel manager not found");
                             }
@@ -219,11 +316,21 @@ impl UdpStackInner {
                                 if let Server::Datagram(server) = server {
                                     let buf = server.serve_datagram(data).await.map_err(into_stack_err!(StackErrorCode::ServerError, ""))?;
                                     udp_socket.send_to(buf.as_slice(), addr).await.map_err(into_stack_err!(StackErrorCode::IoError, "send error"))?;
+                                    
+                                    speed_stat.add_read_data_size(data.len() as u64);
+                                    speed_stat.add_write_data_size(buf.len() as u64);
 
+                                    let notify = Arc::new(Notify::new());
                                     *session_guard = Some(DatagramSession::Server(DatagramServerSession {
                                         server: server_name.to_string(),
                                         latest_time: chrono::Utc::now().timestamp() as u64,
+                                        notify: notify.clone(),
+                                        speed_stat: speed_stat.clone(),
                                     }));
+                                    if let Some(connection_manager) = self.connection_manager.as_ref() {
+                                        let controller = UdpSessionController::new(addr, self.all_client_session.clone(), notify);
+                                        connection_manager.add_connection(ConnectionInfo::new(addr.to_string(), server_name.to_string(), StackProtocol::Udp, speed_stat, controller));
+                                    }
                                 } else {
                                     return Err(stack_err!(
                                         StackErrorCode::InvalidConfig,
@@ -415,6 +522,7 @@ pub struct UdpStackBuilder {
     hook_point: Option<ProcessChainConfigs>,
     servers: Option<ServerManagerRef>,
     global_process_chains: Option<GlobalProcessChainsRef>,
+    connection_manager: Option<ConnectionManagerRef>,
 }
 
 impl UdpStackBuilder {
@@ -426,6 +534,7 @@ impl UdpStackBuilder {
             hook_point: None,
             servers: None,
             global_process_chains: None,
+            connection_manager: None,
         }
     }
     pub fn bind(mut self, bind: impl Into<String>) -> Self {
@@ -454,6 +563,11 @@ impl UdpStackBuilder {
 
     pub fn session_idle_time(mut self, session_idle_time: Duration) -> Self {
         self.session_idle_time = session_idle_time;
+        self
+    }
+
+    pub fn connection_manager(mut self, connection_manager: ConnectionManagerRef) -> Self {
+        self.connection_manager = Some(connection_manager);
         self
     }
 

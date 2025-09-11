@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use http::{Request, Response};
+use http_body_util::combinators::BoxBody;
+use hyper::body::Bytes;
 use name_client::{NameInfo, RecordType};
 use name_lib::{EncodedDocument, DID};
-use reqwest::{Request, Response};
 
 #[async_trait::async_trait]
 pub trait InnerHttpService: Send + Sync {
-    async fn handle(&self, request: Request) -> Result<Response, ()>;
+    async fn handle(&self, request: Request<BoxBody<Bytes, ()>>) -> Response<BoxBody<Bytes, ()>>;
 }
 
 pub struct InnerHttpServiceManager {

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::poll_fn;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -14,9 +15,10 @@ use rustls::client::verify_server_name;
 use rustls::pki_types::{DnsName, ServerName};
 use rustls::server::{ClientHello, ParsedCertificate};
 use rustls::sign::CertifiedKey;
+use sfo_io::StatStream;
 use tokio::task::JoinHandle;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::stream_forward;
 
@@ -110,6 +112,7 @@ struct QuicStackInner {
     alpn_protocols: Vec<Vec<u8>>,
     servers: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
+    connection_manager: Option<ConnectionManagerRef>,
 }
 
 impl QuicStackInner {
@@ -180,6 +183,7 @@ impl QuicStackInner {
             server_name.unwrap().to_string()
         };
 
+        let local_addr: SocketAddr = self.bind_addr.parse().unwrap();
         let remote_addr = connection.remote_address();
         let map = MemoryMapCollection::new_ref();
         map.insert("dest_host", CollectionValue::String(server_name)).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -219,12 +223,18 @@ impl QuicStackInner {
                             loop {
                                 let (send, recv) = connection.accept_bi().await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
                                 let stream = sfo_split::Splittable::new(recv, send);
+                                let stat_stream = StatStream::new(stream);
+                                let speed = stat_stream.get_speed_stat();
                                 let target = list[1].clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = stream_forward(Box::new(stream), target.as_str()).await {
+                                let handle = tokio::spawn(async move {
+                                    if let Err(e) = stream_forward(Box::new(stat_stream), target.as_str()).await {
                                         log::error!("stream forward error: {}", e);
                                     }
                                 });
+                                if let Some(connection_manager) = self.connection_manager.as_ref() {
+                                    let controller = HandleConnectionController::new(handle);
+                                    connection_manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), local_addr.to_string(), StackProtocol::Quic, speed, controller));
+                                }
                             }
                         }
                         "server" => {
@@ -269,6 +279,7 @@ impl QuicStackInner {
                                                     let (req, stream) = resolver.unwrap().resolve_request().await
                                                         .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 resolve request error"))?;
                                                     let (parts, _) = req.into_parts();
+                                                    // let stat_stream = StatStream::new(stream);
                                                     let (mut send, recv) = stream.split();
                                                     let req = http::Request::from_parts(parts, BoxBody::new(Http3Body::new(recv)));
                                                     let resp = server
@@ -311,12 +322,18 @@ impl QuicStackInner {
                                         loop {
                                             let (send, recv) = connection.accept_bi().await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
                                             let server = server.clone();
-                                            tokio::spawn(async move {
-                                                let stream = sfo_split::Splittable::new(recv, send);
-                                                if let Err(e) = server.serve_connection(Box::new(stream)).await {
+                                            let stream = sfo_split::Splittable::new(recv, send);
+                                            let stat_stream = StatStream::new(stream);
+                                            let speed = stat_stream.get_speed_stat();
+                                            let handle = tokio::spawn(async move {
+                                                if let Err(e) = server.serve_connection(Box::new(stat_stream)).await {
                                                     log::error!("server error: {}", e);
                                                 }
                                             });
+                                            if let Some(connection_manager) = self.connection_manager.as_ref() {
+                                                let controller = HandleConnectionController::new(handle);
+                                                connection_manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), local_addr.to_string(), StackProtocol::Quic, speed, controller));
+                                            }
                                         }
                                     }
                                     Server::Datagram(_) => {
@@ -381,6 +398,7 @@ impl QuicStack {
                 alpn_protocols: builder.alpn_protocols,
                 servers: builder.servers.unwrap(),
                 executor: Arc::new(Mutex::new(executor)),
+                connection_manager: builder.connection_manager,
             }),
             handle: None,
         })
@@ -411,6 +429,7 @@ pub struct QuicStackBuilder {
     certs: Vec<TlsDomainConfig>,
     alpn_protocols: Vec<Vec<u8>>,
     concurrency: u32,
+    connection_manager: Option<ConnectionManagerRef>,
 }
 
 impl QuicStackBuilder {
@@ -423,6 +442,7 @@ impl QuicStackBuilder {
             certs: vec![],
             concurrency: 1024,
             alpn_protocols: vec![],
+            connection_manager: None,
         }
     }
     pub fn bind(mut self, bind: &str) -> Self {
@@ -461,6 +481,11 @@ impl QuicStackBuilder {
 
     pub fn alpn_protocols(mut self, alpn: Vec<Vec<u8>>) -> Self {
         self.alpn_protocols = alpn;
+        self
+    }
+
+    pub fn connection_manager(mut self, connection_manager: ConnectionManagerRef) -> Self {
+        self.connection_manager = Some(connection_manager);
         self
     }
 

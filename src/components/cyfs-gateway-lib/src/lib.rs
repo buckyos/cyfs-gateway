@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod aes_stream;
 mod config;
@@ -15,6 +16,7 @@ mod server;
 mod inner_service;
 mod stack;
 mod global_process_chains;
+mod connection_manager;
 
 pub use aes_stream::*;
 pub use config::*;
@@ -29,6 +31,7 @@ pub use acme_client::*;
 pub use server::*;
 pub use inner_service::*;
 pub use stack::*;
+pub use connection_manager::*;
 
 use once_cell::sync::OnceCell;
 use thiserror::Error;
