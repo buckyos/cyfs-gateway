@@ -1,13 +1,25 @@
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::collections::HashMap;
 use std::future::poll_fn;
+use std::io;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
+use futures::Stream;
+use h3::error::Code;
 use h3::quic;
+use h3::quic::{BidiStream, ConnectionErrorIncoming, OpenStreams, RecvStream, SendStream, StreamErrorIncoming, StreamId, WriteBuf};
 use h3::server::{RequestResolver, RequestStream};
+use http::response;
+use http::response::Parts;
+use http_body_util::BodyExt;
 use http_body_util::combinators::BoxBody;
 use hyper::body::{Body, Buf, Bytes, Frame};
+use ndn_lib::CollectionStorageMode::Simple;
+use pin_project::pin_project;
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use quinn::Incoming;
 use rustls::{server, sign, Error, ServerConfig};
@@ -15,11 +27,17 @@ use rustls::client::verify_server_name;
 use rustls::pki_types::{DnsName, ServerName};
 use rustls::server::{ClientHello, ParsedCertificate};
 use rustls::sign::CertifiedKey;
-use sfo_io::StatStream;
+use sfo_io::{LimitRead, LimitStream, LimitWrite, SfoSpeedStat, SimpleAsyncWrite, SimpleAsyncWriteHolder, SpeedTracker, StatStream};
+use sfo_split::Splittable;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, Take};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio_util::bytes::BytesMut;
+use tokio_util::io::ReaderStream;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
+use crate::stack::limiter::Limiter;
 use crate::stack::stream_forward;
 
 pub struct Http3Body<S, B> {
@@ -61,6 +79,571 @@ where
                 Poll::Pending
             }
         }
+    }
+}
+
+#[pin_project]
+#[derive(Debug)]
+pub struct AsyncReadBody<T> {
+    #[pin]
+    reader: ReaderStream<T>,
+}
+
+impl<T> AsyncReadBody<T>
+where
+    T: AsyncRead + Send + 'static,
+{
+    /// Create a new [`AsyncReadBody`] wrapping the given reader,
+    /// with a specific read buffer capacity
+    pub(crate) fn with_capacity(read: T, capacity: usize) -> Self {
+        Self {
+            reader: ReaderStream::with_capacity(read, capacity),
+        }
+    }
+
+    pub(crate) fn with_capacity_limited(
+        read: T,
+        capacity: usize,
+        max_read_bytes: u64,
+    ) -> AsyncReadBody<Take<T>> {
+        AsyncReadBody {
+            reader: ReaderStream::with_capacity(read.take(max_read_bytes), capacity),
+        }
+    }
+
+    pub fn raw_stream(&mut self) -> &mut ReaderStream<T> {
+        &mut self.reader
+    }
+}
+
+impl<T> Body for AsyncReadBody<T>
+where
+    T: AsyncRead,
+{
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match std::task::ready!(self.project().reader.poll_next(cx)) {
+            Some(Ok(chunk)) => Poll::Ready(Some(Ok(Frame::data(chunk)))),
+            Some(Err(err)) => Poll::Ready(Some(Err(err))),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+pub struct Http3Recv<B: Buf + 'static + Send, R: quic::RecvStream + 'static> {
+    recv: RequestStream<R, B>,
+    cache: Option<Box<dyn Read + Send + Sync>>,
+}
+
+impl<B: Buf + 'static + Send,
+    R: quic::RecvStream + 'static, > Http3Recv<B, R> {
+    pub fn new(recv: RequestStream<R, B>) -> Self {
+        Self {
+            recv,
+            cache: None,
+        }
+    }
+}
+
+impl<B: Buf + 'static + Send,
+    R: quic::RecvStream + 'static> AsyncRead for Http3Recv<B, R>
+{
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if let Some(reader) = self.cache.as_mut() {
+            let buf_ref = buf.initialize_unfilled();
+            match reader.read(buf_ref) {
+                Ok(n) => {
+                    buf.advance(n);
+                    if n == 0 {
+                        self.cache = None;
+                    } else {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                Err(e) => {
+                    return Poll::Ready(Err(e));
+                }
+            }
+        }
+        match self.recv.poll_recv_data(cx) {
+            Poll::Ready(ret) => {
+                match ret {
+                    Ok(Some(ret)) => {
+                        let remaining = ret.remaining();
+                        let mut reader = Box::new(ret.reader());
+                        let buf_ref = buf.initialize_unfilled();
+                        match reader.read(buf_ref) {
+                            Ok(n) => {
+                                buf.advance(n);
+                                if n < remaining {
+                                    self.cache = Some(reader);
+                                }
+                            }
+                            Err(e) => {
+                                return Poll::Ready(Err(e));
+                            }
+                        }
+                        Poll::Ready(Ok(()))
+                    }
+                    Ok(None) => {
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(e) => {
+                        Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                    }
+                }
+            }
+            Poll::Pending => {
+                Poll::Pending
+            }
+        }
+    }
+}
+
+pub struct Http3Send<B: Buf + 'static + Send, S: quic::SendStream<B> + 'static> {
+    send: RequestStream<S, B>,
+}
+
+impl<B: Buf + 'static + Send,
+    S: quic::SendStream<B> + 'static, > Http3Send<B, S> {
+    pub fn new(send: RequestStream<S, B>) -> Self {
+        Self {
+            send,
+        }
+    }
+
+    pub fn raw_stream(&mut self) -> &mut RequestStream<S, B> {
+        &mut self.send
+    }
+}
+
+#[async_trait::async_trait]
+impl<S: quic::SendStream<Bytes> + Send + Unpin + 'static, > SimpleAsyncWrite for Http3Send<Bytes, S> {
+    async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let static_buf = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
+        match self.send.send_data(Bytes::from(static_buf)).await {
+            Ok(()) => {
+                Ok(buf.len())
+            }
+            Err(e) => {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+            }
+        }
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        self.send.finish().await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    }
+}
+
+pub struct Http3RecvStream {
+    recv: h3_quinn::RecvStream,
+    speed_tracker: Arc<dyn SpeedTracker>,
+    notify: Arc<Notify>,
+    has_stopped: Arc<AtomicBool>,
+}
+
+impl Drop for Http3RecvStream {
+    fn drop(&mut self) {
+        self.notify.notify_one();
+    }
+}
+
+impl Http3RecvStream {
+    pub fn new(recv: h3_quinn::RecvStream,
+               speed_tracker: Arc<dyn SpeedTracker>,
+               notify: Arc<Notify>,
+               has_stopped: Arc<AtomicBool>, ) -> Self {
+        Self {
+            recv,
+            speed_tracker,
+            notify,
+            has_stopped,
+        }
+    }
+}
+
+impl quic::RecvStream for Http3RecvStream {
+    type Buf = Bytes;
+
+    fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
+        if self.has_stopped.load(Ordering::Relaxed) {
+            return Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error: ConnectionErrorIncoming::InternalError("user stopped".to_string()) }));
+        }
+
+        match self.recv.poll_data(cx) {
+            Poll::Ready(Ok(Some(ret))) => {
+                self.speed_tracker.add_read_data_size(ret.len() as u64);
+                Poll::Ready(Ok(Some(ret)))
+            }
+            Poll::Ready(Ok(None)) => {
+                Poll::Ready(Ok(None))
+            }
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn stop_sending(&mut self, error_code: u64) {
+        self.recv.stop_sending(error_code);
+    }
+
+    fn recv_id(&self) -> StreamId {
+        self.recv.recv_id()
+    }
+}
+
+pub struct Http3SendStream<B: Buf> {
+    send: h3_quinn::SendStream<B>,
+    speed_tracker: Arc<dyn SpeedTracker>,
+    notify: Arc<Notify>,
+    has_stopped: Arc<AtomicBool>,
+}
+
+impl<B: Buf> Drop for Http3SendStream<B> {
+    fn drop(&mut self) {
+        self.notify.notify_waiters();
+    }
+}
+
+impl<B: Buf> Http3SendStream<B> {
+    pub fn new(send: h3_quinn::SendStream<B>,
+               speed_tracker: Arc<dyn SpeedTracker>,
+               notify: Arc<Notify>,
+               has_stopped: Arc<AtomicBool>, ) -> Self {
+        Self {
+            send,
+            speed_tracker,
+            notify,
+            has_stopped,
+        }
+    }
+}
+
+impl<B: Buf> quic::SendStream<B> for Http3SendStream<B> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.send.poll_ready(cx)
+    }
+
+    fn send_data<T: Into<WriteBuf<B>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
+        if self.has_stopped.load(Ordering::Relaxed) {
+            return Err(StreamErrorIncoming::ConnectionErrorIncoming { connection_error: ConnectionErrorIncoming::InternalError("user stopped".to_string()) });
+        }
+
+        let buf = data.into();
+        self.speed_tracker.add_write_data_size(buf.remaining() as u64);
+        self.send.send_data(buf)
+    }
+
+    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.send.poll_finish(cx)
+    }
+
+    fn reset(&mut self, reset_code: u64) {
+        self.send.reset(reset_code);
+    }
+
+    fn send_id(&self) -> StreamId {
+        self.send.send_id()
+    }
+}
+
+pub struct Http3BidiStream<B: Buf> {
+    send: Http3SendStream<B>,
+    recv: Http3RecvStream,
+}
+
+impl<B: Buf> Http3BidiStream<B> {
+    pub fn new(stream: h3_quinn::BidiStream<B>,
+               speed_tracker: Arc<dyn SpeedTracker>,
+               notify: Arc<Notify>,
+               has_stopped: Arc<AtomicBool>, ) -> Self {
+        let (send, recv) = stream.split();
+        Self {
+            send: Http3SendStream::new(send, speed_tracker.clone(), notify.clone(), has_stopped.clone()),
+            recv: Http3RecvStream::new(recv, speed_tracker, notify, has_stopped),
+        }
+    }
+}
+
+impl<B: Buf> SendStream<B> for Http3BidiStream<B> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.send.poll_ready(cx)
+    }
+
+    fn send_data<T: Into<WriteBuf<B>>>(&mut self, data: T) -> Result<(), StreamErrorIncoming> {
+        self.send.send_data(data.into())
+    }
+
+    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.send.poll_finish(cx)
+    }
+
+    fn reset(&mut self, reset_code: u64) {
+        self.send.reset(reset_code);
+    }
+
+    fn send_id(&self) -> StreamId {
+        self.send.send_id()
+    }
+}
+
+impl<B: Buf> RecvStream for Http3BidiStream<B> {
+    type Buf = Bytes;
+
+    fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
+        self.recv.poll_data(cx)
+    }
+
+    fn stop_sending(&mut self, error_code: u64) {
+        self.recv.stop_sending(error_code);
+    }
+
+    fn recv_id(&self) -> StreamId {
+        self.recv.recv_id()
+    }
+}
+
+impl<B: Buf> quic::BidiStream<B> for Http3BidiStream<B> {
+    type SendStream = Http3SendStream<B>;
+    type RecvStream = Http3RecvStream;
+
+    fn split(self) -> (Self::SendStream, Self::RecvStream) {
+        (self.send, self.recv)
+    }
+}
+
+pub struct Http3OpenStreams {
+    streams: h3_quinn::OpenStreams,
+    speed_tracker: Arc<dyn SpeedTracker>,
+    notify: Arc<Notify>,
+    has_stopped: Arc<AtomicBool>,
+}
+
+impl Http3OpenStreams {
+    pub fn new(streams: h3_quinn::OpenStreams,
+               speed_tracker: Arc<dyn SpeedTracker>,
+               notify: Arc<Notify>,
+               has_stopped: Arc<AtomicBool>, ) -> Self {
+        Self {
+            streams,
+            speed_tracker,
+            notify,
+            has_stopped,
+        }
+    }
+}
+
+impl<B: Buf> quic::OpenStreams<B> for Http3OpenStreams {
+    type BidiStream = Http3BidiStream<B>;
+    type SendStream = Http3SendStream<B>;
+
+    fn poll_open_bidi(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
+        match self.streams.poll_open_bidi(cx) {
+            Poll::Ready(Ok(stream)) => {
+                Poll::Ready(Ok(Http3BidiStream::new(stream, self.speed_tracker.clone(), self.notify.clone(), self.has_stopped.clone())))
+            }
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn poll_open_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::SendStream, StreamErrorIncoming>> {
+        match self.streams.poll_open_send(cx) {
+            Poll::Ready(Ok(stream)) => {
+                Poll::Ready(Ok(Http3SendStream::new(stream, self.speed_tracker.clone(), self.notify.clone(), self.has_stopped.clone())))
+            }
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn close(&mut self, code: Code, reason: &[u8]) {
+        <h3_quinn::OpenStreams as OpenStreams<B>>::close(&mut self.streams, code, reason);
+    }
+}
+
+struct Http3ConnectionController {
+    is_stopped: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    stopped: AtomicBool,
+}
+
+impl Http3ConnectionController {
+    pub fn new(is_stopped: Arc<AtomicBool>,
+               notify: Arc<Notify>) -> Self {
+        Self {
+            is_stopped,
+            notify,
+            stopped: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConnectionController for Http3ConnectionController {
+    fn stop_connection(&self) {
+        self.is_stopped.store(true, Ordering::Relaxed);
+    }
+
+    async fn wait_stop(&self) {
+        self.notify.notified().await;
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+}
+
+pub struct Http3Connection {
+    conn: h3_quinn::Connection,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    connection_manager: Option<ConnectionManagerRef>,
+}
+
+impl Http3Connection {
+    pub fn new(conn: h3_quinn::Connection,
+               local_addr: SocketAddr,
+               remote_addr: SocketAddr,
+               connection_manager: Option<ConnectionManagerRef>) -> Self {
+        Self {
+            conn,
+            local_addr,
+            remote_addr,
+            connection_manager,
+        }
+    }
+}
+
+impl<B: Buf> OpenStreams<B> for Http3Connection {
+    type BidiStream = Http3BidiStream<B>;
+    type SendStream = Http3SendStream<B>;
+
+    fn poll_open_bidi(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
+        match self.conn.poll_open_bidi(cx) {
+            Poll::Ready(Ok(stream)) => {
+                let speed_tracker = Arc::new(SfoSpeedStat::new());
+                let notify = Arc::new(Notify::new());
+                let has_stopped = Arc::new(AtomicBool::new(false));
+                if let Some(connection_manager) = &self.connection_manager {
+                    let controller = Arc::new(Http3ConnectionController::new(has_stopped.clone(), notify.clone()));
+                    connection_manager.add_connection(ConnectionInfo::new(self.remote_addr.to_string(), self.local_addr.to_string(), StackProtocol::Quic, speed_tracker.clone(), controller));
+                }
+                Poll::Ready(Ok(Http3BidiStream::new(stream, speed_tracker.clone(), notify.clone(), has_stopped.clone())))
+            }
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn poll_open_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::SendStream, StreamErrorIncoming>> {
+        match self.conn.poll_open_send(cx) {
+            Poll::Ready(Ok(stream)) => {
+                let speed_tracker = Arc::new(SfoSpeedStat::new());
+                let notify = Arc::new(Notify::new());
+                let has_stopped = Arc::new(AtomicBool::new(false));
+                if let Some(connection_manager) = &self.connection_manager {
+                    let controller = Arc::new(Http3ConnectionController::new(has_stopped.clone(), notify.clone()));
+                    connection_manager.add_connection(ConnectionInfo::new(self.remote_addr.to_string(), self.local_addr.to_string(), StackProtocol::Quic, speed_tracker.clone(), controller));
+                }
+                Poll::Ready(Ok(Http3SendStream::new(stream, speed_tracker.clone(), notify.clone(), has_stopped.clone())))
+            }
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn close(&mut self, code: Code, reason: &[u8]) {
+        <h3_quinn::Connection as OpenStreams<B>>::close(&mut self.conn, code, reason);
+    }
+}
+
+impl<B: Buf> quic::Connection<B> for Http3Connection {
+    type RecvStream = Http3RecvStream;
+    type OpenStreams = Http3OpenStreams;
+
+    fn poll_accept_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
+        match <h3_quinn::Connection as h3::quic::Connection<B>>::poll_accept_recv(&mut self.conn, cx) {
+            Poll::Ready(Ok(stream)) => {
+                let speed_tracker = Arc::new(SfoSpeedStat::new());
+                let notify = Arc::new(Notify::new());
+                let has_stopped = Arc::new(AtomicBool::new(false));
+                if let Some(connection_manager) = &self.connection_manager {
+                    let controller = Arc::new(Http3ConnectionController::new(has_stopped.clone(), notify.clone()));
+                    connection_manager.add_connection(ConnectionInfo::new(self.remote_addr.to_string(), self.local_addr.to_string(), StackProtocol::Quic, speed_tracker.clone(), controller));
+                }
+                Poll::Ready(Ok(Http3RecvStream::new(stream, speed_tracker.clone(), notify.clone(), has_stopped.clone())))
+            }
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn poll_accept_bidi(&mut self, cx: &mut Context<'_>) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
+        match self.conn.poll_accept_bidi(cx) {
+            Poll::Ready(Ok(stream)) => {
+                let speed_tracker = Arc::new(SfoSpeedStat::new());
+                let notify = Arc::new(Notify::new());
+                let has_stopped = Arc::new(AtomicBool::new(false));
+                if let Some(connection_manager) = &self.connection_manager {
+                    let controller = Arc::new(Http3ConnectionController::new(has_stopped.clone(), notify.clone()));
+                    connection_manager.add_connection(ConnectionInfo::new(self.remote_addr.to_string(), self.local_addr.to_string(), StackProtocol::Quic, speed_tracker.clone(), controller));
+                }
+                Poll::Ready(Ok(Http3BidiStream::new(stream, speed_tracker.clone(), notify.clone(), has_stopped.clone())))
+            }
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(e))
+            }
+            Poll::Pending => {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn opener(&self) -> Self::OpenStreams {
+        let speed_tracker = Arc::new(SfoSpeedStat::new());
+        let notify = Arc::new(Notify::new());
+        let has_stopped = Arc::new(AtomicBool::new(false));
+        if let Some(connection_manager) = &self.connection_manager {
+            let controller = Arc::new(Http3ConnectionController::new(has_stopped.clone(), notify.clone()));
+            connection_manager.add_connection(ConnectionInfo::new(self.remote_addr.to_string(), self.local_addr.to_string(), StackProtocol::Quic, speed_tracker.clone(), controller));
+        }
+        Http3OpenStreams::new(<h3_quinn::Connection as h3::quic::Connection<B>>::opener(&self.conn), speed_tracker.clone(), notify.clone(), has_stopped.clone())
     }
 }
 #[derive(Debug)]
@@ -248,7 +831,12 @@ impl QuicStackInner {
                             if let Some(server) = self.servers.get_server(server_name) {
                                 match server {
                                     Server::Http(server) => {
-                                        let mut h3_conn = match h3::server::Connection::<_, Bytes>::new(h3_quinn::Connection::new(connection))
+                                        let mut h3_conn = match h3::server::Connection::<_, Bytes>::new(
+                                            Http3Connection::new(
+                                                h3_quinn::Connection::new(connection),
+                                                local_addr,
+                                                remote_addr,
+                                                self.connection_manager.clone()))
                                             .await {
                                             Ok(h3_conn) => h3_conn,
                                             Err(e) => {
@@ -281,16 +869,23 @@ impl QuicStackInner {
                                                     let (parts, _) = req.into_parts();
                                                     // let stat_stream = StatStream::new(stream);
                                                     let (mut send, recv) = stream.split();
-                                                    let req = http::Request::from_parts(parts, BoxBody::new(Http3Body::new(recv)));
+                                                    let recv_stream = Http3Recv::new(recv);
+                                                    let limiter = Arc::new(Limiter::new(None, None));
+                                                    let recv = LimitRead::new(recv_stream, limiter.clone());
+                                                    let body = AsyncReadBody::with_capacity(recv, 4096)
+                                                        .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed();
+                                                    let req = http::Request::from_parts(parts, body);
                                                     let resp = server
                                                         .serve_request(req)
                                                         .await
                                                         .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
                                                     let (parts, mut body) = resp.into_parts();
-                                                    let resp = http::Response::from_parts(parts, ());
-                                                    send.send_response(resp)
-                                                        .await
+
+                                                    send.send_response(http::Response::from_parts(parts, ())).await
                                                         .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 send response error"))?;
+
+                                                    let send_stream = SimpleAsyncWriteHolder::new(Http3Send::new(send));
+                                                    let mut send = LimitWrite::new(send_stream, limiter);
                                                     loop {
                                                         let mut pin_body = Pin::new(&mut body);
                                                         let data = poll_fn(move |cx| {
@@ -299,8 +894,8 @@ impl QuicStackInner {
                                                         match data {
                                                             Some(data) => {
                                                                 let data = data.map_err(into_stack_err!(StackErrorCode::QuicError, "h3 map error"))?;
-                                                                send.send_data(data.into_data()
-                                                                    .map_err(|_e| stack_err!(StackErrorCode::QuicError, "h3 data error"))?).await
+                                                                send.write_all(data.into_data()
+                                                                    .map_err(|_e| stack_err!(StackErrorCode::QuicError, "h3 data error"))?.as_ref()).await
                                                                     .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 send data error"))?;
                                                             }
                                                             None => {
@@ -308,7 +903,7 @@ impl QuicStackInner {
                                                             }
                                                         }
                                                     }
-                                                    send.finish().await
+                                                    send.shutdown().await
                                                         .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 finish error"))?;
                                                     Ok(())
                                                 }.await;

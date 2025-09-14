@@ -9,9 +9,10 @@ use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, Stac
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use sfo_io::StatStream;
+use sfo_io::{LimitStream, StatStream};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
+use crate::stack::limiter::Limiter;
 
 struct TcpStackInner {
     bind_addr: String,
@@ -77,11 +78,11 @@ impl TcpStackInner {
                 };
 
                 let this_tmp = this.clone();
-                let statStream = StatStream::new(stream);
-                let speed = statStream.get_speed_stat();
+                let stat_stream = StatStream::new(stream);
+                let speed = stat_stream.get_speed_stat();
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        this_tmp.handle_connect(statStream, local_addr).await
+                        this_tmp.handle_connect(stat_stream, local_addr).await
                     {
                         log::error!("handle tcp stream failed: {}", e);
                     }
@@ -133,6 +134,8 @@ impl TcpStackInner {
                                 ));
                             }
                             let target = list[1].as_str();
+                            let limiter = Limiter::new(Some(1), Some(1));
+                            let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
                             stream_forward(stream, target).await?;
                         }
                         "server" => {
@@ -142,6 +145,9 @@ impl TcpStackInner {
                                     "invalid server command"
                                 ));
                             }
+                            let limiter = Limiter::new(Some(1), Some(1));
+                            let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
+
                             let server_name = list[1].as_str();
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
@@ -441,6 +447,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
+        let start = std::time::SystemTime::now();
         {
             let mut stream = TcpStream::connect("127.0.0.1:8082").await.unwrap();
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -450,6 +457,7 @@ mod tests {
 
             let mut buf = [0u8; 4];
             let ret = stream.read_exact(&mut buf).await;
+
             assert!(ret.is_ok());
             assert_eq!(&buf, b"recv");
             stream.shutdown().await.unwrap();
@@ -466,7 +474,7 @@ mod tests {
   blocks:
     - id: main
       block: |
-        return "forward tcp:///127.0.0.1:8085";
+        return "forward tcp:///127.0.0.1:8086";
         "#;
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();

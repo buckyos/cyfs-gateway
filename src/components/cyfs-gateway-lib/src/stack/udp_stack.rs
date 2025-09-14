@@ -1,3 +1,5 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 use std::collections::{BTreeMap};
 use std::net::SocketAddr;
 use std::ops::Div;
@@ -5,45 +7,131 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
-use sfo_io::{SfoSpeedStat, SpeedStat, SpeedTracker};
+use sfo_io::{Datagram, LimitDatagram, SfoSpeedStat, SpeedStat, SpeedTracker};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, GATEWAY_TUNNEL_MANAGER, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, SpeedStatRef};
+use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, GATEWAY_TUNNEL_MANAGER, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, SpeedStatRef, StackError};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
+use crate::stack::limiter::Limiter;
 
-pub struct UdpStream {
+pub struct UdpSendDatagram {
     socket: Arc<UdpSocket>,
+    addr: SocketAddr,
 }
 
-impl UdpStream {
-    pub async fn new(socket: Arc<UdpSocket>) -> StackResult<Self> {
-        Ok(Self {
+impl UdpSendDatagram {
+    pub fn new(socket: Arc<UdpSocket>, addr: SocketAddr) -> Self {
+        Self {
             socket,
-        })
+            addr,
+        }
     }
 }
 
-impl AsyncRead for UdpStream {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        self.socket.poll_recv(cx, buf)
+#[async_trait::async_trait]
+impl Datagram for UdpSendDatagram {
+    type Error = StackError;
+
+    async fn send_to(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        self.socket.send_to(buf, self.addr).await.map_err(into_stack_err!(StackErrorCode::IoError))
+    }
+
+    async fn recv_from(&mut self, _buf: &mut [u8]) -> Result<usize, Self::Error> {
+        unreachable!()
     }
 }
 
-impl AsyncWrite for UdpStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        self.socket.poll_send(cx, buf)
+pub struct UdpDatagram {
+    socket: Arc<UdpSocket>,
+    dest: SocketAddr,
+    recv_channel: tokio::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+impl UdpDatagram {
+    fn new(socket: Arc<UdpSocket>, dest: SocketAddr, recv_channel: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            socket,
+            dest,
+            recv_channel,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Datagram for UdpDatagram {
+    type Error = StackError;
+
+    async fn send_to(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        self.socket.send_to(buf, self.dest).await.map_err(into_stack_err!(StackErrorCode::IoError))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+    async fn recv_from(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        if let Some(data) = self.recv_channel.recv().await {
+            if buf.len() >= data.len() {
+                buf[..data.len()].copy_from_slice(&data);
+                Ok(data.len())
+            } else {
+                buf.copy_from_slice(&data[..buf.len()]);
+                Ok(buf.len())
+            }
+        } else {
+            Err(stack_err!(StackErrorCode::IoError, "no data"))
+        }
+    }
+}
+
+pub struct ClientDatagram {
+    client: Box<dyn DatagramClientBox>,
+}
+
+impl ClientDatagram {
+    pub fn new(client: Box<dyn DatagramClientBox>) -> Self {
+        Self {
+            client,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Datagram for ClientDatagram {
+    type Error = StackError;
+
+    async fn send_to(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        self.client.send_datagram(buf).await.map_err(into_stack_err!(StackErrorCode::IoError))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
+    async fn recv_from(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        self.client.recv_datagram(buf).await.map_err(into_stack_err!(StackErrorCode::IoError))
+    }
+}
+
+pub struct ChannelDatagram {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl ChannelDatagram {
+    pub fn new(sender: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            sender,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Datagram for ChannelDatagram {
+    type Error = StackError;
+
+    async fn send_to(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        let _ = self.sender.try_send(buf.to_vec());
+        Ok(buf.len())
+    }
+
+    async fn recv_from(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        unreachable!()
     }
 }
 
@@ -81,16 +169,20 @@ impl ConnectionController for UdpSessionController {
 }
 
 struct DatagramForwardSession {
-    client: Box<dyn DatagramClientBox>,
+    client: Box<dyn Datagram<Error=StackError>>,
     latest_time: u64,
     receive_handle: Option<JoinHandle<()>>,
     notify: Arc<Notify>,
     speed_stat: Arc<dyn SpeedTracker>,
+    send_handle: Option<JoinHandle<()>>,
 }
 
 impl Drop for DatagramForwardSession {
     fn drop(&mut self) {
         if let Some(handle) = self.receive_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.send_handle.take() {
             handle.abort();
         }
         self.notify.notify_waiters();
@@ -102,10 +194,15 @@ struct DatagramServerSession {
     latest_time: u64,
     notify: Arc<Notify>,
     speed_stat: Arc<dyn SpeedTracker>,
+    send_handle: Option<JoinHandle<()>>,
+    send_datagram: Option<Box<dyn Datagram<Error=StackError>>>,
 }
 
 impl Drop for DatagramServerSession {
     fn drop(&mut self) {
+        if let Some(handle) = self.send_handle.take() {
+            handle.abort();
+        }
         self.notify.notify_waiters();
     }
 }
@@ -153,7 +250,7 @@ impl UdpStackInner {
         })
     }
 
-    async fn handle_datagram(&self, udp_socket: Arc<UdpSocket>, addr: SocketAddr, data: &[u8]) -> StackResult<()> {
+    async fn handle_datagram(&self, udp_socket: Arc<UdpSocket>, addr: SocketAddr, data: Vec<u8>, len: usize) -> StackResult<()> {
         let client_session = {
             let mut all_sessions = self.all_client_session.lock().unwrap();
             let client_session = all_sessions.get(&addr);
@@ -171,35 +268,52 @@ impl UdpStackInner {
             let client_session = session_guard.as_mut().unwrap();
             match client_session {
                 DatagramSession::Forward(forward_session) => {
-                    if let Err(e) = forward_session.client.send_datagram(data).await {
+                    if let Err(e) = forward_session.client.send_to(&data[..len]).await {
                         log::error!("send datagram error: {}", e);
                         *session_guard = None;
                     } else {
                         forward_session.latest_time = chrono::Utc::now().timestamp() as u64;
-                        forward_session.speed_stat.add_read_data_size(data.len() as u64);
+                        forward_session.speed_stat.add_read_data_size(len as u64);
                     }
                 }
                 DatagramSession::Server(server_session) => {
-                    if let Some(server) = self.servers.get_server(&server_session.server) {
-                        if let Server::Datagram(server) = server {
-                            match server.serve_datagram(data).await {
-                                Ok(resp) => {
-                                    if let Err(e) = udp_socket.send_to(resp.as_slice(), &addr).await {
-                                        log::error!("send datagram error: {}", e);
-                                        *session_guard = None;
-                                    } else {
-                                        server_session.latest_time = chrono::Utc::now().timestamp() as u64;
-                                        server_session.speed_stat.add_read_data_size(data.len() as u64);
-                                        server_session.speed_stat.add_write_data_size(resp.len() as u64);
-                                    }
+                    if server_session.send_handle.is_some() {
+                        let is_finished = server_session.send_handle.as_ref().unwrap().is_finished();
+                        if is_finished {
+                            *session_guard = None;
+                        } else {
+                            match server_session.send_datagram.as_mut().unwrap().send_to(&data[..len]).await {
+                                Ok(_) => {
+                                    server_session.latest_time = chrono::Utc::now().timestamp() as u64;
                                 }
                                 Err(e) => {
                                     log::error!("send datagram error: {}", e);
                                     *session_guard = None;
                                 }
                             }
-                        } else {
-                            return Err(stack_err!(StackErrorCode::InvalidConfig, "Unsupport server type"));
+                        }
+                    } else {
+                        if let Some(server) = self.servers.get_server(&server_session.server) {
+                            if let Server::Datagram(server) = server {
+                                match server.serve_datagram(&data[..len]).await {
+                                    Ok(resp) => {
+                                        if let Err(e) = udp_socket.send_to(resp.as_slice(), &addr).await {
+                                            log::error!("send datagram error: {}", e);
+                                            *session_guard = None;
+                                        } else {
+                                            server_session.latest_time = chrono::Utc::now().timestamp() as u64;
+                                            server_session.speed_stat.add_read_data_size(len as u64);
+                                            server_session.speed_stat.add_write_data_size(resp.len() as u64);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!("send datagram error: {}", e);
+                                        *session_guard = None;
+                                    }
+                                }
+                            } else {
+                                return Err(stack_err!(StackErrorCode::InvalidConfig, "Unsupport server type"));
+                            }
                         }
                     }
                 }
@@ -255,46 +369,114 @@ impl UdpStackInner {
                                     .create_datagram_client_by_url(&url)
                                     .await.map_err(into_stack_err!(StackErrorCode::TunnelError))?;
                                 // forward.send_datagram(data).await.map_err(into_stack_err!(StackErrorCode::TunnelError))?;
-                                forward.send_datagram(data).await.map_err(|e| {
+                                forward.send_datagram(&data[..len]).await.map_err(|e| {
                                     println!("send datagram error: {}", e);
                                     stack_err!(StackErrorCode::TunnelError)
                                 })?;
-                                speed_stat.add_read_data_size(data.len() as u64);
+                                speed_stat.add_read_data_size(len as u64);
 
                                 let forward_recv = forward.clone();
                                 let back_socket = udp_socket.clone();
                                 let stat = speed_stat.clone();
-                                let handle = tokio::spawn(async move {
-                                    let mut buffer = vec![0u8; 1024 * 4];
-                                    loop {
-                                        let len = match forward_recv
-                                            .recv_datagram(&mut buffer)
-                                            .await
-                                        {
-                                            Ok(pair) => pair,
-                                            Err(err) => {
-                                                log::error!("accept error: {}", err);
+                                let notify = Arc::new(Notify::new());
+                                let is_limit = true;
+                                if is_limit {
+                                    let (sender, receive) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+                                    let send_datagram = Box::new(ChannelDatagram::new(sender));
+                                    let limit = Arc::new(Limiter::new(None, None));
+                                    let mut receive_datagram = LimitDatagram::new(UdpDatagram::new(udp_socket.clone(), addr, receive), limit.clone());
+                                    let stat = speed_stat.clone();
+                                    let send_handle = tokio::spawn(async move {
+                                        let mut buffer = vec![0u8; 1024 * 4];
+                                        loop {
+                                            match receive_datagram.recv_from(&mut buffer).await {
+                                                Ok(len) => {
+                                                    match forward.send_datagram(&buffer[0..len]).await {
+                                                        Ok(_) => {
+                                                            stat.add_read_data_size(len as u64);
+                                                        },
+                                                        Err(e) => {
+                                                            log::error!("send datagram error: {}", e);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    log::error!("accept error: {}", e);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    });
+
+                                    let stat = speed_stat.clone();
+                                    let mut receive_forward_datagram = LimitDatagram::new(UdpSendDatagram::new(udp_socket.clone(), addr), limit);
+                                    let handle = tokio::spawn(async move {
+                                        let mut buffer = vec![0u8; 1024 * 4];
+                                        loop {
+                                            let len = match forward_recv
+                                                .recv_datagram(&mut buffer)
+                                                .await
+                                            {
+                                                Ok(pair) => pair,
+                                                Err(err) => {
+                                                    log::error!("accept error: {}", err);
+                                                    break;
+                                                }
+                                            };
+                                            if let Err(e) = receive_forward_datagram
+                                                .send_to(&buffer[0..len])
+                                                .await
+                                            {
+                                                log::error!("send datagram error: {}", e);
                                                 break;
                                             }
-                                        };
-                                        if let Err(e) = back_socket
-                                            .send_to(&buffer[0..len], addr)
-                                            .await
-                                        {
-                                            log::error!("send datagram error: {}", e);
-                                            break;
+                                            stat.add_write_data_size(len as u64);
                                         }
-                                        stat.add_write_data_size(len as u64);
-                                    }
-                                });
-                                let notify = Arc::new(Notify::new());
-                                *session_guard = Some(DatagramSession::Forward(DatagramForwardSession {
-                                    client: forward,
-                                    latest_time: chrono::Utc::now().timestamp() as u64,
-                                    receive_handle: Some(handle),
-                                    notify: notify.clone(),
-                                    speed_stat: speed_stat.clone(),
-                                }));
+                                    });
+
+                                    *session_guard = Some(DatagramSession::Forward(DatagramForwardSession {
+                                        client: send_datagram,
+                                        latest_time: chrono::Utc::now().timestamp() as u64,
+                                        receive_handle: Some(handle),
+                                        notify: notify.clone(),
+                                        speed_stat: speed_stat.clone(),
+                                        send_handle: Some(send_handle),
+                                    }));
+                                } else {
+                                    let handle = tokio::spawn(async move {
+                                        let mut buffer = vec![0u8; 1024 * 4];
+                                        loop {
+                                            let len = match forward_recv
+                                                .recv_datagram(&mut buffer)
+                                                .await
+                                            {
+                                                Ok(pair) => pair,
+                                                Err(err) => {
+                                                    log::error!("accept error: {}", err);
+                                                    break;
+                                                }
+                                            };
+                                            if let Err(e) = back_socket
+                                                .send_to(&buffer[0..len], addr)
+                                                .await
+                                            {
+                                                log::error!("send datagram error: {}", e);
+                                                break;
+                                            }
+                                            stat.add_write_data_size(len as u64);
+                                        }
+                                    });
+
+                                    *session_guard = Some(DatagramSession::Forward(DatagramForwardSession {
+                                        client: Box::new(ClientDatagram::new(forward)),
+                                        latest_time: chrono::Utc::now().timestamp() as u64,
+                                        receive_handle: Some(handle),
+                                        notify: notify.clone(),
+                                        speed_stat: speed_stat.clone(),
+                                        send_handle: None,
+                                    }));
+                                }
                                 if let Some(connection_manager) = self.connection_manager.as_ref() {
                                     let controller = UdpSessionController::new(addr, self.all_client_session.clone(), notify);
                                     connection_manager.add_connection(ConnectionInfo::new(addr.to_string(), target.to_string(), StackProtocol::Udp, speed_stat, controller));
@@ -311,22 +493,69 @@ impl UdpStackInner {
                                     "invalid server command"
                                 ));
                             }
-                            let server_name = list[1].as_str();
-                            if let Some(server) = self.servers.get_server(server_name) {
+                            let server_name = list[1].to_string();
+                            if let Some(server) = self.servers.get_server(server_name.as_str()) {
                                 if let Server::Datagram(server) = server {
-                                    let buf = server.serve_datagram(data).await.map_err(into_stack_err!(StackErrorCode::ServerError, ""))?;
-                                    udp_socket.send_to(buf.as_slice(), addr).await.map_err(into_stack_err!(StackErrorCode::IoError, "send error"))?;
-                                    
-                                    speed_stat.add_read_data_size(data.len() as u64);
-                                    speed_stat.add_write_data_size(buf.len() as u64);
-
                                     let notify = Arc::new(Notify::new());
-                                    *session_guard = Some(DatagramSession::Server(DatagramServerSession {
-                                        server: server_name.to_string(),
-                                        latest_time: chrono::Utc::now().timestamp() as u64,
-                                        notify: notify.clone(),
-                                        speed_stat: speed_stat.clone(),
-                                    }));
+                                    let is_limit = true;
+                                    let name = server_name.clone();
+                                    if is_limit {
+                                        let (sender, receive) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+                                        let mut send_datagram = Box::new(ChannelDatagram::new(sender));
+                                        let limit = Arc::new(Limiter::new(None, None));
+                                        let mut receive_datagram = LimitDatagram::new(UdpDatagram::new(udp_socket.clone(), addr, receive), limit.clone());
+                                        let stat = speed_stat.clone();
+                                        let servers = self.servers.clone();
+                                        let handle = tokio::spawn(async move {
+                                            let mut buffer = vec![0u8; 1024 * 4];
+                                            loop {
+                                                match receive_datagram.recv_from(&mut buffer).await {
+                                                    Ok(len) => {
+                                                        if let Some(server) = servers.get_server(name.as_str()) {
+                                                            if let Server::Datagram(server) = server {
+                                                                let buf = server.serve_datagram(&buffer[0..len]).await.unwrap();
+                                                                if let Err(e) = udp_socket.send_to(buf.as_slice(), addr).await {
+                                                                    log::error!("send datagram error: {}", e);
+                                                                    break;
+                                                                }
+                                                                stat.add_read_data_size(len as u64);
+                                                                stat.add_write_data_size(buf.len() as u64);
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        log::error!("accept error: {}", e);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        send_datagram.send_to(&data[..len]).await?;
+
+                                        *session_guard = Some(DatagramSession::Server(DatagramServerSession {
+                                            server: server_name.clone(),
+                                            latest_time: chrono::Utc::now().timestamp() as u64,
+                                            notify: notify.clone(),
+                                            speed_stat: speed_stat.clone(),
+                                            send_handle: Some(handle),
+                                            send_datagram: Some(send_datagram),
+                                        }));
+                                    } else {
+                                        let buf = server.serve_datagram(&data[..len]).await.map_err(into_stack_err!(StackErrorCode::ServerError, ""))?;
+                                        udp_socket.send_to(buf.as_slice(), addr).await.map_err(into_stack_err!(StackErrorCode::IoError, "send error"))?;
+
+                                        speed_stat.add_read_data_size(len as u64);
+                                        speed_stat.add_write_data_size(buf.len() as u64);
+
+                                        *session_guard = Some(DatagramSession::Server(DatagramServerSession {
+                                            server: server_name.clone(),
+                                            latest_time: chrono::Utc::now().timestamp() as u64,
+                                            notify: notify.clone(),
+                                            speed_stat: speed_stat.clone(),
+                                            send_handle: None,
+                                            send_datagram: None,
+                                        }));
+                                    }
                                     if let Some(connection_manager) = self.connection_manager.as_ref() {
                                         let controller = UdpSessionController::new(addr, self.all_client_session.clone(), notify);
                                         connection_manager.add_connection(ConnectionInfo::new(addr.to_string(), server_name.to_string(), StackProtocol::Udp, speed_stat, controller));
@@ -372,7 +601,7 @@ impl UdpStackInner {
                 let this = this.clone();
                 let socket = udp_socket.clone();
                 tokio::spawn(async move {
-                    let result = this.handle_datagram(socket, addr, &buffer[0..len]).await;
+                    let result = this.handle_datagram(socket, addr, buffer, len).await;
                     if let Err(e) = result {
                         log::error!("handle datagram error: {}", e);
                     }
@@ -577,6 +806,7 @@ impl UdpStackBuilder {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
