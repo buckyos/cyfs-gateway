@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use crate::ip::IPTunnelBuilder;
 use crate::socks::SocksTunnelBuilder;
 use crate::DatagramClientBox;
@@ -35,43 +37,36 @@ pub fn get_protocol_category(str_protocol: &str) -> TunnelResult<ProtocolCategor
 
 #[derive(Clone)]
 pub struct TunnelManager {
-    device: GatewayDeviceRef,
-    rtcp_stack_manager: RTcpStackManager,
+    tunnel_builder_manager: Arc<Mutex<HashMap<String, Arc<dyn TunnelBuilder>>>>,
 }
 
 impl TunnelManager {
-    pub fn new(device: GatewayDeviceRef) -> Self {
-        Self {
-            device: device.clone(),
-            rtcp_stack_manager: RTcpStackManager::new(device),
-        }
+    pub fn new() -> Self {
+        let this = Self {
+            tunnel_builder_manager: Arc::new(Mutex::new(Default::default())),
+        };
+        this.register_tunnel_builder("tcp", Arc::new(IPTunnelBuilder::new()));
+        this.register_tunnel_builder("udp", Arc::new(IPTunnelBuilder::new()));
+        
+        this
     }
 
+    pub fn register_tunnel_builder(&self, protocol: &str, builder: Arc<dyn TunnelBuilder>) {
+        self.tunnel_builder_manager.lock().unwrap().insert(protocol.to_string(), builder);
+    }
+    
     pub async fn get_tunnel_builder_by_protocol(
         &self,
         protocol: &str,
-    ) -> TunnelResult<Box<dyn TunnelBuilder>> {
-        match protocol {
-            "tcp" => return Ok(Box::new(IPTunnelBuilder::new())),
-            "udp" => return Ok(Box::new(IPTunnelBuilder::new())),
-            "rtcp" => {
-                let stack = self.rtcp_stack_manager.get_current_device_stack().await?;
-                Ok(Box::new(stack))
-            }
-            "rudp" => {
-                let stack = self.rtcp_stack_manager.get_current_device_stack().await?;
-                Ok(Box::new(stack))
-            }
-            "socks" => {
-                let builder = SocksTunnelBuilder::new();
-                Ok(Box::new(builder))
-            }
-            _ => {
-                let msg = format!("Unknown protocol: {}", protocol);
-                error!("{}", msg);
-                Err(TunnelError::UnknownProtocol(msg))
-            }
-        }
+    ) -> TunnelResult<Arc<dyn TunnelBuilder>> {
+        let tunnel_builder_manager = self.tunnel_builder_manager.lock().unwrap();
+        if let Some(builder) = tunnel_builder_manager.get(protocol) {
+            Ok(builder.clone())
+        } else {
+            let msg = format!("Unknown protocol: {}", protocol);
+            error!("{}", msg);
+            Err(TunnelError::UnknownProtocol(msg))
+        }        
     }
 
     pub fn get_stream_probe(&self, _probe_id: &str) -> TunnelResult<Box<dyn StreamProbe + Send>> {

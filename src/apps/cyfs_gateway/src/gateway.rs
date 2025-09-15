@@ -151,7 +151,7 @@ impl Gateway {
             private_key: self.device_private_key.get().unwrap().clone(),
         };
         let gateway_device = GatewayDeviceRef::new(gateway_device);
-        let tunnel_manager = TunnelManager::new(gateway_device.clone());
+        let tunnel_manager = TunnelManager::new();
         let set_result = self.tunnel_manager.set(tunnel_manager.clone());
         if set_result.is_err() {
             error!("tunnel_manager can only be set once");

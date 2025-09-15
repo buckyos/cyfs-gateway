@@ -876,14 +876,7 @@ mod tests {
         let result = stack.start().await;
         assert!(result.is_ok());
 
-        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
-
-        let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
-            config: device_config,
-            private_key: pkcs8_bytes,
-        }));
+        let tunnel_manager = TunnelManager::new();
         let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
 
         tokio::spawn(async move {
@@ -935,14 +928,7 @@ mod tests {
         let result = stack.start().await;
         assert!(result.is_ok());
 
-        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
-
-        let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
-            config: device_config,
-            private_key: pkcs8_bytes,
-        }));
+        let tunnel_manager = TunnelManager::new();
         let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
 
         let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -995,14 +981,7 @@ mod tests {
         let result = stack.start().await;
         assert!(result.is_ok());
 
-        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
-
-        let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
-            config: device_config,
-            private_key: pkcs8_bytes,
-        }));
+        let tunnel_manager = TunnelManager::new();
         let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
 
         let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();

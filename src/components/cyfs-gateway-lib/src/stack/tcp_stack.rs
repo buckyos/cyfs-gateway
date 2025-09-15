@@ -5,7 +5,7 @@ use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,7 @@ struct TcpStackInner {
     servers: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     connection_manager: Option<ConnectionManagerRef>,
+    tunnel_manager: TunnelManager,
 }
 
 
@@ -42,6 +43,13 @@ impl TcpStackInner {
                 "servers is required"
             ));
         }
+        if config.tunnel_manager.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "tunnel_manager is required"
+            ));
+        }
+
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
                                                           config.global_process_chains).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -50,6 +58,7 @@ impl TcpStackInner {
             servers: config.servers.unwrap(),
             executor: Arc::new(Mutex::new(executor)),
             connection_manager: config.connection_manager,
+            tunnel_manager: config.tunnel_manager.unwrap(),
         })
     }
 
@@ -136,7 +145,7 @@ impl TcpStackInner {
                             let target = list[1].as_str();
                             let limiter = Limiter::new(Some(1), Some(1));
                             let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
-                            stream_forward(stream, target).await?;
+                            stream_forward(stream, target, &self.tunnel_manager).await?;
                         }
                         "server" => {
                             if list.len() < 2 {
@@ -198,6 +207,7 @@ impl TcpStack {
             servers: None,
             global_process_chains: None,
             connection_manager: None,
+            tunnel_manager: None,
         }
     }
 
@@ -240,6 +250,7 @@ pub struct TcpStackBuilder {
     servers: Option<ServerManagerRef>,
     global_process_chains: Option<GlobalProcessChainsRef>,
     connection_manager: Option<ConnectionManagerRef>,
+    tunnel_manager: Option<TunnelManager>,
 }
 
 impl TcpStackBuilder {
@@ -265,6 +276,11 @@ impl TcpStackBuilder {
 
     pub fn connection_manager(mut self, connection_manager: ConnectionManagerRef) -> Self {
         self.connection_manager = Some(connection_manager);
+        self
+    }
+
+    pub fn tunnel_manager(mut self, tunnel_manager: TunnelManager) -> Self {
+        self.tunnel_manager = Some(tunnel_manager);
         self
     }
 
@@ -303,11 +319,20 @@ mod tests {
             .hook_point(vec![])
             .build()
             .await;
+        assert!(result.is_err());
+        let result = TcpStack::builder()
+            .bind("127.0.0.1:8080")
+            .servers(Arc::new(ServerManager::new()))
+            .tunnel_manager(TunnelManager::new())
+            .hook_point(vec![])
+            .build()
+            .await;
         assert!(result.is_ok());
         let result = TcpStack::builder()
             .bind("127.0.0.1:8080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
+            .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
             .await;
@@ -316,6 +341,7 @@ mod tests {
             .bind("127.0.0.1:8080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
+            .tunnel_manager(TunnelManager::new())
             .connection_manager(ConnectionManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
@@ -341,6 +367,7 @@ mod tests {
             .bind("127.0.0.1:8080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
@@ -380,6 +407,7 @@ mod tests {
             .bind("127.0.0.1:8081")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
             .await;
@@ -415,6 +443,7 @@ mod tests {
             .bind("127.0.0.1:8082")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
@@ -423,16 +452,6 @@ mod tests {
         let mut stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
-
-        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
-
-        let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
-            config: device_config,
-            private_key: pkcs8_bytes,
-        }));
-        let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
 
         tokio::spawn(async move {
             let tcp_listener = TcpListener::bind("127.0.0.1:8083").await.unwrap();
@@ -483,6 +502,7 @@ mod tests {
             .bind("127.0.0.1:8084")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
             .await;
@@ -490,16 +510,6 @@ mod tests {
         let mut stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
-
-        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
-
-        let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
-            config: device_config,
-            private_key: pkcs8_bytes,
-        }));
-        let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
@@ -544,6 +554,7 @@ mod tests {
             .bind("127.0.0.1:8085")
             .servers(server_manager)
             .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
             .await;
@@ -551,16 +562,6 @@ mod tests {
         let mut stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
-
-        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
-
-        let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
-            config: device_config,
-            private_key: pkcs8_bytes,
-        }));
-        let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 

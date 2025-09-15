@@ -12,13 +12,9 @@ use futures::Stream;
 use h3::error::Code;
 use h3::quic;
 use h3::quic::{BidiStream, ConnectionErrorIncoming, OpenStreams, RecvStream, SendStream, StreamErrorIncoming, StreamId, WriteBuf};
-use h3::server::{RequestResolver, RequestStream};
-use http::response;
-use http::response::Parts;
+use h3::server::{RequestStream};
 use http_body_util::BodyExt;
-use http_body_util::combinators::BoxBody;
 use hyper::body::{Body, Buf, Bytes, Frame};
-use ndn_lib::CollectionStorageMode::Simple;
 use pin_project::pin_project;
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use quinn::Incoming;
@@ -27,15 +23,13 @@ use rustls::client::verify_server_name;
 use rustls::pki_types::{DnsName, ServerName};
 use rustls::server::{ClientHello, ParsedCertificate};
 use rustls::sign::CertifiedKey;
-use sfo_io::{LimitRead, LimitStream, LimitWrite, SfoSpeedStat, SimpleAsyncWrite, SimpleAsyncWriteHolder, SpeedTracker, StatStream};
-use sfo_split::Splittable;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, Take};
+use sfo_io::{LimitRead, LimitWrite, SfoSpeedStat, SimpleAsyncWrite, SimpleAsyncWriteHolder, SpeedTracker, StatStream};
+use tokio::io::{AsyncRead, ReadBuf, Take};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio_util::bytes::BytesMut;
 use tokio_util::io::ReaderStream;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 use crate::stack::stream_forward;
@@ -696,6 +690,7 @@ struct QuicStackInner {
     servers: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     connection_manager: Option<ConnectionManagerRef>,
+    tunnel_manager: TunnelManager,
 }
 
 impl QuicStackInner {
@@ -809,8 +804,9 @@ impl QuicStackInner {
                                 let stat_stream = StatStream::new(stream);
                                 let speed = stat_stream.get_speed_stat();
                                 let target = list[1].clone();
+                                let tunnel_manager = self.tunnel_manager.clone();
                                 let handle = tokio::spawn(async move {
-                                    if let Err(e) = stream_forward(Box::new(stat_stream), target.as_str()).await {
+                                    if let Err(e) = stream_forward(Box::new(stat_stream), target.as_str(), &tunnel_manager).await {
                                         log::error!("stream forward error: {}", e);
                                     }
                                 });
@@ -971,6 +967,9 @@ impl QuicStack {
         if builder.servers.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "servers is required"));
         }
+        if builder.tunnel_manager.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "tunnel_manager is required"));
+        }
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains).await
@@ -994,6 +993,7 @@ impl QuicStack {
                 servers: builder.servers.unwrap(),
                 executor: Arc::new(Mutex::new(executor)),
                 connection_manager: builder.connection_manager,
+                tunnel_manager: builder.tunnel_manager.unwrap(),
             }),
             handle: None,
         })
@@ -1025,6 +1025,7 @@ pub struct QuicStackBuilder {
     alpn_protocols: Vec<Vec<u8>>,
     concurrency: u32,
     connection_manager: Option<ConnectionManagerRef>,
+    tunnel_manager: Option<TunnelManager>,
 }
 
 impl QuicStackBuilder {
@@ -1038,6 +1039,7 @@ impl QuicStackBuilder {
             concurrency: 1024,
             alpn_protocols: vec![],
             connection_manager: None,
+            tunnel_manager: None,
         }
     }
     pub fn bind(mut self, bind: &str) -> Self {
@@ -1084,6 +1086,11 @@ impl QuicStackBuilder {
         self
     }
 
+    pub fn tunnel_manager(mut self, tunnel_manager: TunnelManager) -> Self {
+        self.tunnel_manager = Some(tunnel_manager);
+        self
+    }
+
     pub async fn build(self) -> StackResult<QuicStack> {
         QuicStack::create(self).await
     }
@@ -1126,6 +1133,15 @@ mod tests {
             .hook_point(vec![])
             .build()
             .await;
+        assert!(result.is_err());
+        let tunnel_manager = TunnelManager::new();
+        let result = QuicStack::builder()
+            .bind("127.0.0.1:9080")
+            .servers(Arc::new(ServerManager::new()))
+            .hook_point(vec![])
+            .tunnel_manager(tunnel_manager.clone())
+            .build()
+            .await;
         assert!(result.is_ok());
         let result = QuicStack::builder()
             .bind("127.0.0.1:9080")
@@ -1138,6 +1154,7 @@ mod tests {
                     cert_key.signing_key.serialize_der(),
                 )),
             }])
+            .tunnel_manager(tunnel_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .build()
             .await;
@@ -1163,6 +1180,7 @@ mod tests {
             .bind("127.0.0.1:9180")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 certs: vec![cert_key.cert.der().clone()],
@@ -1219,6 +1237,7 @@ mod tests {
             .bind("127.0.0.1:9181")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 certs: vec![cert_key.cert.der().clone()],
@@ -1336,12 +1355,15 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let tunnel_manager = TunnelManager::new();
+
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server("www.buckyos.com".to_string(), Server::Stream(Arc::new(MockServer)));
         let result = QuicStack::builder()
             .bind("127.0.0.1:9185")
             .servers(server_manager)
             .hook_point(chains)
+            .tunnel_manager(tunnel_manager)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 certs: vec![cert_key.cert.der().clone()],
@@ -1356,16 +1378,6 @@ mod tests {
         let mut stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
-
-        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
-
-        let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
-            config: device_config,
-            private_key: pkcs8_bytes,
-        }));
-        let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
@@ -1440,10 +1452,12 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let tunnel_manager = TunnelManager::new();
         let result = QuicStack::builder()
             .bind("127.0.0.1:9186")
             .servers(server_manager)
             .hook_point(chains)
+            .tunnel_manager(tunnel_manager)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 certs: vec![cert_key.cert.der().clone()],
@@ -1459,16 +1473,6 @@ mod tests {
         let mut stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
-
-        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
-
-        let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
-            config: device_config,
-            private_key: pkcs8_bytes,
-        }));
-        let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
@@ -1550,10 +1554,12 @@ mod tests {
         let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
         let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
         let server_manager = Arc::new(ServerManager::new());
+        let tunnel_manager = TunnelManager::new();
         let result = QuicStack::builder()
             .bind("127.0.0.1:9188")
             .servers(server_manager)
             .hook_point(chains)
+            .tunnel_manager(tunnel_manager)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 certs: vec![cert_key.cert.der().clone()],
@@ -1569,16 +1575,6 @@ mod tests {
         let result = stack.start().await;
         assert!(result.is_ok());
 
-
-        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
-
-        let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
-            config: device_config,
-            private_key: pkcs8_bytes,
-        }));
-        let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
 
         tokio::spawn(async move {
             let tcp_listener = TcpListener::bind("127.0.0.1:9183").await.unwrap();

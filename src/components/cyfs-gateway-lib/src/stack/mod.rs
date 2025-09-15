@@ -32,25 +32,21 @@ pub type StackError = sfo_result::Error<StackErrorCode>;
 pub use sfo_result::into_err as into_stack_err;
 pub use sfo_result::err as stack_err;
 use url::Url;
-use crate::{GATEWAY_TUNNEL_MANAGER};
+use crate::{TunnelManager};
 
-pub(crate) async fn stream_forward(mut stream: Box<dyn AsyncStream>, target: &str) -> StackResult<()> {
-    if let Some(tunnel_manager) = GATEWAY_TUNNEL_MANAGER.get() {
-        let url = Url::parse(target).map_err(into_stack_err!(
+pub(crate) async fn stream_forward(mut stream: Box<dyn AsyncStream>, target: &str, tunnel_manager: &TunnelManager) -> StackResult<()> {
+    let url = Url::parse(target).map_err(into_stack_err!(
                                     StackErrorCode::InvalidConfig,
                                     "invalid forward url {}",
                                     target
                                 ))?;
-        let mut forward_stream = tunnel_manager
-            .open_stream_by_url(&url)
-            .await
-            .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
+    let mut forward_stream = tunnel_manager
+        .open_stream_by_url(&url)
+        .await
+        .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
 
-        tokio::io::copy_bidirectional(&mut stream, forward_stream.as_mut())
-            .await
-            .map_err(into_stack_err!(StackErrorCode::StreamError, "target {target}"))?;
-    } else {
-        log::error!("tunnel manager not found");
-    }
+    tokio::io::copy_bidirectional(&mut stream, forward_stream.as_mut())
+        .await
+        .map_err(into_stack_err!(StackErrorCode::StreamError, "target {target}"))?;
     Ok(())
 }

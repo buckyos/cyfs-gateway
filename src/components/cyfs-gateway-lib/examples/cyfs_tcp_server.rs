@@ -46,10 +46,7 @@ async fn main() {
     let pkcs8_bytes = load_raw_private_key(key_path.as_path()).unwrap();
     let device = std::fs::read_to_string(device_path.as_path()).unwrap();
     let device_config = serde_json::from_str::<DeviceConfig>(device.as_str()).unwrap();
-    let tunnel_manager = TunnelManager::new(Arc::new(GatewayDevice {
-        config: device_config,
-        private_key: pkcs8_bytes,
-    }));
+    let tunnel_manager = TunnelManager::new();
     tunnel_manager.get_tunnel_builder_by_protocol("rtcp").await.unwrap();
     let _ = GATEWAY_TUNNEL_MANAGER.set(tunnel_manager);
     init_name_lib(&HashMap::new()).await.unwrap();

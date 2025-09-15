@@ -95,7 +95,7 @@ pub trait Tunnel: Send + Sync {
         &self,
         session_id:&str,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error>;
-    
+
 }
 
 pub trait TunnelBox: Tunnel {
@@ -116,9 +116,9 @@ impl Clone for Box<dyn TunnelBox> {
 }
 
 #[async_trait]
-pub trait TunnelBuilder: Send {
+pub trait TunnelBuilder: Send + Sync + 'static {
     async fn create_tunnel(&self, tunnel_stack_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>>;
-    async fn create_stream_listener(&self, 
+    async fn create_stream_listener(&self,
         bind_stream_id: &Url) -> TunnelResult<Box<dyn StreamListener>>;
     async fn create_datagram_server(
         &self,
@@ -173,7 +173,7 @@ pub fn get_dest_info_from_url_path(path: &str) -> Result<(Option<String>, u16), 
             let dest_port = sock_addr.port();
             return Ok((Some(dest_host), dest_port))
         }
-        
+
         let parts = addr_str.split(':').collect::<Vec<&str>>();
         if parts.len() != 2 {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid address format"));
