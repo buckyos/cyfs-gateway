@@ -40,6 +40,12 @@ pub struct TunnelManager {
     tunnel_builder_manager: Arc<Mutex<HashMap<String, Arc<dyn TunnelBuilder>>>>,
 }
 
+impl Default for TunnelManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TunnelManager {
     pub fn new() -> Self {
         let this = Self {
@@ -47,14 +53,14 @@ impl TunnelManager {
         };
         this.register_tunnel_builder("tcp", Arc::new(IPTunnelBuilder::new()));
         this.register_tunnel_builder("udp", Arc::new(IPTunnelBuilder::new()));
-        
+
         this
     }
 
     pub fn register_tunnel_builder(&self, protocol: &str, builder: Arc<dyn TunnelBuilder>) {
         self.tunnel_builder_manager.lock().unwrap().insert(protocol.to_string(), builder);
     }
-    
+
     pub async fn get_tunnel_builder_by_protocol(
         &self,
         protocol: &str,
@@ -66,7 +72,7 @@ impl TunnelManager {
             let msg = format!("Unknown protocol: {}", protocol);
             error!("{}", msg);
             Err(TunnelError::UnknownProtocol(msg))
-        }        
+        }
     }
 
     pub fn get_stream_probe(&self, _probe_id: &str) -> TunnelResult<Box<dyn StreamProbe + Send>> {

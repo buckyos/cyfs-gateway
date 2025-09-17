@@ -17,6 +17,7 @@ mod inner_service;
 mod stack;
 mod global_process_chains;
 mod connection_manager;
+mod quic_tunnel;
 
 pub use aes_stream::*;
 pub use config::*;
