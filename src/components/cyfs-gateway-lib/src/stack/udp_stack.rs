@@ -1,5 +1,3 @@
-#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
-
 use std::collections::{BTreeMap};
 use std::net::SocketAddr;
 use std::ops::Div;

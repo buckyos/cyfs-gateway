@@ -1,25 +1,28 @@
 use crate::tunnel::DatagramClient;
 use buckyos_kit::AsyncStream;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, ReadHalf, WriteHalf};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct AsyncStreamWithDatagram {
-    stream: Arc<Mutex<Box<dyn AsyncStream>>>,
+    send: Arc<Mutex<WriteHalf<Box<dyn AsyncStream>>>>,
+    recv: Arc<Mutex<ReadHalf<Box<dyn AsyncStream>>>>,
 }
 
 impl AsyncStreamWithDatagram {
     pub fn new(stream: Box<dyn AsyncStream>) -> Self {
+        let (recv, send) = tokio::io::split(stream);
         AsyncStreamWithDatagram {
-            stream: Arc::new(Mutex::new(stream)),
+            send: Arc::new(Mutex::new(send)),
+            recv: Arc::new(Mutex::new(recv)),
         }
     }
 
     pub async fn recv_datagram(&self, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
-        let mut stream = self.stream.lock().await;
+        let mut stream = self.recv.lock().await;
 
         // First write the length of the datagram in u32, to the buffer
         let mut len_buffer = [0u8; 4];
@@ -55,7 +58,7 @@ impl AsyncStreamWithDatagram {
     }
 
     pub async fn send_datagram(&self, buffer: &[u8]) -> Result<usize, std::io::Error> {
-        let mut stream = self.stream.lock().await;
+        let mut stream = self.send.lock().await;
 
         //TODO: u16 is enough?
         // First write the length of the datagram in u32, to the buffer

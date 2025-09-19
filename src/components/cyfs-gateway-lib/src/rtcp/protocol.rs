@@ -71,11 +71,17 @@ impl RTcpTargetStackEP {
     }
 }
 
-// xxx.dev.did:2980 or xxx:2980 
+// xxx.dev.did:2980 or xxx:2980
 pub(crate) fn parse_rtcp_stack_id(stack_id: &str) -> Option<RTcpTargetStackEP> {
-    let stack_port = DEFAULT_RTCP_STACK_PORT;
-    //let mut target_host_name = stack_id.to_string();
-    let target_did = DID::from_str(stack_id);
+    let mut stack_port = DEFAULT_RTCP_STACK_PORT;
+    let target_did = if stack_id.contains(':') {
+        let mut parts = stack_id.split(':');
+        let target_host_name = parts.next().unwrap();
+        stack_port = parts.next().unwrap().parse::<u16>().ok()?;
+        DID::from_str(target_host_name)
+    } else {
+        DID::from_str(stack_id)
+    };
     if target_did.is_err() {
         return None;
     }

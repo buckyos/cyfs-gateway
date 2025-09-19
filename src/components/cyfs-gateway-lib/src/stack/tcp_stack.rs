@@ -1,5 +1,3 @@
-#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
-
 use super::{stream_forward, Stack};
 use super::StackResult;
 use crate::global_process_chains::{

@@ -60,6 +60,10 @@ impl TunnelManager {
     pub fn register_tunnel_builder(&self, protocol: &str, builder: Arc<dyn TunnelBuilder>) {
         self.tunnel_builder_manager.lock().unwrap().insert(protocol.to_string(), builder);
     }
+    
+    pub fn remove_tunnel_builder(&self, protocol: &str) {
+        self.tunnel_builder_manager.lock().unwrap().remove(protocol);
+    }
 
     pub async fn get_tunnel_builder_by_protocol(
         &self,
@@ -154,7 +158,12 @@ impl TunnelManager {
         url: &Url,
     ) -> TunnelResult<Box<dyn DatagramClientBox>> {
         let builder = self.get_tunnel_builder_by_protocol(url.scheme()).await?;
-        let tunnel = builder.create_tunnel(url.host_str()).await?;
+        let auth_str = url.authority();
+        let tunnel = if auth_str.is_empty() {
+            builder.create_tunnel(None).await?
+        } else {
+            builder.create_tunnel(Some(auth_str)).await?
+        };
         let client = tunnel
             .create_datagram_client(url.path())
             .await
