@@ -1,12 +1,15 @@
+use std::any::Any;
 use super::{stream_forward, Stack};
 use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use as_any::AsAny;
+use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
@@ -216,12 +219,6 @@ impl TcpStack {
             handle: None,
         })
     }
-
-    pub async fn start(&mut self) -> StackResult<()> {
-        let handle = self.inner.start().await?;
-        self.handle = Some(handle);
-        Ok(())
-    }
 }
 
 impl Drop for TcpStack {
@@ -231,6 +228,8 @@ impl Drop for TcpStack {
         }
     }
 }
+
+#[async_trait::async_trait]
 impl Stack for TcpStack {
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Tcp
@@ -238,6 +237,16 @@ impl Stack for TcpStack {
 
     fn get_bind_addr(&self) -> String {
         self.inner.bind_addr.clone()
+    }
+
+    async fn start(&mut self) -> StackResult<()> {
+        let handle = self.inner.start().await?;
+        self.handle = Some(handle);
+        Ok(())
+    }
+
+    async fn update_config(&mut self, config: Arc<dyn StackConfig>) -> StackResult<()> {
+        todo!()
     }
 }
 
@@ -288,11 +297,67 @@ impl TcpStackBuilder {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TcpStackConfig {
+    pub protocol: StackProtocol,
+    pub bind: SocketAddr,
+    pub hook_point: Vec<ProcessChainConfig>,
+}
+
+impl StackConfig for TcpStackConfig {
+    fn stack_protocol(&self) -> StackProtocol {
+        StackProtocol::Tcp
+    }
+}
+
+pub struct TcpStackFactory {
+    servers: ServerManagerRef,
+    global_process_chains: GlobalProcessChainsRef,
+    connection_manager: ConnectionManagerRef,
+    tunnel_manager: TunnelManager,
+}
+
+impl TcpStackFactory {
+    pub fn new(
+        servers: ServerManagerRef,
+        global_process_chains: GlobalProcessChainsRef,
+        connection_manager: ConnectionManagerRef,
+        tunnel_manager: TunnelManager,
+    ) -> Self {
+        Self {
+            servers,
+            global_process_chains,
+            connection_manager,
+            tunnel_manager,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StackFactory for TcpStackFactory {
+    async fn create(
+        &self,
+        config: Box<dyn StackConfig>,
+    ) -> StackResult<Box<dyn Stack>> {
+        let config = config.as_ref().as_any().downcast_ref::<TcpStackConfig>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+        let stack = TcpStack::builder()
+            .bind(config.bind.to_string())
+            .tunnel_manager(self.tunnel_manager.clone())
+            .connection_manager(self.connection_manager.clone())
+            .global_process_chains(self.global_process_chains.clone())
+            .servers(self.servers.clone())
+            .hook_point(config.hook_point.clone())
+            .build().await?;
+        Ok(Box::new(stack))
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ConnectionManager};
+    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory};
     use buckyos_kit::AsyncStream;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use std::sync::Arc;
@@ -571,5 +636,21 @@ mod tests {
         let ret = stream.read_exact(&mut buf).await;
         assert!(ret.is_ok());
         assert_eq!(&buf, b"recv");
+    }
+
+    #[tokio::test]
+    async fn test_factory() {
+        let tcp_factory = TcpStackFactory::new(Arc::new(ServerManager::new()),
+                                               Arc::new(GlobalProcessChains::new()),
+                                               ConnectionManager::new(),
+                                               TunnelManager::new());
+        let config = TcpStackConfig {
+            protocol: StackProtocol::Tcp,
+            bind: "127.0.0.1:3345".parse().unwrap(),
+            hook_point: vec![],
+        };
+
+        let ret = tcp_factory.create(Box::new(config)).await;
+        assert!(ret.is_ok());
     }
 }

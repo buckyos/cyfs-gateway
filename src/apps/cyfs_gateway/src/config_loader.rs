@@ -1,5 +1,5 @@
 use buckyos_kit::{adjust_path, get_buckyos_root_dir};
-use cyfs_gateway_lib::DNSServerConfig;
+use cyfs_gateway_lib::{config_err, into_config_err, ConfigErrorCode, ConfigResult, DNSServerConfig, StackBox, StackConfig, TcpStackConfig};
 use cyfs_gateway_lib::DispatcherConfig;
 use cyfs_gateway_lib::ServerConfig;
 use cyfs_gateway_lib::WarpServerConfig;
@@ -11,15 +11,68 @@ use name_lib::load_raw_private_key;
 use serde_json::from_value;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 //use buckyos_api::ZONE_PROVIDER;
+
+pub trait StackConfigFactory<D: for<'de> Deserializer<'de>>: Send + Sync {
+    fn create(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>>;
+}
+
+pub struct CyfsStackFactory<D: for<'de> Deserializer<'de>> {
+    stack_factory: HashMap<String, Arc<dyn StackConfigFactory<D>>>,
+}
+
+impl<D: for<'de> Deserializer<'de>> Default for CyfsStackFactory<D> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<D: for<'de> Deserializer<'de>> CyfsStackFactory<D> {
+    pub fn new() -> Self {
+        Self {
+            stack_factory: HashMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, protocol: &str, factory: Arc<dyn StackConfigFactory<D>>) {
+        self.stack_factory.insert(protocol.to_string(), factory);
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct StackProtocolConfig {
+    protocol: String,
+}
+
+impl<D: for<'de> Deserializer<'de> + Clone> StackConfigFactory<D> for CyfsStackFactory<D> {
+    fn create(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
+        let config = StackProtocolConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", e))?;
+        let factory = self.stack_factory.get(config.protocol.as_str())
+            .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", config.protocol))?;
+        factory.create(de)
+    }
+}
+
+pub struct TcpStackFactory {}
+
+impl<D: for<'de> Deserializer<'de>> StackConfigFactory<D> for TcpStackFactory {
+    fn create(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
+        let tcp_config = TcpStackConfig::deserialize(de)
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", e))?;
+        Ok(Arc::new(tcp_config))
+    }
+}
 
 pub struct GatewayConfig {
     pub dispatcher: HashMap<Url, DispatcherConfig>,
     pub servers: HashMap<String, ServerConfig>,
     pub device_key_path: PathBuf,
     pub device_name: Option<String>,
-    
+
     //pub device_private_key: Option<[u8; 48]>,
     //pub device_did: Option<String>,
     //tunnel_builder_config : HashMap<String,TunnelBuilderConfig>,
@@ -116,8 +169,8 @@ impl GatewayConfig {
                         error!("{}", msg);
                         return Err(msg);
                     }
-                    new_config = DispatcherConfig::new_probe_selector(incoming_url, 
-                        probe_id.unwrap().as_str().unwrap().to_string(), 
+                    new_config = DispatcherConfig::new_probe_selector(incoming_url,
+                                                                      probe_id.unwrap().as_str().unwrap().to_string(),
                         selector_id.unwrap().as_str().unwrap().to_string());
                 }
                 _ => {

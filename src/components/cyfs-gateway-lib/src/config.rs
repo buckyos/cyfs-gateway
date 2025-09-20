@@ -3,6 +3,7 @@
 use tokio::fs;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 use cyfs_socks::SocksProxyConfig;
@@ -257,15 +258,6 @@ impl DispatcherConfig {
 }
 
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum StackProtocol {
-    Tcp,
-    Udp,
-    Quic,
-    Rtcp,
-    Tls,
-}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BlockConfig {
@@ -323,69 +315,69 @@ pub struct CyfsHttpServiceConfig {
     pub process_chains: Vec<ProcessChainConfig>,
 }
 
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct CyfsServerConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    protocol: Option<StackProtocol>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bind: Option<IpAddr>,
-    port: u16,
-    process_chains: Vec<ProcessChainConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    rtcp_service: Option<CyfsRtcpServiceConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    http_services: Option<HashMap<String, CyfsHttpServiceConfig>>,
-}
-
-impl CyfsServerConfig {
-    pub fn new(listen: u16) -> Self {
-        CyfsServerConfig {
-            protocol: None,
-            bind: None,
-            port: listen,
-            process_chains: vec![],
-            rtcp_service: None,
-            http_services: None,
-        }
-    }
-
-    pub fn set_protocol(&mut self, protocol: StackProtocol) {
-        self.protocol = Some(protocol);
-    }
-
-    pub fn set_bind(&mut self, bind: IpAddr) {
-        self.bind = Some(bind);
-    }
-
-    pub fn add_process_chain(&mut self, process_chain: ProcessChainConfig) {
-        self.process_chains.push(process_chain);
-    }
-
-    pub fn get_protocol(&self) -> StackProtocol {
-        self.protocol.unwrap_or(StackProtocol::Tcp)
-    }
-
-    pub fn get_bind(&self) -> IpAddr {
-        self.bind.unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)))
-    }
-
-    pub fn get_port(&self) -> u16 {
-        self.port
-    }
-
-    pub fn get_process_chains(&self) -> &Vec<ProcessChainConfig> {
-        &self.process_chains
-    }
-
-    pub fn get_rtcp_service(&self) -> &Option<CyfsRtcpServiceConfig> {
-        &self.rtcp_service
-    }
-
-    pub fn get_http_services(&self) -> &Option<HashMap<String, CyfsHttpServiceConfig>> {
-        &self.http_services
-    }
-}
+//
+// #[derive(Serialize, Deserialize, Clone)]
+// pub struct CyfsServerConfig {
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     protocol: Option<StackProtocol>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     bind: Option<IpAddr>,
+//     port: u16,
+//     process_chains: Vec<ProcessChainConfig>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     rtcp_service: Option<CyfsRtcpServiceConfig>,
+//     #[serde(skip_serializing_if = "Option::is_none")]
+//     http_services: Option<HashMap<String, CyfsHttpServiceConfig>>,
+// }
+//
+// impl CyfsServerConfig {
+//     pub fn new(listen: u16) -> Self {
+//         CyfsServerConfig {
+//             protocol: None,
+//             bind: None,
+//             port: listen,
+//             process_chains: vec![],
+//             rtcp_service: None,
+//             http_services: None,
+//         }
+//     }
+//
+//     pub fn set_protocol(&mut self, protocol: StackProtocol) {
+//         self.protocol = Some(protocol);
+//     }
+//
+//     pub fn set_bind(&mut self, bind: IpAddr) {
+//         self.bind = Some(bind);
+//     }
+//
+//     pub fn add_process_chain(&mut self, process_chain: ProcessChainConfig) {
+//         self.process_chains.push(process_chain);
+//     }
+//
+//     pub fn get_protocol(&self) -> StackProtocol {
+//         self.protocol.unwrap_or(StackProtocol::Tcp)
+//     }
+//
+//     pub fn get_bind(&self) -> IpAddr {
+//         self.bind.unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)))
+//     }
+//
+//     pub fn get_port(&self) -> u16 {
+//         self.port
+//     }
+//
+//     pub fn get_process_chains(&self) -> &Vec<ProcessChainConfig> {
+//         &self.process_chains
+//     }
+//
+//     pub fn get_rtcp_service(&self) -> &Option<CyfsRtcpServiceConfig> {
+//         &self.rtcp_service
+//     }
+//
+//     pub fn get_http_services(&self) -> &Option<HashMap<String, CyfsHttpServiceConfig>> {
+//         &self.http_services
+//     }
+// }
 
 #[derive(Debug, Copy, Clone)]
 pub enum ConfigErrorCode {
@@ -395,45 +387,47 @@ pub enum ConfigErrorCode {
 pub type ConfigResult<T> = sfo_result::Result<T, ConfigErrorCode>;
 pub type ConfigError = sfo_result::Error<ConfigErrorCode>;
 pub use sfo_result::err as config_err;
+pub use sfo_result::into_err as into_config_err;
 use cyfs_process_chain::{Block, BlockParser, ProcessChain};
+use crate::{StackBox, StackProtocol};
 
-pub trait CyfsServerConfigParser {
-    fn parse(config: &str) -> ConfigResult<Vec<CyfsServerConfig>>;
-}
-
-pub trait CyfsServerConfigDumps {
-    fn dumps(config: &[CyfsServerConfig]) -> ConfigResult<String>;
-}
-
-#[derive(Serialize, Deserialize)]
-struct YamlServers {
-    servers: Vec<YamlServer>
-}
-
-#[derive(Serialize, Deserialize)]
-struct YamlServer {
-    server: CyfsServerConfig,
-}
-
-pub struct YamlCyfsServerConfigParser;
-impl CyfsServerConfigParser for YamlCyfsServerConfigParser {
-    fn parse(config: &str) -> ConfigResult<Vec<CyfsServerConfig>> {
-        let config: YamlServers = serde_yaml_ng::from_str(config).map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{:?}", e))?;
-        Ok(config.servers.into_iter().map(|s| s.server).collect())
-    }
-}
-
-pub struct YamlCyfsServerConfigDumps;
-impl CyfsServerConfigDumps for YamlCyfsServerConfigDumps {
-    fn dumps(config: &[CyfsServerConfig]) -> ConfigResult<String> {
-        let servers: Vec<YamlServer> = config.iter().map(|s| YamlServer {
-            server: s.clone(),
-        }).collect();
-        Ok(serde_yaml_ng::to_string(&YamlServers {
-            servers,
-        }).map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{:?}", e))?)
-    }
-}
+// pub trait CyfsServerConfigParser {
+//     fn parse(config: &str) -> ConfigResult<Vec<CyfsServerConfig>>;
+// }
+//
+// pub trait CyfsServerConfigDumps {
+//     fn dumps(config: &[CyfsServerConfig]) -> ConfigResult<String>;
+// }
+//
+// #[derive(Serialize, Deserialize)]
+// struct YamlServers {
+//     servers: Vec<YamlServer>
+// }
+//
+// #[derive(Serialize, Deserialize)]
+// struct YamlServer {
+//     server: CyfsServerConfig,
+// }
+//
+// pub struct YamlCyfsServerConfigParser;
+// impl CyfsServerConfigParser for YamlCyfsServerConfigParser {
+//     fn parse(config: &str) -> ConfigResult<Vec<CyfsServerConfig>> {
+//         let config: YamlServers = serde_yaml_ng::from_str(config).map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{:?}", e))?;
+//         Ok(config.servers.into_iter().map(|s| s.server).collect())
+//     }
+// }
+//
+// pub struct YamlCyfsServerConfigDumps;
+// impl CyfsServerConfigDumps for YamlCyfsServerConfigDumps {
+//     fn dumps(config: &[CyfsServerConfig]) -> ConfigResult<String> {
+//         let servers: Vec<YamlServer> = config.iter().map(|s| YamlServer {
+//             server: s.clone(),
+//         }).collect();
+//         Ok(serde_yaml_ng::to_string(&YamlServers {
+//             servers,
+//         }).map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{:?}", e))?)
+//     }
+// }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TcpConfig {
@@ -449,14 +443,6 @@ pub struct UdpConfig {
     pub hook_point: Vec<ProcessChainConfig>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct RtcpConfig {
-    pub protocol: StackProtocol,
-    pub bind: SocketAddr,
-    pub device_name: String,
-    pub device_key: String,
-    pub hook_point: Vec<ProcessChainConfig>,
-}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct StackCertConfig {
@@ -466,190 +452,175 @@ pub struct StackCertConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct TlsStackConfig {
-    pub protocol: StackProtocol,
-    pub bind: SocketAddr,
-    pub certs: Vec<StackCertConfig>,
-    pub hook_point: Vec<ProcessChainConfig>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct QuicStackConfig {
-    pub protocol: StackProtocol,
-    pub bind: SocketAddr,
-    pub certs: Vec<StackCertConfig>,
-    pub hook_point: Vec<ProcessChainConfig>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
 struct StackConfigBase {
     protocol: StackProtocol,
 }
-
-#[derive(Serialize, Clone)]
-#[serde(untagged)]
-pub enum StackConfig {
-    Tcp(TcpConfig),
-    Udp(UdpConfig),
-    Rtcp(RtcpConfig),
-    Tls(TlsStackConfig),
-    Quic(QuicStackConfig),
-}
-
-impl<'de> Deserialize<'de> for StackConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let stack_base = StackConfigBase::deserialize(value.clone()).map_err(|e| serde::de::Error::custom(e))?;
-        match stack_base.protocol {
-            StackProtocol::Tcp => {
-                let config = TcpConfig::deserialize(value).map_err(|e| serde::de::Error::custom(e))?;
-                Ok(StackConfig::Tcp(config))
-            }
-            StackProtocol::Udp => {
-                let config = UdpConfig::deserialize(value).map_err(|e| serde::de::Error::custom(e))?;
-                Ok(StackConfig::Udp(config))
-            }
-            StackProtocol::Quic => {
-                let config = QuicStackConfig::deserialize(value).map_err(|e| serde::de::Error::custom(e))?;
-                Ok(StackConfig::Quic(config))
-            }
-            StackProtocol::Rtcp => {
-                let config = RtcpConfig::deserialize(value).map_err(|e| serde::de::Error::custom(e))?;
-                Ok(StackConfig::Rtcp(config))
-            }
-            StackProtocol::Tls => {
-                let config = TlsStackConfig::deserialize(value).map_err(|e| {
-                    serde::de::Error::custom(e)})?;
-                Ok(StackConfig::Tls(config))
-            }
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct CyfsConfig {
-    stacks: Vec<StackConfig>,
-}
-
-#[cfg(test)]
-mod test {
-    use std::net::IpAddr;
-    use crate::{CyfsConfig};
-
-    #[test]
-    fn test_stack_config_serialization() {
-        let yaml_config = r#"
-stacks:
-  - bind: 0.0.0.0:8080
-    protocol: tcp
-    hook_point:
-      - id: main
-        priority: 1
-        blocks:
-          - id: default
-            block: |
-              call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
-              call http-probe || reject;
-              eq ${REQ.ext.method} "CONNECT" && return "forward tcp:///${REQ.dest_host}";
-              return "forward tcp:///${REQ.dest_host}:80";
-
-  - bind: 0.0.0.0:8081
-    protocol: udp
-    hook_point:
-      - id: main
-        priority: 1
-        blocks:
-          - id: default
-            block: |
-              reject;
-
-  - bind: 0.0.0.0:8082
-    protocol: rtcp
-    device_name: "web3.buckyos.com"
-    device_key: ./identity.json
-    hook_point:
-      - id: main
-        priority: 1
-        blocks:
-          - id: default
-            block: |
-              reject;
-
-  - bind: 0.0.0.0:8083
-    protocol: tls
-    certs:
-      - domain: "web3.buckyos.com"
-        cert_file: ./cert.pem
-        key_file: ./key.pem
-    hook_point:
-      - id: main
-        priority: 1
-        blocks:
-          - id: default
-            block: |
-              reject;
-
-  - bind: 0.0.0.0:8083
-    protocol: quic
-    certs:
-      - domain: "web3.buckyos.com"
-        cert_file: ./cert.pem
-        key_file: ./key.pem
-    hook_point:
-      - id: main
-        priority: 1
-        blocks:
-          - id: default
-            block: |
-              reject;
-        "#;
-
-        let config: CyfsConfig = serde_yaml_ng::from_str(yaml_config).unwrap();
-        assert_eq!(config.stacks.len(), 5);
-    }
-
-    #[test]
-    fn test_stack_config_deserialization_from_json() {
-        use crate::{StackConfig, StackProtocol};
-        use std::net::{SocketAddr, Ipv4Addr};
-
-        // Test deserializing TcpStackConfig from JSON
-        let tcp_json = r#"{
-            "protocol": "tcp",
-            "bind": "127.0.0.1:8080",
-            "hook_point": []
-        }"#;
-
-        let tcp_config: StackConfig = serde_json::from_str(tcp_json).unwrap();
-        match tcp_config {
-            StackConfig::Tcp(tcp) => {
-                assert_eq!(tcp.protocol, StackProtocol::Tcp);
-                assert_eq!(tcp.bind, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080));
-            }
-            _ => panic!("Expected Tcp variant"),
-        }
-
-        // Test deserializing UdpStackConfig from JSON
-        let udp_json = r#"{
-            "protocol": "udp",
-            "bind": "127.0.0.1:8081",
-            "hook_point": []
-        }"#;
-
-        let udp_config: StackConfig = serde_json::from_str(udp_json).unwrap();
-        match udp_config {
-            StackConfig::Udp(udp) => {
-                assert_eq!(udp.protocol, StackProtocol::Udp);
-                assert_eq!(udp.bind, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081));
-            }
-            _ => panic!("Expected Udp variant"),
-        }
-    }
-}
-
+//
+// #[derive(Serialize, Clone)]
+// #[serde(untagged)]
+// pub enum StackConfig {
+//     Tcp(TcpConfig),
+//     Udp(UdpConfig),
+//     Rtcp(RtcpConfig),
+//     Tls(TlsStackConfig),
+//     Quic(QuicStackConfig),
+// }
+//
+// impl<'de> Deserialize<'de> for StackConfig {
+//     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+//     where
+//         D: Deserializer<'de>,
+//     {
+//         let value = serde_json::Value::deserialize(deserializer)?;
+//         let stack_base = StackConfigBase::deserialize(value.clone()).map_err(|e| serde::de::Error::custom(e))?;
+//         match stack_base.protocol {
+//             StackProtocol::Tcp => {
+//                 let config = TcpConfig::deserialize(value).map_err(|e| serde::de::Error::custom(e))?;
+//                 Ok(StackConfig::Tcp(config))
+//             }
+//             StackProtocol::Udp => {
+//                 let config = UdpConfig::deserialize(value).map_err(|e| serde::de::Error::custom(e))?;
+//                 Ok(StackConfig::Udp(config))
+//             }
+//             StackProtocol::Quic => {
+//                 let config = QuicStackConfig::deserialize(value).map_err(|e| serde::de::Error::custom(e))?;
+//                 Ok(StackConfig::Quic(config))
+//             }
+//             StackProtocol::Rtcp => {
+//                 let config = RtcpConfig::deserialize(value).map_err(|e| serde::de::Error::custom(e))?;
+//                 Ok(StackConfig::Rtcp(config))
+//             }
+//             StackProtocol::Tls => {
+//                 let config = TlsStackConfig::deserialize(value).map_err(|e| {
+//                     serde::de::Error::custom(e)})?;
+//                 Ok(StackConfig::Tls(config))
+//             }
+//         }
+//     }
+// }
+//
+// #[derive(Serialize, Deserialize, Clone)]
+// pub struct CyfsConfig {
+//     stacks: Vec<StackConfig>,
+// }
+//
+//
+// #[cfg(test)]
+// mod test {
+//     use std::net::IpAddr;
+//     use crate::{CyfsConfig};
+//
+//     #[test]
+//     fn test_stack_config_serialization() {
+//         let yaml_config = r#"
+// stacks:
+//   - bind: 0.0.0.0:8080
+//     protocol: tcp
+//     hook_point:
+//       - id: main
+//         priority: 1
+//         blocks:
+//           - id: default
+//             block: |
+//               call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
+//               call http-probe || reject;
+//               eq ${REQ.ext.method} "CONNECT" && return "forward tcp:///${REQ.dest_host}";
+//               return "forward tcp:///${REQ.dest_host}:80";
+//
+//   - bind: 0.0.0.0:8081
+//     protocol: udp
+//     hook_point:
+//       - id: main
+//         priority: 1
+//         blocks:
+//           - id: default
+//             block: |
+//               reject;
+//
+//   - bind: 0.0.0.0:8082
+//     protocol: rtcp
+//     device_name: "web3.buckyos.com"
+//     device_key: ./identity.json
+//     hook_point:
+//       - id: main
+//         priority: 1
+//         blocks:
+//           - id: default
+//             block: |
+//               reject;
+//
+//   - bind: 0.0.0.0:8083
+//     protocol: tls
+//     certs:
+//       - domain: "web3.buckyos.com"
+//         cert_file: ./cert.pem
+//         key_file: ./key.pem
+//     hook_point:
+//       - id: main
+//         priority: 1
+//         blocks:
+//           - id: default
+//             block: |
+//               reject;
+//
+//   - bind: 0.0.0.0:8083
+//     protocol: quic
+//     certs:
+//       - domain: "web3.buckyos.com"
+//         cert_file: ./cert.pem
+//         key_file: ./key.pem
+//     hook_point:
+//       - id: main
+//         priority: 1
+//         blocks:
+//           - id: default
+//             block: |
+//               reject;
+//         "#;
+//
+//         let config: CyfsConfig = serde_yaml_ng::from_str(yaml_config).unwrap();
+//         assert_eq!(config.stacks.len(), 5);
+//     }
+//
+//     #[test]
+//     fn test_stack_config_deserialization_from_json() {
+//         use crate::{StackConfig, StackProtocol};
+//         use std::net::{SocketAddr, Ipv4Addr};
+//
+//         // Test deserializing TcpStackConfig from JSON
+//         let tcp_json = r#"{
+//             "protocol": "tcp",
+//             "bind": "127.0.0.1:8080",
+//             "hook_point": []
+//         }"#;
+//
+//         let tcp_config: StackConfig = serde_json::from_str(tcp_json).unwrap();
+//         match tcp_config {
+//             StackConfig::Tcp(tcp) => {
+//                 assert_eq!(tcp.protocol, StackProtocol::Tcp);
+//                 assert_eq!(tcp.bind, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080));
+//             }
+//             _ => panic!("Expected Tcp variant"),
+//         }
+//
+//         // Test deserializing UdpStackConfig from JSON
+//         let udp_json = r#"{
+//             "protocol": "udp",
+//             "bind": "127.0.0.1:8081",
+//             "hook_point": []
+//         }"#;
+//
+//         let udp_config: StackConfig = serde_json::from_str(udp_json).unwrap();
+//         match udp_config {
+//             StackConfig::Udp(udp) => {
+//                 assert_eq!(udp.protocol, StackProtocol::Udp);
+//                 assert_eq!(udp.bind, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8081));
+//             }
+//             _ => panic!("Expected Udp variant"),
+//         }
+//     }
+// }
+//
 
 pub fn gen_demo_gateway_json_config() -> String {
     let result = r#"

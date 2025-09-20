@@ -55,6 +55,7 @@ serde_qs = "0.15"
 serde_urlencoded = "0.7.1"
 tokio-util = { version = "0.7", features = ["full"] }
 rustls-platform-verifier = "0.6.1"
+as-any = "0.3.2"
 
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
 name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" }
@@ -67,6 +68,7 @@ pin-project = "1.1.10"
 
 [dev-dependencies]
 rcgen = "0.14.3"
+tempfile = "3.22.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }

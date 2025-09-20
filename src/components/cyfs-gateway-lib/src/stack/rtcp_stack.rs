@@ -1,15 +1,17 @@
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use buckyos_kit::AsyncStream;
-use name_lib::DeviceConfig;
+use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig};
 use sfo_io::{LimitStream, StatStream};
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor, StreamRequest};
-use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, DatagramServerBox, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackErrorCode, StackProtocol, StackResult, StreamListener, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelError, TunnelManager, TunnelResult};
+use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, DatagramServerBox, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackBox, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, StreamListener, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelError, TunnelManager, TunnelResult};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, execute_stream_chain, GlobalProcessChainsRef};
 use crate::rtcp::{AsyncStreamWithDatagram, DatagramForwarder, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
 use crate::stack::{datagram_forward, stream_forward};
+use serde::{Deserialize, Serialize};
 
 struct Listener {
     inner: Arc<RtcpStackInner>,
@@ -350,8 +352,19 @@ impl RtcpStack {
             inner,
         })
     }
+}
 
-    pub async fn start(&mut self) -> StackResult<()> {
+#[async_trait::async_trait]
+impl Stack for RtcpStack {
+    fn stack_protocol(&self) -> StackProtocol {
+        StackProtocol::Rtcp
+    }
+
+    fn get_bind_addr(&self) -> String {
+        self.bind_addr.clone()
+    }
+
+    async fn start(&mut self) -> StackResult<()> {
         let mut rtcp = self.rtcp.take().unwrap();
         rtcp.start().await
             .map_err(|e| stack_err!(StackErrorCode::IoError, "start rtcp failed: {:?}", e))?;
@@ -362,15 +375,9 @@ impl RtcpStack {
         self.rtcp_ref = Some(rtcp);
         Ok(())
     }
-}
 
-impl Stack for RtcpStack {
-    fn stack_protocol(&self) -> StackProtocol {
-        StackProtocol::Rtcp
-    }
-
-    fn get_bind_addr(&self) -> String {
-        self.bind_addr.clone()
+    async fn update_config(&mut self, config: Arc<dyn StackConfig>) -> StackResult<()> {
+        todo!()
     }
 }
 
@@ -444,14 +451,101 @@ impl RtcpStackBuilder {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RtcpStackConfig {
+    pub protocol: StackProtocol,
+    pub bind: String,
+    pub hook_point: Vec<crate::ProcessChainConfig>,
+    pub key_path: String,
+    pub device_config_path: Option<String>,
+    pub name: Option<String>,
+}
+
+impl crate::StackConfig for RtcpStackConfig {
+    fn stack_protocol(&self) -> StackProtocol {
+        StackProtocol::Rtcp
+    }
+}
+
+pub struct RtcpStackFactory {
+    servers: ServerManagerRef,
+    global_process_chains: GlobalProcessChainsRef,
+    connection_manager: ConnectionManagerRef,
+    tunnel_manager: TunnelManager,
+}
+
+impl RtcpStackFactory {
+    pub fn new(
+        servers: ServerManagerRef,
+        global_process_chains: GlobalProcessChainsRef,
+        connection_manager: ConnectionManagerRef,
+        tunnel_manager: TunnelManager,
+    ) -> Self {
+        Self {
+            servers,
+            global_process_chains,
+            connection_manager,
+            tunnel_manager,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StackFactory for RtcpStackFactory {
+    async fn create(&self, config: Box<dyn StackConfig>) -> StackResult<StackBox> {
+        let config = config
+            .as_any()
+            .downcast_ref::<RtcpStackConfig>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+
+        let private_key = load_raw_private_key(Path::new(config.key_path.as_str()))
+            .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "load private key {} failed", config.key_path))?;
+        let public_key = encode_ed25519_pkcs8_sk_to_pk(&private_key);
+        let device_config = if config.device_config_path.is_some() {
+            let content = tokio::fs::read_to_string(config.device_config_path.as_ref().unwrap()).await
+                .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "load device config {} failed", config.device_config_path.as_ref().unwrap()))?;
+            let device_config = serde_json::from_str::<DeviceConfig>(content.as_str())
+                .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "parse device config {} failed", config.device_config_path.as_ref().unwrap()))?;
+            let default_key = device_config.get_default_key()
+                .ok_or(stack_err!(StackErrorCode::InvalidConfig, "device config {} has no default key", config.device_config_path.as_ref().unwrap()))?;
+            let x_of_auth_key = get_x_from_jwk(&default_key)
+                .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "device config {} has no auth key", config.device_config_path.as_ref().unwrap()))?;
+            if x_of_auth_key != public_key {
+                return Err(stack_err!(StackErrorCode::InvalidConfig, "device config {} public key not match", config.device_config_path.as_ref().unwrap()));
+            }
+            device_config
+        } else {
+            if config.name.is_none() {
+                return Err(stack_err!(StackErrorCode::InvalidConfig, "name is required"));
+            }
+            let device_config = DeviceConfig::new(
+                config.name.as_ref().unwrap().as_str(),
+                public_key,
+            );
+            device_config
+        };
+        let stack = RtcpStack::builder()
+            .bind(config.bind.clone())
+            .tunnel_manager(self.tunnel_manager.clone())
+            .connection_manager(self.connection_manager.clone())
+            .global_process_chains(self.global_process_chains.clone())
+            .servers(self.servers.clone())
+            .device_config(device_config)
+            .private_key(private_key)
+            .hook_point(config.hook_point.clone())
+            .build().await?;
+        Ok(Box::new(stack))
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use std::collections::HashMap;
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, RtcpStack, TunnelManager, Server, ConnectionManager};
-    use buckyos_kit::{init_logging, AsyncStream};
-    use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig, EncodedDocument};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory};
+    use buckyos_kit::{AsyncStream};
+    use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, generate_ed25519_key_pair, DeviceConfig, EncodedDocument};
     use std::sync::Arc;
     use name_client::{init_name_lib, NameInfo, GLOBAL_NAME_CLIENT};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1583,5 +1677,47 @@ mod tests {
         assert_eq!(&buf, b"datagram");
     }
 
+    #[tokio::test]
+    async fn test_factory() {
+        let factory = RtcpStackFactory::new(
+            Arc::new(ServerManager::new()),
+            Arc::new(GlobalProcessChains::new()),
+            ConnectionManager::new(),
+            TunnelManager::new(),
+        );
 
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key_pair();
+
+        let key_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(key_file.path(), signing_key).unwrap();
+
+        let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(pkcs8_bytes).unwrap());
+        let device_doc = serde_json::to_string(&device_config).unwrap();
+        let config_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(config_file.path(), device_doc).unwrap();
+
+        let config = RtcpStackConfig {
+            protocol: StackProtocol::Rtcp,
+            bind: "127.0.0.1:394".to_string(),
+            hook_point: vec![],
+            key_path: key_file.path().to_string_lossy().to_string(),
+            device_config_path: None,
+            name: Some("test".to_string()),
+        };
+
+        let ret = factory.create(Box::new(config)).await;
+        assert!(ret.is_ok());
+
+        let config = RtcpStackConfig {
+            protocol: StackProtocol::Rtcp,
+            bind: "127.0.0.1:394".to_string(),
+            hook_point: vec![],
+            key_path: key_file.path().to_string_lossy().to_string(),
+            device_config_path: Some(config_file.path().to_string_lossy().to_string()),
+            name: Some("test".to_string()),
+        };
+
+        let ret = factory.create(Box::new(config)).await;
+        assert!(ret.is_ok());
+    }
 }

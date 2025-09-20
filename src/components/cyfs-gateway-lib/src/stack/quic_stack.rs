@@ -1,9 +1,11 @@
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::collections::HashMap;
 use std::future::poll_fn;
 use std::io;
 use std::io::Read;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +31,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackBox, StackFactory};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 use crate::stack::stream_forward;
@@ -641,7 +643,7 @@ impl<B: Buf> quic::Connection<B> for Http3Connection {
     }
 }
 #[derive(Debug)]
-struct ResolvesServerCertUsingSni {
+pub(crate) struct ResolvesServerCertUsingSni {
     by_name: Mutex<HashMap<String, Arc<sign::CertifiedKey>>>,
 }
 
@@ -998,14 +1000,9 @@ impl QuicStack {
             handle: None,
         })
     }
-
-    pub async fn start(&mut self) -> StackResult<()> {
-        let handle = self.inner.start().await?;
-        self.handle = Some(handle);
-        Ok(())
-    }
 }
 
+#[async_trait::async_trait]
 impl Stack for QuicStack {
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Quic
@@ -1013,6 +1010,16 @@ impl Stack for QuicStack {
 
     fn get_bind_addr(&self) -> String {
         self.inner.bind_addr.clone()
+    }
+
+    async fn start(&mut self) -> StackResult<()> {
+        let handle = self.inner.start().await?;
+        self.handle = Some(handle);
+        Ok(())
+    }
+
+    async fn update_config(&mut self, config: Arc<dyn StackConfig>) -> StackResult<()> {
+        todo!()
     }
 }
 
@@ -1096,12 +1103,83 @@ impl QuicStackBuilder {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct QuicStackConfig {
+    pub protocol: StackProtocol,
+    pub bind: SocketAddr,
+    pub concurrency: Option<u32>,
+    pub hook_point: Vec<ProcessChainConfig>,
+    pub certs: Vec<StackCertConfig>,
+    pub alpn_protocols: Vec<String>,
+}
+
+impl StackConfig for QuicStackConfig {
+    fn stack_protocol(&self) -> StackProtocol {
+        StackProtocol::Quic
+    }
+}
+
+pub struct QuicStackFactory {
+    servers: ServerManagerRef,
+    global_process_chains: GlobalProcessChainsRef,
+    connection_manager: ConnectionManagerRef,
+    tunnel_manager: TunnelManager,
+}
+
+impl QuicStackFactory {
+    pub fn new(
+        servers: ServerManagerRef,
+        global_process_chains: GlobalProcessChainsRef,
+        connection_manager: ConnectionManagerRef,
+        tunnel_manager: TunnelManager,
+    ) -> Self {
+        Self {
+            servers,
+            global_process_chains,
+            connection_manager,
+            tunnel_manager,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StackFactory for QuicStackFactory {
+    async fn create(&self, config: Box<dyn StackConfig>) -> StackResult<StackBox> {
+        let config = config
+            .as_any()
+            .downcast_ref::<QuicStackConfig>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+        let mut cert_list = vec![];
+        for cert_config in config.certs.iter() {
+            let certs = load_certs(cert_config.cert_file.as_str()).await?;
+            let key = load_key(cert_config.key_file.as_str()).await?;
+            cert_list.push(TlsDomainConfig {
+                domain: cert_config.domain.clone(),
+                certs,
+                key,
+            });
+        }
+        let stack = QuicStack::builder()
+            .bind(config.bind.to_string().as_str())
+            .tunnel_manager(self.tunnel_manager.clone())
+            .connection_manager(self.connection_manager.clone())
+            .global_process_chains(self.global_process_chains.clone())
+            .servers(self.servers.clone())
+            .hook_point(config.hook_point.clone())
+            .add_certs(cert_list)
+            .alpn_protocols(config.alpn_protocols.iter().map(|s| s.as_bytes().to_vec()).collect())
+            .concurrency(config.concurrency.unwrap_or(1024))
+            .build()
+            .await?;
+        Ok(Box::new(stack))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use buckyos_kit::AsyncStream;
     use h3::error::{ConnectionError, StreamError};
-    use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use quinn::crypto::rustls::QuicClientConfig;
     use quinn::Endpoint;
     use rcgen::generate_simple_self_signed;
@@ -1110,7 +1188,7 @@ mod tests {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use crate::{GatewayDevice, ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerHttpServiceManager};
+    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerHttpServiceManager, Stack, QuicStackFactory, ConnectionManager, UdpStackConfig, StackProtocol, QuicStackConfig, StackFactory};
     use crate::global_process_chains::GlobalProcessChains;
 
     #[tokio::test]
@@ -1607,5 +1685,25 @@ mod tests {
         let ret = recv.read_exact(&mut buf).await;
         assert!(ret.is_ok());
         assert_eq!(&buf, b"recv");
+    }
+
+    #[tokio::test]
+    async fn test_factory() {
+        let factory = QuicStackFactory::new(
+            Arc::new(ServerManager::new()),
+            Arc::new(GlobalProcessChains::new()),
+            ConnectionManager::new(),
+            TunnelManager::new(),
+        );
+
+        let config = QuicStackConfig {
+            protocol: StackProtocol::Quic,
+            bind: "127.0.0.1:3345".parse().unwrap(),
+            concurrency: None,
+            hook_point: vec![],
+            certs: vec![],
+            alpn_protocols: vec![],
+        };
+        let ret = factory.create(Box::new(config));
     }
 }
