@@ -1144,7 +1144,7 @@ impl QuicStackFactory {
 
 #[async_trait::async_trait]
 impl StackFactory for QuicStackFactory {
-    async fn create(&self, config: Box<dyn StackConfig>) -> StackResult<StackBox> {
+    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackBox> {
         let config = config
             .as_any()
             .downcast_ref::<QuicStackConfig>()
@@ -1188,7 +1188,7 @@ mod tests {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerHttpServiceManager, Stack, QuicStackFactory, ConnectionManager, UdpStackConfig, StackProtocol, QuicStackConfig, StackFactory};
+    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerHttpServiceManager, Stack, QuicStackFactory, ConnectionManager, UdpStackConfig, StackProtocol, QuicStackConfig, StackFactory, ServerConfig};
     use crate::global_process_chains::GlobalProcessChains;
 
     #[tokio::test]
@@ -1364,6 +1364,10 @@ mod tests {
             stream.write_all("recv".as_bytes()).await.unwrap();
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             Ok(())
+        }
+
+        async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
+            todo!()
         }
     }
     #[derive(Debug)]
@@ -1704,6 +1708,6 @@ mod tests {
             certs: vec![],
             alpn_protocols: vec![],
         };
-        let ret = factory.create(Box::new(config));
+        let ret = factory.create(Arc::new(config));
     }
 }

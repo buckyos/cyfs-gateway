@@ -33,6 +33,7 @@ pub use server::*;
 pub use inner_service::*;
 pub use stack::*;
 pub use connection_manager::*;
+pub use global_process_chains::*;
 
 use once_cell::sync::OnceCell;
 use thiserror::Error;

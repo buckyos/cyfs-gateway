@@ -1,44 +1,43 @@
 use buckyos_kit::{adjust_path, get_buckyos_root_dir};
-use cyfs_gateway_lib::{config_err, into_config_err, ConfigErrorCode, ConfigResult, DNSServerConfig, StackBox, StackConfig, TcpStackConfig};
+use cyfs_gateway_lib::{config_err, into_config_err, ConfigErrorCode, ConfigResult, DNSServerConfig, InnerServiceConfig, ProcessChainConfigs, QuicStackConfig, RtcpStackConfig, ServerConfig, StackBox, StackConfig, TcpStackConfig, TlsStack, UdpStackConfig};
 use cyfs_gateway_lib::DispatcherConfig;
-use cyfs_gateway_lib::ServerConfig;
 use cyfs_gateway_lib::WarpServerConfig;
 use cyfs_sn::*;
 use cyfs_socks::SocksProxyConfig;
 use cyfs_warp::register_inner_service_builder;
 use log::*;
 use name_lib::load_raw_private_key;
-use serde_json::from_value;
+use serde_json::{from_value};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 //use buckyos_api::ZONE_PROVIDER;
 
-pub trait StackConfigFactory<D: for<'de> Deserializer<'de>>: Send + Sync {
-    fn create(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>>;
+pub trait StackConfigParser<D: for<'de> Deserializer<'de>>: Send + Sync {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>>;
 }
 
-pub struct CyfsStackFactory<D: for<'de> Deserializer<'de>> {
-    stack_factory: HashMap<String, Arc<dyn StackConfigFactory<D>>>,
+pub struct CyfsStackConfigParser<D: for<'de> Deserializer<'de>> {
+    parsers: Mutex<HashMap<String, Arc<dyn StackConfigParser<D>>>>,
 }
 
-impl<D: for<'de> Deserializer<'de>> Default for CyfsStackFactory<D> {
+impl<D: for<'de> Deserializer<'de>> Default for CyfsStackConfigParser<D> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<D: for<'de> Deserializer<'de>> CyfsStackFactory<D> {
+impl<D: for<'de> Deserializer<'de>> CyfsStackConfigParser<D> {
     pub fn new() -> Self {
         Self {
-            stack_factory: HashMap::new(),
+            parsers: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn register(&mut self, protocol: &str, factory: Arc<dyn StackConfigFactory<D>>) {
-        self.stack_factory.insert(protocol.to_string(), factory);
+    pub fn register(&self, protocol: &str, factory: Arc<dyn StackConfigParser<D>>) {
+        self.parsers.lock().unwrap().insert(protocol.to_string(), factory);
     }
 }
 
@@ -47,287 +46,269 @@ struct StackProtocolConfig {
     protocol: String,
 }
 
-impl<D: for<'de> Deserializer<'de> + Clone> StackConfigFactory<D> for CyfsStackFactory<D> {
-    fn create(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
+impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for CyfsStackConfigParser<D> {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
         let config = StackProtocolConfig::deserialize(de.clone())
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", e))?;
-        let factory = self.stack_factory.get(config.protocol.as_str())
-            .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", config.protocol))?;
-        factory.create(de)
+        let factory = {
+            self.parsers.lock().unwrap().get(config.protocol.as_str())
+                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", config.protocol))?.clone()
+        };
+        factory.parse(de)
     }
 }
 
-pub struct TcpStackFactory {}
+pub struct TcpStackConfigParser {}
 
-impl<D: for<'de> Deserializer<'de>> StackConfigFactory<D> for TcpStackFactory {
-    fn create(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
+impl TcpStackConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<D: for<'de> Deserializer<'de>> StackConfigParser<D> for TcpStackConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
         let tcp_config = TcpStackConfig::deserialize(de)
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", e))?;
         Ok(Arc::new(tcp_config))
     }
 }
 
-pub struct GatewayConfig {
-    pub dispatcher: HashMap<Url, DispatcherConfig>,
-    pub servers: HashMap<String, ServerConfig>,
-    pub device_key_path: PathBuf,
-    pub device_name: Option<String>,
+pub struct UdpStackConfigParser {}
 
-    //pub device_private_key: Option<[u8; 48]>,
-    //pub device_did: Option<String>,
-    //tunnel_builder_config : HashMap<String,TunnelBuilderConfig>,
+impl UdpStackConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
 }
 
-impl GatewayConfig {
-    pub async fn load_dispatcher_config(dispatcher_config_value: &serde_json::Value) -> Result<HashMap<Url, DispatcherConfig>,String> {
-        let mut dispatcher_cfg = HashMap::new();
-        let dispatcher_config_value = dispatcher_config_value.as_object().unwrap();
+impl<D: for<'de> Deserializer<'de>> StackConfigParser<D> for UdpStackConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
+        let udp_config = UdpStackConfig::deserialize(de)
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", e))?;
+        Ok(Arc::new(udp_config))
+    }
+}
+pub struct TlsStackConfigParser {}
 
-        for (k, v) in dispatcher_config_value.iter() {
-            let incoming_url = Url::parse(&k);
-            if incoming_url.is_err() {
-                let msg = format!("Invalid incoming url: {}", k);
-                error!("{}", msg);
-                return Err(msg);
-            }
-            let incoming_url = incoming_url.unwrap();
-            let incoming_url2 = incoming_url.clone();
+impl TlsStackConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
 
-            let target_type: Result<String, _> = from_value(v["type"].clone());
-            if target_type.is_err() {
-                let msg = format!("Target type not found: {}", k);
-                error!("{}", msg);
-                return Err(msg);
-            }
+impl<D: for<'de> Deserializer<'de>> StackConfigParser<D> for TlsStackConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
+        let tls_config = cyfs_gateway_lib::TlsStackConfig::deserialize(de)
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid tls stack config: {}", e))?;
+        Ok(Arc::new(tls_config))
+    }
+}
 
-            let target_type = target_type.unwrap();
-            //let enable_tunnel: Result<Vec<String>, _> = from_value(v["enable_tunnel"].clone());
-            //let enable_tunnel = enable_tunnel.ok();
+pub struct QuicStackConfigParser {}
 
-            let new_config: DispatcherConfig;
-            match target_type.as_str() {
-                "server" => {
-                    let server_id = v.get("id");
-                    if server_id.is_none() {
-                        let msg = format!("Server id not found: {}", k);
-                        error!("{}", msg);
-                        return Err(msg);
-                    }
+impl QuicStackConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
 
-                    let server_id = server_id.unwrap().as_str();
-                    if server_id.is_none() {
-                        let msg = format!("Server id not string: {}", k);
-                        error!("{}", msg);
-                        return Err(msg);
-                    }
+impl<D: for<'de> Deserializer<'de>> StackConfigParser<D> for QuicStackConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
+        let quic_config = QuicStackConfig::deserialize(de)
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid quic stack config: {}", e))?;
+        Ok(Arc::new(quic_config))
+    }
+}
+pub struct RtcpStackConfigParser {}
 
-                    let server_id = server_id.unwrap();
-                    new_config = DispatcherConfig::new_server(
-                        incoming_url,
-                        server_id.to_string()
-                    );
-                }
-                "forward" => {
-                    let target_url = v.get("target");
-                    if target_url.is_none() {
-                        let msg = format!("Target url not found: {}", k);
-                        error!("{}", msg);
-                        return Err(msg);
-                    }
-                    let target_url = target_url.unwrap().as_str();
-                    if target_url.is_none() {
-                        let msg = format!("Target url not string: {}", k);
-                        error!("{}", msg);
-                        return Err(msg);
-                    }
+impl RtcpStackConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
 
-                    let target_url = target_url.unwrap();
-                    let target_url = Url::parse(target_url).map_err(|e| {
-                        let msg = format!("Invalid target url: {}, {}", target_url, e);
-                        error!("{}", msg);
-                        msg
-                    })?;
+impl<D: for<'de> Deserializer<'de>> StackConfigParser<D> for RtcpStackConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
+        let rtcp_config = RtcpStackConfig::deserialize(de)
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid rtcp stack config: {}", e))?;
+        Ok(Arc::new(rtcp_config))
+    }
+}
 
-                    new_config =
-                        DispatcherConfig::new_forward(incoming_url, target_url);
-                }
-                "selector" => {
-                    let selector_id = v.get("selector_id");
-                    if selector_id.is_none() {
-                        let msg = format!("Selector id not found: {}", k);
-                        error!("{}", msg);
-                        return Err(msg);
-                    }
-                    let selector_id = selector_id.unwrap().as_str().unwrap();
-                    new_config = DispatcherConfig::new_selector(incoming_url, selector_id.to_string());
-                }
-                "probe_selector" => {
-                    let probe_id = v.get("probe_id");
-                    let selector_id = v.get("selector_id");
-                    if probe_id.is_none() || selector_id.is_none() {
-                        let msg = format!("Probe id or selector id not found: {}", k);
-                        error!("{}", msg);
-                        return Err(msg);
-                    }
-                    new_config = DispatcherConfig::new_probe_selector(incoming_url,
-                                                                      probe_id.unwrap().as_str().unwrap().to_string(),
-                        selector_id.unwrap().as_str().unwrap().to_string());
-                }
-                _ => {
-                    return Err(format!("Invalid target type: {}", target_type));
-                }
-            }
-            dispatcher_cfg.insert(incoming_url2, new_config);
+pub trait ServerConfigParser<D: for<'de> Deserializer<'de>> {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>>;
+}
+
+pub struct CyfsServerConfigParser<D: for<'de> Deserializer<'de>> {
+    parsers: Mutex<HashMap<String, Arc<dyn ServerConfigParser<D>>>>,
+}
+
+impl<D: for<'de> Deserializer<'de>> CyfsServerConfigParser<D> {
+    pub fn new() -> Self {
+        Self {
+            parsers: Mutex::new(HashMap::new()),
         }
-        Ok(dispatcher_cfg)
     }
 
-    pub async fn load_from_json_value(json_value: serde_json::Value) -> Result<Self, String> {
-        let mut device_key_path = PathBuf::new();
-        if let Some(Some(path)) = json_value.get("device_key_path").map(|p| p.as_str()) {
-            device_key_path = adjust_path(path).
-                map_err(|e| format!("adjust path failed! {}", e))?;
+    pub fn register(&self, name: &str, parser: Arc<dyn ServerConfigParser<D>>) {
+        self.parsers.lock().unwrap().insert(name.to_string(), parser);
+    }
+}
 
-            info!(
-                "adjust device key path {} to {}",
-                path,device_key_path.display()
-            );
-        }
+#[derive(Serialize, Deserialize)]
+pub struct ServerConfigType {
+    #[serde(rename = "type")]
+    ty: String,
+}
 
-        let device_name:Option<String> = json_value.get("device_name").map(|v| v.as_str()).flatten().map(|s| s.to_string());
-        // register inner services
-        //TODO:需要通过插件优化，否则每次添加一个新的类型都要在这里添加注册函数
-        if let Some(Some(inner_services)) = json_value.get("inner_services").map(|v| v.as_object())
-        {
-            for (server_id, server_config) in inner_services.iter() {
-                let server_type = server_config.get("type")
-                    .ok_or("server_config type column not found".to_string())?
-                    .as_str()
-                    .ok_or("Server type not string".to_string())?;
-
-                match server_type {
-                    "cyfs-sn" => {
-                        let sn_config =
-                            serde_json::from_value::<SNServerConfig>(server_config.clone());
-                        if sn_config.is_err() {
-                            return Err(format!("Invalid sn config: {}", sn_config.err().unwrap()));
-                        }
-                        let sn_config = sn_config.unwrap();
-                        let sn_server = SNServer::new(sn_config);
-                        register_sn_server(server_id, sn_server.clone()).await;
-                        info!("Register sn server: {:?}", server_id);
-                        register_inner_service_builder(server_id, move || {
-                            Box::new(sn_server.clone())
-                        })
-                        .await;
-                    }
-                    // "zone-provider" => {
-                    //     register_inner_service_builder(server_id, move || {
-                    //         Box::new(ZONE_PROVIDER.clone())
-                    //     })
-                    //     .await;
-                    // }
-                    _ => {
-                        return Err(format!("Invalid server type: {}", server_type));
-                    }
-                }
-            }
-        }
-
-        //register_inner_service_builder("cyfs_sn",|| {
-        //    Box::new(SNServer::new(None))
-        //}).await;
-
-        //load servers
-        let mut servers_cfg = HashMap::new();
-        if let Some(Some(servers)) = json_value.get("servers").map(|v| v.as_object()) {
-            for (k, v) in servers.iter() {
-                let server_type = v.get("type");
-                if server_type.is_none() {
-                    return Err("Server type not found".to_string());
-                }
-                let server_type = server_type.unwrap().as_str();
-                if server_type.is_none() {
-                    return Err("Server type not string".to_string());
-                }
-                let server_type = server_type.unwrap();
-                match server_type {
-                    "cyfs-warp" => {
-                        let warp_config = serde_json::from_value::<WarpServerConfig>(v.clone());
-                        if warp_config.is_err() {
-                            return Err(format!(
-                                "Invalid warp config: {}",
-                                warp_config.err().unwrap()
-                            ));
-                        }
-                        let mut warp_config = warp_config.unwrap();
-                        // adjust warp config`s route local dir path
-                        for (host, host_config) in warp_config.hosts.iter_mut() {
-                            for (route, route_config) in host_config.routes.iter_mut() {
-                                if route_config.local_dir.is_some() {
-                                    let new_path =
-                                        adjust_path(route_config.local_dir.as_ref().unwrap())
-                                            .map_err(|e| format!("adjust path failed! {}", e))?;
-                                    debug!(
-                                        "adjust host {}.{} local path {} to {}",
-                                        host,
-                                        route,
-                                        route_config.local_dir.as_ref().unwrap(),
-                                        new_path.display()
-                                    );
-                                    route_config.local_dir =
-                                        Some(new_path.to_string_lossy().to_string());
-                                }
-                            }
-                        }
-                        servers_cfg.insert(k.clone(), ServerConfig::Warp(warp_config));
-                    }
-                    "cyfs-dns" => {
-                        let dns_config = serde_json::from_value::<DNSServerConfig>(v.clone());
-                        if dns_config.is_err() {
-                            return Err(format!(
-                                "Invalid dns config: {}",
-                                dns_config.err().unwrap()
-                            ));
-                        }
-                        let dns_config = dns_config.unwrap();
-                        servers_cfg.insert(k.clone(), ServerConfig::DNS(dns_config));
-                    }
-                    "cyfs-socks" => {
-                        let mut socks_config = SocksProxyConfig::load(v)
-                            .map_err(|e| format!("load socks config failed! {}", e))?;
-
-                        // Try load rule config
-                        socks_config
-                            .load_rules()
-                            .await
-                            .map_err(|e| format!("load socks rule config failed! {}", e))?;
-
-                        servers_cfg.insert(k.clone(), ServerConfig::Socks(socks_config));
-                    }
-                    _ => {
-                        return Err(format!("Invalid server type: {}", server_type));
-                    }
-                }
-            }
-        }
-
-        //load dispatcher
-        let dispatcher_config_value = json_value.get("dispatcher");
-        let dispatcher = if dispatcher_config_value.is_some() {
-            let dispatcher_config_value = dispatcher_config_value.unwrap();
-            let dispatcher_cfg = GatewayConfig::load_dispatcher_config(dispatcher_config_value).await?;
-            dispatcher_cfg
-        } else {
-            HashMap::new()
+impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for CyfsServerConfigParser<D> {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
+        let server_type = ServerConfigType::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", e))?;
+        let parser = {
+            self.parsers.lock().unwrap().get(&server_type.ty).cloned()
         };
-        info!("load gateway config OK!");
-        Ok(Self {
-            dispatcher,
-            servers: servers_cfg,
-            device_key_path,
-            device_name:device_name
+        if let Some(parser) = parser {
+            parser.parse(de)
+        } else {
+            Err(config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid stack config.unknown server type:{}",
+                server_type.ty
+            ))
+        }
+    }
+}
 
+pub struct HttpServerConfigParser {}
+
+impl HttpServerConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<D: for<'de> Deserializer<'de>> ServerConfigParser<D> for HttpServerConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
+        todo!();
+    }
+}
+
+pub trait InnerServiceConfigParser<D: for<'de> Deserializer<'de>>: Send + Sync {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn InnerServiceConfig>>;
+}
+
+pub struct CyfsInnerServiceConfigParser<D: for<'de> Deserializer<'de>> {
+    inner_service_config_parser: Mutex<HashMap<String, Arc<dyn InnerServiceConfigParser<D>>>>,
+}
+
+impl<D: for<'de> Deserializer<'de>> CyfsInnerServiceConfigParser<D> {
+    pub fn new() -> Self {
+        Self {
+            inner_service_config_parser: Mutex::new(HashMap::new()),
+        }
+    }
+    pub fn register(&self, service_type: &str, parser: Arc<dyn InnerServiceConfigParser<D>>) {
+        self.inner_service_config_parser.lock().unwrap().insert(service_type.to_string(), parser);
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct InnerServiceConfigType {
+    #[serde(rename = "type")]
+    ty: String,
+}
+
+impl<D: for<'de> Deserializer<'de> + Clone> InnerServiceConfigParser<D> for CyfsInnerServiceConfigParser<D> {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn InnerServiceConfig>> {
+        let service_type = InnerServiceConfigType::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid inner service config.{}", e))?;
+        let parser = {
+            self.inner_service_config_parser.lock().unwrap().get(&service_type.ty).cloned()
+        };
+        if parser.is_none() {
+            return Err(config_err!(ConfigErrorCode::InvalidConfig, "unknown inner service type: {}", service_type.ty));
+        }
+        parser.unwrap().parse(de)
+    }
+}
+
+pub struct GatewayConfigParser {
+    stack_config_parser: CyfsStackConfigParser<serde_json::Value>,
+    server_config_parser: CyfsServerConfigParser<serde_json::Value>,
+    inner_service_config_parser: CyfsInnerServiceConfigParser<serde_json::Value>,
+}
+
+impl GatewayConfigParser {
+    pub fn new() -> Self {
+        let cyfs_stack_parser = CyfsStackConfigParser::new();
+
+        let cyfs_server_parser = CyfsServerConfigParser::new();
+
+        let inner_service_parser = CyfsInnerServiceConfigParser::new();
+        GatewayConfigParser {
+            stack_config_parser: cyfs_stack_parser,
+            server_config_parser: cyfs_server_parser,
+            inner_service_config_parser: inner_service_parser,
+        }
+    }
+
+    pub fn register_stack_config_parser(&self, protocol: &str, parser: Arc<dyn StackConfigParser<serde_json::Value>>) {
+        self.stack_config_parser.register(protocol, parser);
+    }
+
+    pub fn register_server_config_parser(&self, server_type: &str, parser: Arc<dyn ServerConfigParser<serde_json::Value>>) {
+        self.server_config_parser.register(server_type, parser);
+    }
+
+    pub fn register_inner_service_config_parser(&self, service_type: &str, parser: Arc<dyn InnerServiceConfigParser<serde_json::Value>>) {
+        self.inner_service_config_parser.register(service_type, parser);
+    }
+
+    pub fn parse(&self, json_value: serde_json::Value) -> ConfigResult<GatewayConfig> {
+        let mut stacks = vec![];
+        if let Some(stacks_value) = json_value.get("stacks") {
+            let stack_value_list = stacks_value.as_array()
+                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stacks config.\n{}",
+                    serde_json::to_string_pretty(stacks_value).unwrap()))?;
+            for stack_value in stack_value_list {
+                stacks.push(self.stack_config_parser.parse(stack_value.clone())?);
+            }
+        }
+
+        let mut servers = vec![];
+        if let Some(servers_value) = json_value.get("servers") {
+            let servers_value_list = servers_value.as_array()
+                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid servers config.\n{}",
+                    serde_json::to_string_pretty(servers_value).unwrap()))?;
+            for server_value in servers_value_list {
+                servers.push(self.server_config_parser.parse(server_value.clone())?);
+            }
+        }
+
+        let mut global_process_chains = vec![];
+        if let Some(global_chains_value) = json_value.get("global_process_chains") {
+            global_process_chains = serde_json::from_value(global_chains_value.clone()).map_err(|e| {
+                config_err!(ConfigErrorCode::InvalidConfig, "invalid global_process_chains: {:?}\n{}", e,
+                serde_json::to_string_pretty(global_chains_value).unwrap())
+            })?;
+        }
+
+        Ok(GatewayConfig {
+            stacks,
+            servers,
+            inner_services: vec![],
+            global_process_chains,
         })
     }
+}
+
+
+
+pub struct GatewayConfig {
+    pub stacks: Vec<Arc<dyn StackConfig>>,
+    pub servers: Vec<Arc<dyn ServerConfig>>,
+    pub inner_services: Vec<Arc<dyn InnerServiceConfig>>,
+    pub global_process_chains: ProcessChainConfigs,
 }

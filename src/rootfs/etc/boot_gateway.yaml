@@ -1,0 +1,114 @@
+stacks:
+  - bind: 0.0.0.0:8080
+    protocol: tcp
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
+              call http-probe || reject;
+              eq ${REQ.ext.method} "CONNECT" && return "forward tcp:///${REQ.dest_host}";
+              return "forward tcp:///${REQ.dest_host}:80";
+
+  - bind: 0.0.0.0:8081
+    protocol: udp
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              reject;
+
+  - bind: 0.0.0.0:8082
+    protocol: rtcp
+    key_path: ./device_key.pem
+    device_config_path: ./device.doc.json
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              reject;            
+
+  - bind: 0.0.0.0:8083
+    protocol: tls
+    certs:
+      - domain: "web3.buckyos.com"
+        cert_file: ./cert.pem
+        key_file: ./key.pem
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              reject;   
+
+  - bind: 0.0.0.0:8083
+    protocol: quic
+    certs:
+      - domain: "web3.buckyos.com"
+        cert_file: ./cert.pem
+        key_file: ./key.pem
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              reject;               
+
+servers:
+  - id: web3.buckyos.com
+    type: http
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              reject;   
+
+  - id: proxy
+    type: socks5
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              reject;   
+
+  - id: main_dns
+    type: dns
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              reject;   
+
+global_process_chains:
+  - id: global1
+    priority: 1
+    blocks:
+      - id: default
+        block: |
+          reject;
+
+  - id: global2
+    priority: 1
+    blocks:
+      - id: default
+        block: |
+          reject;
+
+inner_services:
+  # 服务自定义参数
+  - id: sn
+    type: sn

@@ -21,6 +21,7 @@ pub enum ServerErrorCode {
     InvalidData,
     IOError,
     BadRequest,
+    UnknownServerType,
 }
 pub type ServerResult<T> = sfo_result::Result<T, ServerErrorCode>;
 pub type ServerError = sfo_result::Error<ServerErrorCode>;

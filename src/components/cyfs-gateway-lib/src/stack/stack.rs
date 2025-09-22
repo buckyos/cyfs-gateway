@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use as_any::AsAny;
 use serde::{Deserialize, Serialize};
 use crate::{stack_err, StackErrorCode, StackResult};
@@ -34,21 +34,38 @@ pub struct StackManager {
     stacks: Vec<StackBox>,
 }
 
+impl Default for StackManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StackManager {
     pub fn new() -> Self {
         Self {
             stacks: vec![],
         }
     }
+
+    pub fn add_stack(&mut self, stack: StackBox) {
+        self.stacks.push(stack);
+    }
+
+    pub async fn start(&mut self) -> StackResult<()> {
+        for stack in self.stacks.iter_mut() {
+            stack.start().await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
 pub trait StackFactory: Send + Sync {
-    async fn create(&self, config: Box<dyn StackConfig>) -> StackResult<StackBox>;
+    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackBox>;
 }
 
 pub struct CyfsStackFactory {
-    stack_factory: HashMap<StackProtocol, Arc<dyn StackFactory>>,
+    stack_factory: Mutex<HashMap<StackProtocol, Arc<dyn StackFactory>>>,
 }
 
 impl Default for CyfsStackFactory {
@@ -60,20 +77,22 @@ impl Default for CyfsStackFactory {
 impl CyfsStackFactory {
     pub fn new() -> Self {
         Self {
-            stack_factory: HashMap::new(),
+            stack_factory: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn register(&mut self, protocol: StackProtocol, factory: Arc<dyn StackFactory>) {
-        self.stack_factory.insert(protocol, factory);
+    pub fn register(&self, protocol: StackProtocol, factory: Arc<dyn StackFactory>) {
+        self.stack_factory.lock().unwrap().insert(protocol, factory);
     }
 }
 
 #[async_trait::async_trait]
 impl StackFactory for CyfsStackFactory {
-    async fn create(&self, config: Box<dyn StackConfig>) -> StackResult<StackBox> {
+    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackBox> {
         let protocol = config.stack_protocol();
-        let factory = self.stack_factory.get(&protocol);
+        let factory = {
+            self.stack_factory.lock().unwrap().get(&protocol).cloned()
+        };
         if factory.is_none() {
             return Err(stack_err!(StackErrorCode::UnsupportedStackProtocol, "unsupported stack protocol {:?}", protocol));
         }

@@ -205,13 +205,6 @@ pub struct DNSServerConfig {
     pub fallback : Vec<String>,//fallback dns servers
 }
 
-#[derive(Debug)]
-pub enum ServerConfig {
-    Warp(WarpServerConfig),
-    DNS(DNSServerConfig),
-    Socks(SocksProxyConfig),
-}
-
 #[derive(Clone,Debug)]
 pub enum DispatcherTarget {
     Forward(Url),

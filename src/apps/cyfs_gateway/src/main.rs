@@ -17,7 +17,7 @@ mod socks;
 #[macro_use]
 extern crate log;
 
-use crate::gateway::{Gateway, GatewayParams};
+use crate::gateway::{Gateway, GatewayFactory, GatewayParams};
 use buckyos_kit::*;
 use clap::{Arg, ArgAction, Command};
 use console_subscriber::{self, Server};
@@ -28,17 +28,28 @@ use log::*;
 use name_client::*;
 use name_lib::*;
 use std::path::PathBuf;
+use std::sync::Arc;
 use serde_json::{Value};
 use tokio::task;
 use url::Url;
+use crate::config_loader::{GatewayConfigParser, HttpServerConfigParser, QuicStackConfigParser, RtcpStackConfigParser, TcpStackConfigParser, TlsStackConfigParser, UdpStackConfigParser};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 async fn service_main(config_json: serde_json::Value, matches: &clap::ArgMatches) -> Result<()> {
     // Load config from json
-    let load_result = config_loader::GatewayConfig::load_from_json_value(config_json).await;
+    let parser = GatewayConfigParser::new();
+    parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
+    parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
+    parser.register_stack_config_parser("rtcp", Arc::new(RtcpStackConfigParser::new()));
+    parser.register_stack_config_parser("tls", Arc::new(TlsStackConfigParser::new()));
+    parser.register_stack_config_parser("quic", Arc::new(QuicStackConfigParser::new()));
+
+    parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
+
+    let load_result = parser.parse(config_json);
     if load_result.is_err() {
-        let msg = format!("Error loading config: {}", load_result.err().unwrap());
+        let msg = format!("Error loading config: {}", load_result.err().unwrap().msg());
         error!("{}", msg);
         std::process::exit(1);
     }
@@ -53,7 +64,56 @@ async fn service_main(config_json: serde_json::Value, matches: &clap::ArgMatches
             .collect(),
     };
 
-    let gateway = Gateway::new(config_loader);
+    let connect_manager = ConnectionManager::new();
+    let tunnel_manager = TunnelManager::new();
+    let server_manager = Arc::new(ServerManager::new());
+    let global_process_chains = Arc::new(GlobalProcessChains::new());
+
+    let factory = GatewayFactory::new(
+        server_manager.clone(),
+        global_process_chains.clone(),
+        connect_manager.clone(),
+        tunnel_manager.clone(),
+    );
+    factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
+        server_manager.clone(),
+        global_process_chains.clone(),
+        connect_manager.clone(),
+        tunnel_manager.clone(),
+    )));
+    factory.register_stack_factory(StackProtocol::Udp, Arc::new(UdpStackFactory::new(
+        server_manager.clone(),
+        global_process_chains.clone(),
+        connect_manager.clone(),
+        tunnel_manager.clone(),
+    )));
+    factory.register_stack_factory(StackProtocol::Tls, Arc::new(TlsStackFactory::new(
+        server_manager.clone(),
+        global_process_chains.clone(),
+        connect_manager.clone(),
+        tunnel_manager.clone(),
+    )));
+    factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
+        server_manager.clone(),
+        global_process_chains.clone(),
+        connect_manager.clone(),
+        tunnel_manager.clone(),
+    )));
+    factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
+        server_manager.clone(),
+        global_process_chains.clone(),
+        connect_manager.clone(),
+        tunnel_manager.clone(),
+    )));
+
+
+    let mut gateway = match factory.create_gateway(config_loader).await {
+        Ok(gateway) => gateway,
+        Err(e) => {
+            error!("create gateway failed: {}", e);
+            std::process::exit(1);
+        }
+    };
     gateway.start(params).await;
 
     // Sleep forever
@@ -78,7 +138,7 @@ async fn load_config_from_args(matches: &clap::ArgMatches) -> Result<serde_json:
         error!("{}", msg);
         msg
     })?;
-    
+
     let config_json = buckyos_kit::ConfigMerger::load_dir_with_root(&config_dir, &real_config_file).await?;
 
     Ok(config_json)
@@ -158,7 +218,7 @@ async fn main() {
             std::process::exit(1);
         })
         .unwrap();
-    
+
     //let config_json : Value = config_json.unwrap();
     info!("Gateway config: {}", serde_json::to_string_pretty(&config_json).unwrap());
 
@@ -172,73 +232,4 @@ async fn main() {
         error!("Gateway run error: {}", e);
     }
 
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config_loader::GatewayConfig;
-    use tokio::net::UdpSocket;
-    use tokio::task;
-    use tokio::test;
-
-    async fn start_test_udp_echo_server() -> Result<()> {
-        let socket = UdpSocket::bind("0.0.0.0:8889").await.unwrap();
-
-        let mut buf = [0; 2048]; // 缓冲区，接收数据
-
-        loop {
-            let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
-            socket.send_to(&buf[..len], &addr).await?;
-            info!("echo {} bytes back to {}", len, addr);
-        }
-    }
-
-    //#[test]
-    async fn test_dispatcher() {
-        //TODO: need fix
-        std::env::set_var("BUCKY_LOG", "debug");
-        buckyos_kit::init_logging("test_dispatcher",false);
-        buckyos_kit::start_tcp_echo_server("127.0.0.1:8888").await;
-        buckyos_kit::start_udp_echo_server("127.0.0.1:8889").await;
-
-        let config = r#"
-        {
-            "tcp://0.0.0.0:6001":{
-                "type":"forward",
-                "target":"tcp:///:8888"
-            },
-            "udp://0.0.0.0:6002":{
-                "type":"forward",
-                "target":"udp:///:8889"
-            },
-            "tcp://0.0.0.0:6003":{
-                "type":"forward",
-                "target":"socks://192.168.1.188:7890/qq.com:80"
-            },
-            "tcp://0.0.0.0:6004":{
-                "type":"probe_selector",
-                "probe_id":"https-sni",
-                "selector_id":"smart-selector"
-            },
-            "tcp://0.0.0.0:6005":{
-                "type":"selector",
-                "selector_id":"smart-selector"
-            }
-
-        }
-        "#;
-        let config: serde_json::Value = serde_json::from_str(config).unwrap();
-        let dispatcher_cfg = GatewayConfig::load_dispatcher_config(&config)
-            .await
-            .unwrap();
-
-        let tunnel_manager = GATEWAY_TUNNEL_MANAGER.get().unwrap();
-        let dispatcher = dispatcher::ServiceDispatcher::new(tunnel_manager.clone(),dispatcher_cfg);
-        dispatcher.start().await;
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        buckyos_kit::start_tcp_echo_client("127.0.0.1:6001").await;
-        buckyos_kit::start_udp_echo_client("127.0.0.1:6002").await;
-        tokio::time::sleep(std::time::Duration::from_secs(100)).await;
-    }
 }

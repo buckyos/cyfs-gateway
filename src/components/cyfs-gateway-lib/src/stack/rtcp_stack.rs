@@ -492,7 +492,7 @@ impl RtcpStackFactory {
 
 #[async_trait::async_trait]
 impl StackFactory for RtcpStackFactory {
-    async fn create(&self, config: Box<dyn StackConfig>) -> StackResult<StackBox> {
+    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackBox> {
         let config = config
             .as_any()
             .downcast_ref::<RtcpStackConfig>()
@@ -543,7 +543,7 @@ impl StackFactory for RtcpStackFactory {
 mod tests {
     use std::collections::HashMap;
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory, ServerConfig};
     use buckyos_kit::{AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, generate_ed25519_key_pair, DeviceConfig, EncodedDocument};
     use std::sync::Arc;
@@ -1050,6 +1050,10 @@ mod tests {
             stream.write_all("recv".as_bytes()).await.unwrap();
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             Ok(())
+        }
+
+        async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
+            todo!()
         }
     }
 
@@ -1574,6 +1578,10 @@ mod tests {
             assert_eq!(buf, b"test_server");
             Ok("datagram".as_bytes().to_vec())
         }
+
+        async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
+            todo!()
+        }
     }
 
     #[tokio::test]
@@ -1705,7 +1713,7 @@ mod tests {
             name: Some("test".to_string()),
         };
 
-        let ret = factory.create(Box::new(config)).await;
+        let ret = factory.create(Arc::new(config)).await;
         assert!(ret.is_ok());
 
         let config = RtcpStackConfig {
@@ -1717,7 +1725,7 @@ mod tests {
             name: Some("test".to_string()),
         };
 
-        let ret = factory.create(Box::new(config)).await;
+        let ret = factory.create(Arc::new(config)).await;
         assert!(ret.is_ok());
     }
 }

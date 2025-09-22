@@ -6,7 +6,7 @@ use hyper::body::{Bytes};
 use hyper::{http, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use cyfs_process_chain::{CollectionValue, MapCollection, ProcessChainLibExecutor};
-use crate::{HttpRequestHeaderMap, HttpServer, InnerHttpServiceManagerRef, ProcessChainConfigs, ServerError, ServerErrorCode, ServerResult};
+use crate::{HttpRequestHeaderMap, HttpServer, InnerHttpServiceManagerRef, ProcessChainConfigs, ServerConfig, ServerError, ServerErrorCode, ServerResult};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err, into_server_err};
 
@@ -145,6 +145,10 @@ impl HttpServer for ProcessChainHttpServer {
 
     fn http3_port(&self) -> Option<u16> {
         self.h3_port
+    }
+
+    async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
+        todo!()
     }
 }
 

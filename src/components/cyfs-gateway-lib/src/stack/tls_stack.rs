@@ -357,7 +357,7 @@ pub struct TlsStackConfig {
     #[serde(skip)]
     pub certs: Vec<TlsDomainConfig>,
     pub concurrency: Option<u32>,
-    pub alpn_protocols: Vec<String>,
+    pub alpn_protocols: Option<Vec<String>>,
 }
 
 impl crate::StackConfig for TlsStackConfig {
@@ -391,7 +391,7 @@ impl TlsStackFactory {
 
 #[async_trait::async_trait]
 impl crate::StackFactory for TlsStackFactory {
-    async fn create(&self, config: Box<dyn crate::StackConfig>) -> crate::StackResult<crate::StackBox> {
+    async fn create(&self, config: Arc<dyn crate::StackConfig>) -> crate::StackResult<crate::StackBox> {
         let config = config
             .as_any()
             .downcast_ref::<TlsStackConfig>()
@@ -405,7 +405,7 @@ impl crate::StackFactory for TlsStackFactory {
             .add_certs(config.certs.clone())
             .concurrency(config.concurrency.unwrap_or(0))
             .tunnel_manager(self.tunnel_manager.clone())
-            .alpn_protocols(config.alpn_protocols.iter().map(|s| s.as_bytes().to_vec()).collect())
+            .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec![]).iter().map(|s| s.as_bytes().to_vec()).collect())
             .build()
             .await?;
         Ok(Box::new(stack))
@@ -496,7 +496,7 @@ impl TlsStackBuilder {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerHttpServiceManager, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory};
+    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerHttpServiceManager, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, ServerConfig};
     use crate::{TlsDomainConfig, TlsStack};
     use buckyos_kit::AsyncStream;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
@@ -819,6 +819,10 @@ mod tests {
             stream.write_all("recv".as_bytes()).await.unwrap();
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             Ok(())
+        }
+
+        async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
+            todo!()
         }
     }
     #[derive(Debug)]
@@ -1144,9 +1148,9 @@ mod tests {
             hook_point: vec![],
             certs: vec![],
             concurrency: None,
-            alpn_protocols: vec![],
+            alpn_protocols: None,
         };
-        let ret = factory.create(Box::new(config)).await;
+        let ret = factory.create(Arc::new(config)).await;
         assert!(ret.is_ok());
     }
 }

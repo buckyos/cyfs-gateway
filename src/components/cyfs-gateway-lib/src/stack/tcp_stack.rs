@@ -337,7 +337,7 @@ impl TcpStackFactory {
 impl StackFactory for TcpStackFactory {
     async fn create(
         &self,
-        config: Box<dyn StackConfig>,
+        config: Arc<dyn StackConfig>,
     ) -> StackResult<Box<dyn Stack>> {
         let config = config.as_ref().as_any().downcast_ref::<TcpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
@@ -357,7 +357,7 @@ impl StackFactory for TcpStackFactory {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory};
+    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, ServerConfig};
     use buckyos_kit::AsyncStream;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use std::sync::Arc;
@@ -597,6 +597,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             Ok(())
         }
+
+        async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
+            todo!()
+        }
     }
     #[tokio::test]
     async fn test_tcp_stack_server() {
@@ -650,7 +654,7 @@ mod tests {
             hook_point: vec![],
         };
 
-        let ret = tcp_factory.create(Box::new(config)).await;
+        let ret = tcp_factory.create(Arc::new(config)).await;
         assert!(ret.is_ok());
     }
 }

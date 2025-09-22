@@ -10,6 +10,7 @@ use crate::{
 use buckyos_kit::AsyncStream;
 use log::*;
 use url::Url;
+use crate::quic_tunnel::QuicTunnelBuilder;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProtocolCategory {
@@ -53,6 +54,7 @@ impl TunnelManager {
         };
         this.register_tunnel_builder("tcp", Arc::new(IPTunnelBuilder::new()));
         this.register_tunnel_builder("udp", Arc::new(IPTunnelBuilder::new()));
+        this.register_tunnel_builder("quic", Arc::new(QuicTunnelBuilder::new()));
 
         this
     }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU32;
+use as_any::AsAny;
 use buckyos_kit::AsyncStream;
 use http::{HeaderName, Request, Uri};
 use http_body_util::BodyExt;
@@ -11,10 +12,47 @@ use tokio::sync::RwLock;
 use cyfs_process_chain::{CollectionValue, EnvRef, MapCollection, MapCollectionTraverseCallBackRef, TraverseGuard, VariableVisitor, VariableVisitorWrapperForMapCollection, HTTP_REQUEST_HEADER_VARS};
 use crate::{server_err, ServerError, ServerErrorCode, ServerResult};
 
-pub enum ServerType {
-    Http,
-    Stream,
-    Datagram,
+pub trait ServerConfig: AsAny + Send + Sync {
+    fn server_type(&self) -> String;
+}
+
+#[async_trait::async_trait]
+pub trait ServerFactory: Send + Sync {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server>;
+}
+
+pub struct CyfsServerFactory {
+    server_factory: Mutex<HashMap<String, Arc<dyn ServerFactory>>>,
+}
+
+impl Default for CyfsServerFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CyfsServerFactory {
+    pub fn new() -> Self {
+        Self {
+            server_factory: Mutex::new(HashMap::new()),
+        }
+    }
+    pub fn register(&self, server_type: String, factory: Arc<dyn ServerFactory>) {
+        self.server_factory.lock().unwrap().insert(server_type, factory);
+    }
+}
+
+#[async_trait::async_trait]
+impl ServerFactory for CyfsServerFactory {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
+        let factory = {
+            self.server_factory.lock().unwrap().get(config.server_type().as_str()).cloned()
+        };
+        match factory {
+            Some(factory) => factory.create(config).await,
+            None => Err(server_err!(ServerErrorCode::UnknownServerType, "unknown server type {}", config.server_type())),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -26,8 +64,9 @@ pub enum Server {
 
 // 流处理服务
 #[async_trait::async_trait]
-pub trait StreamServer: Send + Sync + 'static {
+pub trait StreamServer: Send + Sync {
     async fn serve_connection(&self, stream: Box<dyn AsyncStream>) -> ServerResult<()>;
+    async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()>;
 }
 
 #[derive(Clone)]
@@ -298,11 +337,13 @@ pub trait HttpServer: Send + Sync + 'static {
     async fn serve_request(&self, req: http::Request<BoxBody<Bytes, ServerError>>) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>>;
     fn http_version(&self) -> http::Version;
     fn http3_port(&self) -> Option<u16>;
+    async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()>;
 }
 
 #[async_trait::async_trait]
 pub trait DatagramServer: Send + Sync + 'static {
     async fn serve_datagram(&self, buf: &[u8]) -> ServerResult<Vec<u8>>;
+    async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()>;
 }
 
 pub struct ServerManager {

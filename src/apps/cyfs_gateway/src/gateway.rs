@@ -1,10 +1,10 @@
 use std::path::PathBuf;
-
+use std::sync::Arc;
 use super::config_loader::GatewayConfig;
 use super::dispatcher::ServiceDispatcher;
 use cyfs_dns::start_cyfs_dns_server;
 use cyfs_dns::DNSServer;
-use cyfs_gateway_lib::ServerConfig;
+use cyfs_gateway_lib::{ConnectionManager, ConnectionManagerRef, CyfsInnerServiceFactory, CyfsServerFactory, CyfsStackFactory, GlobalProcessChains, GlobalProcessChainsRef, InnerServiceFactory, ProcessChainConfigs, QuicStackFactory, RtcpStackFactory, ServerConfig, ServerFactory, ServerManager, ServerManagerRef, StackFactory, StackManager, StackProtocol, TcpStackFactory, TlsStackFactory, UdpStackFactory};
 use cyfs_gateway_lib::{GatewayDevice, GatewayDeviceRef, TunnelManager};
 use cyfs_socks::Socks5Proxy;
 use cyfs_warp::start_cyfs_warp_server;
@@ -16,47 +16,87 @@ use once_cell::sync::OnceCell;
 use tokio::sync::Mutex;
 use url::Url;
 use anyhow::Result;
-//use buckyos_api::{*}; 
+//use buckyos_api::{*};
 pub struct GatewayParams {
     pub keep_tunnel: Vec<String>,
 }
 
+pub struct GatewayFactory {
+    servers: ServerManagerRef,
+    global_process_chains: GlobalProcessChainsRef,
+    connection_manager: ConnectionManagerRef,
+    tunnel_manager: TunnelManager,
+    stack_factory: CyfsStackFactory,
+    server_factory: CyfsServerFactory,
+    inner_service_factory: CyfsInnerServiceFactory,
+}
+impl GatewayFactory {
+    pub fn new(
+        servers: ServerManagerRef,
+        global_process_chains: GlobalProcessChainsRef,
+        connection_manager: ConnectionManagerRef,
+        tunnel_manager: TunnelManager, ) -> Self {
+        Self {
+            servers,
+            global_process_chains,
+            connection_manager,
+            tunnel_manager,
+            stack_factory: CyfsStackFactory::new(),
+            server_factory: CyfsServerFactory::new(),
+            inner_service_factory: CyfsInnerServiceFactory::new(),
+        }
+    }
+
+    pub fn register_stack_factory(&self, protocol: StackProtocol, factory: Arc<dyn StackFactory>) {
+        self.stack_factory.register(protocol, factory);
+    }
+
+    pub fn register_server_factory(&self, server_type: String, factory: Arc<dyn ServerFactory>) {
+        self.server_factory.register(server_type, factory);
+    }
+
+    pub fn register_inner_service_factory(
+        &self,
+        service_type: String,
+        factory: Arc<dyn InnerServiceFactory>,
+    ) {
+        self.inner_service_factory.register(service_type, factory);
+    }
+
+    pub async fn create_gateway(
+        &self,
+        config: GatewayConfig,
+    ) -> Result<Gateway> {
+        let mut stack_manager = StackManager::new();
+        for stack_config in config.stacks.iter() {
+            let stack = self.stack_factory.create(stack_config.clone()).await?;
+            stack_manager.add_stack(stack);
+        }
+
+        Ok(Gateway {
+            config,
+            stack_manager,
+            tunnel_manager: self.tunnel_manager.clone(),
+            server_manager: self.servers.clone(),
+            global_process_chains: self.global_process_chains.clone(),
+        })
+    }
+}
+
 pub struct Gateway {
     config: GatewayConfig,
-    tunnel_manager: OnceCell<TunnelManager>,
-
-
-    // servers
-    warp_servers: Mutex<Vec<CyfsWarpServer>>,
-    dns_servers: Mutex<Vec<DNSServer>>,
-    socks_servers: Mutex<Vec<Socks5Proxy>>,
-    device_config: OnceCell<DeviceConfig>,
-    device_private_key: OnceCell<[u8; 48]>,
+    stack_manager: StackManager,
+    tunnel_manager: TunnelManager,
+    server_manager: ServerManagerRef,
+    global_process_chains: GlobalProcessChainsRef,
 }
 
 impl Gateway {
-    pub fn new(config: GatewayConfig) -> Self {
-        Self {
-            config,
-            tunnel_manager: OnceCell::new(),
-            device_config: OnceCell::new(),
-            warp_servers: Mutex::new(Vec::new()),
-            dns_servers: Mutex::new(Vec::new()),
-            socks_servers: Mutex::new(Vec::new()),
-            device_private_key: OnceCell::new(),
-        }
-    }
-
     pub fn tunnel_manager(&self) -> &TunnelManager {
-        self.tunnel_manager.get().unwrap()
+        &self.tunnel_manager
     }
 
-    pub async fn start(&self, params: GatewayParams) {
-        let init_result = self.load_device_keypair().await;
-        if init_result.is_err() {
-            error!("init device keypair failed, err:{}", init_result.err().unwrap());
-            return;
-        }
+    pub async fn start(&mut self, params: GatewayParams) {
         let mut real_machine_config = BuckyOSMachineConfig::default();
         let machine_config = BuckyOSMachineConfig::load_machine_config();
         if machine_config.is_some() {
@@ -68,104 +108,15 @@ impl Gateway {
             return;
         }
         info!("init default name client OK!");
-        
-        // Init tunnel manager
-        self.init_tunnel_manager().await;
 
         if !params.keep_tunnel.is_empty() {
             self.keep_tunnels(params.keep_tunnel).await;
         }
-        // Start servers
-        self.start_servers().await;
 
-        // Start dispatchers
-        self.start_dispatcher().await;
-    }
-
-    async fn load_device_keypair(&self) -> Result<()> {
-        //get device private key from config
-        // if not set,try load from default path
-        let device_private_key_path;
-        if self.config.device_key_path.is_file() {
-            device_private_key_path = self.config.device_key_path.clone();
-        } else {
-            device_private_key_path = get_buckyos_system_etc_dir().join("node_private_key.pem");
-        }
-
-        let device_private_key = load_raw_private_key(&device_private_key_path)
-            .map_err(|e| {
-                error!("load device_private_key failed: {}", e);
-                anyhow::anyhow!("load device_private_key failed: {}", e)
-            })?;
-        let set_result = self.device_private_key.set(device_private_key);
-        if set_result.is_err() {
-            error!("device_private_key can only be set once");
-        }
-        info!("cyfs-gatway load device private key from {} success", device_private_key_path.display());
-        let public_key = encode_ed25519_pkcs8_sk_to_pk(&device_private_key);
-        info!("cyfs-gatway load device public key: {}", public_key);
-        let mut will_use_current_device_from_env = false;
-        if try_load_current_device_config_from_env().is_ok() {
-            let device_config = CURRENT_DEVICE_CONFIG.get().unwrap();
-            let x_of_auth_key = get_x_from_jwk(&device_config.get_default_key().unwrap());
-            if x_of_auth_key.is_ok() {
-                let x_of_auth_key = x_of_auth_key.unwrap();
-                if x_of_auth_key == public_key {
-                    will_use_current_device_from_env = true;
-                    let set_result = self.device_config.set(device_config.clone());
-                    if set_result.is_err() {
-                        error!("device_config can only be set once");
-                    }
-                    info!("cyfs-gatway use current device from env,device_did:{},device_name:{}",device_config.id.to_string(),device_config.name.clone());
-                }
-            }
-        }
-
-        if !will_use_current_device_from_env {   
-            if self.config.device_name.is_none() {
-                error!("cann't load device config, device_name not set");
-                return Err(anyhow::anyhow!("device_name not set"));
-            }
-
-            let this_device_config = DeviceConfig::new(self.config.device_name.as_ref().unwrap(), public_key);
-            let set_result = self.device_config.set(this_device_config.clone());
-            if set_result.is_err() {
-                error!("device_config can only be set once");
-            }
-
-            info!("cyfs-gatway use device config: {}",this_device_config.id.to_string());
-
-            // Also set it to global for now..
-            let set_result = CURRENT_DEVICE_CONFIG.set(this_device_config);
-                if set_result.is_err() {
-                    error!("Failed to set CURRENT_DEVICE_CONFIG");
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn init_tunnel_manager(&self) {
-        let gateway_device = GatewayDevice {
-            config: self.device_config.get().unwrap().clone(),
-            private_key: self.device_private_key.get().unwrap().clone(),
-        };
-        let gateway_device = GatewayDeviceRef::new(gateway_device);
-        let tunnel_manager = TunnelManager::new();
-        let set_result = self.tunnel_manager.set(tunnel_manager.clone());
-        if set_result.is_err() {
-            error!("tunnel_manager can only be set once");
-        }
-
-        if let Err(_) = cyfs_gateway_lib::CURRENT_GATEWAY_DEVICE.set(gateway_device) {
-            unreachable!("CURRENT_GATEWAY_DEVICE can only be set once");
-        }
-
-        if let Err(_) = cyfs_gateway_lib::GATEWAY_TUNNEL_MANAGER.set(tunnel_manager) {
-            unreachable!("GATEWAY_TUNNEL_MANAGER can only be set once");
+        if let Err(e) = self.stack_manager.start().await {
+            error!("start stack manager failed, err:{}", e);
         }
     }
-
     async fn keep_tunnels(&self, keep_tunnel: Vec<String>) {
         for tunnel in keep_tunnel {
             self.keep_tunnel(tunnel.as_str()).await;
@@ -208,69 +159,5 @@ impl Gateway {
                 }
             }
         });
-    }
-
-    async fn start_servers(&self) {
-        for (server_id, server_config) in self.config.servers.iter() {
-            info!("Will start server: {}, {:?}", server_id, server_config);
-
-            match server_config {
-                ServerConfig::Warp(warp_config) => {
-                    let warp_config = warp_config.clone();
-                    match cyfs_warp::start_cyfs_warp_server(warp_config).await {
-                        Ok(warp_server) => {
-                            let mut warp_servers = self.warp_servers.lock().await;
-                            warp_servers.push(warp_server);
-                        }
-                        Err(e) => {
-                            // FIXME: should we return error here? or just ignore it?
-                            error!("Error starting warp server: {}", e);
-                        }
-                    }
-                }
-                ServerConfig::DNS(dns_config) => {
-                    let dns_config = dns_config.clone();
-
-                    let ret = cyfs_dns::start_cyfs_dns_server(dns_config).await;
-                    match ret {
-                        Ok(dns_server) => {
-                            let mut dns_servers = self.dns_servers.lock().await;
-                            dns_servers.push(dns_server);
-                        }
-                        Err(e) => {
-                            // FIXME: should we return error here? or just ignore it?
-                            error!("Error starting dns server: {}", e);
-                        }
-                    }
-                }
-                ServerConfig::Socks(socks_config) => {
-                    let tunnel_provider =
-                        crate::socks::SocksTunnelBuilder::new_ref(self.tunnel_manager().clone());
-
-                    let socks_config = socks_config.clone();
-                    let ret =
-                        cyfs_socks::start_cyfs_socks_server(socks_config, tunnel_provider).await;
-
-                    match ret {
-                        Ok(socks_server) => {
-                            let mut socks_servers = self.socks_servers.lock().await;
-                            socks_servers.push(socks_server);
-                        }
-                        Err(e) => {
-                            // FIXME: should we return error here? or just ignore it?
-                            error!("Error starting socks server: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    async fn start_dispatcher(&self) {
-        let dispatcher = ServiceDispatcher::new(
-            self.tunnel_manager().clone(),
-            self.config.dispatcher.clone(),
-        );
-        dispatcher.start().await;
     }
 }

@@ -856,7 +856,7 @@ impl UdpStackFactory {
 
 #[async_trait::async_trait]
 impl StackFactory for UdpStackFactory {
-    async fn create(&self, config: Box<dyn StackConfig>) -> StackResult<StackBox> {
+    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackBox> {
         let config = config
             .as_any()
             .downcast_ref::<UdpStackConfig>()
@@ -882,7 +882,7 @@ mod tests {
     use std::time::Duration;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use tokio::net::UdpSocket;
-    use crate::{ConnectionManager, GatewayDevice, ProcessChainConfigs, Server, ServerManager, ServerResult, Stack, StackFactory, StackProtocol, TunnelManager, UdpStack, UdpStackConfig, UdpStackFactory, GATEWAY_TUNNEL_MANAGER};
+    use crate::{ConnectionManager, GatewayDevice, ProcessChainConfigs, Server, ServerConfig, ServerManager, ServerResult, Stack, StackFactory, StackProtocol, TunnelManager, UdpStack, UdpStackConfig, UdpStackFactory, GATEWAY_TUNNEL_MANAGER};
     use crate::global_process_chains::GlobalProcessChains;
     use crate::server::{DatagramServer};
 
@@ -1024,6 +1024,10 @@ mod tests {
             assert_eq!(buf, b"test_server");
             Ok("datagram".as_bytes().to_vec())
         }
+
+        async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
+            todo!()
+        }
     }
 
     #[tokio::test]
@@ -1084,7 +1088,7 @@ mod tests {
             session_idle_time: None,
             hook_point: vec![],
         };
-        let ret = udp_factory.create(Box::new(config)).await;
+        let ret = udp_factory.create(Arc::new(config)).await;
         assert!(ret.is_ok());
     }
 }
