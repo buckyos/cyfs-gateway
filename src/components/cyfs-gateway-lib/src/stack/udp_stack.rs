@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap};
 use std::net::SocketAddr;
 use std::ops::Div;
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration};
 use serde::{Deserialize, Serialize};
 use sfo_io::{Datagram, LimitDatagram, SfoSpeedStat, SpeedTracker};
-use tokio::io::{Interest};
 use tokio::net::{UdpSocket};
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
@@ -15,6 +17,7 @@ use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecuto
 use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, SpeedStatRef, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackBox, config_err};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
+#[cfg(unix)]
 use crate::stack::{has_root_privileges, recv_from, set_socket_opt};
 
 pub struct UdpSendDatagram {
@@ -667,8 +670,13 @@ impl UdpStackInner {
         }
         // 4. 绑定套接字到指定地址
         socket.bind(&sockaddr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind error"))?;
+        #[cfg(unix)]
         let socket = unsafe {
             std::net::UdpSocket::from_raw_fd(socket.into_raw_fd())
+        };
+        #[cfg(windows)]
+        let socket = unsafe {
+            std::net::UdpSocket::from_raw_socket(socket.into_raw_socket())
         };
         let udp_socket = tokio::net::UdpSocket::from_std(socket).map_err(into_stack_err!(StackErrorCode::IoError))?;
         let udp_socket = Arc::new(udp_socket);
@@ -709,7 +717,7 @@ impl UdpStackInner {
                         };
                         (len, addr, dest_addr)
                     };
-                #[cfg(not(unix))]
+                #[cfg(windows)]
                 let (len, src_addr, dest_addr) = {
                     let (len, addr) = match udp_socket.recv_from(&mut buffer).await {
                         Ok(pair) => pair,
@@ -718,8 +726,13 @@ impl UdpStackInner {
                             break;
                         }
                     };
-                    let dest_addr = udp_socket.local_addr()
-                        .map_err(into_stack_err!(StackErrorCode::InvalidData))?;
+                    let dest_addr = match udp_socket.local_addr() {
+                        Ok(addr) => addr,
+                        Err(err) => {
+                            log::error!("get local addr error: {}", err);
+                            break;
+                        }
+                    };
                     (len, addr, dest_addr)
                 };
                 let this = this.clone();

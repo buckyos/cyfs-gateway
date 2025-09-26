@@ -1,4 +1,8 @@
+#[cfg(unix)]
 use super::{get_socket_opt, has_root_privileges, set_socket_opt, sockaddr_to_socket_addr, stream_forward, Stack};
+#[cfg(windows)]
+use super::{stream_forward, Stack};
+
 use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
@@ -6,7 +10,10 @@ use crate::global_process_chains::{
 use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
@@ -111,8 +118,13 @@ impl TcpStackInner {
         }
         socket.bind(&sockaddr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind error"))?;
         socket.listen(1024).map_err(into_stack_err!(StackErrorCode::ListenFailed, "listen error"))?;
+        #[cfg(unix)]
         let std_listener = unsafe {
             std::net::TcpListener::from_raw_fd(socket.into_raw_fd())
+        };
+        #[cfg(windows)]
+        let std_listener = unsafe {
+            std::net::TcpListener::from_raw_socket(socket.into_raw_socket())
         };
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(into_stack_err!(StackErrorCode::BindFailed))?;
@@ -155,28 +167,29 @@ impl TcpStackInner {
     }
 
     fn get_dest_addr(stream: &TcpStream) -> StackResult<SocketAddr> {
-        #[cfg(unix)]
-        let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let ret = get_socket_opt(
-            stream,
-            libc::SOL_IPV6,
-            libc::IP6T_SO_ORIGINAL_DST,
-            &mut addr,
-        );
-        if ret.is_ok() {
-            return sockaddr_to_socket_addr(&addr)
-                .map_err(into_stack_err!(StackErrorCode::InvalidData, "read dest addr failed"));
-        }
+        #[cfg(unix)] {
+            let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+            let ret = crate::stack::get_socket_opt(
+                stream,
+                libc::SOL_IPV6,
+                libc::IP6T_SO_ORIGINAL_DST,
+                &mut addr,
+            );
+            if ret.is_ok() {
+                return crate::stack::sockaddr_to_socket_addr(&addr)
+                    .map_err(into_stack_err!(StackErrorCode::InvalidData, "read dest addr failed"));
+            }
 
-        let ret = get_socket_opt(
-            stream,
-            libc::SOL_IP,
-            libc::SO_ORIGINAL_DST,
-            &mut addr,
-        );
-        if ret.is_ok() {
-            return sockaddr_to_socket_addr(&addr)
-                .map_err(into_stack_err!(StackErrorCode::InvalidData, "read dest addr failed"));
+            let ret = crate::stack::get_socket_opt(
+                stream,
+                libc::SOL_IP,
+                libc::SO_ORIGINAL_DST,
+                &mut addr,
+            );
+            if ret.is_ok() {
+                return crate::stack::sockaddr_to_socket_addr(&addr)
+                    .map_err(into_stack_err!(StackErrorCode::InvalidData, "read dest addr failed"));
+            }
         }
 
         stream.local_addr().map_err(into_stack_err!(StackErrorCode::ServerError, "read dest addr failed"))

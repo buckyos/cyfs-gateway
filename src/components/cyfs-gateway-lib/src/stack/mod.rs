@@ -6,6 +6,7 @@ mod tls_stack;
 mod quic_stack;
 mod limiter;
 
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use buckyos_kit::AsyncStream;
 pub use tcp_stack::*;
@@ -98,6 +99,7 @@ pub(crate) async fn copy_datagram_bidirectional(a: Box<dyn DatagramClientBox>, b
     Ok(())
 }
 
+#[cfg(unix)]
 pub(crate) fn sockaddr_to_socket_addr(addr: &libc::sockaddr_storage) -> std::io::Result<std::net::SocketAddr> {
     unsafe {
         match (*addr).ss_family as i32 {
@@ -127,6 +129,7 @@ pub(crate) fn sockaddr_to_socket_addr(addr: &libc::sockaddr_storage) -> std::io:
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn set_socket_opt<T: AsRawFd, V>(
     socket: &T,
     level: libc::c_int,
@@ -151,6 +154,7 @@ pub(crate) fn set_socket_opt<T: AsRawFd, V>(
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn get_socket_opt<T: AsRawFd, V>(
     socket: &T,
     level: libc::c_int,
@@ -176,6 +180,7 @@ pub(crate) fn get_socket_opt<T: AsRawFd, V>(
     }
 }
 
+#[cfg(unix)]
 fn get_destination_addr(msg: &libc::msghdr) -> Option<libc::sockaddr_storage> {
     unsafe {
         let mut cmsg: *mut libc::cmsghdr = libc::CMSG_FIRSTHDR(msg);
@@ -213,6 +218,7 @@ fn get_destination_addr(msg: &libc::msghdr) -> Option<libc::sockaddr_storage> {
     None
 }
 
+#[cfg(unix)]
 pub(crate) fn recv_from<T: AsRawFd>(
     socket: &T,
     buf: &mut [u8]
@@ -257,6 +263,7 @@ pub(crate) fn recv_from<T: AsRawFd>(
     }
 }
 
+#[cfg(unix)]
 fn has_root_privileges() -> bool {
     // 获取当前进程的有效用户ID (EUID)
     let euid: libc::uid_t = unsafe { libc::geteuid() };
