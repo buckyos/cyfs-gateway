@@ -1,5 +1,4 @@
-use std::any::Any;
-use super::{stream_forward, Stack};
+use super::{get_socket_opt, has_root_privileges, set_socket_opt, sockaddr_to_socket_addr, stream_forward, Stack};
 use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
@@ -7,8 +6,8 @@ use crate::global_process_chains::{
 use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
+use std::os::fd::{FromRawFd, IntoRawFd};
 use std::sync::{Arc, Mutex};
-use as_any::AsAny;
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
 use tokio::net::TcpStream;
@@ -21,6 +20,7 @@ struct TcpStackInner {
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: TunnelManager,
+    transparent: bool,
 }
 
 
@@ -60,18 +60,66 @@ impl TcpStackInner {
             executor: Arc::new(Mutex::new(executor)),
             connection_manager: config.connection_manager,
             tunnel_manager: config.tunnel_manager.unwrap(),
+            transparent: config.transparent,
         })
     }
 
     pub async fn start(self: &Arc<Self>) -> StackResult<JoinHandle<()>> {
-        let bind_addr = self.bind_addr.clone();
-        let listener = tokio::net::TcpListener::bind(bind_addr.as_str())
-            .await
+        let addr: SocketAddr = self.bind_addr.parse()
+            .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "invalid bind address"))?;
+        let sockaddr: socket2::SockAddr = addr.into();
+
+        // 2. 创建原始套接字
+        // 根据目标地址的IP版本选择域 (Domain::IPV4 或 Domain::IPV6)
+        let domain = match addr {
+            std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
+            std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+        // 创建数据报 (DGRAM) 套接字，对应 UDP
+        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+            .map_err(into_stack_err!(StackErrorCode::IoError, "create socket error"))?;
+
+        socket.set_nonblocking(true).map_err(into_stack_err!(StackErrorCode::IoError, "set nonblocking error"))?;
+        #[cfg(unix)]
+        {
+            if self.transparent {
+                if !has_root_privileges() {
+                    return Err(stack_err!(
+                        StackErrorCode::PermissionDenied,
+                        "transparent mode requires root privileges"
+                    ));
+                }
+                socket.set_reuse_address(true)
+                    .map_err(into_stack_err!(StackErrorCode::IoError, "set reuse address error"))?;
+                socket.set_ip_transparent_v4(true)
+                    .map_err(into_stack_err!(StackErrorCode::IoError, "set ip transparent error"))?;
+
+                unsafe {
+                    if domain == socket2::Domain::IPV4 {
+                        set_socket_opt(&socket,
+                                       libc::SOL_IP,
+                                       libc::IP_TRANSPARENT,
+                                       libc::c_int::from(1))?;
+                    } else if domain == socket2::Domain::IPV6 {
+                        set_socket_opt(&socket,
+                                       libc::SOL_IPV6,
+                                       libc::IP_TRANSPARENT,
+                                       libc::c_int::from(1))?;
+                    }
+                }
+            }
+        }
+        socket.bind(&sockaddr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind error"))?;
+        socket.listen(1024).map_err(into_stack_err!(StackErrorCode::ListenFailed, "listen error"))?;
+        let std_listener = unsafe {
+            std::net::TcpListener::from_raw_fd(socket.into_raw_fd())
+        };
+        let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(into_stack_err!(StackErrorCode::BindFailed))?;
         let this = self.clone();
         let handle = tokio::spawn(async move {
             loop {
-                let (stream, local_addr) = match listener.accept().await {
+                let (stream, remote_addr) = match listener.accept().await {
                     Ok(s) => s,
                     Err(e) => {
                         log::error!("accept tcp stream failed: {}", e);
@@ -79,44 +127,72 @@ impl TcpStackInner {
                     }
                 };
 
-                let remote_addr = match stream.peer_addr() {
+                let dest_addr = match Self::get_dest_addr(&stream) {
                     Ok(addr) => addr,
                     Err(e) => {
-                        log::error!("get remote addr failed: {}", e);
+                        log::error!("get dest addr failed: {}", e);
                         continue;
                     }
                 };
-
+                log::info!("accept tcp stream from {} to {}", remote_addr, dest_addr);
                 let this_tmp = this.clone();
                 let stat_stream = StatStream::new(stream);
                 let speed = stat_stream.get_speed_stat();
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        this_tmp.handle_connect(stat_stream, local_addr).await
+                        this_tmp.handle_connect(stat_stream, dest_addr).await
                     {
                         log::error!("handle tcp stream failed: {}", e);
                     }
                 });
                 if let Some(manager) = &this.connection_manager {
                     let controller = HandleConnectionController::new(handle);
-                    manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), local_addr.to_string(), StackProtocol::Tcp, speed, controller));
+                    manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), dest_addr.to_string(), StackProtocol::Tcp, speed, controller));
                 }
             }
         });
         Ok(handle)
     }
 
+    fn get_dest_addr(stream: &TcpStream) -> StackResult<SocketAddr> {
+        #[cfg(unix)]
+        let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let ret = get_socket_opt(
+            stream,
+            libc::SOL_IPV6,
+            libc::IP6T_SO_ORIGINAL_DST,
+            &mut addr,
+        );
+        if ret.is_ok() {
+            return sockaddr_to_socket_addr(&addr)
+                .map_err(into_stack_err!(StackErrorCode::InvalidData, "read dest addr failed"));
+        }
+
+        let ret = get_socket_opt(
+            stream,
+            libc::SOL_IP,
+            libc::SO_ORIGINAL_DST,
+            &mut addr,
+        );
+        if ret.is_ok() {
+            return sockaddr_to_socket_addr(&addr)
+                .map_err(into_stack_err!(StackErrorCode::InvalidData, "read dest addr failed"));
+        }
+
+        stream.local_addr().map_err(into_stack_err!(StackErrorCode::ServerError, "read dest addr failed"))
+    }
+
     async fn handle_connect(
         &self,
         mut stream: StatStream<TcpStream>,
-        local_addr: SocketAddr,
+        dest_addr: SocketAddr,
     ) -> StackResult<()> {
         let executor = {
             self.executor.lock().unwrap().fork()
         };
         let servers = self.servers.clone();
         let remote_addr = stream.raw_stream().peer_addr().map_err(into_stack_err!(StackErrorCode::ServerError, "read remote addr failed"))?;
-        let mut request = StreamRequest::new(Box::new(stream), local_addr);
+        let mut request = StreamRequest::new(Box::new(stream), dest_addr);
         request.source_addr = Some(remote_addr);
         let (ret, stream) = execute_stream_chain(executor, request)
             .await
@@ -209,6 +285,7 @@ impl TcpStack {
             global_process_chains: None,
             connection_manager: None,
             tunnel_manager: None,
+            transparent: false,
         }
     }
 
@@ -258,6 +335,7 @@ pub struct TcpStackBuilder {
     global_process_chains: Option<GlobalProcessChainsRef>,
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: Option<TunnelManager>,
+    transparent: bool,
 }
 
 impl TcpStackBuilder {
@@ -291,6 +369,11 @@ impl TcpStackBuilder {
         self
     }
 
+    pub fn transparent(mut self, transparent: bool) -> Self {
+        self.transparent = transparent;
+        self
+    }
+
     pub async fn build(self) -> StackResult<TcpStack> {
         let stack = TcpStack::create(self).await?;
         Ok(stack)
@@ -301,6 +384,7 @@ impl TcpStackBuilder {
 pub struct TcpStackConfig {
     pub protocol: StackProtocol,
     pub bind: SocketAddr,
+    pub transparent: Option<bool>,
     pub hook_point: Vec<ProcessChainConfig>,
 }
 
@@ -347,6 +431,7 @@ impl StackFactory for TcpStackFactory {
             .connection_manager(self.connection_manager.clone())
             .global_process_chains(self.global_process_chains.clone())
             .servers(self.servers.clone())
+            .transparent(config.transparent.unwrap_or(false))
             .hook_point(config.hook_point.clone())
             .build().await?;
         Ok(Box::new(stack))
@@ -651,6 +736,7 @@ mod tests {
         let config = TcpStackConfig {
             protocol: StackProtocol::Tcp,
             bind: "127.0.0.1:3345".parse().unwrap(),
+            transparent: None,
             hook_point: vec![],
         };
 

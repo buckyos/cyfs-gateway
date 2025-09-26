@@ -4,7 +4,7 @@
       "path": "user_gateway.json"
     },
     {
-      "path": "boot_gateway.json"
+      "path": "boot_gateway.yaml"
     },
     {
       "path": "node_gateway.json"
