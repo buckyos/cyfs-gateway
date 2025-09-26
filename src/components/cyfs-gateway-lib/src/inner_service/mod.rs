@@ -1,23 +1,37 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+pub use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use as_any::AsAny;
-use http::{Request, Response};
-use http_body_util::combinators::BoxBody;
-use hyper::body::Bytes;
-use name_client::{NameInfo, RecordType};
+pub use http::{Request, Response};
+pub use http_body_util::combinators::BoxBody;
+pub use hyper::body::Bytes;
+pub use name_client::{NameInfo, RecordType};
 use name_lib::{EncodedDocument, DID};
+pub use sfo_result::err as service_err;
+pub use sfo_result::into_err as into_service_err;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ServiceErrorCode {
     Failed,
     UnknownService,
+    InvalidConfig,
 }
 pub type ServiceResult<T> = sfo_result::Result<T, ServiceErrorCode>;
 pub type ServiceError = sfo_result::Error<ServiceErrorCode>;
 
-pub trait InnerService: Send + Sync {
-    fn service_type(&self) -> String;
+#[derive(Clone)]
+pub enum InnerService {
+    HttpService(Arc<dyn InnerHttpService>),
+    DnsService(Arc<dyn InnerDnsService>),
+}
+
+impl InnerService {
+    pub fn id(&self) -> String {
+        match self {
+            InnerService::HttpService(service) => service.id(),
+            InnerService::DnsService(service) => service.id(),
+        }
+    }
 }
 
 pub trait InnerServiceConfig: AsAny + Send + Sync {
@@ -26,7 +40,7 @@ pub trait InnerServiceConfig: AsAny + Send + Sync {
 
 #[async_trait::async_trait]
 pub trait InnerServiceFactory: Send + Sync {
-    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<Arc<dyn InnerService>>;
+    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<InnerService>;
 }
 
 pub struct CyfsInnerServiceFactory {
@@ -52,7 +66,7 @@ impl CyfsInnerServiceFactory {
 
 #[async_trait::async_trait]
 impl InnerServiceFactory for CyfsInnerServiceFactory {
-    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<Arc<dyn InnerService>> {
+    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<InnerService> {
         let factory = {
             self.service_factory.lock().unwrap().get(&config.service_type()).cloned()
         };
@@ -66,37 +80,62 @@ impl InnerServiceFactory for CyfsInnerServiceFactory {
         }
     }
 }
+
 #[async_trait::async_trait]
 pub trait InnerHttpService: Send + Sync {
+    fn id(&self) -> String;
     async fn handle(&self, request: Request<BoxBody<Bytes, ()>>) -> Response<BoxBody<Bytes, ()>>;
 }
 
-pub struct InnerHttpServiceManager {
-    services: HashMap<String, Arc<dyn InnerHttpService>>,
+pub struct InnerServiceManager {
+    services: Mutex<HashMap<String, InnerService>>,
 }
-pub type InnerHttpServiceManagerRef = Arc<InnerHttpServiceManager>;
+pub type InnerServiceManagerRef = Arc<InnerServiceManager>;
 
 
-impl Default for InnerHttpServiceManager {
+impl Default for InnerServiceManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl InnerHttpServiceManager {
+impl InnerServiceManager {
     pub fn new() -> Self {
         Self {
-            services: HashMap::new(),
+            services: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn add_service(&self, service: String, service_impl: InnerService) {
+        self.services.lock().unwrap().insert(service, service_impl);
+    }
+
+    pub fn get_service(&self, service: &str) -> Option<InnerService> {
+        self.services.lock().unwrap().get(service).cloned()
+    }
+
+    pub fn get_http_service(&self, service: &str) -> Option<Arc<dyn InnerHttpService>> {
+        self.get_service(service).and_then(|service| {
+            match service {
+                InnerService::HttpService(service) => Some(service.clone()),
+                _ => None,
+            }
+        })
+    }
+
+    pub fn get_dns_service(&self, service: &str) -> Option<Arc<dyn InnerDnsService>> {
+        self.get_service(service).and_then(|service| {
+            match service {
+                InnerService::DnsService(service) => Some(service.clone()),
+                _ => None,
+            }
+        })
     }
 }
 
 #[async_trait::async_trait]
 pub trait InnerDnsService: Send + Sync {
+    fn id(&self) -> String;
     async fn query(&self, name: &str, record_type: Option<RecordType>, from_ip: Option<IpAddr>) -> Result<NameInfo, ()>;
     async fn query_did(&self, did: &DID, fragment: Option<&str>, from_ip: Option<IpAddr>) -> Result<EncodedDocument, ()>;
-}
-
-pub struct InnerDnsServiceManager {
-    services: HashMap<String, Arc<dyn InnerDnsService>>,
 }

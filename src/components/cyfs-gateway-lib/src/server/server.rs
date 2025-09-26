@@ -62,10 +62,20 @@ pub enum Server {
     Datagram(Arc<dyn DatagramServer>),
 }
 
+impl Server {
+    pub fn id(&self) -> String {
+        match self {
+            Server::Http(server) => server.id(),
+            Server::Stream(server) => server.id(),
+            Server::Datagram(server) => server.id(),
+        }
+    }
+}
 // 流处理服务
 #[async_trait::async_trait]
 pub trait StreamServer: Send + Sync {
     async fn serve_connection(&self, stream: Box<dyn AsyncStream>) -> ServerResult<()>;
+    fn id(&self) -> String;
     async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()>;
 }
 
@@ -335,6 +345,7 @@ impl VariableVisitor for HttpRequestUrlVisitor {
 #[async_trait::async_trait]
 pub trait HttpServer: Send + Sync + 'static {
     async fn serve_request(&self, req: http::Request<BoxBody<Bytes, ServerError>>) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>>;
+    fn id(&self) -> String;
     fn http_version(&self) -> http::Version;
     fn http3_port(&self) -> Option<u16>;
     async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()>;
@@ -343,6 +354,7 @@ pub trait HttpServer: Send + Sync + 'static {
 #[async_trait::async_trait]
 pub trait DatagramServer: Send + Sync + 'static {
     async fn serve_datagram(&self, buf: &[u8]) -> ServerResult<Vec<u8>>;
+    fn id(&self) -> String;
     async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()>;
 }
 

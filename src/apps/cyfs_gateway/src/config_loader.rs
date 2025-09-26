@@ -1,5 +1,5 @@
 use buckyos_kit::{adjust_path, get_buckyos_root_dir};
-use cyfs_gateway_lib::{config_err, into_config_err, ConfigErrorCode, ConfigResult, DNSServerConfig, InnerServiceConfig, ProcessChainConfigs, QuicStackConfig, RtcpStackConfig, ServerConfig, StackBox, StackConfig, TcpStackConfig, TlsStack, UdpStackConfig};
+use cyfs_gateway_lib::{config_err, into_config_err, ConfigErrorCode, ConfigResult, DNSServerConfig, InnerServiceConfig, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackBox, StackConfig, TcpStackConfig, TlsStack, UdpStackConfig};
 use cyfs_gateway_lib::DispatcherConfig;
 use cyfs_gateway_lib::WarpServerConfig;
 use cyfs_sn::*;
@@ -191,7 +191,9 @@ impl HttpServerConfigParser {
 
 impl<D: for<'de> Deserializer<'de>> ServerConfigParser<D> for HttpServerConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        todo!();
+        let config = ProcessChainHttpServerConfig::deserialize(de)
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", e))?;
+        Ok(Arc::new(config))
     }
 }
 

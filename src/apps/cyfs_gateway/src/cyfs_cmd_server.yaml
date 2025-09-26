@@ -1,0 +1,25 @@
+stacks:
+  - listen: 127.0.0.1:13451
+    protocol: tcp
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              return "server cmd_server";
+
+servers:
+  - id: cmd_server
+    type: http
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              return "inner cmd_inner_server";
+
+inner_services:
+  - id: cmd_inner_server
+    type: cmd_server

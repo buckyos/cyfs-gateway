@@ -16,7 +16,7 @@ impl GlobalProcessChains {
         }
     }
 
-    pub fn add_process_chain(&mut self, process_chain: ProcessChainRef) {
+    pub fn add_process_chain(&self, process_chain: ProcessChainRef) {
         let process_chain_lib = ProcessChainListLib::new(process_chain.id().to_string().as_str(), 0, vec![process_chain]);
         self.process_chains.lock().unwrap().push(process_chain_lib.into_process_chain_lib());
     }

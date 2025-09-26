@@ -1053,6 +1053,10 @@ mod tests {
             Ok(())
         }
 
+        fn id(&self) -> String {
+            todo!()
+        }
+
         async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
             todo!()
         }
@@ -1579,6 +1583,10 @@ mod tests {
         async fn serve_datagram(&self, buf: &[u8]) -> ServerResult<Vec<u8>> {
             assert_eq!(buf, b"test_server");
             Ok("datagram".as_bytes().to_vec())
+        }
+
+        fn id(&self) -> String {
+            todo!()
         }
 
         async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {

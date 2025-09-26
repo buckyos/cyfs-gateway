@@ -4,7 +4,7 @@ use super::config_loader::GatewayConfig;
 use super::dispatcher::ServiceDispatcher;
 use cyfs_dns::start_cyfs_dns_server;
 use cyfs_dns::DNSServer;
-use cyfs_gateway_lib::{ConnectionManager, ConnectionManagerRef, CyfsInnerServiceFactory, CyfsServerFactory, CyfsStackFactory, GlobalProcessChains, GlobalProcessChainsRef, InnerServiceFactory, ProcessChainConfigs, QuicStackFactory, RtcpStackFactory, ServerConfig, ServerFactory, ServerManager, ServerManagerRef, StackFactory, StackManager, StackProtocol, TcpStackFactory, TlsStackFactory, UdpStackFactory};
+use cyfs_gateway_lib::{ConnectionManager, ConnectionManagerRef, CyfsInnerServiceFactory, CyfsServerFactory, CyfsStackFactory, GlobalProcessChains, GlobalProcessChainsRef, InnerServiceFactory, InnerServiceManager, InnerServiceManagerRef, ProcessChainConfigs, QuicStackFactory, RtcpStackFactory, ServerConfig, ServerFactory, ServerManager, ServerManagerRef, StackFactory, StackManager, StackProtocol, TcpStackFactory, TlsStackFactory, UdpStackFactory};
 use cyfs_gateway_lib::{GatewayDevice, GatewayDeviceRef, TunnelManager};
 use cyfs_socks::Socks5Proxy;
 use cyfs_warp::start_cyfs_warp_server;
@@ -26,6 +26,7 @@ pub struct GatewayFactory {
     global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
+    inner_service_manager: InnerServiceManagerRef,
     stack_factory: CyfsStackFactory,
     server_factory: CyfsServerFactory,
     inner_service_factory: CyfsInnerServiceFactory,
@@ -35,12 +36,14 @@ impl GatewayFactory {
         servers: ServerManagerRef,
         global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
-        tunnel_manager: TunnelManager, ) -> Self {
+        tunnel_manager: TunnelManager,
+        inner_service_manager: InnerServiceManagerRef) -> Self {
         Self {
             servers,
             global_process_chains,
             connection_manager,
             tunnel_manager,
+            inner_service_manager,
             stack_factory: CyfsStackFactory::new(),
             server_factory: CyfsServerFactory::new(),
             inner_service_factory: CyfsInnerServiceFactory::new(),
@@ -51,16 +54,16 @@ impl GatewayFactory {
         self.stack_factory.register(protocol, factory);
     }
 
-    pub fn register_server_factory(&self, server_type: String, factory: Arc<dyn ServerFactory>) {
-        self.server_factory.register(server_type, factory);
+    pub fn register_server_factory<T: Into<String>>(&self, server_type: T, factory: Arc<dyn ServerFactory>) {
+        self.server_factory.register(server_type.into(), factory);
     }
 
-    pub fn register_inner_service_factory(
+    pub fn register_inner_service_factory<T: Into<String>>(
         &self,
-        service_type: String,
+        service_type: T,
         factory: Arc<dyn InnerServiceFactory>,
     ) {
-        self.inner_service_factory.register(service_type, factory);
+        self.inner_service_factory.register(service_type.into(), factory);
     }
 
     pub async fn create_gateway(
@@ -73,11 +76,27 @@ impl GatewayFactory {
             stack_manager.add_stack(stack);
         }
 
+        for server_config in config.servers.iter() {
+            let server = self.server_factory.create(server_config.clone()).await?;
+            self.servers.add_server(server.id(), server);
+        }
+
+        for inner_service_config in config.inner_services.iter() {
+            let service = self.inner_service_factory.create(inner_service_config.clone()).await?;
+            self.inner_service_manager.add_service(service.id(), service);
+        }
+
+        for process_chain_config in config.global_process_chains.iter() {
+            let process_chain = process_chain_config.create_process_chain()?;
+            self.global_process_chains.add_process_chain(Arc::new(process_chain));
+        }
+        
         Ok(Gateway {
             config,
             stack_manager,
             tunnel_manager: self.tunnel_manager.clone(),
             server_manager: self.servers.clone(),
+            inner_service_factory: self.inner_service_manager.clone(),
             global_process_chains: self.global_process_chains.clone(),
         })
     }
@@ -88,6 +107,7 @@ pub struct Gateway {
     stack_manager: StackManager,
     tunnel_manager: TunnelManager,
     server_manager: ServerManagerRef,
+    inner_service_factory: InnerServiceManagerRef,
     global_process_chains: GlobalProcessChainsRef,
 }
 

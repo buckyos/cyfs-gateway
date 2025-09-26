@@ -7,7 +7,8 @@ mod config_loader;
 mod dispatcher;
 mod gateway;
 mod socks;
-
+mod cyfs_cmd_server;
+mod cyfs_cmd_client;
 //mod peer;
 //mod proxy;
 //mod service;
@@ -33,6 +34,7 @@ use serde_json::{Value};
 use tokio::task;
 use url::Url;
 use crate::config_loader::{GatewayConfigParser, HttpServerConfigParser, QuicStackConfigParser, RtcpStackConfigParser, TcpStackConfigParser, TlsStackConfigParser, UdpStackConfigParser};
+use crate::cyfs_cmd_server::{CyfsCmdServerConfigParser, CyfsCmdServerFactory};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -46,6 +48,8 @@ async fn service_main(config_json: serde_json::Value, matches: &clap::ArgMatches
     parser.register_stack_config_parser("quic", Arc::new(QuicStackConfigParser::new()));
 
     parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
+
+    parser.register_inner_service_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
 
     let load_result = parser.parse(config_json);
     if load_result.is_err() {
@@ -68,12 +72,14 @@ async fn service_main(config_json: serde_json::Value, matches: &clap::ArgMatches
     let tunnel_manager = TunnelManager::new();
     let server_manager = Arc::new(ServerManager::new());
     let global_process_chains = Arc::new(GlobalProcessChains::new());
+    let inner_service_manager = Arc::new(InnerServiceManager::new());
 
     let factory = GatewayFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
         connect_manager.clone(),
         tunnel_manager.clone(),
+        inner_service_manager.clone(),
     );
     factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
         server_manager.clone(),
@@ -106,6 +112,12 @@ async fn service_main(config_json: serde_json::Value, matches: &clap::ArgMatches
         tunnel_manager.clone(),
     )));
 
+    factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
+        inner_service_manager.clone(),
+        global_process_chains.clone(),
+    )));
+    
+    factory.register_inner_service_factory("cmd_server", Arc::new(CyfsCmdServerFactory::new()));
 
     let mut gateway = match factory.create_gateway(config_loader).await {
         Ok(gateway) => gateway,

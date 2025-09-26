@@ -496,7 +496,7 @@ impl TlsStackBuilder {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerHttpServiceManager, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, ServerConfig};
+    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerServiceManager, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, ServerConfig};
     use crate::{TlsDomainConfig, TlsStack};
     use buckyos_kit::AsyncStream;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
@@ -821,6 +821,10 @@ mod tests {
             Ok(())
         }
 
+        fn id(&self) -> String {
+            todo!()
+        }
+
         async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
             todo!()
         }
@@ -959,7 +963,7 @@ mod tests {
             .h3_port(9186)
             .hook_point(chains)
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .inner_services(Arc::new(InnerHttpServiceManager::new()))
+            .inner_services(Arc::new(InnerServiceManager::new()))
             .build().await.unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
@@ -1056,7 +1060,7 @@ mod tests {
             .h3_port(9186)
             .hook_point(chains)
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .inner_services(Arc::new(InnerHttpServiceManager::new()))
+            .inner_services(Arc::new(InnerServiceManager::new()))
             .build().await.unwrap();
 
         let server_manager = Arc::new(ServerManager::new());

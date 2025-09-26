@@ -13,6 +13,10 @@ impl StreamServer for Socks5Server {
         Ok(())
     }
 
+    fn id(&self) -> String {
+        todo!()
+    }
+
     async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
         todo!()
     }
