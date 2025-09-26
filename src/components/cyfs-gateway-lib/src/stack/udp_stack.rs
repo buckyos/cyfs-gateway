@@ -691,7 +691,7 @@ impl UdpStackInner {
                 #[cfg(unix)]
                 let (len, src_addr, dest_addr) =
                     if this.transparent {
-                        match udp_socket.async_io(Interest::READABLE, || {
+                        match udp_socket.async_io(tokio::io::Interest::READABLE, || {
                             recv_from(&udp_socket, &mut buffer)
                         }).await {
                             Ok(ret) => ret,

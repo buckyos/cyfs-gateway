@@ -56,11 +56,11 @@ impl Tunnel for QuicTunnel {
         self.open_stream_by_dest(dest_port, dest_host).await
     }
 
-    async fn create_datagram_client_by_dest(&self, dest_port: u16, dest_host: Option<String>) -> Result<Box<dyn DatagramClientBox>, Error> {
+    async fn create_datagram_client_by_dest(&self, _dest_port: u16, _dest_host: Option<String>) -> Result<Box<dyn DatagramClientBox>, Error> {
         unreachable!()
     }
 
-    async fn create_datagram_client(&self, session_id: &str) -> Result<Box<dyn DatagramClientBox>, Error> {
+    async fn create_datagram_client(&self, _session_id: &str) -> Result<Box<dyn DatagramClientBox>, Error> {
         unreachable!()
     }
 }
