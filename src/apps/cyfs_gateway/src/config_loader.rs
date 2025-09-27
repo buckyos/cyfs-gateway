@@ -49,10 +49,15 @@ struct StackProtocolConfig {
 impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for CyfsStackConfigParser<D> {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
         let config = StackProtocolConfig::deserialize(de.clone())
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", e))?;
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
         let factory = {
             self.parsers.lock().unwrap().get(config.protocol.as_str())
-                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", config.protocol))?.clone()
+                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}\n{}",
+                    config.protocol,
+                    serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()
+                ))?.clone()
         };
         factory.parse(de)
     }
@@ -66,10 +71,12 @@ impl TcpStackConfigParser {
     }
 }
 
-impl<D: for<'de> Deserializer<'de>> StackConfigParser<D> for TcpStackConfigParser {
+impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for TcpStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let tcp_config = TcpStackConfig::deserialize(de)
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", e))?;
+        let tcp_config = TcpStackConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid tcp stack config.{}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
         Ok(Arc::new(tcp_config))
     }
 }
@@ -82,10 +89,12 @@ impl UdpStackConfigParser {
     }
 }
 
-impl<D: for<'de> Deserializer<'de>> StackConfigParser<D> for UdpStackConfigParser {
+impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for UdpStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let udp_config = UdpStackConfig::deserialize(de)
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", e))?;
+        let udp_config = UdpStackConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid udp stack config.{}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
         Ok(Arc::new(udp_config))
     }
 }
@@ -97,10 +106,12 @@ impl TlsStackConfigParser {
     }
 }
 
-impl<D: for<'de> Deserializer<'de>> StackConfigParser<D> for TlsStackConfigParser {
+impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for TlsStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let tls_config = cyfs_gateway_lib::TlsStackConfig::deserialize(de)
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid tls stack config: {}", e))?;
+        let tls_config = cyfs_gateway_lib::TlsStackConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid tls stack config: {}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
         Ok(Arc::new(tls_config))
     }
 }
@@ -113,10 +124,12 @@ impl QuicStackConfigParser {
     }
 }
 
-impl<D: for<'de> Deserializer<'de>> StackConfigParser<D> for QuicStackConfigParser {
+impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for QuicStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let quic_config = QuicStackConfig::deserialize(de)
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid quic stack config: {}", e))?;
+        let quic_config = QuicStackConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid quic stack config: {}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
         Ok(Arc::new(quic_config))
     }
 }
@@ -128,10 +141,12 @@ impl RtcpStackConfigParser {
     }
 }
 
-impl<D: for<'de> Deserializer<'de>> StackConfigParser<D> for RtcpStackConfigParser {
+impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for RtcpStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let rtcp_config = RtcpStackConfig::deserialize(de)
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid rtcp stack config: {}", e))?;
+        let rtcp_config = RtcpStackConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid rtcp stack config: {}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
         Ok(Arc::new(rtcp_config))
     }
 }
@@ -189,10 +204,12 @@ impl HttpServerConfigParser {
     }
 }
 
-impl<D: for<'de> Deserializer<'de>> ServerConfigParser<D> for HttpServerConfigParser {
+impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for HttpServerConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = ProcessChainHttpServerConfig::deserialize(de)
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", e))?;
+        let config = ProcessChainHttpServerConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid http server config.{}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
         Ok(Arc::new(config))
     }
 }
@@ -225,7 +242,9 @@ pub struct InnerServiceConfigType {
 impl<D: for<'de> Deserializer<'de> + Clone> InnerServiceConfigParser<D> for CyfsInnerServiceConfigParser<D> {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn InnerServiceConfig>> {
         let service_type = InnerServiceConfigType::deserialize(de.clone())
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid inner service config.{}", e))?;
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid inner service config.{}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
         let parser = {
             self.inner_service_config_parser.lock().unwrap().get(&service_type.ty).cloned()
         };
@@ -288,6 +307,16 @@ impl GatewayConfigParser {
                 servers.push(self.server_config_parser.parse(server_value.clone())?);
             }
         }
+        
+        let mut inner_services = vec![];
+        if let Some(inner_services_value) = json_value.get("inner_services") {
+            let inner_services_value_list = inner_services_value.as_array()
+                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid servers config.\n{}",
+                    serde_json::to_string_pretty(inner_services_value).unwrap()))?;
+            for inner_service_value in inner_services_value_list {
+                inner_services.push(self.inner_service_config_parser.parse(inner_service_value.clone())?);
+            }
+        }
 
         let mut global_process_chains = vec![];
         if let Some(global_chains_value) = json_value.get("global_process_chains") {
@@ -300,7 +329,7 @@ impl GatewayConfigParser {
         Ok(GatewayConfig {
             stacks,
             servers,
-            inner_services: vec![],
+            inner_services,
             global_process_chains,
         })
     }

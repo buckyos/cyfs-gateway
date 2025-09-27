@@ -119,7 +119,7 @@ stacks:
 #        block: |
 #          reject;
 
-inner_services:
-  # 服务自定义参数
-  - id: sn
-    type: sn
+#inner_services:
+#  # 服务自定义参数
+#  - id: sn
+#    type: sn

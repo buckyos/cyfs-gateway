@@ -235,7 +235,7 @@ impl TlsStackInner {
                                 ));
                             }
                             let target = list[1].as_str();
-                            let limiter = Limiter::new(Some(1), Some(1));
+                            let limiter = Limiter::new(None, None);
                             let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
                             stream_forward(stream, target, &self.tunnel_manager).await?;
                         }

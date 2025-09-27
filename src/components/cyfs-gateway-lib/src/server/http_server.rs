@@ -239,6 +239,8 @@ impl ServerFactory for ProcessChainHttpServerFactory {
 
         let mut builder = ProcessChainHttpServer::builder()
             .hook_point(config.hook_point.clone())
+            .id(config.id.clone())
+            .inner_services(self.inner_service_manager.clone())
             .global_process_chains(self.global_process_chains.clone());
         if config.h3_port.is_some() {
             builder = builder.h3_port(config.h3_port.clone().unwrap());

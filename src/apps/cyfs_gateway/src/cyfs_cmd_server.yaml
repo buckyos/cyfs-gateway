@@ -1,5 +1,5 @@
 stacks:
-  - listen: 127.0.0.1:13451
+  - bind: 0.0.0.0:13451
     protocol: tcp
     hook_point:
       - id: main
@@ -18,7 +18,7 @@ servers:
         blocks:
           - id: default
             block: |
-              return "inner cmd_inner_server";
+              return "inner_service cmd_inner_server";
 
 inner_services:
   - id: cmd_inner_server

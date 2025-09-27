@@ -30,11 +30,12 @@ use name_client::*;
 use name_lib::*;
 use std::path::PathBuf;
 use std::sync::Arc;
+use json_value_merge::Merge;
 use serde_json::{Value};
 use tokio::task;
 use url::Url;
 use crate::config_loader::{GatewayConfigParser, HttpServerConfigParser, QuicStackConfigParser, RtcpStackConfigParser, TcpStackConfigParser, TlsStackConfigParser, UdpStackConfigParser};
-use crate::cyfs_cmd_server::{CyfsCmdServerConfigParser, CyfsCmdServerFactory};
+use crate::cyfs_cmd_server::{CyfsCmdServerConfigParser, CyfsCmdServerFactory, CYFS_CMD_SERVER_CONFIG};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -231,8 +232,11 @@ async fn main() {
         })
         .unwrap();
 
+    let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(CYFS_CMD_SERVER_CONFIG).unwrap();
+    cmd_config.merge(&config_json);
+    
     //let config_json : Value = config_json.unwrap();
-    info!("Gateway config: {}", serde_json::to_string_pretty(&config_json).unwrap());
+    info!("Gateway config: {}", serde_json::to_string_pretty(&cmd_config).unwrap());
 
     if matches.get_flag("debug") {
         info!("Debug mode enabled");
@@ -240,7 +244,7 @@ async fn main() {
         console_subscriber::init();
     }
 
-    if let Err(e) = service_main(config_json, &matches).await {
+    if let Err(e) = service_main(cmd_config, &matches).await {
         error!("Gateway run error: {}", e);
     }
 
