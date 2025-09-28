@@ -1,9 +1,10 @@
 use http_body_util::{BodyExt, Full};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize};
 use cyfs_gateway_lib::{config_err, into_service_err, service_err, BoxBody, ConfigErrorCode, ConfigResult, InnerHttpService, InnerService, InnerServiceConfig, InnerServiceFactory, Request, Response, ServiceErrorCode, ServiceResult};
 use crate::config_loader::InnerServiceConfigParser;
+use crate::service_main;
 
 pub const CYFS_CMD_SERVER_CONFIG: &str = include_str!("cyfs_cmd_server.yaml");
 
@@ -18,20 +19,22 @@ impl InnerServiceConfig for CyfsCmdServerConfig {
     fn service_type(&self) -> String {
         String::from("cmd_server")
     }
-}
 
-
-pub struct CyfsCmdServerFactory {}
-
-impl CyfsCmdServerFactory {
-    pub fn new() -> Self {
-        CyfsCmdServerFactory {}
+    fn get_config_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
     }
 }
 
-impl Default for CyfsCmdServerFactory {
-    fn default() -> Self {
-        Self::new()
+
+pub struct CyfsCmdServerFactory {
+    handler: Weak<dyn CyfsCmdHandler>,
+}
+
+impl CyfsCmdServerFactory {
+    pub fn new(handler: Arc<dyn CyfsCmdHandler>) -> Self {
+        CyfsCmdServerFactory {
+            handler: Arc::downgrade(&handler),
+        }
     }
 }
 
@@ -40,7 +43,7 @@ impl InnerServiceFactory for CyfsCmdServerFactory {
     async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<InnerService> {
         let config = config.as_any().downcast_ref::<CyfsCmdServerConfig>()
             .ok_or(service_err!(ServiceErrorCode::InvalidConfig, "invalid CyfsCmdServer config {}", config.service_type()))?;
-        Ok(InnerService::HttpService(Arc::new(CyfsCmdServer::new(config.clone()))))
+        Ok(InnerService::HttpService(Arc::new(CyfsCmdServer::new(config.clone(), self.handler.clone()))))
     }
 }
 
@@ -68,32 +71,39 @@ impl<D: for<'de> Deserializer<'de>> InnerServiceConfigParser<D> for CyfsCmdServe
     }
 }
 
+#[async_trait::async_trait]
+pub trait CyfsCmdHandler: Send + Sync + 'static {
+    async fn handle(&self, method: &str, params: &serde_json::Value) -> ServiceResult<serde_json::Value>;
+}
+
 pub struct CyfsCmdServer {
-    config: CyfsCmdServerConfig
+    config: CyfsCmdServerConfig,
+    handler: Weak<dyn CyfsCmdHandler>,
 }
 
 impl CyfsCmdServer {
-    pub fn new(config: CyfsCmdServerConfig) -> Self {
+    pub fn new(config: CyfsCmdServerConfig, handler: Weak<dyn CyfsCmdHandler>) -> Self {
         CyfsCmdServer {
             config,
+            handler,
         }
     }
 }
 
 #[derive(Deserialize)]
-struct CmdReq {
+struct CmdReq<P> {
     method: String,
-    params: serde_json::Value,
+    params: P,
     sys: Vec<serde_json::Value>,
 }
 
 #[derive(Serialize)]
-struct CmdResp {
+struct CmdResp<R: Serialize> {
     sys: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<serde_json::Value>,
+    result: Option<R>,
 }
 
 #[async_trait::async_trait]
@@ -114,19 +124,20 @@ impl InnerHttpService for CyfsCmdServer {
                 .map(|chunk| chunk.to_bytes())
                 .map_err(|e| service_err!(ServiceErrorCode::Failed, "{:?}", e))?;
 
-            let req: CmdReq = serde_json::from_slice(&data)
+            let req: CmdReq<serde_json::Value> = serde_json::from_slice(&data)
                 .map_err(|e| service_err!(ServiceErrorCode::Failed, "{}", e))?;
-            match req.method.as_str() {
-                "test" => {
-                    let resp = Response::new(Full::new(Bytes::from("test ok"))
-                        .map_err(|_| ()).boxed());
-                    Ok(resp)
-                }
-                v => {
-                    let resp = Response::new(Full::new(Bytes::from(format!("unknown cmd {}", v)))
-                        .map_err(|_| ()).boxed());
-                    Ok(resp)
-                }
+            if let Some(handler) = self.handler.upgrade() {
+                let result = handler.handle(req.method.as_str(), &req.params).await?;
+                let resp = CmdResp::<serde_json::Value> {
+                    sys: vec![],
+                    result: Some(result),
+                    error: None,
+                };
+                let data = serde_json::to_vec(&resp)
+                    .map_err(|e| service_err!(ServiceErrorCode::Failed, "{}", e))?;
+                Ok(Response::new(Full::new(Bytes::from(data)).map_err(|e| ()).boxed()))
+            } else {
+                Err(service_err!(ServiceErrorCode::Failed, "{}", "cmd handler has released"))
             }
         }.await;
 

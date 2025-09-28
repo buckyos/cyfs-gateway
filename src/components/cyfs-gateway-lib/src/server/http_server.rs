@@ -206,7 +206,9 @@ pub struct ProcessChainHttpServerConfig {
     pub id: String,
     #[serde(rename = "type")]
     pub ty: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub h3_port: Option<u16>,
     pub hook_point: ProcessChainConfigs,
 }
@@ -214,6 +216,10 @@ pub struct ProcessChainHttpServerConfig {
 impl ServerConfig for ProcessChainHttpServerConfig {
     fn server_type(&self) -> String {
         "http".to_string()
+    }
+
+    fn get_config_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
     }
 }
 
@@ -311,6 +317,7 @@ mod tests {
         let mock_inner_services = Arc::new(InnerServiceManager::new());
 
         let result = ProcessChainHttpServer::builder()
+            .id("1")
             .version("HTTP/1.1".to_string())
             .hook_point(vec![])
             .inner_services(mock_inner_services).build().await;
@@ -323,6 +330,7 @@ mod tests {
         let mock_inner_services = Arc::new(InnerServiceManager::new());
 
         let result = ProcessChainHttpServer::builder()
+            .id("1")
             .version("HTTP/2".to_string())
             .hook_point(vec![])
             .inner_services(mock_inner_services).build().await;
@@ -345,6 +353,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let result = ProcessChainHttpServer::builder()
+            .id("1")
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
             .inner_services(mock_inner_services).build().await;
@@ -388,6 +397,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let result = ProcessChainHttpServer::builder()
+            .id("1")
             .version("HTTP/2".to_string())
             .hook_point(chains)
             .inner_services(mock_inner_services).build().await;
@@ -431,6 +441,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let result = ProcessChainHttpServer::builder()
+            .id("1")
             .version("HTTP/2".to_string())
             .hook_point(chains)
             .inner_services(mock_inner_services).build().await;
@@ -475,6 +486,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let result = ProcessChainHttpServer::builder()
+            .id("1")
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
             .inner_services(mock_inner_services).build().await;

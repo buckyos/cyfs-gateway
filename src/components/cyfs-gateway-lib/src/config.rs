@@ -382,7 +382,7 @@ pub type ConfigError = sfo_result::Error<ConfigErrorCode>;
 pub use sfo_result::err as config_err;
 pub use sfo_result::into_err as into_config_err;
 use cyfs_process_chain::{Block, BlockParser, ProcessChain};
-use crate::{StackBox, StackProtocol};
+use crate::{StackRef, StackProtocol};
 
 // pub trait CyfsServerConfigParser {
 //     fn parse(config: &str) -> ConfigResult<Vec<CyfsServerConfig>>;

@@ -7,7 +7,7 @@ use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -286,7 +286,7 @@ impl TcpStackInner {
 
 pub struct TcpStack {
     inner: Arc<TcpStackInner>,
-    handle: Option<JoinHandle<()>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl TcpStack {
@@ -306,14 +306,14 @@ impl TcpStack {
         let inner = TcpStackInner::create(config).await?;
         Ok(Self {
             inner: Arc::new(inner),
-            handle: None,
+            handle: Mutex::new(None),
         })
     }
 }
 
 impl Drop for TcpStack {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.handle.lock().unwrap().take() {
             handle.abort();
         }
     }
@@ -329,13 +329,13 @@ impl Stack for TcpStack {
         self.inner.bind_addr.clone()
     }
 
-    async fn start(&mut self) -> StackResult<()> {
+    async fn start(&self) -> StackResult<()> {
         let handle = self.inner.start().await?;
-        self.handle = Some(handle);
+        *self.handle.lock().unwrap() = Some(handle);
         Ok(())
     }
 
-    async fn update_config(&mut self, config: Arc<dyn StackConfig>) -> StackResult<()> {
+    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
         todo!()
     }
 }
@@ -405,6 +405,10 @@ impl StackConfig for TcpStackConfig {
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Tcp
     }
+
+    fn get_config_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
 }
 
 pub struct TcpStackFactory {
@@ -435,7 +439,7 @@ impl StackFactory for TcpStackFactory {
     async fn create(
         &self,
         config: Arc<dyn StackConfig>,
-    ) -> StackResult<Box<dyn Stack>> {
+    ) -> StackResult<StackRef> {
         let config = config.as_ref().as_any().downcast_ref::<TcpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
         let stack = TcpStack::builder()
@@ -447,7 +451,7 @@ impl StackFactory for TcpStackFactory {
             .transparent(config.transparent.unwrap_or(false))
             .hook_point(config.hook_point.clone())
             .build().await?;
-        Ok(Box::new(stack))
+        Ok(Arc::new(stack))
     }
 }
 

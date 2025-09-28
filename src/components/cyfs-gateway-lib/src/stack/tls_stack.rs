@@ -1,7 +1,7 @@
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -280,12 +280,12 @@ impl TlsStackInner {
 
 pub struct TlsStack {
     inner: Arc<TlsStackInner>,
-    handle: Option<JoinHandle<()>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for TlsStack {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.handle.lock().unwrap().take() {
             handle.abort();
         }
     }
@@ -301,7 +301,7 @@ impl TlsStack {
 
         Ok(Self {
             inner: Arc::new(inner),
-            handle: None,
+            handle: Mutex::new(None),
         })
     }
 }
@@ -316,13 +316,13 @@ impl Stack for TlsStack {
         self.inner.bind_addr.clone()
     }
 
-    async fn start(&mut self) -> StackResult<()> {
+    async fn start(&self) -> StackResult<()> {
         let handle = self.inner.start().await?;
-        self.handle = Some(handle);
+        *self.handle.lock().unwrap() = Some(handle);
         Ok(())
     }
 
-    async fn update_config(&mut self, config: Arc<dyn StackConfig>) -> StackResult<()> {
+    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
         todo!()
     }
 }
@@ -354,15 +354,20 @@ pub struct TlsStackConfig {
     pub protocol: StackProtocol,
     pub bind: std::net::SocketAddr,
     pub hook_point: Vec<crate::ProcessChainConfig>,
-    #[serde(skip)]
-    pub certs: Vec<TlsDomainConfig>,
+    pub certs: Vec<StackCertConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub alpn_protocols: Option<Vec<String>>,
 }
 
 impl crate::StackConfig for TlsStackConfig {
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Tls
+    }
+
+    fn get_config_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
     }
 }
 
@@ -391,24 +396,36 @@ impl TlsStackFactory {
 
 #[async_trait::async_trait]
 impl crate::StackFactory for TlsStackFactory {
-    async fn create(&self, config: Arc<dyn crate::StackConfig>) -> crate::StackResult<crate::StackBox> {
+    async fn create(&self, config: Arc<dyn crate::StackConfig>) -> crate::StackResult<crate::StackRef> {
         let config = config
             .as_any()
             .downcast_ref::<TlsStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+
+        let mut cert_list = vec![];
+        for cert_config in config.certs.iter() {
+            let certs = load_certs(cert_config.cert_file.as_str()).await?;
+            let key = load_key(cert_config.key_file.as_str()).await?;
+            cert_list.push(TlsDomainConfig {
+                domain: cert_config.domain.clone(),
+                certs,
+                key,
+            });
+        }
+
         let stack = TlsStack::builder()
             .bind(config.bind.to_string())
             .connection_manager(self.connection_manager.clone())
             .global_process_chains(self.global_process_chains.clone())
             .servers(self.servers.clone())
             .hook_point(config.hook_point.clone())
-            .add_certs(config.certs.clone())
+            .add_certs(cert_list)
             .concurrency(config.concurrency.unwrap_or(0))
             .tunnel_manager(self.tunnel_manager.clone())
             .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec![]).iter().map(|s| s.as_bytes().to_vec()).collect())
             .build()
             .await?;
-        Ok(Box::new(stack))
+        Ok(Arc::new(stack))
     }
 }
 
@@ -959,6 +976,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let http_server = ProcessChainHttpServer::builder()
+            .id("1")
             .version("HTTP/3")
             .h3_port(9186)
             .hook_point(chains)
@@ -1056,6 +1074,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let http_server = ProcessChainHttpServer::builder()
+            .id("1")
             .version("HTTP/3")
             .h3_port(9186)
             .hook_point(chains)

@@ -14,6 +14,7 @@ use crate::{server_err, ServerError, ServerErrorCode, ServerResult};
 
 pub trait ServerConfig: AsAny + Send + Sync {
     fn server_type(&self) -> String;
+    fn get_config_json(&self) -> String;
 }
 
 #[async_trait::async_trait]

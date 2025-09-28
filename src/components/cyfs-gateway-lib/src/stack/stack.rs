@@ -18,41 +18,41 @@ pub enum StackProtocol {
 
 pub trait StackConfig: AsAny + Send + Sync {
     fn stack_protocol(&self) -> StackProtocol;
+    fn get_config_json(&self) -> String;
 }
 
 #[async_trait::async_trait]
-pub trait Stack {
+pub trait Stack: Send + Sync + 'static {
     fn stack_protocol(&self) -> StackProtocol;
     fn get_bind_addr(&self) -> String;
-    async fn start(&mut self) -> StackResult<()>;
-    async fn update_config(&mut self, config: Arc<dyn StackConfig>) -> StackResult<()>;
+    async fn start(&self) -> StackResult<()>;
+    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()>;
 }
 
-pub type StackBox = Box<dyn Stack>;
+pub type StackRef = Arc<dyn Stack>;
 
 pub struct StackManager {
-    stacks: Vec<StackBox>,
+    stacks: Mutex<Vec<StackRef>>,
 }
-
-impl Default for StackManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub type StackManagerRef = Arc<StackManager>;
 
 impl StackManager {
-    pub fn new() -> Self {
-        Self {
-            stacks: vec![],
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stacks: Mutex::new(vec![]),
+        })
+    }
+
+    pub fn add_stack(&self, stack: StackRef) {
+        self.stacks.lock().unwrap().push(stack);
+    }
+
+    pub async fn start(&self) -> StackResult<()> {
+        let mut stacks = Vec::new();
+        for stack in self.stacks.lock().unwrap().iter() {
+            stacks.push(stack.clone());
         }
-    }
-
-    pub fn add_stack(&mut self, stack: StackBox) {
-        self.stacks.push(stack);
-    }
-
-    pub async fn start(&mut self) -> StackResult<()> {
-        for stack in self.stacks.iter_mut() {
+        for stack in stacks.iter() {
             stack.start().await?;
         }
         Ok(())
@@ -61,7 +61,7 @@ impl StackManager {
 
 #[async_trait::async_trait]
 pub trait StackFactory: Send + Sync {
-    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackBox>;
+    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackRef>;
 }
 
 pub struct CyfsStackFactory {
@@ -88,7 +88,7 @@ impl CyfsStackFactory {
 
 #[async_trait::async_trait]
 impl StackFactory for CyfsStackFactory {
-    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackBox> {
+    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackRef> {
         let protocol = config.stack_protocol();
         let factory = {
             self.stack_factory.lock().unwrap().get(&protocol).cloned()

@@ -36,6 +36,7 @@ impl InnerService {
 
 pub trait InnerServiceConfig: AsAny + Send + Sync {
     fn service_type(&self) -> String;
+    fn get_config_json(&self) -> String;
 }
 
 #[async_trait::async_trait]

@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use super::config_loader::GatewayConfig;
 use super::dispatcher::ServiceDispatcher;
 use cyfs_dns::start_cyfs_dns_server;
 use cyfs_dns::DNSServer;
-use cyfs_gateway_lib::{ConnectionManager, ConnectionManagerRef, CyfsInnerServiceFactory, CyfsServerFactory, CyfsStackFactory, GlobalProcessChains, GlobalProcessChainsRef, InnerServiceFactory, InnerServiceManager, InnerServiceManagerRef, ProcessChainConfigs, QuicStackFactory, RtcpStackFactory, ServerConfig, ServerFactory, ServerManager, ServerManagerRef, StackFactory, StackManager, StackProtocol, TcpStackFactory, TlsStackFactory, UdpStackFactory};
+use cyfs_gateway_lib::{into_service_err, service_err, ConnectionManager, ConnectionManagerRef, CyfsInnerServiceFactory, CyfsServerFactory, CyfsStackFactory, GlobalProcessChains, GlobalProcessChainsRef, InnerServiceFactory, InnerServiceManager, InnerServiceManagerRef, ProcessChainConfigs, QuicStackFactory, RtcpStackFactory, ServerConfig, ServerFactory, ServerManager, ServerManagerRef, ServiceErrorCode, ServiceResult, StackFactory, StackManager, StackManagerRef, StackProtocol, TcpStackFactory, TlsStackFactory, UdpStackFactory};
 use cyfs_gateway_lib::{GatewayDevice, GatewayDeviceRef, TunnelManager};
 use cyfs_socks::Socks5Proxy;
 use cyfs_warp::start_cyfs_warp_server;
@@ -13,9 +14,11 @@ use name_client::*;
 use name_lib::*;
 use buckyos_kit::*;
 use once_cell::sync::OnceCell;
-use tokio::sync::Mutex;
 use url::Url;
 use anyhow::Result;
+use serde_json::Value;
+use crate::cyfs_cmd_server::CyfsCmdHandler;
+
 //use buckyos_api::{*};
 pub struct GatewayParams {
     pub keep_tunnel: Vec<String>,
@@ -70,7 +73,7 @@ impl GatewayFactory {
         &self,
         config: GatewayConfig,
     ) -> Result<Gateway> {
-        let mut stack_manager = StackManager::new();
+        let stack_manager = StackManager::new();
         for stack_config in config.stacks.iter() {
             let stack = self.stack_factory.create(stack_config.clone()).await?;
             stack_manager.add_stack(stack);
@@ -90,9 +93,9 @@ impl GatewayFactory {
             let process_chain = process_chain_config.create_process_chain()?;
             self.global_process_chains.add_process_chain(Arc::new(process_chain));
         }
-        
+
         Ok(Gateway {
-            config,
+            config: Mutex::new(config),
             stack_manager,
             tunnel_manager: self.tunnel_manager.clone(),
             server_manager: self.servers.clone(),
@@ -103,12 +106,18 @@ impl GatewayFactory {
 }
 
 pub struct Gateway {
-    config: GatewayConfig,
-    stack_manager: StackManager,
+    config: Mutex<GatewayConfig>,
+    stack_manager: StackManagerRef,
     tunnel_manager: TunnelManager,
     server_manager: ServerManagerRef,
     inner_service_factory: InnerServiceManagerRef,
     global_process_chains: GlobalProcessChainsRef,
+}
+
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        info!("Gateway is dropped!");
+    }
 }
 
 impl Gateway {
@@ -116,7 +125,7 @@ impl Gateway {
         &self.tunnel_manager
     }
 
-    pub async fn start(&mut self, params: GatewayParams) {
+    pub async fn start(&self, params: GatewayParams) {
         let mut real_machine_config = BuckyOSMachineConfig::default();
         let machine_config = BuckyOSMachineConfig::load_machine_config();
         if machine_config.is_some() {
@@ -179,5 +188,79 @@ impl Gateway {
                 }
             }
         });
+    }
+
+    pub fn get_config(&self) -> Result<Value> {
+        let config = self.config.lock().unwrap();
+        let mut config_value = HashMap::new();
+        let mut stacks = vec![];
+        for stack in config.stacks.iter() {
+            let stack_value: Value = serde_json::from_str(stack.get_config_json().as_str())?;
+            stacks.push(stack_value);
+        }
+        config_value.insert("stacks".to_string(), Value::Array(stacks));
+
+        let mut servers = vec![];
+        for server in config.servers.iter() {
+            let server_value: Value = serde_json::from_str(server.get_config_json().as_str())?;
+            servers.push(server_value);
+        }
+        config_value.insert("servers".to_string(), Value::Array(servers));
+
+        let mut inner_services = vec![];
+        for service in config.inner_services.iter() {
+            let service_value: Value = serde_json::from_str(service.get_config_json().as_str())?;
+            inner_services.push(service_value);
+        }
+        config_value.insert("inner_services".to_string(), Value::Array(inner_services));
+
+        let global_config = serde_json::to_value(&config.global_process_chains)?;
+        config_value.insert("global_process_chains".to_string(), global_config);
+
+        Ok(serde_json::to_value(&config_value)?)
+    }
+}
+
+pub struct GatewayCmdHandler {
+    gateway: Mutex<Option<Arc<Gateway>>>,
+}
+
+impl GatewayCmdHandler {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            gateway: Mutex::new(None)
+        })
+    }
+
+    pub fn set_gateway(&self, gateway: Arc<Gateway>) {
+        self.gateway.lock().unwrap().replace(gateway);
+    }
+
+    fn get_gateway(&self) -> Option<Arc<Gateway>> {
+        self.gateway.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl CyfsCmdHandler for GatewayCmdHandler {
+    async fn handle(&self, method: &str, params: &Value) -> ServiceResult<Value> {
+        let gatway = self.get_gateway();
+        if gatway.is_none() {
+            return Err(service_err!(ServiceErrorCode::Failed, "gateway not init"));
+        }
+        let gateway = gatway.unwrap();
+        match method {
+            "read_config" => {
+                gateway.get_config()
+                    .map_err(|e| service_err!(ServiceErrorCode::Failed, "{}", e))
+            }
+            v => {
+                Err(service_err!(
+                    ServiceErrorCode::Failed,
+                    "gateway method not support: {}",
+                    v
+                ))
+            }
+        }
     }
 }

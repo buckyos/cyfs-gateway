@@ -31,7 +31,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackBox, StackFactory};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 use crate::stack::stream_forward;
@@ -951,7 +951,15 @@ impl QuicStackInner {
 
 pub struct QuicStack {
     inner: Arc<QuicStackInner>,
-    handle: Option<JoinHandle<()>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for QuicStack {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.lock().unwrap().take() {
+            handle.abort();
+        }
+    }
 }
 
 impl QuicStack {
@@ -997,7 +1005,7 @@ impl QuicStack {
                 connection_manager: builder.connection_manager,
                 tunnel_manager: builder.tunnel_manager.unwrap(),
             }),
-            handle: None,
+            handle: Mutex::new(None),
         })
     }
 }
@@ -1012,13 +1020,13 @@ impl Stack for QuicStack {
         self.inner.bind_addr.clone()
     }
 
-    async fn start(&mut self) -> StackResult<()> {
+    async fn start(&self) -> StackResult<()> {
         let handle = self.inner.start().await?;
-        self.handle = Some(handle);
+        *self.handle.lock().unwrap() = Some(handle);
         Ok(())
     }
 
-    async fn update_config(&mut self, config: Arc<dyn StackConfig>) -> StackResult<()> {
+    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
         todo!()
     }
 }
@@ -1110,12 +1118,17 @@ pub struct QuicStackConfig {
     pub concurrency: Option<u32>,
     pub hook_point: Vec<ProcessChainConfig>,
     pub certs: Vec<StackCertConfig>,
-    pub alpn_protocols: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alpn_protocols: Option<Vec<String>>,
 }
 
 impl StackConfig for QuicStackConfig {
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Quic
+    }
+
+    fn get_config_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
     }
 }
 
@@ -1144,7 +1157,7 @@ impl QuicStackFactory {
 
 #[async_trait::async_trait]
 impl StackFactory for QuicStackFactory {
-    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackBox> {
+    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackRef> {
         let config = config
             .as_any()
             .downcast_ref::<QuicStackConfig>()
@@ -1167,11 +1180,11 @@ impl StackFactory for QuicStackFactory {
             .servers(self.servers.clone())
             .hook_point(config.hook_point.clone())
             .add_certs(cert_list)
-            .alpn_protocols(config.alpn_protocols.iter().map(|s| s.as_bytes().to_vec()).collect())
+            .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec![]).iter().map(|s| s.as_bytes().to_vec()).collect())
             .concurrency(config.concurrency.unwrap_or(1024))
             .build()
             .await?;
-        Ok(Box::new(stack))
+        Ok(Arc::new(stack))
     }
 }
 
@@ -1517,6 +1530,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let http_server = ProcessChainHttpServer::builder()
+            .id("1")
             .version("HTTP/3")
             .h3_port(9186)
             .hook_point(chains)
@@ -1710,7 +1724,7 @@ mod tests {
             concurrency: None,
             hook_point: vec![],
             certs: vec![],
-            alpn_protocols: vec![],
+            alpn_protocols: None,
         };
         let ret = factory.create(Arc::new(config));
     }

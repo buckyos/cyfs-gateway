@@ -14,7 +14,7 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, SpeedStatRef, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackBox, config_err};
+use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, SpeedStatRef, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, config_err};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 #[cfg(unix)]
@@ -823,16 +823,16 @@ impl UdpStackInner {
 
 pub struct UdpStack {
     inner: Arc<UdpStackInner>,
-    handle: Option<JoinHandle<()>>,
-    clear_handle: Option<JoinHandle<()>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
+    clear_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for UdpStack {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.handle.lock().unwrap().take() {
             handle.abort();
         }
-        if let Some(handle) = self.clear_handle.take() {
+        if let Some(handle) = self.clear_handle.lock().unwrap().take() {
             handle.abort();
         }
     }
@@ -847,8 +847,8 @@ impl UdpStack {
         let inner = UdpStackInner::create(builder).await?;
         Ok(Self {
             inner: Arc::new(inner),
-            handle: None,
-            clear_handle: None,
+            handle: Mutex::new(None),
+            clear_handle: Mutex::new(None),
         })
     }
 
@@ -867,21 +867,21 @@ impl Stack for UdpStack {
         self.inner.bind_addr.clone()
     }
 
-    async fn start(&mut self) -> StackResult<()> {
+    async fn start(&self) -> StackResult<()> {
         let handle = self.inner.start().await?;
         let inner = self.inner.clone();
-        self.clear_handle = Some(tokio::spawn(async move {
+        *self.clear_handle.lock().unwrap() = Some(tokio::spawn(async move {
             let mut latest_key = None;
             loop {
                 latest_key = inner.clear_idle_sessions(latest_key).await;
                 tokio::time::sleep(inner.session_idle_time.div(2)).await;
             }
         }));
-        self.handle = Some(handle);
+        *self.handle.lock().unwrap() = Some(handle);
         Ok(())
     }
 
-    async fn update_config(&mut self, config: Arc<dyn StackConfig>) -> StackResult<()> {
+    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
         todo!()
     }
 }
@@ -965,15 +965,22 @@ impl UdpStackBuilder {
 pub struct UdpStackConfig {
     pub protocol: StackProtocol,
     pub bind: SocketAddr,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_idle_time: Option<u64>,
     pub hook_point: Vec<ProcessChainConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transparent: Option<bool>,
 }
 
 impl StackConfig for UdpStackConfig {
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Udp
+    }
+
+    fn get_config_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
     }
 }
 
@@ -1002,7 +1009,7 @@ impl UdpStackFactory {
 
 #[async_trait::async_trait]
 impl StackFactory for UdpStackFactory {
-    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackBox> {
+    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackRef> {
         let config = config
             .as_any()
             .downcast_ref::<UdpStackConfig>()
@@ -1018,7 +1025,7 @@ impl StackFactory for UdpStackFactory {
             .session_idle_time(Duration::from_secs(config.session_idle_time.unwrap_or(120)))
             .transparent(config.transparent.unwrap_or(false))
             .build().await?;
-        Ok(Box::new(stack))
+        Ok(Arc::new(stack))
     }
 }
 

@@ -18,7 +18,7 @@ mod cyfs_cmd_client;
 #[macro_use]
 extern crate log;
 
-use crate::gateway::{Gateway, GatewayFactory, GatewayParams};
+use crate::gateway::{Gateway, GatewayCmdHandler, GatewayFactory, GatewayParams};
 use buckyos_kit::*;
 use clap::{Arg, ArgAction, Command};
 use console_subscriber::{self, Server};
@@ -35,11 +35,14 @@ use serde_json::{Value};
 use tokio::task;
 use url::Url;
 use crate::config_loader::{GatewayConfigParser, HttpServerConfigParser, QuicStackConfigParser, RtcpStackConfigParser, TcpStackConfigParser, TlsStackConfigParser, UdpStackConfigParser};
-use crate::cyfs_cmd_server::{CyfsCmdServerConfigParser, CyfsCmdServerFactory, CYFS_CMD_SERVER_CONFIG};
+use crate::cyfs_cmd_server::{CyfsCmdHandler, CyfsCmdServerConfigParser, CyfsCmdServerFactory, CYFS_CMD_SERVER_CONFIG};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 async fn service_main(config_json: serde_json::Value, matches: &clap::ArgMatches) -> Result<()> {
+    let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(CYFS_CMD_SERVER_CONFIG).unwrap();
+    cmd_config.merge(&config_json);
+    
     // Load config from json
     let parser = GatewayConfigParser::new();
     parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
@@ -52,7 +55,7 @@ async fn service_main(config_json: serde_json::Value, matches: &clap::ArgMatches
 
     parser.register_inner_service_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
 
-    let load_result = parser.parse(config_json);
+    let load_result = parser.parse(cmd_config);
     if load_result.is_err() {
         let msg = format!("Error loading config: {}", load_result.err().unwrap().msg());
         error!("{}", msg);
@@ -118,9 +121,12 @@ async fn service_main(config_json: serde_json::Value, matches: &clap::ArgMatches
         global_process_chains.clone(),
     )));
     
-    factory.register_inner_service_factory("cmd_server", Arc::new(CyfsCmdServerFactory::new()));
+    let handler = GatewayCmdHandler::new();
+    factory.register_inner_service_factory(
+        "cmd_server",
+        Arc::new(CyfsCmdServerFactory::new(handler.clone())));
 
-    let mut gateway = match factory.create_gateway(config_loader).await {
+    let gateway = match factory.create_gateway(config_loader).await {
         Ok(gateway) => gateway,
         Err(e) => {
             error!("create gateway failed: {}", e);
@@ -128,6 +134,7 @@ async fn service_main(config_json: serde_json::Value, matches: &clap::ArgMatches
         }
     };
     gateway.start(params).await;
+    handler.set_gateway(Arc::new(gateway));
 
     // Sleep forever
     let _ = tokio::signal::ctrl_c().await;
@@ -231,12 +238,9 @@ async fn main() {
             std::process::exit(1);
         })
         .unwrap();
-
-    let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(CYFS_CMD_SERVER_CONFIG).unwrap();
-    cmd_config.merge(&config_json);
     
     //let config_json : Value = config_json.unwrap();
-    info!("Gateway config: {}", serde_json::to_string_pretty(&cmd_config).unwrap());
+    info!("Gateway config: {}", serde_json::to_string_pretty(&config_json).unwrap());
 
     if matches.get_flag("debug") {
         info!("Debug mode enabled");
@@ -244,7 +248,7 @@ async fn main() {
         console_subscriber::init();
     }
 
-    if let Err(e) = service_main(cmd_config, &matches).await {
+    if let Err(e) = service_main(config_json, &matches).await {
         error!("Gateway run error: {}", e);
     }
 

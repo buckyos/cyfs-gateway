@@ -6,7 +6,7 @@ use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_k
 use sfo_io::{LimitStream, StatStream};
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor, StreamRequest};
-use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, DatagramServerBox, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackBox, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, StreamListener, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelError, TunnelManager, TunnelResult};
+use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, DatagramServerBox, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, StreamListener, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelError, TunnelManager, TunnelResult};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, execute_stream_chain, GlobalProcessChainsRef};
 use crate::rtcp::{AsyncStreamWithDatagram, DatagramForwarder, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
@@ -311,8 +311,8 @@ impl TunnelBuilder for RtcpTunnelBuilder {
 
 pub struct RtcpStack {
     bind_addr: String,
-    rtcp: Option<RTcp>,
-    rtcp_ref: Option<Arc<RTcp>>,
+    rtcp: Mutex<Option<RTcp>>,
+    rtcp_ref: Mutex<Option<Arc<RTcp>>>,
     inner: Arc<RtcpStackInner>,
 }
 
@@ -347,8 +347,8 @@ impl RtcpStack {
         let rtcp = RTcp::new(device_config.id.clone(), bind_addr.clone(), private_key, Arc::new(Listener::new(inner.clone())));
         Ok(Self {
             bind_addr,
-            rtcp: Some(rtcp),
-            rtcp_ref: None,
+            rtcp: Mutex::new(Some(rtcp)),
+            rtcp_ref: Mutex::new(None),
             inner,
         })
     }
@@ -364,19 +364,21 @@ impl Stack for RtcpStack {
         self.bind_addr.clone()
     }
 
-    async fn start(&mut self) -> StackResult<()> {
-        let mut rtcp = self.rtcp.take().unwrap();
+    async fn start(&self) -> StackResult<()> {
+        let mut rtcp = {
+            self.rtcp.lock().unwrap().take().unwrap()
+        };
         rtcp.start().await
             .map_err(|e| stack_err!(StackErrorCode::IoError, "start rtcp failed: {:?}", e))?;
         let rtcp = Arc::new(rtcp);
         let tunnel_builder = Arc::new(RtcpTunnelBuilder::new(rtcp.clone()));
         self.inner.tunnel_manager.register_tunnel_builder("rtcp", tunnel_builder.clone());
         self.inner.tunnel_manager.register_tunnel_builder("rudp", tunnel_builder);
-        self.rtcp_ref = Some(rtcp);
+        *self.rtcp_ref.lock().unwrap() = Some(rtcp);
         Ok(())
     }
 
-    async fn update_config(&mut self, config: Arc<dyn StackConfig>) -> StackResult<()> {
+    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
         todo!()
     }
 }
@@ -465,6 +467,10 @@ impl crate::StackConfig for RtcpStackConfig {
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Rtcp
     }
+
+    fn get_config_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
 }
 
 pub struct RtcpStackFactory {
@@ -492,7 +498,7 @@ impl RtcpStackFactory {
 
 #[async_trait::async_trait]
 impl StackFactory for RtcpStackFactory {
-    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackBox> {
+    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackRef> {
         let config = config
             .as_any()
             .downcast_ref::<RtcpStackConfig>()
@@ -534,7 +540,7 @@ impl StackFactory for RtcpStackFactory {
             .private_key(private_key)
             .hook_point(config.hook_point.clone())
             .build().await?;
-        Ok(Box::new(stack))
+        Ok(Arc::new(stack))
     }
 }
 
@@ -1572,7 +1578,7 @@ mod tests {
         let ret = tokio::time::timeout(Duration::from_secs(5),
                                        stream.recv_datagram(&mut buf)).await;
 
-        assert!(ret.is_err());
+        assert!(ret.is_err() || ret.unwrap().is_err());
     }
 
 

@@ -1,5 +1,5 @@
 use buckyos_kit::{adjust_path, get_buckyos_root_dir};
-use cyfs_gateway_lib::{config_err, into_config_err, ConfigErrorCode, ConfigResult, DNSServerConfig, InnerServiceConfig, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackBox, StackConfig, TcpStackConfig, TlsStack, UdpStackConfig};
+use cyfs_gateway_lib::{config_err, into_config_err, ConfigErrorCode, ConfigResult, DNSServerConfig, InnerServiceConfig, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackRef, StackConfig, TcpStackConfig, TlsStack, UdpStackConfig};
 use cyfs_gateway_lib::DispatcherConfig;
 use cyfs_gateway_lib::WarpServerConfig;
 use cyfs_sn::*;
@@ -307,7 +307,7 @@ impl GatewayConfigParser {
                 servers.push(self.server_config_parser.parse(server_value.clone())?);
             }
         }
-        
+
         let mut inner_services = vec![];
         if let Some(inner_services_value) = json_value.get("inner_services") {
             let inner_services_value_list = inner_services_value.as_array()
