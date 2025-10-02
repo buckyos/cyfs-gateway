@@ -18,7 +18,7 @@ mod cyfs_cmd_client;
 #[macro_use]
 extern crate log;
 
-use crate::gateway::{Gateway, GatewayCmdHandler, GatewayFactory, GatewayParams};
+use crate::gateway::{Gateway, GatewayCmdHandler, GatewayFactory, GatewayParams, LocalTokenKeyStore, LocalTokenManager};
 use buckyos_kit::*;
 use clap::{Arg, ArgAction, Command};
 use console_subscriber::{self, Server};
@@ -39,10 +39,10 @@ use crate::cyfs_cmd_server::{CyfsCmdHandler, CyfsCmdServerConfigParser, CyfsCmdS
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-async fn service_main(config_json: serde_json::Value, matches: &clap::ArgMatches) -> Result<()> {
+async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> Result<()> {
     let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(CYFS_CMD_SERVER_CONFIG).unwrap();
     cmd_config.merge(&config_json);
-    
+
     // Load config from json
     let parser = GatewayConfigParser::new();
     parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
@@ -62,15 +62,6 @@ async fn service_main(config_json: serde_json::Value, matches: &clap::ArgMatches
         std::process::exit(1);
     }
     let config_loader = load_result.unwrap();
-
-    // Extract necessary params from command line
-    let params = GatewayParams {
-        keep_tunnel: matches
-            .get_many::<String>("keep_tunnel")
-            .unwrap_or_default()
-            .map(|s| s.to_string())
-            .collect(),
-    };
 
     let connect_manager = ConnectionManager::new();
     let tunnel_manager = TunnelManager::new();
@@ -120,11 +111,33 @@ async fn service_main(config_json: serde_json::Value, matches: &clap::ArgMatches
         inner_service_manager.clone(),
         global_process_chains.clone(),
     )));
-    
+
+    let user_name: Option<String> = match config_json.get("user_name") {
+        Some(user_name) => {
+            match user_name.as_str() {
+                Some(user_name) => Some(user_name.to_string()),
+                None => None,
+            }
+        },
+        None => None,
+    };
+    let password: Option<String> = match config_json.get("password") {
+        Some(password) => {
+            match password.as_str() {
+                Some(password) => Some(password.to_string()),
+                None => None,
+            }
+        },
+        None => None,
+    };
+
+    let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
+    let store = LocalTokenKeyStore::new(data_dir);
+    let token_manager = LocalTokenManager::new(user_name, password, store).await?;
     let handler = GatewayCmdHandler::new();
     factory.register_inner_service_factory(
         "cmd_server",
-        Arc::new(CyfsCmdServerFactory::new(handler.clone())));
+        Arc::new(CyfsCmdServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
 
     let gateway = match factory.create_gateway(config_loader).await {
         Ok(gateway) => gateway,
@@ -238,7 +251,7 @@ async fn main() {
             std::process::exit(1);
         })
         .unwrap();
-    
+
     //let config_json : Value = config_json.unwrap();
     info!("Gateway config: {}", serde_json::to_string_pretty(&config_json).unwrap());
 
@@ -248,7 +261,16 @@ async fn main() {
         console_subscriber::init();
     }
 
-    if let Err(e) = service_main(config_json, &matches).await {
+    // Extract necessary params from command line
+    let params = GatewayParams {
+        keep_tunnel: matches
+            .get_many::<String>("keep_tunnel")
+            .unwrap_or_default()
+            .map(|s| s.to_string())
+            .collect(),
+    };
+
+    if let Err(e) = service_main(config_json, params).await {
         error!("Gateway run error: {}", e);
     }
 

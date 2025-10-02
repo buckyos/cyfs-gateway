@@ -1,5 +1,5 @@
 stacks:
-  - bind: 0.0.0.0:13451
+  - bind: 127.0.0.1:13451
     protocol: tcp
     hook_point:
       - id: main
