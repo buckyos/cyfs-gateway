@@ -1,8 +1,7 @@
-use super::loader::ProcessChainXMLLoader;
+use super::loader::{ProcessChainJSONLoader, ProcessChainXMLLoader};
 use crate::chain::EnvRef;
 use crate::chain::{
-    ProcessChainLib, ProcessChainLibExecutor, ProcessChainLibRef, ProcessChainLinkedManagerRef,
-    ProcessChainListLib, ProcessChainManager,
+    ProcessChainLibExecutor, ProcessChainLibRef, ProcessChainLinkedManagerRef, ProcessChainManager,
 };
 use crate::cmd::CommandResult;
 use crate::pipe::CommandPipe;
@@ -43,14 +42,19 @@ impl HookPoint {
         priority: i32,
         content: &str,
     ) -> Result<ProcessChainLibRef, String> {
-        let chains = ProcessChainXMLLoader::parse(content)?;
-        let chains = chains
-            .into_iter()
-            .map(|chain| Arc::new(chain))
-            .collect::<Vec<_>>();
+        let lib = ProcessChainXMLLoader::load_process_chain_lib(lib_id, priority, content)?;
+        self.add_process_chain_lib(lib.clone())?;
 
-        let lib = ProcessChainListLib::new(lib_id, priority, chains);
-        let lib = Arc::new(Box::new(lib) as Box<dyn ProcessChainLib>);
+        Ok(lib)
+    }
+
+    pub async fn load_process_chain_lib_from_json(
+        &self,
+        lib_id: &str,
+        priority: i32,
+        content: &str,
+    ) -> Result<ProcessChainLibRef, String> {
+        let lib = ProcessChainJSONLoader::load_process_chain_lib(lib_id, priority, content)?;
         self.add_process_chain_lib(lib.clone())?;
 
         Ok(lib)
