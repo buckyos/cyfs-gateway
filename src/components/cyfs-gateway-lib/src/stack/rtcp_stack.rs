@@ -6,7 +6,7 @@ use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_k
 use sfo_io::{LimitStream, StatStream};
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor, StreamRequest};
-use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, DatagramServerBox, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, StreamListener, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelError, TunnelManager, TunnelResult};
+use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, DatagramServerBox, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, StreamListener, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelError, TunnelManager, TunnelResult, StreamInfo};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, execute_stream_chain, GlobalProcessChainsRef};
 use crate::rtcp::{AsyncStreamWithDatagram, DatagramForwarder, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
@@ -163,7 +163,7 @@ impl RtcpStackInner {
                                     }
                                     Server::Stream(server) => {
                                         server
-                                            .serve_connection(stream)
+                                            .serve_connection(stream, StreamInfo::new(remote_addr.to_string()))
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
                                     }
@@ -549,7 +549,7 @@ impl StackFactory for RtcpStackFactory {
 mod tests {
     use std::collections::HashMap;
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory, ServerConfig};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo};
     use buckyos_kit::{AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, generate_ed25519_key_pair, DeviceConfig, EncodedDocument};
     use std::sync::Arc;
@@ -1050,7 +1050,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StreamServer for MockServer {
-        async fn serve_connection(&self, mut stream: Box<dyn AsyncStream>) -> ServerResult<()> {
+        async fn serve_connection(&self, mut stream: Box<dyn AsyncStream>, _info: StreamInfo) -> ServerResult<()> {
             let mut buf = [0u8; 4];
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"test");

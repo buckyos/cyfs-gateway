@@ -1,7 +1,7 @@
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig, StreamInfo};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -257,7 +257,7 @@ impl TlsStackInner {
                                     }
                                     Server::Stream(server) => {
                                         server
-                                            .serve_connection(Box::new(stream))
+                                            .serve_connection(Box::new(stream), StreamInfo::new(remote_addr.to_string()))
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
                                     }
@@ -513,7 +513,7 @@ impl TlsStackBuilder {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerServiceManager, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, ServerConfig};
+    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerServiceManager, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo};
     use crate::{TlsDomainConfig, TlsStack};
     use buckyos_kit::AsyncStream;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
@@ -829,7 +829,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StreamServer for MockServer {
-        async fn serve_connection(&self, mut stream: Box<dyn AsyncStream>) -> ServerResult<()> {
+        async fn serve_connection(&self, mut stream: Box<dyn AsyncStream>, _info: StreamInfo) -> ServerResult<()> {
             let mut buf = [0u8; 4];
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"test");

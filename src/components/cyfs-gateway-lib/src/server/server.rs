@@ -72,10 +72,24 @@ impl Server {
         }
     }
 }
+
+#[derive(Default)]
+pub struct StreamInfo {
+    pub src_addr: Option<String>,
+}
+
+impl StreamInfo {
+    pub fn new(src_addr: String) -> Self {
+        Self {
+            src_addr: Some(src_addr),
+        }
+    }
+}
+
 // 流处理服务
 #[async_trait::async_trait]
 pub trait StreamServer: Send + Sync {
-    async fn serve_connection(&self, stream: Box<dyn AsyncStream>) -> ServerResult<()>;
+    async fn serve_connection(&self, stream: Box<dyn AsyncStream>, info: StreamInfo) -> ServerResult<()>;
     fn id(&self) -> String;
     async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()>;
 }

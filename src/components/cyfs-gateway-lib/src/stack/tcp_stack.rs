@@ -7,7 +7,7 @@ use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -256,7 +256,7 @@ impl TcpStackInner {
                                     }
                                     Server::Stream(server) => {
                                         server
-                                            .serve_connection(stream)
+                                            .serve_connection(stream, StreamInfo::new(remote_addr.to_string()))
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
                                     }
@@ -459,7 +459,7 @@ impl StackFactory for TcpStackFactory {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, ServerConfig};
+    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo};
     use buckyos_kit::AsyncStream;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use std::sync::Arc;
@@ -691,7 +691,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StreamServer for MockServer {
-        async fn serve_connection(&self, mut stream: Box<dyn AsyncStream>) -> ServerResult<()> {
+        async fn serve_connection(&self, mut stream: Box<dyn AsyncStream>, _info: StreamInfo) -> ServerResult<()> {
             let mut buf = [0u8; 4];
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"test");

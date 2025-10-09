@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use buckyos_kit::AsyncStream;
 use cyfs_process_chain::HookPoint;
-use crate::{ServerConfig, ServerResult, StreamServer};
+use crate::{ServerConfig, ServerResult, StreamInfo, StreamServer};
 
 pub struct Socks5Server {
     hook_point: Arc<HookPoint>,
@@ -9,7 +9,7 @@ pub struct Socks5Server {
 
 #[async_trait::async_trait]
 impl StreamServer for Socks5Server {
-    async fn serve_connection(&self, _stream: Box<dyn AsyncStream>) -> ServerResult<()> {
+    async fn serve_connection(&self, _stream: Box<dyn AsyncStream>, _info: StreamInfo) -> ServerResult<()> {
         Ok(())
     }
 

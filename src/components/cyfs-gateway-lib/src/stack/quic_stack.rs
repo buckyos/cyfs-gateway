@@ -31,7 +31,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 use crate::stack::stream_forward;
@@ -919,7 +919,7 @@ impl QuicStackInner {
                                             let stat_stream = StatStream::new(stream);
                                             let speed = stat_stream.get_speed_stat();
                                             let handle = tokio::spawn(async move {
-                                                if let Err(e) = server.serve_connection(Box::new(stat_stream)).await {
+                                                if let Err(e) = server.serve_connection(Box::new(stat_stream), StreamInfo::new(remote_addr.to_string())).await {
                                                     log::error!("server error: {}", e);
                                                 }
                                             });
@@ -1201,7 +1201,7 @@ mod tests {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerServiceManager, Stack, QuicStackFactory, ConnectionManager, UdpStackConfig, StackProtocol, QuicStackConfig, StackFactory, ServerConfig};
+    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerServiceManager, Stack, QuicStackFactory, ConnectionManager, UdpStackConfig, StackProtocol, QuicStackConfig, StackFactory, ServerConfig, StreamInfo};
     use crate::global_process_chains::GlobalProcessChains;
 
     #[tokio::test]
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StreamServer for MockServer {
-        async fn serve_connection(&self, mut stream: Box<dyn AsyncStream>) -> ServerResult<()> {
+        async fn serve_connection(&self, mut stream: Box<dyn AsyncStream>, _info: StreamInfo) -> ServerResult<()> {
             let mut buf = [0u8; 4];
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"test");
