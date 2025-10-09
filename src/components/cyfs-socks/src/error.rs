@@ -55,6 +55,9 @@ pub enum SocksError {
 
     #[error("Socks error: {0}")]
     SocksError(String),
+
+    #[error("Hook point error: {0}")]
+    HookPointError(String),
 }
 
 pub type SocksResult<T> = std::result::Result<T, SocksError>;

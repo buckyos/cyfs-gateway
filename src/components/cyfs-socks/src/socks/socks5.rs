@@ -1,6 +1,7 @@
 use super::config::{SocksProxyAuth, SocksProxyConfig};
 use super::util::Socks5Util;
 use crate::error::{SocksError, SocksResult};
+use crate::hook::SocksHookManagerRef;
 use crate::rule::{RuleAction, RuleInput};
 use buckyos_kit::AsyncStream;
 use fast_socks5::{
@@ -13,11 +14,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
-use tokio::{
-    net::{TcpListener, TcpStream},
-    task,
-    task::JoinHandle,
-};
+use tokio::{net::TcpStream, task::JoinHandle};
 use url::Url;
 
 #[async_trait::async_trait]
@@ -37,6 +34,8 @@ pub struct Socks5Proxy {
     config: Arc<SocksProxyConfig>,
     socks5_config: Arc<Config<SimpleUserPassword>>,
 
+    hook_point: SocksHookManagerRef,
+
     // Use to stop the proxy
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
 
@@ -45,7 +44,7 @@ pub struct Socks5Proxy {
 }
 
 impl Socks5Proxy {
-    pub fn new(config: SocksProxyConfig) -> Self {
+    pub fn new(config: SocksProxyConfig, hook_point: SocksHookManagerRef) -> Self {
         let mut socks5_config = Config::default();
 
         // We should process the command and dns resolve by ourselves
@@ -66,19 +65,12 @@ impl Socks5Proxy {
             socks5_config: Arc::new(socks5_config),
             task: Arc::new(Mutex::new(None)),
             data_tunnel_provider: Arc::new(OnceCell::new()),
+            hook_point,
         }
     }
 
     pub fn id(&self) -> &str {
         &self.config.id
-    }
-
-    pub fn addr(&self) -> &SocketAddr {
-        &self.config.addr
-    }
-
-    pub fn dump(&self) -> serde_json::Value {
-        self.config.dump()
     }
 
     // Should only call once
@@ -91,73 +83,11 @@ impl Socks5Proxy {
         }
     }
 
-    pub async fn start(&self) -> SocksResult<()> {
-        let listener = TcpListener::bind(&self.config.addr).await.map_err(|e| {
-            let msg = format!("Error socks5 binding to {}: {}", self.config.addr, e);
-            error!("{}", msg);
-            SocksError::IoError(msg)
-        })?;
-
-        info!("Listen for socks5 connections at {}", &self.config.addr);
-
-        let this = self.clone();
-        let proxy_task = task::spawn(async move {
-            if let Err(e) = this.run(listener).await {
-                error!("Error running socks5 proxy: {}", e);
-            }
-        });
-
-        let prev;
-        {
-            let mut slot = self.task.lock().unwrap();
-            prev = slot.replace(proxy_task);
-        }
-
-        if let Some(prev) = prev {
-            warn!(
-                "Previous socks5 proxy task still running, aborting now: {}",
-                self.config.id
-            );
-            prev.abort();
-        }
-
-        Ok(())
-    }
-
-    pub fn stop(&self) {
-        let task = {
-            let mut slot = self.task.lock().unwrap();
-            slot.take()
-        };
-
-        if let Some(task) = task {
-            task.abort();
-            info!("Socks5 proxy task stopped: {}", self.config.id);
-        } else {
-            warn!("Socks5 proxy task not running: {}", self.config.id);
-        }
-    }
-
-    async fn run(&self, listener: TcpListener) -> SocksResult<()> {
-        // Standard TCP loop
-        loop {
-            match listener.accept().await {
-                Ok((socket, addr)) => {
-                    let this = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = this.on_new_connection(socket, addr).await {
-                            error!("Error processing socks5 connection: {}", e);
-                        }
-                    });
-                }
-                Err(err) => {
-                    error!("Error accepting connection: {}", err);
-                }
-            }
-        }
-    }
-
-    async fn on_new_connection(&self, conn: TcpStream, addr: SocketAddr) -> SocksResult<()> {
+    pub async fn handle_new_connection(
+        &self,
+        conn: Box<dyn AsyncStream>,
+        addr: SocketAddr,
+    ) -> SocksResult<()> {
         // info!("Socks5 connection from {}", addr);
         let socket = Socks5Socket::new(conn, self.socks5_config.clone());
 
@@ -219,7 +149,7 @@ impl Socks5Proxy {
 
     async fn process_socket(
         &self,
-        mut socket: fast_socks5::server::Socks5Socket<TcpStream, SimpleUserPassword>,
+        mut socket: fast_socks5::server::Socks5Socket<Box<dyn AsyncStream>, SimpleUserPassword>,
         addr: SocketAddr,
         target: TargetAddr,
     ) -> SocksResult<()> {
@@ -268,7 +198,7 @@ impl Socks5Proxy {
 
     async fn process_socket_direct(
         &self,
-        mut socket: fast_socks5::server::Socks5Socket<TcpStream, SimpleUserPassword>,
+        mut socket: fast_socks5::server::Socks5Socket<Box<dyn AsyncStream>, SimpleUserPassword>,
         target: TargetAddr,
     ) -> SocksResult<()> {
         // Connect to target directly
@@ -311,12 +241,12 @@ impl Socks5Proxy {
 
     async fn process_socket_via_proxy(
         &self,
-        mut socket: fast_socks5::server::Socks5Socket<TcpStream, SimpleUserPassword>,
+        mut socket: fast_socks5::server::Socks5Socket<Box<dyn AsyncStream>, SimpleUserPassword>,
         target: TargetAddr,
     ) -> SocksResult<()> {
         let mut tunnel = match self.build_data_tunnel(&target).await {
             Ok(tunnel) => {
-                 // Reply success after data tunnel connected
+                // Reply success after data tunnel connected
                 Socks5Util::reply_error(&mut socket, fast_socks5::ReplyError::Succeeded).await?;
                 tunnel
             }
@@ -330,7 +260,6 @@ impl Socks5Proxy {
             }
         };
 
-       
         let (read, write) = tokio::io::copy_bidirectional(&mut tunnel, &mut socket)
             .await
             .map_err(|e| {

@@ -23,6 +23,7 @@ serde = "*"
 fast-socks5 = "*"
 once_cell = "*"
 chrono = "*"
+clap =  { version = "*", features = ["string"]}
 
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
 cyfs-process-chain = { path = "../cyfs-process-chain" }

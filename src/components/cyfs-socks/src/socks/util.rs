@@ -1,4 +1,5 @@
 use crate::error::{SocksResult, SocksError};
+use buckyos_kit::AsyncStream;
 use fast_socks5::consts;
 use fast_socks5::server::{SimpleUserPassword, Socks5Socket};
 use fast_socks5::ReplyError;
@@ -35,7 +36,7 @@ impl Socks5Util {
     }
 
     pub async fn reply_error(
-        socket: &mut Socks5Socket<tokio::net::TcpStream, SimpleUserPassword>,
+        socket: &mut Socks5Socket<Box<dyn AsyncStream>, SimpleUserPassword>,
         error: ReplyError,
     ) -> SocksResult<()> {
         let reply = Self::new_reply(error, "0.0.0.0:0".parse().unwrap());
