@@ -34,7 +34,8 @@ use json_value_merge::Merge;
 use serde_json::{Value};
 use tokio::task;
 use url::Url;
-use crate::config_loader::{GatewayConfigParser, HttpServerConfigParser, QuicStackConfigParser, RtcpStackConfigParser, TcpStackConfigParser, TlsStackConfigParser, UdpStackConfigParser};
+use cyfs_socks::SocksServerFactory;
+use crate::config_loader::{GatewayConfigParser, HttpServerConfigParser, SocksServerConfigParser, QuicStackConfigParser, RtcpStackConfigParser, TcpStackConfigParser, TlsStackConfigParser, UdpStackConfigParser};
 use crate::cyfs_cmd_server::{CyfsCmdHandler, CyfsCmdServerConfigParser, CyfsCmdServerFactory, CYFS_CMD_SERVER_CONFIG};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -52,6 +53,7 @@ async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> 
     parser.register_stack_config_parser("quic", Arc::new(QuicStackConfigParser::new()));
 
     parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
+    parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
 
     parser.register_inner_service_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
 
@@ -112,6 +114,10 @@ async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> 
         global_process_chains.clone(),
     )));
 
+    factory.register_server_factory("socks", Arc::new(SocksServerFactory::new(
+        global_process_chains.clone(),
+    )));
+
     let user_name: Option<String> = match config_json.get("user_name") {
         Some(user_name) => {
             match user_name.as_str() {
@@ -134,6 +140,7 @@ async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> 
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
     let store = LocalTokenKeyStore::new(data_dir);
     let token_manager = LocalTokenManager::new(user_name, password, store).await?;
+    
     let handler = GatewayCmdHandler::new();
     factory.register_inner_service_factory(
         "cmd_server",

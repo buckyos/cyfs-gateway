@@ -2,6 +2,7 @@ use buckyos_kit::{adjust_path, get_buckyos_root_dir};
 use cyfs_gateway_lib::{config_err, into_config_err, ConfigErrorCode, ConfigResult, DNSServerConfig, InnerServiceConfig, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackRef, StackConfig, TcpStackConfig, TlsStack, UdpStackConfig};
 use cyfs_gateway_lib::DispatcherConfig;
 use cyfs_gateway_lib::WarpServerConfig;
+use cyfs_socks::SocksServerConfig;
 use cyfs_sn::*;
 use cyfs_socks::SocksProxyConfig;
 use cyfs_warp::register_inner_service_builder;
@@ -210,6 +211,25 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for HttpServer
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid http server config.{}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
+        Ok(Arc::new(config))
+    }
+}
+
+pub struct SocksServerConfigParser {}
+
+impl SocksServerConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for SocksServerConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
+        let config = SocksServerConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid socks server config.{}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
+
         Ok(Arc::new(config))
     }
 }
