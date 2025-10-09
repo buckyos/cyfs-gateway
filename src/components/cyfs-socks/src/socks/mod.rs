@@ -5,4 +5,3 @@ mod util;
 pub use config::*;
 pub use fast_socks5::util::target_addr::TargetAddr;
 pub use socks5::*;
-pub use crate::error::SocksResult;

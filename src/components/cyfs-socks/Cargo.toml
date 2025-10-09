@@ -27,3 +27,4 @@ clap =  { version = "*", features = ["string"]}
 
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
 cyfs-process-chain = { path = "../cyfs-process-chain" }
+cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
