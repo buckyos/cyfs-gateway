@@ -6,7 +6,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
-use cyfs_socks::SocksProxyConfig;
 
 fn default_true() -> bool {
     true
