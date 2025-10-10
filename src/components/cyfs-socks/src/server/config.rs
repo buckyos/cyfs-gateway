@@ -1,5 +1,5 @@
 use crate::SocksProxyAuth;
-use cyfs_gateway_lib::{ServerConfig, ProcessChainConfig};
+use cyfs_gateway_lib::{ServerConfig, ProcessChainConfig, get_min_priority};
 use cyfs_process_chain::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -58,11 +58,36 @@ impl SocksServerConfig {
 }
 
 impl ServerConfig for SocksServerConfig {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
     fn server_type(&self) -> String {
         "socks".to_string()
     }
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+
+    fn add_pre_hook_point_process_chain(&self, mut process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
+        let mut config = self.clone();
+        process_chain.priority = get_min_priority(&config.hook_point) - 1;
+        config.hook_point.push(process_chain);
+        Arc::new(config)
+    }
+
+    fn remove_pre_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig> {
+        let mut config = self.clone();
+        config.hook_point.retain(|chain| chain.id != process_chain_id);
+        Arc::new(config)
+    }
+
+    fn add_post_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
+        Arc::new(self.clone())
+    }
+
+    fn remove_post_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig> {
+        Arc::new(self.clone())
     }
 }

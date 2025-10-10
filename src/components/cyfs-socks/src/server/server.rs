@@ -1,10 +1,7 @@
 use super::config::SocksServerConfig;
 use crate::{Socks5Proxy, SocksHookManager, SocksProxyConfig};
 use buckyos_kit::AsyncStream;
-use cyfs_gateway_lib::{
-    server_err, GlobalProcessChainsRef, Server, ServerConfig, ServerErrorCode, ServerFactory,
-    ServerResult, StreamServer,
-};
+use cyfs_gateway_lib::{server_err, GlobalProcessChainsRef, Server, ServerConfig, ServerErrorCode, ServerFactory, ServerResult, StreamInfo, StreamServer};
 use std::sync::Arc;
 
 pub struct SocksServer {
@@ -19,7 +16,7 @@ impl SocksServer {
 
 #[async_trait::async_trait]
 impl StreamServer for SocksServer {
-    async fn serve_connection(&self, stream: Box<dyn AsyncStream>) -> ServerResult<()> {
+    async fn serve_connection(&self, stream: Box<dyn AsyncStream>, info: StreamInfo) -> ServerResult<()> {
         // FIXME: serve_connection should provide the source addr
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
 

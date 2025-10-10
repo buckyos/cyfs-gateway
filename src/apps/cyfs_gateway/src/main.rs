@@ -1,20 +1,5 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
-//mod config;
-//mod gateway;
-//mod interface;
-mod config_loader;
-mod dispatcher;
-mod gateway;
-mod socks;
-mod cyfs_cmd_server;
-mod cyfs_cmd_client;
-//mod peer;
-//mod proxy;
-//mod service;
-//mod storage;
-//mod tunnel;
-
 #[macro_use]
 extern crate log;
 
@@ -35,10 +20,8 @@ use serde_json::{Value};
 use tokio::fs::create_dir_all;
 use tokio::task;
 use url::Url;
-use cyfs_socks::SocksServerFactory;
-use crate::config_loader::{GatewayConfigParser, HttpServerConfigParser, SocksServerConfigParser, QuicStackConfigParser, RtcpStackConfigParser, TcpStackConfigParser, TlsStackConfigParser, UdpStackConfigParser};
-use crate::cyfs_cmd_server::{CyfsCmdHandler, CyfsCmdServerConfigParser, CyfsCmdServerFactory, CYFS_CMD_SERVER_CONFIG};
 use cyfs_gateway::*;
+use cyfs_socks::SocksServerFactory;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -113,6 +96,10 @@ async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> 
 
     factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
         inner_service_manager.clone(),
+        global_process_chains.clone(),
+    )));
+
+    factory.register_server_factory("socks", Arc::new(SocksServerFactory::new(
         global_process_chains.clone(),
     )));
 
@@ -210,6 +197,56 @@ fn generate_ed25519_key_pair_to_local() {
     println!("Public key saved to: {:?}", pk_file);
 }
 
+fn read_login_token(server: &str) -> Option<String> {
+    let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
+    let token_dir = get_buckyos_service_data_dir("cyfs_gateway").join("cli_token");
+    if !token_dir.exists() {
+        let _ = create_dir_all(token_dir.as_path());
+    }
+
+    if server.to_lowercase() == CMD_SERVER {
+        let private_key = data_dir.join("private_key.pem");
+        let encode_key = match load_private_key(private_key.as_path()) {
+            Ok(key) => key,
+            Err(e) => {
+                error!("load private key failed: {}", e);
+                return None;
+            }
+        };
+
+        let (token, _) = match RPCSessionToken::generate_jwt_token(
+            "root",
+            "cyfs-gateway",
+            None,
+            &encode_key, ) {
+            Ok(token) => token,
+            Err(e) => {
+                error!("generate jwt token failed: {}", e);
+                return None;
+            }
+        };
+        Some(token)
+    } else {
+        let token_file = token_dir.join(hex::encode(server.to_lowercase()));
+        match std::fs::read_to_string(token_file) {
+            Ok(token) => Some(token),
+            Err(e) => {
+                error!("read token file failed: {}", e);
+                None
+            }
+        }
+    }
+}
+
+fn save_login_token(server: &str, token: &str) {
+    if server.to_lowercase() == CMD_SERVER {
+        return;
+    }
+    let token_dir = get_buckyos_service_data_dir("cyfs_gateway").join("cli_token");
+    let token_file = token_dir.join(hex::encode(server.to_lowercase()));
+    let _ = std::fs::write(token_file, token);
+}
+
 #[tokio::main]
 async fn main() {
     let matches = Command::new("CYFS Gateway Service")
@@ -245,8 +282,232 @@ async fn main() {
                 .required(false)
                 .action(ArgAction::SetTrue),
         )
+        .subcommand(Command::new("login")
+            .about("Login to server")
+            .arg(Arg::new("user")
+                .long("user")
+                .short('u')
+                .help("user name")
+                .required(true))
+            .arg(Arg::new("password")
+                .long("password")
+                .short('p')
+                .help("password")
+                .required(true))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CMD_SERVER)))
+        .subcommand(Command::new("show_config")
+            .about("Show current config")
+            .arg(Arg::new("config_type")
+                .long("config_type")
+                .short('t')
+                .help("Config type, optional stack | server | inner_service | global_process_chain")
+                .required(false))
+            .arg(Arg::new("config_id")
+                .long("config_id")
+                .short('i')
+                .help("Config id")
+                .required(false))
+            .arg(Arg::new("format")
+                .long("format")
+                .short('f')
+                .help("Show format, optional json | yaml")
+                .required(false)
+                .default_value("yaml"))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CMD_SERVER)))
+        .subcommand(Command::new("show_connections")
+            .about("Show current connections")
+            .arg(Arg::new("format")
+                .long("format")
+                .short('f')
+                .help("Show format, optional json | yaml")
+                .required(false)
+                .default_value("yaml"))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CMD_SERVER)))
+        .subcommand(Command::new("add_chain")
+            .about("Add a chain")
+            .arg(Arg::new("config_type")
+                .long("config_type")
+                .short('t')
+                .help("Config type, optional stack | server | inner_service | global_process_chain")
+                .required(true))
+            .arg(Arg::new("config_id")
+                .long("config_id")
+                .short('i')
+                .help("Config id")
+                .required(true))
+            .arg(Arg::new("chain_id")
+                .long("chain_id")
+                .short('n')
+                .help("Chain id")
+                .required(false))
+            .arg(Arg::new("hook_point")
+                .long("hook_point")
+                .short('k')
+                .help("The hook point to which the chain belongs, optional pre | post")
+                .required(false)
+                .default_value("pre"))
+            .arg(Arg::new("chain_type")
+                .long("chain_type")
+                .short('y')
+                .help("Chain type")
+                .required(true))
+            .arg(Arg::new("chain_params")
+                .long("chain_params")
+                .short('p')
+                .help("Chain params")
+                .required(false))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CMD_SERVER)))
+        .subcommand(Command::new("del_chain")
+            .about("Delete a chain")
+            .arg(Arg::new("config_type")
+                .long("config_type")
+                .short('t')
+                .help("Config type, optional stack | server | inner_service | global_process_chain")
+                .required(true))
+            .arg(Arg::new("config_id")
+                .long("config_id")
+                .short('i')
+                .help("Config id")
+                .required(true))
+            .arg(Arg::new("chain_id")
+                .long("chain_id")
+                .short('n')
+                .help("Chain id")
+                .required(true))
+            .arg(Arg::new("hook_point")
+                .long("hook_point")
+                .short('k')
+                .help("The hook point to which the chain belongs, optional pre | post")
+                .required(false)
+                .default_value("pre"))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CMD_SERVER))
+        )
         .get_matches();
 
+    match matches.subcommand() {
+        Some(("login", sub_matches)) => {
+            let user = sub_matches.get_one::<String>("user").unwrap();
+            let password = sub_matches.get_one::<String>("password").unwrap();
+            let server = sub_matches.get_one::<String>("server").unwrap();
+            if server.to_lowercase() == CMD_SERVER {
+                std::process::exit(0);
+            }
+            let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), None);
+            let login_result = match cyfs_cmd_client.login(user, password).await {
+                Ok(result) => result,
+                Err(e) => {
+                    println!("login error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            save_login_token(server.as_str(), login_result.as_str());
+        }
+        Some(("show_config", sub_matches)) => {
+            let config_type = sub_matches.get_one::<String>("config_type");
+            let config_id = sub_matches.get_one::<String>("config_id");
+            let format = sub_matches.get_one::<String>("format").unwrap();
+            let server = sub_matches.get_one::<String>("server").unwrap();
+            let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.get_config(
+                config_type.map(|s| s.to_string()),
+                config_id.map(|s| s.to_string())).await {
+                Ok(result) => {
+                    if format == "json" {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        println!("{}", serde_yaml_ng::to_string(&result).unwrap());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("show config error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(("show_connections", sub_matches)) => {
+            let server = sub_matches.get_one::<String>("server").unwrap();
+            let format = sub_matches.get_one::<String>("format").unwrap();
+            let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.get_connections().await {
+                Ok(result) => {
+                    if format == "json" {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        println!("{}", serde_yaml_ng::to_string(&result).unwrap());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("show connections error: {}", e);
+                }
+            }
+        }
+        Some(("del_chain", sub_matches)) => {
+            let config_type = sub_matches.get_one::<String>("config_type").expect("config_type is required");
+            let config_id = sub_matches.get_one::<String>("config_id").expect("config_id is required");
+            let chain_id = sub_matches.get_one::<String>("chain_id").expect("chain_id is required");
+            let hook_point = sub_matches.get_one::<String>("hook_point").expect("hook_point is required");
+            let server = sub_matches.get_one::<String>("server").expect("server is required");
+            let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.del_chain(config_type, config_id, chain_id, hook_point).await {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("del chain error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(("add_chain", sub_matches)) => {
+            let config_type = sub_matches.get_one::<String>("config_type").expect("config_type is required");
+            let config_id = sub_matches.get_one::<String>("config_id").expect("config_id is required");
+            let chain_id = sub_matches.get_one::<String>("chain_id").expect("chain_id is required");
+            let chain_type = sub_matches.get_one::<String>("chain_type").expect("chain_type is required");
+            let hook_point = sub_matches.get_one::<String>("hook_point").expect("hook_point is required");
+            let chain_params = sub_matches.get_one::<String>("chain_params").expect("chain_config is required");
+            let server = sub_matches.get_one::<String>("server").expect("server is required");
+            let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.add_chain(config_type, config_id, hook_point, chain_id, chain_type, chain_params).await {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("add chain error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        },
+        _ => {}
+    }
     // set buckyos root dir
     if matches.get_flag("new_key_pair") {
         generate_ed25519_key_pair_to_local();
