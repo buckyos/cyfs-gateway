@@ -21,6 +21,21 @@ impl GlobalProcessChains {
         self.process_chains.lock().unwrap().push(process_chain_lib.into_process_chain_lib());
     }
 
+    pub fn clear_process_chains(&self) {
+        self.process_chains.lock().unwrap().clear();
+    }
+
+    pub fn update_process_chain(&self, process_chain: ProcessChainRef) {
+        let id = process_chain.id().to_string();
+        let new_chain_lib = ProcessChainListLib::new(id.as_str(), 0, vec![process_chain]);
+        for process_chain_lib in self.process_chains.lock().unwrap().iter_mut() {
+            if process_chain_lib.get_id() == id {
+                *process_chain_lib = new_chain_lib.into_process_chain_lib();
+                break;
+            }
+        }
+    }
+    
     pub fn get_process_chains(&self) -> Vec<ProcessChainLibRef> {
         self.process_chains.lock().unwrap().clone()
     }

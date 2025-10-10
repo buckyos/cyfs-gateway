@@ -7,7 +7,7 @@ use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_min_priority};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -22,17 +22,25 @@ use tokio::task::JoinHandle;
 use crate::stack::limiter::Limiter;
 
 struct TcpStackInner {
+    id: String,
     bind_addr: String,
     servers: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: TunnelManager,
+    global_process_chains: Option<GlobalProcessChainsRef>,
     transparent: bool,
 }
 
 
 impl TcpStackInner {
     async fn create(config: TcpStackBuilder) -> StackResult<Self> {
+        if config.id.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "id is required"
+            ));
+        }
         if config.bind.is_none() {
             return Err(stack_err!(
                 StackErrorCode::InvalidConfig,
@@ -59,14 +67,16 @@ impl TcpStackInner {
         }
 
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
-                                                          config.global_process_chains).await
+                                                          config.global_process_chains.clone()).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
+            id: config.id.unwrap(),
             bind_addr: config.bind.unwrap(),
             servers: config.servers.unwrap(),
             executor: Arc::new(Mutex::new(executor)),
             connection_manager: config.connection_manager,
             tunnel_manager: config.tunnel_manager.unwrap(),
+            global_process_chains: config.global_process_chains,
             transparent: config.transparent,
         })
     }
@@ -292,6 +302,7 @@ pub struct TcpStack {
 impl TcpStack {
     pub fn builder() -> TcpStackBuilder {
         TcpStackBuilder {
+            id: None,
             bind: None,
             hook_point: None,
             servers: None,
@@ -321,6 +332,10 @@ impl Drop for TcpStack {
 
 #[async_trait::async_trait]
 impl Stack for TcpStack {
+    fn id(&self) -> String {
+        self.inner.id.clone()
+    }
+
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Tcp
     }
@@ -336,12 +351,28 @@ impl Stack for TcpStack {
     }
 
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
-        todo!()
+        let config = config.as_ref().as_any().downcast_ref::<TcpStackConfig>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+
+        if config.id != self.inner.id {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
+        }
+
+        if config.bind.to_string() != self.inner.bind_addr {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "bind unmatch"));
+        }
+
+        let (executor, _) = create_process_chain_executor(&config.hook_point,
+                                                          self.inner.global_process_chains.clone()).await
+            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        *self.inner.executor.lock().unwrap() = executor;
+        Ok(())
     }
 }
 
 
 pub struct TcpStackBuilder {
+    id: Option<String>,
     bind: Option<String>,
     hook_point: Option<ProcessChainConfigs>,
     servers: Option<ServerManagerRef>,
@@ -352,6 +383,11 @@ pub struct TcpStackBuilder {
 }
 
 impl TcpStackBuilder {
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
     pub fn bind(mut self, bind: impl Into<String>) -> Self {
         self.bind = Some(bind.into());
         self
@@ -395,6 +431,7 @@ impl TcpStackBuilder {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TcpStackConfig {
+    pub id: String,
     pub protocol: StackProtocol,
     pub bind: SocketAddr,
     pub transparent: Option<bool>,
@@ -402,12 +439,29 @@ pub struct TcpStackConfig {
 }
 
 impl StackConfig for TcpStackConfig {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Tcp
     }
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+
+    fn add_process_chain(&self, mut process_chain: ProcessChainConfig) -> Arc<dyn StackConfig> {
+        let mut config = self.clone();
+        process_chain.priority = get_min_priority(&config.hook_point) - 1;
+        config.hook_point.push(process_chain);
+        Arc::new(config)
+    }
+
+    fn remove_process_chain(&self, process_chain_id: &str) -> Arc<dyn StackConfig> {
+        let mut config = self.clone();
+        config.hook_point.retain(|chain| chain.id != process_chain_id);
+        Arc::new(config)
     }
 }
 
@@ -443,6 +497,7 @@ impl StackFactory for TcpStackFactory {
         let config = config.as_ref().as_any().downcast_ref::<TcpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
         let stack = TcpStack::builder()
+            .id(config.id.clone())
             .bind(config.bind.to_string())
             .tunnel_manager(self.tunnel_manager.clone())
             .connection_manager(self.connection_manager.clone())
@@ -473,12 +528,14 @@ mod tests {
         let result = TcpStack::builder().bind("127.0.0.1:8080").build().await;
         assert!(result.is_err());
         let result = TcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:8080")
             .servers(Arc::new(ServerManager::new()))
             .build()
             .await;
         assert!(result.is_err());
         let result = TcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:8080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
@@ -486,6 +543,7 @@ mod tests {
             .await;
         assert!(result.is_err());
         let result = TcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:8080")
             .servers(Arc::new(ServerManager::new()))
             .tunnel_manager(TunnelManager::new())
@@ -494,6 +552,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
         let result = TcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:8080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
@@ -503,6 +562,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
         let result = TcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:8080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
@@ -529,6 +589,7 @@ mod tests {
 
         let connection_manager = ConnectionManager::new();
         let result = TcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:8080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
@@ -569,6 +630,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let result = TcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:8081")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
@@ -605,6 +667,7 @@ mod tests {
 
         let connection_manager = ConnectionManager::new();
         let result = TcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:8082")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
@@ -664,6 +727,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let result = TcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:8084")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
@@ -724,6 +788,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server("www.buckyos.com".to_string(), Server::Stream(Arc::new(MockServer)));
         let result = TcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:8085")
             .servers(server_manager)
             .hook_point(chains)
@@ -755,6 +820,7 @@ mod tests {
                                                ConnectionManager::new(),
                                                TunnelManager::new());
         let config = TcpStackConfig {
+            id: "test".to_string(),
             protocol: StackProtocol::Tcp,
             bind: "127.0.0.1:3345".parse().unwrap(),
             transparent: None,

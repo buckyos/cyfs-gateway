@@ -2,6 +2,7 @@
 mod tests {
     use std::io::{Read, Write};
     use std::sync::Arc;
+    use buckyos_kit::init_logging;
     use jsonwebtoken::{DecodingKey, EncodingKey};
     use jsonwebtoken::jwk::Jwk;
     use log::error;
@@ -58,8 +59,33 @@ mod tests {
             Ok(())
         }
     }
+
+    pub struct TempExternalCmdStore {
+        test_cmd: tempfile::NamedTempFile,
+    }
+
+    impl TempExternalCmdStore {
+        pub fn new() -> Self {
+            let mut test_cmd = tempfile::NamedTempFile::with_suffix(".py").unwrap();
+            let cmd = r#"
+print("hello python")
+            "#;
+            test_cmd.write_all(cmd.as_bytes()).unwrap();
+            TempExternalCmdStore {
+                test_cmd,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalCmdStore for TempExternalCmdStore {
+        async fn read_external_cmd(&self, cmd: &str) -> CmdResult<String> {
+            Ok(self.test_cmd.path().to_string_lossy().to_string())
+        }
+    }
     #[tokio::test]
     async fn test_cmd_server() {
+        init_logging("cyfs_gateway", false);
         let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(CYFS_CMD_SERVER_CONFIG).unwrap();
 
         // Load config from json
@@ -136,7 +162,8 @@ mod tests {
             Some("test".to_string()),
             Some("123456".to_string()),
             store).await.unwrap();
-        let handler = GatewayCmdHandler::new();
+        let cmd_store = TempExternalCmdStore::new();
+        let handler = GatewayCmdHandler::new(Arc::new(cmd_store));
         factory.register_inner_service_factory(
             "cmd_server",
             Arc::new(CyfsCmdServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));

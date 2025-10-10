@@ -14,7 +14,7 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, SpeedStatRef, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, config_err};
+use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, get_min_priority};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 #[cfg(unix)]
@@ -132,7 +132,7 @@ impl Datagram for ChannelDatagram {
         Ok(buf.len())
     }
 
-    async fn recv_from(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+    async fn recv_from(&mut self, _buf: &mut [u8]) -> Result<usize, Self::Error> {
         unreachable!()
     }
 }
@@ -243,6 +243,7 @@ fn recv_message(fd: std::os::unix::io::RawFd, buffer: &mut [u8]) -> Result<usize
 }
 
 struct UdpStackInner {
+    id: String,
     bind_addr: String,
     concurrency: u32,
     session_idle_time: Duration,
@@ -251,11 +252,15 @@ struct UdpStackInner {
     all_client_session: DatagramClientSessionMap,
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: TunnelManager,
+    global_process_chains: Option<GlobalProcessChainsRef>,
     transparent: bool,
 }
 
 impl UdpStackInner {
     async fn create(builder: UdpStackBuilder) -> StackResult<Self> {
+        if builder.id.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "id is required"));
+        }
         if builder.bind.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "bind is required"));
         }
@@ -269,10 +274,11 @@ impl UdpStackInner {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "tunnel_manager is required"));
         }
 
-        let (executor, _) = create_process_chain_executor(&builder.hook_point.unwrap(), builder.
-            global_process_chains).await
+        let (executor, _) = create_process_chain_executor(&builder.hook_point.unwrap(),
+                                                          builder.global_process_chains.clone()).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create process chain executor error: {}", e))?;
         Ok(Self {
+            id: builder.id.unwrap(),
             bind_addr: builder.bind.unwrap(),
             concurrency: builder.concurrency,
             session_idle_time: builder.session_idle_time,
@@ -281,6 +287,7 @@ impl UdpStackInner {
             all_client_session: Arc::new(Mutex::new(BTreeMap::new())),
             connection_manager: builder.connection_manager,
             tunnel_manager: builder.tunnel_manager.unwrap(),
+            global_process_chains: builder.global_process_chains,
             transparent: builder.transparent,
         })
     }
@@ -860,6 +867,10 @@ impl UdpStack {
 
 #[async_trait::async_trait]
 impl Stack for UdpStack {
+    fn id(&self) -> String {
+        self.inner.id.clone()
+    }
+
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Udp
     }
@@ -882,11 +893,27 @@ impl Stack for UdpStack {
     }
 
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
-        todo!()
+        let config = config.as_ref().as_any().downcast_ref::<UdpStackConfig>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+
+        if config.id != self.inner.id {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
+        }
+
+        if config.bind.to_string() != self.inner.bind_addr {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "bind unmatch"));
+        }
+
+        let (executor, _) = create_process_chain_executor(&config.hook_point,
+                                                          self.inner.global_process_chains.clone()).await
+            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        *self.inner.executor.lock().unwrap() = executor;
+        Ok(())
     }
 }
 
 pub struct UdpStackBuilder {
+    id: Option<String>,
     bind: Option<String>,
     concurrency: u32,
     session_idle_time: Duration,
@@ -901,6 +928,7 @@ pub struct UdpStackBuilder {
 impl UdpStackBuilder {
     fn new() -> Self {
         Self {
+            id: None,
             bind: None,
             concurrency: 200,
             session_idle_time: Duration::from_secs(120),
@@ -912,6 +940,12 @@ impl UdpStackBuilder {
             transparent: false,
         }
     }
+
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
     pub fn bind(mut self, bind: impl Into<String>) -> Self {
         self.bind = Some(bind.into());
         self
@@ -963,6 +997,7 @@ impl UdpStackBuilder {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct UdpStackConfig {
+    pub id: String,
     pub protocol: StackProtocol,
     pub bind: SocketAddr,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -975,12 +1010,29 @@ pub struct UdpStackConfig {
 }
 
 impl StackConfig for UdpStackConfig {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Udp
     }
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+
+    fn add_process_chain(&self, mut process_chain: ProcessChainConfig) -> Arc<dyn StackConfig> {
+        let mut config = self.clone();
+        process_chain.priority = get_min_priority(&config.hook_point) - 1;
+        config.hook_point.push(process_chain);
+        Arc::new(config)
+    }
+
+    fn remove_process_chain(&self, process_chain_id: &str) -> Arc<dyn StackConfig> {
+        let mut config = self.clone();
+        config.hook_point.retain(|chain| chain.id != process_chain_id);
+        Arc::new(config)
     }
 }
 
@@ -1015,6 +1067,7 @@ impl StackFactory for UdpStackFactory {
             .downcast_ref::<UdpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
         let stack = UdpStack::builder()
+            .id(config.id.clone())
             .bind(config.bind.to_string())
             .tunnel_manager(self.tunnel_manager.clone())
             .connection_manager(self.connection_manager.clone())
@@ -1043,21 +1096,25 @@ mod tests {
     #[tokio::test]
     async fn test_udp_stack_creation() {
         let result = UdpStack::builder()
+            .id("test")
             .build()
             .await;
         assert!(result.is_err());
         let result = UdpStack::builder()
+            .id("test")
             .bind("0.0.0.0:8930")
             .build()
             .await;
         assert!(result.is_err());
         let result = UdpStack::builder()
+            .id("test")
             .bind("0.0.0.0:8930")
             .servers(Arc::new(ServerManager::new()))
             .build()
             .await;
         assert!(result.is_err());
         let result = UdpStack::builder()
+            .id("test")
             .bind("0.0.0.0:8930")
             .hook_point(vec![])
             .servers(Arc::new(ServerManager::new()))
@@ -1066,6 +1123,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
         let result = UdpStack::builder()
+            .id("test")
             .bind("0.0.0.0:8930")
             .hook_point(vec![])
             .servers(Arc::new(ServerManager::new()))
@@ -1091,6 +1149,7 @@ mod tests {
 
         let tunnel_manager = TunnelManager::new();
         let result = UdpStack::builder()
+            .id("test")
             .bind("0.0.0.0:8930")
             .hook_point(chains)
             .servers(Arc::new(ServerManager::new()))
@@ -1144,6 +1203,7 @@ mod tests {
 
         let tunnel_manager = TunnelManager::new();
         let result = UdpStack::builder()
+            .id("test")
             .bind("0.0.0.0:8931")
             .hook_point(chains)
             .session_idle_time(Duration::from_secs(5))
@@ -1206,6 +1266,7 @@ mod tests {
         let datagram_server_manager = Arc::new(ServerManager::new());
         datagram_server_manager.add_server("mock".to_string(), Server::Datagram(Arc::new(MockServer)));
         let result = UdpStack::builder()
+            .id("test")
             .bind("0.0.0.0:8938")
             .hook_point(chains)
             .session_idle_time(Duration::from_secs(5))
@@ -1241,6 +1302,7 @@ mod tests {
         );
 
         let config = UdpStackConfig {
+            id: "test".to_string(),
             protocol: StackProtocol::Udp,
             bind: "127.0.0.1:334".parse().unwrap(),
             concurrency: None,

@@ -18,9 +18,8 @@ mod cyfs_cmd_client;
 #[macro_use]
 extern crate log;
 
-use crate::gateway::{Gateway, GatewayCmdHandler, GatewayFactory, GatewayParams, LocalTokenKeyStore, LocalTokenManager};
 use buckyos_kit::*;
-use clap::{Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
 use cyfs_dns::start_cyfs_dns_server;
 use cyfs_gateway_lib::*;
@@ -31,12 +30,15 @@ use name_lib::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 use json_value_merge::Merge;
+use kRPC::RPCSessionToken;
 use serde_json::{Value};
+use tokio::fs::create_dir_all;
 use tokio::task;
 use url::Url;
 use cyfs_socks::SocksServerFactory;
 use crate::config_loader::{GatewayConfigParser, HttpServerConfigParser, SocksServerConfigParser, QuicStackConfigParser, RtcpStackConfigParser, TcpStackConfigParser, TlsStackConfigParser, UdpStackConfigParser};
 use crate::cyfs_cmd_server::{CyfsCmdHandler, CyfsCmdServerConfigParser, CyfsCmdServerFactory, CYFS_CMD_SERVER_CONFIG};
+use cyfs_gateway::*;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -114,10 +116,6 @@ async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> 
         global_process_chains.clone(),
     )));
 
-    factory.register_server_factory("socks", Arc::new(SocksServerFactory::new(
-        global_process_chains.clone(),
-    )));
-
     let user_name: Option<String> = match config_json.get("user_name") {
         Some(user_name) => {
             match user_name.as_str() {
@@ -138,10 +136,18 @@ async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> 
     };
 
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
+    if !data_dir.exists() {
+        create_dir_all(data_dir.clone()).await?;
+    }
+
     let store = LocalTokenKeyStore::new(data_dir);
     let token_manager = LocalTokenManager::new(user_name, password, store).await?;
-    
-    let handler = GatewayCmdHandler::new();
+    let external_cmd_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("add_chain_cmds");
+    if !external_cmd_dir.exists() {
+        create_dir_all(external_cmd_dir.clone()).await?;
+    }
+    let external_cmd_store = LocalExternalCmdStore::new(external_cmd_dir);
+    let handler = GatewayCmdHandler::new(Arc::new(external_cmd_store));
     factory.register_inner_service_factory(
         "cmd_server",
         Arc::new(CyfsCmdServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));

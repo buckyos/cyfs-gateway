@@ -31,7 +31,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 use crate::stack::stream_forward;
@@ -685,6 +685,7 @@ impl server::ResolvesServerCert for ResolvesServerCertUsingSni {
 }
 
 struct QuicStackInner {
+    id: String,
     bind_addr: String,
     concurrency: u32,
     certs: Arc<ResolvesServerCertUsingSni>,
@@ -692,6 +693,7 @@ struct QuicStackInner {
     servers: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     connection_manager: Option<ConnectionManagerRef>,
+    global_process_chains: Option<GlobalProcessChainsRef>,
     tunnel_manager: TunnelManager,
 }
 
@@ -968,6 +970,9 @@ impl QuicStack {
     }
 
     async fn create(builder: QuicStackBuilder) -> StackResult<Self> {
+        if builder.id.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "id is required"));
+        }
         if builder.bind.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "bind is required"));
         }
@@ -982,7 +987,7 @@ impl QuicStack {
         }
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
-                                                          builder.global_process_chains).await
+                                                          builder.global_process_chains.clone()).await
             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
 
         let crypto_provider = rustls::crypto::ring::default_provider();
@@ -996,6 +1001,7 @@ impl QuicStack {
 
         Ok(QuicStack {
             inner: Arc::new(QuicStackInner {
+                id: builder.id.unwrap(),
                 bind_addr: builder.bind.unwrap(),
                 concurrency: builder.concurrency,
                 certs: cert_resolver,
@@ -1003,6 +1009,7 @@ impl QuicStack {
                 servers: builder.servers.unwrap(),
                 executor: Arc::new(Mutex::new(executor)),
                 connection_manager: builder.connection_manager,
+                global_process_chains: builder.global_process_chains,
                 tunnel_manager: builder.tunnel_manager.unwrap(),
             }),
             handle: Mutex::new(None),
@@ -1012,6 +1019,10 @@ impl QuicStack {
 
 #[async_trait::async_trait]
 impl Stack for QuicStack {
+    fn id(&self) -> String {
+        self.inner.id.clone()
+    }
+
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Quic
     }
@@ -1027,11 +1038,27 @@ impl Stack for QuicStack {
     }
 
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
-        todo!()
+        let config = config.as_ref().as_any().downcast_ref::<QuicStackConfig>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+
+        if config.id != self.inner.id {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
+        }
+
+        if config.bind.to_string() != self.inner.bind_addr {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "bind unmatch"));
+        }
+
+        let (executor, _) = create_process_chain_executor(&config.hook_point,
+                                                          self.inner.global_process_chains.clone()).await
+            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        *self.inner.executor.lock().unwrap() = executor;
+        Ok(())
     }
 }
 
 pub struct QuicStackBuilder {
+    id: Option<String>,
     bind: Option<String>,
     hook_point: Option<ProcessChainConfigs>,
     servers: Option<ServerManagerRef>,
@@ -1046,6 +1073,7 @@ pub struct QuicStackBuilder {
 impl QuicStackBuilder {
     fn new() -> Self {
         QuicStackBuilder {
+            id: None,
             bind: None,
             hook_point: None,
             servers: None,
@@ -1056,6 +1084,11 @@ impl QuicStackBuilder {
             connection_manager: None,
             tunnel_manager: None,
         }
+    }
+
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
     pub fn bind(mut self, bind: &str) -> Self {
         self.bind = Some(bind.to_string());
@@ -1113,6 +1146,7 @@ impl QuicStackBuilder {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct QuicStackConfig {
+    pub id: String,
     pub protocol: StackProtocol,
     pub bind: SocketAddr,
     pub concurrency: Option<u32>,
@@ -1123,12 +1157,29 @@ pub struct QuicStackConfig {
 }
 
 impl StackConfig for QuicStackConfig {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Quic
     }
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+
+    fn add_process_chain(&self, mut process_chain: ProcessChainConfig) -> Arc<dyn StackConfig> {
+        let mut config = self.clone();
+        process_chain.priority = get_min_priority(&config.hook_point) - 1;
+        config.hook_point.push(process_chain);
+        Arc::new(config)
+    }
+
+    fn remove_process_chain(&self, process_chain_id: &str) -> Arc<dyn StackConfig> {
+        let mut config = self.clone();
+        config.hook_point.retain(|chain| chain.id != process_chain_id);
+        Arc::new(config)
     }
 }
 
@@ -1213,12 +1264,14 @@ mod tests {
         let result = QuicStack::builder().bind("127.0.0.1:9080").build().await;
         assert!(result.is_err());
         let result = QuicStack::builder()
+            .id("test")
             .bind("127.0.0.1:9080")
             .servers(Arc::new(ServerManager::new()))
             .build()
             .await;
         assert!(result.is_err());
         let result = QuicStack::builder()
+            .id("test")
             .bind("127.0.0.1:9080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
@@ -1227,6 +1280,7 @@ mod tests {
         assert!(result.is_err());
         let tunnel_manager = TunnelManager::new();
         let result = QuicStack::builder()
+            .id("test")
             .bind("127.0.0.1:9080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
@@ -1235,6 +1289,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
         let result = QuicStack::builder()
+            .id("test")
             .bind("127.0.0.1:9080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
@@ -1268,6 +1323,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let result = QuicStack::builder()
+            .id("test")
             .bind("127.0.0.1:9180")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
@@ -1325,6 +1381,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let result = QuicStack::builder()
+            .id("test")
             .bind("127.0.0.1:9181")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
@@ -1459,6 +1516,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server("www.buckyos.com".to_string(), Server::Stream(Arc::new(MockServer)));
         let result = QuicStack::builder()
+            .id("test")
             .bind("127.0.0.1:9185")
             .servers(server_manager)
             .hook_point(chains)
@@ -1554,6 +1612,7 @@ mod tests {
 
         let tunnel_manager = TunnelManager::new();
         let result = QuicStack::builder()
+            .id("test")
             .bind("127.0.0.1:9186")
             .servers(server_manager)
             .hook_point(chains)
@@ -1656,6 +1715,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let tunnel_manager = TunnelManager::new();
         let result = QuicStack::builder()
+            .id("test")
             .bind("127.0.0.1:9188")
             .servers(server_manager)
             .hook_point(chains)
@@ -1719,6 +1779,7 @@ mod tests {
         );
 
         let config = QuicStackConfig {
+            id: "test".to_string(),
             protocol: StackProtocol::Quic,
             bind: "127.0.0.1:3345".parse().unwrap(),
             concurrency: None,

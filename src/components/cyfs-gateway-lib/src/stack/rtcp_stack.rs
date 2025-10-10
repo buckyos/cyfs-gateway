@@ -1,14 +1,13 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use buckyos_kit::AsyncStream;
 use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig};
 use sfo_io::{LimitStream, StatStream};
 use url::Url;
-use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor, StreamRequest};
-use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, DatagramServerBox, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, StreamListener, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelError, TunnelManager, TunnelResult, StreamInfo};
-use crate::global_process_chains::{create_process_chain_executor, execute_chain, execute_stream_chain, GlobalProcessChainsRef};
-use crate::rtcp::{AsyncStreamWithDatagram, DatagramForwarder, RTcpTunnelDatagramClient};
+use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
+use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, DatagramServerBox, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, StreamListener, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, ProcessChainConfig, get_min_priority};
+use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
+use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
 use crate::stack::{datagram_forward, stream_forward};
 use serde::{Deserialize, Serialize};
@@ -77,6 +76,7 @@ struct RtcpStackInner {
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: TunnelManager,
+    global_process_chains: Option<GlobalProcessChainsRef>,
 }
 
 impl RtcpStackInner {
@@ -89,7 +89,7 @@ impl RtcpStackInner {
         }
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
-                                                          builder.global_process_chains).await
+                                                          builder.global_process_chains.clone()).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
             bind_addr: builder.bind_addr.unwrap(),
@@ -97,6 +97,7 @@ impl RtcpStackInner {
             executor: Arc::new(Mutex::new(executor)),
             connection_manager: builder.connection_manager,
             tunnel_manager: builder.tunnel_manager.unwrap(),
+            global_process_chains: builder.global_process_chains,
         })
     }
 
@@ -186,12 +187,12 @@ impl RtcpStackInner {
         Ok(())
     }
 
-    async fn on_new_datagram(&self, datagram: Box<dyn AsyncStream>, dest_host: Option<String>, dest_port: u16, endpoint: TunnelEndpoint) -> StackResult<()> {
+    async fn on_new_datagram(&self, datagram: Box<dyn AsyncStream>, dest_host: Option<String>, dest_port: u16, _endpoint: TunnelEndpoint) -> StackResult<()> {
         let executor = {
             self.executor.lock().unwrap().fork()
         };
         let servers = self.servers.clone();
-        let remote_addr = match dest_host.clone() {
+        let _remote_addr = match dest_host.clone() {
             Some(host) => format!("{}:{}", host, dest_port),
             None => format!("127.0.0.1:{}", dest_port),
         };
@@ -300,16 +301,17 @@ impl TunnelBuilder for RtcpTunnelBuilder {
         self.rtcp.create_tunnel(tunnel_stack_id).await
     }
 
-    async fn create_stream_listener(&self, bind_stream_id: &Url) -> TunnelResult<Box<dyn StreamListener>> {
+    async fn create_stream_listener(&self, _bind_stream_id: &Url) -> TunnelResult<Box<dyn StreamListener>> {
         todo!()
     }
 
-    async fn create_datagram_server(&self, bind_session_id: &Url) -> TunnelResult<Box<dyn DatagramServerBox>> {
+    async fn create_datagram_server(&self, _bind_session_id: &Url) -> TunnelResult<Box<dyn DatagramServerBox>> {
         todo!()
     }
 }
 
 pub struct RtcpStack {
+    id: String,
     bind_addr: String,
     rtcp: Mutex<Option<RTcp>>,
     rtcp_ref: Mutex<Option<Arc<RTcp>>>,
@@ -329,6 +331,9 @@ impl RtcpStack {
     }
 
     async fn create(mut builder: RtcpStackBuilder) -> StackResult<Self> {
+        if builder.id.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "id is required"));
+        }
         if builder.bind_addr.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "bind is required"));
         }
@@ -339,6 +344,7 @@ impl RtcpStack {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "private_key is required"));
         }
 
+        let id = builder.id.take().unwrap();
         let bind_addr = builder.bind_addr.clone().unwrap();
         let device_config = builder.device_config.take().unwrap();
         let private_key = builder.private_key.take();
@@ -346,6 +352,7 @@ impl RtcpStack {
 
         let rtcp = RTcp::new(device_config.id.clone(), bind_addr.clone(), private_key, Arc::new(Listener::new(inner.clone())));
         Ok(Self {
+            id,
             bind_addr,
             rtcp: Mutex::new(Some(rtcp)),
             rtcp_ref: Mutex::new(None),
@@ -356,6 +363,10 @@ impl RtcpStack {
 
 #[async_trait::async_trait]
 impl Stack for RtcpStack {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Rtcp
     }
@@ -379,11 +390,27 @@ impl Stack for RtcpStack {
     }
 
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
-        todo!()
+        let config = config.as_ref().as_any().downcast_ref::<RtcpStackConfig>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+
+        if config.id != self.id {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
+        }
+
+        if config.bind != self.inner.bind_addr {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "bind unmatch"));
+        }
+
+        let (executor, _) = create_process_chain_executor(&config.hook_point,
+                                                          self.inner.global_process_chains.clone()).await
+            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        *self.inner.executor.lock().unwrap() = executor;
+        Ok(())
     }
 }
 
 pub struct RtcpStackBuilder {
+    id: Option<String>,
     bind_addr: Option<String>,
     device_config: Option<DeviceConfig>,
     private_key: Option<[u8; 48]>,
@@ -397,6 +424,7 @@ pub struct RtcpStackBuilder {
 impl RtcpStackBuilder {
     fn new() -> Self {
         Self {
+            id: None,
             bind_addr: None,
             device_config: None,
             private_key: None,
@@ -406,6 +434,11 @@ impl RtcpStackBuilder {
             connection_manager: None,
             tunnel_manager: None,
         }
+    }
+
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     pub fn bind(mut self, bind_addr: String) -> Self {
@@ -455,6 +488,7 @@ impl RtcpStackBuilder {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RtcpStackConfig {
+    pub id: String,
     pub protocol: StackProtocol,
     pub bind: String,
     pub hook_point: Vec<crate::ProcessChainConfig>,
@@ -464,12 +498,29 @@ pub struct RtcpStackConfig {
 }
 
 impl crate::StackConfig for RtcpStackConfig {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Rtcp
     }
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+
+    fn add_process_chain(&self, mut process_chain: ProcessChainConfig) -> Arc<dyn StackConfig> {
+        let mut config = self.clone();
+        process_chain.priority = get_min_priority(&config.hook_point) - 1;
+        config.hook_point.push(process_chain);
+        Arc::new(config)
+    }
+
+    fn remove_process_chain(&self, process_chain_id: &str) -> Arc<dyn StackConfig> {
+        let mut config = self.clone();
+        config.hook_point.retain(|chain| chain.id != process_chain_id);
+        Arc::new(config)
     }
 }
 
@@ -531,6 +582,7 @@ impl StackFactory for RtcpStackFactory {
             device_config
         };
         let stack = RtcpStack::builder()
+            .id(config.id.clone())
             .bind(config.bind.clone())
             .tunnel_manager(self.tunnel_manager.clone())
             .connection_manager(self.connection_manager.clone())
@@ -570,12 +622,14 @@ mod tests {
         let result = RtcpStack::builder().bind("127.0.0.1:2980".to_string()).build().await;
         assert!(result.is_err());
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
             .build()
             .await;
         assert!(result.is_err());
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -583,6 +637,7 @@ mod tests {
             .await;
         assert!(result.is_err());
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -591,6 +646,7 @@ mod tests {
             .await;
         assert!(result.is_err());
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -600,6 +656,7 @@ mod tests {
             .await;
         assert!(result.is_err());
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -610,6 +667,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -621,6 +679,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -661,6 +720,7 @@ mod tests {
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2981".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -700,6 +760,7 @@ mod tests {
 
         let tunnel_manager2 = TunnelManager::new();
         let result = RtcpStack::builder()
+            .id("test2")
             .bind("127.0.0.1:2982".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -760,6 +821,7 @@ mod tests {
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2983".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -799,6 +861,7 @@ mod tests {
 
         let tunnel_manager2 = TunnelManager::new();
         let result = RtcpStack::builder()
+            .id("test2")
             .bind("127.0.0.1:2984".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -859,6 +922,7 @@ mod tests {
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2985".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -898,6 +962,7 @@ mod tests {
 
         let tunnel_manager2 = TunnelManager::new();
         let result = RtcpStack::builder()
+            .id("test2")
             .bind("127.0.0.1:2986".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -974,6 +1039,7 @@ mod tests {
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2988".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1013,6 +1079,7 @@ mod tests {
 
         let tunnel_manager2 = TunnelManager::new();
         let result = RtcpStack::builder()
+            .id("test2")
             .bind("127.0.0.1:2989".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1097,6 +1164,7 @@ mod tests {
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2990".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1138,6 +1206,7 @@ mod tests {
         server_manager.add_server("www.buckyos.com".to_string(), Server::Stream(Arc::new(MockServer)));
         let tunnel_manager2 = TunnelManager::new();
         let result = RtcpStack::builder()
+            .id("test2")
             .bind("127.0.0.1:2991".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1197,6 +1266,7 @@ mod tests {
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2995".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1236,6 +1306,7 @@ mod tests {
 
         let tunnel_manager2 = TunnelManager::new();
         let result = RtcpStack::builder()
+            .id("test2")
             .bind("127.0.0.1:2996".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1296,6 +1367,7 @@ mod tests {
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2997".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1335,6 +1407,7 @@ mod tests {
 
         let tunnel_manager2 = TunnelManager::new();
         let result = RtcpStack::builder()
+            .id("test2")
             .bind("127.0.0.1:2313".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1395,6 +1468,7 @@ mod tests {
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2998".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1434,6 +1508,7 @@ mod tests {
 
         let tunnel_manager2 = TunnelManager::new();
         let result = RtcpStack::builder()
+            .id("test2")
             .bind("127.0.0.1:2999".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1508,6 +1583,7 @@ mod tests {
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2301".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1547,6 +1623,7 @@ mod tests {
 
         let tunnel_manager2 = TunnelManager::new();
         let result = RtcpStack::builder()
+            .id("test2")
             .bind("127.0.0.1:2302".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1629,6 +1706,7 @@ mod tests {
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
+            .id("test")
             .bind("127.0.0.1:2310".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1670,6 +1748,7 @@ mod tests {
         server_manager.add_server("www.buckyos.com".to_string(), Server::Datagram(Arc::new(MockDatagramServer)));
         let tunnel_manager2 = TunnelManager::new();
         let result = RtcpStack::builder()
+            .id("test2")
             .bind("127.0.0.1:2311".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
@@ -1721,6 +1800,7 @@ mod tests {
         std::fs::write(config_file.path(), device_doc).unwrap();
 
         let config = RtcpStackConfig {
+            id: "test".to_string(),
             protocol: StackProtocol::Rtcp,
             bind: "127.0.0.1:394".to_string(),
             hook_point: vec![],
@@ -1733,6 +1813,7 @@ mod tests {
         assert!(ret.is_ok());
 
         let config = RtcpStackConfig {
+            id: "test1".to_string(),
             protocol: StackProtocol::Rtcp,
             bind: "127.0.0.1:394".to_string(),
             hook_point: vec![],

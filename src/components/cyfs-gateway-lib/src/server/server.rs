@@ -10,11 +10,16 @@ use hyper::body::{Bytes};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::RwLock;
 use cyfs_process_chain::{CollectionValue, EnvRef, MapCollection, MapCollectionTraverseCallBackRef, TraverseGuard, VariableVisitor, VariableVisitorWrapperForMapCollection, HTTP_REQUEST_HEADER_VARS};
-use crate::{server_err, ServerError, ServerErrorCode, ServerResult};
+use crate::{server_err, ProcessChainConfig, ServerError, ServerErrorCode, ServerResult};
 
 pub trait ServerConfig: AsAny + Send + Sync {
+    fn id(&self) -> String;
     fn server_type(&self) -> String;
     fn get_config_json(&self) -> String;
+    fn add_pre_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig>;
+    fn remove_pre_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig>;
+    fn add_post_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig>;
+    fn remove_post_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig>;
 }
 
 #[async_trait::async_trait]
@@ -69,6 +74,14 @@ impl Server {
             Server::Http(server) => server.id(),
             Server::Stream(server) => server.id(),
             Server::Datagram(server) => server.id(),
+        }
+    }
+
+    pub async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
+        match self {
+            Server::Http(server) => server.update_config(config).await,
+            Server::Stream(server) => server.update_config(config).await,
+            Server::Datagram(server) => server.update_config(config).await,
         }
     }
 }

@@ -8,14 +8,16 @@ pub use sfo_result::into_err as into_cmd_err;
 use sha2::Digest;
 use crate::cyfs_cmd_server::{CmdErrorCode, CmdResult, LoginReq};
 
+pub const CMD_SERVER: &str = "http://127.0.0.1:13451";
+
 pub struct CyfsCmdClient {
     krpc: kRPC::kRPC,
 }
 
 impl CyfsCmdClient {
-    pub fn new(url: String, token: Option<String>) -> Self {
+    pub fn new(url: impl Into<String>, token: Option<String>) -> Self {
         Self {
-            krpc: kRPC::kRPC::new(url.as_str(), token),
+            krpc: kRPC::kRPC::new(url.into().as_str(), token),
         }
     }
 
@@ -43,6 +45,32 @@ impl CyfsCmdClient {
             params.insert("config_id", config_id.unwrap());
         }
         let result = self.krpc.call("get_config", serde_json::to_value(&params).unwrap()).await
+            .map_err(into_cmd_err!(CmdErrorCode::RpcError))?;
+
+        Ok(result)
+    }
+
+    pub async fn del_chain(&self, config_type: &str, config_id: &str, chain_id: &str, hook_point: &str) -> CmdResult<Value> {
+        let mut params = HashMap::new();
+        params.insert("config_type", config_type);
+        params.insert("config_id", config_id);
+        params.insert("chain_id", chain_id);
+        params.insert("hook_point", hook_point);
+        let result = self.krpc.call("del_chain", serde_json::to_value(&params).unwrap()).await
+            .map_err(into_cmd_err!(CmdErrorCode::RpcError))?;
+
+        Ok(result)
+    }
+
+    pub async fn add_chain(&self, config_type: &str, config_id: &str, hook_point: &str, chain_id: &str, chain_type: &str, chain_params: &str) -> CmdResult<Value> {
+        let mut params = HashMap::new();
+        params.insert("config_type", config_type);
+        params.insert("config_id", config_id);
+        params.insert("chain_type", chain_type);
+        params.insert("chain_params", chain_params);
+        params.insert("hook_point", hook_point);
+        params.insert("chain_id", chain_id);
+        let result = self.krpc.call("add_chain", serde_json::to_value(&params).unwrap()).await
             .map_err(into_cmd_err!(CmdErrorCode::RpcError))?;
 
         Ok(result)

@@ -1,12 +1,11 @@
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig, StreamInfo};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig, StreamInfo, ProcessChainConfig, get_min_priority};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, pkcs8_private_keys};
-use std::collections::HashMap;
 use std::io::{BufReader, Cursor};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -78,17 +77,25 @@ pub async fn create_server_config(
 }
 
 struct TlsStackInner {
+    id: String,
     bind_addr: String,
     certs: Arc<ResolvesServerCertUsingSni>,
     servers: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     connection_manager: Option<ConnectionManagerRef>,
+    global_process_chains: Option<GlobalProcessChainsRef>,
     tunnel_manager: TunnelManager,
     alpn_protocols: Vec<Vec<u8>>,
 }
 
 impl TlsStackInner {
     async fn create(config: TlsStackBuilder) -> StackResult<Self> {
+        if config.id.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "id is required"
+            ));
+        }
         if config.bind.is_none() {
             return Err(stack_err!(
                 StackErrorCode::InvalidConfig,
@@ -114,7 +121,7 @@ impl TlsStackInner {
             ));
         }
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
-                                                          config.global_process_chains).await
+                                                          config.global_process_chains.clone()).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let crypto_provider = rustls::crypto::ring::default_provider();
         let cert_resolver = Arc::new(ResolvesServerCertUsingSni::new());
@@ -126,11 +133,13 @@ impl TlsStackInner {
         }
 
         Ok(Self {
+            id: config.id.unwrap(),
             bind_addr: config.bind.unwrap(),
             certs: cert_resolver.clone(),
             servers: config.servers.unwrap(),
             executor: Arc::new(Mutex::new(executor)),
             connection_manager: config.connection_manager,
+            global_process_chains: config.global_process_chains,
             tunnel_manager: config.tunnel_manager.unwrap(),
             alpn_protocols: config.alpn_protocols,
         })
@@ -308,6 +317,10 @@ impl TlsStack {
 
 #[async_trait::async_trait]
 impl Stack for TlsStack {
+    fn id(&self) -> String {
+        self.inner.id.clone()
+    }
+
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Tls
     }
@@ -323,7 +336,20 @@ impl Stack for TlsStack {
     }
 
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
-        todo!()
+        let config = config.as_ref().as_any().downcast_ref::<TlsStackConfig>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+        if config.id != self.inner.id {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
+        }
+        if config.bind.to_string() != self.inner.bind_addr {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "bind unmatch"));
+        }
+
+        let (executor, _) = create_process_chain_executor(&config.hook_point,
+                                                          self.inner.global_process_chains.clone()).await
+            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        *self.inner.executor.lock().unwrap() = executor;
+        Ok(())
     }
 }
 
@@ -351,6 +377,7 @@ impl Clone for TlsDomainConfig {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TlsStackConfig {
+    pub id: String,
     pub protocol: StackProtocol,
     pub bind: std::net::SocketAddr,
     pub hook_point: Vec<crate::ProcessChainConfig>,
@@ -362,12 +389,29 @@ pub struct TlsStackConfig {
 }
 
 impl crate::StackConfig for TlsStackConfig {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
     fn stack_protocol(&self) -> StackProtocol {
         StackProtocol::Tls
     }
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+
+    fn add_process_chain(&self, mut process_chain: ProcessChainConfig) -> Arc<dyn StackConfig> {
+        let mut config = self.clone();
+        process_chain.priority = get_min_priority(&config.hook_point) - 1;
+        config.hook_point.push(process_chain);
+        Arc::new(config)
+    }
+
+    fn remove_process_chain(&self, process_chain_id: &str) -> Arc<dyn StackConfig> {
+        let mut config = self.clone();
+        config.hook_point.retain(|chain| chain.id != process_chain_id);
+        Arc::new(config)
     }
 }
 
@@ -414,6 +458,7 @@ impl crate::StackFactory for TlsStackFactory {
         }
 
         let stack = TlsStack::builder()
+            .id(config.id.clone())
             .bind(config.bind.to_string())
             .connection_manager(self.connection_manager.clone())
             .global_process_chains(self.global_process_chains.clone())
@@ -430,6 +475,7 @@ impl crate::StackFactory for TlsStackFactory {
 }
 
 pub struct TlsStackBuilder {
+    id: Option<String>,
     bind: Option<String>,
     hook_point: Option<ProcessChainConfigs>,
     servers: Option<ServerManagerRef>,
@@ -444,6 +490,7 @@ pub struct TlsStackBuilder {
 impl TlsStackBuilder {
     fn new() -> Self {
         Self {
+            id: None,
             bind: None,
             hook_point: None,
             servers: None,
@@ -454,6 +501,11 @@ impl TlsStackBuilder {
             tunnel_manager: None,
             alpn_protocols: vec![],
         }
+    }
+
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     pub fn bind(mut self, bind: impl Into<String>) -> Self {
@@ -541,12 +593,14 @@ mod tests {
         let result = TlsStack::builder().bind("127.0.0.1:9080").build().await;
         assert!(result.is_err());
         let result = TlsStack::builder()
+            .id("test")
             .bind("127.0.0.1:9080")
             .servers(Arc::new(ServerManager::new()))
             .build()
             .await;
         assert!(result.is_err());
         let result = TlsStack::builder()
+            .id("test")
             .bind("127.0.0.1:9080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
@@ -555,6 +609,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
         let result = TlsStack::builder()
+            .id("test")
             .bind("127.0.0.1:9080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
@@ -588,6 +643,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let result = TlsStack::builder()
+            .id("test")
             .bind("127.0.0.1:9080")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
@@ -644,6 +700,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let result = TlsStack::builder()
+            .id("test")
             .bind("127.0.0.1:9081")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
@@ -701,6 +758,7 @@ mod tests {
 
         let connection_manager = ConnectionManager::new();
         let result = TlsStack::builder()
+            .id("test")
             .bind("127.0.0.1:9091")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
@@ -781,6 +839,7 @@ mod tests {
 
         let connection_manager = ConnectionManager::new();
         let result = TlsStack::builder()
+            .id("test")
             .bind("127.0.0.1:9093")
             .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
@@ -916,6 +975,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server("www.buckyos.com".to_string(), Server::Stream(Arc::new(MockServer)));
         let result = TlsStack::builder()
+            .id("test")
             .bind("127.0.0.1:9085")
             .servers(server_manager)
             .hook_point(chains)
@@ -1000,6 +1060,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let result = TlsStack::builder()
+            .id("test")
             .bind("127.0.0.1:9087")
             .servers(server_manager)
             .hook_point(chains)
@@ -1098,6 +1159,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let result = TlsStack::builder()
+            .id("test")
             .bind("127.0.0.1:9086")
             .servers(server_manager)
             .hook_point(chains)
@@ -1166,6 +1228,7 @@ mod tests {
         );
 
         let config = TlsStackConfig {
+            id: "test".to_string(),
             protocol: StackProtocol::Tls,
             bind: "127.0.0.1:343".parse().unwrap(),
             hook_point: vec![],

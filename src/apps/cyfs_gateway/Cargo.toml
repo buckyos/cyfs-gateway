@@ -28,6 +28,7 @@ sha2 = "0.10"
 chrono = "0.4"
 hex = "0.4"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+sfo-io = "0.1"
 
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
 name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" }

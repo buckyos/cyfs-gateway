@@ -1,5 +1,6 @@
 stacks:
-  - bind: 127.0.0.1:13451
+  - id: cmd_server
+    bind: 127.0.0.1:13451
     protocol: tcp
     hook_point:
       - id: main

@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap};
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
 use sfo_io::SpeedStat;
 use tokio::task::{AbortHandle, JoinHandle};
 use crate::StackProtocol;
@@ -160,7 +158,8 @@ impl ConnectionManager {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio;
 
     pub struct MockSpeedStat {

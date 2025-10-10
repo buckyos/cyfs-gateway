@@ -1142,7 +1142,7 @@ mod tests {
     use super::*;
     use crate::rtcp::rtcp::RTcp;
     use crate::{TunnelEndpoint, TunnelResult};
-    use buckyos_kit::{AsyncStream};
+    use buckyos_kit::{init_logging, AsyncStream};
     use name_lib::DID;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1389,6 +1389,7 @@ mod tests {
             assert_eq!(&buf[..len], b"test");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+        log::info!("test_rtcp_datagram end");
 
         {
             let tunnel = rtcp2.create_tunnel(Some(format!("{}:19043", id1.to_host_name()).as_str())).await.unwrap();
@@ -1402,5 +1403,6 @@ mod tests {
             assert_eq!(&buf[..len], b"test");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+        log::info!("test_rtcp_datagram2 end");
     }
 }

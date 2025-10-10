@@ -20,6 +20,13 @@ pub enum CmdErrorCode {
     InvalidToken,
     CreateTokenFailed,
     NotSupportLogin,
+    ReadFileFailed,
+    RunPythonFailed,
+    InvalidConfigType,
+    ConfigNotFound,
+    InvalidParams,
+    SerializeFailed,
+    InvalidMethod,
 }
 pub type CmdResult<T> = sfo_result::Result<T, CmdErrorCode>;
 pub type CmdError = sfo_result::Error<CmdErrorCode>;
@@ -34,6 +41,10 @@ pub struct CyfsCmdServerConfig {
 }
 
 impl InnerServiceConfig for CyfsCmdServerConfig {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
     fn service_type(&self) -> String {
         String::from("cmd_server")
     }
@@ -100,7 +111,7 @@ impl<D: for<'de> Deserializer<'de>> InnerServiceConfigParser<D> for CyfsCmdServe
 
 #[async_trait::async_trait]
 pub trait CyfsCmdHandler: Send + Sync + 'static {
-    async fn handle(&self, method: &str, params: &Value) -> CmdResult<Value>;
+    async fn handle(&self, method: &str, params: Value) -> CmdResult<Value>;
 }
 
 #[async_trait::async_trait]
@@ -249,7 +260,7 @@ impl InnerHttpService for CyfsCmdServer {
             };
 
             if let Some(handler) = self.handler.upgrade() {
-                let result = handler.handle(req.method.as_str(), &req.params).await?;
+                let result = handler.handle(req.method.as_str(), req.params).await?;
                 let sys = if new_token.is_some() {
                     vec![seq, Value::String(new_token.unwrap())]
                 } else {

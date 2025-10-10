@@ -294,6 +294,10 @@ impl ProcessChainConfig {
 }
 pub type ProcessChainConfigs = Vec<ProcessChainConfig>;
 
+pub fn get_min_priority(chain_configs: &ProcessChainConfigs) -> i32 {
+    chain_configs.iter().map(|c| c.priority).min().unwrap_or(0)
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CyfsRtcpServiceConfig {
     pub device_name: String,

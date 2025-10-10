@@ -1,5 +1,6 @@
 stacks:
-  - bind: 0.0.0.0:8080
+  - id: test1
+    bind: 0.0.0.0:8080
     protocol: tcp
     hook_point:
       - id: main
@@ -12,7 +13,8 @@ stacks:
               eq ${REQ.ext.method} "CONNECT" && return "forward tcp:///${REQ.dest_host}";
               return "forward tcp:///${REQ.dest_host}:80";
 
-  - bind: 0.0.0.0:5235
+  - id: test2
+    bind: 0.0.0.0:5235
     protocol: tcp
     hook_point:
       - id: main
@@ -22,7 +24,8 @@ stacks:
             block: |
               reject;
 
-  - bind: 0.0.0.0:9545
+  - id: test3
+    bind: 0.0.0.0:9545
     protocol: udp
     transparent: true
     hook_point:
@@ -33,7 +36,7 @@ stacks:
             block: |
               reject;
 
-#  - bind: 0.0.0.0:8082
+#  - id: test2
 #    protocol: rtcp
 #    key_path: ./device_key.pem
 #    device_config_path: ./device.doc.json
