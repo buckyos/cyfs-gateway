@@ -86,7 +86,7 @@ impl Server {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct StreamInfo {
     pub src_addr: Option<String>,
 }

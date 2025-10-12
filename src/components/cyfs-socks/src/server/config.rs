@@ -83,11 +83,11 @@ impl ServerConfig for SocksServerConfig {
         Arc::new(config)
     }
 
-    fn add_post_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
+    fn add_post_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
         Arc::new(self.clone())
     }
 
-    fn remove_post_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig> {
+    fn remove_post_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
         Arc::new(self.clone())
     }
 }

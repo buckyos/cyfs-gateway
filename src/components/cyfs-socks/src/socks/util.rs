@@ -1,9 +1,10 @@
-use crate::error::{SocksResult, SocksError};
+use crate::error::{SocksError, SocksResult};
 use buckyos_kit::AsyncStream;
 use fast_socks5::consts;
 use fast_socks5::server::{SimpleUserPassword, Socks5Socket};
 use fast_socks5::ReplyError;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use tokio::io::AsyncWriteExt;
 
 pub struct Socks5Util {}
@@ -55,4 +56,64 @@ impl Socks5Util {
 
         Ok(())
     }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ProxyAccessMethod {
+    Proxy(Option<String>),
+    Direct,
+    Reject,
+}
+
+impl FromStr for ProxyAccessMethod {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if parts.is_empty() {
+            let msg = format!("Empty access method string");
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        match parts[0].to_uppercase().as_str() {
+            "PROXY" | "SOCKS" => {
+                if parts.len() < 2 {
+                    return Ok(Self::Proxy(None));
+                }
+
+                Ok(Self::Proxy(Some(parts[1].to_string())))
+            }
+            "DIRECT" => Ok(ProxyAccessMethod::Direct),
+            "REJECT" => Ok(ProxyAccessMethod::Reject),
+            _ => {
+                let msg = format!("Invalid proxy access method: {}", s);
+                error!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+}
+
+// Same as the return value of pac script
+pub fn parse_hook_point_return_value(pac_string: &str) -> SocksResult<Vec<ProxyAccessMethod>> {
+    // Split the string by semicolons to get different access methods
+    let list = pac_string
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<&str>>();
+
+    let mut result = Vec::new();
+    for item in list {
+        let value = ProxyAccessMethod::from_str(item).map_err(|e| {
+            let msg = format!("Invalid hook point return value: {}, err={}", item, e);
+            error!("{}", msg);
+            SocksError::HookPointError(msg)
+        })?;
+
+        result.push(value);
+    }
+
+    Ok(result)
 }

@@ -1,19 +1,17 @@
 use super::config::{SocksProxyAuth, SocksProxyConfig};
-use super::util::Socks5Util;
+use super::util::{parse_hook_point_return_value, ProxyAccessMethod, Socks5Util};
 use crate::error::{SocksError, SocksResult};
-use crate::hook::SocksHookManagerRef;
-use crate::rule::{RuleAction, RuleInput};
+use crate::hook::*;
 use buckyos_kit::AsyncStream;
+use cyfs_gateway_lib::StreamInfo;
+use cyfs_process_chain::{CommandResult, EnvExternal};
 use fast_socks5::{
     server::{Config, SimpleUserPassword, Socks5Socket},
     util::target_addr::TargetAddr,
     Socks5Command,
 };
 use once_cell::sync::OnceCell;
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 use tokio::{net::TcpStream, task::JoinHandle};
 use url::Url;
 
@@ -86,21 +84,21 @@ impl Socks5Proxy {
     pub async fn handle_new_connection(
         &self,
         conn: Box<dyn AsyncStream>,
-        addr: SocketAddr,
+        addr: StreamInfo,
     ) -> SocksResult<()> {
-        // info!("Socks5 connection from {}", addr);
+        debug!("Socks5 connection from {:?}", addr);
         let socket = Socks5Socket::new(conn, self.socks5_config.clone());
 
         match socket.upgrade_to_socks5().await {
             Ok(mut socket) => {
                 let target = match socket.target_addr() {
                     Some(target) => {
-                        info!("Recv socks5 connection from {} to {}", addr, target);
+                        info!("Recv socks5 connection from {:?} to {}", addr, target);
                         target.to_owned()
                     }
                     None => {
                         let msg =
-                            format!("Error getting socks5 connection target address: {},", addr,);
+                            format!("Error getting socks5 connection target address: {:?}", addr,);
                         error!("{}", msg);
                         return Err(SocksError::InvalidParam(msg));
                     }
@@ -123,7 +121,7 @@ impl Socks5Proxy {
                 }
             }
             Err(err) => {
-                let msg = format!("Upgrade to socks5 error: {}", err);
+                let msg = format!("Upgrade to socks5 error: {:?}, {}", addr, err);
                 error!("{}", msg);
                 Err(SocksError::SocksError(msg))
             }
@@ -150,49 +148,85 @@ impl Socks5Proxy {
     async fn process_socket(
         &self,
         mut socket: fast_socks5::server::Socks5Socket<Box<dyn AsyncStream>, SimpleUserPassword>,
-        addr: SocketAddr,
+        addr: StreamInfo,
         target: TargetAddr,
     ) -> SocksResult<()> {
-        // Select by rule engine
-        if let Some(ref rule_engine) = self.config.rule_engine {
-            let input = RuleInput::new_socks_request(&addr, &target);
-            match rule_engine.select(input).await {
-                Ok(action) => match action {
-                    RuleAction::Direct | RuleAction::Pass => {
-                        info!("Will process socks5 connection to {} directly", target);
-                        self.process_socket_direct(socket, target).await
-                    }
-                    RuleAction::Proxy(proxy_target) => {
-                        info!(
-                            "Will process socks5 connection to {} via proxy {}",
-                            target, proxy_target
-                        );
-                        self.process_socket_via_proxy(socket, target).await
-                    }
-                    RuleAction::Reject => {
-                        let msg = format!("Rule engine blocked connection to {}", target);
-                        error!("{}", msg);
-                        Socks5Util::reply_error(
-                            &mut socket,
-                            fast_socks5::ReplyError::HostUnreachable,
-                        )
-                        .await
-                    }
-                },
-                Err(e) => {
-                    let msg = format!("Error selecting rule, now will use direct: {}", e);
-                    warn!("{}", msg);
-                    // Socks5Util::reply_error(&mut socket, fast_socks5::ReplyError::GeneralFailure)
-                    //    .await
-                    self.process_socket_direct(socket, target).await
+        let hook_point = self.hook_point.get_socks_lib_executor()?;
+        let env = hook_point.chain_env();
+
+        let socks_req = SocksRequestMap::new(addr.src_addr, target.clone());
+        let ext_env = SocksRequestEnv::new(socks_req);
+        let ext_env = Arc::new(Box::new(ext_env) as Box<dyn EnvExternal>);
+        env.env_external_manager()
+            .add_external("socks", ext_env)
+            .await
+            .map_err(|e| {
+                let msg = format!("Add socks request env to external failed: {}", e);
+                error!("{}", msg);
+                SocksError::HookPointError(msg)
+            })?;
+
+        let ret = hook_point.execute_lib().await.map_err(|e| {
+            let msg = format!("Execute socks hook point failed: {}", e);
+            error!("{}", msg);
+            SocksError::HookPointError(msg)
+        })?;
+
+        let hook_point_ret = match ret {
+            CommandResult::Success(value) => value,
+            CommandResult::Error(value) => value,
+            CommandResult::Control(ctrl) => {
+                let msg = format!(
+                    "Socks hook point returned control, will use direct {:?}",
+                    ctrl
+                );
+                warn!("{}", msg);
+                "DIRECT".to_string()
+            }
+        };
+
+        let access_method = match parse_hook_point_return_value(&hook_point_ret) {
+            Ok(m) => {
+                debug!(
+                    "Socks hook point return value: {}, access method: {:?}",
+                    hook_point_ret, m
+                );
+                if m.is_empty() {
+                    vec![ProxyAccessMethod::Direct]
+                } else {
+                    m
                 }
             }
-        } else {
-            warn!(
-                "Rule engine is not set, now Will process socks5 connection to {} directly",
-                target
-            );
-            self.process_socket_direct(socket, target).await
+            Err(e) => {
+                let msg = format!(
+                    "Error parsing socks hook point return value: {}, will use direct",
+                    e
+                );
+                warn!("{}", msg);
+                vec![ProxyAccessMethod::Direct]
+            }
+        };
+
+        // TODO now just use the first one, and will support multiple later?
+        let access_method = &access_method[0];
+        match access_method {
+            ProxyAccessMethod::Direct => {
+                info!("Will process socks5 connection to {} directly", target);
+                self.process_socket_direct(socket, target).await
+            }
+            ProxyAccessMethod::Proxy(proxy_target) => {
+                // TODO now always use the proxy in config
+                info!(
+                    "Will process socks5 connection to {} via proxy {:?}",
+                    target, proxy_target
+                );
+                self.process_socket_via_proxy(socket, target).await
+            }
+            ProxyAccessMethod::Reject => {
+                let msg = format!("Rule engine blocked connection to {}", target);
+                error!("{}", msg);
+                Socks5Util::reply_error(&mut socket, fast_socks5::ReplyError::HostUnreachable).await
+            }
         }
     }
 

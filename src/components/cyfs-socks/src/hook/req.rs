@@ -323,12 +323,12 @@ impl MapCollection for TargetAddrMap {
 
 #[derive(Clone)]
 pub struct SocksRequestMap {
-    inbound_addr: SocketAddr,
+    inbound_addr: Option<String>,
     target_addr: TargetAddr,
 }
 
 impl SocksRequestMap {
-    pub fn new(inbound_addr: SocketAddr, target_addr: TargetAddr) -> Self {
+    pub fn new(inbound_addr: Option<String>, target_addr: TargetAddr) -> Self {
         Self {
             inbound_addr,
             target_addr,
@@ -336,11 +336,12 @@ impl SocksRequestMap {
     }
 
     fn inbound_addr_value(&self) -> CollectionValue {
-        let map = SocketAddrMap {
-            addr: self.inbound_addr,
+        let str = match &self.inbound_addr {
+            Some(addr) => addr.clone(),
+            None => "".to_string(),
         };
-        let map = Arc::new(Box::new(map) as Box<dyn MapCollection>);
-        CollectionValue::Map(map)
+
+        CollectionValue::String(str)
     }
 
     fn target_addr_value(&self) -> CollectionValue {
