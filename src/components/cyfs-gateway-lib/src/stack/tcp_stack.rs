@@ -7,7 +7,7 @@ use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_min_priority};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_min_priority, get_stream_external_commands};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -67,7 +67,8 @@ impl TcpStackInner {
         }
 
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
-                                                          config.global_process_chains.clone()).await
+                                                          config.global_process_chains.clone(),
+                                                          Some(get_stream_external_commands())).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
             id: config.id.unwrap(),
@@ -363,7 +364,8 @@ impl Stack for TcpStack {
         }
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
-                                                          self.inner.global_process_chains.clone()).await
+                                                          self.inner.global_process_chains.clone(),
+                                                          Some(get_stream_external_commands())).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
         Ok(())

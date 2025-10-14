@@ -12,7 +12,7 @@ mod socks;
 mod selector;
 mod acme_client;
 mod cert_mgr;
-mod server;
+pub mod server;
 mod inner_service;
 mod stack;
 mod global_process_chains;

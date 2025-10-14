@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use buckyos_kit::AsyncStream;
-use cyfs_process_chain::{CollectionValue, CommandResult, ExternalCommand, HookPoint, HookPointEnv, HttpProbeCommand, HttpsSniProbeCommand, MapCollectionRef, ProcessChainLibExecutor, ProcessChainLibRef, ProcessChainListLib, ProcessChainRef, StreamRequest, StreamRequestMap};
+use cyfs_process_chain::{CollectionValue, CommandResult, ExternalCommand, ExternalCommandRef, HookPoint, HookPointEnv, HttpProbeCommand, HttpsSniProbeCommand, MapCollectionRef, ProcessChainLibExecutor, ProcessChainLibRef, ProcessChainListLib, ProcessChainRef, StreamRequest, StreamRequestMap};
 use crate::{config_err, ConfigErrorCode, ConfigResult, ProcessChainConfig};
 
 pub struct GlobalProcessChains {
@@ -35,7 +35,7 @@ impl GlobalProcessChains {
             }
         }
     }
-    
+
     pub fn get_process_chains(&self) -> Vec<ProcessChainLibRef> {
         self.process_chains.lock().unwrap().clone()
     }
@@ -50,10 +50,23 @@ impl GlobalProcessChains {
     }
 }
 
+pub fn get_stream_external_commands() -> Vec<(String, ExternalCommandRef)> {
+    let mut cmds = vec![];
+    let https_sni_probe_command = HttpsSniProbeCommand::new();
+    let name = https_sni_probe_command.name().to_owned();
+    cmds.push((name, Arc::new(Box::new(https_sni_probe_command) as Box<dyn ExternalCommand>)));
 
-pub(crate) async fn create_process_chain_executor(
+    let http_probe_command = HttpProbeCommand::new();
+    let name = http_probe_command.name().to_owned();
+    cmds.push((name, Arc::new(Box::new(http_probe_command) as Box<dyn ExternalCommand>)));
+
+    cmds
+}
+
+pub async fn create_process_chain_executor(
     chains: &Vec<ProcessChainConfig>,
     global_process_chains: Option<GlobalProcessChainsRef>,
+    external_commands: Option<Vec<(String, ExternalCommandRef)>>,
 ) -> ConfigResult<(ProcessChainLibExecutor, HookPointEnv)> {
     let hook_point = HookPoint::new("cyfs_server_hook_point");
     let process_chain_lib = ProcessChainListLib::new_empty("main", 0);
@@ -70,23 +83,12 @@ pub(crate) async fn create_process_chain_executor(
 
     let hook_point_env = HookPointEnv::new("cyfs_server_hook_point_env", PathBuf::new());
 
-    let https_sni_probe_command = HttpsSniProbeCommand::new();
-    let name = https_sni_probe_command.name().to_owned();
-    hook_point_env
-        .register_external_command(
-            &name,
-            Arc::new(Box::new(https_sni_probe_command) as Box<dyn ExternalCommand>),
-        )
-        .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
-
-    let http_probe_command = HttpProbeCommand::new();
-    let name = http_probe_command.name().to_owned();
-    hook_point_env
-        .register_external_command(
-            &name,
-            Arc::new(Box::new(http_probe_command) as Box<dyn ExternalCommand>),
-        )
-        .unwrap();
+    if let Some(external_commands) = external_commands {
+        for (name, cmd) in external_commands {
+            hook_point_env.register_external_command(name.as_str(), cmd.clone())
+                .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
+        }
+    }
 
     let executor = hook_point_env
         .link_hook_point(&hook_point)
@@ -122,7 +124,7 @@ pub(crate) async fn execute_stream_chain(executor: ProcessChainLibExecutor, requ
     Ok((ret, socket))
 }
 
-pub(crate) async fn execute_chain(executor: ProcessChainLibExecutor, coll: MapCollectionRef) -> ConfigResult<CommandResult> {
+pub async fn execute_chain(executor: ProcessChainLibExecutor, coll: MapCollectionRef) -> ConfigResult<CommandResult> {
     let chain_env = executor.chain_env();
     chain_env.create("REQ", CollectionValue::Map(coll))
         .await

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
+use cyfs_dns::DnsServerConfig;
 //use buckyos_api::ZONE_PROVIDER;
 
 pub trait StackConfigParser<D: for<'de> Deserializer<'de>>: Send + Sync {
@@ -211,6 +212,26 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for HttpServer
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid http server config.{}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
+        Ok(Arc::new(config))
+    }
+}
+
+pub struct DnsServerConfigParser {
+}
+
+impl DnsServerConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for DnsServerConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
+        let config = DnsServerConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid dns server config.{:?}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()
+            ))?;
         Ok(Arc::new(config))
     }
 }

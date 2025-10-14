@@ -1,7 +1,7 @@
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig, StreamInfo, ProcessChainConfig, get_min_priority};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -121,7 +121,8 @@ impl TlsStackInner {
             ));
         }
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
-                                                          config.global_process_chains.clone()).await
+                                                          config.global_process_chains.clone(),
+                                                          Some(get_stream_external_commands())).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let crypto_provider = rustls::crypto::ring::default_provider();
         let cert_resolver = Arc::new(ResolvesServerCertUsingSni::new());
@@ -346,7 +347,8 @@ impl Stack for TlsStack {
         }
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
-                                                          self.inner.global_process_chains.clone()).await
+                                                          self.inner.global_process_chains.clone(),
+                                                          Some(get_stream_external_commands())).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
         Ok(())

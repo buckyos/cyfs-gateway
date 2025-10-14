@@ -14,7 +14,7 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, get_min_priority};
+use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, get_min_priority, DatagramInfo};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 #[cfg(unix)]
@@ -275,7 +275,8 @@ impl UdpStackInner {
         }
 
         let (executor, _) = create_process_chain_executor(&builder.hook_point.unwrap(),
-                                                          builder.global_process_chains.clone()).await
+                                                          builder.global_process_chains.clone(),
+                                                          None).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create process chain executor error: {}", e))?;
         Ok(Self {
             id: builder.id.unwrap(),
@@ -337,7 +338,7 @@ impl UdpStackInner {
                     } else {
                         if let Some(server) = self.servers.get_server(&server_session.server) {
                             if let Server::Datagram(server) = server {
-                                match server.serve_datagram(&data[..len]).await {
+                                match server.serve_datagram(&data[..len], DatagramInfo::new(Some(src_addr.to_string()))).await {
                                     Ok(resp) => {
                                         if let Err(e) = udp_socket.send_to(resp.as_slice(), &src_addr).await {
                                             log::error!("send datagram error: {}", e);
@@ -557,7 +558,14 @@ impl UdpStackInner {
                                                     Ok(len) => {
                                                         if let Some(server) = servers.get_server(name.as_str()) {
                                                             if let Server::Datagram(server) = server {
-                                                                let buf = server.serve_datagram(&buffer[0..len]).await.unwrap();
+                                                                let buf = match server.serve_datagram(&buffer[0..len],
+                                                                                                      DatagramInfo::new(Some(src_addr.to_string()))).await {
+                                                                    Ok(buf) => buf,
+                                                                    Err(e) => {
+                                                                        log::error!("server error: {}", e);
+                                                                        break;
+                                                                    }
+                                                                };
                                                                 if let Err(e) = udp_socket.send_to(buf.as_slice(), src_addr).await {
                                                                     log::error!("send datagram error: {}", e);
                                                                     break;
@@ -585,7 +593,9 @@ impl UdpStackInner {
                                             send_datagram: Some(send_datagram),
                                         }));
                                     } else {
-                                        let buf = server.serve_datagram(&data[..len]).await.map_err(into_stack_err!(StackErrorCode::ServerError, ""))?;
+                                        let buf = server.serve_datagram(&data[..len],
+                                                                        DatagramInfo::new(Some(src_addr.to_string()))).await
+                                            .map_err(into_stack_err!(StackErrorCode::ServerError, ""))?;
                                         udp_socket.send_to(buf.as_slice(), src_addr).await.map_err(into_stack_err!(StackErrorCode::IoError, "send error"))?;
 
                                         speed_stat.add_read_data_size(len as u64);
@@ -729,6 +739,11 @@ impl UdpStackInner {
                     let (len, addr) = match udp_socket.recv_from(&mut buffer).await {
                         Ok(pair) => pair,
                         Err(err) => {
+                            if let Some(err) = err.raw_os_error() {
+                                if err == 10054 {
+                                    continue;
+                                }
+                            }
                             log::error!("accept error: {}", err);
                             break;
                         }
@@ -905,7 +920,8 @@ impl Stack for UdpStack {
         }
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
-                                                          self.inner.global_process_chains.clone()).await
+                                                          self.inner.global_process_chains.clone(),
+                                                          None).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
         Ok(())
@@ -1089,7 +1105,7 @@ mod tests {
     use std::time::Duration;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use tokio::net::UdpSocket;
-    use crate::{ConnectionManager, GatewayDevice, ProcessChainConfigs, Server, ServerConfig, ServerManager, ServerResult, Stack, StackFactory, StackProtocol, TunnelManager, UdpStack, UdpStackConfig, UdpStackFactory, GATEWAY_TUNNEL_MANAGER};
+    use crate::{ConnectionManager, DatagramInfo, GatewayDevice, ProcessChainConfigs, Server, ServerConfig, ServerManager, ServerResult, Stack, StackFactory, StackProtocol, TunnelManager, UdpStack, UdpStackConfig, UdpStackFactory, GATEWAY_TUNNEL_MANAGER};
     use crate::global_process_chains::GlobalProcessChains;
     use crate::server::{DatagramServer};
 
@@ -1235,7 +1251,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl DatagramServer for MockServer {
-        async fn serve_datagram(&self, buf: &[u8]) -> ServerResult<Vec<u8>> {
+        async fn serve_datagram(&self, buf: &[u8], _info: DatagramInfo) -> ServerResult<Vec<u8>> {
             assert_eq!(buf, b"test_server");
             Ok("datagram".as_bytes().to_vec())
         }

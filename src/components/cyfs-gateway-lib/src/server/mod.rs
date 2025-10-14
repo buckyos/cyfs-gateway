@@ -1,12 +1,10 @@
 mod http_server;
 mod socks5_server;
 mod server;
-mod dns_server;
 
 pub use http_server::*;
 pub use socks5_server::*;
 pub use server::*;
-pub use dns_server::*;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ServerErrorCode {
@@ -22,6 +20,11 @@ pub enum ServerErrorCode {
     IOError,
     BadRequest,
     UnknownServerType,
+    EncodeError,
+    InvalidDnsOpType,
+    InvalidDnsMessageType,
+    InvalidDnsRecordType,
+    Rejected,
 }
 pub type ServerResult<T> = sfo_result::Result<T, ServerErrorCode>;
 pub type ServerError = sfo_result::Error<ServerErrorCode>;

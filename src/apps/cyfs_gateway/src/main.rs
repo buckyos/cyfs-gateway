@@ -6,7 +6,7 @@ extern crate log;
 use buckyos_kit::*;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
-use cyfs_dns::start_cyfs_dns_server;
+use cyfs_dns::{start_cyfs_dns_server, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
 use cyfs_warp::*;
 use log::*;
@@ -39,6 +39,7 @@ async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> 
 
     parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
     parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
+    parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
 
     parser.register_inner_service_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
 
@@ -100,6 +101,11 @@ async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> 
     )));
 
     factory.register_server_factory("socks", Arc::new(SocksServerFactory::new(
+        global_process_chains.clone(),
+    )));
+
+    factory.register_server_factory("dns", Arc::new(ProcessChainDnsServerFactory::new(
+        inner_service_manager.clone(),
         global_process_chains.clone(),
     )));
 

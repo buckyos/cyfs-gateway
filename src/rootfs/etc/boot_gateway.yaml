@@ -27,14 +27,14 @@ stacks:
   - id: test3
     bind: 0.0.0.0:9545
     protocol: udp
-    transparent: true
+    transparent: false
     hook_point:
       - id: main
         priority: 1
         blocks:
           - id: default
             block: |
-              reject;
+              return "server main_dns";
 
 #  - id: test2
 #    protocol: rtcp
@@ -76,7 +76,7 @@ stacks:
 #            block: |
 #              reject;
 
-#servers:
+servers:
 #  - id: web3.buckyos.com
 #    type: http
 #    hook_point:
@@ -97,15 +97,15 @@ stacks:
 #            block: |
 #              reject;
 #
-#  - id: main_dns
-#    type: dns
-#    hook_point:
-#      - id: main
-#        priority: 1
-#        blocks:
-#          - id: default
-#            block: |
-#              reject;
+  - id: main_dns
+    type: dns
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              call resolve ${REQ.name} ${REQ.record_type} 223.5.5.5 && return;
 #
 #global_process_chains:
 #  - id: global1

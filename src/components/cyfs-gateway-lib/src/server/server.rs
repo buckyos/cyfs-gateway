@@ -379,9 +379,21 @@ pub trait HttpServer: Send + Sync + 'static {
     async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()>;
 }
 
+pub struct DatagramInfo {
+    pub src_addr: Option<String>,
+}
+
+impl DatagramInfo {
+    pub fn new(src_addr: Option<String>) -> Self {
+        DatagramInfo {
+            src_addr,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait DatagramServer: Send + Sync + 'static {
-    async fn serve_datagram(&self, buf: &[u8]) -> ServerResult<Vec<u8>>;
+    async fn serve_datagram(&self, buf: &[u8], info: DatagramInfo) -> ServerResult<Vec<u8>>;
     fn id(&self) -> String;
     async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()>;
 }

@@ -31,7 +31,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_stream_external_commands};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 use crate::stack::stream_forward;
@@ -987,7 +987,8 @@ impl QuicStack {
         }
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
-                                                          builder.global_process_chains.clone()).await
+                                                          builder.global_process_chains.clone(),
+                                                          Some(get_stream_external_commands())).await
             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
 
         let crypto_provider = rustls::crypto::ring::default_provider();
@@ -1049,9 +1050,11 @@ impl Stack for QuicStack {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "bind unmatch"));
         }
 
-        let (executor, _) = create_process_chain_executor(&config.hook_point,
-                                                          self.inner.global_process_chains.clone()).await
-            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        let (executor, _) = create_process_chain_executor(
+            &config.hook_point,
+            self.inner.global_process_chains.clone(),
+            Some(get_stream_external_commands()),
+        ).await.map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
         Ok(())
     }

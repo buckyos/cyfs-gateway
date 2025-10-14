@@ -138,6 +138,6 @@ impl InnerServiceManager {
 #[async_trait::async_trait]
 pub trait InnerDnsService: Send + Sync {
     fn id(&self) -> String;
-    async fn query(&self, name: &str, record_type: Option<RecordType>, from_ip: Option<IpAddr>) -> Result<NameInfo, ()>;
-    async fn query_did(&self, did: &DID, fragment: Option<&str>, from_ip: Option<IpAddr>) -> Result<EncodedDocument, ()>;
+    async fn query(&self, name: &str, record_type: Option<RecordType>, from_ip: Option<IpAddr>) -> ServiceResult<NameInfo>;
+    async fn query_did(&self, did: &DID, fragment: Option<&str>, from_ip: Option<IpAddr>) -> ServiceResult<EncodedDocument>;
 }

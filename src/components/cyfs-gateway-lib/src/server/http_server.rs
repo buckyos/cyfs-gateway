@@ -6,7 +6,7 @@ use hyper::body::{Bytes};
 use hyper::{http, StatusCode};
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CollectionValue, CommandControl, MapCollection, ProcessChainLibExecutor};
-use crate::{HttpRequestHeaderMap, HttpServer, InnerServiceManagerRef, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult};
+use crate::{get_stream_external_commands, HttpRequestHeaderMap, HttpServer, InnerServiceManagerRef, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err, into_server_err};
 
@@ -104,7 +104,8 @@ impl ProcessChainHttpServer {
         };
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
-                                                          builder.global_process_chains).await
+                                                          builder.global_process_chains,
+                                                          None).await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
         Ok(ProcessChainHttpServer {
             id: builder.id.unwrap(),
