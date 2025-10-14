@@ -2,6 +2,7 @@
 
 mod dns_server;
 mod resolve;
+mod local_dns;
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -12,8 +13,9 @@ use name_client::NameInfo;
 use name_lib::EncodedDocument;
 use cyfs_gateway_lib::{into_server_err, server_err, ServerErrorCode, ServerResult};
 use cyfs_process_chain::{CollectionValue, MapCollectionRef, MemoryMapCollection, MemorySetCollection};
-pub use dns_server::*;
 use cyfs_process_chain::SetCollection;
+pub use dns_server::*;
+pub use local_dns::*;
 
 
 #[cfg(test)]

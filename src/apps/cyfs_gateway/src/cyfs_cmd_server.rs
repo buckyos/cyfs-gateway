@@ -75,13 +75,13 @@ impl CyfsCmdServerFactory {
 
 #[async_trait::async_trait]
 impl InnerServiceFactory for CyfsCmdServerFactory {
-    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<InnerService> {
+    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<Vec<InnerService>> {
         let config = config.as_any().downcast_ref::<CyfsCmdServerConfig>()
             .ok_or(service_err!(ServiceErrorCode::InvalidConfig, "invalid CyfsCmdServer config {}", config.service_type()))?;
-        Ok(InnerService::HttpService(Arc::new(CyfsCmdServer::new(config.clone(),
+        Ok(vec![InnerService::HttpService(Arc::new(CyfsCmdServer::new(config.clone(),
                                                                  self.handler.clone(),
                                                                  self.token_factory.clone(),
-                                                                 self.token_verifier.clone()))))
+                                                                 self.token_verifier.clone())))])
     }
 }
 

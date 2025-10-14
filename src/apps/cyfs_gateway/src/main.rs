@@ -6,13 +6,13 @@ extern crate log;
 use buckyos_kit::*;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
-use cyfs_dns::{start_cyfs_dns_server, ProcessChainDnsServerFactory};
+use cyfs_dns::{start_cyfs_dns_server, LocalDnsFactory, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
 use cyfs_warp::*;
 use log::*;
 use name_client::*;
 use name_lib::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use json_value_merge::Merge;
 use kRPC::RPCSessionToken;
@@ -25,7 +25,7 @@ use cyfs_socks::SocksServerFactory;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> Result<()> {
+async fn service_main(config_dir: &Path, config_json: serde_json::Value, params: GatewayParams) -> Result<()> {
     let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(CYFS_CMD_SERVER_CONFIG).unwrap();
     cmd_config.merge(&config_json);
 
@@ -42,6 +42,7 @@ async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> 
     parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
 
     parser.register_inner_service_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
+    parser.register_inner_service_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
 
     let load_result = parser.parse(cmd_config);
     if load_result.is_err() {
@@ -144,6 +145,9 @@ async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> 
     factory.register_inner_service_factory(
         "cmd_server",
         Arc::new(CyfsCmdServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
+    factory.register_inner_service_factory(
+        "local_dns",
+        Arc::new(LocalDnsFactory::new(config_dir.to_string_lossy().to_string())));
 
     let gateway = match factory.create_gateway(config_loader).await {
         Ok(gateway) => gateway,
@@ -162,7 +166,7 @@ async fn service_main(config_json: serde_json::Value, params: GatewayParams) -> 
 }
 
 // Parse config first, then config file if supplied by user
-async fn load_config_from_args(matches: &clap::ArgMatches) -> Result<serde_json::Value> {
+async fn load_config_from_args(matches: &clap::ArgMatches) -> Result<(PathBuf, serde_json::Value)> {
     let default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
     let config_file = matches.get_one::<String>("config_file");
     let real_config_file;
@@ -180,7 +184,7 @@ async fn load_config_from_args(matches: &clap::ArgMatches) -> Result<serde_json:
 
     let config_json = buckyos_kit::ConfigMerger::load_dir_with_root(&config_dir, &real_config_file).await?;
 
-    Ok(config_json)
+    Ok((config_dir.to_path_buf(), config_json))
 }
 
 fn generate_ed25519_key_pair_to_local() {
@@ -524,7 +528,7 @@ async fn main() {
     init_logging("cyfs_gateway",true);
     info!("cyfs_gateway start...");
 
-    let config_json: serde_json::Value = load_config_from_args(&matches)
+    let (config_dir, config_json) = load_config_from_args(&matches)
         .await
         .map_err(|e| {
             error!("Error loading config: {}", e);
@@ -550,7 +554,7 @@ async fn main() {
             .collect(),
     };
 
-    if let Err(e) = service_main(config_json, params).await {
+    if let Err(e) = service_main(config_dir.as_path(), config_json, params).await {
         error!("Gateway run error: {}", e);
     }
 

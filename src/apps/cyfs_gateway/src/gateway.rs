@@ -86,8 +86,10 @@ impl GatewayFactory {
         }
 
         for inner_service_config in config.inner_services.iter() {
-            let service = self.inner_service_factory.create(inner_service_config.clone()).await?;
-            self.inner_service_manager.add_service(service.id(), service);
+            let services = self.inner_service_factory.create(inner_service_config.clone()).await?;
+            for service in services {
+                self.inner_service_manager.add_service(service.id(), service);
+            }
         }
 
         for process_chain_config in config.global_process_chains.iter() {

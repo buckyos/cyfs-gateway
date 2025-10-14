@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
-use cyfs_dns::DnsServerConfig;
+use cyfs_dns::{DnsServerConfig, LocalDnsConfig};
 //use buckyos_api::ZONE_PROVIDER;
 
 pub trait StackConfigParser<D: for<'de> Deserializer<'de>>: Send + Sync {
@@ -293,6 +293,25 @@ impl<D: for<'de> Deserializer<'de> + Clone> InnerServiceConfigParser<D> for Cyfs
             return Err(config_err!(ConfigErrorCode::InvalidConfig, "unknown inner service type: {}", service_type.ty));
         }
         parser.unwrap().parse(de)
+    }
+}
+
+pub struct LocalDnsConfigParser {}
+
+impl LocalDnsConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<D: for<'de> Deserializer<'de> + Clone> InnerServiceConfigParser<D> for LocalDnsConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn InnerServiceConfig>> {
+        let config = LocalDnsConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid local dns config.{:?}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()
+            ))?;
+        Ok(Arc::new(config))
     }
 }
 

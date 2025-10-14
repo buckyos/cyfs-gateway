@@ -15,6 +15,7 @@ pub enum ServiceErrorCode {
     Failed,
     UnknownService,
     InvalidConfig,
+    DnsQueryError,
 }
 pub type ServiceResult<T> = sfo_result::Result<T, ServiceErrorCode>;
 pub type ServiceError = sfo_result::Error<ServiceErrorCode>;
@@ -42,7 +43,7 @@ pub trait InnerServiceConfig: AsAny + Send + Sync {
 
 #[async_trait::async_trait]
 pub trait InnerServiceFactory: Send + Sync {
-    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<InnerService>;
+    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<Vec<InnerService>>;
 }
 
 pub struct CyfsInnerServiceFactory {
@@ -68,7 +69,7 @@ impl CyfsInnerServiceFactory {
 
 #[async_trait::async_trait]
 impl InnerServiceFactory for CyfsInnerServiceFactory {
-    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<InnerService> {
+    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<Vec<InnerService>> {
         let factory = {
             self.service_factory.lock().unwrap().get(&config.service_type()).cloned()
         };

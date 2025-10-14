@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::Value;
-use cyfs_gateway_lib::{into_service_err, ServiceErrorCode, ServiceResult};
 pub use sfo_result::err as cmd_err;
 pub use sfo_result::into_err as into_cmd_err;
 use sha2::Digest;

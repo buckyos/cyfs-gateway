@@ -105,7 +105,8 @@ servers:
         blocks:
           - id: default
             block: |
-              call resolve ${REQ.name} ${REQ.record_type} 223.5.5.5 && return;
+              call resolve ${REQ.name} ${REQ.record_type} local_dns && return;
+              call resolve ${REQ.name} ${REQ.record_type} "223.5.5.5" && return;
 #
 #global_process_chains:
 #  - id: global1
@@ -122,7 +123,7 @@ servers:
 #        block: |
 #          reject;
 
-#inner_services:
-#  # 服务自定义参数
-#  - id: sn
-#    type: sn
+inner_services:
+  - id: local_dns
+    type: local_dns
+    path: ./local_dns.toml
