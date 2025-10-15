@@ -131,8 +131,7 @@ impl ExternalCommand for Resolve {
         } else {
             let server_address = server_address.unwrap();
             if let Ok(address) = server_address.parse::<IpAddr>() {
-                // let provider = DnsProvider::new(Some(SocketAddr::new(address, 53).to_string()));
-                let provider = DnsProvider::new(Some(address.to_string()));
+                let provider = DnsProvider::new(Some(server_address.to_string()));
                 match provider.query(domain.as_str(), Some(record_type), None).await {
                     Ok(name_info) => name_info,
                     Err(e) => {

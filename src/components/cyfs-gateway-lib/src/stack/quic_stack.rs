@@ -1426,7 +1426,15 @@ mod tests {
         assert!(ret.is_err());
     }
 
-    pub struct MockServer;
+    pub struct MockServer {
+        id: String,
+    }
+
+    impl MockServer {
+        pub fn new(id: String) -> Self {
+            MockServer { id }
+        }
+    }
 
     #[async_trait::async_trait]
     impl StreamServer for MockServer {
@@ -1440,7 +1448,7 @@ mod tests {
         }
 
         fn id(&self) -> String {
-            todo!()
+            self.id.clone()
         }
 
         async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
@@ -1517,7 +1525,7 @@ mod tests {
         let tunnel_manager = TunnelManager::new();
 
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server("www.buckyos.com".to_string(), Server::Stream(Arc::new(MockServer)));
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))));
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9185")
@@ -1591,7 +1599,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let http_server = ProcessChainHttpServer::builder()
-            .id("1")
+            .id("www.buckyos.com")
             .version("HTTP/3")
             .h3_port(9186)
             .hook_point(chains)
@@ -1600,7 +1608,7 @@ mod tests {
             .build().await.unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server("www.buckyos.com".to_string(), Server::Http(Arc::new(http_server)));
+        server_manager.add_server(Server::Http(Arc::new(http_server)));
 
         let chains = r#"
 - id: main

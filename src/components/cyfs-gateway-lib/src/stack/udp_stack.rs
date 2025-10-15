@@ -1247,7 +1247,17 @@ mod tests {
         assert_eq!(stack.get_session_count(), 0);
     }
 
-    struct MockServer;
+    struct MockServer {
+        id: String,
+    }
+
+    impl MockServer {
+        fn new(id: String) -> Self {
+            Self {
+                id,
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl DatagramServer for MockServer {
@@ -1257,7 +1267,7 @@ mod tests {
         }
 
         fn id(&self) -> String {
-            todo!()
+            self.id.clone()
         }
 
         async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
@@ -1280,7 +1290,7 @@ mod tests {
 
         let tunnel_manager = TunnelManager::new();
         let datagram_server_manager = Arc::new(ServerManager::new());
-        datagram_server_manager.add_server("mock".to_string(), Server::Datagram(Arc::new(MockServer)));
+        datagram_server_manager.add_server(Server::Datagram(Arc::new(MockServer::new("mock".to_string()))));
         let result = UdpStack::builder()
             .id("test")
             .bind("0.0.0.0:8938")

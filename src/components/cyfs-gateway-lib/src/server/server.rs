@@ -408,8 +408,8 @@ impl ServerManager {
             servers: Mutex::new(HashMap::new()),
         }
     }
-    pub fn add_server(&self, name: String, server: Server) {
-        self.servers.lock().unwrap().insert(name, server);
+    pub fn add_server(&self, server: Server) {
+        self.servers.lock().unwrap().insert(server.id(), server);
     }
     pub fn get_server(&self, name: &str) -> Option<Server> {
         self.servers.lock().unwrap().get(name).cloned()

@@ -28,3 +28,7 @@ cyfs-sn = {path = "../cyfs-sn"}
 cyfs-process-chain = { path = "../cyfs-process-chain" }
 shlex = "1.3.0"
 clap = "4.5"
+
+[dev-dependencies]
+serde_yaml_ng = "0.10.0"
+tempfile = "3.23.0"

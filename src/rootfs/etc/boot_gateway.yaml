@@ -106,7 +106,7 @@ servers:
           - id: default
             block: |
               call resolve ${REQ.name} ${REQ.record_type} local_dns && return;
-              call resolve ${REQ.name} ${REQ.record_type} "223.5.5.5" && return;
+              call resolve ${REQ.name} ${REQ.record_type} "223.5.5.5:53" && return;
 #
 #global_process_chains:
 #  - id: global1

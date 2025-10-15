@@ -17,36 +17,6 @@ use cyfs_process_chain::SetCollection;
 pub use dns_server::*;
 pub use local_dns::*;
 
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use cyfs_gateway_lib::*;
-    use serde_json::*;
-
-    #[tokio::test]
-    async fn test_cyfs_dns_main() {
-
-        let config_str = r#"
-{
-  "port":2053,
-  "resolver_chain": [
-    {
-      "type": "dns",
-      "cache": true
-    }
-  ],
-  "fallback": []
-}
-    "#;
-        let dns_config:DNSServerConfig = serde_json::from_str(config_str).unwrap();
-
-        let start_result = start_cyfs_dns_server(dns_config).await;
-        //println!("result: {:?}", start_result);
-        assert!(start_result.is_ok());
-    }
-}
-
 pub(crate) async fn nameinfo_to_map_collection(record_type: &str, name_info: &NameInfo) -> ServerResult<MapCollectionRef> {
     let map = MemoryMapCollection::new_ref();
     map.insert("record_type", CollectionValue::String(record_type.to_string())).await

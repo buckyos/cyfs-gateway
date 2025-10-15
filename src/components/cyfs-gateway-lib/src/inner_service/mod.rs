@@ -109,8 +109,8 @@ impl InnerServiceManager {
         }
     }
 
-    pub fn add_service(&self, service: String, service_impl: InnerService) {
-        self.services.lock().unwrap().insert(service, service_impl);
+    pub fn add_service(&self, service_impl: InnerService) {
+        self.services.lock().unwrap().insert(service_impl.id(), service_impl);
     }
 
     pub fn get_service(&self, service: &str) -> Option<InnerService> {

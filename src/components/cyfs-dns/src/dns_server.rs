@@ -32,72 +32,6 @@ use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, P
 use crate::map_collection_to_nameinfo;
 use crate::resolve::Resolve;
 
-#[derive(thiserror::Error, Debug)]
-pub enum Error {
-    #[error("Name not found: {0:}")]
-    NameNotFound(String),
-    #[error("Invalid OpCode {0:}")]
-    InvalidOpCode(OpCode),
-    #[error("Invalid MessageType {0:}")]
-    InvalidMessageType(MessageType),
-    #[error("Invalid Zone {0:}")]
-    InvalidZone(LowerName),
-    #[error("Invalid RecordType {0:}")]
-    InvalidRecordType(String),
-    #[error("IO error: {0:}")]
-    Io(#[from] std::io::Error),
-    #[error("Proto error: {0:}")]
-    Proto(#[from] hickory_proto::ProtoError),
-}
-
-#[derive(Clone)]
-pub struct DNSServer {
-    config: DNSServerConfig,
-    resolver_chain: Arc<Vec<Box<dyn NsProvider>>>,
-}
-
-pub async fn create_ns_provider(
-    provider_config: &DNSProviderConfig,
-) -> Result<Box<dyn NsProvider>> {
-    match provider_config.provider_type {
-        DNSProviderType::DNS => {
-            let dns_provider = DnsProvider::new_with_config(provider_config.config.clone())?;
-            Ok(Box::new(dns_provider))
-        }
-        DNSProviderType::LocalConfig => {
-            let local_provider = LocalConfigDnsProvider::new_with_config(provider_config.config.clone())?;
-            Ok(Box::new(local_provider))
-        }
-
-        DNSProviderType::SN => {
-            let sn_server_id = provider_config.config.get("server_id");
-            if sn_server_id.is_none() {
-                error!("server_id is none");
-                return Err(anyhow::anyhow!("server_id is none"));
-            }
-            let sn_server_id = sn_server_id.unwrap();
-            let sn_server_id = sn_server_id.as_str();
-            if sn_server_id.is_none() {
-                error!("server_id is none");
-                return Err(anyhow::anyhow!("server_id is none"));
-            }
-            let sn_server_id = sn_server_id.unwrap();
-            let sn_server = get_sn_server_by_id(sn_server_id).await;
-            //let sn_server = SNServer::new(sn_server_id);
-            if sn_server.is_none() {
-                error!("sn_server not found:{}", sn_server_id);
-                return Err(anyhow::anyhow!("sn_server not found:{}", sn_server_id));
-            }
-            let sn_server = sn_server.unwrap();
-            Ok(Box::new(sn_server))
-        }
-        _ => Err(anyhow::anyhow!(
-            "Unknown provider type: {:?}",
-            provider_config.provider_type
-        )),
-    }
-}
-
 //TODO: dns_provider is realy a demo implementation, must refactor before  used in a offical server.
 fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RData>> {
     match record_type {
@@ -190,211 +124,6 @@ fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RDat
             return Err(anyhow::anyhow!("Unknown record type:{}", record_type));
         }
     }
-}
-
-impl DNSServer {
-    pub async fn new(config: DNSServerConfig) -> Result<Self> {
-        let mut resolver_chain: Vec<Box<dyn NsProvider>> = Vec::new();
-
-        for provider_config in config.resolver_chain.iter() {
-            let provider = create_ns_provider(provider_config).await;
-            if provider.is_err() {
-                error!("Failed to create provider: {}", provider_config.config);
-            } else {
-                resolver_chain.push(provider.unwrap());
-            }
-        }
-
-        Ok(DNSServer {
-            config,
-            resolver_chain: Arc::new(resolver_chain),
-        })
-    }
-
-    async fn start(&self) -> Result<()> {
-        let bind_addr = self.config.bind.clone().unwrap_or("0.0.0.0".to_string());
-        let addr = format!("{}:{}", bind_addr, self.config.port);
-        info!("cyfs-dns-server try bind at:{}", addr);
-        let udp_socket = UdpSocket::bind(addr.clone()).await?;
-
-        let mut server = ServerFuture::new(self.clone());
-        server.register_socket(udp_socket);
-
-        tokio::spawn(async move {
-            info!("cyfs-dns-server run at:{}", addr);
-            match server.block_until_done().await {
-                Ok(_) => {
-                    info!("cyfs-dns-server done: {}", addr);
-                }
-                Err(e) => {
-                    error!("cyfs-dns-server error: {}, {}", e, addr);
-                }
-            }
-        });
-
-        Ok(())
-    }
-
-    async fn stop(&self) -> Result<()> {
-        // TODO: stop server for config dynamic update or outside control
-        Ok(())
-    }
-
-    async fn handle_fallback<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        server_name: &str,
-        mut response: R,
-    ) -> Result<Message, Error> {
-        let message = request.to_bytes();
-        let message = message.unwrap();
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        let target_url = Url::parse(server_name);
-        if target_url.is_err() {
-            return Err(Error::NameNotFound("".to_string()));
-        }
-        let target_url = target_url.unwrap();
-        let host = target_url.host_str().unwrap();
-        let port = target_url.port().unwrap_or(53);
-        let target_addr = SocketAddr::new(IpAddr::from_str(host).unwrap(), port);
-        socket.send_to(&message, target_addr).await?;
-        let mut buf = [0u8; 2048];
-        let mut resp_len = 512;
-        let proxy_result = timeout(Duration::from_secs(5), socket.recv_from(&mut buf)).await;
-        //let resp_vec =buf[0..resp_len].to_vec();
-        let resp_message = Message::from_vec(&buf[0..resp_len]);
-        if resp_message.is_err() {
-            return Err(Error::NameNotFound("".to_string()));
-        }
-        let resp_message = resp_message.unwrap();
-        let resp_info = resp_message.into();
-        return Ok(resp_info);
-        //unimplemented!("handle_fallback");
-    }
-
-    async fn do_handle_request<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        mut response: R,
-    ) -> Result<ResponseInfo, Error> {
-        // make sure the request is a query
-        if request.op_code() != OpCode::Query {
-            return Err(Error::InvalidOpCode(request.op_code()));
-        }
-
-        // make sure the message type is a query
-        if request.message_type() != MessageType::Query {
-            return Err(Error::InvalidMessageType(request.message_type()));
-        }
-
-        let from_ip = request.src().ip();
-
-        // WARN!!!
-        // Be careful to handle the request that may be delivered to the DNS-Server again to avoid the dead cycle
-        let reqeust_info = request.request_info()?;
-        let name = reqeust_info.query.name().to_string();
-        let record_type_str = reqeust_info.query.query_type().to_string();
-        let record_type = RecordType::from_str(&record_type_str)
-            .ok_or_else(|| Error::InvalidRecordType(record_type_str))?;
-
-        info!("|==>DNS query name:{}, record_type:{:?}", name, record_type);
-
-        for provider in self.resolver_chain.iter() {
-            let name_info = provider
-                .query(name.as_str(), Some(record_type.clone()), Some(from_ip))
-                .await;
-            if name_info.is_err() {
-                trace!("Provider {} can't resolve name:{}", provider.get_id(), name);
-                continue;
-            }
-
-            let name_info = name_info.unwrap();
-            let rdata_vec = nameinfo_to_rdata(record_type.to_string().as_str(), &name_info);
-            if rdata_vec.is_err() {
-                error!(
-                    "Failed to convert nameinfo to rdata:{}",
-                    rdata_vec.err().unwrap()
-                );
-                continue;
-            }
-
-            let rdata_vec = rdata_vec.unwrap();
-            let mut builder = MessageResponseBuilder::from_message_request(request);
-            let mut header = Header::response_from_request(request.header());
-            header.set_response_code(ResponseCode::NoError);
-
-            let mut ttl = name_info.ttl.unwrap_or(600);
-            let records = rdata_vec
-                .into_iter()
-                .map(|rdata| Record::from_rdata(reqeust_info.query.name().into(), ttl, rdata))
-                .collect::<Vec<_>>();
-            let mut message = builder.build(header, records.iter(), &[], &[], &[]);
-            response.send_response(message).await;
-            info!(
-                "<==|name:{} {} resolved by provider:{}",
-                name,
-                record_type.to_string(),
-                provider.get_id()
-            );
-            //let mut response = message.into();
-            return Ok(header.into());
-        }
-
-        // if let Some(server_name) = self.config.this_name.as_ref() {
-        //     if !name.ends_with(server_name.as_str()) {
-        // info!(
-        //     "All providers can't resolve name:{}, {} enter fallback",
-        //     name,
-        //     server_name.as_str()
-        // );
-        // for server_name in self.config.fallback.iter() {
-        //     let resp_message = self.handle_fallback(request,server_name,response.clone()).await;
-        //     if resp_message.is_ok() {
-
-        //         return resp_info;
-        //     }
-        // }
-        //     }
-        // }
-
-        warn!(
-            "[{:?}] All providers can't resolve name:{}",
-            record_type, name
-        );
-        return Err(Error::NameNotFound("".to_string()));
-    }
-}
-
-#[async_trait]
-impl RequestHandler for DNSServer {
-    async fn handle_request<R: ResponseHandler>(
-        &self,
-        request: &Request,
-        response: R,
-    ) -> ResponseInfo {
-        // try to handle request
-        let mut resp2 = response.clone();
-        match self.do_handle_request(request, response).await {
-            Ok(info) => info,
-            Err(error) => {
-                error!("Error in RequestHandler: {error}");
-                let mut builder = MessageResponseBuilder::from_message_request(request);
-                let mut header = Header::response_from_request(request.header());
-                header.set_response_code(ResponseCode::NXDomain);
-                let records = vec![];
-                let mut message = builder.build(header, records.iter(), &[], &[], &[]);
-                resp2.send_response(message).await;
-                header.into()
-            }
-        }
-    }
-}
-
-pub async fn start_cyfs_dns_server(config: DNSServerConfig) -> anyhow::Result<DNSServer> {
-    let server = DNSServer::new(config).await?;
-    server.start().await?;
-
-    Ok(server)
 }
 
 /// Trait for handling incoming requests, and providing a message response.
@@ -674,11 +403,6 @@ impl ProcessChainDnsServer {
 #[async_trait::async_trait]
 impl cyfs_gateway_lib::server::DatagramServer for ProcessChainDnsServer {
     async fn serve_datagram(&self, buf: &[u8], info: DatagramInfo) -> ServerResult<Vec<u8>> {
-        if info.src_addr.is_none() {
-            return Err(server_err!(ServerErrorCode::InvalidData, "no src_addr"));
-        }
-        let src_addr: SocketAddr = info.src_addr.as_ref().unwrap().parse()
-            .map_err(into_server_err!(ServerErrorCode::InvalidData, "invalid src addr {}", info.src_addr.as_ref().unwrap()))?;
         let response = self.handle(buf, info.src_addr).await?;
 
         Ok(response)
@@ -782,5 +506,343 @@ impl ServerConfig for DnsServerConfig {
     fn remove_post_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig> {
         let config = self.clone();
         Arc::new(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use hickory_proto::op::{Message, Query};
+    use hickory_proto::rr::RecordType;
+    use hickory_server::proto::rr::{Name, RData};
+    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, GlobalProcessChains, InnerService, InnerServiceManager, ServerFactory, ServerManager, StackFactory, TunnelManager, UdpStackConfig, UdpStackFactory};
+    use cyfs_gateway_lib::server::DatagramServer;
+    use crate::{DnsServerConfig, LocalDns, ProcessChainDnsServer, ProcessChainDnsServerFactory};
+
+    #[tokio::test]
+    async fn test_process_chain_dns_server_factory() {
+        let config = r#"
+type: dns
+id: test
+hook_point:
+  - id: main
+    priority: 1
+    blocks:
+      - id: main
+        block: |
+          return "server www.buckyos.com";
+        "#;
+        let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
+        let config = Arc::new(config);
+        let factory = ProcessChainDnsServerFactory::new(
+            Arc::new(InnerServiceManager::new()),
+            Arc::new(GlobalProcessChains::new()),
+        );
+        let ret = factory.create(config).await;
+        assert!(ret.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_dns_server_local_dns() {
+        let local_dns_content = r#"
+["www.buckyos.com"]
+ttl = 300
+A = ["192.168.1.1"]
+TXT="THISISATEST"
+
+["*.buckyos.com"]
+ttl = 300
+A = ["192.168.1.2"]
+
+["*.sub.buckyos.com"]
+ttl = 300
+A = ["192.168.1.3"]
+
+["mail.buckyos.com"]
+ttl = 300
+A = ["192.168.1.106"]
+        "#;
+        let mut local_dns = tempfile::NamedTempFile::new().unwrap();
+        local_dns.write_all(local_dns_content.as_bytes()).unwrap();
+        let inner_services = Arc::new(InnerServiceManager::new());
+        let dns_server = LocalDns::create("local_dns".to_string(), local_dns.path().to_string_lossy().to_string());
+        assert!(dns_server.is_ok());
+        inner_services.add_service(InnerService::DnsService(Arc::new(dns_server.unwrap())));
+
+        let config = r#"
+type: dns
+id: test
+hook_point:
+  - id: main
+    priority: 1
+    blocks:
+      - id: main
+        block: |
+           call resolve ${REQ.name} ${REQ.record_type} ttt && return;
+        "#;
+        let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
+        let server = ProcessChainDnsServer::create_server(
+            config.id,
+            inner_services.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            config.hook_point,
+        ).await;
+        assert!(server.is_ok());
+        let server = server.unwrap();
+
+        let mut message = Message::new();
+
+        // 添加查询
+        let name = Name::from_str("www.buckyos.com.").unwrap();
+        let query = Query::query(name, RecordType::A);
+        message.add_query(query);
+
+        // 设置DNSSEC标志
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let msg_vec = message.to_vec();
+        assert!(msg_vec.is_ok());
+        let msg_vec = msg_vec.unwrap();
+
+        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.answers().len(), 0);
+
+        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(Some("127.0.0.1:434".to_string()))).await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.answers().len(), 0);
+
+        let config = r#"
+type: dns
+id: test
+hook_point:
+  - id: main
+    priority: 1
+    blocks:
+      - id: main
+        block: |
+           call resolve ${REQ.name} ${REQ.record_type} local_dns && return;
+        "#;
+        let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
+        let server = ProcessChainDnsServer::create_server(
+            config.id,
+            inner_services.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            config.hook_point,
+        ).await;
+        assert!(server.is_ok());
+        let server = server.unwrap();
+
+        let mut message = Message::new();
+
+        // 添加查询
+        let name = Name::from_str("www.buckyos.com.").unwrap();
+        let query = Query::query(name, RecordType::A);
+        message.add_query(query);
+
+        // 设置DNSSEC标志
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let msg_vec = message.to_vec();
+        assert!(msg_vec.is_ok());
+        let msg_vec = msg_vec.unwrap();
+
+        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.answers()[0].record_type(), RecordType::A);
+        assert_eq!(resp.answers()[0].data(), &RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::from_str("192.168.1.1").unwrap())));
+
+        let mut message = Message::new();
+        // 添加查询
+        let name = Name::from_str("www.buckyos.com.").unwrap();
+        let query = Query::query(name, RecordType::TXT);
+        message.add_query(query);
+
+        // 设置DNSSEC标志
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let msg_vec = message.to_vec();
+        assert!(msg_vec.is_ok());
+        let msg_vec = msg_vec.unwrap();
+
+        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.answers()[0].record_type(), RecordType::TXT);
+        assert_eq!(resp.answers()[0].data(), &RData::TXT(hickory_proto::rr::rdata::txt::TXT::new(vec!["THISISATEST".to_string()])));
+
+        let mut message = Message::new();
+        // 添加查询
+        let name = Name::from_str("www.buckyos1.com.").unwrap();
+        let query = Query::query(name, RecordType::A);
+        message.add_query(query);
+
+        // 设置DNSSEC标志
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let msg_vec = message.to_vec();
+        assert!(msg_vec.is_ok());
+        let msg_vec = msg_vec.unwrap();
+
+        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(Some("127.0.0.1:434".to_string()))).await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.answers().len(), 0);
+
+
+        let data = server.serve_datagram(&msg_vec[..1], DatagramInfo::new(None)).await;
+        assert!(data.is_err());
+
+        let data = server.serve_datagram(&msg_vec[..msg_vec.len() - 1], DatagramInfo::new(None)).await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.answers().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_dns_server_query() {
+        let local_dns_content = r#"
+["www.buckyos.com"]
+ttl = 300
+A = ["192.168.1.1"]
+TXT="THISISATEST"
+
+["*.buckyos.com"]
+ttl = 300
+A = ["192.168.1.2"]
+
+["*.sub.buckyos.com"]
+ttl = 300
+A = ["192.168.1.3"]
+
+["mail.buckyos.com"]
+ttl = 300
+A = ["192.168.1.106"]
+        "#;
+        let mut local_dns = tempfile::NamedTempFile::new().unwrap();
+        local_dns.write_all(local_dns_content.as_bytes()).unwrap();
+        let inner_services = Arc::new(InnerServiceManager::new());
+        let dns_server = LocalDns::create("local_dns".to_string(), local_dns.path().to_string_lossy().to_string());
+        assert!(dns_server.is_ok());
+        inner_services.add_service(InnerService::DnsService(Arc::new(dns_server.unwrap())));
+
+        let config = r#"
+type: dns
+id: test
+hook_point:
+  - id: main
+    priority: 1
+    blocks:
+      - id: main
+        block: |
+           call resolve ${REQ.name} ${REQ.record_type} local_dns && return;
+        "#;
+        let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
+        let global_process_chains = Arc::new(GlobalProcessChains::new());
+        let server_factory = ProcessChainDnsServerFactory::new(inner_services.clone(), global_process_chains.clone());
+        let ret = server_factory.create(Arc::new(config)).await;
+        assert!(ret.is_ok());
+        let server = ret.unwrap();
+
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server(server);
+        let stack_config = r#"
+id: test_dns
+bind: 127.0.0.1:9325
+protocol: udp
+hook_point:
+  - id: main
+    priority: 1
+    blocks:
+       - id: default
+         block: |
+            return "server test";
+        "#;
+
+        let stack_config: UdpStackConfig = serde_yaml_ng::from_str(stack_config).unwrap();
+        let stack = UdpStackFactory::new(server_manager.clone(),
+                                         global_process_chains.clone(),
+                                         ConnectionManager::new(),
+                                         TunnelManager::new());
+        let ret = stack.create(Arc::new(stack_config)).await;
+        assert!(ret.is_ok());
+        let stack = ret.unwrap();
+        stack.start().await;
+
+        let config = r#"
+type: dns
+id: test
+hook_point:
+  - id: main
+    priority: 1
+    blocks:
+      - id: main
+        block: |
+           call resolve ${REQ.name} ${REQ.record_type} "127.0.0.1:9325" && return;
+        "#;
+        let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
+        let server = ProcessChainDnsServer::create_server(
+            config.id,
+            inner_services.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            config.hook_point,
+        ).await;
+        assert!(server.is_ok());
+        let server = server.unwrap();
+
+        let mut message = Message::new();
+
+        // 添加查询
+        let name = Name::from_str("www.buckyos.com.").unwrap();
+        let query = Query::query(name, RecordType::A);
+        message.add_query(query);
+
+        // 设置DNSSEC标志
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let msg_vec = message.to_vec();
+        assert!(msg_vec.is_ok());
+        let msg_vec = msg_vec.unwrap();
+
+        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.answers()[0].record_type(), RecordType::A);
+        assert_eq!(resp.answers()[0].data(), &RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::from_str("192.168.1.1").unwrap())));
+
+
+        let mut message = Message::new();
+
+        // 添加查询
+        let name = Name::from_str("www.buckyos1.com.").unwrap();
+        let query = Query::query(name, RecordType::A);
+        message.add_query(query);
+
+        // 设置DNSSEC标志
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let msg_vec = message.to_vec();
+        assert!(msg_vec.is_ok());
+        let msg_vec = msg_vec.unwrap();
+
+        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.answers().len(), 0);
     }
 }

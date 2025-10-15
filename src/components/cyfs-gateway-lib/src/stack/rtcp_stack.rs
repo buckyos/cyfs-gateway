@@ -1115,7 +1115,17 @@ mod tests {
         assert!(ret.is_err());
     }
 
-    pub struct MockServer;
+    pub struct MockServer {
+        id: String,
+    }
+
+    impl MockServer {
+        pub fn new(id: String) -> Self {
+            Self {
+                id,
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl StreamServer for MockServer {
@@ -1129,7 +1139,7 @@ mod tests {
         }
 
         fn id(&self) -> String {
-            todo!()
+            self.id.clone()
         }
 
         async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
@@ -1162,7 +1172,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server("www.buckyos.com".to_string(), Server::Stream(Arc::new(MockServer)));
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
@@ -1205,7 +1215,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server("www.buckyos.com".to_string(), Server::Stream(Arc::new(MockServer)));
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager2 = TunnelManager::new();
         let result = RtcpStack::builder()
             .id("test2")
@@ -1661,7 +1671,17 @@ mod tests {
     }
 
 
-    struct MockDatagramServer;
+    struct MockDatagramServer {
+        id: String,
+    }
+
+    impl MockDatagramServer {
+        pub fn new(id: String) -> Self {
+            Self {
+                id,
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl crate::server::DatagramServer for MockDatagramServer {
@@ -1671,7 +1691,7 @@ mod tests {
         }
 
         fn id(&self) -> String {
-            todo!()
+            self.id.clone()
         }
 
         async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
@@ -1704,7 +1724,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server("www.buckyos.com".to_string(), Server::Datagram(Arc::new(MockDatagramServer)));
+        server_manager.add_server(Server::Datagram(Arc::new(MockDatagramServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
@@ -1747,7 +1767,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server("www.buckyos.com".to_string(), Server::Datagram(Arc::new(MockDatagramServer)));
+        server_manager.add_server(Server::Datagram(Arc::new(MockDatagramServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager2 = TunnelManager::new();
         let result = RtcpStack::builder()
             .id("test2")

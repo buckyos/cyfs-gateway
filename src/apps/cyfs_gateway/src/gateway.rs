@@ -82,13 +82,13 @@ impl GatewayFactory {
 
         for server_config in config.servers.iter() {
             let server = self.server_factory.create(server_config.clone()).await?;
-            self.servers.add_server(server.id(), server);
+            self.servers.add_server(server);
         }
 
         for inner_service_config in config.inner_services.iter() {
             let services = self.inner_service_factory.create(inner_service_config.clone()).await?;
             for service in services {
-                self.inner_service_manager.add_service(service.id(), service);
+                self.inner_service_manager.add_service(service);
             }
         }
 
