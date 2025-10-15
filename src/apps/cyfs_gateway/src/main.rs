@@ -6,7 +6,7 @@ extern crate log;
 use buckyos_kit::*;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
-use cyfs_dns::{start_cyfs_dns_server, LocalDnsFactory, ProcessChainDnsServerFactory};
+use cyfs_dns::{LocalDnsFactory, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
 use cyfs_warp::*;
 use log::*;
