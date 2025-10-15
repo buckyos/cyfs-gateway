@@ -101,17 +101,18 @@ impl ExternalCommand for ResolveDNSCommand {
 
         let domain = matches.get_one::<String>("domain").unwrap();
 
-        let addr = tokio::net::lookup_host((domain.as_str(), 0))
-            .await
-            .map_err(|e| {
-                let msg = format!("Failed to resolve domain {}: {}", domain, e);
-                error!("{}", msg);
-                msg
-            })?;
+        match tokio::net::lookup_host((domain.to_owned(), 0)).await {
+            Ok(addr) => {
+                let ips: Vec<String> = addr.map(|addr| addr.ip().to_string()).collect();
+                let ip_string = ips.join(";");
 
-        let ips: Vec<String> = addr.map(|addr| addr.ip().to_string()).collect();
-        let ip_string = ips.join(";");
-
-        Ok(CommandResult::success_with_value(ip_string))
+                Ok(CommandResult::success_with_value(ip_string))
+            }
+            Err(e) => {
+                let msg = format!("DNS resolution failed for '{}': {}", domain, e);
+                warn!("{}", msg);
+                Ok(CommandResult::error_with_value(msg))
+            }
+        }
     }
 }
