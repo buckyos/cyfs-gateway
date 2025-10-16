@@ -78,24 +78,24 @@ impl GatewayFactory {
         let stack_manager = StackManager::new();
         for stack_config in config.stacks.iter() {
             let stack = self.stack_factory.create(stack_config.clone()).await?;
-            stack_manager.add_stack(stack);
+            stack_manager.add_stack(stack)?;
         }
 
         for server_config in config.servers.iter() {
             let server = self.server_factory.create(server_config.clone()).await?;
-            self.servers.add_server(server);
+            self.servers.add_server(server)?;
         }
 
         for inner_service_config in config.inner_services.iter() {
             let services = self.inner_service_factory.create(inner_service_config.clone()).await?;
             for service in services {
-                self.inner_service_manager.add_service(service);
+                self.inner_service_manager.add_service(service)?;
             }
         }
 
         for process_chain_config in config.global_process_chains.iter() {
             let process_chain = process_chain_config.create_process_chain()?;
-            self.global_process_chains.add_process_chain(Arc::new(process_chain));
+            self.global_process_chains.add_process_chain(Arc::new(process_chain))?;
         }
 
         Ok(Gateway {
@@ -307,7 +307,7 @@ impl Gateway {
                     }
                 }
                 if let Some((index, stack_config)) = stack_info {
-                    if let Some(stack) = self.stack_manager.get_stack(config_id).await {
+                    if let Some(stack) = self.stack_manager.get_stack(config_id) {
                         stack.update_config(stack_config.clone()).await?;
                         let mut config = self.config.lock().unwrap();
                         config.stacks[index] = stack_config;
@@ -364,7 +364,7 @@ impl Gateway {
                     }
                 }
                 if let Some((index, stack_config)) = stack_info {
-                    if let Some(stack) = self.stack_manager.get_stack(config_id).await {
+                    if let Some(stack) = self.stack_manager.get_stack(config_id) {
                         stack.update_config(stack_config.clone()).await?;
                         let mut config = self.config.lock().unwrap();
                         config.stacks[index] = stack_config;

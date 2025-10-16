@@ -16,6 +16,7 @@ pub enum ServiceErrorCode {
     UnknownService,
     InvalidConfig,
     DnsQueryError,
+    AlreadyExists,
 }
 pub type ServiceResult<T> = sfo_result::Result<T, ServiceErrorCode>;
 pub type ServiceError = sfo_result::Error<ServiceErrorCode>;
@@ -109,8 +110,12 @@ impl InnerServiceManager {
         }
     }
 
-    pub fn add_service(&self, service_impl: InnerService) {
+    pub fn add_service(&self, service_impl: InnerService) -> ServiceResult<()>{
+        if self.get_service(service_impl.id().as_str()).is_some() {
+            return Err(service_err!(ServiceErrorCode::AlreadyExists, "service {} already exists", service_impl.id()))
+        }
         self.services.lock().unwrap().insert(service_impl.id(), service_impl);
+        Ok(())
     }
 
     pub fn get_service(&self, service: &str) -> Option<InnerService> {

@@ -379,6 +379,7 @@ pub struct CyfsHttpServiceConfig {
 pub enum ConfigErrorCode {
     InvalidConfig,
     ProcessChainError,
+    AlreadyExists,
 }
 pub type ConfigResult<T> = sfo_result::Result<T, ConfigErrorCode>;
 pub type ConfigError = sfo_result::Error<ConfigErrorCode>;

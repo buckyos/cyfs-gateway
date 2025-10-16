@@ -16,9 +16,17 @@ impl GlobalProcessChains {
         }
     }
 
-    pub fn add_process_chain(&self, process_chain: ProcessChainRef) {
+    pub fn add_process_chain(&self, process_chain: ProcessChainRef) -> ConfigResult<()> {
+        if self.get_process_chain(process_chain.id()).is_some() {
+            return Err(config_err!(
+                ConfigErrorCode::AlreadyExists,
+                "process chain {} already exists",
+                process_chain.id()
+            ));
+        }
         let process_chain_lib = ProcessChainListLib::new(process_chain.id().to_string().as_str(), 0, vec![process_chain]);
         self.process_chains.lock().unwrap().push(process_chain_lib.into_process_chain_lib());
+        Ok(())
     }
 
     pub fn clear_process_chains(&self) {
@@ -34,6 +42,15 @@ impl GlobalProcessChains {
                 break;
             }
         }
+    }
+
+    pub fn get_process_chain(&self, id: &str) -> Option<ProcessChainLibRef> {
+        for process_chain_lib in self.process_chains.lock().unwrap().iter() {
+            if process_chain_lib.get_id() == id {
+                return Some(process_chain_lib.clone());
+            }
+        }
+        None
     }
 
     pub fn get_process_chains(&self) -> Vec<ProcessChainLibRef> {

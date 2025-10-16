@@ -25,6 +25,7 @@ pub enum ServerErrorCode {
     InvalidDnsMessageType,
     InvalidDnsRecordType,
     Rejected,
+    AlreadyExists
 }
 pub type ServerResult<T> = sfo_result::Result<T, ServerErrorCode>;
 pub type ServerError = sfo_result::Error<ServerErrorCode>;

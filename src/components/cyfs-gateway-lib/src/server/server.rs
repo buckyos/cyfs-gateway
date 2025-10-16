@@ -408,9 +408,15 @@ impl ServerManager {
             servers: Mutex::new(HashMap::new()),
         }
     }
-    pub fn add_server(&self, server: Server) {
+    pub fn add_server(&self, server: Server) -> ServerResult<()> {
+        if self.get_server(server.id().as_str()).is_some() {
+            return Err(server_err!(ServerErrorCode::AlreadyExists, "Server {} already exists", server.id().as_str()));
+        }
+
         self.servers.lock().unwrap().insert(server.id(), server);
+        Ok(())
     }
+
     pub fn get_server(&self, name: &str) -> Option<Server> {
         self.servers.lock().unwrap().get(name).cloned()
     }

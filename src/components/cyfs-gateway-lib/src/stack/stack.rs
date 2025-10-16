@@ -46,8 +46,12 @@ impl StackManager {
         })
     }
 
-    pub fn add_stack(&self, stack: StackRef) {
+    pub fn add_stack(&self, stack: StackRef) -> StackResult<()> {
+        if self.get_stack(stack.id().as_str()).is_some() {
+            return Err(stack_err!(StackErrorCode::AlreadyExists, "stack {} already exists", stack.id()));
+        }
         self.stacks.lock().unwrap().push(stack);
+        Ok(())
     }
 
     pub async fn start(&self) -> StackResult<()> {
@@ -61,7 +65,7 @@ impl StackManager {
         Ok(())
     }
 
-    pub async fn get_stack(&self, id: &str) -> Option<StackRef> {
+    pub fn get_stack(&self, id: &str) -> Option<StackRef> {
         for stack in self.stacks.lock().unwrap().iter() {
             if stack.id() == id {
                 return Some(stack.clone());
