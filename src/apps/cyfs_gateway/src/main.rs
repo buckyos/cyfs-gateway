@@ -288,13 +288,18 @@ async fn main() {
                 .help("enable debug mode")
                 .action(ArgAction::SetTrue),
         )
-        .arg(
-            Arg::new("new_key_pair")
-                .long("new-key-pair")
-                .help("Generate a new key pair for service")
-                .required(false)
-                .action(ArgAction::SetTrue),
-        )
+        .subcommand(Command::new("gen_rtcp_key")
+            .about("Generate a new rtcp key pair")
+            .arg(Arg::new("name")
+                .long("name")
+                .short('n')
+                .help("rtcp name")
+                .required(true))
+            .arg(Arg::new("path")
+                .long("path")
+                .short('p')
+                .help("The save path of the generated key")
+                .required(false)))
         .subcommand(Command::new("login")
             .about("Login to server")
             .arg(Arg::new("user")
@@ -423,6 +428,30 @@ async fn main() {
         .get_matches();
 
     match matches.subcommand() {
+        Some(("gen_rtcp_key", sub_matches)) => {
+            let name = sub_matches.get_one::<String>("name").expect("Missing key 'name'");
+            // Get temp path
+            let temp_dir = std::env::temp_dir();
+            let key_dir = temp_dir.join("buckyos").join("keys");
+            let default_path = key_dir.to_string_lossy().to_string();
+            let save_path = sub_matches.get_one::<String>("path").unwrap_or(&default_path);
+            let key_dir = Path::new(save_path);
+            if !key_dir.is_dir() {
+                std::fs::create_dir_all(&key_dir).unwrap();
+            }
+            println!("key_dir: {:?}", key_dir);
+
+            let (private_key, public_key) = generate_ed25519_key_pair();
+            let device_config = DeviceConfig::new_by_jwk(name, serde_json::from_value(public_key).unwrap());
+            let sk_file = key_dir.join("device.key.pem");
+            std::fs::write(&sk_file, private_key).unwrap();
+            println!("Private key saved to: {:?}", sk_file);
+
+            let pk_file = key_dir.join("device.doc.json");
+            std::fs::write(&pk_file, serde_json::to_string(&device_config).unwrap()).unwrap();
+            println!("Device doc saved to: {:?}", pk_file);
+            std::process::exit(0);
+        }
         Some(("login", sub_matches)) => {
             let user = sub_matches.get_one::<String>("user").unwrap();
             let password = sub_matches.get_one::<String>("password").unwrap();
@@ -545,11 +574,6 @@ async fn main() {
             }
         },
         _ => {}
-    }
-    // set buckyos root dir
-    if matches.get_flag("new_key_pair") {
-        generate_ed25519_key_pair_to_local();
-        std::process::exit(0);
     }
 
     // init log
