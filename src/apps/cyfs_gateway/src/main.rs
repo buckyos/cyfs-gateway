@@ -167,7 +167,10 @@ async fn service_main(config_dir: &Path, config_json: serde_json::Value, params:
 
 // Parse config first, then config file if supplied by user
 async fn load_config_from_args(matches: &clap::ArgMatches) -> Result<(PathBuf, serde_json::Value)> {
-    let default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
+    let mut default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.yaml");
+    if !default_config.exists() {
+        default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
+    }
     let config_file = matches.get_one::<String>("config_file");
     let real_config_file;
     if config_file.is_none() {

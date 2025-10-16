@@ -1,0 +1,20 @@
+stacks:
+  - id: test4
+    bind: 0.0.0.0:8089
+    protocol: tcp
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
+              call http-probe || reject;
+              eq ${REQ.ext.method} "CONNECT" && return "forward tcp:///${REQ.dest_host}";
+              return "forward tcp:///${REQ.dest_host}:80";
+
+includes:
+  - path: user_gateway.json
+  - path: boot_gateway.yaml
+  - path: node_gateway.json
+  - path: post_gateway.json
