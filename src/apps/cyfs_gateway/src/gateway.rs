@@ -19,6 +19,7 @@ use serde_json::Value;
 use sha2::Digest;
 use crate::cyfs_cmd_client::{cmd_err, into_cmd_err};
 use crate::cyfs_cmd_server::{CmdErrorCode, CmdResult, CyfsCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
+use crate::CYFS_CMD_SERVER_KEY;
 
 //use buckyos_api::{*};
 pub struct GatewayParams {
@@ -200,6 +201,9 @@ impl Gateway {
         let mut config_value = HashMap::new();
         let mut stacks = vec![];
         for stack in config.stacks.iter() {
+            if stack.id().as_str() == CYFS_CMD_SERVER_KEY {
+                continue;
+            }
             let stack_value: Value = serde_json::from_str(stack.get_config_json().as_str())?;
             stacks.push(stack_value);
         }
@@ -207,6 +211,9 @@ impl Gateway {
 
         let mut servers = vec![];
         for server in config.servers.iter() {
+            if server.id().as_str() == CYFS_CMD_SERVER_KEY {
+                continue;
+            }
             let server_value: Value = serde_json::from_str(server.get_config_json().as_str())?;
             servers.push(server_value);
         }
@@ -214,6 +221,9 @@ impl Gateway {
 
         let mut inner_services = vec![];
         for service in config.inner_services.iter() {
+            if service.id().as_str() == CYFS_CMD_SERVER_KEY {
+                continue;
+            }
             let service_value: Value = serde_json::from_str(service.get_config_json().as_str())?;
             inner_services.push(service_value);
         }
@@ -226,6 +236,12 @@ impl Gateway {
     }
 
     pub fn get_config(&self, config_type: &str, config_id: &str) -> Result<Value> {
+        if config_id == CYFS_CMD_SERVER_KEY {
+            return Err(anyhow::Error::new(cmd_err!(
+            CmdErrorCode::ConfigNotFound,
+            "Config not found: {}", config_id,
+        )));
+        }
         let config = self.config.lock().unwrap();
         match config_type {
             "stack" => {
@@ -271,6 +287,12 @@ impl Gateway {
     }
 
     pub async fn add_chain(&self, config_type: &str, config_id: &str, hook_point: Option<String>, chain: ProcessChainConfig) -> Result<()> {
+        if config_id == CYFS_CMD_SERVER_KEY {
+            return Err(anyhow::Error::new(cmd_err!(
+            CmdErrorCode::ConfigNotFound,
+            "Config not found: {}", config_id,
+        )));
+        }
         match config_type {
             "stack" => {
                 let mut stack_info = None;

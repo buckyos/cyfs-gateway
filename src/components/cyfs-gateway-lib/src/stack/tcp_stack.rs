@@ -436,6 +436,7 @@ pub struct TcpStackConfig {
     pub id: String,
     pub protocol: StackProtocol,
     pub bind: SocketAddr,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transparent: Option<bool>,
     pub hook_point: Vec<ProcessChainConfig>,
 }

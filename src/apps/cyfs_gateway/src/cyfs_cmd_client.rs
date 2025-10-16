@@ -19,6 +19,10 @@ impl CyfsCmdClient {
             krpc: kRPC::kRPC::new(url.into().as_str(), token),
         }
     }
+    
+    pub async fn get_latest_token(&self) -> Option<String> {
+        self.krpc.get_session_token().await
+    }
 
     pub async fn login(&self, user_name: &str, password: &str) -> CmdResult<String> {
         let mut sha256 = sha2::Sha256::new();

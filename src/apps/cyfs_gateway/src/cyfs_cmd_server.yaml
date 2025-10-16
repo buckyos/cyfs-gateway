@@ -1,5 +1,5 @@
 stacks:
-  - id: cmd_server
+  - id: __cmd_server__
     bind: 127.0.0.1:13451
     protocol: tcp
     hook_point:
@@ -8,10 +8,10 @@ stacks:
         blocks:
           - id: default
             block: |
-              return "server cmd_server";
+              return "server __cmd_server__";
 
 servers:
-  - id: cmd_server
+  - id: __cmd_server__
     type: http
     hook_point:
       - id: main
@@ -19,8 +19,8 @@ servers:
         blocks:
           - id: default
             block: |
-              return "inner_service cmd_inner_server";
+              return "inner_service __cmd_server__";
 
 inner_services:
-  - id: cmd_inner_server
+  - id: __cmd_server__
     type: cmd_server

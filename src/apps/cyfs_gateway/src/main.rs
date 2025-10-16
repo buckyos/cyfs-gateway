@@ -455,10 +455,16 @@ async fn main() {
                     } else {
                         println!("{}", serde_yaml_ng::to_string(&result).unwrap());
                     }
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
                     std::process::exit(0);
                 }
                 Err(e) => {
                     println!("show config error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
                     std::process::exit(1);
                 }
             }
@@ -474,10 +480,17 @@ async fn main() {
                     } else {
                         println!("{}", serde_yaml_ng::to_string(&result).unwrap());
                     }
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
                     std::process::exit(0);
                 }
                 Err(e) => {
                     println!("show connections error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(1);
                 }
             }
         }
@@ -491,10 +504,16 @@ async fn main() {
             match cyfs_cmd_client.del_chain(config_type, config_id, chain_id, hook_point).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
                     std::process::exit(0);
                 }
                 Err(e) => {
                     println!("del chain error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
                     std::process::exit(1);
                 }
             }
@@ -511,10 +530,16 @@ async fn main() {
             match cyfs_cmd_client.add_chain(config_type, config_id, hook_point, chain_id, chain_type, chain_params).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
                     std::process::exit(0);
                 }
                 Err(e) => {
                     println!("add chain error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
                     std::process::exit(1);
                 }
             }

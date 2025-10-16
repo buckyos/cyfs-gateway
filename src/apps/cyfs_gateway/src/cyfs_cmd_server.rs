@@ -32,6 +32,7 @@ pub type CmdResult<T> = sfo_result::Result<T, CmdErrorCode>;
 pub type CmdError = sfo_result::Error<CmdErrorCode>;
 
 pub const CYFS_CMD_SERVER_CONFIG: &str = include_str!("cyfs_cmd_server.yaml");
+pub const CYFS_CMD_SERVER_KEY: &str = "__cmd_server__";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CyfsCmdServerConfig {
