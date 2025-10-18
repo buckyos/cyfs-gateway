@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap};
-use std::net::SocketAddr;
+use std::collections::{BTreeMap, HashMap};
+use std::net::{IpAddr, SocketAddr};
 use std::ops::Div;
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd};
@@ -7,13 +7,14 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration};
+use local_ip_address::list_afinet_netifas;
 use serde::{Deserialize, Serialize};
 use sfo_io::{Datagram, LimitDatagram, SfoSpeedStat, SpeedTracker};
 use tokio::net::{UdpSocket};
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
-use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
+use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
 use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, get_min_priority, DatagramInfo};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
@@ -137,16 +138,31 @@ impl Datagram for ChannelDatagram {
     }
 }
 
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Copy, Ord, PartialOrd)]
+struct SessionKey {
+    pub src_addr: SocketAddr,
+    pub dest_addr: SocketAddr,
+}
+
+impl SessionKey {
+    pub fn new(src_addr: SocketAddr, dest_addr: SocketAddr) -> Self {
+        Self {
+            src_addr,
+            dest_addr,
+        }
+    }
+}
+
 struct UdpSessionController {
-    addr: SocketAddr,
+    session_key: SessionKey,
     client_session: DatagramClientSessionMap,
     notify: Arc<Notify>,
 }
 
 impl UdpSessionController {
-    fn new(addr: SocketAddr, client_session: DatagramClientSessionMap, notify: Arc<Notify>) -> Arc<Self> {
+    fn new(session_key: SessionKey, client_session: DatagramClientSessionMap, notify: Arc<Notify>) -> Arc<Self> {
         Arc::new(Self {
-            addr,
+            session_key,
             client_session,
             notify,
         })
@@ -157,7 +173,7 @@ impl UdpSessionController {
 impl ConnectionController for UdpSessionController {
     fn stop_connection(&self) {
         let mut all_sessions = self.client_session.lock().unwrap();
-        all_sessions.remove(&self.addr);
+        all_sessions.remove(&self.session_key);
     }
 
     async fn wait_stop(&self) {
@@ -166,9 +182,10 @@ impl ConnectionController for UdpSessionController {
 
     fn is_stopped(&self) -> bool {
         let all_sessions = self.client_session.lock().unwrap();
-        !all_sessions.contains_key(&self.addr)
+        !all_sessions.contains_key(&self.session_key)
     }
 }
+
 
 struct DatagramForwardSession {
     client: Box<dyn Datagram<Error=StackError>>,
@@ -214,7 +231,7 @@ enum DatagramSession {
     Server(DatagramServerSession),
 }
 
-type DatagramClientSessionMap = Arc<Mutex<BTreeMap<SocketAddr, Arc<tokio::sync::Mutex<Option<DatagramSession>>>>>>;
+type DatagramClientSessionMap = Arc<Mutex<BTreeMap<SessionKey, Arc<tokio::sync::Mutex<Option<DatagramSession>>>>>>;
 
 
 #[cfg(unix)]
@@ -242,6 +259,100 @@ fn recv_message(fd: std::os::unix::io::RawFd, buffer: &mut [u8]) -> Result<usize
     }
 }
 
+struct SocketCache {
+    socket_cache: Arc<tokio::sync::Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>>,
+}
+
+impl SocketCache {
+    pub fn new() -> Self {
+        Self {
+            socket_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub async fn get_socket(&self, addr: SocketAddr) -> StackResult<Arc<UdpSocket>> {
+        let mut cache = self.socket_cache.lock().await;
+        if let Some(socket) = cache.get(&addr) {
+            Ok(socket.clone())
+        } else {
+            let std_addr = addr;
+            let domain = match addr {
+                std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
+                std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
+            };
+            let addr: socket2::SockAddr = addr.into();
+            // 创建数据报 (DGRAM) 套接字，对应 UDP
+            let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+                .map_err(into_stack_err!(StackErrorCode::IoError, "create socket error"))?;
+
+            socket.set_nonblocking(true).map_err(into_stack_err!(StackErrorCode::IoError, "set nonblocking error"))?;
+            socket.set_reuse_address(true)
+                .map_err(into_stack_err!(StackErrorCode::IoError, "set reuse address error"))?;
+            socket.set_ip_transparent_v4(true)
+                .map_err(into_stack_err!(StackErrorCode::IoError, "set ip transparent error"))?;
+
+            unsafe {
+                if domain == socket2::Domain::IPV4 {
+                    set_socket_opt(&socket,
+                                   libc::SOL_IP,
+                                   libc::IP_TRANSPARENT,
+                                   libc::c_int::from(1))?;
+                    set_socket_opt(&socket,
+                                   libc::SOL_IP,
+                                   libc::IP_ORIGDSTADDR,
+                                   libc::c_int::from(1))?;
+                    set_socket_opt(&socket,
+                                   libc::SOL_IP,
+                                   libc::IP_FREEBIND,
+                                   libc::c_int::from(1))?;
+                } else if domain == socket2::Domain::IPV6 {
+                    set_socket_opt(&socket,
+                                   libc::SOL_IPV6,
+                                   libc::IP_TRANSPARENT,
+                                   libc::c_int::from(1))?;
+                    set_socket_opt(&socket,
+                                   libc::SOL_IPV6,
+                                   libc::IPV6_RECVORIGDSTADDR,
+                                   libc::c_int::from(1))?;
+                    set_socket_opt(&socket,
+                                   libc::SOL_IPV6,
+                                   libc::IP_FREEBIND,
+                                   libc::c_int::from(1))?;
+                }
+            }
+
+            socket.bind(&addr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind error"))?;
+            #[cfg(unix)]
+            let socket = unsafe {
+                std::net::UdpSocket::from_raw_fd(socket.into_raw_fd())
+            };
+            #[cfg(windows)]
+            let socket = unsafe {
+                std::net::UdpSocket::from_raw_socket(socket.into_raw_socket())
+            };
+            let udp_socket = tokio::net::UdpSocket::from_std(socket).map_err(into_stack_err!(StackErrorCode::IoError))?;
+            let udp_socket = Arc::new(udp_socket);
+            
+            cache.insert(std_addr, udp_socket.clone());
+            Ok(udp_socket)
+        }
+    }
+
+    pub async fn clear_socket(&self) {
+        let mut cache = self.socket_cache.lock().await;
+        let mut list = Vec::new();
+        for (addr, socket) in cache.iter() {
+            if Arc::strong_count(socket) == 1 {
+                list.push(addr.clone());
+            }
+        }
+
+        for addr in list {
+            cache.remove(&addr);
+        }
+    }
+}
+
 struct UdpStackInner {
     id: String,
     bind_addr: String,
@@ -254,6 +365,8 @@ struct UdpStackInner {
     tunnel_manager: TunnelManager,
     global_process_chains: Option<GlobalProcessChainsRef>,
     transparent: bool,
+    local_ips: Vec<IpAddr>,
+    socket_cache: SocketCache,
 }
 
 impl UdpStackInner {
@@ -278,6 +391,7 @@ impl UdpStackInner {
                                                           builder.global_process_chains.clone(),
                                                           None).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create process chain executor error: {}", e))?;
+        let local_ips = Self::local_ips()?;
         Ok(Self {
             id: builder.id.unwrap(),
             bind_addr: builder.bind.unwrap(),
@@ -290,18 +404,39 @@ impl UdpStackInner {
             tunnel_manager: builder.tunnel_manager.unwrap(),
             global_process_chains: builder.global_process_chains,
             transparent: builder.transparent,
+            local_ips,
+            socket_cache: SocketCache::new(),
         })
     }
 
+    fn local_ips() -> StackResult<Vec<IpAddr>> {
+        let mut list = vec![];
+
+        let interfaces = list_afinet_netifas()
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "list local ip error: {}", e))?;
+        for (_, ip) in interfaces {
+            list.push(ip);
+        }
+        Ok(list)
+    }
+
+    fn is_local_ip(&self, ip: &IpAddr) -> bool {
+        if ip.is_loopback() || ip.is_unspecified() {
+            return true;
+        }
+        self.local_ips.contains(ip)
+    }
+
     async fn handle_datagram(&self, udp_socket: Arc<UdpSocket>, src_addr: SocketAddr, dest_addr: SocketAddr, data: Vec<u8>, len: usize) -> StackResult<()> {
+        let session_key = SessionKey::new(src_addr, dest_addr);
         let client_session = {
             let mut all_sessions = self.all_client_session.lock().unwrap();
-            let client_session = all_sessions.get(&src_addr);
+            let client_session = all_sessions.get(&session_key);
             if client_session.is_none() {
                 let client_session = Arc::new(tokio::sync::Mutex::new(None));
-                all_sessions.insert(src_addr, client_session.clone());
+                all_sessions.insert(session_key, client_session.clone());
             }
-            let client_session = all_sessions.get(&src_addr);
+            let client_session = all_sessions.get(&session_key);
             let client_session = client_session.unwrap();
             client_session.clone()
         };
@@ -366,19 +501,15 @@ impl UdpStackInner {
 
         let executor = { self.executor.lock().unwrap().fork() };
         let chain_env = executor.chain_env();
-        chain_env.create("src_ip", CollectionValue::String(src_addr.ip().to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create chain env error: {}", e))?;
-        chain_env.create(
-            "src_port",
-            CollectionValue::String(format!("{}", src_addr.port())),
-        ).await.map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create chain env error: {}", e))?;
+        let map = MemoryMapCollection::new_ref();
+        map.insert("source_addr", CollectionValue::String(src_addr.to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_addr error: {}", e))?;
 
-        chain_env.create("dest_ip", CollectionValue::String(dest_addr.ip().to_string())).await
+        map.insert("dest_addr", CollectionValue::String(dest_addr.to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_addr error: {}", e))?;
+
+        chain_env.create("REQ", CollectionValue::Map(map)).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create chain env error: {}", e))?;
-        chain_env.create(
-            "dest_port",
-            CollectionValue::String(format!("{}", dest_addr.port())),
-        ).await.map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create chain env error: {}", e))?;
 
         let speed_stat = Arc::new(SfoSpeedStat::new());
         let ret = executor.execute_lib().await
@@ -397,6 +528,12 @@ impl UdpStackInner {
                                     "invalid forward command"
                                 ));
                     }
+
+                    let udp_socket = if self.is_local_ip(&dest_addr.ip()) {
+                        udp_socket.clone()
+                    } else {
+                        self.socket_cache.get_socket(dest_addr).await?
+                    };
 
                     let cmd = list[0].as_str();
                     match cmd {
@@ -425,7 +562,6 @@ impl UdpStackInner {
                             speed_stat.add_read_data_size(len as u64);
 
                             let forward_recv = forward.clone();
-                            let back_socket = udp_socket.clone();
                             let stat = speed_stat.clone();
                             let notify = Arc::new(Notify::new());
                             let is_limit = true;
@@ -506,7 +642,7 @@ impl UdpStackInner {
                                                 break;
                                             }
                                         };
-                                        if let Err(e) = back_socket
+                                        if let Err(e) = udp_socket
                                             .send_to(&buffer[0..len], src_addr)
                                             .await
                                         {
@@ -527,7 +663,7 @@ impl UdpStackInner {
                                 }));
                             }
                             if let Some(connection_manager) = self.connection_manager.as_ref() {
-                                let controller = UdpSessionController::new(src_addr, self.all_client_session.clone(), notify);
+                                let controller = UdpSessionController::new(session_key, self.all_client_session.clone(), notify);
                                 connection_manager.add_connection(ConnectionInfo::new(src_addr.to_string(), target.to_string(), StackProtocol::Udp, speed_stat, controller));
                             }
                         }
@@ -611,7 +747,7 @@ impl UdpStackInner {
                                         }));
                                     }
                                     if let Some(connection_manager) = self.connection_manager.as_ref() {
-                                        let controller = UdpSessionController::new(src_addr, self.all_client_session.clone(), notify);
+                                        let controller = UdpSessionController::new(session_key, self.all_client_session.clone(), notify);
                                         connection_manager.add_connection(ConnectionInfo::new(src_addr.to_string(), server_name.to_string(), StackProtocol::Udp, speed_stat, controller));
                                     }
                                 } else {
@@ -672,6 +808,10 @@ impl UdpStackInner {
                                        libc::SOL_IP,
                                        libc::IP_ORIGDSTADDR,
                                        libc::c_int::from(1))?;
+                        set_socket_opt(&socket,
+                                       libc::SOL_IP,
+                                       libc::IP_FREEBIND,
+                                       libc::c_int::from(1))?;
                     } else if domain == socket2::Domain::IPV6 {
                         set_socket_opt(&socket,
                                        libc::SOL_IPV6,
@@ -680,6 +820,10 @@ impl UdpStackInner {
                         set_socket_opt(&socket,
                                        libc::SOL_IPV6,
                                        libc::IPV6_RECVORIGDSTADDR,
+                                       libc::c_int::from(1))?;
+                        set_socket_opt(&socket,
+                                       libc::SOL_IPV6,
+                                       libc::IP_FREEBIND,
                                        libc::c_int::from(1))?;
                     }
                 }
@@ -771,7 +915,7 @@ impl UdpStackInner {
         Ok(handle)
     }
 
-    async fn clear_idle_sessions(&self, latest_key: Option<SocketAddr>) -> Option<SocketAddr> {
+    async fn clear_idle_sessions(&self, latest_key: Option<SessionKey>) -> Option<SessionKey> {
         let mut sessions = self.all_client_session.lock().unwrap();
         let now = chrono::Utc::now().timestamp() as u64;
         let timeout = self.session_idle_time.as_secs();
@@ -841,6 +985,10 @@ impl UdpStackInner {
         }
         None
     }
+
+    async fn clear_socket(&self) {
+        self.socket_cache.clear_socket().await;
+    }
 }
 
 pub struct UdpStack {
@@ -900,6 +1048,7 @@ impl Stack for UdpStack {
             let mut latest_key = None;
             loop {
                 latest_key = inner.clear_idle_sessions(latest_key).await;
+                inner.clear_socket().await;
                 tokio::time::sleep(inner.session_idle_time.div(2)).await;
             }
         }));
@@ -1103,9 +1252,8 @@ impl StackFactory for UdpStackFactory {
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
-    use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use tokio::net::UdpSocket;
-    use crate::{ConnectionManager, DatagramInfo, GatewayDevice, ProcessChainConfigs, Server, ServerConfig, ServerManager, ServerResult, Stack, StackFactory, StackProtocol, TunnelManager, UdpStack, UdpStackConfig, UdpStackFactory, GATEWAY_TUNNEL_MANAGER};
+    use crate::{ConnectionManager, DatagramInfo, ProcessChainConfigs, Server, ServerConfig, ServerManager, ServerResult, Stack, StackFactory, StackProtocol, TunnelManager, UdpStack, UdpStackConfig, UdpStackFactory};
     use crate::global_process_chains::GlobalProcessChains;
     use crate::server::{DatagramServer};
 

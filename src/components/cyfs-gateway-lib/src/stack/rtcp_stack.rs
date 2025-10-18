@@ -116,6 +116,8 @@ impl RtcpStackInner {
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("dest_host", CollectionValue::String(dest_host.unwrap_or_default())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("protocol", CollectionValue::String("tcp".to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         let ret = execute_chain(executor, map)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -201,6 +203,8 @@ impl RtcpStackInner {
         map.insert("dest_port", CollectionValue::String(dest_port.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("dest_host", CollectionValue::String(dest_host.unwrap_or_default())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("protocol", CollectionValue::String("udp".to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         let ret = execute_chain(executor, map)
             .await

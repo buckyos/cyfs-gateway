@@ -769,8 +769,7 @@ impl QuicStackInner {
         let remote_addr = connection.remote_address();
         let map = MemoryMapCollection::new_ref();
         map.insert("dest_host", CollectionValue::String(server_name)).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_addr", CollectionValue::String(remote_addr.ip().to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_port", CollectionValue::String(remote_addr.port().to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
 
         let executor = {
             self.executor.lock().unwrap().fork()
