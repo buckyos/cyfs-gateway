@@ -21,6 +21,7 @@ use tokio::fs::create_dir_all;
 use tokio::task;
 use url::Url;
 use cyfs_gateway::*;
+use cyfs_sn::SNServerFactory;
 use cyfs_socks::SocksServerFactory;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -43,6 +44,7 @@ async fn service_main(config_dir: &Path, config_json: serde_json::Value, params:
 
     parser.register_inner_service_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
     parser.register_inner_service_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
+    parser.register_inner_service_config_parser("sn", Arc::new(SNServerConfigParser::new()));
 
     let load_result = parser.parse(cmd_config);
     if load_result.is_err() {
@@ -148,6 +150,10 @@ async fn service_main(config_dir: &Path, config_json: serde_json::Value, params:
     factory.register_inner_service_factory(
         "local_dns",
         Arc::new(LocalDnsFactory::new(config_dir.to_string_lossy().to_string())));
+    factory.register_inner_service_factory(
+        "sn",
+        Arc::new(SNServerFactory::new())
+    );
 
     let gateway = match factory.create_gateway(config_loader).await {
         Ok(gateway) => gateway,

@@ -2,7 +2,7 @@
 use crate::sn_db::{self, *};
 use ::kRPC::*;
 use async_trait::async_trait;
-use cyfs_gateway_lib::TunnelSelector;
+use cyfs_gateway_lib::{into_service_err, service_err, BoxBody, Bytes, InnerDnsService, InnerHttpService, InnerService, InnerServiceConfig, InnerServiceFactory, Request, Response, ServiceErrorCode, ServiceResult, StreamInfo, TunnelSelector};
 use jsonwebtoken::DecodingKey;
 use lazy_static::lazy_static;
 use log::*;
@@ -18,25 +18,14 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     result::Result,
 };
+use std::net::SocketAddr;
+use http::{Method, StatusCode};
+use http_body_util::{BodyExt, Collected, Full};
 use tokio::sync::Mutex;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SNServerConfig {
-    host: String,
-    ip: String,
-    zone_config_jwt: String,
-    zone_config_pkx: String,
-    #[serde(default)]
-    aliases: Vec<String>,
-}
-
-lazy_static! {
-    static ref SN_SERVER_MAP: Arc<Mutex<HashMap<String, SNServer>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-}
 
 #[derive(Clone)]
 pub struct SNServer {
+    id: String,
     //ipaddress is the ip from update_op's ip_from
     all_device_info: Arc<Mutex<HashMap<String, (DeviceInfo, IpAddr)>>>,
     all_user_zone_config: Arc<Mutex<HashMap<String, (String, String)>>>,
@@ -77,6 +66,7 @@ impl SNServer {
         let zone_config_pkx = server_config.zone_config_pkx;
 
         SNServer {
+            id: server_config.id,
             all_device_info: Arc::new(Mutex::new(HashMap::new())),
             all_user_zone_config: Arc::new(Mutex::new(HashMap::new())),
             server_host: server_host,
@@ -536,7 +526,7 @@ impl SNServer {
                     } else {
                         return None;
                     }
-                } 
+                }
                 return Some((sub_name.clone(), sub_name));
             }
         }
@@ -545,7 +535,7 @@ impl SNServer {
 
     async fn get_user_zonegate_address(&self, username: &str) -> Option<Vec<IpAddr>> {
         let device_info = self.get_device_info(username, "ood1").await;
-        
+
         if device_info.is_some() {
             let (device_info, device_ip) = device_info.unwrap();
             let mut address_vec: Vec<IpAddr> = Vec::new();
@@ -593,196 +583,7 @@ impl SNServer {
         }
         return None;
     }
-}
 
-#[async_trait]
-impl NsProvider for SNServer {
-    fn get_id(&self) -> String {
-        "sn_ns_provider".to_string()
-    }
-
-    async fn query(
-        &self,
-        name: &str,
-        record_type: Option<RecordType>,
-        from_ip: Option<IpAddr>,
-    ) -> NSResult<NameInfo> {
-        info!(
-            "sn server process name query: {}, record_type: {:?}",
-            name, record_type
-        );
-        let record_type = record_type.unwrap_or_default();
-        let from_ip = from_ip.unwrap_or(self.server_ip);
-        let mut is_support = false;
-        if record_type == RecordType::A
-            || record_type == RecordType::AAAA
-            || record_type == RecordType::TXT
-        {
-            is_support = true;
-        }
-
-        if !is_support {
-            return Err(NSError::NotFound(format!(
-                "sn-server not support record type {}",
-                record_type.to_string()
-            )));
-        }
-        let mut req_real_name:String = name.to_string();
-        if name.ends_with(".") {
-            req_real_name = name.trim_end_matches('.').to_string();
-        }
-        
-        if req_real_name == self.server_host 
-        || self.server_aliases.contains(&req_real_name)
-
-        {
-            //返回当前服务器的地址
-            match record_type {
-                RecordType::A => {
-                    let result_name_info = NameInfo::from_address(name, self.server_ip);
-                    return Ok(result_name_info);
-                }
-                RecordType::TXT => {
-                    let mut gateway_list = Vec::new();
-                    let current_device_config = CURRENT_DEVICE_CONFIG.get();
-                    if current_device_config.is_some() {
-                        let current_device_config = current_device_config.unwrap();
-                        gateway_list.push(current_device_config.get_id().to_string());
-                    }
-                    let gateway_list = Some(gateway_list);
-                    //返回当前服务器的zoneconfig和auth_key
-                    let result_name_info = NameInfo::from_zone_config_str(
-                        name,
-                        self.zone_boot_config.as_str(),
-                        self.zone_boot_config_pkx.as_str(),
-                        &gateway_list,
-                    );
-                    return Ok(result_name_info);
-                }
-                _ => {
-                    return Err(NSError::NotFound(format!(
-                        "sn-server not support record type {}",
-                        record_type.to_string()
-                    )));
-                }
-            }
-        }
-        //query A or AAAA record
-        //端口映射方案: 如果用户存在 返回设备ood1的IP
-        //使用web3桥返连方案:如果用户存在和ood1都存在 返回当前服务器的IP
-
-        //query TXT record
-        //如果用户存在，则返回用户的ZoneConfig
-        let end_string = format!(".{}.", self.server_host.as_str());
-        if name.ends_with(&end_string) {
-            let sub_name = name[0..name.len() - end_string.len()].to_string();
-            //split sub_name by "."
-            let subs: Vec<&str> = sub_name.split(".").collect();
-            let username = subs.last();
-            if username.is_none() {
-                return Err(NSError::NotFound(name.to_string()));
-            }
-            let username = username.unwrap();
-            info!(
-                "sub zone {},enter sn serverquery: {}, record_type: {:?}",
-                username, name, record_type
-            );
-            match record_type {
-                RecordType::TXT => {
-                    let zone_config = self.get_user_zone_config(username).await;
-                    if zone_config.is_some() {
-                        let zone_config = zone_config.unwrap();
-                        let pkx = get_x_from_jwk_string(zone_config.0.as_str()).map_err(|e| {
-                            error!("failed to get x from jwk string: {:?}", e);
-                            NSError::NotFound(format!(
-                                "failed to get x from jwk string: {}",
-                                e.to_string()
-                            ))
-                        })?;
-                        let result_name_info = NameInfo::from_zone_config_str(
-                            name,
-                            zone_config.1.as_str(),
-                            pkx.as_str(),
-                            &None,
-                        );
-                        info!("result_name_info: {:?}", result_name_info);
-                        return Ok(result_name_info);
-                    } else {
-                        return Err(NSError::NotFound(name.to_string()));
-                    }
-                }
-                RecordType::A | RecordType::AAAA => {
-                    let address_vec = self.get_user_zonegate_address(username).await;
-                    if address_vec.is_some() {
-                        let address_vec = address_vec.unwrap();
-                        let result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        return Ok(result_name_info);
-                    } else {
-                        return Err(NSError::NotFound(name.to_string()));
-                    }
-                }
-                _ => {
-                    return Err(NSError::NotFound(format!(
-                        "sn-server not support record type {}",
-                        record_type.to_string()
-                    )));
-                }
-            }
-        } else {
-            let real_domain_name = name[0..name.len() - 1].to_string();
-            let db = GLOBAL_SN_DB.lock().await;
-            let user_info = db
-                .get_user_info_by_domain(real_domain_name.as_str())
-                .unwrap();
-            if user_info.is_none() {
-                return Err(NSError::NotFound(name.to_string()));
-            }
-            let (username, public_key, zone_config, _) = user_info.unwrap();
-            match record_type {
-                RecordType::TXT => {
-                    let pkx = get_x_from_jwk_string(public_key.as_str())?;
-                    let result_name_info = NameInfo::from_zone_config_str(
-                        name,
-                        zone_config.as_str(),
-                        pkx.as_str(),
-                        &None,
-                    );
-                    return Ok(result_name_info);
-                }
-                RecordType::A | RecordType::AAAA => {
-                    let address_vec = self.get_user_zonegate_address(&username).await;
-                    if address_vec.is_some() {
-                        let address_vec = address_vec.unwrap();
-                        let result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        return Ok(result_name_info);
-                    }
-                }
-                _ => {
-                    return Err(NSError::NotFound(format!(
-                        "sn-server not support record type {}",
-                        record_type.to_string()
-                    )));
-                }
-            }
-
-            return Err(NSError::NotFound(name.to_string()));
-        }
-    }
-
-    async fn query_did(
-        &self,
-        did: &DID,
-        fragment: Option<&str>,
-        from_ip: Option<IpAddr>,
-    ) -> NSResult<EncodedDocument> {
-        return Err(NSError::NotFound(
-            "sn-server not support did query".to_string(),
-        ));
-    }
-}
-
-#[async_trait]
-impl InnerServiceHandler for SNServer {
     async fn handle_rpc_call(
         &self,
         req: RPCRequest,
@@ -820,9 +621,284 @@ impl InnerServiceHandler for SNServer {
             _ => Err(RPCErrors::UnknownMethod(req.method)),
         }
     }
+}
 
-    async fn handle_http_get(&self, req_path: &str, ip_from: IpAddr) -> Result<String, RPCErrors> {
-        return Err(RPCErrors::UnknownMethod(req_path.to_string()));
+#[async_trait]
+impl InnerDnsService for SNServer {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    async fn query(
+        &self,
+        name: &str,
+        record_type: Option<RecordType>,
+        from_ip: Option<IpAddr>,
+    ) -> ServiceResult<NameInfo> {
+        info!(
+            "sn server process name query: {}, record_type: {:?}",
+            name, record_type
+        );
+        let record_type = record_type.unwrap_or_default();
+        let from_ip = from_ip.unwrap_or(self.server_ip);
+        let mut is_support = false;
+        if record_type == RecordType::A
+            || record_type == RecordType::AAAA
+            || record_type == RecordType::TXT
+        {
+            is_support = true;
+        }
+
+        if !is_support {
+            return Err(service_err!(ServiceErrorCode::NotFound,
+                "sn-server not support record type {}",
+                record_type.to_string()
+            ));
+        }
+        let mut req_real_name:String = name.to_string();
+        if name.ends_with(".") {
+            req_real_name = name.trim_end_matches('.').to_string();
+        }
+
+        if req_real_name == self.server_host
+        || self.server_aliases.contains(&req_real_name)
+
+        {
+            //返回当前服务器的地址
+            match record_type {
+                RecordType::A => {
+                    let result_name_info = NameInfo::from_address(name, self.server_ip);
+                    return Ok(result_name_info);
+                }
+                RecordType::TXT => {
+                    let mut gateway_list = Vec::new();
+                    let current_device_config = CURRENT_DEVICE_CONFIG.get();
+                    if current_device_config.is_some() {
+                        let current_device_config = current_device_config.unwrap();
+                        gateway_list.push(current_device_config.get_id().to_string());
+                    }
+                    let gateway_list = Some(gateway_list);
+                    //返回当前服务器的zoneconfig和auth_key
+                    let result_name_info = NameInfo::from_zone_config_str(
+                        name,
+                        self.zone_boot_config.as_str(),
+                        self.zone_boot_config_pkx.as_str(),
+                        &gateway_list,
+                    );
+                    return Ok(result_name_info);
+                }
+                _ => {
+                    return Err(service_err!(ServiceErrorCode::NotFound,
+                        "sn-server not support record type {}",
+                        record_type.to_string()
+                    ));
+                }
+            }
+        }
+        //query A or AAAA record
+        //端口映射方案: 如果用户存在 返回设备ood1的IP
+        //使用web3桥返连方案:如果用户存在和ood1都存在 返回当前服务器的IP
+
+        //query TXT record
+        //如果用户存在，则返回用户的ZoneConfig
+        let end_string = format!(".{}.", self.server_host.as_str());
+        if name.ends_with(&end_string) {
+            let sub_name = name[0..name.len() - end_string.len()].to_string();
+            //split sub_name by "."
+            let subs: Vec<&str> = sub_name.split(".").collect();
+            let username = subs.last();
+            if username.is_none() {
+                return Err(service_err!(ServiceErrorCode::NotFound, "{}", name.to_string()));
+            }
+            let username = username.unwrap();
+            info!(
+                "sub zone {},enter sn serverquery: {}, record_type: {:?}",
+                username, name, record_type
+            );
+            match record_type {
+                RecordType::TXT => {
+                    let zone_config = self.get_user_zone_config(username).await;
+                    if zone_config.is_some() {
+                        let zone_config = zone_config.unwrap();
+                        let pkx = get_x_from_jwk_string(zone_config.0.as_str()).map_err(|e| {
+                            error!("failed to get x from jwk string: {:?}", e);
+                            service_err!(ServiceErrorCode::NotFound,
+                                "failed to get x from jwk string: {}",
+                                e.to_string()
+                            )
+                        })?;
+                        let result_name_info = NameInfo::from_zone_config_str(
+                            name,
+                            zone_config.1.as_str(),
+                            pkx.as_str(),
+                            &None,
+                        );
+                        info!("result_name_info: {:?}", result_name_info);
+                        return Ok(result_name_info);
+                    } else {
+                        return Err(service_err!(ServiceErrorCode::NotFound, "{}", name.to_string()));
+                    }
+                }
+                RecordType::A | RecordType::AAAA => {
+                    let address_vec = self.get_user_zonegate_address(username).await;
+                    if address_vec.is_some() {
+                        let address_vec = address_vec.unwrap();
+                        let result_name_info = NameInfo::from_address_vec(name, address_vec);
+                        return Ok(result_name_info);
+                    } else {
+                        return Err(service_err!(ServiceErrorCode::NotFound, "{}", name.to_string()));
+                    }
+                }
+                _ => {
+                    return Err(service_err!(ServiceErrorCode::NotFound,
+                        "sn-server not support record type {}",
+                        record_type.to_string()
+                    ));
+                }
+            }
+        } else {
+            let real_domain_name = name[0..name.len() - 1].to_string();
+            let db = GLOBAL_SN_DB.lock().await;
+            let user_info = db
+                .get_user_info_by_domain(real_domain_name.as_str())
+                .unwrap();
+            if user_info.is_none() {
+                return Err(service_err!(ServiceErrorCode::NotFound, "{}", name.to_string()));
+            }
+            let (username, public_key, zone_config, _) = user_info.unwrap();
+            match record_type {
+                RecordType::TXT => {
+                    let pkx = get_x_from_jwk_string(public_key.as_str())
+                        .map_err(into_service_err!(ServiceErrorCode::InvalidConfig))?;
+                    let result_name_info = NameInfo::from_zone_config_str(
+                        name,
+                        zone_config.as_str(),
+                        pkx.as_str(),
+                        &None,
+                    );
+                    return Ok(result_name_info);
+                }
+                RecordType::A | RecordType::AAAA => {
+                    let address_vec = self.get_user_zonegate_address(&username).await;
+                    if address_vec.is_some() {
+                        let address_vec = address_vec.unwrap();
+                        let result_name_info = NameInfo::from_address_vec(name, address_vec);
+                        return Ok(result_name_info);
+                    }
+                }
+                _ => {
+                    return Err(service_err!(ServiceErrorCode::NotFound,
+                        "sn-server not support record type {}",
+                        record_type.to_string()
+                    ));
+                }
+            }
+
+            return Err(service_err!(ServiceErrorCode::NotFound, "{}", name.to_string()));
+        }
+    }
+
+    async fn query_did(
+        &self,
+        did: &DID,
+        fragment: Option<&str>,
+        from_ip: Option<IpAddr>,
+    ) -> ServiceResult<EncodedDocument> {
+        return Err(service_err!(ServiceErrorCode::NotFound,
+            "sn-server not support did query"
+        ));
+    }
+}
+
+#[async_trait]
+impl InnerHttpService for SNServer {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    async fn handle(&self, request: Request<BoxBody<Bytes, ()>>, info: StreamInfo) -> Response<BoxBody<Bytes, ()>> {
+        if request.method() != Method::POST {
+            return Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .body(BoxBody::new(Full::new(Bytes::from_static(b"Method Not Allowed"))
+                    .map_err(|_e| ()).boxed())).unwrap();
+        }
+
+        let client_ip = match info.src_addr {
+            Some(addr) => {
+                match addr.parse::<SocketAddr>() {
+                    Ok(socket_addr) => socket_addr.ip(),
+                    Err(e) => {
+                        error!("parse client ip {} err {}", addr.as_str(), e);
+                        return Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .body(BoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
+                                .map_err(|_e| ()).boxed())
+                            .unwrap();
+                    }
+                }
+            }
+            None => {
+                error!("Failed to get client ip");
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(BoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
+                        .map_err(|_e| ()).boxed())
+                    .unwrap();
+            }
+        };
+
+        let body_bytes = match request.collect().await {
+            Ok(data) => {
+                data.to_bytes()
+            }
+            Err(e) => {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(BoxBody::new(Full::new(Bytes::from(format!("Failed to read body: {:?}", e))))
+                        .map_err(|_e| ()).boxed())
+                    .unwrap();
+            }
+        };
+
+        let body_str = match String::from_utf8(body_bytes.to_vec()) {
+            Ok(s) => s,
+            Err(e) => {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(BoxBody::new(Full::new(Bytes::from(format!("Failed to convert body to string: {}", e))))
+                        .map_err(|_e| ()).boxed())
+                    .unwrap();
+            }
+        };
+
+        info!("|==>recv kRPC req: {}",body_str);
+
+        let rpc_request: RPCRequest = match serde_json::from_str(body_str.as_str()) {
+            Ok(rpc_request) => rpc_request,
+            Err(e) => {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(BoxBody::new(Full::new(Bytes::from(format!("Failed to parse request body to RPCRequest: {}", e))))
+                        .map_err(|_e| ()).boxed())
+                    .unwrap();
+            }
+        };
+
+        let resp = match self.handle_rpc_call(rpc_request, client_ip).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(BoxBody::new(Full::new(Bytes::from(format!("Failed to handle rpc call: {}", e))))
+                        .map_err(|_e| ()).boxed())
+                    .unwrap();
+            }
+        };
+
+        //parse resp to Response<Body>
+        Response::new(Full::new(Bytes::from(serde_json::to_string(&resp).unwrap()))
+            .map_err(|never| match never {}).boxed())
     }
 }
 
@@ -876,19 +952,48 @@ impl TunnelSelector for SNServer {
     }
 }
 
-pub async fn register_sn_server(server_id: &str, sn_server: SNServer) {
-    let mut server_map = SN_SERVER_MAP.lock().await;
-    server_map.insert(server_id.to_string(), sn_server);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SNServerConfig {
+    id: String,
+    host: String,
+    ip: String,
+    zone_config_jwt: String,
+    zone_config_pkx: String,
+    #[serde(default)]
+    aliases: Vec<String>,
 }
 
-pub async fn get_sn_server_by_id(server_id: &str) -> Option<SNServer> {
-    let server_map = SN_SERVER_MAP.lock().await;
-    let sn_server = server_map.get(server_id);
-    if sn_server.is_none() {
-        return None;
+impl InnerServiceConfig for SNServerConfig {
+    fn id(&self) -> String {
+        self.id.clone()
     }
-    let sn_server = sn_server.unwrap();
-    Some(sn_server.clone())
+
+    fn service_type(&self) -> String {
+        "sn".to_string()
+    }
+
+    fn get_config_json(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+}
+
+pub struct SNServerFactory {}
+
+impl SNServerFactory {
+    pub fn new() -> Self {
+        SNServerFactory {}
+    }
+}
+
+#[async_trait::async_trait]
+impl InnerServiceFactory for SNServerFactory {
+    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<Vec<InnerService>> {
+        let config = config.as_any().downcast_ref::<SNServerConfig>()
+            .ok_or(service_err!(ServiceErrorCode::InvalidConfig, "invalid InnerService config {}", config.service_type()))?;
+
+        let sn = Arc::new(SNServer::new(config.clone()));
+        Ok(vec![InnerService::HttpService(sn.clone()), InnerService::DnsService(sn.clone())])
+    }
 }
 
 #[cfg(test)]

@@ -39,7 +39,7 @@ pub type StackError = sfo_result::Error<StackErrorCode>;
 pub use sfo_result::into_err as into_stack_err;
 pub use sfo_result::err as stack_err;
 use url::Url;
-use crate::{DatagramClient, DatagramClientBox, TunnelManager};
+use crate::{DatagramClientBox, TunnelManager};
 
 pub(crate) async fn stream_forward(mut stream: Box<dyn AsyncStream>, target: &str, tunnel_manager: &TunnelManager) -> StackResult<()> {
     let url = Url::parse(target).map_err(into_stack_err!(

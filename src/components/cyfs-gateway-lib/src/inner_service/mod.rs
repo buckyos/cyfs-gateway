@@ -9,6 +9,7 @@ pub use name_client::{NameInfo, RecordType};
 use name_lib::{EncodedDocument, DID};
 pub use sfo_result::err as service_err;
 pub use sfo_result::into_err as into_service_err;
+use crate::StreamInfo;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ServiceErrorCode {
@@ -17,6 +18,7 @@ pub enum ServiceErrorCode {
     InvalidConfig,
     DnsQueryError,
     AlreadyExists,
+    NotFound,
 }
 pub type ServiceResult<T> = sfo_result::Result<T, ServiceErrorCode>;
 pub type ServiceError = sfo_result::Error<ServiceErrorCode>;
@@ -88,7 +90,7 @@ impl InnerServiceFactory for CyfsInnerServiceFactory {
 #[async_trait::async_trait]
 pub trait InnerHttpService: Send + Sync {
     fn id(&self) -> String;
-    async fn handle(&self, request: Request<BoxBody<Bytes, ()>>) -> Response<BoxBody<Bytes, ()>>;
+    async fn handle(&self, request: Request<BoxBody<Bytes, ()>>, info: StreamInfo) -> Response<BoxBody<Bytes, ()>>;
 }
 
 pub struct InnerServiceManager {

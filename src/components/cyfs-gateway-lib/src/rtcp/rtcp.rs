@@ -767,7 +767,7 @@ impl RTcpTunnel {
         &self,
         dest_host: Option<String>,
         dest_port: u16,
-        mut stream: Box<dyn AsyncStream>,
+        stream: Box<dyn AsyncStream>,
     ) -> Result<(), anyhow::Error> {
         //TODO: bug?
         let end_point = TunnelEndpoint {
@@ -1142,7 +1142,7 @@ mod tests {
     use super::*;
     use crate::rtcp::rtcp::RTcp;
     use crate::{TunnelEndpoint, TunnelResult};
-    use buckyos_kit::{init_logging, AsyncStream};
+    use buckyos_kit::{AsyncStream};
     use name_lib::DID;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1211,7 +1211,6 @@ mod tests {
                 let len = datagram_stream.recv_datagram(&mut buf).await.unwrap();
                 datagram_stream.send_datagram(&buf[..len]).await.unwrap();
             }
-            Ok(())
         }
     }
 

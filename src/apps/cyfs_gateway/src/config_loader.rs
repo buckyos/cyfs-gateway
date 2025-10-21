@@ -1,19 +1,9 @@
-use buckyos_kit::{adjust_path, get_buckyos_root_dir};
-use cyfs_gateway_lib::{config_err, into_config_err, ConfigErrorCode, ConfigResult, DNSServerConfig, InnerServiceConfig, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackRef, StackConfig, TcpStackConfig, TlsStack, UdpStackConfig};
-use cyfs_gateway_lib::DispatcherConfig;
-use cyfs_gateway_lib::WarpServerConfig;
+use cyfs_gateway_lib::{config_err, ConfigErrorCode, ConfigResult, InnerServiceConfig, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig};
 use cyfs_socks::SocksServerConfig;
 use cyfs_sn::*;
-use cyfs_socks::SocksProxyConfig;
-use cyfs_warp::register_inner_service_builder;
-use log::*;
-use name_lib::load_raw_private_key;
-use serde_json::{from_value};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Deserializer, Serialize};
-use url::Url;
 use cyfs_dns::{DnsServerConfig, LocalDnsConfig};
 //use buckyos_api::ZONE_PROVIDER;
 
@@ -308,6 +298,25 @@ impl<D: for<'de> Deserializer<'de> + Clone> InnerServiceConfigParser<D> for Loca
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn InnerServiceConfig>> {
         let config = LocalDnsConfig::deserialize(de.clone())
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid local dns config.{:?}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()
+            ))?;
+        Ok(Arc::new(config))
+    }
+}
+
+pub struct SNServerConfigParser {}
+
+impl SNServerConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<D: for<'de> Deserializer<'de> + Clone> InnerServiceConfigParser<D> for SNServerConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn InnerServiceConfig>> {
+        let config = SNServerConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid sn server config.{:?}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()
             ))?;

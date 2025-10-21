@@ -17,7 +17,6 @@ use tokio::net::UdpSocket;
 
 use anyhow::Result;
 use cyfs_gateway_lib::*;
-use cyfs_sn::get_sn_server_by_id;
 use futures::stream::{self, StreamExt};
 use name_client::{DnsProvider, LocalConfigDnsProvider, NameInfo, NsProvider, RecordType};
 use std::sync::{Arc, Mutex};

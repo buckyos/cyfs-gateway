@@ -8,8 +8,8 @@ stacks:
         blocks:
           - id: default
             block: |
-              call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
-              call http-probe || reject;
+              call https-sni-probe && return "forward rtcp://home.zhicong.me:2980/${REQ.dest_host}:443";
+              call http-probe  && return "forward rtcp://home.zhicong.me:2980/${REQ.dest_host}:80";
               eq ${REQ.ext.method} "CONNECT" && return "forward tcp:///${REQ.dest_host}";
               return "forward tcp:///${REQ.dest_host}:80";
 
@@ -36,17 +36,18 @@ stacks:
             block: |
               return "server main_dns";
 
-#  - id: test2
-#    protocol: rtcp
-#    key_path: ./device_key.pem
-#    device_config_path: ./device.doc.json
-#    hook_point:
-#      - id: main
-#        priority: 1
-#        blocks:
-#          - id: default
-#            block: |
-#              reject;
+  - id: test5
+    bind: 0.0.0.0:2980
+    protocol: rtcp
+    key_path: ./rootfs/etc/device.key.pem
+    device_config_path: ./rootfs/etc/device.doc.json
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              reject;
 #
 #  - bind: 0.0.0.0:8083
 #    protocol: tls

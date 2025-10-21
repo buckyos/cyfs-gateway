@@ -6,7 +6,7 @@ use hyper::body::{Bytes};
 use hyper::{http, StatusCode};
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CollectionValue, CommandControl, MapCollection, ProcessChainLibExecutor};
-use crate::{get_stream_external_commands, HttpRequestHeaderMap, HttpServer, InnerServiceManagerRef, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult};
+use crate::{get_stream_external_commands, HttpRequestHeaderMap, HttpServer, InnerServiceManagerRef, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err, into_server_err};
 
@@ -119,7 +119,7 @@ impl ProcessChainHttpServer {
 
 #[async_trait::async_trait]
 impl HttpServer for ProcessChainHttpServer {
-    async fn serve_request(&self, req: http::Request<BoxBody<Bytes, ServerError>>) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    async fn serve_request(&self, req: http::Request<BoxBody<Bytes, ServerError>>, info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let executor = {
             self.executor.lock().unwrap().fork()
         };
@@ -168,7 +168,7 @@ impl HttpServer for ProcessChainHttpServer {
 
                             let req = hyper::Request::from_parts(parts, body.map_err(|_| ()).boxed());
                             if let Some(service) = self.inner_services.get_http_service(service) {
-                                let resp = service.handle(req).await;
+                                let resp = service.handle(req, info).await;
                                 let (parts, body) = resp.into_parts();
                                 return Ok(hyper::Response::from_parts(parts, body.map_err(|_| server_err!(ServerErrorCode::InvalidData)).boxed()))
                             }
@@ -291,7 +291,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use hyper_util::rt::{TokioExecutor, TokioIo};
-    use crate::{hyper_serve_http, hyper_serve_http1, InnerServiceManager};
+    use crate::{hyper_serve_http, hyper_serve_http1, InnerServiceManager, StreamInfo};
 
     #[tokio::test]
     async fn test_http_server_builder_creation() {
@@ -391,7 +391,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http1(Box::new(server), http_server).await.unwrap();
+            hyper_serve_http1(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
         });
 
         let request = http::Request::builder()
@@ -435,7 +435,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
         });
 
         let request = http::Request::builder()
@@ -479,7 +479,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
         });
 
         let request = http::Request::builder()
@@ -524,7 +524,7 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            let ret = hyper_serve_http(Box::new(server), http_server).await;
+            let ret = hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await;
             assert!(ret.is_err());
         });
 

@@ -875,7 +875,7 @@ impl QuicStackInner {
                                                         .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed();
                                                     let req = http::Request::from_parts(parts, body);
                                                     let resp = server
-                                                        .serve_request(req)
+                                                        .serve_request(req, StreamInfo::new(local_addr.to_string()))
                                                         .await
                                                         .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
                                                     let (parts, mut body) = resp.into_parts();

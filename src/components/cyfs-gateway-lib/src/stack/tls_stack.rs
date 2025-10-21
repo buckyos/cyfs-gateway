@@ -261,13 +261,15 @@ impl TlsStackInner {
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
                                     Server::Http(http_server) => {
-                                        if let Err(e) = hyper_serve_http(Box::new(stream), http_server).await {
+                                        if let Err(e) = hyper_serve_http(Box::new(stream),
+                                                                         http_server,
+                                                                         StreamInfo::new(local_addr.to_string())).await {
                                             log::error!("hyper serve http failed: {}", e);
                                         }
                                     }
                                     Server::Stream(server) => {
                                         server
-                                            .serve_connection(Box::new(stream), StreamInfo::new(remote_addr.to_string()))
+                                            .serve_connection(Box::new(stream), StreamInfo::new(local_addr.to_string()))
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
                                     }
@@ -567,7 +569,7 @@ impl TlsStackBuilder {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{GatewayDevice, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, GATEWAY_TUNNEL_MANAGER, Server, ProcessChainHttpServer, InnerServiceManager, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, InnerServiceManager, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo};
     use crate::{TlsDomainConfig, TlsStack};
     use buckyos_kit::AsyncStream;
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
@@ -889,7 +891,7 @@ mod tests {
     pub struct MockServer {
         id: String,
     }
-    
+
     impl MockServer {
         pub fn new(id: String) -> Self {
             Self { id }

@@ -107,7 +107,7 @@ impl RtcpStackInner {
             self.executor.lock().unwrap().fork()
         };
         let servers = self.servers.clone();
-        let remote_addr = match dest_host.clone() {
+        let _remote_addr = match dest_host.clone() {
             Some(host) => format!("{}:{}", host, dest_port),
             None => format!("{}:{}", endpoint.device_id, dest_port),
         };
@@ -162,12 +162,12 @@ impl RtcpStackInner {
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
                                     Server::Http(server) => {
-                                        hyper_serve_http(stream, server).await
+                                        hyper_serve_http(stream, server, StreamInfo::default()).await
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
                                     }
                                     Server::Stream(server) => {
                                         server
-                                            .serve_connection(stream, StreamInfo::new(remote_addr.to_string()))
+                                            .serve_connection(stream, StreamInfo::default())
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
                                     }
@@ -1146,7 +1146,7 @@ mod tests {
             self.id.clone()
         }
 
-        async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
+        async fn update_config(&self, _config: Arc<dyn ServerConfig>) -> ServerResult<()> {
             todo!()
         }
     }

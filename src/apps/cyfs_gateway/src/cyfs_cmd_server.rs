@@ -3,7 +3,7 @@ use std::sync::{Arc, Weak};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use cyfs_gateway_lib::{config_err, service_err, BoxBody, ConfigErrorCode, ConfigResult, InnerHttpService, InnerService, InnerServiceConfig, InnerServiceFactory, Request, Response, ServiceErrorCode, ServiceResult};
+use cyfs_gateway_lib::{config_err, service_err, BoxBody, ConfigErrorCode, ConfigResult, InnerHttpService, InnerService, InnerServiceConfig, InnerServiceFactory, Request, Response, ServiceErrorCode, ServiceResult, StreamInfo};
 use crate::config_loader::InnerServiceConfigParser;
 use crate::cyfs_cmd_client::cmd_err;
 
@@ -175,7 +175,7 @@ impl InnerHttpService for CyfsCmdServer {
         self.config.id.clone()
     }
 
-    async fn handle(&self, request: Request<BoxBody<Bytes, ()>>) -> Response<BoxBody<Bytes, ()>> {
+    async fn handle(&self, request: Request<BoxBody<Bytes, ()>>, _info: StreamInfo) -> Response<BoxBody<Bytes, ()>> {
         if request.method() != http::Method::POST {
             return Response::builder()
                 .status(http::StatusCode::FORBIDDEN)

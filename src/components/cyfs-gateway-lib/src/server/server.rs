@@ -86,7 +86,7 @@ impl Server {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct StreamInfo {
     pub src_addr: Option<String>,
 }
@@ -372,7 +372,7 @@ impl VariableVisitor for HttpRequestUrlVisitor {
 
 #[async_trait::async_trait]
 pub trait HttpServer: Send + Sync + 'static {
-    async fn serve_request(&self, req: http::Request<BoxBody<Bytes, ServerError>>) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>>;
+    async fn serve_request(&self, req: http::Request<BoxBody<Bytes, ServerError>>, info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>>;
     fn id(&self) -> String;
     fn http_version(&self) -> http::Version;
     fn http3_port(&self) -> Option<u16>;
@@ -425,28 +425,31 @@ impl ServerManager {
 
 pub type ServerManagerRef = Arc<ServerManager>;
 
-pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn HttpServer>) -> ServerResult<()> {
+pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn HttpServer>, info: StreamInfo) -> ServerResult<()> {
     if server.http_version() <= http::Version::HTTP_11 {
         hyper::server::conn::http1::Builder::new()
             .serve_connection(TokioIo::new(stream), hyper::service::service_fn(|req| {
                 let server = server.clone();
+                let info = info.clone();
                 async move {
                     let (parts, body) = req.into_parts();
                     let req = Request::new(BoxBody::new(body)).map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                     let req = Request::from_parts(parts, req);
-                    server.serve_request(req).await
+                    server.serve_request(req, info).await
                 }
             })).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
     } else if server.http_version() == http::Version::HTTP_3 && server.http3_port().is_some() {
         hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
             .serve_connection(TokioIo::new(stream), hyper::service::service_fn(|req| {
                 let server = server.clone();
+                let info = info.clone();
                 async move {
                     let (parts, body) = req.into_parts();
-                    let req = Request::new(BoxBody::new(body)).map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
+                    let req = Request::new(BoxBody::new(body))
+                        .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                     let req = Request::from_parts(parts, req);
                     let http3_port = server.http3_port().unwrap();
-                    match server.serve_request(req).await {
+                    match server.serve_request(req, info).await {
                         Ok(mut res) => {
                             res.headers_mut().insert(
                                 http::header::ALT_SVC,
@@ -462,11 +465,13 @@ pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn Http
         hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
             .serve_connection(TokioIo::new(stream), hyper::service::service_fn(|req| {
                 let server = server.clone();
+                let info = info.clone();
                 async move {
                     let (parts, body) = req.into_parts();
-                    let req = Request::new(BoxBody::new(body)).map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
+                    let req = Request::new(BoxBody::new(body))
+                        .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                     let req = Request::from_parts(parts, req);
-                    server.serve_request(req).await
+                    server.serve_request(req, info).await
                 }
             })).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
     }
@@ -474,15 +479,17 @@ pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn Http
     Ok(())
 }
 
-pub async fn hyper_serve_http1(stream: Box<dyn AsyncStream>, server: Arc<dyn HttpServer>) -> ServerResult<()> {
+pub async fn hyper_serve_http1(stream: Box<dyn AsyncStream>, server: Arc<dyn HttpServer>, info: StreamInfo) -> ServerResult<()> {
     hyper::server::conn::http1::Builder::new()
         .serve_connection(TokioIo::new(stream), hyper::service::service_fn(|req| {
             let server = server.clone();
+            let info = info.clone();
             async move {
                 let (parts, body) = req.into_parts();
-                let req = Request::new(BoxBody::new(body)).map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
+                let req = Request::new(BoxBody::new(body))
+                    .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                 let req = Request::from_parts(parts, req);
-                server.serve_request(req).await
+                server.serve_request(req, info).await
             }
         })).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
     Ok(())
