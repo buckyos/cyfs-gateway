@@ -29,6 +29,7 @@ chrono = "0.4"
 hex = "0.4"
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 sfo-io = "0.1"
+sfo-log = { version = "0.1"}
 
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
 name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" }

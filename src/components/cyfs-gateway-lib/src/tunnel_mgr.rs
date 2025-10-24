@@ -147,7 +147,7 @@ impl TunnelManager {
         let path = url.path();
         debug!("Open stream by url.path: {}", path);
         let stream = tunnel.open_stream(path).await.map_err(|e| {
-            error!("Open stream by url failed: {}", e);
+            error!("Open stream by url {} failed: {}", url.to_string(), e);
             TunnelError::ConnectError(format!("Open stream by url failed: {}", e))
         })?;
 

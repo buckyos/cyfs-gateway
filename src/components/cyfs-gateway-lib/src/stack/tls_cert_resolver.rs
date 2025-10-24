@@ -44,12 +44,19 @@ impl ResolvesServerCertUsingSni {
 impl server::ResolvesServerCert for ResolvesServerCertUsingSni {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<sign::CertifiedKey>> {
         if let Some(name) = client_hello.server_name() {
-            self.by_name.lock().unwrap().get(name).cloned()
-        } else {
+            {
+                let cert = self.by_name.lock().unwrap().get(name).cloned();
+                if cert.is_some() {
+                    return cert;
+                }
+            }
+
             if self.external_resolver.is_none() {
                 return None;
             }
             self.external_resolver.as_ref().unwrap().resolve(client_hello)
+        } else {
+            None
         }
     }
 }

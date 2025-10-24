@@ -40,7 +40,9 @@ mod tests {
         //3. create tunnel with remote rtcp stack id
         //4. use stream_url like rtcp://$stack_id/:$port to connect to remote tcp server at remote device
         //5  use stream_url like rtcp://$stack_id/google.com:443 to use remote device as a tcp proxy
-        std::env::set_var("BUCKY_LOG", "debug");
+        unsafe {
+            std::env::set_var("BUCKY_LOG", "debug");
+        }
         init_logging("test_rtcp_tunnel",false);
         let web3_bridge_config = get_default_web3_bridge_config();
         init_name_lib(&web3_bridge_config).await.unwrap();

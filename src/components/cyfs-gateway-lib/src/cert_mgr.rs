@@ -278,7 +278,7 @@ impl CertStub {
     }
 
     async fn start_order(&self) -> Result<()> {
-        let mut interval = 1;
+        let mut interval = 15;
         loop {
             let result = self.order_inner().await;
 
