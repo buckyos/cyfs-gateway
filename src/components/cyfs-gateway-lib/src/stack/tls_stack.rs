@@ -506,7 +506,7 @@ impl crate::StackFactory for TlsStackFactory {
             .add_certs(cert_list)
             .concurrency(config.concurrency.unwrap_or(0))
             .tunnel_manager(self.tunnel_manager.clone())
-            .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec![]).iter().map(|s| s.as_bytes().to_vec()).collect())
+            .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec!["http/1.1".to_string()]).iter().map(|s| s.as_bytes().to_vec()).collect())
             .acme_resolver(self.acme_resolver.clone())
             .build()
             .await?;
