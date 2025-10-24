@@ -641,7 +641,7 @@ mod tests {
             .build()
             .await;
         assert!(result.is_ok());
-        let mut stack = result.unwrap();
+        let stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
 
@@ -679,7 +679,7 @@ mod tests {
             .build()
             .await;
         assert!(result.is_ok());
-        let mut stack = result.unwrap();
+        let stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
 
@@ -696,7 +696,6 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let start = std::time::SystemTime::now();
         {
             let mut stream = TcpStream::connect("127.0.0.1:8082").await.unwrap();
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -738,7 +737,7 @@ mod tests {
             .build()
             .await;
         assert!(result.is_ok());
-        let mut stack = result.unwrap();
+        let stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
 
@@ -807,7 +806,7 @@ mod tests {
             .build()
             .await;
         assert!(result.is_ok());
-        let mut stack = result.unwrap();
+        let stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
 

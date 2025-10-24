@@ -286,41 +286,44 @@ impl SocketCache {
                 .map_err(into_stack_err!(StackErrorCode::IoError, "create socket error"))?;
 
             socket.set_nonblocking(true).map_err(into_stack_err!(StackErrorCode::IoError, "set nonblocking error"))?;
-            socket.set_reuse_address(true)
-                .map_err(into_stack_err!(StackErrorCode::IoError, "set reuse address error"))?;
-            socket.set_ip_transparent_v4(true)
-                .map_err(into_stack_err!(StackErrorCode::IoError, "set ip transparent error"))?;
+            #[cfg(unix)]
+            {
+                socket.set_reuse_address(true)
+                    .map_err(into_stack_err!(StackErrorCode::IoError, "set reuse address error"))?;
+                socket.set_ip_transparent_v4(true)
+                    .map_err(into_stack_err!(StackErrorCode::IoError, "set ip transparent error"))?;
 
-            unsafe {
-                if domain == socket2::Domain::IPV4 {
-                    set_socket_opt(&socket,
-                                   libc::SOL_IP,
-                                   libc::IP_TRANSPARENT,
-                                   libc::c_int::from(1))?;
-                    set_socket_opt(&socket,
-                                   libc::SOL_IP,
-                                   libc::IP_ORIGDSTADDR,
-                                   libc::c_int::from(1))?;
-                    set_socket_opt(&socket,
-                                   libc::SOL_IP,
-                                   libc::IP_FREEBIND,
-                                   libc::c_int::from(1))?;
-                } else if domain == socket2::Domain::IPV6 {
-                    set_socket_opt(&socket,
-                                   libc::SOL_IPV6,
-                                   libc::IP_TRANSPARENT,
-                                   libc::c_int::from(1))?;
-                    set_socket_opt(&socket,
-                                   libc::SOL_IPV6,
-                                   libc::IPV6_RECVORIGDSTADDR,
-                                   libc::c_int::from(1))?;
-                    set_socket_opt(&socket,
-                                   libc::SOL_IPV6,
-                                   libc::IP_FREEBIND,
-                                   libc::c_int::from(1))?;
+                unsafe {
+                    if domain == socket2::Domain::IPV4 {
+                        crate::stack::set_socket_opt(&socket,
+                                                     libc::SOL_IP,
+                                                     libc::IP_TRANSPARENT,
+                                                     libc::c_int::from(1))?;
+                        crate::stack::set_socket_opt(&socket,
+                                                     libc::SOL_IP,
+                                                     libc::IP_ORIGDSTADDR,
+                                                     libc::c_int::from(1))?;
+                        crate::stack::set_socket_opt(&socket,
+                                                     libc::SOL_IP,
+                                                     libc::IP_FREEBIND,
+                                                     libc::c_int::from(1))?;
+                    } else if domain == socket2::Domain::IPV6 {
+                        crate::stack::set_socket_opt(&socket,
+                                                     libc::SOL_IPV6,
+                                                     libc::IP_TRANSPARENT,
+                                                     libc::c_int::from(1))?;
+                        crate::stack::set_socket_opt(&socket,
+                                                     libc::SOL_IPV6,
+                                                     libc::IPV6_RECVORIGDSTADDR,
+                                                     libc::c_int::from(1))?;
+                        crate::stack::set_socket_opt(&socket,
+                                                     libc::SOL_IPV6,
+                                                     libc::IP_FREEBIND,
+                                                     libc::c_int::from(1))?;
+                    }
                 }
-            }
 
+            }
             socket.bind(&addr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind error"))?;
             #[cfg(unix)]
             let socket = unsafe {
@@ -332,7 +335,7 @@ impl SocketCache {
             };
             let udp_socket = tokio::net::UdpSocket::from_std(socket).map_err(into_stack_err!(StackErrorCode::IoError))?;
             let udp_socket = Arc::new(udp_socket);
-            
+
             cache.insert(std_addr, udp_socket.clone());
             Ok(udp_socket)
         }
@@ -1324,7 +1327,7 @@ mod tests {
             .build()
             .await;
         assert!(result.is_ok());
-        let mut stack = result.unwrap();
+        let stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
 

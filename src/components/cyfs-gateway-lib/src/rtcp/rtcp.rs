@@ -1154,7 +1154,7 @@ mod tests {
         let did = DID::new("test", "device1");
         let listener = Arc::new(MockRTcpListener {});
 
-        let rtcp = RTcp::new(did.clone(), "127.0.0.1:8000".to_string(), None, listener);
+        let _rtcp = RTcp::new(did.clone(), "127.0.0.1:8000".to_string(), None, listener);
 
         // 由于RTcp的大部分功能通过公共方法暴露
         // 这里可以添加更多针对公共方法的测试
@@ -1205,7 +1205,7 @@ mod tests {
             _dest_port: u16,
             _endpoint: TunnelEndpoint,
         ) -> TunnelResult<()> {
-            let mut datagram_stream = AsyncStreamWithDatagram::new(stream);
+            let datagram_stream = AsyncStreamWithDatagram::new(stream);
             let mut buf = [0u8; 1024];
             loop {
                 let len = datagram_stream.recv_datagram(&mut buf).await.unwrap();
@@ -1220,7 +1220,7 @@ mod tests {
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let id1 = device_config.id.clone();
+        let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
         GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
@@ -1245,7 +1245,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         {
-            let tunnel = rtcp1.create_tunnel(Some(format!("{}:19024", id2.to_host_name()).as_str())).await.unwrap();
+            let _tunnel = rtcp1.create_tunnel(Some(format!("{}:19024", id2.to_host_name()).as_str())).await.unwrap();
         }
         drop(rtcp2);
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1261,7 +1261,7 @@ mod tests {
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let id1 = device_config.id.clone();
+        let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
         GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
@@ -1378,7 +1378,7 @@ mod tests {
 
         {
             let tunnel = rtcp1.create_tunnel(Some(format!("{}:19044", id2.to_host_name()).as_str())).await.unwrap();
-            let mut stream = tunnel.create_datagram_client("www.baidu.com:80").await.unwrap();
+            let stream = tunnel.create_datagram_client("www.baidu.com:80").await.unwrap();
             stream.send_datagram(b"test").await.unwrap();
             let mut buf = [0u8; 1024];
             let ret = stream.recv_datagram(&mut buf).await;
@@ -1392,7 +1392,7 @@ mod tests {
 
         {
             let tunnel = rtcp2.create_tunnel(Some(format!("{}:19043", id1.to_host_name()).as_str())).await.unwrap();
-            let mut stream = tunnel.create_datagram_client("www.baidu.com:80").await.unwrap();
+            let stream = tunnel.create_datagram_client("www.baidu.com:80").await.unwrap();
             stream.send_datagram(b"test").await.unwrap();
             let mut buf = [0u8; 1024];
             let ret = stream.recv_datagram(&mut buf).await;

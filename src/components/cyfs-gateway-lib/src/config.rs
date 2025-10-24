@@ -2,9 +2,8 @@
 
 use tokio::fs;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use serde::{Deserialize, Deserializer, Serialize};
+use std::net::{SocketAddr};
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 fn default_true() -> bool {
@@ -386,7 +385,7 @@ pub type ConfigError = sfo_result::Error<ConfigErrorCode>;
 pub use sfo_result::err as config_err;
 pub use sfo_result::into_err as into_config_err;
 use cyfs_process_chain::{Block, BlockParser, ProcessChain};
-use crate::{StackRef, StackProtocol};
+use crate::{StackProtocol};
 
 // pub trait CyfsServerConfigParser {
 //     fn parse(config: &str) -> ConfigResult<Vec<CyfsServerConfig>>;
@@ -440,12 +439,25 @@ pub struct UdpConfig {
     pub hook_point: Vec<ProcessChainConfig>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CertInfo {
+    pub cert_file: String,
+    pub key_file: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub enum CertType {
+    Acme,
+    Local(CertInfo),
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct StackCertConfig {
     pub domain: String,
-    pub cert_file: String,
-    pub key_file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

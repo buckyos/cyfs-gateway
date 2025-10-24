@@ -3,6 +3,7 @@
 use reqwest;
 use serde::{Serialize, Deserialize};
 use std::{sync::RwLock, time::Duration};
+use std::fmt::Display;
 use std::sync::Mutex;
 use openssl::{
     pkey::{PKey, Private},
@@ -15,9 +16,14 @@ use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use base64::Engine;
 use anyhow::Result;
+use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
+use rustls::crypto::ring::sign::any_ecdsa_type;
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::sign::CertifiedKey;
+use sha2::{Digest, Sha256};
 
 /// ACME 目录结构
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Directory {
     #[serde(rename = "newNonce")]
     new_nonce: String,
@@ -97,7 +103,7 @@ impl From<AccountConfig> for AcmeAccount {
         let key_pem = inner.key.as_bytes();
         let key = PKey::private_key_from_pem(key_pem)
             .expect("Failed to parse private key from PEM");
-            
+
         Self {
             inner: Arc::new(AccountInner {
                 email: inner.email,
@@ -128,7 +134,7 @@ impl AcmeAccount {
         info!("generate acme account key for {}", email);
         let rsa = Rsa::generate(2048).unwrap();
         let key = PKey::from_rsa(rsa).unwrap();
-        
+
         Self { inner: Arc::new(AccountInner { email, key, kid: RwLock::new(None) }) }
     }
 
@@ -139,7 +145,7 @@ impl AcmeAccount {
                 error!("read acme account key file {} failed, {}", path.display(), e);
                 anyhow::anyhow!("read acme account key file {} failed, {}", path.display(), e)
             })?;
-        
+
         let account = serde_json::from_str(&content).map_err(|e| {
             error!("parse acme account key file {} failed, {}", path.display(), e);
             anyhow::anyhow!("parse acme account key file {} failed, {}", path.display(), e)
@@ -156,7 +162,7 @@ impl AcmeAccount {
                 error!("save acme account key to {} failed, {}", path.display(), e);
                 anyhow::anyhow!("save acme account key to {} failed, {}", path.display(), e)
             })?;
-        
+
         info!("save acme account key to {} success, account: {}", path.display(), self);
         Ok(())
     }
@@ -201,51 +207,45 @@ pub struct AcmeClient {
 }
 
 struct AcmeClientInner {
-    directory: Directory,
+    directory: tokio::sync::Mutex<Option<Directory>>,
     http_client: reqwest::Client,
     nonce_manager: NonceManager,
     account: AcmeAccount,
+    acme_server: String,
 }
 
 /// 挑战响应接口
 #[async_trait::async_trait]
 pub trait AcmeChallengeResponder: Send + Sync {
-    /// 响应 HTTP 挑战
-    async fn respond_http(&self, domain: &str, token: &str, key_auth: &str) -> Result<()>;
-    fn revert_http(&self, domain: &str, token: &str);
-    
-    /// 响应 DNS 挑战
-    async fn respond_dns(&self, domain: &str, digest: &str) -> Result<()>;
-    fn revert_dns(&self, domain: &str, digest: &str);
-
-    /// 响应 TLS-ALPN 挑战
-    async fn respond_tls_alpn(&self, domain: &str, key_auth: &str) -> Result<()>;
-    fn revert_tls_alpn(&self, domain: &str, key_auth: &str);
+    async fn respond_challenge<'a>(&self, challenges: &'a [Challenge]) -> Result<&'a Challenge>;
+    fn revert_challenge(&self, challenge: &Challenge);
 }
 
+pub type AcmeChallengeResponderRef = Arc<dyn AcmeChallengeResponder>;
+
 /// 证书订单会话
-pub struct AcmeOrderSession<R: AcmeChallengeResponder> {
+pub struct AcmeOrderSession {
     domains: Vec<String>,
     valid_days: u32,
     key_type: KeyType,
     status: OrderStatus,
-    client: AcmeClient, 
-    responder: R,
+    client: AcmeClient,
+    responder: AcmeChallengeResponderRef,
     respond_logs: Vec<Challenge>,
     order_info: Option<OrderInfo>,
 }
 
-impl<R: AcmeChallengeResponder> std::fmt::Display for AcmeOrderSession<R> {
+impl std::fmt::Display for AcmeOrderSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "AcmeOrderSession(domains: {})", self.domains.join(","))
     }
 }
 
-impl<R: AcmeChallengeResponder> AcmeOrderSession<R> {
+impl AcmeOrderSession {
     pub fn new(
         domains: Vec<String>,
         client: AcmeClient,
-        responder: R
+        responder: AcmeChallengeResponderRef,
     ) -> Self {
         Self {
             domains,
@@ -253,7 +253,7 @@ impl<R: AcmeChallengeResponder> AcmeOrderSession<R> {
             key_type: KeyType::Rsa2048,
             status: OrderStatus::New,
             client,
-            responder, 
+            responder,
             respond_logs: vec![],
             order_info: None,
         }
@@ -261,16 +261,17 @@ impl<R: AcmeChallengeResponder> AcmeOrderSession<R> {
 
     /// 开始证书申请流程
     pub async fn start(mut self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let directory = self.client.get_directory().await?;
         // 1. 创建订单
-        let (authorizations, finalize_url) = self.client.create_order(&self.domains).await?;
-        
+        let (authorizations, finalize_url) = self.client.create_order(&self.domains, directory.clone()).await?;
+
         // 更新订单信息和状态
         self.order_info = Some(OrderInfo {
             authorizations,
             finalize_url,
         });
         self.update_status(OrderStatus::Pending);
-        
+
         // 2. 处理每个授权
         if let Some(order_info) = &self.order_info {
             for auth_url in &order_info.authorizations {
@@ -278,26 +279,15 @@ impl<R: AcmeChallengeResponder> AcmeOrderSession<R> {
                 let challenge = self.client.get_challenge(auth_url).await?;
                 info!("got acme challenge, client: {}, challenge: {:?}", self, challenge);
                 // 准备挑战响应
-                match challenge.type_.as_str() {
-                    "http-01" => {
-                        self.responder.respond_http(challenge.domain.as_str(), &challenge.token, &challenge.key_auth).await?;
-                    }
-                    "dns-01" => {
-                        self.responder.respond_dns(&challenge.domain, &challenge.digest).await?;
-                    }
-                    "tls-alpn-01" => {
-                        self.responder.respond_tls_alpn(&challenge.domain, &challenge.key_auth).await?;
-                    }
-                    _ => return Err(anyhow::anyhow!("Unsupported challenge type")),
-                }
+                let resp_challenge = self.responder.respond_challenge(&challenge).await?;
 
                 // 通知服务器验证挑战
-                self.client.verify_challenge(&challenge.url).await?;
-                
+                self.client.verify_challenge(&resp_challenge.url, directory.clone()).await?;
+
                 // 等待验证完成
                 self.client.poll_authorization(auth_url).await?;
 
-                self.respond_logs.push(challenge);
+                self.respond_logs.push(resp_challenge.clone());
             }
         }
 
@@ -305,13 +295,13 @@ impl<R: AcmeChallengeResponder> AcmeOrderSession<R> {
         if let Some(order_info) = &self.order_info {
             // 生成CSR
             let (csr, private_key) = self.client.generate_csr(&self.domains)?;
-            
+
             // Finalize订单
-            let cert_url = self.client.finalize_order(&order_info.finalize_url, &csr).await?;
-            
+            let cert_url = self.client.finalize_order(&order_info.finalize_url, directory.clone(), &csr).await?;
+
             // 下载证书
             let cert = self.client.download_certificate(&cert_url).await?;
-            
+
             Ok((cert, private_key))
         } else {
             Err(anyhow::anyhow!("No order information available"))
@@ -320,21 +310,10 @@ impl<R: AcmeChallengeResponder> AcmeOrderSession<R> {
 }
 
 
-impl<R: AcmeChallengeResponder> Drop for AcmeOrderSession<R> {
+impl Drop for AcmeOrderSession {
     fn drop(&mut self) {
         for log in self.respond_logs.iter() {
-            match log.type_.as_str() {
-                "http-01" => {
-                    self.responder.revert_http(log.domain.as_str(), log.token.as_str());
-                }
-                "dns-01" => {
-                    self.responder.revert_dns(log.domain.as_str(), log.digest.as_str());
-                }
-                "tls-alpn-01" => {
-                    self.responder.revert_tls_alpn(log.domain.as_str(), log.key_auth.as_str());
-                },
-                _ => {unreachable!()}
-            }
+            self.responder.revert_challenge(log);
         }
     }
 }
@@ -366,21 +345,60 @@ struct OrderResponse {
     finalize: String,
 }
 
-impl<R: AcmeChallengeResponder> AcmeOrderSession<R> {
+impl AcmeOrderSession {
     // 更新状态的方法
     fn update_status(&mut self, new_status: OrderStatus) {
         self.status = new_status;
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct Challenge {
-    type_: String,
-    url: String,
-    token: String,
-    domain: String,
-    key_auth: String,
-    digest: String,
+#[derive(Debug, Clone, Eq, PartialEq, Copy, Serialize, Deserialize)]
+pub enum ChallengeType {
+    #[serde(rename = "http-01")]
+    Http01,
+    #[serde(rename = "dns-01")]
+    Dns01,
+    #[serde(rename = "tls-alpn-01")]
+    TlsAlpn01,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Display for ChallengeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let str = match self {
+            ChallengeType::Http01 => "http-01".to_string(),
+            ChallengeType::Dns01 => "dns-01".to_string(),
+            ChallengeType::TlsAlpn01 => "tls-alpn-01".to_string(),
+            ChallengeType::Unknown => { "unknown".to_string() }
+        };
+        write!(f, "{}", str)
+    }
+}
+
+impl From<String> for ChallengeType {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "http-01" => ChallengeType::Http01,
+            "dns-01" => ChallengeType::Dns01,
+            "tls-alpn-01" => ChallengeType::TlsAlpn01,
+            _ => ChallengeType::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Challenge {
+    pub domain: String,
+    pub url: String,
+    pub data: ChallengeData,
+}
+
+#[derive(Debug, Clone)]
+pub enum ChallengeData {
+    TlsAlpn01 { cert: Arc<CertifiedKey> },
+    Http01 { token: String, key_auth: String },
+    Dns01 { token: String, key_hash: String },
 }
 
 
@@ -392,40 +410,20 @@ impl std::fmt::Display for AcmeClient {
 
 impl AcmeClient {
     // 已有方法改为使用 inner
-    pub async fn new(account: AcmeAccount) -> Result<Self> {
+    pub async fn new(account: AcmeAccount, acme_directory: String) -> Result<Self> {
         info!("create acme client, account: {}", account);
         let http_client = reqwest::Client::new();
-        
-        info!("get acme directory");
-        // 从 ACME 服务器获取目录
-        let directory: Directory = http_client
-            .get("https://acme-v02.api.letsencrypt.org/directory")
-            .send()
-            .await
-            .map_err(|e| {
-                error!("get acme directory failed, {}", e);
-                anyhow::anyhow!("get acme directory failed, {}", e)
-            })?
-            .json()
-            .await
-            .map_err(|e| {
-                error!("parse acme directory failed, {}", e);
-                anyhow::anyhow!("parse acme directory failed, {}", e)
-            })?;
-            
-        info!("get acme directory success, directory: {:?}", directory);
+
         let inner = AcmeClientInner {
-            directory,
+            directory: tokio::sync::Mutex::new(None),
             http_client,
             nonce_manager: NonceManager::new(),
             account,
+            acme_server: acme_directory,
         };
-        
+
         let client = Self { inner: Arc::new(inner) };
 
-        if client.account().kid().is_none() {
-            client.register_account().await?;
-        }
         Ok(client)
     }
 
@@ -433,7 +431,39 @@ impl AcmeClient {
         &self.inner.account
     }
 
-    async fn register_account(&self) -> Result<()> {
+    async fn get_directory(&self) -> Result<Directory> {
+        let mut directory = self.inner.directory.lock().await;
+        if directory.is_some() {
+            Ok(directory.clone().unwrap())
+        } else {
+            info!("get acme directory");
+            // 从 ACME 服务器获取目录
+            let dir: Directory = self.inner.http_client
+                // .get("https://acme-v02.api.letsencrypt.org/directory")
+                .get(self.inner.acme_server.as_str())
+                .send()
+                .await
+                .map_err(|e| {
+                    error!("get acme directory failed, {}", e);
+                    anyhow::anyhow!("get acme directory failed, {}", e)
+                })?
+                .json()
+                .await
+                .map_err(|e| {
+                    error!("parse acme directory failed, {}", e);
+                    anyhow::anyhow!("parse acme directory failed, {}", e)
+                })?;
+
+            info!("get acme directory success, directory: {:?}", dir);
+            *directory = Some(dir.clone());
+
+            if self.account().kid().is_none() {
+                self.register_account(dir.clone()).await?;
+            }
+            Ok(dir)
+        }
+    }
+    async fn register_account(&self, directory: Directory) -> Result<()> {
         info!("register acme account, client: {}", self);
         let payload = serde_json::json!({
             "termsOfServiceAgreed": true,
@@ -442,11 +472,11 @@ impl AcmeClient {
             ]
         });
 
-        let nonce = self.get_nonce().await?;
-        let jws = self.sign_request_new_account(&self.inner.directory.new_account, &nonce, &payload)?;
-        
+        let nonce = self.get_nonce(directory.clone()).await?;
+        let jws = self.sign_request_new_account(&directory.new_account, &nonce, &payload)?;
+
         let response = self.inner.http_client
-            .post(&self.inner.directory.new_account)
+            .post(&directory.new_account)
             .header("Content-Type", "application/jose+json")
             .json(&jws)
             .send()
@@ -467,7 +497,7 @@ impl AcmeClient {
             self.inner.account.set_kid(kid.clone());
             info!("got account kid: {}", kid);
         }
-        
+
         let _: AccountResponse = self.handle_response(response).await?;
         Ok(())
     }
@@ -481,7 +511,7 @@ impl AcmeClient {
     ) -> Result<serde_json::Value> {
         let payload_str = serde_json::to_string(payload)?;
         let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_str);
-        
+
         let protected = serde_json::json!({
             "alg": "RS256",
             "nonce": nonce,
@@ -492,10 +522,10 @@ impl AcmeClient {
                 "e": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.account().key().rsa()?.e().to_vec()),
             }
         });
-        
+
         let protected_str = serde_json::to_string(&protected)?;
         let protected_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(protected_str);
-        
+
         let signing_input = format!("{}.{}", protected_b64, payload_b64);
         let mut signer = openssl::sign::Signer::new(
             openssl::hash::MessageDigest::sha256(),
@@ -503,9 +533,9 @@ impl AcmeClient {
         )?;
         let mut signature = vec![0; signer.len()?];
         signer.sign_oneshot(&mut signature, signing_input.as_bytes())?;
-        
+
         let signature_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature);
-        
+
         Ok(serde_json::json!({
             "protected": protected_b64,
             "payload": payload_b64,
@@ -514,9 +544,9 @@ impl AcmeClient {
     }
 
     // 新增方法
-    async fn get_challenge(&self, auth_url: &str) -> Result<Challenge> {
+    async fn get_challenge(&self, auth_url: &str) -> Result<Vec<Challenge>> {
         info!("get acme challenge, client: {}, auth_url: {}", self, auth_url);
-        
+
         let response = self.inner.http_client
             .get(auth_url)
             .send()
@@ -527,23 +557,44 @@ impl AcmeClient {
             })?;
 
         let authz: AuthzResponse = response.json().await?;
-        
-        // 选择 http-01 挑战
-        let challenge = authz.challenges.iter()
-            .find(|c| c.type_ == "http-01")
-            .ok_or_else(|| anyhow::anyhow!("No http-01 challenge found"))?;
 
-        // 计算 key authorization
-        let key_auth = self.compute_key_authorization(&challenge.token)?;
-        
-        Ok(Challenge {
-            type_: challenge.type_.clone(),
-            url: challenge.url.clone(),
-            token: challenge.token.clone(),
-            domain: authz.identifier.value,
-            key_auth,
-            digest: "".to_string(), // 对于 http-01 挑战，不需要 digest
-        })
+        let mut challengs = vec![];
+        for challenge in authz.challenges.iter() {
+            match challenge.type_ {
+                ChallengeType::Http01 => {
+                    challengs.push(Challenge {
+                        domain: authz.identifier.value.clone(),
+                        url: challenge.url.clone(),
+                        data: ChallengeData::Http01 {
+                            token: challenge.token.clone(),
+                            key_auth: self.compute_key_authorization(&challenge.token)?,
+                        },
+                    });
+                }
+                ChallengeType::Dns01 => {
+                    challengs.push(Challenge {
+                        domain: authz.identifier.value.clone(),
+                        url: challenge.url.clone(),
+                        data: ChallengeData::Dns01 {
+                            token: challenge.token.clone(),
+                            key_hash: self.compute_key_authorization_hash(&challenge.token)?,
+                        },
+                    });
+                }
+                ChallengeType::TlsAlpn01 => {
+                    challengs.push(Challenge {
+                        domain: authz.identifier.value.clone(),
+                        url: challenge.url.clone(),
+                        data: ChallengeData::TlsAlpn01 {
+                            cert: Arc::new(self.compute_tls_alpn_01_key(authz.identifier.value.as_str(), &challenge.token)?),
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        Ok(challengs)
     }
 
     fn compute_key_authorization(&self, token: &str) -> Result<String> {
@@ -558,8 +609,41 @@ impl AcmeClient {
         let mut hasher = openssl::sha::Sha256::new();
         hasher.update(jwk_str.as_bytes());
         let thumbprint = hasher.finish();
-        
+
         Ok(format!("{}.{}", token, base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(thumbprint)))
+    }
+
+    fn compute_key_authorization_hash(&self, token: &str) -> Result<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(self.compute_key_authorization(token)?.as_bytes());
+        let key_bytes = hasher.finalize();
+        Ok(hex::encode(key_bytes))
+    }
+
+    fn compute_tls_alpn_01_key(&self, domain: &str, token: &str) -> Result<CertifiedKey> {
+        let mut params = rcgen::CertificateParams::new(vec![domain.to_string()]).map_err(|e| {
+            error!("generate tls alpn01 key failed, domain: {}, {}", domain, e);
+            anyhow::anyhow!("generate tls alpn01 key failed, domain: {}, {}", domain, e)
+        })?;
+        let key_auth = self.compute_key_authorization_hash(token)?;
+        params.custom_extensions = vec![
+            rcgen::CustomExtension::new_acme_identifier(hex::decode(key_auth.as_str()).unwrap().as_slice()),
+        ];
+        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(|e| {
+            error!("generate tls alpn01 key failed, domain: {}, {}", domain, e);
+            anyhow::anyhow!("generate tls alpn01 key failed, domain: {}, {}", domain, e)
+        })?;
+        let cert = params.self_signed(&key_pair).map_err(|e| {
+            error!("generate tls alpn01 key failed, domain: {}, {}", domain, e);
+            anyhow::anyhow!("generate tls alpn01 key failed, domain: {}, {}", domain, e)
+        })?;
+
+        let sk = any_ecdsa_type(&PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()))).map_err(|e| {
+            error!("generate tls alpn01 key failed, domain: {}, {}", domain, e);
+            anyhow::anyhow!("generate tls alpn01 key failed, domain: {}, {}", domain, e)
+        })?;
+        let certi_key = CertifiedKey::new(vec![cert.der().clone()], sk);
+        Ok(certi_key)
     }
 
     /// 处理ACME响应，不关心返回值
@@ -582,9 +666,9 @@ impl AcmeClient {
         Ok(())
     }
 
-    async fn verify_challenge(&self, challenge_url: &str) -> Result<()> {
+    async fn verify_challenge(&self, challenge_url: &str, directory: Directory) -> Result<()> {
         info!("verify acme challenge, client: {}, challenge_url: {}", self, challenge_url);
-        self.signed_post_no_body(challenge_url, &serde_json::json!({})).await
+        self.signed_post_no_body(challenge_url, directory, &serde_json::json!({})).await
             .map_err(|e| {
                 error!("verify acme challenge failed, client: {}, challenge_url: {}, {}", self, challenge_url, e);
                 anyhow::anyhow!("verify acme challenge failed, client: {}, challenge_url: {}, {}", self, challenge_url, e)
@@ -608,7 +692,7 @@ impl AcmeClient {
                 })?;
 
             let authz: AuthzResponse = response.json().await?;
-            
+
             match authz.status.as_str() {
                 "valid" => {
                     info!("poll acme authorization success, client: {}, auth_url: {}", self, auth_url);
@@ -629,24 +713,24 @@ impl AcmeClient {
                 }
             }
         }
-        
+
         info!("poll acme authorization timeout, client: {}, auth_url: {}", self, auth_url);
         Err(anyhow::anyhow!("Authorization polling timeout"))
     }
 
     /// 完成订单
-    async fn finalize_order(&self, url: &str, csr: &[u8]) -> Result<String> {
+    async fn finalize_order(&self, url: &str, directory: Directory, csr: &[u8]) -> Result<String> {
         info!("finalize acme order, client: {}, url: {}, csr: {}", self, url, csr.len());
         let payload = serde_json::json!({
             "csr": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(csr)
         });
 
-        let response: FinalizeResponse = self.signed_post(url, &payload).await
+        let response: FinalizeResponse = self.signed_post(url, directory, &payload).await
             .map_err(|e| {
                 error!("finalize acme order failed, client: {}, url: {}, csr: {}, {}", self, url, csr.len(), e);
                 anyhow::anyhow!("finalize acme order failed, client: {}, url: {}, csr: {}, {}", self, url, csr.len(), e)
             })?;
-        
+
         info!("finalize acme order success, client: {}, url: {}, csr: {}, response: {:?}", self, url, csr.len(), response);
         match response.status.as_str() {
             "valid" => Ok(response.certificate.ok_or_else(|| anyhow::anyhow!("No certificate URL in response"))?),
@@ -657,7 +741,7 @@ impl AcmeClient {
     /// 下载证书
     async fn download_certificate(&self, url: &str) -> Result<Vec<u8>> {
         info!("download acme certificate, client: {}, url: {}", self, url);
-        
+
         let response = self.inner.http_client
             .get(url)
             .header("Accept", "application/pem-certificate-chain")
@@ -667,7 +751,7 @@ impl AcmeClient {
                 error!("download acme certificate failed, client: {}, url: {}, {}", self, url, e);
                 anyhow::anyhow!("download acme certificate failed: {}", e)
             })?;
-        
+
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await?;
@@ -681,7 +765,7 @@ impl AcmeClient {
     }
 
     /// 创建新的订单
-    async fn create_order(&self, domains: &[String]) -> Result<(Vec<String>, String)> {
+    async fn create_order(&self, domains: &[String], directory: Directory) -> Result<(Vec<String>, String)> {
         info!("create acme order, client: {}, domains: {}", self, domains.join(","));
         // 构造订单请求
         let request = OrderRequest {
@@ -693,7 +777,8 @@ impl AcmeClient {
 
         // 发送订单请求
         let response: OrderResponse = self.signed_post(
-            &self.inner.directory.new_order,
+            directory.new_order.clone().as_str(),
+            directory,
             &request
         ).await
         .map_err(|e| {
@@ -710,10 +795,10 @@ impl AcmeClient {
     fn generate_csr(&self, domains: &[String]) -> Result<(Vec<u8>, Vec<u8>)> {
         let rsa = Rsa::generate(2048)?;
         let pkey = PKey::from_rsa(rsa)?;
-        
+
         let mut builder = X509ReqBuilder::new()?;
         builder.set_pubkey(&pkey)?;
-        
+
         let mut name_builder = X509NameBuilder::new()?;
         name_builder.append_entry_by_text("CN", &domains[0])?;
         builder.set_subject_name(&name_builder.build())?;
@@ -730,19 +815,19 @@ impl AcmeClient {
         }
 
         builder.sign(&pkey, openssl::hash::MessageDigest::sha256())?;
-        
+
         Ok((builder.build().to_der()?, pkey.private_key_to_pem_pkcs8()?))
     }
 
     /// 发送签名的POST请求并处理响应
-    async fn signed_post<T, R>(&self, url: &str, payload: &T) -> Result<R>
+    async fn signed_post<T, R>(&self, url: &str, directory: Directory, payload: &T) -> Result<R>
     where
         T: Serialize,
         R: DeserializeOwned,
     {
-        let nonce = self.get_nonce().await?;
+        let nonce = self.get_nonce(directory).await?;
         let jws = self.sign_request(url, &nonce, payload)?;
-        
+
         let response = self.inner.http_client
             .post(url)
             .header("Content-Type", "application/jose+json")
@@ -750,24 +835,24 @@ impl AcmeClient {
             .send()
             .await?;
 
-        
+
         self.handle_response(response).await
     }
 
     /// 获取 nonce
-    async fn get_nonce(&self) -> Result<String> {
+    async fn get_nonce(&self, directory: Directory) -> Result<String> {
         if let Some(nonce) = self.inner.nonce_manager.take_nonce() {
             Ok(nonce)
         } else {
-            self.fetch_new_nonce().await
+            self.fetch_new_nonce(directory).await
         }
     }
 
     /// 从服务器获取新的 nonce
-    async fn fetch_new_nonce(&self) -> Result<String> {
+    async fn fetch_new_nonce(&self, directory: Directory) -> Result<String> {
         info!("fetch acme nonce, client: {}", self);
         let response = self.inner.http_client
-            .head(&self.inner.directory.new_nonce)
+            .head(&directory.new_nonce)
             .send()
             .await
             .map_err(|e| {
@@ -787,8 +872,6 @@ impl AcmeClient {
         Ok(nonce)
     }
 
-
-    
 
     /// 处理ACME响应
     async fn handle_response<R>(&self, response: reqwest::Response) -> Result<R>
@@ -824,7 +907,7 @@ impl AcmeClient {
     ) -> Result<serde_json::Value> {
         let payload_str = serde_json::to_string(payload)?;
         let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_str);
-        
+
         let protected = if let Some(kid) = self.inner.account.kid() {
             // 已注册账户使用 kid
             serde_json::json!({
@@ -846,10 +929,10 @@ impl AcmeClient {
                 }
             })
         };
-        
+
         let protected_str = serde_json::to_string(&protected)?;
         let protected_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(protected_str);
-        
+
         let signing_input = format!("{}.{}", protected_b64, payload_b64);
         let mut signer = openssl::sign::Signer::new(
             openssl::hash::MessageDigest::sha256(),
@@ -857,9 +940,9 @@ impl AcmeClient {
         )?;
         let mut signature = vec![0; signer.len()?];
         signer.sign_oneshot(&mut signature, signing_input.as_bytes())?;
-        
+
         let signature_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature);
-        
+
         Ok(serde_json::json!({
             "protected": protected_b64,
             "payload": payload_b64,
@@ -868,10 +951,10 @@ impl AcmeClient {
     }
 
     /// 发送签名的POST请求，不需要响应体
-    async fn signed_post_no_body<T: Serialize>(&self, url: &str, payload: &T) -> Result<()> {
-        let nonce = self.get_nonce().await?;
+    async fn signed_post_no_body<T: Serialize>(&self, url: &str, directory: Directory, payload: &T) -> Result<()> {
+        let nonce = self.get_nonce(directory).await?;
         let jws = self.sign_request(url, &nonce, payload)?;
-        
+
         let response = self.inner.http_client
             .post(url)
             .header("Content-Type", "application/jose+json")
@@ -912,7 +995,7 @@ struct AuthzResponse {
 #[derive(Debug, Deserialize)]
 struct ChallengeResponse {
     #[serde(rename = "type")]
-    type_: String,
+    type_: ChallengeType,
     url: String,
     status: String,
     token: String,

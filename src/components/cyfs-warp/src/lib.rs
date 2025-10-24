@@ -3,7 +3,6 @@
 mod router;
 mod http_server;
 mod ndn_router;
-mod cert;
 
 pub use router::*;
 pub use http_server::*;
@@ -15,12 +14,12 @@ pub fn parse_range(range: &str, file_size: u64) -> Result<(u64, u64)> {
   // 解析 "bytes=start-end" 格式
   let range = range.trim_start_matches("bytes=");
   let mut parts = range.split('-');
-  
+
   let start = parts.next()
       .and_then(|s| s.parse::<u64>().ok())
       .unwrap_or(0);
 
-      
+
   let end = parts.next()
       .and_then(|s| s.parse::<u64>().ok())
       .unwrap_or(file_size - 1);
@@ -40,7 +39,7 @@ mod test {
     use buckyos_kit::*;
     use serde_json::*;
 
-    
+
     async fn test_cyfs_warp_main() {
         let config_str = r#"
 {
@@ -52,7 +51,7 @@ mod test {
       "routes": {
         "1": {
           "upstream": "http://localhost:9090"
-        }, 
+        },
         "2": {
           "upstream": "http://localhost:9091 redirect"
         },
@@ -76,7 +75,7 @@ mod test {
       }
     }
   }
-}        
+}
         "#;
         let warp_config:WarpServerConfig = serde_json::from_str(config_str).unwrap();
         //init_logging();

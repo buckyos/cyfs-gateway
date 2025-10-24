@@ -6,7 +6,7 @@ use hyper::body::{Bytes};
 use hyper::{http, StatusCode};
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CollectionValue, CommandControl, MapCollection, ProcessChainLibExecutor};
-use crate::{get_stream_external_commands, HttpRequestHeaderMap, HttpServer, InnerServiceManagerRef, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
+use crate::{HttpRequestHeaderMap, HttpServer, InnerServiceManagerRef, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err, into_server_err};
 
@@ -291,7 +291,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use hyper_util::rt::{TokioExecutor, TokioIo};
-    use crate::{hyper_serve_http, hyper_serve_http1, InnerServiceManager, StreamInfo};
+    use crate::{hyper_serve_http, hyper_serve_http1, GlobalProcessChains, InnerServiceManager, StreamInfo};
 
     #[tokio::test]
     async fn test_http_server_builder_creation() {
@@ -553,5 +553,11 @@ mod tests {
             h3_port: None,
             hook_point: ProcessChainConfigs::default(),
         };
+        let factory = ProcessChainHttpServerFactory::new(
+            Arc::new(InnerServiceManager::new()),
+            Arc::new(GlobalProcessChains::new()),
+        );
+        let result = factory.create(Arc::new(config)).await;
+        assert!(result.is_ok());
     }
 }

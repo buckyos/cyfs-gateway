@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use buckyos_kit::AsyncStream;
-use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig};
+use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig, CURRENT_DEVICE_CONFIG};
 use sfo_io::{LimitStream, StatStream};
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
@@ -354,6 +354,8 @@ impl RtcpStack {
         let device_config = builder.device_config.take().unwrap();
         let private_key = builder.private_key.take();
         let inner = Arc::new(RtcpStackInner::create(builder).await?);
+
+        CURRENT_DEVICE_CONFIG.set(device_config.clone());
 
         let rtcp = RTcp::new(device_config.id.clone(), bind_addr.clone(), private_key, Arc::new(Listener::new(inner.clone())));
         Ok(Self {
@@ -739,14 +741,14 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack1 = result.unwrap();
+        let stack1 = result.unwrap();
         let result = stack1.start().await;
         assert!(result.is_ok());
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let id2 = device_config.id.clone();
+        let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
         GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
@@ -779,7 +781,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack2 = result.unwrap();
+        let stack2 = result.unwrap();
         let result = stack2.start().await;
         assert!(result.is_ok());
 
@@ -840,14 +842,14 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack1 = result.unwrap();
+        let stack1 = result.unwrap();
         let result = stack1.start().await;
         assert!(result.is_ok());
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let id2 = device_config.id.clone();
+        let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
         GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
@@ -880,7 +882,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack2 = result.unwrap();
+        let stack2 = result.unwrap();
         let result = stack2.start().await;
         assert!(result.is_ok());
 
@@ -941,14 +943,14 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack1 = result.unwrap();
+        let stack1 = result.unwrap();
         let result = stack1.start().await;
         assert!(result.is_ok());
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let id2 = device_config.id.clone();
+        let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
         GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
@@ -981,7 +983,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack2 = result.unwrap();
+        let stack2 = result.unwrap();
         let result = stack2.start().await;
         assert!(result.is_ok());
 
@@ -1058,14 +1060,14 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack1 = result.unwrap();
+        let stack1 = result.unwrap();
         let result = stack1.start().await;
         assert!(result.is_ok());
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let id2 = device_config.id.clone();
+        let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
         GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
@@ -1098,7 +1100,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack2 = result.unwrap();
+        let stack2 = result.unwrap();
         let result = stack2.start().await;
         assert!(result.is_ok());
 
@@ -1193,14 +1195,14 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack1 = result.unwrap();
+        let stack1 = result.unwrap();
         let result = stack1.start().await;
         assert!(result.is_ok());
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let id2 = device_config.id.clone();
+        let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
         GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
@@ -1235,7 +1237,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack2 = result.unwrap();
+        let stack2 = result.unwrap();
         let result = stack2.start().await;
         assert!(result.is_ok());
 
@@ -1295,14 +1297,14 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack1 = result.unwrap();
+        let stack1 = result.unwrap();
         let result = stack1.start().await;
         assert!(result.is_ok());
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let id2 = device_config.id.clone();
+        let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
         GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
@@ -1344,7 +1346,7 @@ mod tests {
         let url = Url::parse(format!("rudp://{}:2995/test:80", id1.to_host_name()).as_str()).unwrap();
         let ret = tunnel_manager2.create_datagram_client_by_url(&url).await;
         assert!(ret.is_ok());
-        let mut stream = ret.unwrap();
+        let stream = ret.unwrap();
         let result = stream
             .send_datagram(b"GET / HTTP/1.1\r\nHost: httpbin.org\r\n\r\n")
             .await;
@@ -1396,14 +1398,14 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack1 = result.unwrap();
+        let stack1 = result.unwrap();
         let result = stack1.start().await;
         assert!(result.is_ok());
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let id2 = device_config.id.clone();
+        let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
         GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
@@ -1436,7 +1438,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack2 = result.unwrap();
+        let stack2 = result.unwrap();
         let result = stack2.start().await;
         assert!(result.is_ok());
 
@@ -1445,7 +1447,7 @@ mod tests {
         let url = Url::parse(format!("rudp://{}:2997/test:80", id1.to_host_name()).as_str()).unwrap();
         let ret = tunnel_manager2.create_datagram_client_by_url(&url).await;
         assert!(ret.is_ok());
-        let mut stream = ret.unwrap();
+        let stream = ret.unwrap();
         let result = stream
             .send_datagram(b"GET / HTTP/1.1\r\nHost: httpbin.org\r\n\r\n")
             .await;
@@ -1497,14 +1499,14 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack1 = result.unwrap();
+        let stack1 = result.unwrap();
         let result = stack1.start().await;
         assert!(result.is_ok());
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let id2 = device_config.id.clone();
+        let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
         GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
@@ -1537,7 +1539,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack2 = result.unwrap();
+        let stack2 = result.unwrap();
         let result = stack2.start().await;
         assert!(result.is_ok());
 
@@ -1555,7 +1557,7 @@ mod tests {
         let url = Url::parse(format!("rudp://{}:2998/test:80", id1.to_host_name()).as_str()).unwrap();
         let ret = tunnel_manager2.create_datagram_client_by_url(&url).await;
         assert!(ret.is_ok());
-        let mut stream = ret.unwrap();
+        let stream = ret.unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert_eq!(connection_manager.get_all_connection_info().len(), 1);
         let result = stream.send_datagram(b"test").await;
@@ -1612,14 +1614,14 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack1 = result.unwrap();
+        let stack1 = result.unwrap();
         let result = stack1.start().await;
         assert!(result.is_ok());
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let id2 = device_config.id.clone();
+        let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
         GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
@@ -1652,7 +1654,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack2 = result.unwrap();
+        let stack2 = result.unwrap();
         let result = stack2.start().await;
         assert!(result.is_ok());
 
@@ -1661,7 +1663,7 @@ mod tests {
         let url = Url::parse(format!("rudp://{}:2301/test:80", id1.to_host_name()).as_str()).unwrap();
         let ret = tunnel_manager2.create_datagram_client_by_url(&url).await;
         assert!(ret.is_ok());
-        let mut stream = ret.unwrap();
+        let stream = ret.unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert_eq!(connection_manager.get_all_connection_info().len(), 1);
         let result = stream.send_datagram(b"test").await;
@@ -1745,14 +1747,14 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack1 = result.unwrap();
+        let stack1 = result.unwrap();
         let result = stack1.start().await;
         assert!(result.is_ok());
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let id2 = device_config.id.clone();
+        let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
         GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
@@ -1787,7 +1789,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let mut stack2 = result.unwrap();
+        let stack2 = result.unwrap();
         let result = stack2.start().await;
         assert!(result.is_ok());
 
@@ -1796,7 +1798,7 @@ mod tests {
         let url = Url::parse(format!("rudp://{}:2310/test:80", id1.to_host_name()).as_str()).unwrap();
         let ret = tunnel_manager2.create_datagram_client_by_url(&url).await;
         assert!(ret.is_ok());
-        let mut stream = ret.unwrap();
+        let stream = ret.unwrap();
         let result = stream.send_datagram(b"test_server").await;
         assert!(result.is_ok());
 

@@ -35,14 +35,17 @@ pub struct GatewayFactory {
     stack_factory: CyfsStackFactory,
     server_factory: CyfsServerFactory,
     inner_service_factory: CyfsInnerServiceFactory,
+    acme_mgr: CertManagerRef,
 }
+
 impl GatewayFactory {
     pub fn new(
         servers: ServerManagerRef,
         global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
-        inner_service_manager: InnerServiceManagerRef) -> Self {
+        inner_service_manager: InnerServiceManagerRef,
+        acme_mgr: CertManagerRef, ) -> Self {
         Self {
             servers,
             global_process_chains,
@@ -52,6 +55,7 @@ impl GatewayFactory {
             stack_factory: CyfsStackFactory::new(),
             server_factory: CyfsServerFactory::new(),
             inner_service_factory: CyfsInnerServiceFactory::new(),
+            acme_mgr,
         }
     }
 
@@ -106,6 +110,7 @@ impl GatewayFactory {
             inner_service_factory: self.inner_service_manager.clone(),
             global_process_chains: self.global_process_chains.clone(),
             connection_manager: self.connection_manager.clone(),
+            acme_mgr: self.acme_mgr.clone(),
         })
     }
 }
@@ -118,6 +123,7 @@ pub struct Gateway {
     inner_service_factory: InnerServiceManagerRef,
     global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
+    acme_mgr: CertManagerRef,
 }
 
 impl Drop for Gateway {

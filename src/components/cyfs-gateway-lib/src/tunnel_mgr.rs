@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use crate::ip::IPTunnelBuilder;
-use crate::socks::SocksTunnelBuilder;
 use crate::DatagramClientBox;
 use crate::{
-    DatagramServerBox, GatewayDeviceRef, RTcpStackManager, StreamListener, StreamProbe,
+    DatagramServerBox, StreamListener, StreamProbe,
     StreamSelector, TunnelBox, TunnelBuilder, TunnelError, TunnelResult,
 };
 use buckyos_kit::AsyncStream;
@@ -62,7 +61,7 @@ impl TunnelManager {
     pub fn register_tunnel_builder(&self, protocol: &str, builder: Arc<dyn TunnelBuilder>) {
         self.tunnel_builder_manager.lock().unwrap().insert(protocol.to_string(), builder);
     }
-    
+
     pub fn remove_tunnel_builder(&self, protocol: &str) {
         self.tunnel_builder_manager.lock().unwrap().remove(protocol);
     }

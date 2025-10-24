@@ -60,12 +60,43 @@ async fn service_main(config_dir: &Path, config_json: serde_json::Value, params:
     let global_process_chains = Arc::new(GlobalProcessChains::new());
     let inner_service_manager = Arc::new(InnerServiceManager::new());
 
+    let acme_account: Option<String> = match config_json.get("acme_account") {
+        Some(acme_account) => {
+            match acme_account.as_str() {
+                Some(acme_account) => Some(acme_account.to_string()),
+                None => None,
+            }
+        },
+        None => None,
+    };
+    let acme_server: Option<String> = match config_json.get("acme_server") {
+        Some(acme_server) => {
+            match acme_server.as_str() {
+                Some(acme_server) => Some(acme_server.to_string()),
+                None => None,
+            }
+        },
+        None => None,
+    };
+
+    let mut cert_config = CertManagerConfig::default();
+    let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+    cert_config.keystore_path = data_dir.to_string_lossy().to_string();
+    cert_config.account = acme_account;
+    if acme_server.is_some() {
+        cert_config.acme_server = acme_server.unwrap();
+    }
+
+    let cert_manager = CertManager::create(cert_config).await?;
+    let resolver = AcmeCertResolver::new(cert_manager.clone());
+
     let factory = GatewayFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
         connect_manager.clone(),
         tunnel_manager.clone(),
         inner_service_manager.clone(),
+        cert_manager
     );
     factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
         server_manager.clone(),
@@ -84,12 +115,14 @@ async fn service_main(config_dir: &Path, config_json: serde_json::Value, params:
         global_process_chains.clone(),
         connect_manager.clone(),
         tunnel_manager.clone(),
+        resolver.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
         connect_manager.clone(),
         tunnel_manager.clone(),
+        resolver.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
         server_manager.clone(),

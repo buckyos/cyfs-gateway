@@ -7,13 +7,11 @@
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::{rtcp::*, TunnelBuilder};
     use std::time::Duration;
     use buckyos_kit::*;
     use name_client::*;
     use name_lib::*;
-    use url::Url;
     use std::net::IpAddr;
     #[tokio::test]
     async fn test_rtcp_url() {

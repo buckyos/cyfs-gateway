@@ -5,6 +5,7 @@ mod stack;
 mod tls_stack;
 mod quic_stack;
 mod limiter;
+mod tls_cert_resolver;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -15,6 +16,7 @@ pub use udp_stack::*;
 pub use quic_stack::*;
 pub use stack::*;
 pub use tls_stack::*;
+pub use tls_cert_resolver::*;
 
 #[derive(Debug, Copy, Clone)]
 pub enum StackErrorCode {
