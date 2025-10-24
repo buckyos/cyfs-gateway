@@ -235,8 +235,13 @@ impl TlsStackInner {
                 }
             }
         }
+        let server_name = {
+            let (_, conn) = tls_stream.get_ref();
+            conn.server_name().map(|s| s.to_string())
+        };
         let mut request = StreamRequest::new(Box::new(tls_stream), local_addr);
         request.source_addr = Some(remote_addr);
+        request.dest_host = server_name;
         let (ret, stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
