@@ -9,7 +9,7 @@ use name_client::*;
 use name_lib::*;
 use buckyos_kit::*;
 use url::Url;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{Utc};
 use json_value_merge::Merge;
 use jsonwebtoken::{DecodingKey, EncodingKey};
@@ -437,7 +437,8 @@ impl Gateway {
         Ok(())
     }
 
-    pub async fn reload(&self, config: GatewayConfig) -> Result<()> {
+    pub async fn reload(&self, mut config: GatewayConfig) -> Result<()> {
+        let old_global_chains = self.global_process_chains.get_process_chains();
         let mut new_process_chains = HashMap::new();
         for process_chain_config in config.global_process_chains.iter() {
             let process_chain = Arc::new(process_chain_config.create_process_chain()?);
@@ -452,19 +453,31 @@ impl Gateway {
 
         let mut new_services = HashMap::new();
         for inner_service_config in config.inner_services.iter() {
-            let new_inner_services = self.inner_service_factory.create(inner_service_config.clone()).await?;
+            let new_inner_services = match self.inner_service_factory.create(inner_service_config.clone()).await {
+                Ok(new_inner_services) => new_inner_services,
+                Err(err) => {
+                    self.global_process_chains.replace_process_chains(old_global_chains.clone());
+                    return Err(anyhow!(err));
+                }
+            };
             if new_inner_services.is_empty() {
                 continue;
             }
 
             let new_inner_service_id = new_inner_services.first().unwrap().id();
             if new_services.contains_key(new_inner_service_id.as_str()) {
+                self.global_process_chains.replace_process_chains(old_global_chains.clone());
                 Err(cmd_err!(
                     ConfigErrorCode::AlreadyExists,
                     "Duplicated inner service: {}", new_inner_service_id,
                 ))?;
             }
             new_services.insert(new_inner_service_id, new_inner_services);
+        }
+
+        self.global_process_chains.clear_process_chains();
+        for process_chain in new_process_chains.values() {
+            self.global_process_chains.add_process_chain(process_chain.clone())?;
         }
 
         let mut new_servers = HashMap::new();
@@ -479,11 +492,6 @@ impl Gateway {
             new_servers.insert(new_server.id(), new_server);
         }
 
-        self.global_process_chains.clear_process_chains();
-        for process_chain in new_process_chains.values() {
-            self.global_process_chains.add_process_chain(process_chain.clone())?;
-        }
-
         for service in new_services.values() {
             self.inner_service_manager.replace_service(service.clone());
         }
@@ -492,6 +500,7 @@ impl Gateway {
             self.server_manager.replace_server(server.clone());
         }
 
+        let mut success_stacks = Vec::new();
         for stack_config in config.stacks.iter() {
             if let Some(stack) = self.stack_manager.get_stack(stack_config.id().as_str()) {
                 if let Err(e) = stack.update_config(stack_config.clone()).await {
@@ -511,9 +520,18 @@ impl Gateway {
                             self.stack_manager.remove(stack_config.id().as_str());
                             log::error!("Failed to start stack {}: {}", stack_config.id(), e);
                         }
+                        success_stacks.push(stack_config.clone());
                     } else {
                         log::error!("Failed to update stack {}: {}", stack_config.id(), e);
+                        let config = self.config.lock().unwrap();
+                        for old_config in config.stacks.iter() {
+                            if old_config.id() == stack_config.id() {
+                                success_stacks.push(old_config.clone());
+                            }
+                        }
                     }
+                } else {
+                    success_stacks.push(stack_config.clone());
                 }
             } else {
                 let new_stack = match self.stack_factory.create(stack_config.clone()).await {
@@ -525,13 +543,18 @@ impl Gateway {
                 };
                 if let Err(e) = self.stack_manager.add_stack(new_stack.clone()) {
                     log::error!("Failed to add stack {}: {}", stack_config.id(), e);
+                    continue;
                 }
                 if let Err(e) = new_stack.start().await {
+                    self.stack_manager.remove(stack_config.id().as_str());
                     log::error!("Failed to start stack {}: {}", stack_config.id(), e);
+                    continue;
                 }
+                success_stacks.push(stack_config.clone());
             }
         }
 
+        config.stacks = success_stacks;
         self.stack_manager.retain(|id| {
             config.stacks.iter().any(|stack| stack.id() == id)
         });

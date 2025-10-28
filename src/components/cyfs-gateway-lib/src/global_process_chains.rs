@@ -29,6 +29,11 @@ impl GlobalProcessChains {
         Ok(())
     }
 
+    pub fn replace_process_chains(&self, process_chains: Vec<ProcessChainLibRef>) {
+        self.clear_process_chains();
+        *self.process_chains.lock().unwrap() = process_chains;
+    }
+
     pub fn clear_process_chains(&self) {
         self.process_chains.lock().unwrap().clear();
     }
