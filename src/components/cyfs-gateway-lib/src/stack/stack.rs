@@ -73,6 +73,22 @@ impl StackManager {
         }
         None
     }
+
+    pub fn retain<F>(&self, f: F)
+    where
+        F: Fn(&str) -> bool,
+    {
+        let mut stacks = self.stacks.lock().unwrap();
+        stacks.retain(|stack| {
+            f(stack.id().as_str())
+        });
+    }
+
+    pub fn remove(&self, id: &str) {
+        self.retain(|stack_id| {
+            stack_id != id
+        });
+    }
 }
 
 #[async_trait::async_trait]
@@ -83,6 +99,7 @@ pub trait StackFactory: Send + Sync {
 pub struct CyfsStackFactory {
     stack_factory: Mutex<HashMap<StackProtocol, Arc<dyn StackFactory>>>,
 }
+pub type CyfsStackFactoryRef = Arc<CyfsStackFactory>;
 
 impl Default for CyfsStackFactory {
     fn default() -> Self {

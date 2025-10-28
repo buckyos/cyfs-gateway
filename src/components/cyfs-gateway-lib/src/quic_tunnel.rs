@@ -75,15 +75,15 @@ impl QuicTunnelBuilder {
 
 #[async_trait::async_trait]
 impl TunnelBuilder for QuicTunnelBuilder {
-    async fn create_tunnel(&self, tunnel_stack_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>> {
+    async fn create_tunnel(&self, _tunnel_stack_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>> {
         Ok(Box::new(QuicTunnel::new()))
     }
 
-    async fn create_stream_listener(&self, bind_stream_id: &Url) -> TunnelResult<Box<dyn StreamListener>> {
+    async fn create_stream_listener(&self, _bind_stream_id: &Url) -> TunnelResult<Box<dyn StreamListener>> {
         todo!()
     }
 
-    async fn create_datagram_server(&self, bind_session_id: &Url) -> TunnelResult<Box<dyn DatagramServerBox>> {
+    async fn create_datagram_server(&self, _bind_session_id: &Url) -> TunnelResult<Box<dyn DatagramServerBox>> {
         todo!()
     }
 }

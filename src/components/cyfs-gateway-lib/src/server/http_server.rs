@@ -196,10 +196,6 @@ impl HttpServer for ProcessChainHttpServer {
     fn http3_port(&self) -> Option<u16> {
         self.h3_port
     }
-
-    async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
-        todo!()
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]

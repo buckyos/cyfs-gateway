@@ -36,6 +36,20 @@ impl InnerService {
             InnerService::DnsService(service) => service.id(),
         }
     }
+
+    pub fn is_http_service(&self) -> bool {
+        match self {
+            InnerService::HttpService(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_dns_service(&self) -> bool {
+        match self {
+            InnerService::DnsService(_) => true,
+            _ => false,
+        }
+    }
 }
 
 pub trait InnerServiceConfig: AsAny + Send + Sync {
@@ -52,6 +66,7 @@ pub trait InnerServiceFactory: Send + Sync {
 pub struct CyfsInnerServiceFactory {
     service_factory: Mutex<HashMap<String, Arc<dyn InnerServiceFactory>>>,
 }
+pub type CyfsInnerServiceFactoryRef = Arc<CyfsInnerServiceFactory>;
 
 impl Default for CyfsInnerServiceFactory {
     fn default() -> Self {
@@ -94,7 +109,7 @@ pub trait InnerHttpService: Send + Sync {
 }
 
 pub struct InnerServiceManager {
-    services: Mutex<HashMap<String, InnerService>>,
+    services: Mutex<HashMap<String, Vec<InnerService>>>,
 }
 pub type InnerServiceManagerRef = Arc<InnerServiceManager>;
 
@@ -112,34 +127,67 @@ impl InnerServiceManager {
         }
     }
 
-    pub fn add_service(&self, service_impl: InnerService) -> ServiceResult<()>{
-        if self.get_service(service_impl.id().as_str()).is_some() {
-            return Err(service_err!(ServiceErrorCode::AlreadyExists, "service {} already exists", service_impl.id()))
+    pub fn add_service(&self, service_impl: Vec<InnerService>) -> ServiceResult<()> {
+        if service_impl.is_empty() {
+            return Ok(())
         }
-        self.services.lock().unwrap().insert(service_impl.id(), service_impl);
+        let id = service_impl.first().unwrap().id();
+        if self.get_service(id.as_str()).is_some() {
+            return Err(service_err!(ServiceErrorCode::AlreadyExists, "service {} already exists", id))
+        }
+        self.services.lock().unwrap().insert(id, service_impl);
         Ok(())
     }
 
-    pub fn get_service(&self, service: &str) -> Option<InnerService> {
+    pub fn replace_service(&self, service_impl: Vec<InnerService>) {
+        let mut services = self.services.lock().unwrap();
+        if service_impl.is_empty() {
+            return;
+        }
+        let id = service_impl.first().unwrap().id();
+        services.insert(id, service_impl);
+    }
+
+    pub fn get_service(&self, service: &str) -> Option<Vec<InnerService>> {
         self.services.lock().unwrap().get(service).cloned()
     }
 
     pub fn get_http_service(&self, service: &str) -> Option<Arc<dyn InnerHttpService>> {
-        self.get_service(service).and_then(|service| {
+        let services = self.get_service(service);
+        if services.is_none() {
+            return None;
+        }
+        
+        let services = services.unwrap();
+        for service in services {
             match service {
-                InnerService::HttpService(service) => Some(service.clone()),
-                _ => None,
+                InnerService::HttpService(service) => return Some(service.clone()),
+                _ => continue,
             }
-        })
+        }
+        None
     }
 
     pub fn get_dns_service(&self, service: &str) -> Option<Arc<dyn InnerDnsService>> {
-        self.get_service(service).and_then(|service| {
+        let services = self.get_service(service);
+        if services.is_none() {
+            return None;
+        }
+
+        let services = services.unwrap();
+        for service in services {
             match service {
-                InnerService::DnsService(service) => Some(service.clone()),
-                _ => None,
+                InnerService::DnsService(service) => return Some(service.clone()),
+                _ => continue,
             }
-        })
+        }
+        None
+    }
+
+    pub fn retain(&self, f: impl Fn(&str) -> bool) {
+        self.services.lock().unwrap().retain(|k, _| {
+            f(k)
+        });
     }
 }
 

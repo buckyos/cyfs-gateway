@@ -19,7 +19,7 @@ impl CyfsCmdClient {
             krpc: kRPC::kRPC::new(url.into().as_str(), token),
         }
     }
-    
+
     pub async fn get_latest_token(&self) -> Option<String> {
         self.krpc.get_session_token().await
     }
@@ -81,6 +81,12 @@ impl CyfsCmdClient {
 
     pub async fn get_connections(&self) -> CmdResult<Value> {
         let result = self.krpc.call("get_connections", Value::Null).await
+            .map_err(into_cmd_err!(CmdErrorCode::RpcError))?;
+        Ok(result)
+    }
+
+    pub async fn reload(&self) -> CmdResult<Value> {
+        let result = self.krpc.call("reload", Value::Null).await
             .map_err(into_cmd_err!(CmdErrorCode::RpcError))?;
         Ok(result)
     }

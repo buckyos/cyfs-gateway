@@ -1068,7 +1068,7 @@ impl Stack for UdpStack {
         }
 
         if config.bind.to_string() != self.inner.bind_addr {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "bind unmatch"));
+            return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
@@ -1419,10 +1419,6 @@ mod tests {
 
         fn id(&self) -> String {
             self.id.clone()
-        }
-
-        async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
-            todo!()
         }
     }
 

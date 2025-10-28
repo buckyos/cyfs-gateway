@@ -18,7 +18,7 @@ pub use stack::*;
 pub use tls_stack::*;
 pub use tls_cert_resolver::*;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum StackErrorCode {
     BindFailed,
     ProcessChainError,
@@ -35,6 +35,7 @@ pub enum StackErrorCode {
     PermissionDenied,
     ListenFailed,
     AlreadyExists,
+    BindUnmatched,
 }
 pub type StackResult<T> = sfo_result::Result<T, StackErrorCode>;
 pub type StackError = sfo_result::Error<StackErrorCode>;

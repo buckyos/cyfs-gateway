@@ -410,24 +410,6 @@ impl cyfs_gateway_lib::server::DatagramServer for ProcessChainDnsServer {
     fn id(&self) -> String {
         self.id.clone()
     }
-
-    async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
-        let config = config.as_any().downcast_ref::<DnsServerConfig>()
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid config"))?;
-
-        if config.id != self.id {
-            return Err(stack_err!(ServerErrorCode::InvalidConfig, "id unmatch"));
-        }
-
-        let resolve_cmd = Resolve::new(self.inner_dns_services.clone());
-        let (executor, _) = create_process_chain_executor(
-            &config.hook_point,
-            self.global_process_chains.clone(),
-            Some(vec![(resolve_cmd.name().to_string(), Arc::new(Box::new(resolve_cmd)))])).await
-            .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
-        *self.executor.lock().unwrap() = executor;
-        Ok(())
-    }
 }
 
 pub struct ProcessChainDnsServerFactory {

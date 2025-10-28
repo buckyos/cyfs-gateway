@@ -355,7 +355,7 @@ impl RtcpStack {
         let private_key = builder.private_key.take();
         let inner = Arc::new(RtcpStackInner::create(builder).await?);
 
-        CURRENT_DEVICE_CONFIG.set(device_config.clone());
+        let _ = CURRENT_DEVICE_CONFIG.set(device_config.clone());
 
         let rtcp = RTcp::new(device_config.id.clone(), bind_addr.clone(), private_key, Arc::new(Listener::new(inner.clone())));
         Ok(Self {
@@ -405,7 +405,7 @@ impl Stack for RtcpStack {
         }
 
         if config.bind != self.inner.bind_addr {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "bind unmatch"));
+            return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
@@ -1146,10 +1146,6 @@ mod tests {
 
         fn id(&self) -> String {
             self.id.clone()
-        }
-
-        async fn update_config(&self, _config: Arc<dyn ServerConfig>) -> ServerResult<()> {
-            todo!()
         }
     }
 

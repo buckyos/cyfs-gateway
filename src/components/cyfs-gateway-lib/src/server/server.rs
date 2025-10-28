@@ -30,6 +30,7 @@ pub trait ServerFactory: Send + Sync {
 pub struct CyfsServerFactory {
     server_factory: Mutex<HashMap<String, Arc<dyn ServerFactory>>>,
 }
+pub type CyfsServerFactoryRef = Arc<CyfsServerFactory>;
 
 impl Default for CyfsServerFactory {
     fn default() -> Self {
@@ -76,14 +77,6 @@ impl Server {
             Server::Datagram(server) => server.id(),
         }
     }
-
-    pub async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
-        match self {
-            Server::Http(server) => server.update_config(config).await,
-            Server::Stream(server) => server.update_config(config).await,
-            Server::Datagram(server) => server.update_config(config).await,
-        }
-    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -104,7 +97,6 @@ impl StreamInfo {
 pub trait StreamServer: Send + Sync {
     async fn serve_connection(&self, stream: Box<dyn AsyncStream>, info: StreamInfo) -> ServerResult<()>;
     fn id(&self) -> String;
-    async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()>;
 }
 
 #[derive(Clone)]
@@ -376,7 +368,6 @@ pub trait HttpServer: Send + Sync + 'static {
     fn id(&self) -> String;
     fn http_version(&self) -> http::Version;
     fn http3_port(&self) -> Option<u16>;
-    async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()>;
 }
 
 pub struct DatagramInfo {
@@ -395,7 +386,6 @@ impl DatagramInfo {
 pub trait DatagramServer: Send + Sync + 'static {
     async fn serve_datagram(&self, buf: &[u8], info: DatagramInfo) -> ServerResult<Vec<u8>>;
     fn id(&self) -> String;
-    async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()>;
 }
 
 pub struct ServerManager {
@@ -421,6 +411,13 @@ impl ServerManager {
         self.servers.lock().unwrap().get(name).cloned()
     }
 
+    pub fn replace_server(&self, server: Server) {
+        self.servers.lock().unwrap().insert(server.id(), server);
+    }
+
+    pub fn retain(&self, f: impl Fn(&str) -> bool) {
+        self.servers.lock().unwrap().retain(|id, _| f(id.as_str()));
+    }
 }
 
 pub type ServerManagerRef = Arc<ServerManager>;

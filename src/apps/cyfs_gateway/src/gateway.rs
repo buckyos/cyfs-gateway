@@ -11,6 +11,7 @@ use buckyos_kit::*;
 use url::Url;
 use anyhow::Result;
 use chrono::{Utc};
+use json_value_merge::Merge;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use jsonwebtoken::jwk::Jwk;
 use kRPC::RPCSessionToken;
@@ -19,7 +20,29 @@ use serde_json::Value;
 use sha2::Digest;
 use crate::cyfs_cmd_client::{cmd_err, into_cmd_err};
 use crate::cyfs_cmd_server::{CmdErrorCode, CmdResult, CyfsCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
-use crate::CYFS_CMD_SERVER_KEY;
+use crate::{GatewayConfigParser, CYFS_CMD_SERVER_CONFIG, CYFS_CMD_SERVER_KEY};
+
+pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Value> {
+    let config_dir = config_file.parent().ok_or_else(|| {
+        let msg = format!("cannot get config dir: {:?}", config_file);
+        error!("{}", msg);
+        anyhow::anyhow!(msg)
+    })?;
+
+    let config_json = buckyos_kit::ConfigMerger::load_dir_with_root(&config_dir, &config_file).await
+        .map_err(|e| {
+            let msg = format!("local config {} failed {:?}", config_file.to_string_lossy().to_string(), e);
+            error!("{}", msg);
+            anyhow::anyhow!(msg)
+        })?;
+
+    info!("Gateway config: {}", serde_json::to_string_pretty(&config_json).unwrap());
+
+    let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(CYFS_CMD_SERVER_CONFIG).unwrap();
+    cmd_config.merge(&config_json);
+
+    Ok(cmd_config)
+}
 
 //use buckyos_api::{*};
 pub struct GatewayParams {
@@ -32,9 +55,9 @@ pub struct GatewayFactory {
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
     inner_service_manager: InnerServiceManagerRef,
-    stack_factory: CyfsStackFactory,
-    server_factory: CyfsServerFactory,
-    inner_service_factory: CyfsInnerServiceFactory,
+    stack_factory: CyfsStackFactoryRef,
+    server_factory: CyfsServerFactoryRef,
+    inner_service_factory: CyfsInnerServiceFactoryRef,
     acme_mgr: CertManagerRef,
 }
 
@@ -52,9 +75,9 @@ impl GatewayFactory {
             connection_manager,
             tunnel_manager,
             inner_service_manager,
-            stack_factory: CyfsStackFactory::new(),
-            server_factory: CyfsServerFactory::new(),
-            inner_service_factory: CyfsInnerServiceFactory::new(),
+            stack_factory: Arc::new(CyfsStackFactory::new()),
+            server_factory: Arc::new(CyfsServerFactory::new()),
+            inner_service_factory: Arc::new(CyfsInnerServiceFactory::new()),
             acme_mgr,
         }
     }
@@ -92,9 +115,7 @@ impl GatewayFactory {
 
         for inner_service_config in config.inner_services.iter() {
             let services = self.inner_service_factory.create(inner_service_config.clone()).await?;
-            for service in services {
-                self.inner_service_manager.add_service(service)?;
-            }
+            self.inner_service_manager.add_service(services)?;
         }
 
         for process_chain_config in config.global_process_chains.iter() {
@@ -107,10 +128,13 @@ impl GatewayFactory {
             stack_manager,
             tunnel_manager: self.tunnel_manager.clone(),
             server_manager: self.servers.clone(),
-            inner_service_factory: self.inner_service_manager.clone(),
+            inner_service_manager: self.inner_service_manager.clone(),
             global_process_chains: self.global_process_chains.clone(),
             connection_manager: self.connection_manager.clone(),
             acme_mgr: self.acme_mgr.clone(),
+            stack_factory: self.stack_factory.clone(),
+            server_factory: self.server_factory.clone(),
+            inner_service_factory: self.inner_service_factory.clone(),
         })
     }
 }
@@ -120,10 +144,13 @@ pub struct Gateway {
     stack_manager: StackManagerRef,
     tunnel_manager: TunnelManager,
     server_manager: ServerManagerRef,
-    inner_service_factory: InnerServiceManagerRef,
+    inner_service_manager: InnerServiceManagerRef,
     global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
     acme_mgr: CertManagerRef,
+    stack_factory: CyfsStackFactoryRef,
+    server_factory: CyfsServerFactoryRef,
+    inner_service_factory: CyfsInnerServiceFactoryRef,
 }
 
 impl Drop for Gateway {
@@ -338,11 +365,10 @@ impl Gateway {
                     }
                 }
                 if let Some((index, server_config)) = server_info {
-                    if let Some(server) = self.server_manager.get_server(config_id) {
-                        server.update_config(server_config.clone()).await?;
-                        let mut config = self.config.lock().unwrap();
-                        config.servers[index] = server_config;
-                    }
+                    let new_server = self.server_factory.create(server_config.clone()).await?;
+                    self.server_manager.replace_server(new_server);
+                    let mut config = self.config.lock().unwrap();
+                    config.servers[index] = server_config;
                 }
             }
             _ => {
@@ -395,11 +421,10 @@ impl Gateway {
                     }
                 }
                 if let Some((index, server_config)) = server_info {
-                    if let Some(server) = self.server_manager.get_server(config_id) {
-                        server.update_config(server_config.clone()).await?;
-                        let mut config = self.config.lock().unwrap();
-                        config.servers[index] = server_config;
-                    }
+                    let new_server = self.server_factory.create(server_config.clone()).await?;
+                    self.server_manager.replace_server(new_server);
+                    let mut config = self.config.lock().unwrap();
+                    config.servers[index] = server_config;
                 }
             }
             _ => {
@@ -411,18 +436,132 @@ impl Gateway {
         }
         Ok(())
     }
+
+    pub async fn reload(&self, config: GatewayConfig) -> Result<()> {
+        let mut new_process_chains = HashMap::new();
+        for process_chain_config in config.global_process_chains.iter() {
+            let process_chain = Arc::new(process_chain_config.create_process_chain()?);
+            if new_process_chains.contains_key(process_chain.id()) {
+                Err(cmd_err!(
+                    ConfigErrorCode::AlreadyExists,
+                    "Duplicated process chain: {}", process_chain.id(),
+                ))?;
+            }
+            new_process_chains.insert(process_chain.id().to_string(), process_chain);
+        }
+
+        let mut new_services = HashMap::new();
+        for inner_service_config in config.inner_services.iter() {
+            let new_inner_services = self.inner_service_factory.create(inner_service_config.clone()).await?;
+            if new_inner_services.is_empty() {
+                continue;
+            }
+
+            let new_inner_service_id = new_inner_services.first().unwrap().id();
+            if new_services.contains_key(new_inner_service_id.as_str()) {
+                Err(cmd_err!(
+                    ConfigErrorCode::AlreadyExists,
+                    "Duplicated inner service: {}", new_inner_service_id,
+                ))?;
+            }
+            new_services.insert(new_inner_service_id, new_inner_services);
+        }
+
+        let mut new_servers = HashMap::new();
+        for server_config in config.servers.iter() {
+            let new_server = self.server_factory.create(server_config.clone()).await?;
+            if new_servers.contains_key(new_server.id().as_str()) {
+                Err(cmd_err!(
+                    ConfigErrorCode::AlreadyExists,
+                    "Duplicated server: {}", new_server.id(),
+                ))?;
+            }
+            new_servers.insert(new_server.id(), new_server);
+        }
+
+        self.global_process_chains.clear_process_chains();
+        for process_chain in new_process_chains.values() {
+            self.global_process_chains.add_process_chain(process_chain.clone())?;
+        }
+
+        for service in new_services.values() {
+            self.inner_service_manager.replace_service(service.clone());
+        }
+
+        for server in new_servers.values() {
+            self.server_manager.replace_server(server.clone());
+        }
+
+        for stack_config in config.stacks.iter() {
+            if let Some(stack) = self.stack_manager.get_stack(stack_config.id().as_str()) {
+                if let Err(e) = stack.update_config(stack_config.clone()).await {
+                    if e.code() == StackErrorCode::BindUnmatched {
+                        self.stack_manager.remove(stack_config.id().as_str());
+                        let new_stack = match self.stack_factory.create(stack_config.clone()).await {
+                            Ok(stack) => stack,
+                            Err(e) => {
+                                log::error!("Failed to create stack {}: {}", stack_config.id(), e);
+                                continue;
+                            }
+                        };
+                        if let Err(e) = self.stack_manager.add_stack(new_stack.clone()) {
+                            log::error!("Failed to add stack {}: {}", stack_config.id(), e);
+                        }
+                        if let Err(e) = new_stack.start().await {
+                            self.stack_manager.remove(stack_config.id().as_str());
+                            log::error!("Failed to start stack {}: {}", stack_config.id(), e);
+                        }
+                    } else {
+                        log::error!("Failed to update stack {}: {}", stack_config.id(), e);
+                    }
+                }
+            } else {
+                let new_stack = match self.stack_factory.create(stack_config.clone()).await {
+                    Ok(stack) => stack,
+                    Err(e) => {
+                        log::error!("Failed to create stack {}: {}", stack_config.id(), e);
+                        continue;
+                    }
+                };
+                if let Err(e) = self.stack_manager.add_stack(new_stack.clone()) {
+                    log::error!("Failed to add stack {}: {}", stack_config.id(), e);
+                }
+                if let Err(e) = new_stack.start().await {
+                    log::error!("Failed to start stack {}: {}", stack_config.id(), e);
+                }
+            }
+        }
+
+        self.stack_manager.retain(|id| {
+            config.stacks.iter().any(|stack| stack.id() == id)
+        });
+        self.server_manager.retain(|id| {
+            config.servers.iter().any(|server| server.id() == id)
+        });
+        self.inner_service_manager.retain(|id| {
+            config.inner_services.iter().any(|service| service.id() == id)
+        });
+        *self.config.lock().unwrap() = config;
+        Ok(())
+    }
 }
 
 pub struct GatewayCmdHandler {
     gateway: Mutex<Option<Arc<Gateway>>>,
     external_cmd_store: ExternalCmdStoreRef,
+    config_file: PathBuf,
+    parser: GatewayConfigParser,
 }
 
 impl GatewayCmdHandler {
-    pub fn new(external_cmd_store: ExternalCmdStoreRef) -> Arc<Self> {
+    pub fn new(external_cmd_store: ExternalCmdStoreRef,
+               config_file: PathBuf,
+               parser: GatewayConfigParser, ) -> Arc<Self> {
         Arc::new(Self {
             gateway: Mutex::new(None),
             external_cmd_store,
+            config_file,
+            parser,
         })
     }
 
@@ -539,6 +678,15 @@ impl CyfsCmdHandler for GatewayCmdHandler {
                     hook_point.map(|s| s.to_string()),
                     process_chain_config,
                 ).await
+                    .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))?;
+                Ok(Value::String("ok".to_string()))
+            }
+            "reload" => {
+                let gateway_config = load_config_from_file(self.config_file.as_path()).await
+                    .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))?;
+                let gateway_config = self.parser.parse(gateway_config)
+                    .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+                gateway.reload(gateway_config).await
                     .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }

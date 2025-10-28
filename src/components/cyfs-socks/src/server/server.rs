@@ -37,10 +37,6 @@ impl StreamServer for SocksServer {
     fn id(&self) -> String {
         self.proxy.id().to_string()
     }
-
-    async fn update_config(&self, _config: Arc<dyn ServerConfig>) -> ServerResult<()> {
-        todo!()
-    }
 }
 
 pub struct SocksServerFactory {

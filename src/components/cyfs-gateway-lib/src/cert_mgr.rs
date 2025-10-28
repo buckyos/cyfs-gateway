@@ -17,7 +17,7 @@ use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::Deserialize;
 use tokio::task::JoinHandle;
-use crate::{AcmeChallengeResponderRef, ChallengeType};
+use crate::{AcmeChallengeResponderRef};
 
 pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 
@@ -62,7 +62,7 @@ impl Drop for CertStubInner {
         }
     }
 }
-struct CertStub {
+pub struct CertStub {
     inner: Arc<CertStubInner>
 }
 

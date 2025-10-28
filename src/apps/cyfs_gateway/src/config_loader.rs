@@ -143,7 +143,7 @@ impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for RtcpStackCo
     }
 }
 
-pub trait ServerConfigParser<D: for<'de> Deserializer<'de>> {
+pub trait ServerConfigParser<D: for<'de> Deserializer<'de>>: Send + Sync {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>>;
 }
 

@@ -26,39 +26,14 @@ use cyfs_socks::SocksServerFactory;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-async fn service_main(config_dir: &Path, config_json: serde_json::Value, params: GatewayParams) -> Result<()> {
-    let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(CYFS_CMD_SERVER_CONFIG).unwrap();
-    cmd_config.merge(&config_json);
+async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
+    let config_json = load_config_from_file(config_file).await?;
 
-    // Load config from json
-    let parser = GatewayConfigParser::new();
-    parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
-    parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
-    parser.register_stack_config_parser("rtcp", Arc::new(RtcpStackConfigParser::new()));
-    parser.register_stack_config_parser("tls", Arc::new(TlsStackConfigParser::new()));
-    parser.register_stack_config_parser("quic", Arc::new(QuicStackConfigParser::new()));
-
-    parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
-    parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
-    parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
-
-    parser.register_inner_service_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
-    parser.register_inner_service_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
-    parser.register_inner_service_config_parser("sn", Arc::new(SNServerConfigParser::new()));
-
-    let load_result = parser.parse(cmd_config);
-    if load_result.is_err() {
-        let msg = format!("Error loading config: {}", load_result.err().unwrap().msg());
+    let config_dir = config_file.parent().ok_or_else(|| {
+        let msg = format!("cannot get config dir: {:?}", config_file);
         error!("{}", msg);
-        std::process::exit(1);
-    }
-    let config_loader = load_result.unwrap();
-
-    let connect_manager = ConnectionManager::new();
-    let tunnel_manager = TunnelManager::new();
-    let server_manager = Arc::new(ServerManager::new());
-    let global_process_chains = Arc::new(GlobalProcessChains::new());
-    let inner_service_manager = Arc::new(InnerServiceManager::new());
+        msg
+    })?;
 
     let acme_account: Option<String> = match config_json.get("acme_account") {
         Some(acme_account) => {
@@ -78,6 +53,55 @@ async fn service_main(config_dir: &Path, config_json: serde_json::Value, params:
         },
         None => None,
     };
+
+    let user_name: Option<String> = match config_json.get("user_name") {
+        Some(user_name) => {
+            match user_name.as_str() {
+                Some(user_name) => Some(user_name.to_string()),
+                None => None,
+            }
+        },
+        None => None,
+    };
+    let password: Option<String> = match config_json.get("password") {
+        Some(password) => {
+            match password.as_str() {
+                Some(password) => Some(password.to_string()),
+                None => None,
+            }
+        },
+        None => None,
+    };
+
+    // Load config from json
+    let parser = GatewayConfigParser::new();
+    parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
+    parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
+    parser.register_stack_config_parser("rtcp", Arc::new(RtcpStackConfigParser::new()));
+    parser.register_stack_config_parser("tls", Arc::new(TlsStackConfigParser::new()));
+    parser.register_stack_config_parser("quic", Arc::new(QuicStackConfigParser::new()));
+
+    parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
+    parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
+    parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
+
+    parser.register_inner_service_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
+    parser.register_inner_service_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
+    parser.register_inner_service_config_parser("sn", Arc::new(SNServerConfigParser::new()));
+
+    let load_result = parser.parse(config_json);
+    if load_result.is_err() {
+        let msg = format!("Error loading config: {}", load_result.err().unwrap().msg());
+        error!("{}", msg);
+        std::process::exit(1);
+    }
+    let config_loader = load_result.unwrap();
+
+    let connect_manager = ConnectionManager::new();
+    let tunnel_manager = TunnelManager::new();
+    let server_manager = Arc::new(ServerManager::new());
+    let global_process_chains = Arc::new(GlobalProcessChains::new());
+    let inner_service_manager = Arc::new(InnerServiceManager::new());
 
     let mut cert_config = CertManagerConfig::default();
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
@@ -145,25 +169,6 @@ async fn service_main(config_dir: &Path, config_json: serde_json::Value, params:
         global_process_chains.clone(),
     )));
 
-    let user_name: Option<String> = match config_json.get("user_name") {
-        Some(user_name) => {
-            match user_name.as_str() {
-                Some(user_name) => Some(user_name.to_string()),
-                None => None,
-            }
-        },
-        None => None,
-    };
-    let password: Option<String> = match config_json.get("password") {
-        Some(password) => {
-            match password.as_str() {
-                Some(password) => Some(password.to_string()),
-                None => None,
-            }
-        },
-        None => None,
-    };
-
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
     if !data_dir.exists() {
         create_dir_all(data_dir.clone()).await?;
@@ -176,7 +181,10 @@ async fn service_main(config_dir: &Path, config_json: serde_json::Value, params:
         create_dir_all(external_cmd_dir.clone()).await?;
     }
     let external_cmd_store = LocalExternalCmdStore::new(external_cmd_dir);
-    let handler = GatewayCmdHandler::new(Arc::new(external_cmd_store));
+    let handler = GatewayCmdHandler::new(
+        Arc::new(external_cmd_store),
+        config_file.to_path_buf(),
+        parser);
     factory.register_inner_service_factory(
         "cmd_server",
         Arc::new(CyfsCmdServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
@@ -205,7 +213,7 @@ async fn service_main(config_dir: &Path, config_json: serde_json::Value, params:
 }
 
 // Parse config first, then config file if supplied by user
-async fn load_config_from_args(matches: &clap::ArgMatches) -> Result<(PathBuf, serde_json::Value)> {
+async fn load_config_from_args(matches: &clap::ArgMatches) -> Result<(PathBuf, PathBuf, serde_json::Value)> {
     let mut default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.yaml");
     if !default_config.exists() {
         default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
@@ -226,7 +234,23 @@ async fn load_config_from_args(matches: &clap::ArgMatches) -> Result<(PathBuf, s
 
     let config_json = buckyos_kit::ConfigMerger::load_dir_with_root(&config_dir, &real_config_file).await?;
 
-    Ok((config_dir.to_path_buf(), config_json))
+    Ok((config_dir.to_path_buf(), real_config_file, config_json))
+}
+
+fn get_config_file_path(matches: &clap::ArgMatches) -> PathBuf {
+    let mut default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.yaml");
+    if !default_config.exists() {
+        default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
+    }
+    let config_file = matches.get_one::<String>("config_file");
+    let real_config_file;
+    if config_file.is_none() {
+        real_config_file = default_config;
+    } else {
+        real_config_file = PathBuf::from(config_file.unwrap());
+    }
+
+    real_config_file
 }
 
 fn generate_ed25519_key_pair_to_local() {
@@ -464,6 +488,14 @@ async fn main() {
                 .required(false)
                 .default_value(CMD_SERVER))
         )
+        .subcommand(Command::new("reload")
+            .about("reload config")
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CMD_SERVER)))
         .get_matches();
 
     match matches.subcommand() {
@@ -612,6 +644,26 @@ async fn main() {
                 }
             }
         },
+        Some(("reload", sub_matches)) => {
+            let server = sub_matches.get_one::<String>("server").unwrap();
+            let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.reload().await {
+                Ok(result) => {
+                    println!("{}", result.to_string());
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("reload error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {}
     }
 
@@ -619,16 +671,8 @@ async fn main() {
     init_logging("cyfs_gateway",true);
     info!("cyfs_gateway start...");
 
-    let (config_dir, config_json) = load_config_from_args(&matches)
-        .await
-        .map_err(|e| {
-            error!("Error loading config: {}", e);
-            std::process::exit(1);
-        })
-        .unwrap();
+    let config_file = get_config_file_path(&matches);
 
-    //let config_json : Value = config_json.unwrap();
-    info!("Gateway config: {}", serde_json::to_string_pretty(&config_json).unwrap());
 
     if matches.get_flag("debug") {
         info!("Debug mode enabled");
@@ -645,7 +689,7 @@ async fn main() {
             .collect(),
     };
 
-    if let Err(e) = service_main(config_dir.as_path(), config_json, params).await {
+    if let Err(e) = service_main(config_file.as_path(), params).await {
         error!("Gateway run error: {}", e);
     }
 

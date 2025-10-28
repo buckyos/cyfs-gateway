@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::collections::HashMap;
 use std::future::poll_fn;
 use std::io;
 use std::io::Read;
@@ -20,10 +19,8 @@ use hyper::body::{Body, Buf, Bytes, Frame};
 use pin_project::pin_project;
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use quinn::Incoming;
-use rustls::{server, sign, Error, ServerConfig};
-use rustls::client::verify_server_name;
-use rustls::pki_types::{DnsName, ServerName};
-use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
+use rustls::{ServerConfig};
+use rustls::server::{ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use sfo_io::{LimitRead, LimitWrite, SfoSpeedStat, SimpleAsyncWrite, SimpleAsyncWriteHolder, SpeedTracker, StatStream};
 use tokio::io::{AsyncRead, ReadBuf, Take};
@@ -31,7 +28,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_stream_external_commands, CertManagerRef, AcmeCertResolverRef};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_stream_external_commands, AcmeCertResolverRef};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 use crate::stack::stream_forward;
@@ -1014,7 +1011,7 @@ impl Stack for QuicStack {
         }
 
         if config.bind.to_string() != self.inner.bind_addr {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "bind unmatch"));
+            return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
         let (executor, _) = create_process_chain_executor(
@@ -1435,10 +1432,6 @@ mod tests {
 
         fn id(&self) -> String {
             self.id.clone()
-        }
-
-        async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
-            todo!()
         }
     }
     #[derive(Debug)]
