@@ -36,18 +36,18 @@ stacks:
             block: |
               return "server main_dns";
 
-  - id: test5
-    bind: 0.0.0.0:2980
-    protocol: rtcp
-    key_path: ./rootfs/etc/device.key.pem
-    device_config_path: ./rootfs/etc/device.doc.json
-    hook_point:
-      - id: main
-        priority: 1
-        blocks:
-          - id: default
-            block: |
-              reject;
+#  - id: test5
+#    bind: 0.0.0.0:2980
+#    protocol: rtcp
+#    key_path: ./rootfs/etc/device.key.pem
+#    device_config_path: ./rootfs/etc/device.doc.json
+#    hook_point:
+#      - id: main
+#        priority: 1
+#        blocks:
+#          - id: default
+#            block: |
+#              reject;
 #
 #  - bind: 0.0.0.0:8083
 #    protocol: tls

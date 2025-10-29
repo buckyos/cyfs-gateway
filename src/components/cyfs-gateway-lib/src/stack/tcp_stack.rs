@@ -1,7 +1,7 @@
-#[cfg(unix)]
-use super::{get_socket_opt, has_root_privileges, set_socket_opt, sockaddr_to_socket_addr, stream_forward, Stack};
-#[cfg(windows)]
 use super::{stream_forward, Stack};
+
+#[cfg(target_os = "linux")]
+use super::{get_socket_opt, has_root_privileges, set_socket_opt, sockaddr_to_socket_addr};
 
 use super::StackResult;
 use crate::global_process_chains::{
@@ -179,7 +179,8 @@ impl TcpStackInner {
     }
 
     fn get_dest_addr(stream: &TcpStream) -> StackResult<SocketAddr> {
-        #[cfg(target_os = "linux")] {
+        #[cfg(target_os = "linux")]
+        {
             let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let ret = crate::stack::get_socket_opt(
                 stream,

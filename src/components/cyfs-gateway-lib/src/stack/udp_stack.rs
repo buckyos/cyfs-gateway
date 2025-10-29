@@ -881,7 +881,7 @@ impl UdpStackInner {
                         };
                         (len, addr, dest_addr)
                     };
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                #[cfg(not(target_os = "linux"))]
                 let (len, src_addr, dest_addr) = {
                     let (len, addr) = match udp_socket.recv_from(&mut buffer).await {
                         Ok(pair) => pair,

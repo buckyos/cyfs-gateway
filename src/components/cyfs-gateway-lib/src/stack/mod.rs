@@ -103,7 +103,7 @@ pub(crate) async fn copy_datagram_bidirectional(a: Box<dyn DatagramClientBox>, b
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn sockaddr_to_socket_addr(addr: &libc::sockaddr_storage) -> std::io::Result<std::net::SocketAddr> {
     unsafe {
         match (*addr).ss_family as i32 {
@@ -133,7 +133,7 @@ pub(crate) fn sockaddr_to_socket_addr(addr: &libc::sockaddr_storage) -> std::io:
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn set_socket_opt<T: AsRawFd, V>(
     socket: &T,
     level: libc::c_int,
@@ -158,7 +158,7 @@ pub(crate) fn set_socket_opt<T: AsRawFd, V>(
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn get_socket_opt<T: AsRawFd, V>(
     socket: &T,
     level: libc::c_int,
@@ -267,7 +267,7 @@ pub(crate) fn recv_from<T: AsRawFd>(
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn has_root_privileges() -> bool {
     // 获取当前进程的有效用户ID (EUID)
     let euid: libc::uid_t = unsafe { libc::geteuid() };
