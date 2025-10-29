@@ -184,7 +184,7 @@ pub(crate) fn get_socket_opt<T: AsRawFd, V>(
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn get_destination_addr(msg: &libc::msghdr) -> Option<libc::sockaddr_storage> {
     unsafe {
         let mut cmsg: *mut libc::cmsghdr = libc::CMSG_FIRSTHDR(msg);
@@ -222,7 +222,7 @@ fn get_destination_addr(msg: &libc::msghdr) -> Option<libc::sockaddr_storage> {
     None
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub(crate) fn recv_from<T: AsRawFd>(
     socket: &T,
     buf: &mut [u8]

@@ -98,7 +98,7 @@ impl TcpStackInner {
             .map_err(into_stack_err!(StackErrorCode::IoError, "create socket error"))?;
 
         socket.set_nonblocking(true).map_err(into_stack_err!(StackErrorCode::IoError, "set nonblocking error"))?;
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             if self.transparent {
                 if !has_root_privileges() {
@@ -137,6 +137,7 @@ impl TcpStackInner {
         let std_listener = unsafe {
             std::net::TcpListener::from_raw_socket(socket.into_raw_socket())
         };
+
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(into_stack_err!(StackErrorCode::BindFailed))?;
         let this = self.clone();
@@ -178,7 +179,7 @@ impl TcpStackInner {
     }
 
     fn get_dest_addr(stream: &TcpStream) -> StackResult<SocketAddr> {
-        #[cfg(unix)] {
+        #[cfg(target_os = "linux")] {
             let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
             let ret = crate::stack::get_socket_opt(
                 stream,

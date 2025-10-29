@@ -18,7 +18,7 @@ use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, P
 use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, get_min_priority, DatagramInfo};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use crate::stack::{has_root_privileges, recv_from, set_socket_opt};
 
 pub struct UdpSendDatagram {
@@ -286,7 +286,7 @@ impl SocketCache {
                 .map_err(into_stack_err!(StackErrorCode::IoError, "create socket error"))?;
 
             socket.set_nonblocking(true).map_err(into_stack_err!(StackErrorCode::IoError, "set nonblocking error"))?;
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             {
                 socket.set_reuse_address(true)
                     .map_err(into_stack_err!(StackErrorCode::IoError, "set reuse address error"))?;
@@ -787,7 +787,7 @@ impl UdpStackInner {
             .map_err(into_stack_err!(StackErrorCode::IoError, "create socket error"))?;
 
         socket.set_nonblocking(true).map_err(into_stack_err!(StackErrorCode::IoError, "set nonblocking error"))?;
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             if self.transparent {
                 if !has_root_privileges() {
@@ -852,7 +852,7 @@ impl UdpStackInner {
             loop {
                 let permit = semaphore.clone().acquire_owned().await.unwrap();
                 let mut buffer = vec![0u8; 1024 * 2];
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 let (len, src_addr, dest_addr) =
                     if this.transparent {
                         match udp_socket.async_io(tokio::io::Interest::READABLE, || {
@@ -881,7 +881,7 @@ impl UdpStackInner {
                         };
                         (len, addr, dest_addr)
                     };
-                #[cfg(windows)]
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 let (len, src_addr, dest_addr) = {
                     let (len, addr) = match udp_socket.recv_from(&mut buffer).await {
                         Ok(pair) => pair,
