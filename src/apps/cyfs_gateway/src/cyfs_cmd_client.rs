@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use chrono::Utc;
-use serde::Deserialize;
 use serde_json::Value;
 pub use sfo_result::err as cmd_err;
 pub use sfo_result::into_err as into_cmd_err;

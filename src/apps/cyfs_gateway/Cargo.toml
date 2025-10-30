@@ -41,6 +41,7 @@ cyfs-warp = { path= "../../components/cyfs-warp"}
 cyfs-sn = { path = "../../components/cyfs-sn" }
 cyfs-dns = { path = "../../components/cyfs-dns" }
 cyfs-socks = { path = "../../components/cyfs-socks" }
+cyfs-tun = { path = "../../components/cyfs-tun"}
 http-body-util = "0.1.3"
 http = "1.3.1"
 

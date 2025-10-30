@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Deserializer, Serialize};
 use cyfs_dns::{DnsServerConfig, LocalDnsConfig};
+use cyfs_tun::TunStackConfig;
 //use buckyos_api::ZONE_PROVIDER;
 
 pub trait StackConfigParser<D: for<'de> Deserializer<'de>>: Send + Sync {
@@ -140,6 +141,25 @@ impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for RtcpStackCo
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
         Ok(Arc::new(rtcp_config))
+    }
+}
+
+pub struct TunStackConfigParser {}
+
+impl TunStackConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for TunStackConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
+        let tun_config = TunStackConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid tun stack config: {}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap())
+            )?;
+        Ok(Arc::new(tun_config))
     }
 }
 

@@ -8,5 +8,5 @@ members = [
     "components/cyfs-gateway-lib",
     "components/cyfs-sn",
 
-    "apps/cyfs_gateway",
+    "apps/cyfs_gateway", "components/cyfs-tun",
 ]

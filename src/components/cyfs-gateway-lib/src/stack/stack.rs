@@ -1,18 +1,50 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use as_any::AsAny;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::{stack_err, ProcessChainConfig, StackErrorCode, StackResult};
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Copy, Hash)]
-#[serde(rename_all = "lowercase")]
+#[derive(PartialEq, Eq, Debug, Clone, Hash)]
 pub enum StackProtocol {
     Tcp,
     Udp,
     Quic,
     Rtcp,
     Tls,
-    Extension(u8),
+    Extension(String),
+}
+
+impl Serialize for StackProtocol {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            StackProtocol::Tcp => "tcp",
+            StackProtocol::Udp => "udp",
+            StackProtocol::Quic => "quic",
+            StackProtocol::Rtcp => "rtcp",
+            StackProtocol::Tls => "tls",
+            StackProtocol::Extension(name) => name.as_str(),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for StackProtocol {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "tcp" => Ok(StackProtocol::Tcp),
+            "udp" => Ok(StackProtocol::Udp),
+            "quic" => Ok(StackProtocol::Quic),
+            "rtcp" => Ok(StackProtocol::Rtcp),
+            "tls" => Ok(StackProtocol::Tls),
+            _ => Ok(StackProtocol::Extension(s)),
+        }
+    }
 }
 
 pub trait StackConfig: AsAny + Send + Sync {

@@ -23,6 +23,7 @@ use url::Url;
 use cyfs_gateway::*;
 use cyfs_sn::SNServerFactory;
 use cyfs_socks::SocksServerFactory;
+use cyfs_tun::TunStackFactory;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -80,6 +81,7 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
     parser.register_stack_config_parser("rtcp", Arc::new(RtcpStackConfigParser::new()));
     parser.register_stack_config_parser("tls", Arc::new(TlsStackConfigParser::new()));
     parser.register_stack_config_parser("quic", Arc::new(QuicStackConfigParser::new()));
+    parser.register_stack_config_parser("tun", Arc::new(TunStackConfigParser::new()));
 
     parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
     parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
@@ -149,6 +151,12 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
         resolver.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
+        server_manager.clone(),
+        global_process_chains.clone(),
+        connect_manager.clone(),
+        tunnel_manager.clone(),
+    )));
+    factory.register_stack_factory(StackProtocol::Extension("tun".to_string()), Arc::new(TunStackFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
         connect_manager.clone(),

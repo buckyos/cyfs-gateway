@@ -1695,10 +1695,6 @@ mod tests {
         fn id(&self) -> String {
             self.id.clone()
         }
-
-        async fn update_config(&self, config: Arc<dyn ServerConfig>) -> ServerResult<()> {
-            todo!()
-        }
     }
 
     #[tokio::test]

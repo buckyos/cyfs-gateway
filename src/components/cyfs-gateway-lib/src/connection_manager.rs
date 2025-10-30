@@ -89,7 +89,7 @@ impl ConnectionInfo {
     }
 
     pub fn protocol(&self) -> StackProtocol {
-        self.protocol
+        self.protocol.clone()
     }
 
     pub fn get_upload_speed(&self) -> u64 {

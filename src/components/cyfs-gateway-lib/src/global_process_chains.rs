@@ -121,7 +121,7 @@ pub async fn create_process_chain_executor(
 }
 
 
-pub(crate) async fn execute_stream_chain(executor: ProcessChainLibExecutor, request: StreamRequest) -> ConfigResult<(CommandResult, Box<dyn AsyncStream>)> {
+pub async fn execute_stream_chain(executor: ProcessChainLibExecutor, request: StreamRequest) -> ConfigResult<(CommandResult, Box<dyn AsyncStream>)> {
     let request_map = StreamRequestMap::new(request);
     let chain_env = executor.chain_env();
     request_map.register(&chain_env)

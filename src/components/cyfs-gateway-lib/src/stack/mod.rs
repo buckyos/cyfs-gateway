@@ -17,9 +17,11 @@ pub use quic_stack::*;
 pub use stack::*;
 pub use tls_stack::*;
 pub use tls_cert_resolver::*;
+pub use limiter::*;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum StackErrorCode {
+    Failed,
     BindFailed,
     ProcessChainError,
     InvalidConfig,
@@ -44,7 +46,7 @@ pub use sfo_result::err as stack_err;
 use url::Url;
 use crate::{DatagramClientBox, TunnelManager};
 
-pub(crate) async fn stream_forward(mut stream: Box<dyn AsyncStream>, target: &str, tunnel_manager: &TunnelManager) -> StackResult<()> {
+pub async fn stream_forward(mut stream: Box<dyn AsyncStream>, target: &str, tunnel_manager: &TunnelManager) -> StackResult<()> {
     let url = Url::parse(target).map_err(into_stack_err!(
                                     StackErrorCode::InvalidConfig,
                                     "invalid forward url {}",
@@ -61,7 +63,7 @@ pub(crate) async fn stream_forward(mut stream: Box<dyn AsyncStream>, target: &st
     Ok(())
 }
 
-pub(crate) async fn datagram_forward(datagram: Box<dyn DatagramClientBox>, target: &str, tunnel_manager: &TunnelManager) -> StackResult<()> {
+pub async fn datagram_forward(datagram: Box<dyn DatagramClientBox>, target: &str, tunnel_manager: &TunnelManager) -> StackResult<()> {
     let url = Url::parse(&target).map_err(into_stack_err!(
                                     StackErrorCode::InvalidConfig,
                                     "invalid forward url {}",
@@ -75,7 +77,7 @@ pub(crate) async fn datagram_forward(datagram: Box<dyn DatagramClientBox>, targe
     Ok(())
 }
 
-pub(crate) async fn copy_datagram_bidirectional(a: Box<dyn DatagramClientBox>, b: Box<dyn DatagramClientBox>) -> Result<(), std::io::Error> {
+pub async fn copy_datagram_bidirectional(a: Box<dyn DatagramClientBox>, b: Box<dyn DatagramClientBox>) -> Result<(), std::io::Error> {
     let recv = {
         let a = a.clone();
         let b = b.clone();
