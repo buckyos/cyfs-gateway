@@ -167,8 +167,8 @@ impl TunStackInner {
             ip: builder.ip.unwrap(),
             mask: builder.mask.unwrap(),
             mtu: builder.mtu.unwrap_or(DEFAULT_MTU),
-            tcp_timeout: 0,
-            udp_timeout: 0,
+            tcp_timeout: builder.tcp_timeout,
+            udp_timeout: builder.udp_timeout,
             servers: builder.servers.unwrap(),
             executor: Arc::new(Mutex::new(executor)),
             connection_manager: builder.connection_manager,
@@ -231,8 +231,8 @@ impl TunStackInner {
                     Ok(stream) => {
                         match stream {
                             IpStackStream::Tcp(stream) => {
-                                let src_addr = stream.peer_addr();
-                                let dest_addr = stream.local_addr();
+                                let dest_addr = stream.peer_addr();
+                                let src_addr = stream.local_addr();
                                 let stat_stream = StatStream::new(stream);
                                 let speed = stat_stream.get_speed_stat();
                                 let stack = this.clone();
@@ -251,8 +251,8 @@ impl TunStackInner {
                                 }
                             }
                             IpStackStream::Udp(stream) => {
-                                let src_addr = stream.peer_addr();
-                                let dest_addr = stream.local_addr();
+                                let dest_addr = stream.peer_addr();
+                                let src_addr = stream.local_addr();
                                 let stat_stream = StatStream::new(stream);
                                 let speed = stat_stream.get_speed_stat();
                                 let stack = this.clone();
@@ -296,10 +296,11 @@ impl TunStackInner {
             self.executor.lock().unwrap().fork()
         };
         let servers = self.servers.clone();
-        let remote_addr = stream.raw_stream().peer_addr();
-        let dest_addr = stream.raw_stream().local_addr();
+        let remote_addr = stream.raw_stream().local_addr();
+        let dest_addr = stream.raw_stream().peer_addr();
         let mut request = StreamRequest::new(Box::new(stream), dest_addr);
         request.source_addr = Some(remote_addr);
+        request.dest_port = dest_addr.port();
         request.app_protocol = Some("tcp".to_string());
         let (ret, stream) = execute_stream_chain(executor, request)
             .await
@@ -378,11 +379,13 @@ impl TunStackInner {
             self.executor.lock().unwrap().fork()
         };
         let servers = self.servers.clone();
-        let remote_addr = stream.raw_stream().peer_addr();
-        let dest_addr = stream.raw_stream().local_addr();
+        let remote_addr = stream.raw_stream().local_addr();
+        let dest_addr = stream.raw_stream().peer_addr();
 
         let map = MemoryMapCollection::new_ref();
         map.insert("dest_addr", CollectionValue::String(dest_addr.to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_port", CollectionValue::String(dest_addr.port().to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -492,8 +495,8 @@ impl TunStackBuilder {
             ip: None,
             mask: None,
             mtu: None,
-            tcp_timeout: 30,
-            udp_timeout: 30,
+            tcp_timeout: 60,
+            udp_timeout: 60,
             hook_point: None,
             servers: None,
             global_process_chains: None,
@@ -640,8 +643,8 @@ impl StackFactory for TunStackFactory {
             .ip(config.bind)
             .mask(config.mask.unwrap_or(IpAddr::from([255, 255, 255, 0])))
             .mtu(config.mtu.unwrap_or(1500))
-            .tcp_timeout(config.tcp_timeout.unwrap_or(30))
-            .udp_timeout(config.udp_timeout.unwrap_or(30))
+            .tcp_timeout(config.tcp_timeout.unwrap_or(60))
+            .udp_timeout(config.udp_timeout.unwrap_or(60))
             .hook_point(config.hook_point.clone())
             .servers(self.servers.clone())
             .global_process_chains(self.global_process_chains.clone())
