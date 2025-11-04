@@ -1,7 +1,7 @@
 use std::io::Error;
 use std::sync::Arc;
 use buckyos_kit::AsyncStream;
-use name_client::{DnsProvider, NsProvider};
+use name_client::{resolve_ip, DnsProvider, NsProvider};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::ClientConfig;
 use rustls_platform_verifier::BuilderVerifierExt;
@@ -36,15 +36,11 @@ impl Tunnel for QuicTunnel {
         let client_config =
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
 
-        let dns_provider = DnsProvider::new(None);
-        let name_info = dns_provider.query(dest_host.as_ref().unwrap().as_str(), None, None).await
+        let ip = resolve_ip(dest_host.as_ref().unwrap().as_str()).await
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-        if name_info.address.len() == 0 {
-            return Err(Error::new(std::io::ErrorKind::Other, "dns query no ip"));
-        }
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
         endpoint.set_default_client_config(client_config);
-        let connecting = endpoint.connect(format!("{}:{}", name_info.address[0].to_string(), dest_port).parse().unwrap(),
+        let connecting = endpoint.connect(format!("{}:{}", ip.to_string(), dest_port).parse().unwrap(),
                                           dest_host.as_ref().unwrap().as_str()).map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
         let connection = connecting.await.map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
         let (send, recv) = connection.open_bi().await.map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;

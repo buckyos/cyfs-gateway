@@ -455,17 +455,18 @@ async fn main() {
                 .short('y')
                 .help("Chain type")
                 .required(true))
-            .arg(Arg::new("chain_params")
-                .long("chain_params")
-                .short('p')
-                .help("Chain params")
-                .required(false))
             .arg(Arg::new("server")
                 .long("server")
                 .short('s')
                 .help("server url")
                 .required(false)
-                .default_value(CMD_SERVER)))
+                .default_value(CMD_SERVER))
+            .arg(Arg::new("chain_params")
+                .help("Chain params") // 接受一个或多个值
+                .num_args(1..)
+                .value_delimiter(None) // 禁用分隔符解析，保持参数原样
+                .last(true)     // 确保此参数必须放在最后
+                .required(false)))
         .subcommand(Command::new("del_chain")
             .about("Delete a chain")
             .arg(Arg::new("config_type")
@@ -632,10 +633,10 @@ async fn main() {
             let chain_id = sub_matches.get_one::<String>("chain_id").expect("chain_id is required");
             let chain_type = sub_matches.get_one::<String>("chain_type").expect("chain_type is required");
             let hook_point = sub_matches.get_one::<String>("hook_point").expect("hook_point is required");
-            let chain_params = sub_matches.get_one::<String>("chain_params").expect("chain_config is required");
+            let chain_params = sub_matches.get_many::<String>("chain_params").expect("chain_params is required");
             let server = sub_matches.get_one::<String>("server").expect("server is required");
             let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), read_login_token(server.as_str()));
-            match cyfs_cmd_client.add_chain(config_type, config_id, hook_point, chain_id, chain_type, chain_params).await {
+            match cyfs_cmd_client.add_chain(config_type, config_id, hook_point, chain_id, chain_type, chain_params.map(|s| s.clone()).collect::<Vec<_>>().join(" ").as_str()).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
