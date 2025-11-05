@@ -7,6 +7,7 @@ members = [
     "components/cyfs-socks",
     "components/cyfs-gateway-lib",
     "components/cyfs-sn",
-
-    "apps/cyfs_gateway", "components/cyfs-tun",
+    "apps/cyfs_gateway",
+    "components/cyfs-tun",
+    "components/cyfs-acme",
 ]

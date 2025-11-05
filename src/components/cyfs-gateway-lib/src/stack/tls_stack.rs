@@ -1,11 +1,10 @@
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands, ACME_TLS_ALPN_NAME, AcmeCertResolverRef};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::io::{BufReader, Cursor};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -17,6 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use crate::stack::{stream_forward};
 use serde::{Deserialize, Serialize};
+use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType, ACME_TLS_ALPN_NAME};
 use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
 
@@ -25,16 +25,16 @@ pub async fn load_certs(path: &str) -> StackResult<Vec<CertificateDer<'static>>>
         .await
         .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
     let mut reader = BufReader::new(Cursor::new(file_content));
-    Ok(certs(&mut reader)
-        .map_err(|_| {
+    let mut certs = vec![];
+    for cert in rustls_pemfile::certs(&mut reader) {
+        certs.push(cert.map_err(|_| {
             stack_err!(
                 StackErrorCode::InvalidTlsCert,
                 "failed to parse certificates"
             )
-        })?
-        .into_iter()
-        .map(|v| CertificateDer::from(v))
-        .collect())
+        })?);
+    }
+    Ok(certs)
 }
 
 pub async fn load_key(path: &str) -> StackResult<PrivateKeyDer<'static>> {
@@ -44,13 +44,16 @@ pub async fn load_key(path: &str) -> StackResult<PrivateKeyDer<'static>> {
         path
     ))?;
     let mut reader = BufReader::new(Cursor::new(file_content));
-    let keys = pkcs8_private_keys(&mut reader).map_err(|_| {
-        stack_err!(
+    let mut keys = vec![];
+    for key in rustls_pemfile::pkcs8_private_keys(&mut reader) {
+        keys.push(key.map_err(|_| {
+            stack_err!(
             StackErrorCode::InvalidTlsKey,
             "failed to parse private key, file:{}",
             path
         )
-    })?;
+        })?);
+    }
 
     if keys.is_empty() {
         return Err(stack_err!(
@@ -127,7 +130,7 @@ impl TlsStackInner {
                                                           Some(get_stream_external_commands())).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let crypto_provider = rustls::crypto::ring::default_provider();
-        let external_resolver = config.acme_resolver.clone().map(|v| v.clone() as Arc<dyn ResolvesServerCert>);
+        let external_resolver = config.acme_manager.clone().map(|v| v.clone() as Arc<dyn ResolvesServerCert>);
         let cert_resolver = Arc::new(ResolvesServerCertUsingSni::new(external_resolver));
         for cert_config in config.certs.into_iter() {
             if cert_config.certs.is_some() && cert_config.key.is_some() {
@@ -136,8 +139,11 @@ impl TlsStackInner {
                 cert_resolver.add(&cert_config.domain, cert_key)
                     .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "add cert failed"))?;
             } else {
-                if config.acme_resolver.is_some() {
-                    config.acme_resolver.as_ref().unwrap().add_acme_request(cert_config.domain)
+                if config.acme_manager.is_some() {
+                    config.acme_manager.as_ref().unwrap()
+                        .add_acme_item(AcmeItem::new(cert_config.domain,
+                                                     cert_config.acme_type.unwrap_or(ChallengeType::TlsAlpn01),
+                                                     cert_config.data))
                         .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
                 }
             }
@@ -382,8 +388,10 @@ impl Stack for TlsStack {
 
 pub struct TlsDomainConfig {
     pub domain: String,
+    pub acme_type: Option<ChallengeType>,
     pub certs: Option<Vec<CertificateDer<'static>>>,
     pub key: Option<PrivateKeyDer<'static>>,
+    pub data: Option<serde_json::Value>,
 }
 
 // 为TlsDomainConfig实现Clone trait
@@ -391,6 +399,7 @@ impl Clone for TlsDomainConfig {
     fn clone(&self) -> Self {
         Self {
             domain: self.domain.clone(),
+            acme_type: self.acme_type.clone(),
             certs: self.certs.clone(),
             key: match &self.key {
                 None => None,
@@ -399,6 +408,7 @@ impl Clone for TlsDomainConfig {
                 Some(PrivateKeyDer::Sec1(key)) => Some(PrivateKeyDer::Sec1(key.clone_key())),
                 Some(_) => panic!("Unsupported key type"),
             },
+            data: self.data.clone(),
         }
     }
 }
@@ -448,7 +458,7 @@ pub struct TlsStackFactory {
     global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
-    acme_resolver: AcmeCertResolverRef,
+    acme_manager: AcmeCertManagerRef,
 }
 
 impl TlsStackFactory {
@@ -457,14 +467,14 @@ impl TlsStackFactory {
         global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
-        acme_resolver: AcmeCertResolverRef,
+        acme_manager: AcmeCertManagerRef,
     ) -> Self {
         Self {
             servers,
             global_process_chains,
             connection_manager,
             tunnel_manager,
-            acme_resolver,
+            acme_manager,
         }
     }
 }
@@ -484,14 +494,18 @@ impl crate::StackFactory for TlsStackFactory {
                 let key = load_key(cert_config.key_file.as_ref().unwrap().as_str()).await?;
                 cert_list.push(TlsDomainConfig {
                     domain: cert_config.domain.clone(),
+                    acme_type: None,
                     certs: Some(certs),
                     key: Some(key),
+                    data: None,
                 });
             } else {
                 cert_list.push(TlsDomainConfig {
                     domain: cert_config.domain.clone(),
+                    acme_type: cert_config.acme_type,
                     certs: None,
                     key: None,
+                    data: cert_config.data.clone(),
                 });
             }
         }
@@ -507,7 +521,7 @@ impl crate::StackFactory for TlsStackFactory {
             .concurrency(config.concurrency.unwrap_or(0))
             .tunnel_manager(self.tunnel_manager.clone())
             .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec!["http/1.1".to_string()]).iter().map(|s| s.as_bytes().to_vec()).collect())
-            .acme_resolver(self.acme_resolver.clone())
+            .acme_manager(self.acme_manager.clone())
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -525,7 +539,7 @@ pub struct TlsStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: Option<TunnelManager>,
     alpn_protocols: Vec<Vec<u8>>,
-    acme_resolver: Option<AcmeCertResolverRef>,
+    acme_manager: Option<AcmeCertManagerRef>,
 }
 
 impl TlsStackBuilder {
@@ -541,7 +555,7 @@ impl TlsStackBuilder {
             connection_manager: None,
             tunnel_manager: None,
             alpn_protocols: vec![],
-            acme_resolver: None,
+            acme_manager: None,
         }
     }
 
@@ -597,8 +611,8 @@ impl TlsStackBuilder {
         self
     }
 
-    pub fn acme_resolver(mut self, acme_resolver: AcmeCertResolverRef) -> Self {
-        self.acme_resolver = Some(acme_resolver);
+    pub fn acme_manager(mut self, acme_resolver: AcmeCertManagerRef) -> Self {
+        self.acme_manager = Some(acme_resolver);
         self
     }
 
@@ -612,9 +626,9 @@ impl TlsStackBuilder {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, InnerServiceManager, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo, CertManagerConfig, CertManager, AcmeCertResolver};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, InnerServiceManager, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo};
     use crate::{TlsDomainConfig, TlsStack};
-    use buckyos_kit::{get_buckyos_service_data_dir, AsyncStream};
+    use buckyos_kit::{AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use rcgen::generate_simple_self_signed;
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -630,6 +644,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::TlsConnector;
+    use cyfs_acme::{AcmeCertManager, CertManagerConfig};
 
     #[tokio::test]
     async fn test_tls_stack_creation() {
@@ -662,10 +677,12 @@ mod tests {
             .hook_point(vec![])
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der()),
                 )),
+                data: None,
             }])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .tunnel_manager(TunnelManager::new())
@@ -697,10 +714,12 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der()),
                 )),
+                data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
@@ -754,10 +773,12 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der()),
                 )),
+                data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
@@ -813,10 +834,12 @@ mod tests {
             .connection_manager(connection_manager.clone())
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der()),
                 )),
+                data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
@@ -894,10 +917,12 @@ mod tests {
             .connection_manager(connection_manager.clone())
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der()),
                 )),
+                data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
@@ -1033,10 +1058,12 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der()),
                 )),
+                data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
@@ -1117,10 +1144,12 @@ mod tests {
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der()),
                 )),
+                data: None,
             }])
             .tunnel_manager(TunnelManager::new())
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
@@ -1216,10 +1245,12 @@ mod tests {
             .hook_point(chains)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
+                acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der()),
                 )),
+                data: None,
             }])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .tunnel_manager(TunnelManager::new())
@@ -1274,15 +1305,14 @@ mod tests {
         let mut cert_config = CertManagerConfig::default();
         let data_dir = tempfile::tempdir().unwrap();
         cert_config.keystore_path = data_dir.path().to_string_lossy().to_string();
-        let cert_manager = CertManager::create(cert_config).await.unwrap();
-        let resolver = AcmeCertResolver::new(cert_manager.clone());
+        let cert_manager = AcmeCertManager::create(cert_config).await.unwrap();
 
         let factory = TlsStackFactory::new(
             Arc::new(ServerManager::new()),
             Arc::new(GlobalProcessChains::new()),
             ConnectionManager::new(),
             TunnelManager::new(),
-            resolver,
+            cert_manager,
         );
 
         let config = TlsStackConfig {

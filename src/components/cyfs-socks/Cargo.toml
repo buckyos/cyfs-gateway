@@ -7,8 +7,8 @@ authors = ["BuckyOS DAO","@lurenpluto"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-boa_engine = "*"
-boa_runtime  = "*"
+boa_engine = "0.20"
+boa_runtime = "0.20"
 url = "*"
 thiserror = "*"
 async-trait = "*"

@@ -384,6 +384,7 @@ pub type ConfigResult<T> = sfo_result::Result<T, ConfigErrorCode>;
 pub type ConfigError = sfo_result::Error<ConfigErrorCode>;
 pub use sfo_result::err as config_err;
 pub use sfo_result::into_err as into_config_err;
+use cyfs_acme::ChallengeType;
 use cyfs_process_chain::{Block, BlockParser, ProcessChain};
 use crate::{StackProtocol};
 
@@ -454,10 +455,14 @@ pub enum CertType {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct StackCertConfig {
     pub domain: String,
+    pub acme_type: Option<ChallengeType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cert_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_file: Option<String>,
+    #[serde(flatten)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

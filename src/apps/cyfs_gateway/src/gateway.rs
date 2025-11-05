@@ -58,7 +58,7 @@ pub struct GatewayFactory {
     stack_factory: CyfsStackFactoryRef,
     server_factory: CyfsServerFactoryRef,
     inner_service_factory: CyfsInnerServiceFactoryRef,
-    acme_mgr: CertManagerRef,
+    acme_mgr: AcmeCertManagerRef,
 }
 
 impl GatewayFactory {
@@ -68,7 +68,7 @@ impl GatewayFactory {
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
         inner_service_manager: InnerServiceManagerRef,
-        acme_mgr: CertManagerRef, ) -> Self {
+        acme_mgr: AcmeCertManagerRef, ) -> Self {
         Self {
             servers,
             global_process_chains,
@@ -147,7 +147,7 @@ pub struct Gateway {
     inner_service_manager: InnerServiceManagerRef,
     global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
-    acme_mgr: CertManagerRef,
+    acme_mgr: AcmeCertManagerRef,
     stack_factory: CyfsStackFactoryRef,
     server_factory: CyfsServerFactoryRef,
     inner_service_factory: CyfsInnerServiceFactoryRef,

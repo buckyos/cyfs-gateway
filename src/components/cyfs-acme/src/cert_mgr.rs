@@ -9,15 +9,18 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::task;
 use log::*;
-use crate::acme_client::{AcmeClient, AcmeOrderSession, AcmeAccount};
+use crate::acme_client::{AcmeClient, AcmeOrderSession, AcmeAccount, AcmeChallengeResponderRef};
 use openssl::x509::X509;
 use std::sync::Mutex;
 use std::time::Duration;
+use boa_engine::{Context, JsString, JsValue, Source};
 use rustls::crypto::ring::sign::any_supported_type;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use serde::Deserialize;
+use rustls::pki_types::{PrivateKeyDer};
+use rustls::sign;
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
-use crate::{AcmeChallengeResponderRef};
+use crate::{Challenge, ChallengeData, ChallengeType};
+use crate::default_challenge_responder::DefaultChallengeResponder;
 
 pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 
@@ -44,7 +47,7 @@ struct CertMutPart {
 }
 
 struct CertStubInner {
-    domains: Vec<String>,
+    acme_item: AcmeItem,
     keystore_path: String,
     acme_client: AcmeClient,
     responder: AcmeChallengeResponderRef,
@@ -54,7 +57,7 @@ struct CertStubInner {
 
 impl Drop for CertStubInner {
     fn drop(&mut self) {
-        debug!("drop CertStubInner, stub: {:#?}", self.domains);
+        debug!("drop CertStubInner, stub: {:#?}", self.acme_item);
         if let Some(handle) = self.handle.lock().unwrap().take() {
             if !handle.is_finished() {
                 handle.abort();
@@ -77,21 +80,21 @@ impl Clone for CertStub {
 
 impl std::fmt::Display for CertStub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CertStub domains: {}", self.inner.domains.join(","))
+        write!(f, "CertStub domains: {:?}", self.inner.acme_item)
     }
 }
 
 
 impl CertStub {
     fn new(
-        domains: Vec<String>,
+        acme_item: AcmeItem,
         keystore_path: String,
         acme_client: AcmeClient,
         responder: AcmeChallengeResponderRef,
     ) -> Self {
         Self {
             inner: Arc::new(CertStubInner {
-                domains,
+                acme_item,
                 keystore_path,
                 acme_client,
                 responder,
@@ -105,13 +108,25 @@ impl CertStub {
     }
 
     fn create_certified_key(cert_data: &[u8], key_data: &[u8]) -> Result<CertifiedKey> {
-        let cert_chain = vec![rustls_pemfile::certs(&mut &*cert_data)?.remove(0)];
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(rustls_pemfile::pkcs8_private_keys(&mut &*key_data)?.remove(0)));
+        let mut cert_chain = vec![];
+        for cert in rustls_pemfile::certs(&mut &*cert_data) {
+            cert_chain.push(cert?);
+        }
+
+        let mut keys = vec![];
+        for key in rustls_pemfile::pkcs8_private_keys(&mut &*key_data) {
+            keys.push(key?);
+        }
+
+        if keys.is_empty() {
+            return Err(anyhow::anyhow!("No private key found"));
+        }
+
+        let key = PrivateKeyDer::Pkcs8(keys.remove(0));
 
         let signing_key = any_supported_type(&key)
             .map_err(|e| anyhow::anyhow!("Invalid private key: {}", e))?;
 
-        let cert_chain = cert_chain.into_iter().map(|v| CertificateDer::from(v)).collect();
         Ok(CertifiedKey::new(cert_chain, signing_key))
     }
 
@@ -255,7 +270,7 @@ impl CertStub {
 
     async fn order_inner(&self) -> Result<(CertifiedKey, chrono::DateTime<chrono::Utc>)> {
         let order = AcmeOrderSession::new(
-            self.inner.domains.clone(),
+            vec![self.inner.acme_item.domain.clone()],
             self.inner.acme_client.clone(),
             self.inner.responder.clone()
         );
@@ -318,19 +333,45 @@ impl CertStub {
     }
 }
 
-pub struct CertManager {
+#[derive(Clone, Debug)]
+pub struct AcmeItem {
+    domain: String,
+    challenge_type: ChallengeType,
+    data: Option<serde_json::Value>,
+}
+
+impl AcmeItem {
+    pub fn new(domain: String, challenge_type: ChallengeType, data: Option<serde_json::Value>) -> Self {
+        Self {
+            domain,
+            challenge_type,
+            data,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct DnsProvider {
+    pub dns_provider: String,
+}
+
+pub struct AcmeCertManager {
     config: CertManagerConfig,
     acme_client: AcmeClient,
     certs: RwLock<HashMap<String, CertStub>>,
     check_handler: Mutex<Option<JoinHandle<()>>>,
+    responder: Mutex<Option<AcmeChallengeResponderRef>>,
+    challenge_certs: Mutex<HashMap<String, Arc<sign::CertifiedKey>>>,
+    http_challenges: Mutex<HashMap<String, (String, String)>>,
 }
-pub type CertManagerRef = Arc<CertManager>;
+pub type AcmeCertManagerRef = Arc<AcmeCertManager>;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CertManagerConfig {
     pub account: Option<String>,
     pub acme_server: String,
     pub keystore_path: String,
+    pub dns_provider_path: Option<String>,
     #[serde(default = "default_check_interval")]
     pub check_interval: chrono::Duration,     // 检查证书的时间间隔
     #[serde(default = "default_renew_before_expiry")]
@@ -351,19 +392,20 @@ impl Default for CertManagerConfig {
             account: None,
             acme_server: "https://acme-v02.api.letsencrypt.org/directory".to_string(),
             keystore_path: String::new(),
+            dns_provider_path: None,
             check_interval: default_check_interval(),
             renew_before_expiry: default_renew_before_expiry(),
         }
     }
 }
 
-impl std::fmt::Display for CertManager {
+impl std::fmt::Display for AcmeCertManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "CertManager")
     }
 }
 
-impl Drop for CertManager {
+impl Drop for AcmeCertManager {
     fn drop(&mut self) {
         debug!("drop cert manager, {}", self);
         let mut check_handler = self.check_handler.lock().unwrap();
@@ -373,8 +415,8 @@ impl Drop for CertManager {
     }
 }
 
-impl CertManager {
-    pub async fn create(config: CertManagerConfig) -> Result<CertManagerRef> {
+impl AcmeCertManager {
+    pub async fn create(config: CertManagerConfig) -> Result<AcmeCertManagerRef> {
         info!("create cert manager, config: {:?}", config);
 
         if !Path::new(config.keystore_path.as_str()).exists() {
@@ -435,8 +477,15 @@ impl CertManager {
             acme_client,
             certs: RwLock::new(HashMap::new()),
             check_handler: Mutex::new(None),
+            responder: Mutex::new(None),
+            challenge_certs: Mutex::new(Default::default()),
+            http_challenges: Mutex::new(Default::default()),
         });
 
+        {
+            let mut responder = manager.responder.lock().unwrap();
+            *responder = Some(Arc::new(DefaultChallengeResponder::new(manager.clone())));
+        }
         // 启动定期检查任务
         {
             let weak_manager = Arc::downgrade(&manager);
@@ -460,8 +509,8 @@ impl CertManager {
         Ok(manager)
     }
 
-    pub fn insert_config(&self, host: String, responder: AcmeChallengeResponderRef) -> Result<()> {
-        let keystore_path = buckyos_kit::path_join(&self.config.keystore_path, &sanitize_path_component(&host));
+    pub fn add_acme_item(&self, item: AcmeItem) -> Result<()> {
+        let keystore_path = buckyos_kit::path_join(&self.config.keystore_path, &sanitize_path_component(&item.domain));
         if !keystore_path.exists() {
             if let Err(e) = std::fs::create_dir_all(&keystore_path) {
                 error!("Failed to create certificate storage directory: {} {}", e, keystore_path.to_str().unwrap());
@@ -469,13 +518,21 @@ impl CertManager {
             }
         }
 
+        let responder = {
+            self.responder.lock().unwrap().clone().unwrap()
+        };
+        let mut certs = self.certs.write().unwrap();
+        if certs.contains_key(&item.domain) {
+            return Ok(());
+        }
+        let domain = item.domain.clone();
         let cert_stub = CertStub::new(
-            vec![host.clone()],
+            item,
             keystore_path.to_str().unwrap().to_string(),
             self.acme_client.clone(),
             responder,
         );
-        self.certs.write().unwrap().insert(host, cert_stub.clone());
+        certs.insert(domain, cert_stub.clone());
         cert_stub.load_cert();
         Ok(())
     }
@@ -510,16 +567,163 @@ impl CertManager {
         }
         Ok(())
     }
+
+    pub(crate) async fn respond_challenge<'a>(&self, challenges: &'a [Challenge]) -> anyhow::Result<&'a Challenge> {
+        for challenge in challenges {
+            let cert_stub = {
+                let certs = self.certs.read().unwrap();
+                certs.get(challenge.domain.as_str()).cloned()
+            };
+            if cert_stub.is_none() {
+                continue;
+            }
+            let cert_stub = cert_stub.unwrap();
+
+            match challenge.data {
+                ChallengeData::TlsAlpn01 { ref cert } => {
+                    if cert_stub.inner.acme_item.challenge_type == ChallengeType::TlsAlpn01 {
+                        let mut challenge_certs = self.challenge_certs.lock().unwrap();
+                        challenge_certs.insert(challenge.domain.clone(), cert.clone());
+                        return Ok(challenge);
+                    } else {
+                        continue;
+                    }
+                },
+                ChallengeData::Dns01 { token: _, ref key_hash } => {
+                    if cert_stub.inner.acme_item.challenge_type == ChallengeType::Dns01 {
+                        self.call_dns_provider(&cert_stub, key_hash.as_str(), "add_challenge").await?;
+                    } else {
+                        continue;
+                    }
+                },
+                ChallengeData::Http01 { ref token, ref key_auth } => {
+                    if cert_stub.inner.acme_item.challenge_type == ChallengeType::Http01 {
+                        let mut http_challenges = self.http_challenges.lock().unwrap();
+                        http_challenges.insert(challenge.domain.clone(), (token.clone(), key_auth.clone()));
+                    } else {
+                        continue;
+                    }
+                }
+            }
+        }
+        Err(anyhow::anyhow!("no challenge responder"))
+    }
+
+    pub(crate) fn revert_challenge(self: &Arc<Self>, challenge: &Challenge) {
+        match challenge.data {
+            ChallengeData::TlsAlpn01 { cert: _ } => {
+                let mut challenge_certs = self.challenge_certs.lock().unwrap();
+                challenge_certs.remove(&challenge.domain);
+            },
+            ChallengeData::Dns01 { token: _, ref key_hash } => {
+                let cert_stub = {
+                    let certs = self.certs.read().unwrap();
+                    certs.get(challenge.domain.as_str()).cloned()
+                };
+                if cert_stub.is_none() {
+                    return;
+                }
+                let cert_stub = cert_stub.unwrap();
+                let key_hash = key_hash.to_string();
+                let this = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = this.call_dns_provider(&cert_stub, key_hash.as_str(), "del_challenge").await {
+                        error!("revert challenge failed: {}", e);
+                    }
+                });
+            },
+            ChallengeData::Http01 { token: _, key_auth: _ } => {
+                let mut http_challenges = self.http_challenges.lock().unwrap();
+                http_challenges.remove(&challenge.domain);
+            }
+        }
+    }
+
+    async fn call_dns_provider(&self, cert_stub: &CertStub, key_hash: &str, op: &str) -> Result<()> {
+        if self.config.dns_provider_path.is_none() {
+            return Err(anyhow::anyhow!("dns challenge provider path is none"));
+        }
+        if cert_stub.inner.acme_item.data.is_none() {
+            return Err(anyhow::anyhow!("dns challenge provider params is empty"));
+        }
+        let provider_data = cert_stub.inner.acme_item.data.clone().unwrap();
+        let provider: DnsProvider = serde_json::from_value(provider_data.clone())
+            .map_err(|e| anyhow::anyhow!("parse plugin data {} failed: {}", serde_json::to_string(&provider_data).unwrap_or("".to_string()), e))?;
+        let provider_path = Path::new(self.config.dns_provider_path.as_ref().unwrap())
+            .join(format!("{}", provider.dns_provider))
+            .join("main.js");
+        if !provider_path.exists() {
+            return Err(anyhow::anyhow!("dns challenge plugin {} not exists", provider_path.to_str().unwrap()));
+        }
+
+        let domain = if cert_stub.inner.acme_item.domain.starts_with("*.") {
+            format!("_acme-challenge{}", &cert_stub.inner.acme_item.domain[1..])
+        } else {
+            format!("_acme-challenge.{}", cert_stub.inner.acme_item.domain)
+        };
+
+        let key_hash = key_hash.to_string();
+        let op = op.to_string();
+        tokio::task::spawn_blocking(move || {
+            let source = Source::from_filepath(provider_path.as_path())
+                .map_err(|e| anyhow::anyhow!("load dns challenge plugin {} failed: {}", provider_path.to_str().unwrap(), e))?;
+            let mut context = Context::default();
+            boa_runtime::register(
+                (
+                    boa_runtime::extensions::ConsoleExtension::default(),
+                    boa_runtime::extensions::FetchExtension(
+                        boa_runtime::fetch::BlockingReqwestFetcher::default()
+                    ),
+                ),
+                None,
+                &mut context,
+            ).map_err(|e| anyhow::anyhow!("init boa runtime failed: {}", e))?;
+
+            let domain = JsValue::from(JsString::from(domain));
+            let key_hash = JsValue::from(JsString::from(key_hash));
+            let provider = JsValue::from_json(&provider_data, &mut context)
+                .map_err(|e| anyhow::anyhow!("parse plugin data {} failed: {}", serde_json::to_string(&provider_data).unwrap_or("".to_string()), e))?;
+
+            match context.eval(source) {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(anyhow::anyhow!("eval dns challenge plugin {} failed: {}", provider_path.to_str().unwrap(), e));
+                }
+            }
+            let add_challenge = context.global_object().get(JsString::from(op.clone()), &mut context)
+                .map_err(|e| anyhow::anyhow!("can't find {op} failed: {}", e))?;
+            if let Some(add_challenge) = add_challenge.as_callable() {
+                let result = add_challenge.call(&JsValue::null(), &[provider, domain, key_hash], &mut context)
+                    .map_err(|e| anyhow::anyhow!("call {op} failed: {}", e))?;
+                if result.is_boolean() && result.as_boolean().unwrap() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("add_challenge failed"))
+                }
+            } else {
+                Err(anyhow::anyhow!("add_challenge is not callable"))
+            }
+        }).await.map_err(|e| anyhow::anyhow!("spawn block failed: {}", e))?
+    }
 }
 
-impl std::fmt::Debug for CertManager {
+impl std::fmt::Debug for AcmeCertManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "CertManager")
     }
 }
 
-impl ResolvesServerCert for CertManager {
+impl ResolvesServerCert for AcmeCertManager {
     fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        if is_tls_alpn_challenge(&client_hello) {
+            let challenge_certs = self.challenge_certs.lock().unwrap();
+            return if let Some(server_name) = client_hello.server_name() {
+                challenge_certs.get(server_name).cloned()
+            } else {
+                None
+            };
+        }
+
         let server_name = client_hello.server_name().unwrap_or("").to_string();
         let cert_stub = self.get_cert_by_host(&server_name);
         if cert_stub.is_some() {

@@ -107,14 +107,15 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
 
     let mut cert_config = CertManagerConfig::default();
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+    let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
     cert_config.keystore_path = data_dir.to_string_lossy().to_string();
     cert_config.account = acme_account;
+    cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
     if acme_server.is_some() {
         cert_config.acme_server = acme_server.unwrap();
     }
 
-    let cert_manager = CertManager::create(cert_config).await?;
-    let resolver = AcmeCertResolver::new(cert_manager.clone());
+    let cert_manager = AcmeCertManager::create(cert_config).await?;
 
     let factory = GatewayFactory::new(
         server_manager.clone(),
@@ -122,7 +123,7 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
         connect_manager.clone(),
         tunnel_manager.clone(),
         inner_service_manager.clone(),
-        cert_manager
+        cert_manager.clone()
     );
     factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
         server_manager.clone(),
@@ -141,14 +142,14 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
         global_process_chains.clone(),
         connect_manager.clone(),
         tunnel_manager.clone(),
-        resolver.clone(),
+        cert_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
         connect_manager.clone(),
         tunnel_manager.clone(),
-        resolver.clone(),
+        cert_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
         server_manager.clone(),

@@ -16,7 +16,6 @@ serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "*"
 toml = "*"
 thiserror = "*"
-reqwest = {version = "*", features = ["json", "rustls-tls"]}
 x25519-dalek = { version = "*", features = ["static_secrets","getrandom"] }
 ed25519-dalek = { version = "*", features = ["rand_core"] }
 ed25519_to_curve25519 = "*"
@@ -34,10 +33,9 @@ base64 = "*"
 hyper = { version = "1.6", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"]}
 http-body-util ="0.1"
-openssl = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = "0.26.1"
-rustls-pemfile = "1.0"
+rustls-pemfile = "2.0"
 ring = "0.17"
 tokio-socks = "*"
 libsocks_client = "*"
@@ -66,6 +64,7 @@ name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "
 name-lib = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-lib" }
 ndn-lib = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "ndn-lib" }
 cyfs-process-chain = { path = "../cyfs-process-chain" }
+cyfs-acme = { path = "../cyfs-acme" }
 pin-project = "1.1.10"
 #buckyos-api = { path = "../../kernel/buckyos-api" }
 
