@@ -302,7 +302,7 @@ impl TlsStackInner {
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
                                     }
-                                    Server::Datagram(_) => {
+                                    _ => {
                                         return Err(stack_err!(StackErrorCode::InvalidConfig, "unsupported server type"));
                                     }
                                 }

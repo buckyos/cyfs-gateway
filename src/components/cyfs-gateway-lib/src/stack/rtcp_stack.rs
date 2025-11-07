@@ -171,10 +171,10 @@ impl RtcpStackInner {
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
                                     }
-                                    Server::Datagram(_) => {
+                                    _ => {
                                         return Err(stack_err!(
                                             StackErrorCode::InvalidConfig,
-                                            "datagram server {server_name} not support"
+                                            "unsupported server type {server_name}"
                                         ));
                                     }
                                 }
@@ -250,18 +250,6 @@ impl RtcpStackInner {
                             let server_name = list[1].as_str();
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
-                                    Server::Http(_) => {
-                                        return Err(stack_err!(
-                                            StackErrorCode::InvalidConfig,
-                                            "http server {server_name} not support"
-                                        ));
-                                    }
-                                    Server::Stream(_) => {
-                                        return Err(stack_err!(
-                                            StackErrorCode::InvalidConfig,
-                                            "stream server {server_name} not support"
-                                        ));
-                                    }
                                     Server::Datagram(server) => {
                                         let datagram_stream = AsyncStreamWithDatagram::new(stream);
                                         let mut buf = vec![0; 4096];
@@ -273,6 +261,12 @@ impl RtcpStackInner {
                                             datagram_stream.send_datagram(resp.as_slice()).await
                                                 .map_err(into_stack_err!(StackErrorCode::IoError, "send datagram error"))?;
                                         }
+                                    }
+                                    _ => {
+                                        return Err(stack_err!(
+                                            StackErrorCode::InvalidConfig,
+                                            "unsupported server type {server_name}"
+                                        ));
                                     }
                                 }
                             }

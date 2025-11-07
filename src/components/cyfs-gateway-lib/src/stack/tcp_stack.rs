@@ -273,10 +273,10 @@ impl TcpStackInner {
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
                                     }
-                                    Server::Datagram(_) => {
+                                    _ => {
                                         return Err(stack_err!(
                                             StackErrorCode::InvalidConfig,
-                                            "datagram server {server_name} not support"
+                                            "unsupported server type {server_name}"
                                         ));
                                     }
                                 }

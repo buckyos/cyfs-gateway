@@ -302,7 +302,7 @@ impl TunStackInner {
         request.source_addr = Some(remote_addr);
         request.dest_port = dest_addr.port();
         request.app_protocol = Some("tcp".to_string());
-        let (ret, stream) = execute_stream_chain(executor, request)
+        let (ret, mut stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         if ret.is_control() {
@@ -340,7 +340,7 @@ impl TunStackInner {
                                 ));
                             }
                             let limiter = Limiter::new(None, None);
-                            let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
+                            let mut stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
 
                             let server_name = list[1].as_str();
                             if let Some(server) = servers.get_server(server_name) {
@@ -355,10 +355,14 @@ impl TunStackInner {
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
                                     }
-                                    Server::Datagram(_) => {
+                                    Server::QA(server) => {
+                                        serve_qa_from_stream(Box::new(stream), server, StreamInfo::new(remote_addr.to_string())).await
+                                            .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
+                                    }
+                                    _  => {
                                         return Err(stack_err!(
                                             StackErrorCode::InvalidConfig,
-                                            "datagram server {server_name} not support"
+                                            "unsupported server type {server_name}"
                                         ));
                                     }
                                 }
@@ -436,18 +440,6 @@ impl TunStackInner {
                             let server_name = list[1].as_str();
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
-                                    Server::Http(_) => {
-                                        return Err(stack_err!(
-                                            StackErrorCode::InvalidConfig,
-                                            "http server {server_name} not support"
-                                        ));
-                                    }
-                                    Server::Stream(_) => {
-                                        return Err(stack_err!(
-                                            StackErrorCode::InvalidConfig,
-                                            "stream server {server_name} not support"
-                                        ));
-                                    }
                                     Server::Datagram(server) => {
                                         let datagram_stream = TunDatagramClient::new(stream);
                                         let mut buf = vec![0; 4096];
@@ -459,6 +451,12 @@ impl TunStackInner {
                                             datagram_stream.send_datagram(resp.as_slice()).await
                                                 .map_err(into_stack_err!(StackErrorCode::IoError, "send datagram error"))?;
                                         }
+                                    }
+                                    _ => {
+                                        return Err(stack_err!(
+                                            StackErrorCode::InvalidConfig,
+                                            "Unsupport server type"
+                                        ));
                                     }
                                 }
                             }

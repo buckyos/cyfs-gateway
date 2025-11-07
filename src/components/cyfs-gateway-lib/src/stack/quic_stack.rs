@@ -888,7 +888,7 @@ impl QuicStackInner {
                                             }
                                         }
                                     }
-                                    Server::Datagram(_) => {
+                                    _ => {
                                         return Err(stack_err!(
                                             StackErrorCode::InvalidConfig,
                                             "Unsupport server type"
