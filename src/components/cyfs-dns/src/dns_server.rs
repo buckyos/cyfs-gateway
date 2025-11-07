@@ -551,7 +551,9 @@ A = ["192.168.1.106"]
         let inner_services = Arc::new(InnerServiceManager::new());
         let dns_server = LocalDns::create("local_dns".to_string(), local_dns.path().to_string_lossy().to_string());
         assert!(dns_server.is_ok());
-        inner_services.add_service(InnerService::DnsService(Arc::new(dns_server.unwrap())));
+        let dns_server = dns_server.unwrap();
+        let server_vec = vec![InnerService::DnsService(Arc::new(dns_server))];
+        inner_services.add_service(server_vec);
 
         let config = r#"
 type: dns
@@ -717,7 +719,9 @@ A = ["192.168.1.106"]
         let inner_services = Arc::new(InnerServiceManager::new());
         let dns_server = LocalDns::create("local_dns".to_string(), local_dns.path().to_string_lossy().to_string());
         assert!(dns_server.is_ok());
-        inner_services.add_service(InnerService::DnsService(Arc::new(dns_server.unwrap())));
+        let dns_server = dns_server.unwrap();
+        let server_vec = vec![InnerService::DnsService(Arc::new(dns_server))];
+        inner_services.add_service(server_vec);
 
         let config = r#"
 type: dns
