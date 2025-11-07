@@ -77,7 +77,7 @@ impl CollectionValue {
         matches!(self, CollectionValue::String(_))
     }
 
-    pub fn as_ref(&self) -> CollectionValueRef {
+    pub fn as_ref(&self) -> CollectionValueRef<'_> {
         match self {
             CollectionValue::String(s) => CollectionValueRef::String(s.as_str()),
             CollectionValue::Set(s) => CollectionValueRef::Set(s),

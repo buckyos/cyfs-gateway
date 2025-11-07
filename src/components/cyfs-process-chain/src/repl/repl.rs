@@ -262,7 +262,7 @@ impl ProcessChainREPL {
 
         // Translate the block
         let linker =
-            BlockCommandLinker::new(self.parser_context.clone(), COMMAND_PARSER_FACTORY.clone());
+            BlockCommandLinker::new(self.parser_context.clone(), COMMAND_PARSER_FACTORY.clone(), EXTERNAL_COMMAND_FACTORY.clone());
         if let Err(e) = linker.link(&mut item).await {
             let msg = format!("Translate block error: {}, {}", line, e);
             error!("{}", msg);

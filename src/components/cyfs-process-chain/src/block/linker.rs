@@ -1,17 +1,26 @@
 use super::block::{Block, CommandArg, CommandItem, Expression};
 use super::exec::BlockExecuter;
 use crate::chain::{Context, ParserContextRef};
-use crate::cmd::{CommandParserFactory};
+use crate::cmd::{CommandParserFactory, ExternalCommandFactory};
 use crate::collection::CollectionValue;
 
 pub struct BlockCommandLinker {
     context: ParserContextRef,
     parser: CommandParserFactory,
+    external_factory: ExternalCommandFactory,
 }
 
 impl BlockCommandLinker {
-    pub fn new(context: ParserContextRef, parser: CommandParserFactory) -> Self {
-        Self { context, parser }
+    pub fn new(
+        context: ParserContextRef,
+        parser: CommandParserFactory,
+        external_factory: ExternalCommandFactory,
+    ) -> Self {
+        Self {
+            context,
+            parser,
+            external_factory,
+        }
     }
 
     pub async fn link(&self, block: &mut Block) -> Result<(), String> {
@@ -45,11 +54,32 @@ impl BlockCommandLinker {
 
     fn link_command(&self, cmd: &mut CommandItem) -> Result<(), String> {
         // debug!("Linking command: {:?}", cmd.command);
-        let parser = self.parser.get_parser(&cmd.command.name);
+        let mut parser = self.parser.get_parser(&cmd.command.name);
         if parser.is_none() {
-            let msg = format!("No parser for command: {}", cmd.command.name);
-            error!("{}", msg);
-            return Err(msg);
+            // Check if it's a external command
+            if self
+                .external_factory
+                .get_command(&cmd.command.name)
+                .is_some()
+            {
+                info!(
+                    "Command '{}' is an external command, using 'call' parser",
+                    cmd.command.name
+                );
+                // It's an external command without 'call' keyword
+                cmd.command
+                    .args
+                    .push_front(CommandArg::Literal("call".to_string()));
+                cmd.command.name = "call".to_string();
+                
+                parser = self.parser.get_parser("call");
+            }
+
+            if parser.is_none() {
+                let msg = format!("No parser for command: {}", cmd.command.name);
+                error!("{}", msg);
+                return Err(msg);
+            }
         }
 
         // Recursively link the command arguments
@@ -79,7 +109,6 @@ impl BlockCommandLinker {
                 Err(msg)
             }
         }
-
     }
 }
 

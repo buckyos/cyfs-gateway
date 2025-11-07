@@ -171,6 +171,10 @@ impl CommandArgs {
         Self(args)
     }
 
+    pub fn push_front(&mut self, arg: CommandArg) {
+        self.0.insert(0, arg);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

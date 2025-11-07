@@ -1,5 +1,6 @@
 use crate::block::*;
 use crate::cmd::COMMAND_PARSER_FACTORY;
+use crate::cmd::{EXTERNAL_COMMAND_FACTORY, ExternalCommandFactory, ExternalCommandRef};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -54,7 +55,11 @@ impl ProcessChain {
     pub async fn link(&mut self, context: &ParserContextRef) -> Result<(), String> {
         info!("Linking process chain: {}", self.id);
 
-        let linker = BlockCommandLinker::new(context.clone(), COMMAND_PARSER_FACTORY.clone());
+        let linker = BlockCommandLinker::new(
+            context.clone(),
+            COMMAND_PARSER_FACTORY.clone(),
+            EXTERNAL_COMMAND_FACTORY.clone(),
+        );
         // Link each block in the chain
         for block in &mut self.blocks {
             linker.link(block).await?;
@@ -65,8 +70,6 @@ impl ProcessChain {
 }
 
 pub type ProcessChainRef = Arc<ProcessChain>;
-
-use crate::cmd::{EXTERNAL_COMMAND_FACTORY, ExternalCommandFactory, ExternalCommandRef};
 
 pub struct ParserContext {
     external_commands: ExternalCommandFactory,
