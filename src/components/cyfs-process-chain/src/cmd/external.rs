@@ -1,8 +1,8 @@
 use super::cmd::*;
-use crate::block::{CommandArgs, CommandArg};
+use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
 use crate::collection::CollectionValue;
-use crate::js::AsyncJavaScriptCommandExecutor;
+use crate::js::{AsyncJavaScriptCommandExecutor, AsyncJavaScriptCommandExecutorRef};
 use clap::{Arg, Command};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,14 +28,14 @@ pub type ExternalCommandRef = Arc<Box<dyn ExternalCommand>>;
 #[derive(Clone)]
 pub struct ExternalCommandFactory {
     commands: Arc<Mutex<HashMap<String, ExternalCommandRef>>>,
-    js_command_executor: AsyncJavaScriptCommandExecutor,
+    js_command_executor: AsyncJavaScriptCommandExecutorRef,
 }
 
 impl ExternalCommandFactory {
     pub fn new() -> Self {
         Self {
             commands: Arc::new(Mutex::new(HashMap::new())),
-            js_command_executor: AsyncJavaScriptCommandExecutor::new(),
+            js_command_executor: Arc::new(AsyncJavaScriptCommandExecutor::new()),
         }
     }
 
@@ -86,10 +86,13 @@ impl ExternalCommandFactory {
 
     pub fn finalize(&self) {
         self.js_command_executor.stop();
-        
+
         // Clear all commands
         let mut commands = self.commands.lock().unwrap();
-        info!("Unregistering all external commands, count: {}", commands.len());
+        info!(
+            "Unregistering all external commands, count: {}",
+            commands.len()
+        );
         commands.clear();
     }
 }
@@ -145,7 +148,7 @@ impl CommandParser for ExternalCommandParser {
     fn group(&self) -> CommandGroup {
         CommandGroup::External
     }
-    
+
     fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
         command_help(help_type, &self.cmd)
     }
@@ -156,7 +159,6 @@ impl CommandParser for ExternalCommandParser {
         str_args: Vec<&str>,
         args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-       
         let matches = self
             .cmd
             .clone()
@@ -177,10 +179,7 @@ impl CommandParser for ExternalCommandParser {
 
         // Ensure the command argument is a literal string
         if !cmd.is_literal() {
-            let msg = format!(
-                "Command must be a string, got: {:?}",
-                cmd
-            );
+            let msg = format!("Command must be a string, got: {:?}", cmd);
             error!("{}", msg);
             return Err(msg);
         }
@@ -192,10 +191,10 @@ impl CommandParser for ExternalCommandParser {
             msg
         })?;
 
-        let args= match matches.index_of("command") {
+        let args = match matches.index_of("command") {
             Some(index) => {
                 let args = args.as_slice().get(index..).unwrap();
-                 CommandArgs::new(args.to_owned())
+                CommandArgs::new(args.to_owned())
             }
             None => CommandArgs::new_empty(),
         };
@@ -203,8 +202,7 @@ impl CommandParser for ExternalCommandParser {
         // Check the command arguments
         command.check(&args)?;
 
-        let executor =
-            ExternalCommandExecutor::new(cmd.to_owned(), command.clone(), args);
+        let executor = ExternalCommandExecutor::new(cmd.to_owned(), command.clone(), args);
         Ok(Arc::new(Box::new(executor)))
     }
 }
@@ -217,11 +215,7 @@ pub struct ExternalCommandExecutor {
 }
 
 impl ExternalCommandExecutor {
-    pub fn new(
-        name: String,
-        command: ExternalCommandRef,
-        args: CommandArgs,
-    ) -> Self {
+    pub fn new(name: String, command: ExternalCommandRef, args: CommandArgs) -> Self {
         Self {
             name,
             command,
@@ -233,14 +227,13 @@ impl ExternalCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for ExternalCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
-        let args = CommandArg::evaluate_list(
-            &self.args,
-            context,
-        ).await.map_err(|e| {
-            let msg = format!("Failed to evaluate command arguments: {}", e);
-            error!("{}", msg);
-            msg
-        })?;
+        let args = CommandArg::evaluate_list(&self.args, context)
+            .await
+            .map_err(|e| {
+                let msg = format!("Failed to evaluate command arguments: {}", e);
+                error!("{}", msg);
+                msg
+            })?;
 
         // Execute the command with the provided arguments
         let ret = self

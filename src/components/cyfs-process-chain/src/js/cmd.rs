@@ -136,13 +136,13 @@ thread_local! {
     static COMMANDS: RefCell<HashMap<String, JavaScriptExternalCommand>> = RefCell::new(HashMap::new());
 }
 
-#[derive(Clone)]
 pub struct AsyncJavaScriptCommandExecutor {
     sender: Arc<OnceCell<AsyncRequestSenderRef>>,
 }
 
 impl Drop for AsyncJavaScriptCommandExecutor {
     fn drop(&mut self) {
+        info!("Dropping AsyncJavaScriptCommandExecutor...");
         // Stop the executor when it is dropped
         self.stop();
     }
@@ -336,6 +336,8 @@ impl AsyncJavaScriptCommandExecutor {
         });
     }
 }
+
+pub type AsyncJavaScriptCommandExecutorRef = Arc<AsyncJavaScriptCommandExecutor>;
 
 pub struct AsyncJavaScriptExternalCommand {
     name: String,

@@ -58,7 +58,6 @@ impl ProcessChain {
         let linker = BlockCommandLinker::new(
             context.clone(),
             COMMAND_PARSER_FACTORY.clone(),
-            EXTERNAL_COMMAND_FACTORY.clone(),
         );
         // Link each block in the chain
         for block in &mut self.blocks {
@@ -82,12 +81,17 @@ impl ParserContext {
         }
     }
 
+    pub fn get_external_command_factory(&self) -> &ExternalCommandFactory {
+        &self.external_commands
+    }
+
     pub fn register_external_command(
         &self,
         name: &str,
         command: ExternalCommandRef,
     ) -> Result<(), String> {
         // First check if the command already exists in global factory
+        // Local commands should not override global commands to avoid confusion 
         if EXTERNAL_COMMAND_FACTORY.get_command(name).is_some() {
             let msg = format!("External command '{}' already exists in global", name);
             error!("{}", msg);
@@ -98,6 +102,7 @@ impl ParserContext {
     }
 
     pub fn get_external_command(&self, name: &str) -> Option<ExternalCommandRef> {
+        // First lookup in local factory in current env
         if let Some(cmd) = self.external_commands.get_command(name) {
             return Some(cmd);
         }

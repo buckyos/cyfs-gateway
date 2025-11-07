@@ -1,26 +1,17 @@
 use super::block::{Block, CommandArg, CommandItem, Expression};
 use super::exec::BlockExecuter;
 use crate::chain::{Context, ParserContextRef};
-use crate::cmd::{CommandParserFactory, ExternalCommandFactory};
+use crate::cmd::CommandParserFactory;
 use crate::collection::CollectionValue;
 
 pub struct BlockCommandLinker {
     context: ParserContextRef,
     parser: CommandParserFactory,
-    external_factory: ExternalCommandFactory,
 }
 
 impl BlockCommandLinker {
-    pub fn new(
-        context: ParserContextRef,
-        parser: CommandParserFactory,
-        external_factory: ExternalCommandFactory,
-    ) -> Self {
-        Self {
-            context,
-            parser,
-            external_factory,
-        }
+    pub fn new(context: ParserContextRef, parser: CommandParserFactory) -> Self {
+        Self { context, parser }
     }
 
     pub async fn link(&self, block: &mut Block) -> Result<(), String> {
@@ -58,8 +49,8 @@ impl BlockCommandLinker {
         if parser.is_none() {
             // Check if it's a external command
             if self
-                .external_factory
-                .get_command(&cmd.command.name)
+                .context
+                .get_external_command(&cmd.command.name)
                 .is_some()
             {
                 info!(
@@ -71,7 +62,7 @@ impl BlockCommandLinker {
                     .args
                     .push_front(CommandArg::Literal("call".to_string()));
                 cmd.command.name = "call".to_string();
-                
+
                 parser = self.parser.get_parser("call");
             }
 

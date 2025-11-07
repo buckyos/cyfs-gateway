@@ -117,6 +117,7 @@ const PROCESS_CHAIN: &str = r#"
             call check_host "www.buckyos1.com" && reject;
             echo "\$get request url: ${REQ_url} \n ${PROTOCOL}";
             echo $(call add 1 2);
+            echo $(add 1 2);
             local key1 = "value1";
             delete key1;
             echo $(eq $key1 "");
@@ -411,7 +412,7 @@ async fn test_hook_point() -> Result<(), String> {
 #[tokio::test]
 async fn test_process_chain_main() {
     TermLogger::init(
-        LevelFilter::Debug,
+        LevelFilter::Info,
         Config::default(),
         TerminalMode::Mixed,
         ColorChoice::Auto,
