@@ -525,7 +525,6 @@ mod tests {
         // Step 1: Initialize a new NamedDataMgr in a temporary directory and create a test object
         let temp_dir = tempfile::tempdir().unwrap();
         let config = NamedDataMgrConfig {
-            local_store: temp_dir.path().to_str().unwrap().to_string(),
             local_cache: None,
             mmap_cache_dir: None,
         };
@@ -610,11 +609,11 @@ mod tests {
         info!("ndn_client will pull chunk_id_a");
         let mut client = NdnClient::new("http://localhost:3280/ndn/".to_string(),None,Some("test_client".to_string()));
         client.force_trust_remote = true;
-        client.pull_chunk(chunk_id_a.clone(),Some("test_client")).await.unwrap();
+        client.pull_chunk(chunk_id_a.clone(),StoreMode::StoreInNamedMgr).await.unwrap();
 
         let named_mgr_client = NamedDataMgr::get_named_data_mgr_by_id(Some("test_client")).await.unwrap();
         let real_named_mgr_client = named_mgr_client.lock().await;
-        let (mut reader,len) = real_named_mgr_client.open_chunk_reader_impl(&chunk_id_a,SeekFrom::Start(0),false).await.unwrap();
+        let (mut reader,len) = real_named_mgr_client.open_chunk_reader_impl(&chunk_id_a,0,false).await.unwrap();
         assert_eq!(len,chunk_a_size);
         drop(real_named_mgr_client);
         let mut buffer = vec![0u8;chunk_a_size as usize];
@@ -659,7 +658,7 @@ mod tests {
 
         let named_mgr_client = NamedDataMgr::get_named_data_mgr_by_id(Some("test_pub")).await.unwrap();
         let real_named_mgr_client = named_mgr_client.lock().await;
-        let (mut _reader,len) = real_named_mgr_client.open_chunk_reader_impl(&chunk_id_c,SeekFrom::Start(0),false).await.unwrap();
+        let (mut _reader,len) = real_named_mgr_client.open_chunk_reader_impl(&chunk_id_c,0,false).await.unwrap();
         assert_eq!(len,chunk_c_size);
 
     }
