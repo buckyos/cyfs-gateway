@@ -58,6 +58,7 @@ socket2 = "0.6.0"
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 local-ip-address = "0.6"
 rcgen = "0.14"
+clap = "*"
 
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
 name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" }

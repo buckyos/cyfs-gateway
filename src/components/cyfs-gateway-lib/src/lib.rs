@@ -16,6 +16,7 @@ mod stack;
 mod global_process_chains;
 mod connection_manager;
 mod quic_tunnel;
+mod json_collection;
 
 pub use aes_stream::*;
 pub use config::*;
@@ -31,6 +32,7 @@ pub use stack::*;
 pub use connection_manager::*;
 pub use global_process_chains::*;
 pub use cyfs_acme::*;
+pub use json_collection::*;
 
 use once_cell::sync::OnceCell;
 use thiserror::Error;
