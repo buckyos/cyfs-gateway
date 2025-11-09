@@ -110,7 +110,7 @@ impl ExternalCommand for CmdQa {
             .map(|s| s.as_str())
             .unwrap_or("REQ");
 
-        info!("qa command: server_id={}, map_id={}", server_id, map_id);
+        info!("will execute qa command: server_id={}, map_id={}", server_id, map_id);
 
         // Get the QA server
         let server = self.server_manager.get_server(server_id)

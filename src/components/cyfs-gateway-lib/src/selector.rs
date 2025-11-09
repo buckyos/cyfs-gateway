@@ -37,14 +37,6 @@ impl StreamRequest {
 pub type DatagramRequest = StreamRequest;
 
 
-pub trait StreamProbe {
-    fn probe(&self, buffer: &[u8], request:&StreamRequest) -> TunnelResult<StreamRequest>;
-}
-
-pub trait DatagramProbe {
-    fn probe(&self, buffer: &[u8], request:&DatagramRequest) -> TunnelResult<DatagramRequest>;
-}
-
 #[async_trait]
 pub trait StreamSelector {
     //return stream_url

@@ -4,15 +4,19 @@ use super::package::StreamPurpose;
 use super::package::*;
 use super::protocol::*;
 use super::stream_helper::RTcpStreamBuildHelper;
+use crate::TunnelManager;
 use crate::aes_stream::EncryptedStream;
 use crate::tunnel::*;
+use crate::tunnel_mgr;
 use anyhow::Result;
 use async_trait::async_trait;
 use buckyos_kit::buckyos_get_unix_timestamp;
 use buckyos_kit::AsyncStream;
 use log::*;
 use name_lib::DID;
+use percent_encoding::percent_decode_str;
 use rand::Rng;
+use url::Url;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -216,6 +220,10 @@ impl RTcpTunnel {
                 .await
             }
         }
+    }
+
+    fn get_dest_url_from_dest_host(&self, dest_host: &str) -> Option<Url> {
+        return None;
     }
 
     async fn on_stream_ropen(
@@ -479,6 +487,10 @@ impl RTcpTunnel {
         let real_key = format!("{}_{}", self.this_device.to_string(), session_key);
         self.build_helper.wait_ropen_stream(&real_key).await
     }
+    
+    fn get_tunnel_manager(&self) -> TunnelManager {
+        unimplemented!()
+    }
 
     async fn open_stream(
         &self,
@@ -596,6 +608,20 @@ impl Tunnel for RTcpTunnel {
     }
 
     async fn open_stream(&self, stream_id: &str) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+        let real_path = percent_decode_str(stream_id).decode_utf8();
+        if real_path.is_ok() {
+            let real_path = real_path.unwrap();
+            if real_path.find("://").is_some() {
+                let stream_url = Url::parse(&real_path);
+                if stream_url.is_ok() {
+                    let dest_host = Some(real_path.to_string());
+                    return self.open_stream_by_dest(0,dest_host).await;
+                }
+                error!("Invalid stream url: {}", real_path);
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "Invalid stream url"));
+            }
+        }
+
         let (dest_host, dest_port) = get_dest_info_from_url_path(stream_id)?;
         self.open_stream_by_dest(dest_port, dest_host).await
     }
@@ -617,6 +643,19 @@ impl Tunnel for RTcpTunnel {
         &self,
         session_id: &str,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
+        let real_path = percent_decode_str(session_id).decode_utf8();
+        if real_path.is_ok() {
+            let real_path = real_path.unwrap();
+            if real_path.find("://").is_some() {
+                let stream_url = Url::parse(&real_path);
+                if stream_url.is_ok() {
+                    let dest_host = Some(real_path.to_string());
+                    return self.create_datagram_client_by_dest(0,dest_host).await;
+                }
+                error!("Invalid stream url: {}", real_path);
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "Invalid stream url"));
+            }
+        }
         let (dest_host, dest_port) = get_dest_info_from_url_path(session_id)?;
         self.create_datagram_client_by_dest(dest_port, dest_host)
             .await

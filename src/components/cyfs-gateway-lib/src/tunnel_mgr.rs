@@ -3,8 +3,7 @@ use std::sync::{Arc, Mutex};
 use crate::ip::IPTunnelBuilder;
 use crate::DatagramClientBox;
 use crate::{
-    DatagramServerBox, StreamListener, StreamProbe,
-    StreamSelector, TunnelBox, TunnelBuilder, TunnelError, TunnelResult,
+    DatagramServerBox, StreamListener,TunnelBox, TunnelBuilder, TunnelError, TunnelResult,
 };
 use buckyos_kit::AsyncStream;
 use log::*;
@@ -78,17 +77,6 @@ impl TunnelManager {
             error!("{}", msg);
             Err(TunnelError::UnknownProtocol(msg))
         }
-    }
-
-    pub fn get_stream_probe(&self, _probe_id: &str) -> TunnelResult<Box<dyn StreamProbe + Send>> {
-        unimplemented!()
-    }
-
-    pub fn get_stream_selector(
-        &self,
-        _selector_id: &str,
-    ) -> TunnelResult<Box<dyn StreamSelector + Send>> {
-        unimplemented!()
     }
 
     pub async fn get_tunnel(

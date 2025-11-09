@@ -34,3 +34,7 @@ A: Send Stream RopenResp(127.0.0.1,3300,sessionid)
 A': aes_copy_stream(session_steam_real,session_streamA,sessionid)
 B:  session_stream = accept from 2980 and first package is StreamHello(sessionid)
 
+### Open和ROpen的区别
+核心区别：加密的AesStream（这是一个TcpStream）是怎么建立的
+如果是Open，则由发起Open的人建立
+如果是ROpen，则由收到ROpen的人建立

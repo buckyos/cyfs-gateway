@@ -191,7 +191,7 @@ pub fn get_dest_info_from_url_path(path: &str) -> Result<(Option<String>, u16), 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use percent_encoding::percent_decode_str;
     #[test]
     fn test_get_dest_info_from_url_path() {
         unsafe {
@@ -221,5 +221,13 @@ mod tests {
 
         let upstream_url = Url::parse("rtcp://TeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did/:80").unwrap();
         assert_eq!(upstream_url.host_str().unwrap(), "TeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did");
+
+        let upstream_url = Url::parse("rtcp://TeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did/rtcp%3A%2F%2FTeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did%2F%3A443").unwrap();
+        assert_eq!(upstream_url.host_str().unwrap(), "TeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did");
+        let path = upstream_url.path();
+        // Use percent_encoding instead of urlencoding and fix str_as_str lint
+
+        let org_path = percent_decode_str(path).decode_utf8().unwrap();
+        println!("org_path: {}", org_path);
     }
 }
