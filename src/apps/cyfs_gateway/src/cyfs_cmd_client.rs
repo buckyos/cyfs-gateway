@@ -5,7 +5,7 @@ pub use sfo_result::err as cmd_err;
 pub use sfo_result::into_err as into_cmd_err;
 use sha2::Digest;
 use crate::cyfs_cmd_server::{CmdErrorCode, CmdResult, LoginReq};
-
+//TODO： CmdClient / CmdServer 的名字太通用了，叫gateway_control_panel_client / gateway_control_panel 更好一些？
 pub const CMD_SERVER: &str = "http://127.0.0.1:13451";
 
 pub struct CyfsCmdClient {
