@@ -231,18 +231,4 @@ impl TunnelBuilder for SocksTunnelBuilder {
         let tunnel = SocksTunnel::new(tunnel_stack_id).await?;
         Ok(Box::new(tunnel))
     }
-
-    async fn create_stream_listener(
-        &self,
-        _bind_stream_id: &Url,
-    ) -> TunnelResult<Box<dyn StreamListener>> {
-        unimplemented!("SocksTunnelBuilder create_stream_listener not implemented");
-    }
-
-    async fn create_datagram_server(
-        &self,
-        _bind_session_id: &Url,
-    ) -> TunnelResult<Box<dyn DatagramServerBox>> {
-        unimplemented!("SocksTunnelBuilder create_datagram_server not implemented");
-    }
 }

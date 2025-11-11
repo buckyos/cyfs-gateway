@@ -1,7 +1,6 @@
 use crate::TunnelResult;
 use async_trait::async_trait;
 use buckyos_kit::AsyncStream;
-use url::Url;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]
@@ -35,38 +34,6 @@ where
 
 impl Clone for Box<dyn DatagramClientBox> {
     fn clone(&self) -> Box<dyn DatagramClientBox> {
-        self.clone_box()
-    }
-}
-
-#[async_trait]
-pub trait DatagramServer: Send {
-    async fn recv_datagram(
-        &self,
-        buffer: &mut [u8],
-    ) -> Result<(usize, TunnelEndpoint), std::io::Error>;
-    async fn send_datagram(
-        &self,
-        ep: &TunnelEndpoint,
-        buffer: &[u8],
-    ) -> Result<usize, std::io::Error>;
-}
-
-pub trait DatagramServerBox: DatagramServer {
-    fn clone_box(&self) -> Box<dyn DatagramServerBox>;
-}
-
-impl<T> DatagramServerBox for T
-where
-    T: 'static + Clone + Send + DatagramServer,
-{
-    fn clone_box(&self) -> Box<dyn DatagramServerBox> {
-        Box::new(self.clone())
-    }
-}
-
-impl Clone for Box<dyn DatagramServerBox> {
-    fn clone(&self) -> Box<dyn DatagramServerBox> {
         self.clone_box()
     }
 }
@@ -118,11 +85,6 @@ impl Clone for Box<dyn TunnelBox> {
 #[async_trait]
 pub trait TunnelBuilder: Send + Sync + 'static {
     async fn create_tunnel(&self, tunnel_stack_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>>;
-    async fn create_stream_listener(&self,
-        bind_stream_id: &Url) -> TunnelResult<Box<dyn StreamListener>>;
-    async fn create_datagram_server(
-        &self,
-        bind_session_id: &Url) -> TunnelResult<Box<dyn DatagramServerBox>>;
 }
 
 #[async_trait]

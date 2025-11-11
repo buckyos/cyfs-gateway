@@ -1,3 +1,4 @@
+#![allow(unused)]
 mod acme_client;
 mod cert_mgr;
 mod default_challenge_responder;

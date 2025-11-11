@@ -1,10 +1,8 @@
-use super::tcp::TcpStreamListener;
 use super::udp::UdpClient;
 use crate::tunnel::*;
 use crate::TunnelResult;
 use async_trait::async_trait;
 use buckyos_kit::AsyncStream;
-use url::Url;
 use std::net::SocketAddr;
 
 #[derive(Clone)]
@@ -112,21 +110,5 @@ impl IPTunnelBuilder {
 impl TunnelBuilder for IPTunnelBuilder {
     async fn create_tunnel(&self, target_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>> {
         Ok(Box::new(IPTunnel::new(target_id)))
-    }
-
-    async fn create_stream_listener(&self, bind_stream_id: &Url) -> TunnelResult<Box<dyn StreamListener>> {
-        let mut result = TcpStreamListener::new(bind_stream_id);
-        result.bind().await?;
-        Ok(Box::new(result))
-    }
-
-    async fn create_datagram_server(
-        &self,
-        _bind_session_id: &Url,
-    ) -> TunnelResult<Box<dyn DatagramServerBox>> {
-        todo!();
-        // let mut result = UdpDatagramServer::new();
-        // result.bind(bind_session_id).await?;
-        // Ok(Box::new(result))
     }
 }

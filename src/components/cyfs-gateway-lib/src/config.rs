@@ -4,7 +4,6 @@ use tokio::fs;
 use std::collections::HashMap;
 use std::net::{SocketAddr};
 use serde::{Deserialize, Serialize};
-use url::Url;
 
 fn default_true() -> bool {
     true
@@ -172,84 +171,6 @@ impl WarpServerConfig {
 }
 
 
-
-#[derive(Deserialize, Debug,Clone)]
-pub enum DNSProviderType {
-    #[serde(rename = "dns")]
-    DNS,//query name info by system
-    SN,//query name info by sn server
-    LocalConfig,
-
-}
-
-#[derive(Deserialize,Clone,Debug)]
-pub struct DNSProviderConfig {
-    #[serde(rename = "type")]
-    pub provider_type: DNSProviderType,
-    #[serde(flatten)]
-    pub config: serde_json::Value,
-}
-
-#[derive(Deserialize, Clone, Debug)]
-pub struct DNSServerConfig {
-    pub bind : Option<String>,
-    pub port : u16,
-    //dot_port : u16,
-    //doh_port : u16,
-    //tls: Option<TlsConfig>, include cert.pem and key.pem
-    //dnssec: bool,
-    //pub this_name:Option<String>,
-    pub resolver_chain : Vec<DNSProviderConfig>,
-    pub fallback : Vec<String>,//fallback dns servers
-}
-
-#[derive(Clone,Debug)]
-pub enum DispatcherTarget {
-    Forward(Url),
-    Server(String),
-    Selector(String),
-    ProbeSelector(String,String), //probeid,selectorid
-}
-
-#[derive(Clone,Debug)]
-pub struct DispatcherConfig {
-    pub incoming: Url,
-    pub target: DispatcherTarget
-}
-
-
-impl DispatcherConfig {
-    pub fn new_forward(incoming: Url, target: Url) -> Self {
-        DispatcherConfig {
-            incoming,
-            target : DispatcherTarget::Forward(target)
-        }
-    }
-
-    pub fn new_server(incoming: Url, server_id: String) -> Self {
-        DispatcherConfig {
-            incoming,
-            target : DispatcherTarget::Server(server_id),
-        }
-    }
-
-    pub fn new_selector(incoming: Url, selector_id: String) -> Self {
-        DispatcherConfig {
-            incoming,
-            target : DispatcherTarget::Selector(selector_id),
-        }
-    }
-
-    pub fn new_probe_selector(incoming: Url, probe_id: String, selector_id: String) -> Self {
-        DispatcherConfig {
-            incoming,
-            target : DispatcherTarget::ProbeSelector(probe_id, selector_id),
-        }
-    }
-}
-
-
-
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BlockConfig {
     pub id: String,
@@ -297,82 +218,6 @@ pub fn get_min_priority(chain_configs: &ProcessChainConfigs) -> i32 {
     chain_configs.iter().map(|c| c.priority).min().unwrap_or(0)
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-pub struct CyfsRtcpServiceConfig {
-    pub device_name: String,
-    pub device_key: String,
-    pub process_chains: Vec<ProcessChainConfig>,
-}
-
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct CyfsHttpServiceConfig {
-    pub process_chains: Vec<ProcessChainConfig>,
-}
-
-//
-// #[derive(Serialize, Deserialize, Clone)]
-// pub struct CyfsServerConfig {
-//     #[serde(skip_serializing_if = "Option::is_none")]
-//     protocol: Option<StackProtocol>,
-//     #[serde(skip_serializing_if = "Option::is_none")]
-//     bind: Option<IpAddr>,
-//     port: u16,
-//     process_chains: Vec<ProcessChainConfig>,
-//     #[serde(skip_serializing_if = "Option::is_none")]
-//     rtcp_service: Option<CyfsRtcpServiceConfig>,
-//     #[serde(skip_serializing_if = "Option::is_none")]
-//     http_services: Option<HashMap<String, CyfsHttpServiceConfig>>,
-// }
-//
-// impl CyfsServerConfig {
-//     pub fn new(listen: u16) -> Self {
-//         CyfsServerConfig {
-//             protocol: None,
-//             bind: None,
-//             port: listen,
-//             process_chains: vec![],
-//             rtcp_service: None,
-//             http_services: None,
-//         }
-//     }
-//
-//     pub fn set_protocol(&mut self, protocol: StackProtocol) {
-//         self.protocol = Some(protocol);
-//     }
-//
-//     pub fn set_bind(&mut self, bind: IpAddr) {
-//         self.bind = Some(bind);
-//     }
-//
-//     pub fn add_process_chain(&mut self, process_chain: ProcessChainConfig) {
-//         self.process_chains.push(process_chain);
-//     }
-//
-//     pub fn get_protocol(&self) -> StackProtocol {
-//         self.protocol.unwrap_or(StackProtocol::Tcp)
-//     }
-//
-//     pub fn get_bind(&self) -> IpAddr {
-//         self.bind.unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)))
-//     }
-//
-//     pub fn get_port(&self) -> u16 {
-//         self.port
-//     }
-//
-//     pub fn get_process_chains(&self) -> &Vec<ProcessChainConfig> {
-//         &self.process_chains
-//     }
-//
-//     pub fn get_rtcp_service(&self) -> &Option<CyfsRtcpServiceConfig> {
-//         &self.rtcp_service
-//     }
-//
-//     pub fn get_http_services(&self) -> &Option<HashMap<String, CyfsHttpServiceConfig>> {
-//         &self.http_services
-//     }
-// }
 
 #[derive(Debug, Copy, Clone)]
 pub enum ConfigErrorCode {
@@ -387,44 +232,6 @@ pub use sfo_result::into_err as into_config_err;
 use cyfs_acme::ChallengeType;
 use cyfs_process_chain::{Block, BlockParser, ProcessChain};
 use crate::{StackProtocol};
-
-// pub trait CyfsServerConfigParser {
-//     fn parse(config: &str) -> ConfigResult<Vec<CyfsServerConfig>>;
-// }
-//
-// pub trait CyfsServerConfigDumps {
-//     fn dumps(config: &[CyfsServerConfig]) -> ConfigResult<String>;
-// }
-//
-// #[derive(Serialize, Deserialize)]
-// struct YamlServers {
-//     servers: Vec<YamlServer>
-// }
-//
-// #[derive(Serialize, Deserialize)]
-// struct YamlServer {
-//     server: CyfsServerConfig,
-// }
-//
-// pub struct YamlCyfsServerConfigParser;
-// impl CyfsServerConfigParser for YamlCyfsServerConfigParser {
-//     fn parse(config: &str) -> ConfigResult<Vec<CyfsServerConfig>> {
-//         let config: YamlServers = serde_yaml_ng::from_str(config).map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{:?}", e))?;
-//         Ok(config.servers.into_iter().map(|s| s.server).collect())
-//     }
-// }
-//
-// pub struct YamlCyfsServerConfigDumps;
-// impl CyfsServerConfigDumps for YamlCyfsServerConfigDumps {
-//     fn dumps(config: &[CyfsServerConfig]) -> ConfigResult<String> {
-//         let servers: Vec<YamlServer> = config.iter().map(|s| YamlServer {
-//             server: s.clone(),
-//         }).collect();
-//         Ok(serde_yaml_ng::to_string(&YamlServers {
-//             servers,
-//         }).map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{:?}", e))?)
-//     }
-// }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TcpConfig {

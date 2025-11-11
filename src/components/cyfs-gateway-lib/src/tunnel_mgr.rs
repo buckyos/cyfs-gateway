@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use crate::ip::IPTunnelBuilder;
 use crate::DatagramClientBox;
 use crate::{
-    DatagramServerBox, StreamListener,TunnelBox, TunnelBuilder, TunnelError, TunnelResult,
+    TunnelBox, TunnelBuilder, TunnelError, TunnelResult,
 };
 use buckyos_kit::AsyncStream;
 use log::*;
@@ -98,28 +98,6 @@ impl TunnelManager {
 
         info!("Get tunnel for {} success", target_url);
         return Ok(tunnel);
-    }
-
-    pub async fn create_listener_by_url(
-        &self,
-        bind_url: &Url,
-    ) -> TunnelResult<Box<dyn StreamListener>> {
-        let builder = self
-            .get_tunnel_builder_by_protocol(bind_url.scheme())
-            .await?;
-        let listener = builder.create_stream_listener(bind_url).await?;
-        return Ok(listener);
-    }
-
-    pub async fn create_datagram_server_by_url(
-        &self,
-        bind_url: &Url,
-    ) -> TunnelResult<Box<dyn DatagramServerBox>> {
-        let builder = self
-            .get_tunnel_builder_by_protocol(bind_url.scheme())
-            .await?;
-        let server = builder.create_datagram_server(bind_url).await?;
-        return Ok(server);
     }
 
     //$tunnel_schema://$tunnel_stack_id/$target_stream_id

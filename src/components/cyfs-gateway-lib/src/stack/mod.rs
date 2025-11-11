@@ -16,7 +16,7 @@ pub use udp_stack::*;
 pub use quic_stack::*;
 pub use stack::*;
 pub use tls_stack::*;
-pub use tls_cert_resolver::*;
+pub(crate) use tls_cert_resolver::*;
 pub use limiter::*;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -77,6 +77,7 @@ pub async fn datagram_forward(datagram: Box<dyn DatagramClientBox>, target: &str
     Ok(())
 }
 
+#[warn(unreachable_code)]
 pub async fn copy_datagram_bidirectional(a: Box<dyn DatagramClientBox>, b: Box<dyn DatagramClientBox>) -> Result<(), std::io::Error> {
     let recv = {
         let a = a.clone();

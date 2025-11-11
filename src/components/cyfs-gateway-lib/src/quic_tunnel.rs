@@ -1,13 +1,12 @@
 use std::io::Error;
 use std::sync::Arc;
 use buckyos_kit::AsyncStream;
-use name_client::{resolve_ip, DnsProvider, NsProvider};
+use name_client::{resolve_ip};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::ClientConfig;
 use rustls_platform_verifier::BuilderVerifierExt;
 use sfo_split::Splittable;
-use url::Url;
-use crate::{get_dest_info_from_url_path, DatagramClientBox, DatagramServerBox, StreamListener, Tunnel, TunnelBox, TunnelBuilder, TunnelResult};
+use crate::{get_dest_info_from_url_path, DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelResult};
 
 #[derive(Clone)]
 pub struct QuicTunnel {}
@@ -20,7 +19,7 @@ impl QuicTunnel {
 #[async_trait::async_trait]
 impl Tunnel for QuicTunnel {
     async fn ping(&self) -> Result<(), Error> {
-        warn!("IP tunnel's ping not implemented");
+        warn!("Quic tunnel's ping not implemented");
         Ok(())
     }
 
@@ -73,13 +72,5 @@ impl QuicTunnelBuilder {
 impl TunnelBuilder for QuicTunnelBuilder {
     async fn create_tunnel(&self, _tunnel_stack_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>> {
         Ok(Box::new(QuicTunnel::new()))
-    }
-
-    async fn create_stream_listener(&self, _bind_stream_id: &Url) -> TunnelResult<Box<dyn StreamListener>> {
-        todo!()
-    }
-
-    async fn create_datagram_server(&self, _bind_session_id: &Url) -> TunnelResult<Box<dyn DatagramServerBox>> {
-        todo!()
     }
 }
