@@ -2,10 +2,11 @@ use rand::Rng;
 use tokio::fs;
 use anyhow::Result;
 use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
 use std::path::Path;
 use rustls::server::{ResolvesServerCert, ClientHello};
 use rustls::sign::CertifiedKey;
-use std::sync::Arc;
+use std::sync::{Arc};
 use std::sync::RwLock;
 use tokio::task;
 use log::*;
@@ -13,11 +14,11 @@ use crate::acme_client::{AcmeClient, AcmeOrderSession, AcmeAccount, AcmeChalleng
 use openssl::x509::X509;
 use std::sync::Mutex;
 use std::time::Duration;
-use boa_engine::{Context, JsString, JsValue, Source};
 use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::{PrivateKeyDer};
 use rustls::sign;
 use serde::{Deserialize, Serialize};
+use sfo_js::{JsString, JsValue};
 use tokio::task::JoinHandle;
 use crate::{Challenge, ChallengeData, ChallengeType};
 use crate::default_challenge_responder::DefaultChallengeResponder;
@@ -364,12 +365,56 @@ pub struct AcmeCertManager {
     challenge_certs: Mutex<HashMap<String, Arc<sign::CertifiedKey>>>,
     http_challenges: Mutex<HashMap<String, (String, String)>>,
 }
-pub type AcmeCertManagerRef = Arc<AcmeCertManager>;
+
+pub struct AcmeCertManagerHolder {
+    inner: RwLock<Arc<AcmeCertManager>>,
+}
+
+impl Debug for AcmeCertManagerHolder {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AcmeCertManagerRef")
+    }
+}
+
+impl AcmeCertManagerHolder {
+    fn new(cert_manager: AcmeCertManager) -> Self {
+        Self {
+            inner: RwLock::new(Arc::new(cert_manager))
+        }
+    }
+
+    pub async fn update(&self, config: CertManagerConfig) -> Result<()> {
+        let new_manager = AcmeCertManager::create(config).await?;
+        *self.inner.write().unwrap() = new_manager.get_manager();
+        Ok(())
+    }
+
+    fn get_manager(&self) -> Arc<AcmeCertManager> {
+        self.inner.read().unwrap().clone()
+    }
+
+    pub fn get_cert_by_host(&self, host: &str) -> Option<CertStub> {
+        self.get_manager().get_cert_by_host(host)
+    }
+
+    pub fn add_acme_item(&self, item: AcmeItem) -> Result<()> {
+        self.get_manager().add_acme_item(item)
+    }
+}
+
+impl ResolvesServerCert for AcmeCertManagerHolder {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.get_manager().resolve(client_hello)
+    }
+}
+
+pub type AcmeCertManagerRef = Arc<AcmeCertManagerHolder>;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CertManagerConfig {
     pub account: Option<String>,
     pub acme_server: String,
+    pub dns_providers: Option<HashMap<String, serde_json::Value>>,
     pub keystore_path: String,
     pub dns_provider_path: Option<String>,
     #[serde(default = "default_check_interval")]
@@ -391,6 +436,7 @@ impl Default for CertManagerConfig {
         Self {
             account: None,
             acme_server: "https://acme-v02.api.letsencrypt.org/directory".to_string(),
+            dns_providers: None,
             keystore_path: String::new(),
             dns_provider_path: None,
             check_interval: default_check_interval(),
@@ -472,7 +518,7 @@ impl AcmeCertManager {
 
         let acme_client = AcmeClient::new(account, config.acme_server.clone()).await?;
 
-        let manager = Arc::new(Self {
+        let manager = AcmeCertManagerRef::new(AcmeCertManagerHolder::new(Self {
             config: config.clone(),
             acme_client,
             certs: RwLock::new(HashMap::new()),
@@ -480,15 +526,16 @@ impl AcmeCertManager {
             responder: Mutex::new(None),
             challenge_certs: Mutex::new(Default::default()),
             http_challenges: Mutex::new(Default::default()),
-        });
+        }));
 
         {
-            let mut responder = manager.responder.lock().unwrap();
-            *responder = Some(Arc::new(DefaultChallengeResponder::new(manager.clone())));
+            let manager_tmp = manager.get_manager();
+            let mut responder = manager_tmp.responder.lock().unwrap();
+            *responder = Some(Arc::new(DefaultChallengeResponder::new(manager.get_manager())));
         }
         // 启动定期检查任务
         {
-            let weak_manager = Arc::downgrade(&manager);
+            let weak_manager = Arc::downgrade(&manager.get_manager());
             let handle: JoinHandle<()> = tokio::spawn(async move {
                 let check_interval = tokio::time::Duration::from_secs(
                     config.check_interval.num_seconds() as u64
@@ -503,7 +550,7 @@ impl AcmeCertManager {
                     }
                 }
             });
-            *manager.check_handler.lock().unwrap() = Some(handle);
+            *manager.get_manager().check_handler.lock().unwrap() = Some(handle);
         }
 
         Ok(manager)
@@ -592,6 +639,7 @@ impl AcmeCertManager {
                 ChallengeData::Dns01 { token: _, ref key_hash } => {
                     if cert_stub.inner.acme_item.challenge_type == ChallengeType::Dns01 {
                         self.call_dns_provider(&cert_stub, key_hash.as_str(), "add_challenge").await?;
+                        return Ok(challenge);
                     } else {
                         continue;
                     }
@@ -600,6 +648,7 @@ impl AcmeCertManager {
                     if cert_stub.inner.acme_item.challenge_type == ChallengeType::Http01 {
                         let mut http_challenges = self.http_challenges.lock().unwrap();
                         http_challenges.insert(challenge.domain.clone(), (token.clone(), key_auth.clone()));
+                        return Ok(challenge);
                     } else {
                         continue;
                     }
@@ -646,9 +695,21 @@ impl AcmeCertManager {
         if cert_stub.inner.acme_item.data.is_none() {
             return Err(anyhow::anyhow!("dns challenge provider params is empty"));
         }
+
+        if self.config.dns_providers.is_none() {
+            return Err(anyhow::anyhow!("dns challenge provider is empty"));
+        }
+
         let provider_data = cert_stub.inner.acme_item.data.clone().unwrap();
         let provider: DnsProvider = serde_json::from_value(provider_data.clone())
             .map_err(|e| anyhow::anyhow!("parse plugin data {} failed: {}", serde_json::to_string(&provider_data).unwrap_or("".to_string()), e))?;
+
+        let provider_params = self.config.dns_providers.as_ref().unwrap().get(provider.dns_provider.as_str());
+        if provider_params.is_none() {
+            return Err(anyhow::anyhow!("dns challenge provider {} not exists", provider.dns_provider));
+        }
+        let provider_params = provider_params.unwrap().clone();
+
         let provider_path = Path::new(self.config.dns_provider_path.as_ref().unwrap())
             .join(format!("{}", provider.dns_provider))
             .join("main.js");
@@ -665,43 +726,31 @@ impl AcmeCertManager {
         let key_hash = key_hash.to_string();
         let op = op.to_string();
         tokio::task::spawn_blocking(move || {
-            let source = Source::from_filepath(provider_path.as_path())
-                .map_err(|e| anyhow::anyhow!("load dns challenge plugin {} failed: {}", provider_path.to_str().unwrap(), e))?;
-            let mut context = Context::default();
-            boa_runtime::register(
-                (
-                    boa_runtime::extensions::ConsoleExtension::default(),
-                    boa_runtime::extensions::FetchExtension(
-                        boa_runtime::fetch::BlockingReqwestFetcher::default()
-                    ),
-                ),
-                None,
-                &mut context,
-            ).map_err(|e| anyhow::anyhow!("init boa runtime failed: {}", e))?;
+            let mut js_engine = sfo_js::JsEngine::new()?;
+            js_engine.eval_file(provider_path.as_path())?;
 
             let domain = JsValue::from(JsString::from(domain));
             let key_hash = JsValue::from(JsString::from(key_hash));
-            let provider = JsValue::from_json(&provider_data, &mut context)
-                .map_err(|e| anyhow::anyhow!("parse plugin data {} failed: {}", serde_json::to_string(&provider_data).unwrap_or("".to_string()), e))?;
+            let provider = JsValue::from_json(&provider_params, js_engine.context())
+                .map_err(|e| anyhow::anyhow!("parse plugin data {} failed: {}", serde_json::to_string(&provider_params).unwrap_or("".to_string()), e))?;
 
-            match context.eval(source) {
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(anyhow::anyhow!("eval dns challenge plugin {} failed: {}", provider_path.to_str().unwrap(), e));
-                }
-            }
-            let add_challenge = context.global_object().get(JsString::from(op.clone()), &mut context)
-                .map_err(|e| anyhow::anyhow!("can't find {op} failed: {}", e))?;
-            if let Some(add_challenge) = add_challenge.as_callable() {
-                let result = add_challenge.call(&JsValue::null(), &[provider, domain, key_hash], &mut context)
-                    .map_err(|e| anyhow::anyhow!("call {op} failed: {}", e))?;
-                if result.is_boolean() && result.as_boolean().unwrap() {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!("add_challenge failed"))
+            let result = js_engine.call(op.as_str(), vec![provider, domain, key_hash])?;
+            if result.is_boolean() && result.as_boolean().unwrap() {
+                Ok(())
+            } else if result.is_promise() {
+                let result = result.as_promise().unwrap();
+                match result.await_blocking(js_engine.context()) {
+                    Ok(result) => {
+                        if result.is_boolean() && result.as_boolean().unwrap() {
+                            Ok(())
+                        } else {
+                            Err(anyhow::anyhow!("add_challenge failed"))
+                        }
+                    },
+                    Err(e) => Err(anyhow::anyhow!("add_challenge failed: {}", e))
                 }
             } else {
-                Err(anyhow::anyhow!("add_challenge is not callable"))
+                Err(anyhow::anyhow!("add_challenge failed"))
             }
         }).await.map_err(|e| anyhow::anyhow!("spawn block failed: {}", e))?
     }

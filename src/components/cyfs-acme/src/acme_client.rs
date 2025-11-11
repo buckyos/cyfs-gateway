@@ -617,7 +617,7 @@ impl AcmeClient {
         let mut hasher = Sha256::new();
         hasher.update(self.compute_key_authorization(token)?.as_bytes());
         let key_bytes = hasher.finalize();
-        Ok(hex::encode(key_bytes))
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_bytes))
     }
 
     fn compute_tls_alpn_01_key(&self, domain: &str, token: &str) -> Result<CertifiedKey> {
@@ -627,7 +627,7 @@ impl AcmeClient {
         })?;
         let key_auth = self.compute_key_authorization_hash(token)?;
         params.custom_extensions = vec![
-            rcgen::CustomExtension::new_acme_identifier(hex::decode(key_auth.as_str()).unwrap().as_slice()),
+            rcgen::CustomExtension::new_acme_identifier(base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(key_auth.as_str()).unwrap().as_slice()),
         ];
         let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(|e| {
             error!("generate tls alpn01 key failed, domain: {}, {}", domain, e);

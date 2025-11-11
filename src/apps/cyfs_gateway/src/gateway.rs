@@ -564,6 +564,33 @@ impl Gateway {
         self.inner_service_manager.retain(|id| {
             config.inner_services.iter().any(|service| service.id() == id)
         });
+        if config.acme_config.is_some() {
+            let acme_config = config.acme_config.clone().unwrap();
+            let mut cert_config = CertManagerConfig::default();
+            let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+            let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
+            cert_config.keystore_path = data_dir.to_string_lossy().to_string();
+                cert_config.account = acme_config.account;
+                if acme_config.issuer.is_some() {
+                    cert_config.acme_server = acme_config.issuer.unwrap();
+                }
+                cert_config.dns_providers = acme_config.dns_providers;
+                if acme_config.check_interval.is_some() {
+                    if let Some(check_interval) = chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0) {
+                        cert_config.check_interval = check_interval;
+                    }
+                }
+
+                if acme_config.renew_before_expiry.is_some() {
+                    if let Some(renew_before_expiry) = chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0) {
+                        cert_config.renew_before_expiry = renew_before_expiry;
+                    }
+                }
+            cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
+            if let Err(e) = self.acme_mgr.update(cert_config).await {
+                log::error!("Failed to update acme manager: {}", e);
+            }
+        }
         *self.config.lock().unwrap() = config;
         Ok(())
     }

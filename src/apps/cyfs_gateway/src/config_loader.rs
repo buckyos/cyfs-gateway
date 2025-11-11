@@ -415,7 +415,21 @@ impl GatewayConfigParser {
             })?;
         }
 
+        let acme_config: Option<AcmeConfig> = match json_value.get("acme") {
+            Some(config) => {
+                match serde_json::from_value::<AcmeConfig>(config.clone()) {
+                    Ok(config) => Some(config),
+                    Err(err) => {
+                        let msg = format!("invalid acme config: {}", err);
+                        error!("{}", msg);
+                        None
+                    }
+                }
+            },
+            None => None
+        };
         Ok(GatewayConfig {
+            acme_config,
             stacks,
             servers,
             inner_services,
@@ -424,9 +438,18 @@ impl GatewayConfigParser {
     }
 }
 
+#[derive(Deserialize, Clone)]
+pub struct AcmeConfig {
+    pub account: Option<String>,
+    pub issuer: Option<String>,
+    pub dns_providers: Option<HashMap<String, serde_json::Value>>,
+    pub check_interval: Option<u64>,
+    pub renew_before_expiry: Option<u64>,
+}
 
 
 pub struct GatewayConfig {
+    pub acme_config: Option<AcmeConfig>,
     pub stacks: Vec<Arc<dyn StackConfig>>,
     pub servers: Vec<Arc<dyn ServerConfig>>,
     pub inner_services: Vec<Arc<dyn InnerServiceConfig>>,

@@ -22,5 +22,4 @@ rand = "*"
 chrono = "0.4"
 rustls-pemfile = "2.0"
 sfo-io = "0.1"
-boa_engine = { version = "0.21" }
-boa_runtime = { version = "0.21", features = ["all"] }
+sfo-js = "0.1.2"

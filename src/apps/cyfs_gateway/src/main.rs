@@ -14,6 +14,7 @@ use name_client::*;
 use name_lib::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use json_value_merge::Merge;
 use kRPC::RPCSessionToken;
 use serde_json::{Value};
@@ -35,25 +36,6 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
         error!("{}", msg);
         msg
     })?;
-
-    let acme_account: Option<String> = match config_json.get("acme_account") {
-        Some(acme_account) => {
-            match acme_account.as_str() {
-                Some(acme_account) => Some(acme_account.to_string()),
-                None => None,
-            }
-        },
-        None => None,
-    };
-    let acme_server: Option<String> = match config_json.get("acme_server") {
-        Some(acme_server) => {
-            match acme_server.as_str() {
-                Some(acme_server) => Some(acme_server.to_string()),
-                None => None,
-            }
-        },
-        None => None,
-    };
 
     let user_name: Option<String> = match config_json.get("user_name") {
         Some(user_name) => {
@@ -109,11 +91,25 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
     let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
     cert_config.keystore_path = data_dir.to_string_lossy().to_string();
-    cert_config.account = acme_account;
-    cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
-    if acme_server.is_some() {
-        cert_config.acme_server = acme_server.unwrap();
+    if let Some(acme_config) = config_loader.acme_config.clone() {
+        cert_config.account = acme_config.account;
+        if acme_config.issuer.is_some() {
+            cert_config.acme_server = acme_config.issuer.unwrap();
+        }
+        cert_config.dns_providers = acme_config.dns_providers;
+        if acme_config.check_interval.is_some() {
+            if let Some(check_interval) = chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0) {
+                cert_config.check_interval = check_interval;
+            }
+        }
+        
+        if acme_config.renew_before_expiry.is_some() {
+            if let Some(renew_before_expiry) = chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0) {
+                cert_config.renew_before_expiry = renew_before_expiry;
+            }
+        }
     }
+    cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
 
     let cert_manager = AcmeCertManager::create(cert_config).await?;
 
