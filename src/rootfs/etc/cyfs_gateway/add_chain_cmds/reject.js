@@ -3,9 +3,8 @@ export function main(argv) {
         return 1;
     }
 
+    console.log(argv);
     let dest = argv[0];
-
-    console.log(dest);
     let rule = `https-sni-probe && eq \$\{REQ.dest_host\} \"${dest}\" && reject;`;
     console.log(rule);
     return rule;

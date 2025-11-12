@@ -18,6 +18,7 @@ use kRPC::RPCSessionToken;
 use serde::Serialize;
 use serde_json::Value;
 use sfo_js::{js_value, JsEngine, JsString, JsValue};
+use sfo_js::object::builtins::JsArray;
 use sha2::Digest;
 use crate::cyfs_cmd_client::{cmd_err, into_cmd_err};
 use crate::cyfs_cmd_server::{CmdErrorCode, CmdResult, CyfsCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
@@ -641,7 +642,9 @@ impl GatewayCmdHandler {
             } else {
                 vec![]
             };
-            let result = js_engine.call("main", args)
+            let args = JsArray::from_iter(args.into_iter(), js_engine.context());
+            let result = js_engine.call("main",
+                                        vec![JsValue::from(args)])
                 .map_err(into_cmd_err!(CmdErrorCode::RunJsFailed))?;
             if result.is_string() {
                 Ok(result.as_string().unwrap().as_str().to_std_string_lossy())
