@@ -21,3 +21,4 @@ target
 #.idea/
 Cargo.lock
 src/scripts/__pycache__/
+src/rootfs/bin/cyfs_gateway/cyfs_gateway

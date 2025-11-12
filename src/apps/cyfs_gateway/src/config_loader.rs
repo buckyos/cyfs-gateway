@@ -1,4 +1,4 @@
-use cyfs_gateway_lib::{config_err, ConfigErrorCode, ConfigResult, InnerServiceConfig, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig};
+use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, InnerServiceConfig, ProcessChainConfigs, ProcessChainHttpServerConfig, QAServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig, config_err};
 use cyfs_socks::SocksServerConfig;
 use cyfs_sn::*;
 use std::collections::HashMap;
@@ -205,6 +205,24 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for CyfsServer
                 server_type.ty
             ))
         }
+    }
+}
+
+pub struct QAServerConfigParser {}
+
+impl QAServerConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for QAServerConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
+        let config = QAServerConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid qa server config.{}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
+        Ok(Arc::new(config))
     }
 }
 

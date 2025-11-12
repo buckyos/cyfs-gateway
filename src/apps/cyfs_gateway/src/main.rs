@@ -68,6 +68,7 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
     parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
     parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
     parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
+    parser.register_server_config_parser("qa", Arc::new(QAServerConfigParser::new()));
 
     parser.register_inner_service_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
     parser.register_inner_service_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
@@ -161,6 +162,11 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
     )));
 
     factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
+        inner_service_manager.clone(),
+        global_process_chains.clone(),
+    )));
+
+    factory.register_server_factory("qa", Arc::new(ProcessChainQAServerFactory::new(
         inner_service_manager.clone(),
         global_process_chains.clone(),
     )));

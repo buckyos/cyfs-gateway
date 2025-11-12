@@ -25,7 +25,7 @@ servers:
             block: |
               return "inner_service web3_sn";
   - id: main_sn
-    type: qa_server
+    type: qa
     hook_point:
       - id: main
         priority: 1
@@ -38,8 +38,8 @@ stacks:
   - id: main_rtcp
     bind: 0.0.0.0:2980
     protocol: rtcp
-    device_config: ./rootfs/etc/device.doc.json
-    device_private_key: ./rootfs/etc/device.key.pem
+    key_path: ./device_key.pem
+    device_config_path: ./device.doc.json
     hook_point:
       - id: new_tunnel # 确保只有授权的设备才能与sn keep tunnel成功
         priority: 1
@@ -53,7 +53,7 @@ stacks:
 
   - id: tls_forward
     bind: 0.0.0.0:443
-    protocol: tls
+    protocol: tcp
     hook_point:
       - id: main
         priority: 1
@@ -64,7 +64,7 @@ stacks:
               call https-sni-probe && call qa web3_sn;
               match $(ANSWER.result) "0" || reject;
               match $(ANSWER.self_cert) "true" && return "forward rtcp://${ANSWER.ood_did}/:443";
-              return "http_server main_http";
+              reject;
   
   - id: http_forward
     bind: 0.0.0.0:80

@@ -1,12 +1,12 @@
 mod http_server;
 mod socks5_server;
 mod server;
-mod cmd_qa;
+mod qa_server;
 
 pub use http_server::*;
 pub use socks5_server::*;
 pub use server::*;
-pub use cmd_qa::*;
+pub use qa_server::*;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ServerErrorCode {

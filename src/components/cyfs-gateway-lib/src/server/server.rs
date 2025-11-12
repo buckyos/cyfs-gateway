@@ -11,7 +11,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use cyfs_process_chain::{CollectionValue, EnvRef, MapCollection, MapCollectionTraverseCallBackRef, TraverseGuard, VariableVisitor, VariableVisitorWrapperForMapCollection, HTTP_REQUEST_HEADER_VARS};
-use crate::{server_err, ProcessChainConfig, ServerError, ServerErrorCode, ServerResult};
+use crate::{server_err, ProcessChainConfig, ServerError, ServerErrorCode, ServerResult, QAServer};
 
 pub trait ServerConfig: AsAny + Send + Sync {
     fn id(&self) -> String;
@@ -82,114 +82,6 @@ impl Server {
     }
 }
 
-#[async_trait::async_trait]
-pub trait QAServer: Send + Sync {
-    async fn serve_question(&self, req: &serde_json::Value) -> ServerResult<serde_json::Value>;
-    fn id(&self) -> String;
-}
-
-const MAX_JSON_QUESTION_SIZE: usize = 10 * 1024 * 1024; // 10MB
-pub async fn serve_qa_from_stream(mut stream: Box<dyn AsyncStream>, server: Arc<dyn QAServer>, info: StreamInfo) -> ServerResult<()> {
-    // 增量读取并解析 JSON，直到成功解析出完整的 JSON 对象
-    // 这种方式可以处理网速慢、数据分片到达的情况
-    let mut buffer = Vec::new();
-    let mut temp_buf = [0u8; 4096]; // 每次读取 4KB
-    
-    let request: serde_json::Value = loop {
-        // 从流中读取数据块
-        match stream.read(&mut temp_buf).await {
-            Ok(0) => {
-                // 连接关闭，尝试解析已有的数据
-                if buffer.is_empty() {
-                    error!("Connection closed before receiving any data from {}", 
-                           info.src_addr.as_deref().unwrap_or("unknown"));
-                    return Err(server_err!(ServerErrorCode::StreamError, "Connection closed before receiving data"));
-                }
-                
-                // 尝试解析
-                match serde_json::from_slice::<serde_json::Value>(&buffer) {
-                    Ok(req) => break req,
-                    Err(e) => {
-                        error!("Failed to parse incomplete JSON from {}: {}", 
-                               info.src_addr.as_deref().unwrap_or("unknown"), e);
-                        
-                        let error_response = serde_json::json!({
-                            "error": "Invalid JSON",
-                            "message": format!("Incomplete or invalid JSON: {}", e)
-                        });
-                        
-                        if let Ok(response_str) = serde_json::to_string(&error_response) {
-                            let _ = stream.write_all(response_str.as_bytes()).await;
-                            let _ = stream.flush().await;
-                        }
-                        
-                        return Err(server_err!(ServerErrorCode::InvalidData, "Invalid JSON: {}", e));
-                    }
-                }
-            }
-            Ok(n) => {
-                // 追加读取的数据到缓冲区
-                buffer.extend_from_slice(&temp_buf[..n]);
-                
-                // 尝试解析当前缓冲区中的数据
-                match serde_json::from_slice::<serde_json::Value>(&buffer) {
-                    Ok(req) => {
-                        // 成功解析出完整的 JSON
-                        break req;
-                    }
-                    Err(e) => {
-                        // 如果是 EOF 错误，说明 JSON 不完整，继续读取
-                        if e.is_eof() {
-                            continue;
-                        }
-                        
-                        // 如果是其他错误，可能是 JSON 格式错误
-                        // 但也可能只是数据还没传输完，继续尝试
-                        // 设置一个合理的大小限制，防止无限读取
-                        if buffer.len() > MAX_JSON_QUESTION_SIZE {  // 10MB 限制
-                            error!("JSON data too large (>10MB) from {}", 
-                                   info.src_addr.as_deref().unwrap_or("unknown"));
-                            
-                            let error_response = serde_json::json!({
-                                "error": "Invalid JSON",
-                                "message": "JSON data too large"
-                            });
-                            
-                            if let Ok(response_str) = serde_json::to_string(&error_response) {
-                                let _ = stream.write_all(response_str.as_bytes()).await;
-                                let _ = stream.flush().await;
-                            }
-                            
-                            return Err(server_err!(ServerErrorCode::InvalidData, "JSON too large"));
-                        }
-                        
-                        // 继续读取更多数据
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Error reading from stream: {}", e);
-                return Err(server_err!(ServerErrorCode::StreamError, "Error reading from stream: {}", e));
-            }
-        }
-    };
-    
-    let response = server.serve_question(&request).await;
-    match response {
-        Ok(response) => {
-            let response_str = serde_json::to_string(&response).map_err(|e| server_err!(ServerErrorCode::EncodeError, "Failed to serialize response: {}", e))?;
-            stream.write_all(response_str.as_bytes()).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "Failed to write response: {}", e))?;
-            stream.flush().await.map_err(|e| server_err!(ServerErrorCode::StreamError, "Failed to flush stream: {}", e))?;
-            return Ok(())
-        }
-        Err(e) => {
-            stream.shutdown().await.map_err(|e| server_err!(ServerErrorCode::StreamError, "Failed to shutdown stream: {}", e))?;
-            return Err(server_err!(ServerErrorCode::StreamError, "Error serving question: {}", e));
-        }
-    }
-
-}
 
 #[derive(Default, Debug, Clone)]
 pub struct StreamInfo {
