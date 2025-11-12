@@ -77,7 +77,7 @@ pub async fn datagram_forward(datagram: Box<dyn DatagramClientBox>, target: &str
     Ok(())
 }
 
-#[warn(unreachable_code)]
+#[allow(unreachable_code)]
 pub async fn copy_datagram_bidirectional(a: Box<dyn DatagramClientBox>, b: Box<dyn DatagramClientBox>) -> Result<(), std::io::Error> {
     let recv = {
         let a = a.clone();

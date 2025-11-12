@@ -17,6 +17,7 @@ use jsonwebtoken::jwk::Jwk;
 use kRPC::RPCSessionToken;
 use serde::Serialize;
 use serde_json::Value;
+use sfo_js::{js_value, JsEngine, JsString, JsValue};
 use sha2::Digest;
 use crate::cyfs_cmd_client::{cmd_err, into_cmd_err};
 use crate::cyfs_cmd_server::{CmdErrorCode, CmdResult, CyfsCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
@@ -623,13 +624,31 @@ impl GatewayCmdHandler {
         self.gateway.lock().unwrap().clone()
     }
 
-    async fn run_external_cmd(&self, cmd: &str, params: &str) -> CmdResult<String> {
-        let python_cmd = format!("python \"{}\" {}", cmd, params);
-        let data = sfo_io::execute(python_cmd.as_str()).await
-            .map_err(into_cmd_err!(CmdErrorCode::RunPythonFailed))?;
-        let resp = String::from_utf8_lossy(data.as_slice()).to_string();
-        log::info!("cmd {} params {} resp {}", cmd, params, resp);
-        Ok(resp)
+    async fn run_external_cmd(&self, cmd: impl Into<String>, params: impl Into<String>) -> CmdResult<String> {
+        let cmd = cmd.into();
+        let params = params.into();
+
+        tokio::spawn(async move {
+            let mut js_engine = JsEngine::builder()
+                .enable_fetch(false)
+                .build()
+                .map_err(into_cmd_err!(CmdErrorCode::RunJsFailed))?;
+            js_engine.eval_file(Path::new(cmd.as_str()))
+                .map_err(into_cmd_err!(CmdErrorCode::RunJsFailed))?;
+
+            let args: Vec<JsValue> = if let Some(args) = shlex::split(params.as_str()) {
+                args.into_iter().map(|arg| JsValue::from(JsString::from(arg))).collect()
+            } else {
+                vec![]
+            };
+            let result = js_engine.call("main", args)
+                .map_err(into_cmd_err!(CmdErrorCode::RunJsFailed))?;
+            if result.is_string() {
+                Ok(result.as_string().unwrap().as_str().to_std_string_lossy())
+            } else {
+                Err(cmd_err!(CmdErrorCode::RunJsFailed, "result {:?}", result))
+            }
+        }).await.map_err(into_cmd_err!(CmdErrorCode::Failed))?
     }
 }
 
@@ -931,7 +950,7 @@ impl LocalExternalCmdStore {
 #[async_trait::async_trait]
 impl ExternalCmdStore for LocalExternalCmdStore {
     async fn read_external_cmd(&self, cmd: &str) -> CmdResult<String> {
-        let path = self.cmd_path.join(format!("{}.py", cmd));
+        let path = self.cmd_path.join(format!("{}.js", cmd));
         if !path.exists() {
             return Err(cmd_err!(CmdErrorCode::UnknownCmd, "unknown cmd {}", cmd));
         }

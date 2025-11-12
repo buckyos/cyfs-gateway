@@ -21,7 +21,7 @@ pub enum CmdErrorCode {
     CreateTokenFailed,
     NotSupportLogin,
     ReadFileFailed,
-    RunPythonFailed,
+    RunJsFailed,
     InvalidConfigType,
     ConfigNotFound,
     InvalidParams,
@@ -281,6 +281,7 @@ impl InnerHttpService for CyfsCmdServer {
         }.await;
 
         ret.unwrap_or_else(|_e| {
+            log::error!("cmd server handle error: {:?}", _e);
             let resp = Response::builder()
                 .status(http::StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Full::new(Bytes::new())

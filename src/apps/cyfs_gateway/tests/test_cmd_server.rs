@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use buckyos_kit::init_logging;
     use jsonwebtoken::{DecodingKey, EncodingKey};
@@ -66,7 +67,7 @@ mod tests {
 
     impl TempExternalCmdStore {
         pub fn new() -> Self {
-            let mut test_cmd = tempfile::NamedTempFile::with_suffix(".py").unwrap();
+            let mut test_cmd = tempfile::NamedTempFile::with_suffix(".js").unwrap();
             let cmd = r#"
 print("hello python")
             "#;
@@ -113,6 +114,7 @@ print("hello python")
         let server_manager = Arc::new(ServerManager::new());
         let global_process_chains = Arc::new(GlobalProcessChains::new());
         let inner_service_manager = Arc::new(InnerServiceManager::new());
+        let acme_manager = AcmeCertManager::create(CertManagerConfig::default()).await.unwrap();
 
         let factory = GatewayFactory::new(
             server_manager.clone(),
@@ -120,6 +122,7 @@ print("hello python")
             connect_manager.clone(),
             tunnel_manager.clone(),
             inner_service_manager.clone(),
+            acme_manager.clone(),
         );
         factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
             server_manager.clone(),
@@ -138,12 +141,14 @@ print("hello python")
             global_process_chains.clone(),
             connect_manager.clone(),
             tunnel_manager.clone(),
+            acme_manager.clone(),
         )));
         factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
             server_manager.clone(),
             global_process_chains.clone(),
             connect_manager.clone(),
             tunnel_manager.clone(),
+            acme_manager.clone(),
         )));
         factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
             server_manager.clone(),
@@ -163,7 +168,7 @@ print("hello python")
             Some("123456".to_string()),
             store).await.unwrap();
         let cmd_store = TempExternalCmdStore::new();
-        let handler = GatewayCmdHandler::new(Arc::new(cmd_store));
+        let handler = GatewayCmdHandler::new(Arc::new(cmd_store), PathBuf::new(), parser);
         factory.register_inner_service_factory(
             "cmd_server",
             Arc::new(CyfsCmdServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
