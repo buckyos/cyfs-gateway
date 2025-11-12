@@ -1,0 +1,93 @@
+mods:
+  - id: web3_sn
+    type: cyfs-sn
+    config: 
+      main_host: "sn.web3.buckyos.ai"
+
+servers:
+  - id: main_dns
+    type: dns
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              return "inner_service web3_sn";
+
+  - id: main_http
+    type: http
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              return "inner_service web3_sn";
+  - id: main_sn
+    type: qa_server
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              return "inner_service web3_sn";
+
+stacks:
+  - id: main_rtcp
+    bind: 0.0.0.0:2980
+    protocol: rtcp
+    device_config: ./rootfs/etc/device.doc.json
+    device_private_key: ./rootfs/etc/device.key.pem
+    hook_point:
+      - id: new_tunnel # 确保只有授权的设备才能与sn keep tunnel成功
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              set ${REQ.method} "query_by_did";
+              call qa web3_sn;
+              match $(ANSWER.result) "0" || reject;
+              accept;
+
+  - id: tls_forward
+    bind: 0.0.0.0:443
+    protocol: tls
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              set ${REQ.method} "query_by_host";
+              call https-sni-probe && call qa web3_sn;
+              match $(ANSWER.result) "0" || reject;
+              match $(ANSWER.self_cert) "true" && return "forward rtcp://${ANSWER.ood_did}/:443";
+              return "http_server main_http";
+  
+  - id: http_forward
+    bind: 0.0.0.0:80
+    protocol: tcp
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              set ${REQ.method} "query_by_host";
+              call http-probe && call qa web3_sn;
+              match $(ANSWER.result) "0" || reject;
+              strlen $(ANSWER.ood_did) "true" && return "forward rtcp://${ANSWER.ood_did}/:80";
+              return "http_server main_http";
+
+  - id: dns
+    bind: 0.0.0.0:53
+    protocol: udp
+    hook_point:
+      - id: main
+        priority: 1
+        blocks:
+          - id: default
+            block: |
+              return "server main_dns";
