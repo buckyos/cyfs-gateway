@@ -11,6 +11,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use cyfs_process_chain::{CollectionValue, EnvRef, MapCollection, MapCollectionTraverseCallBackRef, TraverseGuard, VariableVisitor, VariableVisitorWrapperForMapCollection, HTTP_REQUEST_HEADER_VARS};
+use crate::server::dns_server::NameServer;
 use crate::{server_err, ProcessChainConfig, ServerError, ServerErrorCode, ServerResult, QAServer};
 
 pub trait ServerConfig: AsAny + Send + Sync {
@@ -65,20 +66,46 @@ impl ServerFactory for CyfsServerFactory {
 
 #[derive(Clone)]
 pub enum Server {
-    Http(Arc<dyn HttpServer>),
     Stream(Arc<dyn StreamServer>),
     Datagram(Arc<dyn DatagramServer>),
+    
     QA(Arc<dyn QAServer>),
+    NameServer(Arc<dyn NameServer>),
+    Http(Arc<dyn HttpServer>),
 }
 
 impl Server {
+    /// 获取 server 的基础 id（不含类型后缀）
     pub fn id(&self) -> String {
         match self {
             Server::Http(server) => server.id(),
             Server::Stream(server) => server.id(),
             Server::Datagram(server) => server.id(),
             Server::QA(server) => server.id(),
+            Server::NameServer(server) => server.id(),
         }
+    }
+
+    /// 获取 server 的 trait 类型名称
+    pub fn trait_type(&self) -> &'static str {
+        match self {
+            Server::Http(_) => "http",
+            Server::Stream(_) => "stream",
+            Server::Datagram(_) => "datagram",
+            Server::QA(_) => "qa",
+            Server::NameServer(_) => "ns",
+        }
+    }
+
+    /// 获取完整的 server key: $id.$trait_type
+    /// 例如: "my-server.http", "my-server.stream"
+    pub fn full_key(&self) -> String {
+        format!("{}.{}", self.id(), self.trait_type())
+    }
+
+    /// 根据 trait 类型构建完整 key
+    pub fn build_key(id: &str, trait_type: &str) -> String {
+        format!("{}.{}", id, trait_type)
     }
 }
 
@@ -393,6 +420,7 @@ pub trait DatagramServer: Send + Sync + 'static {
 }
 
 pub struct ServerManager {
+    // key 格式: "$id.$trait_type", 例如 "my-server.http", "my-server.stream"
     servers: Mutex<HashMap<String, Server>>
 }
 
@@ -402,25 +430,163 @@ impl ServerManager {
             servers: Mutex::new(HashMap::new()),
         }
     }
+
+    /// 添加 server，使用 full_key 作为存储键
+    /// 同一个 id 的 server 可以注册多个不同的 trait 类型
     pub fn add_server(&self, server: Server) -> ServerResult<()> {
-        if self.get_server(server.id().as_str()).is_some() {
-            return Err(server_err!(ServerErrorCode::AlreadyExists, "Server {} already exists", server.id().as_str()));
+        let full_key = server.full_key();
+        
+        if self.get_server_by_key(&full_key).is_some() {
+            return Err(server_err!(
+                ServerErrorCode::AlreadyExists, 
+                "Server {} already exists", 
+                full_key
+            ));
         }
 
-        self.servers.lock().unwrap().insert(server.id(), server);
+        self.servers.lock().unwrap().insert(full_key, server);
         Ok(())
     }
 
-    pub fn get_server(&self, name: &str) -> Option<Server> {
-        self.servers.lock().unwrap().get(name).cloned()
+    /// 通过完整 key 获取 server: "$id.$trait_type"
+    pub fn get_server_by_key(&self, key: &str) -> Option<Server> {
+        self.servers.lock().unwrap().get(key).cloned()
     }
 
+    /// 通过 id 和 trait_type 获取 server
+    pub fn get_server_by_type(&self, id: &str, trait_type: &str) -> Option<Server> {
+        let key = if id.contains(".") {
+            id.to_string()
+        } else {
+            Server::build_key(id, trait_type)
+        };
+  
+        let result = self.get_server_by_key(&key);
+        if result.is_none() {
+            return None;
+        }
+        let result = result.unwrap();
+        if result.trait_type() == trait_type {
+            return Some(result);
+        }
+
+        None
+    }
+
+    pub fn get_http_server(&self, id: &str) -> Option<Arc<dyn HttpServer>> {
+        let server = self.get_server_by_type(id, "http");
+        if server.is_none() {
+            return None;
+        }
+        let server = server.unwrap();
+        match server {
+            Server::Http(server) => Some(server.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn get_stream_server(&self, id: &str) -> Option<Arc<dyn StreamServer>> {
+        let server = self.get_server_by_type(id, "stream");
+        if server.is_none() {
+            return None;
+        }
+        let server = server.unwrap();
+        match server {
+            Server::Stream(server) => Some(server.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn get_datagram_server(&self, id: &str) -> Option<Arc<dyn DatagramServer>> {
+        let server = self.get_server_by_type(id, "datagram");
+        if server.is_none() {
+            return None;
+        }
+        let server = server.unwrap();
+        match server {
+            Server::Datagram(server) => Some(server.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn get_qa_server(&self, id: &str) -> Option<Arc<dyn QAServer>> {
+        let server = self.get_server_by_type(id, "qa");
+        if server.is_none() {
+            return None;
+        }
+        let server = server.unwrap();
+        match server {
+            Server::QA(server) => Some(server.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn get_name_server(&self, id: &str) -> Option<Arc<dyn NameServer>> {
+        let server = self.get_server_by_type(id, "ns");
+        if server.is_none() {
+            return None;
+        }
+        let server = server.unwrap();
+        match server {
+            Server::NameServer(server) => Some(server.clone()),
+            _ => None,
+        }
+    }   
+    /// 兼容旧接口：通过 id 获取第一个匹配的 server
+    /// 如果一个 id 注册了多个 trait，返回任意一个
+    pub fn get_server(&self, id: &str) -> Option<Server> {
+        let servers = self.servers.lock().unwrap();
+        let prefix = format!("{}.", id);
+        
+        // 先尝试精确匹配（向后兼容没有使用 full_key 的旧代码）
+        if let Some(server) = servers.get(id) {
+            return Some(server.clone());
+        }
+
+        // 再尝试前缀匹配
+        servers.iter()
+            .find(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, server)| server.clone())
+    }
+
+    /// 获取某个 id 的所有 trait 实现
+    pub fn get_all_servers_by_id(&self, id: &str) -> Vec<Server> {
+        let servers = self.servers.lock().unwrap();
+        let prefix = format!("{}.", id);
+        
+        servers.iter()
+            .filter(|(key, _)| key.starts_with(&prefix) || key.as_str() == id)
+            .map(|(_, server)| server.clone())
+            .collect()
+    }
+
+    /// 获取所有 server 的完整列表
+    pub fn get_all_servers(&self) -> Vec<Server> {
+        self.servers.lock().unwrap().values().cloned().collect()
+    }
+
+    /// 替换 server（使用 full_key）
     pub fn replace_server(&self, server: Server) {
-        self.servers.lock().unwrap().insert(server.id(), server);
+        let full_key = server.full_key();
+        self.servers.lock().unwrap().insert(full_key, server);
     }
 
+    /// 删除指定的 server
+    pub fn remove_server(&self, key: &str) -> Option<Server> {
+        self.servers.lock().unwrap().remove(key)
+    }
+
+    /// 删除某个 id 的所有 server
+    pub fn remove_servers_by_id(&self, id: &str) {
+        let prefix = format!("{}.", id);
+        self.servers.lock().unwrap().retain(|key, _| {
+            !key.starts_with(&prefix) && key.as_str() != id
+        });
+    }
+
+    /// 保留满足条件的 server (key 为完整的 full_key)
     pub fn retain(&self, f: impl Fn(&str) -> bool) {
-        self.servers.lock().unwrap().retain(|id, _| f(id.as_str()));
+        self.servers.lock().unwrap().retain(|key, _| f(key.as_str()));
     }
 }
 

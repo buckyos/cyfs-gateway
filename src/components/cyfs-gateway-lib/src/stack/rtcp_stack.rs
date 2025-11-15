@@ -548,6 +548,8 @@ impl StackFactory for RtcpStackFactory {
             .downcast_ref::<RtcpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
 
+        
+
         let private_key = load_raw_private_key(Path::new(config.key_path.as_str()))
             .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "load private key {} failed", config.key_path))?;
         let public_key = encode_ed25519_pkcs8_sk_to_pk(&private_key);

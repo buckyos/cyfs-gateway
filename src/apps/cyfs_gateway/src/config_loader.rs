@@ -1,4 +1,4 @@
-use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, InnerServiceConfig, ProcessChainConfigs, ProcessChainHttpServerConfig, QAServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig, config_err};
+use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig, config_err};
 use cyfs_socks::SocksServerConfig;
 use cyfs_sn::*;
 use std::collections::HashMap;
@@ -208,23 +208,6 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for CyfsServer
     }
 }
 
-pub struct QAServerConfigParser {}
-
-impl QAServerConfigParser {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for QAServerConfigParser {
-    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = QAServerConfig::deserialize(de.clone())
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid qa server config.{}\n{}",
-                e,
-                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
-        Ok(Arc::new(config))
-    }
-}
 
 pub struct HttpServerConfigParser {}
 
@@ -283,46 +266,11 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for SocksServe
     }
 }
 
-pub trait InnerServiceConfigParser<D: for<'de> Deserializer<'de>>: Send + Sync {
-    fn parse(&self, de: D) -> ConfigResult<Arc<dyn InnerServiceConfig>>;
-}
 
-pub struct CyfsInnerServiceConfigParser<D: for<'de> Deserializer<'de>> {
-    inner_service_config_parser: Mutex<HashMap<String, Arc<dyn InnerServiceConfigParser<D>>>>,
-}
 
-impl<D: for<'de> Deserializer<'de>> CyfsInnerServiceConfigParser<D> {
-    pub fn new() -> Self {
-        Self {
-            inner_service_config_parser: Mutex::new(HashMap::new()),
-        }
-    }
-    pub fn register(&self, service_type: &str, parser: Arc<dyn InnerServiceConfigParser<D>>) {
-        self.inner_service_config_parser.lock().unwrap().insert(service_type.to_string(), parser);
-    }
-}
 
-#[derive(Serialize, Deserialize)]
-pub struct InnerServiceConfigType {
-    #[serde(rename = "type")]
-    ty: String,
-}
 
-impl<D: for<'de> Deserializer<'de> + Clone> InnerServiceConfigParser<D> for CyfsInnerServiceConfigParser<D> {
-    fn parse(&self, de: D) -> ConfigResult<Arc<dyn InnerServiceConfig>> {
-        let service_type = InnerServiceConfigType::deserialize(de.clone())
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid inner service config.{}\n{}",
-                e,
-                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
-        let parser = {
-            self.inner_service_config_parser.lock().unwrap().get(&service_type.ty).cloned()
-        };
-        if parser.is_none() {
-            return Err(config_err!(ConfigErrorCode::InvalidConfig, "unknown inner service type: {}", service_type.ty));
-        }
-        parser.unwrap().parse(de)
-    }
-}
+
 
 pub struct LocalDnsConfigParser {}
 
@@ -332,8 +280,8 @@ impl LocalDnsConfigParser {
     }
 }
 
-impl<D: for<'de> Deserializer<'de> + Clone> InnerServiceConfigParser<D> for LocalDnsConfigParser {
-    fn parse(&self, de: D) -> ConfigResult<Arc<dyn InnerServiceConfig>> {
+impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for LocalDnsConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
         let config = LocalDnsConfig::deserialize(de.clone())
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid local dns config.{:?}\n{}",
                 e,
@@ -351,8 +299,8 @@ impl SNServerConfigParser {
     }
 }
 
-impl<D: for<'de> Deserializer<'de> + Clone> InnerServiceConfigParser<D> for SNServerConfigParser {
-    fn parse(&self, de: D) -> ConfigResult<Arc<dyn InnerServiceConfig>> {
+impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for SNServerConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
         let config = SNServerConfig::deserialize(de.clone())
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid sn server config.{:?}\n{}",
                 e,
@@ -365,7 +313,7 @@ impl<D: for<'de> Deserializer<'de> + Clone> InnerServiceConfigParser<D> for SNSe
 pub struct GatewayConfigParser {
     stack_config_parser: CyfsStackConfigParser<serde_json::Value>,
     server_config_parser: CyfsServerConfigParser<serde_json::Value>,
-    inner_service_config_parser: CyfsInnerServiceConfigParser<serde_json::Value>,
+
 }
 
 impl GatewayConfigParser {
@@ -374,11 +322,10 @@ impl GatewayConfigParser {
 
         let cyfs_server_parser = CyfsServerConfigParser::new();
 
-        let inner_service_parser = CyfsInnerServiceConfigParser::new();
+
         GatewayConfigParser {
             stack_config_parser: cyfs_stack_parser,
             server_config_parser: cyfs_server_parser,
-            inner_service_config_parser: inner_service_parser,
         }
     }
 
@@ -388,10 +335,6 @@ impl GatewayConfigParser {
 
     pub fn register_server_config_parser(&self, server_type: &str, parser: Arc<dyn ServerConfigParser<serde_json::Value>>) {
         self.server_config_parser.register(server_type, parser);
-    }
-
-    pub fn register_inner_service_config_parser(&self, service_type: &str, parser: Arc<dyn InnerServiceConfigParser<serde_json::Value>>) {
-        self.inner_service_config_parser.register(service_type, parser);
     }
 
     pub fn parse(&self, json_value: serde_json::Value) -> ConfigResult<GatewayConfig> {
@@ -415,15 +358,6 @@ impl GatewayConfigParser {
             }
         }
 
-        let mut inner_services = vec![];
-        if let Some(inner_services_value) = json_value.get("inner_services") {
-            let inner_services_value_list = inner_services_value.as_array()
-                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid servers config.\n{}",
-                    serde_json::to_string_pretty(inner_services_value).unwrap()))?;
-            for inner_service_value in inner_services_value_list {
-                inner_services.push(self.inner_service_config_parser.parse(inner_service_value.clone())?);
-            }
-        }
 
         let mut global_process_chains = vec![];
         if let Some(global_chains_value) = json_value.get("global_process_chains") {
@@ -450,7 +384,6 @@ impl GatewayConfigParser {
             acme_config,
             stacks,
             servers,
-            inner_services,
             global_process_chains,
         })
     }
@@ -470,6 +403,5 @@ pub struct GatewayConfig {
     pub acme_config: Option<AcmeConfig>,
     pub stacks: Vec<Arc<dyn StackConfig>>,
     pub servers: Vec<Arc<dyn ServerConfig>>,
-    pub inner_services: Vec<Arc<dyn InnerServiceConfig>>,
     pub global_process_chains: ProcessChainConfigs,
 }

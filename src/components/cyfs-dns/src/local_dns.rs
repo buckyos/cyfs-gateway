@@ -1,10 +1,11 @@
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
+use cyfs_gateway_lib::{NameServer, ProcessChainConfig, Server, ServerConfig, ServerFactory};
 use name_client::{LocalConfigDnsProvider, NameInfo, NsProvider, RecordType};
 use name_lib::{EncodedDocument, DID};
 use serde::{Deserialize, Serialize};
-use cyfs_gateway_lib::{into_service_err, service_err, InnerDnsService, InnerService, InnerServiceConfig, InnerServiceFactory, ServiceErrorCode, ServiceResult};
+use cyfs_gateway_lib::{into_server_err, server_err, ServerErrorCode, ServerResult};
 
 pub struct LocalDns {
     id: String,
@@ -12,29 +13,29 @@ pub struct LocalDns {
 }
 
 impl LocalDns {
-    pub fn create(id: String, local_config: String) -> ServiceResult<Self> {
+    pub fn create(id: String, local_config: String) -> ServerResult<Self> {
         Ok(LocalDns {
             id,
             local_provider: LocalConfigDnsProvider::new(Path::new(local_config.as_str()))
-                .map_err(into_service_err!(ServiceErrorCode::InvalidConfig, "{}", local_config))?,
+                .map_err(into_server_err!(ServerErrorCode::InvalidConfig, "{}", local_config))?,
         })
     }
 }
 
 #[async_trait::async_trait]
-impl InnerDnsService for LocalDns {
+impl NameServer for LocalDns {
     fn id(&self) -> String {
         self.id.clone()
     }
 
-    async fn query(&self, name: &str, record_type: Option<RecordType>, from_ip: Option<IpAddr>) -> ServiceResult<NameInfo> {
+    async fn query(&self, name: &str, record_type: Option<RecordType>, from_ip: Option<IpAddr>) -> ServerResult<NameInfo> {
         self.local_provider.query(name, record_type, from_ip).await
-            .map_err(into_service_err!(ServiceErrorCode::DnsQueryError))
+            .map_err(into_server_err!(ServerErrorCode::DnsQueryError))
     }
 
-    async fn query_did(&self, did: &DID, fragment: Option<&str>, from_ip: Option<IpAddr>) -> ServiceResult<EncodedDocument> {
+    async fn query_did(&self, did: &DID, fragment: Option<&str>, from_ip: Option<IpAddr>) -> ServerResult<EncodedDocument> {
         self.local_provider.query_did(did, fragment, from_ip).await
-            .map_err(into_service_err!(ServiceErrorCode::DnsQueryError))
+            .map_err(into_server_err!(ServerErrorCode::DnsQueryError))
     }
 }
 
@@ -46,17 +47,33 @@ pub struct LocalDnsConfig {
     path: String,
 }
 
-impl InnerServiceConfig for LocalDnsConfig {
+impl ServerConfig for LocalDnsConfig {
     fn id(&self) -> String {
         self.id.clone()
     }
 
-    fn service_type(&self) -> String {
+    fn server_type(&self) -> String {
         "local_dns".to_string()
     }
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+
+    fn add_pre_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
+        unimplemented!();
+    }
+
+    fn remove_pre_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig> {
+        unimplemented!();
+    }
+    
+    fn add_post_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
+        unimplemented!();
+    }
+
+    fn remove_post_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig> {
+        unimplemented!();
     }
 }
 
@@ -73,18 +90,18 @@ impl LocalDnsFactory {
 }
 
 #[async_trait::async_trait]
-impl InnerServiceFactory for LocalDnsFactory {
-    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<Vec<InnerService>> {
+impl ServerFactory for LocalDnsFactory {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
         let config = config.as_any().downcast_ref::<LocalDnsConfig>()
-            .ok_or(service_err!(ServiceErrorCode::InvalidConfig, "invalid CyfsCmdServer config {}", config.service_type()))?;
+            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid local dns config {}", config.get_config_json()))?;
         
         let path = Path::new(config.path.as_str());
         if path.is_absolute() {
-            Ok(vec![InnerService::DnsService(Arc::new(LocalDns::create(config.id.clone(), config.path.clone())?))])
+            Ok(Server::NameServer(Arc::new(LocalDns::create(config.id.clone(), config.path.clone())?)))
         } else {
             let path = Path::new(self.config_path.as_str()).join(config.path.as_str()).canonicalize()
-                .map_err(into_service_err!(ServiceErrorCode::InvalidConfig, "invalid local dns config {}", config.path))?;
-            Ok(vec![InnerService::DnsService(Arc::new(LocalDns::create(config.id.clone(), path.to_string_lossy().to_string())?))])
+                .map_err(into_server_err!(ServerErrorCode::InvalidConfig, "invalid local dns config {}", config.path))?;
+            Ok(Server::NameServer(Arc::new(LocalDns::create(config.id.clone(), path.to_string_lossy().to_string())?)))
         }
     }
 }

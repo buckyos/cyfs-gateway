@@ -154,6 +154,7 @@ pub fn get_dest_info_from_url_path(path: &str) -> Result<(Option<String>, u16), 
 mod tests {
     use super::*;
     use percent_encoding::percent_decode_str;
+    use url::Url;
     #[test]
     fn test_get_dest_info_from_url_path() {
         unsafe {

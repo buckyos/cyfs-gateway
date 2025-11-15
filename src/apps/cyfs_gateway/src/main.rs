@@ -28,8 +28,11 @@ use cyfs_tun::TunStackFactory;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
-    let config_json = load_config_from_file(config_file).await?;
+async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
+    let mut config_json = load_config_from_file(config_file).await?;
+    let base_dir = PathBuf::from(config_file.parent().unwrap());
+    normalize_all_path_value_config(&mut config_json,&base_dir);
+    info!("Gateway config: {}", serde_json::to_string_pretty(&config_json).unwrap());
 
     let config_dir = config_file.parent().ok_or_else(|| {
         let msg = format!("cannot get config dir: {:?}", config_file);
@@ -68,11 +71,10 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
     parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
     parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
     parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
-    parser.register_server_config_parser("qa", Arc::new(QAServerConfigParser::new()));
 
-    parser.register_inner_service_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
-    parser.register_inner_service_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
-    parser.register_inner_service_config_parser("sn", Arc::new(SNServerConfigParser::new()));
+    parser.register_server_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
+    parser.register_server_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
+    parser.register_server_config_parser("sn", Arc::new(SNServerConfigParser::new()));
 
     let load_result = parser.parse(config_json);
     if load_result.is_err() {
@@ -86,7 +88,7 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
     let tunnel_manager = TunnelManager::new();
     let server_manager = Arc::new(ServerManager::new());
     let global_process_chains = Arc::new(GlobalProcessChains::new());
-    let inner_service_manager = Arc::new(InnerServiceManager::new());
+
 
     let mut cert_config = CertManagerConfig::default();
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
@@ -119,7 +121,6 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
         global_process_chains.clone(),
         connect_manager.clone(),
         tunnel_manager.clone(),
-        inner_service_manager.clone(),
         cert_manager.clone()
     );
     factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
@@ -162,21 +163,17 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
     )));
 
     factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
-        inner_service_manager.clone(),
+        server_manager.clone(),
         global_process_chains.clone(),
     )));
 
-    factory.register_server_factory("qa", Arc::new(ProcessChainQAServerFactory::new(
-        inner_service_manager.clone(),
-        global_process_chains.clone(),
-    )));
 
     factory.register_server_factory("socks", Arc::new(SocksServerFactory::new(
         global_process_chains.clone(),
     )));
 
     factory.register_server_factory("dns", Arc::new(ProcessChainDnsServerFactory::new(
-        inner_service_manager.clone(),
+        server_manager.clone(),
         global_process_chains.clone(),
     )));
 
@@ -196,13 +193,13 @@ async fn service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
         Arc::new(external_cmd_store),
         config_file.to_path_buf(),
         parser);
-    factory.register_inner_service_factory(
+    factory.register_server_factory(
         "cmd_server",
         Arc::new(CyfsCmdServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
-    factory.register_inner_service_factory(
+    factory.register_server_factory(
         "local_dns",
         Arc::new(LocalDnsFactory::new(config_dir.to_string_lossy().to_string())));
-    factory.register_inner_service_factory(
+    factory.register_server_factory(
         "sn",
         Arc::new(SNServerFactory::new())
     );
@@ -256,11 +253,12 @@ fn get_config_file_path(matches: &clap::ArgMatches) -> PathBuf {
     let config_file = matches.get_one::<String>("config_file");
     let real_config_file;
     if config_file.is_none() {
+        
         real_config_file = default_config;
     } else {
         real_config_file = PathBuf::from(config_file.unwrap());
     }
-
+    set_gateway_main_config_dir(&real_config_file);
     real_config_file
 }
 
@@ -701,7 +699,7 @@ async fn main() {
             .collect(),
     };
 
-    if let Err(e) = service_main(config_file.as_path(), params).await {
+    if let Err(e) = gateway_service_main(config_file.as_path(), params).await {
         error!("Gateway run error: {}", e);
     }
 

@@ -1,10 +1,10 @@
-mods:
+servers:
   - id: web3_sn
-    type: cyfs-sn
+    type: sn
     config: 
       main_host: "sn.web3.buckyos.ai"
 
-servers:
+
   - id: main_dns
     type: dns
     hook_point:
@@ -13,26 +13,27 @@ servers:
         blocks:
           - id: default
             block: |
-              return "inner_service web3_sn";
+              return "server web3_sn";
 
-  - id: main_http
-    type: http
-    hook_point:
-      - id: main
-        priority: 1
-        blocks:
-          - id: default
-            block: |
-              return "inner_service web3_sn";
-  - id: main_sn
-    type: qa
-    hook_point:
-      - id: main
-        priority: 1
-        blocks:
-          - id: default
-            block: |
-              return "inner_service web3_sn";
+  # - id: main_http
+  #   type: http
+  #   hook_point:
+  #     - id: main
+  #       priority: 1
+  #       blocks:
+  #         - id: default
+  #           block: |
+  #             return "inner_service web3_sn";
+              
+  # - id: main_sn
+  #   type: qa
+  #   hook_point:
+  #     - id: main
+  #       priority: 1
+  #       blocks:
+  #         - id: default
+  #           block: |
+  #             return "inner_service web3_sn";
 
 stacks:
   - id: main_rtcp
@@ -51,7 +52,7 @@ stacks:
               match $(ANSWER.result) "0" || reject;
               accept;
 
-  - id: tls_forward
+  - id: tls_raw_forward
     bind: 0.0.0.0:443
     protocol: tcp
     hook_point:
@@ -66,22 +67,22 @@ stacks:
               match $(ANSWER.self_cert) "true" && return "forward rtcp://${ANSWER.ood_did}/:443";
               reject;
   
-  - id: http_forward
-    bind: 0.0.0.0:80
-    protocol: tcp
-    hook_point:
-      - id: main
-        priority: 1
-        blocks:
-          - id: default
-            block: |
-              set ${REQ.method} "query_by_host";
-              call http-probe && call qa web3_sn;
-              match $(ANSWER.result) "0" || reject;
-              strlen $(ANSWER.ood_did) "true" && return "forward rtcp://${ANSWER.ood_did}/:80";
-              return "http_server main_http";
+  # - id: http_forward
+  #   bind: 0.0.0.0:80
+  #   protocol: tcp
+  #   hook_point:
+  #     - id: main
+  #       priority: 1
+  #       blocks:
+  #         - id: default
+  #           block: |
+  #             set ${REQ.method} "query_by_host";
+  #             call http-probe && call qa web3_sn;
+  #             match $(ANSWER.result) "0" || reject;
+  #             strlen $(ANSWER.ood_did) "true" && return "forward rtcp://${ANSWER.ood_did}/:80";
+  #             return "http_server main_http";
 
-  - id: dns
+  - id: udp_dns
     bind: 0.0.0.0:53
     protocol: udp
     hook_point:

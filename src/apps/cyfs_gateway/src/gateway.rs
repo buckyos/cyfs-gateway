@@ -38,7 +38,7 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Val
             anyhow::anyhow!(msg)
         })?;
 
-    info!("Gateway config: {}", serde_json::to_string_pretty(&config_json).unwrap());
+    info!("Gateway main config: {}", serde_json::to_string_pretty(&config_json).unwrap());
 
     let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(CYFS_CMD_SERVER_CONFIG).unwrap();
     cmd_config.merge(&config_json);
@@ -52,14 +52,17 @@ pub struct GatewayParams {
 }
 
 pub struct GatewayFactory {
-    servers: ServerManagerRef,
     global_process_chains: GlobalProcessChainsRef,
+    server_factory: CyfsServerFactoryRef,
+    servers: ServerManagerRef,
+
+    stack_factory: CyfsStackFactoryRef,
+ 
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
-    inner_service_manager: InnerServiceManagerRef,
-    stack_factory: CyfsStackFactoryRef,
-    server_factory: CyfsServerFactoryRef,
-    inner_service_factory: CyfsInnerServiceFactoryRef,
+
+    //inner_service_factory: CyfsInnerServiceFactoryRef,
+    //inner_service_manager: InnerServiceManagerRef,
     acme_mgr: AcmeCertManagerRef,
 }
 
@@ -69,17 +72,14 @@ impl GatewayFactory {
         global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
-        inner_service_manager: InnerServiceManagerRef,
         acme_mgr: AcmeCertManagerRef, ) -> Self {
         Self {
             servers,
             global_process_chains,
             connection_manager,
             tunnel_manager,
-            inner_service_manager,
             stack_factory: Arc::new(CyfsStackFactory::new()),
             server_factory: Arc::new(CyfsServerFactory::new()),
-            inner_service_factory: Arc::new(CyfsInnerServiceFactory::new()),
             acme_mgr,
         }
     }
@@ -92,13 +92,6 @@ impl GatewayFactory {
         self.server_factory.register(server_type.into(), factory);
     }
 
-    pub fn register_inner_service_factory<T: Into<String>>(
-        &self,
-        service_type: T,
-        factory: Arc<dyn InnerServiceFactory>,
-    ) {
-        self.inner_service_factory.register(service_type.into(), factory);
-    }
 
     pub async fn create_gateway(
         &self,
@@ -115,11 +108,6 @@ impl GatewayFactory {
             self.servers.add_server(server)?;
         }
 
-        for inner_service_config in config.inner_services.iter() {
-            let services = self.inner_service_factory.create(inner_service_config.clone()).await?;
-            self.inner_service_manager.add_service(services)?;
-        }
-
         for process_chain_config in config.global_process_chains.iter() {
             let process_chain = process_chain_config.create_process_chain()?;
             self.global_process_chains.add_process_chain(Arc::new(process_chain))?;
@@ -130,13 +118,11 @@ impl GatewayFactory {
             stack_manager,
             tunnel_manager: self.tunnel_manager.clone(),
             server_manager: self.servers.clone(),
-            inner_service_manager: self.inner_service_manager.clone(),
             global_process_chains: self.global_process_chains.clone(),
             connection_manager: self.connection_manager.clone(),
             acme_mgr: self.acme_mgr.clone(),
             stack_factory: self.stack_factory.clone(),
             server_factory: self.server_factory.clone(),
-            inner_service_factory: self.inner_service_factory.clone(),
         })
     }
 }
@@ -146,13 +132,11 @@ pub struct Gateway {
     stack_manager: StackManagerRef,
     tunnel_manager: TunnelManager,
     server_manager: ServerManagerRef,
-    inner_service_manager: InnerServiceManagerRef,
     global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
     acme_mgr: AcmeCertManagerRef,
     stack_factory: CyfsStackFactoryRef,
     server_factory: CyfsServerFactoryRef,
-    inner_service_factory: CyfsInnerServiceFactoryRef,
 }
 
 impl Drop for Gateway {
@@ -254,15 +238,6 @@ impl Gateway {
         }
         config_value.insert("servers".to_string(), Value::Array(servers));
 
-        let mut inner_services = vec![];
-        for service in config.inner_services.iter() {
-            if service.id().as_str() == CYFS_CMD_SERVER_KEY {
-                continue;
-            }
-            let service_value: Value = serde_json::from_str(service.get_config_json().as_str())?;
-            inner_services.push(service_value);
-        }
-        config_value.insert("inner_services".to_string(), Value::Array(inner_services));
 
         let global_config = serde_json::to_value(&config.global_process_chains)?;
         config_value.insert("global_process_chains".to_string(), global_config);
@@ -290,13 +265,6 @@ impl Gateway {
                 for server in config.servers.iter() {
                     if server.id() == config_id {
                         return Ok(serde_json::from_str(server.get_config_json().as_str())?);
-                    }
-                }
-            }
-            "inner_service" => {
-                for service in config.inner_services.iter() {
-                    if service.id() == config_id {
-                        return Ok(serde_json::from_str(service.get_config_json().as_str())?);
                     }
                 }
             }
@@ -453,29 +421,7 @@ impl Gateway {
             new_process_chains.insert(process_chain.id().to_string(), process_chain);
         }
 
-        let mut new_services = HashMap::new();
-        for inner_service_config in config.inner_services.iter() {
-            let new_inner_services = match self.inner_service_factory.create(inner_service_config.clone()).await {
-                Ok(new_inner_services) => new_inner_services,
-                Err(err) => {
-                    self.global_process_chains.replace_process_chains(old_global_chains.clone());
-                    return Err(anyhow!(err));
-                }
-            };
-            if new_inner_services.is_empty() {
-                continue;
-            }
 
-            let new_inner_service_id = new_inner_services.first().unwrap().id();
-            if new_services.contains_key(new_inner_service_id.as_str()) {
-                self.global_process_chains.replace_process_chains(old_global_chains.clone());
-                Err(cmd_err!(
-                    ConfigErrorCode::AlreadyExists,
-                    "Duplicated inner service: {}", new_inner_service_id,
-                ))?;
-            }
-            new_services.insert(new_inner_service_id, new_inner_services);
-        }
 
         self.global_process_chains.clear_process_chains();
         for process_chain in new_process_chains.values() {
@@ -494,9 +440,7 @@ impl Gateway {
             new_servers.insert(new_server.id(), new_server);
         }
 
-        for service in new_services.values() {
-            self.inner_service_manager.replace_service(service.clone());
-        }
+
 
         for server in new_servers.values() {
             self.server_manager.replace_server(server.clone());
@@ -563,9 +507,7 @@ impl Gateway {
         self.server_manager.retain(|id| {
             config.servers.iter().any(|server| server.id() == id)
         });
-        self.inner_service_manager.retain(|id| {
-            config.inner_services.iter().any(|service| service.id() == id)
-        });
+     
         if config.acme_config.is_some() {
             let acme_config = config.acme_config.clone().unwrap();
             let mut cert_config = CertManagerConfig::default();

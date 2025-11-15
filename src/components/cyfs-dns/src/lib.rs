@@ -1,7 +1,7 @@
 #![allow(unused)]
 
 mod dns_server;
-mod resolve;
+mod cmd_resolve;
 mod local_dns;
 
 use std::net::IpAddr;

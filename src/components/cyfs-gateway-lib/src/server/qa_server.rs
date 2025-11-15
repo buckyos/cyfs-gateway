@@ -2,9 +2,9 @@ use crate::*;
 use buckyos_kit::AsyncStream;
 use log::*;
 use clap::{Arg, Command};
-use cyfs_process_chain::{command_help, CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel, ExternalCommand, MapCollectionRef};
+use cyfs_process_chain::{CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel, ExternalCommand, MapCollectionRef, ProcessChainLibExecutor, command_help};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::Mutex};
 
 
 #[async_trait::async_trait]
@@ -116,126 +116,7 @@ pub async fn serve_qa_from_stream(mut stream: Box<dyn AsyncStream>, server: Arc<
 
 }
 
-struct ProcessChainQAServer {
-    id: String,
-    inner_krpc_services: InnerServiceManagerRef,
-    global_process_chains: GlobalProcessChainsRef,
-    hook_point: ProcessChainConfigs,
-}
 
-impl ProcessChainQAServer {
-    pub async fn create_server(
-        id: String,
-        inner_krpc_services: InnerServiceManagerRef,
-        global_process_chains: GlobalProcessChainsRef,
-        hook_point: ProcessChainConfigs,
-    ) -> ServerResult<Self> {
-        //let resolve_cmd = Resolve::new(inner_dns_services.clone());
-        // let (executor, _) = create_process_chain_executor(
-        //     &hook_point,
-        //     global_process_chains.clone(),
-        //     Some(vec![(resolve_cmd.name().to_string(), Arc::new(Box::new(resolve_cmd)))])).await
-        //     .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
-
-        Ok(Self {
-            id,
-            inner_krpc_services,
-            global_process_chains,
-            hook_point,
-        })
-    }
-}
-#[async_trait::async_trait]
-impl QAServer for ProcessChainQAServer {
-    async fn serve_question(&self, req: &serde_json::Value) -> ServerResult<serde_json::Value> {
-        unimplemented!()
-    }
-
-    fn id(&self) -> String {
-        self.id.clone()
-    }
-}
-
-
-
-pub struct ProcessChainQAServerFactory {
-    inner_krpc_services: InnerServiceManagerRef,
-    global_process_chains: GlobalProcessChainsRef,
-}
-
-impl ProcessChainQAServerFactory {
-    pub fn new(
-        inner_krpc_services: InnerServiceManagerRef,
-        global_process_chains: GlobalProcessChainsRef,
-    ) -> Self {
-        Self {
-            inner_krpc_services,
-            global_process_chains,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ServerFactory for ProcessChainQAServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
-        let config = config.as_any().downcast_ref::<QAServerConfig>()
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid qa server config"))?;
-
-        let server = ProcessChainQAServer::create_server(
-            config.id.clone(),
-            self.inner_krpc_services.clone(),
-            self.global_process_chains.clone(),
-            config.hook_point.clone(),
-        ).await?;
-        Ok(Server::QA(Arc::new(server)))
-    }
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct QAServerConfig {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub ty: String,
-    pub hook_point: ProcessChainConfigs,
-
-}
-
-
-impl ServerConfig for QAServerConfig {
-    fn id(&self) -> String {
-        self.id.clone()
-    }
-
-    fn server_type(&self) -> String {
-        "qa".to_string()
-    }
-
-    fn get_config_json(&self) -> String {
-        serde_json::to_string(self).unwrap()
-    }
-
-    fn add_pre_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
-        let mut config = self.clone();
-        config.hook_point.push(process_chain);
-        Arc::new(config)
-    }
-
-    fn remove_pre_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig> {
-        let mut config = self.clone();
-        config.hook_point.retain(|chain| chain.id != process_chain_id);
-        Arc::new(config)
-    }
-
-    fn add_post_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
-        let config = self.clone();
-        Arc::new(config)
-    }
-
-    fn remove_post_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig> {
-        let config = self.clone();
-        Arc::new(config)
-    }
-}
 
 //impl process chain command : qa
 // usage:

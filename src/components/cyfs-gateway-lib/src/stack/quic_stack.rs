@@ -1246,7 +1246,7 @@ mod tests {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, Server, ProcessChainHttpServer, InnerServiceManager, Stack, QuicStackFactory, ConnectionManager, StackProtocol, QuicStackConfig, StackFactory, ServerConfig, StreamInfo, CertManagerConfig, AcmeCertManager};
+    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, Server, ProcessChainHttpServer, Stack, QuicStackFactory, ConnectionManager, StackProtocol, QuicStackConfig, StackFactory, ServerConfig, StreamInfo, CertManagerConfig, AcmeCertManager};
     use crate::global_process_chains::GlobalProcessChains;
 
     #[tokio::test]
@@ -1599,7 +1599,7 @@ mod tests {
             .h3_port(9186)
             .hook_point(chains)
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .inner_services(Arc::new(InnerServiceManager::new()))
+            .server_mgr(Arc::new(ServerManager::new()))
             .build().await.unwrap();
 
         let server_manager = Arc::new(ServerManager::new());

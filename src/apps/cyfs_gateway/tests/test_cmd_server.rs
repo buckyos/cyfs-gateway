@@ -99,7 +99,7 @@ print("hello python")
 
         parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
 
-        parser.register_inner_service_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
+        parser.register_server_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
 
         let load_result = parser.parse(cmd_config);
         if load_result.is_err() {
@@ -113,16 +113,14 @@ print("hello python")
         let tunnel_manager = TunnelManager::new();
         let server_manager = Arc::new(ServerManager::new());
         let global_process_chains = Arc::new(GlobalProcessChains::new());
-        let inner_service_manager = Arc::new(InnerServiceManager::new());
-        let acme_manager = AcmeCertManager::create(CertManagerConfig::default()).await.unwrap();
+        let cert_manager = AcmeCertManager::create(CertManagerConfig::default()).await.unwrap();
 
         let factory = GatewayFactory::new(
             server_manager.clone(),
             global_process_chains.clone(),
             connect_manager.clone(),
             tunnel_manager.clone(),
-            inner_service_manager.clone(),
-            acme_manager.clone(),
+            cert_manager.clone(),
         );
         factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
             server_manager.clone(),
@@ -141,14 +139,14 @@ print("hello python")
             global_process_chains.clone(),
             connect_manager.clone(),
             tunnel_manager.clone(),
-            acme_manager.clone(),
+            cert_manager.clone(),
         )));
         factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
             server_manager.clone(),
             global_process_chains.clone(),
             connect_manager.clone(),
             tunnel_manager.clone(),
-            acme_manager.clone(),
+            cert_manager.clone(),
         )));
         factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
             server_manager.clone(),
@@ -158,7 +156,7 @@ print("hello python")
         )));
 
         factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
-            inner_service_manager.clone(),
+            server_manager.clone(),
             global_process_chains.clone(),
         )));
 
@@ -168,10 +166,8 @@ print("hello python")
             Some("123456".to_string()),
             store).await.unwrap();
         let cmd_store = TempExternalCmdStore::new();
-        let handler = GatewayCmdHandler::new(Arc::new(cmd_store), PathBuf::new(), parser);
-        factory.register_inner_service_factory(
-            "cmd_server",
-            Arc::new(CyfsCmdServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
+        let handler = GatewayCmdHandler::new(Arc::new(cmd_store), PathBuf::from("config.yaml"), parser);
+        factory.register_server_factory("cmd_server", Arc::new(CyfsCmdServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
 
         let gateway = factory.create_gateway(config_loader).await;
         assert!(gateway.is_ok());

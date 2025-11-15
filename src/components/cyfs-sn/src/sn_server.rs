@@ -1,8 +1,9 @@
 #![allow(unused)]
 use crate::sn_db::{self, *};
+use http_body_util::combinators::BoxBody;
 use ::kRPC::*;
 use async_trait::async_trait;
-use cyfs_gateway_lib::{into_service_err, service_err, BoxBody, Bytes, InnerDnsService, InnerHttpService, InnerService, InnerServiceConfig, InnerServiceFactory, Request, Response, ServiceErrorCode, ServiceResult, StreamInfo, TunnelSelector};
+use cyfs_gateway_lib::{HttpServer, NameServer, ProcessChainConfig, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
 use jsonwebtoken::DecodingKey;
 use lazy_static::lazy_static;
 use log::*;
@@ -11,6 +12,7 @@ use name_lib::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use hyper::body::{Bytes};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{
@@ -19,9 +21,11 @@ use std::{
     result::Result,
 };
 use std::net::SocketAddr;
-use http::{Method, StatusCode};
+use http::{Method, Response, StatusCode};
 use http_body_util::{BodyExt, Collected, Full};
 use tokio::sync::Mutex;
+use cyfs_gateway_lib::{server_err,into_server_err};
+
 
 #[derive(Clone)]
 pub struct SNServer {
@@ -624,7 +628,7 @@ impl SNServer {
 }
 
 #[async_trait]
-impl InnerDnsService for SNServer {
+impl NameServer for SNServer {
     fn id(&self) -> String {
         self.id.clone()
     }
@@ -634,7 +638,7 @@ impl InnerDnsService for SNServer {
         name: &str,
         record_type: Option<RecordType>,
         from_ip: Option<IpAddr>,
-    ) -> ServiceResult<NameInfo> {
+    ) -> ServerResult<NameInfo> {
         info!(
             "sn server process name query: {}, record_type: {:?}",
             name, record_type
@@ -650,7 +654,7 @@ impl InnerDnsService for SNServer {
         }
 
         if !is_support {
-            return Err(service_err!(ServiceErrorCode::NotFound,
+            return Err(server_err!(ServerErrorCode::NotFound,
                 "sn-server not support record type {}",
                 record_type.to_string()
             ));
@@ -688,7 +692,7 @@ impl InnerDnsService for SNServer {
                     return Ok(result_name_info);
                 }
                 _ => {
-                    return Err(service_err!(ServiceErrorCode::NotFound,
+                    return Err(server_err!(ServerErrorCode::NotFound,
                         "sn-server not support record type {}",
                         record_type.to_string()
                     ));
@@ -708,7 +712,7 @@ impl InnerDnsService for SNServer {
             let subs: Vec<&str> = sub_name.split(".").collect();
             let username = subs.last();
             if username.is_none() {
-                return Err(service_err!(ServiceErrorCode::NotFound, "{}", name.to_string()));
+                return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
             }
             let username = username.unwrap();
             info!(
@@ -722,7 +726,7 @@ impl InnerDnsService for SNServer {
                         let zone_config = zone_config.unwrap();
                         let pkx = get_x_from_jwk_string(zone_config.0.as_str()).map_err(|e| {
                             error!("failed to get x from jwk string: {:?}", e);
-                            service_err!(ServiceErrorCode::NotFound,
+                            server_err!(ServerErrorCode::NotFound,
                                 "failed to get x from jwk string: {}",
                                 e.to_string()
                             )
@@ -736,7 +740,7 @@ impl InnerDnsService for SNServer {
                         info!("result_name_info: {:?}", result_name_info);
                         return Ok(result_name_info);
                     } else {
-                        return Err(service_err!(ServiceErrorCode::NotFound, "{}", name.to_string()));
+                        return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
                     }
                 }
                 RecordType::A | RecordType::AAAA => {
@@ -746,11 +750,11 @@ impl InnerDnsService for SNServer {
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
                         return Ok(result_name_info);
                     } else {
-                        return Err(service_err!(ServiceErrorCode::NotFound, "{}", name.to_string()));
+                        return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
                     }
                 }
                 _ => {
-                    return Err(service_err!(ServiceErrorCode::NotFound,
+                    return Err(server_err!(ServerErrorCode::NotFound,
                         "sn-server not support record type {}",
                         record_type.to_string()
                     ));
@@ -763,13 +767,13 @@ impl InnerDnsService for SNServer {
                 .get_user_info_by_domain(real_domain_name.as_str())
                 .unwrap();
             if user_info.is_none() {
-                return Err(service_err!(ServiceErrorCode::NotFound, "{}", name.to_string()));
+                return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
             }
             let (username, public_key, zone_config, _) = user_info.unwrap();
             match record_type {
                 RecordType::TXT => {
                     let pkx = get_x_from_jwk_string(public_key.as_str())
-                        .map_err(into_service_err!(ServiceErrorCode::InvalidConfig))?;
+                        .map_err(into_server_err!(ServerErrorCode::InvalidConfig))?;
                     let result_name_info = NameInfo::from_zone_config_str(
                         name,
                         zone_config.as_str(),
@@ -787,14 +791,14 @@ impl InnerDnsService for SNServer {
                     }
                 }
                 _ => {
-                    return Err(service_err!(ServiceErrorCode::NotFound,
+                    return Err(server_err!(ServerErrorCode::NotFound,
                         "sn-server not support record type {}",
                         record_type.to_string()
                     ));
                 }
             }
 
-            return Err(service_err!(ServiceErrorCode::NotFound, "{}", name.to_string()));
+            return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
         }
     }
 
@@ -803,25 +807,33 @@ impl InnerDnsService for SNServer {
         did: &DID,
         fragment: Option<&str>,
         from_ip: Option<IpAddr>,
-    ) -> ServiceResult<EncodedDocument> {
-        return Err(service_err!(ServiceErrorCode::NotFound,
+    ) -> ServerResult<EncodedDocument> {
+        return Err(server_err!(ServerErrorCode::NotFound,
             "sn-server not support did query"
         ));
     }
 }
 
 #[async_trait]
-impl InnerHttpService for SNServer {
+impl HttpServer for SNServer {
     fn id(&self) -> String {
         self.id.clone()
     }
 
-    async fn handle(&self, request: Request<BoxBody<Bytes, ()>>, info: StreamInfo) -> Response<BoxBody<Bytes, ()>> {
+    fn http_version(&self) -> http::Version {
+        http::Version::HTTP_11
+    }
+    
+    fn http3_port(&self) -> Option<u16> {
+        None
+    }
+
+    async fn serve_request(&self, request: http::Request<BoxBody<Bytes, ServerError>>, info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> { 
         if request.method() != Method::POST {
-            return Response::builder()
+            return Ok(Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
                 .body(BoxBody::new(Full::new(Bytes::from_static(b"Method Not Allowed"))
-                    .map_err(|_e| ()).boxed())).unwrap();
+                    .map_err(|e| match e {}).boxed())).unwrap());
         }
 
         let client_ip = match info.src_addr {
@@ -830,21 +842,21 @@ impl InnerHttpService for SNServer {
                     Ok(socket_addr) => socket_addr.ip(),
                     Err(e) => {
                         error!("parse client ip {} err {}", addr.as_str(), e);
-                        return Response::builder()
+                        return Ok(Response::builder()
                             .status(StatusCode::BAD_REQUEST)
                             .body(BoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
-                                .map_err(|_e| ()).boxed())
-                            .unwrap();
+                                .map_err(|e| match e {}).boxed())
+                            .unwrap());
                     }
                 }
             }
             None => {
                 error!("Failed to get client ip");
-                return Response::builder()
+                return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(BoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
-                        .map_err(|_e| ()).boxed())
-                    .unwrap();
+                        .map_err(|e| match e {}).boxed())
+                    .unwrap());
             }
         };
 
@@ -853,22 +865,22 @@ impl InnerHttpService for SNServer {
                 data.to_bytes()
             }
             Err(e) => {
-                return Response::builder()
+                return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(BoxBody::new(Full::new(Bytes::from(format!("Failed to read body: {:?}", e))))
-                        .map_err(|_e| ()).boxed())
-                    .unwrap();
+                        .map_err(|e| match e {}).boxed())
+                    .unwrap());
             }
         };
 
         let body_str = match String::from_utf8(body_bytes.to_vec()) {
             Ok(s) => s,
             Err(e) => {
-                return Response::builder()
+                return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(BoxBody::new(Full::new(Bytes::from(format!("Failed to convert body to string: {}", e))))
-                        .map_err(|_e| ()).boxed())
-                    .unwrap();
+                        .map_err(|e| match e {}).boxed())
+                    .unwrap());
             }
         };
 
@@ -877,80 +889,80 @@ impl InnerHttpService for SNServer {
         let rpc_request: RPCRequest = match serde_json::from_str(body_str.as_str()) {
             Ok(rpc_request) => rpc_request,
             Err(e) => {
-                return Response::builder()
+                return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(BoxBody::new(Full::new(Bytes::from(format!("Failed to parse request body to RPCRequest: {}", e))))
-                        .map_err(|_e| ()).boxed())
-                    .unwrap();
+                        .map_err(|e| match e {}).boxed())
+                    .unwrap());
             }
         };
 
         let resp = match self.handle_rpc_call(rpc_request, client_ip).await {
             Ok(resp) => resp,
             Err(e) => {
-                return Response::builder()
+                return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(BoxBody::new(Full::new(Bytes::from(format!("Failed to handle rpc call: {}", e))))
-                        .map_err(|_e| ()).boxed())
-                    .unwrap();
+                        .map_err(|e| match e {}).boxed())
+                    .unwrap());
             }
         };
 
         //parse resp to Response<Body>
-        Response::new(Full::new(Bytes::from(serde_json::to_string(&resp).unwrap()))
-            .map_err(|never| match never {}).boxed())
+        Ok(Response::new(Full::new(Bytes::from(serde_json::to_string(&resp).unwrap()))
+            .map_err(|never| match never {}).boxed()))
     }
 }
 
 
 
-#[async_trait]
-impl TunnelSelector for SNServer {
-    async fn select_tunnel_for_http_upstream(
-        &self,
-        req_host: &str,
-        req_path: &str,
-    ) -> Option<String> {
+// #[async_trait]
+// impl TunnelSelector for SNServer {
+//     async fn select_tunnel_for_http_upstream(
+//         &self,
+//         req_host: &str,
+//         req_path: &str,
+//     ) -> Option<String> {
 
-        let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
-        if get_result.is_some() {
-            let (sub_host,username) = get_result.unwrap();
-            let device_info = self.get_device_info(username.as_str(), "ood1").await;
-            if device_info.is_some() {
-                //info!("ood1 device info found for {} in sn server",username);
-                //let device_did = device_info.unwrap().0.did;
-                let device_host_name = device_info.unwrap().0.id.to_host_name();
-                //TODO: stream url的形式？
-                let result_str = format!("rtcp://{}/:80", device_host_name.as_str());
-                //info!("select device {} for http upstream:{}",device_did.as_str(),result_str.as_str());
-                return Some(result_str);
-            } else {
-                warn!("ood1 device info not found for {} in sn server", username);
-            }
-        } else {
-            let db = GLOBAL_SN_DB.lock().await;
-            let user_info = db.get_user_info_by_domain(req_host).unwrap();
-            if user_info.is_none() {
-                return None;
-            }
-            let (username, public_key, zone_config, _) = user_info.unwrap();
-            let device_info = self.get_device_info(username.as_str(), "ood1").await;
-            if device_info.is_some() {
-                //info!("ood1 device info found for {} in sn server",username);
-                //let device_did = device_info.unwrap().0.did;
-                let device_did = device_info.as_ref().unwrap().0.id.clone();
-                let device_host_name = device_did.to_host_name();
-                let result_str = format!("rtcp://{}/:80", device_host_name.as_str());
-                //info!("select device {} for http upstream:{}",device_did.as_str(),result_str.as_str());
-                return Some(result_str);
-            } else {
-                warn!("ood1 device info not found for {} in sn server", username);
-            }
-        }
+//         let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
+//         if get_result.is_some() {
+//             let (sub_host,username) = get_result.unwrap();
+//             let device_info = self.get_device_info(username.as_str(), "ood1").await;
+//             if device_info.is_some() {
+//                 //info!("ood1 device info found for {} in sn server",username);
+//                 //let device_did = device_info.unwrap().0.did;
+//                 let device_host_name = device_info.unwrap().0.id.to_host_name();
+//                 //TODO: stream url的形式？
+//                 let result_str = format!("rtcp://{}/:80", device_host_name.as_str());
+//                 //info!("select device {} for http upstream:{}",device_did.as_str(),result_str.as_str());
+//                 return Some(result_str);
+//             } else {
+//                 warn!("ood1 device info not found for {} in sn server", username);
+//             }
+//         } else {
+//             let db = GLOBAL_SN_DB.lock().await;
+//             let user_info = db.get_user_info_by_domain(req_host).unwrap();
+//             if user_info.is_none() {
+//                 return None;
+//             }
+//             let (username, public_key, zone_config, _) = user_info.unwrap();
+//             let device_info = self.get_device_info(username.as_str(), "ood1").await;
+//             if device_info.is_some() {
+//                 //info!("ood1 device info found for {} in sn server",username);
+//                 //let device_did = device_info.unwrap().0.did;
+//                 let device_did = device_info.as_ref().unwrap().0.id.clone();
+//                 let device_host_name = device_did.to_host_name();
+//                 let result_str = format!("rtcp://{}/:80", device_host_name.as_str());
+//                 //info!("select device {} for http upstream:{}",device_did.as_str(),result_str.as_str());
+//                 return Some(result_str);
+//             } else {
+//                 warn!("ood1 device info not found for {} in sn server", username);
+//             }
+//         }
 
-        return None;
-    }
-}
+//         return None;
+//     }
+// }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SNServerConfig {
@@ -963,17 +975,34 @@ pub struct SNServerConfig {
     aliases: Vec<String>,
 }
 
-impl InnerServiceConfig for SNServerConfig {
+impl ServerConfig for SNServerConfig {
     fn id(&self) -> String {
         self.id.clone()
     }
 
-    fn service_type(&self) -> String {
+    fn server_type(&self) -> String {
         "sn".to_string()
     }
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+
+
+    fn add_pre_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
+        unimplemented!();
+    }
+
+    fn remove_pre_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig> {
+        unimplemented!();
+    }
+
+    fn add_post_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
+        unimplemented!();
+    }
+
+    fn remove_post_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig> {
+        unimplemented!();
     }
 }
 
@@ -986,13 +1015,13 @@ impl SNServerFactory {
 }
 
 #[async_trait::async_trait]
-impl InnerServiceFactory for SNServerFactory {
-    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<Vec<InnerService>> {
+impl ServerFactory for SNServerFactory {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
         let config = config.as_any().downcast_ref::<SNServerConfig>()
-            .ok_or(service_err!(ServiceErrorCode::InvalidConfig, "invalid InnerService config {}", config.service_type()))?;
+            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid SNServer config {}", config.server_type()))?;
 
         let sn = Arc::new(SNServer::new(config.clone()));
-        Ok(vec![InnerService::HttpService(sn.clone()), InnerService::DnsService(sn.clone())])
+        Ok(Server::NameServer(sn.clone()))
     }
 }
 

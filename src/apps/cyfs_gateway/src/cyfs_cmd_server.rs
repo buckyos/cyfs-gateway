@@ -1,11 +1,14 @@
 use http_body_util::{BodyExt, Full};
+use http_body_util::combinators::BoxBody;
 use std::sync::{Arc, Weak};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use cyfs_gateway_lib::{config_err, service_err, BoxBody, ConfigErrorCode, ConfigResult, InnerHttpService, InnerService, InnerServiceConfig, InnerServiceFactory, Request, Response, ServiceErrorCode, ServiceResult, StreamInfo};
-use crate::config_loader::InnerServiceConfigParser;
+use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, ProcessChainConfig, Server, ServerConfig, StreamInfo, config_err, ServerError};
+use cyfs_gateway_lib::{ServerFactory, HttpServer};
+use crate::config_loader::{ServerConfigParser};
 use crate::cyfs_cmd_client::cmd_err;
+use cyfs_gateway_lib::{server_err, ServerErrorCode, ServerResult};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum CmdErrorCode {
@@ -41,17 +44,33 @@ pub struct CyfsCmdServerConfig {
     pub ty: String,
 }
 
-impl InnerServiceConfig for CyfsCmdServerConfig {
+impl ServerConfig for CyfsCmdServerConfig {
     fn id(&self) -> String {
         self.id.clone()
     }
 
-    fn service_type(&self) -> String {
+    fn server_type(&self) -> String {
         String::from("cmd_server")
     }
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+
+    fn add_pre_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
+        unimplemented!();
+    }
+
+    fn remove_pre_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
+        unimplemented!();
+    }
+    
+    fn add_post_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
+        unimplemented!();
+    }
+
+    fn remove_post_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
+        unimplemented!();
     }
 }
 
@@ -75,14 +94,14 @@ impl CyfsCmdServerFactory {
 }
 
 #[async_trait::async_trait]
-impl InnerServiceFactory for CyfsCmdServerFactory {
-    async fn create(&self, config: Arc<dyn InnerServiceConfig>) -> ServiceResult<Vec<InnerService>> {
+impl ServerFactory for CyfsCmdServerFactory {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
         let config = config.as_any().downcast_ref::<CyfsCmdServerConfig>()
-            .ok_or(service_err!(ServiceErrorCode::InvalidConfig, "invalid CyfsCmdServer config {}", config.service_type()))?;
-        Ok(vec![InnerService::HttpService(Arc::new(CyfsCmdServer::new(config.clone(),
-                                                                 self.handler.clone(),
-                                                                 self.token_factory.clone(),
-                                                                 self.token_verifier.clone())))])
+            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid CyfsCmdServer config {}", config.server_type()))?;
+        Ok(Server::Http(Arc::new(CyfsCmdServer::new(config.clone(),
+                                                     self.handler.clone(),
+                                                     self.token_factory.clone(),
+                                                     self.token_verifier.clone()))))
     }
 }
 
@@ -102,8 +121,8 @@ impl Default for CyfsCmdServerConfigParser {
     }
 }
 
-impl<D: for<'de> Deserializer<'de>> InnerServiceConfigParser<D> for CyfsCmdServerConfigParser {
-    fn parse(&self, de: D) -> ConfigResult<Arc<dyn InnerServiceConfig>> {
+impl<D: for<'de> Deserializer<'de>> ServerConfigParser<D> for CyfsCmdServerConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
         let config = CyfsCmdServerConfig::deserialize(de)
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid CyfsCmdServer config {:?}", e))?;
         Ok(Arc::new(config))
@@ -170,19 +189,27 @@ struct CmdResp<R: Serialize> {
 }
 
 #[async_trait::async_trait]
-impl InnerHttpService for CyfsCmdServer {
+impl HttpServer for CyfsCmdServer {
     fn id(&self) -> String {
         self.config.id.clone()
     }
 
-    async fn handle(&self, request: Request<BoxBody<Bytes, ()>>, _info: StreamInfo) -> Response<BoxBody<Bytes, ()>> {
+    fn http_version(&self) -> http::Version {
+        http::Version::HTTP_11
+    }
+
+    fn http3_port(&self) -> Option<u16> {
+        None
+    }
+
+    async fn serve_request(&self, request: http::Request<BoxBody<Bytes, ServerError>>, _info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         if request.method() != http::Method::POST {
-            return Response::builder()
+            return Ok(http::Response::builder()
                 .status(http::StatusCode::FORBIDDEN)
-                .body(Full::new(Bytes::new()).map_err(|_| ()).boxed()).unwrap();
+                .body(Full::new(Bytes::new()).map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap());
         }
         let body = request.into_body();
-        let ret: CmdResult<Response<BoxBody<Bytes, ()>>> = async move {
+        let ret: CmdResult<http::Response<BoxBody<Bytes, ServerError>>> = async move {
             let data = body.collect().await
                 .map(|chunk| chunk.to_bytes())
                 .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{:?}", e))?;
@@ -192,10 +219,10 @@ impl InnerHttpService for CyfsCmdServer {
 
             if req.method == "login" {
                 if req.sys.len() != 1 {
-                    let resp = Response::builder()
+                    let resp = http::Response::builder()
                         .status(http::StatusCode::BAD_REQUEST)
                         .body(Full::new(Bytes::from("invalid sys param"))
-                            .map_err(|_e| ()).boxed()).unwrap();
+                            .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
                     return Ok(resp)
                 }
                 let seq = req.sys[0].clone();
@@ -203,10 +230,10 @@ impl InnerHttpService for CyfsCmdServer {
                 let login_req: LoginReq = match serde_json::from_value(req.params) {
                     Ok(req) => req,
                     Err(_e) => {
-                        let resp = Response::builder()
+                        let resp = http::Response::builder()
                             .status(http::StatusCode::BAD_REQUEST)
                             .body(Full::new(Bytes::from("invalid login param"))
-                                .map_err(|_e| ()).boxed()).unwrap();
+                                .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
                         return Ok(resp)
                     }
                 };
@@ -235,14 +262,14 @@ impl InnerHttpService for CyfsCmdServer {
                 };
                 let data = serde_json::to_vec(&resp)
                     .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))?;
-                return Ok(Response::new(Full::new(Bytes::from(data)).map_err(|_e| ()).boxed()));
+                return Ok(http::Response::new(Full::new(Bytes::from(data)).map_err(|e| ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))).boxed()));
             }
 
             if req.sys.len() != 2 {
-                let resp = Response::builder()
+                let resp = http::Response::builder()
                     .status(http::StatusCode::UNAUTHORIZED)
                     .body(Full::new(Bytes::new())
-                        .map_err(|_e| ()).boxed()).unwrap();
+                        .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
                 return Ok(resp)
             }
             let seq = req.sys[0].clone();
@@ -252,10 +279,10 @@ impl InnerHttpService for CyfsCmdServer {
                     token
                 },
                 Err(e) => {
-                    let resp = Response::builder()
+                    let resp = http::Response::builder()
                         .status(http::StatusCode::UNAUTHORIZED)
                         .body(Full::new(Bytes::from(e.msg().to_string()))
-                            .map_err(|_e| ()).boxed()).unwrap();
+                            .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
                     return Ok(resp);
                 }
             };
@@ -274,19 +301,17 @@ impl InnerHttpService for CyfsCmdServer {
                 };
                 let data = serde_json::to_vec(&resp)
                     .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))?;
-                Ok(Response::new(Full::new(Bytes::from(data)).map_err(|_e| ()).boxed()))
+                Ok(http::Response::new(Full::new(Bytes::from(data)).map_err(|e| ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))).boxed()))
             } else {
                 Err(cmd_err!(CmdErrorCode::Failed, "{}", "cmd handler has released"))
             }
         }.await;
 
-        ret.unwrap_or_else(|_e| {
-            log::error!("cmd server handle error: {:?}", _e);
-            let resp = Response::builder()
+        Ok(ret.unwrap_or_else(|_e| {
+            http::Response::builder()
                 .status(http::StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Full::new(Bytes::new())
-                    .map_err(|_e| ()).boxed()).unwrap();
-            resp
-        })
+                    .map_err(|e| ServerError::new(ServerErrorCode::IOError, format!("{:?}", e))).boxed()).unwrap()
+        }))
     }
 }

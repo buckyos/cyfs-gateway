@@ -29,7 +29,7 @@ use tokio::time::timeout;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
 use crate::map_collection_to_nameinfo;
-use crate::resolve::Resolve;
+use crate::cmd_resolve::Resolve;
 
 //TODO: dns_provider is realy a demo implementation, must refactor before  used in a offical server.
 fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RData>> {
@@ -184,7 +184,7 @@ impl EmitAndCount for CyfsQueriesEmitAndCount {
 
 pub struct ProcessChainDnsServer {
     id: String,
-    inner_dns_services: InnerServiceManagerRef,
+    server_mgr: ServerManagerRef,
     global_process_chains: Option<GlobalProcessChainsRef>,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
 }
@@ -192,11 +192,11 @@ pub struct ProcessChainDnsServer {
 impl ProcessChainDnsServer {
     pub async fn create_server(
         id: String,
-        inner_dns_services: InnerServiceManagerRef,
+        server_mgr: ServerManagerRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         hook_point: ProcessChainConfigs,
     ) -> ServerResult<Self> {
-        let resolve_cmd = Resolve::new(inner_dns_services.clone());
+        let resolve_cmd = Resolve::new(server_mgr.clone());
         let (executor, _) = create_process_chain_executor(
             &hook_point,
             global_process_chains.clone(),
@@ -205,7 +205,7 @@ impl ProcessChainDnsServer {
 
         Ok(Self {
             id,
-            inner_dns_services,
+            server_mgr,
             global_process_chains,
             executor: Arc::new(Mutex::new(executor)),
         })
@@ -413,17 +413,17 @@ impl cyfs_gateway_lib::server::DatagramServer for ProcessChainDnsServer {
 }
 
 pub struct ProcessChainDnsServerFactory {
-    inner_dns_services: InnerServiceManagerRef,
+    server_mgr: ServerManagerRef,
     global_process_chains: GlobalProcessChainsRef,
 }
 
 impl ProcessChainDnsServerFactory {
     pub fn new(
-        inner_dns_services: InnerServiceManagerRef,
+        server_mgr: ServerManagerRef,
         global_process_chains: GlobalProcessChainsRef,
     ) -> Self {
         Self {
-            inner_dns_services,
+            server_mgr,
             global_process_chains,
         }
     }
@@ -437,7 +437,7 @@ impl ServerFactory for ProcessChainDnsServerFactory {
 
         let server = ProcessChainDnsServer::create_server(
             config.id.clone(),
-            self.inner_dns_services.clone(),
+            self.server_mgr.clone(),
             Some(self.global_process_chains.clone()),
             config.hook_point.clone(),
         ).await?;
@@ -499,7 +499,7 @@ mod tests {
     use hickory_proto::op::{Message, Query};
     use hickory_proto::rr::RecordType;
     use hickory_server::proto::rr::{Name, RData};
-    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, GlobalProcessChains, InnerService, InnerServiceManager, ServerFactory, ServerManager, StackFactory, TunnelManager, UdpStackConfig, UdpStackFactory};
+    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, GlobalProcessChains, Server, ServerFactory, ServerManager, StackFactory, TunnelManager, UdpStackConfig, UdpStackFactory};
     use cyfs_gateway_lib::server::DatagramServer;
     use crate::{DnsServerConfig, LocalDns, ProcessChainDnsServer, ProcessChainDnsServerFactory};
 
@@ -519,7 +519,7 @@ hook_point:
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
         let config = Arc::new(config);
         let factory = ProcessChainDnsServerFactory::new(
-            Arc::new(InnerServiceManager::new()),
+            Arc::new(ServerManager::new()),
             Arc::new(GlobalProcessChains::new()),
         );
         let ret = factory.create(config).await;
@@ -548,12 +548,12 @@ A = ["192.168.1.106"]
         "#;
         let mut local_dns = tempfile::NamedTempFile::new().unwrap();
         local_dns.write_all(local_dns_content.as_bytes()).unwrap();
-        let inner_services = Arc::new(InnerServiceManager::new());
+        let server_mgr = Arc::new(ServerManager::new());
         let dns_server = LocalDns::create("local_dns".to_string(), local_dns.path().to_string_lossy().to_string());
         assert!(dns_server.is_ok());
         let dns_server = dns_server.unwrap();
-        let server_vec = vec![InnerService::DnsService(Arc::new(dns_server))];
-        inner_services.add_service(server_vec);
+      
+        server_mgr.add_server(Server::NameServer(Arc::new(dns_server))).unwrap();
 
         let config = r#"
 type: dns
@@ -569,7 +569,7 @@ hook_point:
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
         let server = ProcessChainDnsServer::create_server(
             config.id,
-            inner_services.clone(),
+            server_mgr.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
             config.hook_point,
         ).await;
@@ -615,7 +615,7 @@ hook_point:
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
         let server = ProcessChainDnsServer::create_server(
             config.id,
-            inner_services.clone(),
+            server_mgr.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
             config.hook_point,
         ).await;
@@ -716,12 +716,12 @@ A = ["192.168.1.106"]
         "#;
         let mut local_dns = tempfile::NamedTempFile::new().unwrap();
         local_dns.write_all(local_dns_content.as_bytes()).unwrap();
-        let inner_services = Arc::new(InnerServiceManager::new());
+        let server_mgr = Arc::new(ServerManager::new());
         let dns_server = LocalDns::create("local_dns".to_string(), local_dns.path().to_string_lossy().to_string());
         assert!(dns_server.is_ok());
         let dns_server = dns_server.unwrap();
-        let server_vec = vec![InnerService::DnsService(Arc::new(dns_server))];
-        inner_services.add_service(server_vec);
+        
+        server_mgr.add_server(Server::NameServer(Arc::new(dns_server))).unwrap();
 
         let config = r#"
 type: dns
@@ -736,7 +736,7 @@ hook_point:
         "#;
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
         let global_process_chains = Arc::new(GlobalProcessChains::new());
-        let server_factory = ProcessChainDnsServerFactory::new(inner_services.clone(), global_process_chains.clone());
+        let server_factory = ProcessChainDnsServerFactory::new(server_mgr.clone(), global_process_chains.clone());
         let ret = server_factory.create(Arc::new(config)).await;
         assert!(ret.is_ok());
         let server = ret.unwrap();
@@ -780,7 +780,7 @@ hook_point:
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
         let server = ProcessChainDnsServer::create_server(
             config.id,
-            inner_services.clone(),
+            server_mgr.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
             config.hook_point,
         ).await;

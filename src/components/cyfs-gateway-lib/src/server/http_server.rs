@@ -6,9 +6,9 @@ use hyper::body::{Bytes};
 use hyper::{http, StatusCode};
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CollectionValue, CommandControl, MapCollection, ProcessChainLibExecutor};
-use crate::{HttpRequestHeaderMap, HttpServer, InnerServiceManagerRef, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
+use crate::{HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerManagerRef, ServerResult, StreamInfo};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
-use super::{server_err, into_server_err};
+use super::{server_err,into_server_err};
 
 pub struct ProcessChainHttpServerBuilder {
     id: Option<String>,
@@ -16,7 +16,7 @@ pub struct ProcessChainHttpServerBuilder {
     h3_port: Option<u16>,
     hook_point: Option<ProcessChainConfigs>,
     global_process_chains: Option<GlobalProcessChainsRef>,
-    inner_services: Option<InnerServiceManagerRef>,
+    server_mgr: Option<ServerManagerRef>,
 }
 
 // Add setter methods for HttpServerBuilder
@@ -41,8 +41,8 @@ impl ProcessChainHttpServerBuilder {
         self
     }
 
-    pub fn inner_services(mut self, inner_services: InnerServiceManagerRef) -> Self {
-        self.inner_services = Some(inner_services);
+    pub fn server_mgr(mut self, server_mgr: ServerManagerRef) -> Self {
+        self.server_mgr = Some(server_mgr);
         self
     }
 
@@ -60,7 +60,7 @@ pub struct ProcessChainHttpServer {
     id: String,
     version: http::Version,
     h3_port: Option<u16>,
-    inner_services: InnerServiceManagerRef,
+    server_mgr: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
 }
 
@@ -72,7 +72,7 @@ impl ProcessChainHttpServer {
             h3_port: None,
             hook_point: None,
             global_process_chains: None,
-            inner_services: None,
+            server_mgr: None,
         }
     }
 
@@ -85,8 +85,8 @@ impl ProcessChainHttpServer {
             return Err(server_err!(ServerErrorCode::InvalidConfig, "hook_point is none"));
         }
 
-        if builder.inner_services.is_none() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "inner_services is none"));
+        if builder.server_mgr.is_none() {
+            return Err(server_err!(ServerErrorCode::InvalidConfig, "server_mgr is none"));
         }
 
         let version: http::Version = match builder.version {
@@ -111,7 +111,7 @@ impl ProcessChainHttpServer {
             id: builder.id.unwrap(),
             version,
             h3_port: builder.h3_port,
-            inner_services: builder.inner_services.unwrap(),
+            server_mgr: builder.server_mgr.unwrap(),
             executor: Arc::new(Mutex::new(executor)),
         })
     }
@@ -153,24 +153,25 @@ impl HttpServer for ProcessChainHttpServer {
 
                     let cmd = list[0].as_str();
                     match cmd {
-                        "inner_service" => {
+                        "server" => {
                             if list.len() < 2 {
                                 return Err(server_err!(
                                     ServerErrorCode::InvalidConfig,
-                                    "invalid inner service command"
+                                    "invalid server command"
                                 ));
                             }
 
-                            let service = list[1].as_str();
-                            let (parts, body) = req_map.into_request()
-                                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?
-                                .into_parts();
-
-                            let req = hyper::Request::from_parts(parts, body.map_err(|_| ()).boxed());
-                            if let Some(service) = self.inner_services.get_http_service(service) {
-                                let resp = service.handle(req, info).await;
-                                let (parts, body) = resp.into_parts();
-                                return Ok(hyper::Response::from_parts(parts, body.map_err(|_| server_err!(ServerErrorCode::InvalidData)).boxed()))
+                            let server_id = list[1].as_str();
+                            // pub fn into_request(self) -> Result<http::Request<BoxBody<Bytes, ServerError>>,
+                            //sync fn serve_request(&self, req: http::Request<BoxBody<Bytes, ServerError>>, info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>>;
+                            let post_req= req_map.into_request()
+                                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+ 
+                            //let req = hyper::Request::from_parts(parts, body.map_err(|_| ()).boxed());
+                            if let Some(service) = self.server_mgr.get_http_server(server_id) {
+                                let resp = service.serve_request(post_req, info).await;
+                                //let (parts, body) = resp.into_parts();
+                                return resp;
                             }
                         },
                         v => {
@@ -247,14 +248,14 @@ impl ServerConfig for ProcessChainHttpServerConfig {
 }
 
 pub struct ProcessChainHttpServerFactory {
-    inner_service_manager: InnerServiceManagerRef,
+    server_mgr: ServerManagerRef,
     global_process_chains: GlobalProcessChainsRef,
 }
 
 impl ProcessChainHttpServerFactory {
-    pub fn new(inner_service_manager: InnerServiceManagerRef, global_process_chains: GlobalProcessChainsRef) -> Self {
+    pub fn new(server_mgr: ServerManagerRef, global_process_chains: GlobalProcessChainsRef) -> Self {
         Self {
-            inner_service_manager,
+            server_mgr,
             global_process_chains,
         }
     }
@@ -269,7 +270,7 @@ impl ServerFactory for ProcessChainHttpServerFactory {
         let mut builder = ProcessChainHttpServer::builder()
             .hook_point(config.hook_point.clone())
             .id(config.id.clone())
-            .inner_services(self.inner_service_manager.clone())
+            .server_mgr(self.server_mgr.clone())
             .global_process_chains(self.global_process_chains.clone());
         if config.h3_port.is_some() {
             builder = builder.h3_port(config.h3_port.clone().unwrap());
@@ -287,7 +288,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use hyper_util::rt::{TokioExecutor, TokioIo};
-    use crate::{hyper_serve_http, hyper_serve_http1, GlobalProcessChains, InnerServiceManager, StreamInfo};
+    use crate::{GlobalProcessChains, ServerManager, StreamInfo, hyper_serve_http, hyper_serve_http1};
 
     #[tokio::test]
     async fn test_http_server_builder_creation() {
@@ -295,15 +296,15 @@ mod tests {
         assert!(builder.version.is_none());
         assert!(builder.hook_point.is_none());
         assert!(builder.global_process_chains.is_none());
-        assert!(builder.inner_services.is_none());
+        assert!(builder.server_mgr.is_none());
     }
 
     #[tokio::test]
     async fn test_create_server_without_hook_point() {
-        let mock_inner_services = Arc::new(InnerServiceManager::new());
+        let mock_server_mgr = Arc::new(ServerManager::new());
 
         let result = ProcessChainHttpServer::builder()
-            .inner_services(mock_inner_services).build().await;
+            .server_mgr(mock_server_mgr).build().await;
         if let Err(e) = result {
             assert_eq!(e.code(), ServerErrorCode::InvalidConfig);
         }
@@ -322,12 +323,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_server_with_invalid_version() {
-        let mock_inner_services = Arc::new(InnerServiceManager::new());
+        let mock_server_mgr = Arc::new(ServerManager::new());
 
         let result = ProcessChainHttpServer::builder()
             .version("HTTP/1.2".to_string())
             .hook_point(vec![])
-            .inner_services(mock_inner_services).build().await;
+            .server_mgr(mock_server_mgr).build().await;
 
         assert!(result.is_err());
         if let Err(e) = result {
@@ -337,33 +338,33 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_server_with_http11_version() {
-        let mock_inner_services = Arc::new(InnerServiceManager::new());
+        let mock_server_mgr = Arc::new(ServerManager::new());
 
         let result = ProcessChainHttpServer::builder()
             .id("1")
             .version("HTTP/1.1".to_string())
             .hook_point(vec![])
-            .inner_services(mock_inner_services).build().await;
+            .server_mgr(mock_server_mgr).build().await;
 
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_create_server_with_http2_version() {
-        let mock_inner_services = Arc::new(InnerServiceManager::new());
+        let mock_server_mgr = Arc::new(ServerManager::new());
 
         let result = ProcessChainHttpServer::builder()
             .id("1")
             .version("HTTP/2".to_string())
             .hook_point(vec![])
-            .inner_services(mock_inner_services).build().await;
+            .server_mgr(mock_server_mgr).build().await;
         assert!(result.is_ok());
     }
 
 
     #[tokio::test]
     async fn test_handle_http1_request_http1_server() {
-        let mock_inner_services = Arc::new(InnerServiceManager::new());
+        let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
 - id: main
   priority: 1
@@ -379,7 +380,7 @@ mod tests {
             .id("1")
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
-            .inner_services(mock_inner_services).build().await;
+            .server_mgr(mock_server_mgr).build().await;
 
         assert!(result.is_ok());
         let http_server = Arc::new(result.unwrap());
@@ -407,7 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_http1_request_http2_server() {
-        let mock_inner_services = Arc::new(InnerServiceManager::new());
+        let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
 - id: main
   priority: 1
@@ -423,7 +424,7 @@ mod tests {
             .id("1")
             .version("HTTP/2".to_string())
             .hook_point(chains)
-            .inner_services(mock_inner_services).build().await;
+            .server_mgr(mock_server_mgr).build().await;
 
         assert!(result.is_ok());
         let http_server = Arc::new(result.unwrap());
@@ -451,7 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_http2_request_http2_server() {
-        let mock_inner_services = Arc::new(InnerServiceManager::new());
+        let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
 - id: main
   priority: 1
@@ -467,7 +468,7 @@ mod tests {
             .id("1")
             .version("HTTP/2".to_string())
             .hook_point(chains)
-            .inner_services(mock_inner_services).build().await;
+            .server_mgr(mock_server_mgr).build().await;
 
         assert!(result.is_ok());
         let http_server = Arc::new(result.unwrap());
@@ -496,7 +497,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_http2_request_http1_server() {
-        let mock_inner_services = Arc::new(InnerServiceManager::new());
+        let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
 - id: main
   priority: 1
@@ -512,7 +513,7 @@ mod tests {
             .id("1")
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
-            .inner_services(mock_inner_services).build().await;
+            .server_mgr(mock_server_mgr).build().await;
 
         assert!(result.is_ok());
         let http_server = Arc::new(result.unwrap());
@@ -550,7 +551,7 @@ mod tests {
             hook_point: ProcessChainConfigs::default(),
         };
         let factory = ProcessChainHttpServerFactory::new(
-            Arc::new(InnerServiceManager::new()),
+            Arc::new(ServerManager::new()),
             Arc::new(GlobalProcessChains::new()),
         );
         let result = factory.create(Arc::new(config)).await;
