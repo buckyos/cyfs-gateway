@@ -29,7 +29,9 @@ aes = "0.8.4"
 ctr = "0.9.2"
 cipher = "0.4.4"
 futures = "*"
+futures-util = "*"
 base64 = "*"
+mime_guess = "*"
 hyper = { version = "1.6", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"]}
 http-body-util ="0.1"
