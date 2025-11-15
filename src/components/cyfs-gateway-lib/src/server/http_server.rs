@@ -3,12 +3,16 @@ use http::{Version};
 use http_body_util::combinators::{BoxBody};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes};
-use hyper::{http, StatusCode};
+use hyper::{http, StatusCode, Request};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CollectionValue, CommandControl, MapCollection, ProcessChainLibExecutor};
 use crate::{HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerManagerRef, ServerResult, StreamInfo};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err,into_server_err};
+use crate::tunnel_connector::TunnelConnector;
+use url::Url;
 
 pub struct ProcessChainHttpServerBuilder {
     id: Option<String>,
@@ -115,6 +119,75 @@ impl ProcessChainHttpServer {
             executor: Arc::new(Mutex::new(executor)),
         })
     }
+
+    async fn handle_forward_upstream(&self, req: http::Request<BoxBody<Bytes, ServerError>>, target_url: &str) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let org_url = req.uri().to_string();
+        let url = format!("{}{}", target_url, org_url);
+        info!("handle_upstream url: {}", url);
+        let upstream_url = Url::parse(target_url);
+        if upstream_url.is_err() {
+            return Err(server_err!(ServerErrorCode::InvalidConfig, "Failed to parse upstream url: {}", upstream_url.err().unwrap()));
+        }
+        //TODO:support url rewrite
+        let upstream_url = upstream_url.unwrap();
+        let scheme = upstream_url.scheme();
+        match scheme {
+            "tcp"|"http"|"https" => {
+                let client: Client<_, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>> = Client::builder(TokioExecutor::new()).build_http();
+                let header = req.headers().clone();
+                let method = req.method().clone();
+                let body = req.into_body().map_err(|e| {
+                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                }).boxed();
+                let mut upstream_req = Request::builder()
+                .method(method)
+                .uri(&url)
+                .body(body).map_err(|e| {
+                    server_err!(ServerErrorCode::InvalidConfig, "Failed to build request: {}", e)
+                })?;
+
+                *upstream_req.headers_mut() = header;
+            
+                let resp = client.request(upstream_req).await.map_err(|e| {
+                    server_err!(ServerErrorCode::InvalidConfig, "Failed to request upstream: {}", e)
+                })?;
+                let resp = resp.map(|body| body.map_err(|e| ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))).boxed());
+                return Ok(resp)
+            },
+            _ => {
+                let _tunnel_connector = TunnelConnector {
+                    target_stream_url: target_url.to_string(),
+                };
+
+                let client: Client<_, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>> = Client::builder(TokioExecutor::new()).build_http();
+
+                let header = req.headers().clone();
+                let mut host_name = "127.0.0.1".to_string();
+                let hname =  req.headers().get("host");
+                if hname.is_some() {
+                    host_name = hname.unwrap().to_str().unwrap().to_string();
+                }
+                let fake_url = format!("http://{}{}", host_name, org_url);
+                let method = req.method().clone();
+                let body = req.into_body().map_err(|e| {
+                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                }).boxed();
+                let mut upstream_req = Request::builder()
+                    .method(method)
+                    .uri(fake_url)
+                    .body(body).map_err(|e| {
+                        server_err!(ServerErrorCode::BadRequest, "Failed to build upstream_req: {}", e)
+                    })?;
+
+                *upstream_req.headers_mut() = header;
+                let resp = client.request(upstream_req).await.map_err(|e| {
+                    server_err!(ServerErrorCode::TunnelError, "Failed to request upstream: {}", e)
+                })?;
+                let resp = resp.map(|body| body.map_err(|e| ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))).boxed());
+                return Ok(resp)
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -162,20 +235,29 @@ impl HttpServer for ProcessChainHttpServer {
                             }
 
                             let server_id = list[1].as_str();
-                            // pub fn into_request(self) -> Result<http::Request<BoxBody<Bytes, ServerError>>,
-                            //sync fn serve_request(&self, req: http::Request<BoxBody<Bytes, ServerError>>, info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>>;
                             let post_req= req_map.into_request()
                                 .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
  
-                            //let req = hyper::Request::from_parts(parts, body.map_err(|_| ()).boxed());
                             if let Some(service) = self.server_mgr.get_http_server(server_id) {
                                 let resp = service.serve_request(post_req, info).await;
-                                //let (parts, body) = resp.into_parts();
                                 return resp;
                             }
                         },
-                        v => {
-                            log::error!("unknown command: {}", v);
+                        "forward" => {
+                            if list.len() < 2 {
+                                return Err(server_err!(
+                                    ServerErrorCode::InvalidConfig,
+                                    "invalid forward command"
+                                ));
+                            }
+                            let target_url = list[1].as_str();
+                            let post_req= req_map.into_request()
+                                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                            let resp = self.handle_forward_upstream(post_req, target_url).await;
+                            return resp;
+                        },
+                        _ => {
+                            log::error!("unknown command: {}", cmd);
                         }
                     }
                 }
