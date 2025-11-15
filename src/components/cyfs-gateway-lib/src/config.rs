@@ -9,7 +9,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NamedDataMgrRouteConfig {
     pub named_data_mgr_id : String,
     #[serde(default = "default_true")]

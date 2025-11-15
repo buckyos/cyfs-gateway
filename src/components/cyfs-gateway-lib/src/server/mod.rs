@@ -4,6 +4,7 @@ mod socks5_server;
 mod server;
 mod qa_server;
 mod dir_server;
+mod ndn_server;
 
 use std::path::PathBuf;
 
@@ -13,6 +14,7 @@ pub use server::*;
 pub use qa_server::*;
 pub use dns_server::*;
 pub use dir_server::*;
+pub use ndn_server::*;
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ServerErrorCode {
     BindFailed,

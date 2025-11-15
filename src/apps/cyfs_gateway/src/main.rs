@@ -8,7 +8,7 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
 use cyfs_dns::{LocalDnsFactory, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
-use cyfs_warp::*;
+
 use log::*;
 use name_client::*;
 use name_lib::*;

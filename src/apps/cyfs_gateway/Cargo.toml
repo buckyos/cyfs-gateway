@@ -37,7 +37,6 @@ name-lib = { git = "https://github.com/buckyos/buckyos-base.git", package = "nam
 kRPC = { git = "https://github.com/buckyos/buckyos-base.git", package = "kRPC" }
 
 cyfs-gateway-lib = { path = "../../components/cyfs-gateway-lib" }
-cyfs-warp = { path= "../../components/cyfs-warp"}
 cyfs-sn = { path = "../../components/cyfs-sn" }
 cyfs-dns = { path = "../../components/cyfs-dns" }
 cyfs-socks = { path = "../../components/cyfs-socks" }
