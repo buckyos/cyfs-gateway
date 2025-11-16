@@ -29,8 +29,8 @@ Scope Options:
 
 Behavior:
   - Evaluates argument and identifies its type.
-  - If the target var exists, returns its success(type).
-  - If the target var does not exist, returns error.
+  - If the target var exists, returns its success(type string).
+  - If the target var does not exist, returns error("None").
   - If scope is not specified, defaults to the variable's current scope, default is chain level
 
 Examples:
