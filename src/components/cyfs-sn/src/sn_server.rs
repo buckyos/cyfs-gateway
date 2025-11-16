@@ -3,7 +3,7 @@ use crate::sn_db::{self, *};
 use http_body_util::combinators::BoxBody;
 use ::kRPC::*;
 use async_trait::async_trait;
-use cyfs_gateway_lib::{HttpServer, NameServer, ProcessChainConfig, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
+use cyfs_gateway_lib::{HttpServer, NameServer, ProcessChainConfig, QAServer, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
 use jsonwebtoken::DecodingKey;
 use lazy_static::lazy_static;
 use log::*;
@@ -26,6 +26,15 @@ use http_body_util::{BodyExt, Collected, Full};
 use tokio::sync::Mutex;
 use cyfs_gateway_lib::{server_err,into_server_err};
 
+
+#[derive(Serialize, Deserialize)]
+pub struct OODInfo {
+    //pub device_info: DeviceInfo,
+    pub did_hostname: String,
+    pub owner_id: String,
+    pub self_cert: bool,
+    pub state: String,//active,suspended,disabled,banned
+}
 
 #[derive(Clone)]
 pub struct SNServer {
@@ -622,8 +631,140 @@ impl SNServer {
                 //get device info
                 return self.get_device(req).await;
             }
+            "query_by_hostname" => {
+                //query device by hostname
+                let hostname = req.params.get("dest_host");
+                if hostname.is_none() {
+                    return Err(RPCErrors::ParseRequestError("Invalid params, hostname is none".to_string()));
+                }
+                let hostname = hostname.unwrap().as_str();
+                if hostname.is_none() {
+                    return Err(RPCErrors::ParseRequestError("Invalid params, hostname is none".to_string()));
+                }
+                let hostname = hostname.unwrap();
+                let ood_info= self.query_device_by_hostname(hostname).await;
+                if ood_info.is_some() {
+                    let ood_info = ood_info.unwrap();
+                    let ood_json = serde_json::to_value(ood_info).unwrap();
+                    return Ok(RPCResponse::new(RPCResult::Success(ood_json), req.id));
+                } else {
+                    return Err(RPCErrors::ParseRequestError("Invalid params, hostname is none".to_string()));
+                }
+            }
+            "query_by_did" => {
+                let did = req.params.get("source_device_id");
+                if did.is_none() {
+                    return Err(RPCErrors::ParseRequestError("Invalid params, did is none".to_string()));
+                }
+                let did = did.unwrap().as_str();
+                if did.is_none() {
+                    return Err(RPCErrors::ParseRequestError("Invalid params, did is none".to_string()));
+                }
+                let did = did.unwrap();
+                let ood_info = self.query_by_did(did).await;
+                if ood_info.is_some() {
+                    let ood_info = ood_info.unwrap();
+                    let ood_json = serde_json::to_value(ood_info).unwrap();
+                    return Ok(RPCResponse::new(RPCResult::Success(ood_json), req.id));
+                } else {
+                    return Err(RPCErrors::ParseRequestError("Invalid params, did is none".to_string()));
+                }
+            }
             _ => Err(RPCErrors::UnknownMethod(req.method)),
         }
+    }
+
+
+    async fn query_by_did(
+        &self,
+        did: &str,
+    ) -> Option<OODInfo> {
+        let db = GLOBAL_SN_DB.lock().await;
+        let device_info = db.query_device_by_did(did).unwrap();
+        if device_info.is_none() {
+            return None;
+        }
+        let device_info = device_info.unwrap();
+        let (username, device_name, did, ip, description, created_at, updated_at) = device_info;
+        return Some(OODInfo {
+            did_hostname: did.to_string(),
+            owner_id: username.clone(),
+            self_cert: true,
+            state: "active".to_string(),
+        });
+    }
+
+    async fn query_device_by_hostname(
+        &self,
+        req_host: &str,
+    ) -> Option<OODInfo> {
+        let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
+        if get_result.is_some() {
+            let (sub_host,username) = get_result.unwrap();
+            let device_info = self.get_device_info(username.as_str(), "ood1").await;
+            if device_info.is_some() {
+                //info!("ood1 device info found for {} in sn server",username);
+                //let device_did = device_info.unwrap().0.did;
+                let (device_info, device_ip) = device_info.unwrap();
+                let did_hostname = device_info.id.to_host_name();
+                let ood_info = OODInfo {
+                    did_hostname: did_hostname,
+                    owner_id: username.clone(),
+                    self_cert: false,
+                    state: "active".to_string(),
+                };
+                return Some(ood_info);
+            } else {
+                warn!("ood1 device info not found for {} in sn server", username);
+            }
+        } else {
+            let db = GLOBAL_SN_DB.lock().await;
+            let user_info = db.get_user_info_by_domain(req_host).unwrap();
+            if user_info.is_none() {
+                return None;
+            }
+            let (username, public_key, zone_config, _) = user_info.unwrap();
+            let device_info = self.get_device_info(username.as_str(), "ood1").await;
+            if device_info.is_some() {
+                //info!("ood1 device info found for {} in sn server",username);
+                //let device_did = device_info.unwrap().0.did;
+                let device_did = device_info.as_ref().unwrap().0.id.clone();
+                let did_hostname = device_did.to_host_name();
+                let ood_info = OODInfo {
+                    did_hostname: did_hostname,
+                    owner_id: username.clone(),
+                    self_cert: true,
+                    state: "active".to_string(),
+                };
+                //info!("select device {} for http upstream:{}",device_did.as_str(),result_str.as_str());
+                return Some(ood_info);
+            } else {
+                warn!("ood1 device info not found for {} in sn server", username);
+            }
+        }
+
+        return None;
+    }
+}
+
+#[async_trait]
+impl QAServer for SNServer {
+    async fn serve_question(&self, req: &serde_json::Value) -> ServerResult<serde_json::Value> {
+        let rpc_request = serde_json::from_value::<RPCRequest>(req.clone());
+        if rpc_request.is_err() {
+            return Err(server_err!(ServerErrorCode::InvalidParam, "invalid request"));
+        }
+        let rpc_request = rpc_request.unwrap();
+        let rpc_response = self.handle_rpc_call(rpc_request, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).await;
+        if rpc_response.is_err() {
+            return Err(server_err!(ServerErrorCode::ProcessChainError, "failed to handle rpc call"));
+        }
+        let rpc_response = rpc_response.unwrap();
+        return Ok(serde_json::to_value(rpc_response).unwrap());
+    }
+
+    fn id(&self) -> String {
+        self.id.clone()
     }
 }
 
@@ -914,55 +1055,6 @@ impl HttpServer for SNServer {
     }
 }
 
-
-
-// #[async_trait]
-// impl TunnelSelector for SNServer {
-//     async fn select_tunnel_for_http_upstream(
-//         &self,
-//         req_host: &str,
-//         req_path: &str,
-//     ) -> Option<String> {
-
-//         let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
-//         if get_result.is_some() {
-//             let (sub_host,username) = get_result.unwrap();
-//             let device_info = self.get_device_info(username.as_str(), "ood1").await;
-//             if device_info.is_some() {
-//                 //info!("ood1 device info found for {} in sn server",username);
-//                 //let device_did = device_info.unwrap().0.did;
-//                 let device_host_name = device_info.unwrap().0.id.to_host_name();
-//                 //TODO: stream url的形式？
-//                 let result_str = format!("rtcp://{}/:80", device_host_name.as_str());
-//                 //info!("select device {} for http upstream:{}",device_did.as_str(),result_str.as_str());
-//                 return Some(result_str);
-//             } else {
-//                 warn!("ood1 device info not found for {} in sn server", username);
-//             }
-//         } else {
-//             let db = GLOBAL_SN_DB.lock().await;
-//             let user_info = db.get_user_info_by_domain(req_host).unwrap();
-//             if user_info.is_none() {
-//                 return None;
-//             }
-//             let (username, public_key, zone_config, _) = user_info.unwrap();
-//             let device_info = self.get_device_info(username.as_str(), "ood1").await;
-//             if device_info.is_some() {
-//                 //info!("ood1 device info found for {} in sn server",username);
-//                 //let device_did = device_info.unwrap().0.did;
-//                 let device_did = device_info.as_ref().unwrap().0.id.clone();
-//                 let device_host_name = device_did.to_host_name();
-//                 let result_str = format!("rtcp://{}/:80", device_host_name.as_str());
-//                 //info!("select device {} for http upstream:{}",device_did.as_str(),result_str.as_str());
-//                 return Some(result_str);
-//             } else {
-//                 warn!("ood1 device info not found for {} in sn server", username);
-//             }
-//         }
-
-//         return None;
-//     }
-// }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SNServerConfig {

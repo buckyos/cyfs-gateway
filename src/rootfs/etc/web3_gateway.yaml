@@ -2,7 +2,7 @@ servers:
   - id: web3_sn
     type: sn
     config: 
-      main_host: "sn.web3.buckyos.ai"
+      main_host: "sn.buckyos.ai"
 
 
   - id: main_dns
@@ -47,10 +47,9 @@ stacks:
         blocks:
           - id: default
             block: |
-              set ${REQ.method} "query_by_did";
-              call qa web3_sn;
-              match $(ANSWER.result) "0" || reject;
-              accept;
+              map-add REQ method "query_by_did"
+              call qa web3_sn && eq $ANSWER.state "active" && accept;
+              reject;
 
   - id: tls_raw_forward
     bind: 0.0.0.0:443
@@ -61,11 +60,8 @@ stacks:
         blocks:
           - id: default
             block: |
-              set ${REQ.method} "query_by_host";
-              call https-sni-probe && call qa web3_sn;
-              match $(ANSWER.result) "0" || reject;
-              match $(ANSWER.self_cert) "true" && return "forward rtcp://${ANSWER.ood_did}/:443";
-              reject;
+              map-add REQ method "query_by_hostname"
+              call https-sni-probe && call qa web3_sn && eq $ANSWER.self_cert "true" && return "forward rtcp://${ANSWER.did_hostname}/:443"
   
   # - id: http_forward
   #   bind: 0.0.0.0:80

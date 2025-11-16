@@ -1039,3 +1039,24 @@ Examples:
   range $REQ.port 1000 2000
 ```
 
+## 一些常见的内置对象
+
+### REQ
+- REQ.dest_port
+- REQ.dest_host
+- REQ.protocol udp | tcp
+- REQ.app_protocl
+- REQ.dest_url
+- REQ.source_addr
+- REQ.source_mac
+- REQ.source_device_id
+- REQ.source_app_id
+- REQ.source_user_id
+
+
+
+### RESP
+
+
+### ANSWER
+

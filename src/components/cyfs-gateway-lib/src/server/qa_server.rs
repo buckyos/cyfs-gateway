@@ -228,21 +228,11 @@ impl ExternalCommand for CmdQa {
         info!("will execute qa command: server_id={}, map_id={}", server_id, map_id);
 
         // Get the QA server
-        let server = self.server_manager.get_server(server_id)
-            .ok_or_else(|| {
-                let msg = format!("QA server '{}' not found", server_id);
-                error!("{}", msg);
-                msg
-            })?;
-
-        let qa_server = match server {
-            Server::QA(qa_server) => qa_server,
-            _ => {
-                let msg = format!("Server '{}' is not a QA server", server_id);
-                error!("{}", msg);
-                return Err(msg);
-            }
-        };
+        let server = self.server_manager.get_qa_server(server_id);
+        if server.is_none() {
+            return Err(format!("QA server '{}' not found", server_id));
+        }
+        let qa_server = server.unwrap();
 
         // Get the request map from environment
         let req_value = context.env().get(map_id, None).await?
