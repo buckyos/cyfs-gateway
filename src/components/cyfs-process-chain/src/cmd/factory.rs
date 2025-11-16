@@ -8,6 +8,7 @@ use super::external::*;
 use super::map::*;
 use super::match_::*;
 use super::string::*;
+use super::type_::*;
 use super::var::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -79,6 +80,7 @@ impl CommandParserFactory {
         // env command
         self.register("assign", Arc::new(Box::new(AssignCommandParser::new())));
         self.register("delete", Arc::new(Box::new(DeleteCommandParser::new())));
+        self.register("type", Arc::new(Box::new(TypeCommandParser::new())));
 
         // match command
         self.register("match", Arc::new(Box::new(MatchCommandParser::new())));

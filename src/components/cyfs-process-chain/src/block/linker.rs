@@ -172,7 +172,7 @@ impl CommandArgEvaluator {
         let ret = match arg {
             CommandArg::Literal(value) => CollectionValue::String(value.clone()),
             CommandArg::Var(var) => {
-                info!("Resolving variable: {}", var);
+                debug!("Resolving variable: {}", var);
                 if let Some(value) = context.env().get(&var, None).await? {
                     value
                 } else {

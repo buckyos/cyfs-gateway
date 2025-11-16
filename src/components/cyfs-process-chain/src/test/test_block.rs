@@ -114,6 +114,8 @@ const PROCESS_CHAIN: &str = r#"
             # We reject the request if the protocol is not https
             !(match $PROTOCOL https) && reject;
 
+            local key1="key1";
+            echo $(type key2);
             call check_host "www.buckyos1.com" && reject;
             echo "\$get request url: ${REQ_url} \n ${PROTOCOL}";
             echo $(call add 1 2);
