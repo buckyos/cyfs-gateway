@@ -2,7 +2,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use url::Url;
 use std::error::Error as StdError;
 use std::task::{Context, Poll};
-use hyper::service::Service;
+use tower_service::Service;
+use hyper::rt::{Read, Write};
 use buckyos_kit::AsyncStream;
 use std::pin::Pin;
 use std::future::Future;
@@ -60,6 +61,54 @@ impl AsyncWrite for TunnelStreamConnection {
     }
 }
 
+// Implement hyper::rt::Read trait
+impl Read for TunnelStreamConnection {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let n = unsafe {
+            let mut tbuf = ReadBuf::uninit(buf.as_mut());
+            match AsyncRead::poll_read(self, cx, &mut tbuf) {
+                Poll::Ready(Ok(())) => tbuf.filled().len(),
+                other => return other,
+            }
+        };
+
+        unsafe {
+            buf.advance(n);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+// Implement hyper::rt::Write trait
+impl Write for TunnelStreamConnection {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        AsyncWrite::poll_write(self, cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        AsyncWrite::poll_flush(self, cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        AsyncWrite::poll_shutdown(self, cx)
+    }
+}
+
+// Implement Connection trait for TunnelStreamConnection
+impl hyper_util::client::legacy::connect::Connection for TunnelStreamConnection {
+    fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
+        hyper_util::client::legacy::connect::Connected::new()
+    }
+}
+
 
 #[derive(Clone)]
 pub struct TunnelConnector {
@@ -72,7 +121,11 @@ impl Service<Uri> for TunnelConnector {
     type Error = Box<dyn StdError + Send + Sync>;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-    fn call(&self, _uri: Uri) -> Self::Future {
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _uri: Uri) -> Self::Future {
         let target_stream_url = self.target_stream_url.clone();
         Box::pin(async move {
             debug!("TunnelConnector call uri: {}", target_stream_url.as_str());

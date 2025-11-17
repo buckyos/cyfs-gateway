@@ -155,14 +155,16 @@ impl ProcessChainHttpServer {
                 return Ok(resp)
             },
             _ => {
-                let _tunnel_connector = TunnelConnector {
+                let tunnel_connector = TunnelConnector {
                     target_stream_url: target_url.to_string(),
                 };
 
-                let client: Client<_, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>> = Client::builder(TokioExecutor::new()).build_http();
+
+                let client: Client<TunnelConnector, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>> = Client::builder(TokioExecutor::new())
+                    .build(tunnel_connector);
 
                 let header = req.headers().clone();
-                let mut host_name = "127.0.0.1".to_string();
+                let mut host_name = "localhost".to_string();
                 let hname =  req.headers().get("host");
                 if hname.is_some() {
                     host_name = hname.unwrap().to_str().unwrap().to_string();
