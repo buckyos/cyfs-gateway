@@ -28,7 +28,7 @@ sha2 = "0.10"
 chrono = "0.4"
 hex = "0.4"
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
-sfo-io = "0.1"
+sfo-io = "=0.1.9"
 sfo-log = { version = "0.1"}
 
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", branch = "beta1", package = "buckyos-kit" }
