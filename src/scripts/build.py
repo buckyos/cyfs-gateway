@@ -56,7 +56,10 @@ def build_main():
         if arg == "amd64":
             target = "x86_64-unknown-linux-musl"
         if arg == "aarch64":
-            target = "aarch64-unknown-linux-gnu"
+            target = "aarch64-unknown-linux-musl"
+        if arg == "windows" and system != "Windows":
+            target = "x86_64-pc-windows-gnu"
+            
         if arg == "--auto-win-sdk":
             auto_win_sdk = True
         if arg == "--tray-controller":

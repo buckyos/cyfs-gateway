@@ -1,8 +1,10 @@
 servers:
   - id: web3_sn
     type: sn
-    config: 
-      main_host: "sn.buckyos.ai"
+    host: "sn.buckyos.ai"
+    zone_config_jwt: "test"
+    zone_config_pkx: "test"
+    ip: "127.0.0.1"
 
 
   - id: main_dns
