@@ -122,6 +122,7 @@ struct TunStackInner {
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: TunnelManager,
     global_process_chains: Option<GlobalProcessChainsRef>,
+    limiter_manager: LimiterManagerRef,
 }
 
 impl TunStackInner {
@@ -156,6 +157,9 @@ impl TunStackInner {
         if builder.tunnel_manager.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "tunnel_manager is required"));
         }
+        if builder.limiter_manager.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "limiter_manager is required"));
+        }
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains.clone(),
@@ -173,6 +177,7 @@ impl TunStackInner {
             executor: Arc::new(Mutex::new(executor)),
             connection_manager: builder.connection_manager,
             tunnel_manager: builder.tunnel_manager.unwrap(),
+            limiter_manager: builder.limiter_manager.unwrap(),
             global_process_chains: builder.global_process_chains,
         })
     }
@@ -302,6 +307,7 @@ impl TunStackInner {
         request.source_addr = Some(remote_addr);
         request.dest_port = dest_addr.port();
         request.app_protocol = Some("tcp".to_string());
+        let chain_env = executor.chain_env().clone();
         let (ret, mut stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -318,6 +324,18 @@ impl TunStackInner {
                         return Ok(());
                     }
 
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env).await?;
+                    let upper = if limiter_id.is_some() {
+                        self.limiter_manager.get_limiter(limiter_id.unwrap())
+                    } else {
+                        None
+                    };
+                    let limiter = if down_speed.is_some() && up_speed.is_some() {
+                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
+                    } else {
+                        None
+                    };
+
                     let cmd = list[0].as_str();
                     match cmd {
                         "forward" => {
@@ -328,8 +346,13 @@ impl TunStackInner {
                                 ));
                             }
                             let target = list[1].as_str();
-                            let limiter = Limiter::new(None, None);
-                            let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                stream
+                            };
                             stream_forward(stream, target, &self.tunnel_manager).await?;
                         }
                         "server" => {
@@ -339,8 +362,13 @@ impl TunStackInner {
                                     "invalid server command"
                                 ));
                             }
-                            let limiter = Limiter::new(None, None);
-                            let mut stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                stream
+                            };
 
                             let server_name = list[1].as_str();
                             if let Some(server) = servers.get_server(server_name) {
@@ -396,6 +424,7 @@ impl TunStackInner {
         map.insert("app_protocol", CollectionValue::String("udp".to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
 
+        let chain_env = executor.chain_env().clone();
         let ret = execute_chain(executor, map).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
 
@@ -412,6 +441,18 @@ impl TunStackInner {
                         return Ok(());
                     }
 
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env).await?;
+                    let upper = if limiter_id.is_some() {
+                        self.limiter_manager.get_limiter(limiter_id.unwrap())
+                    } else {
+                        None
+                    };
+                    let limiter = if down_speed.is_some() && up_speed.is_some() {
+                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
+                    } else {
+                        None
+                    };
+
                     let cmd = list[0].as_str();
                     match cmd {
                         "forward" => {
@@ -422,8 +463,13 @@ impl TunStackInner {
                                 ));
                             }
                             let target = list[1].as_str();
-                            let limiter = Limiter::new(None, None);
-                            let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
+                            let stream: Box<dyn AsyncStream> = if limiter.is_some() {
+                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                Box::new(stream)
+                            };
                             let datagram_stream = Box::new(TunDatagramClient::new(stream));
                             datagram_forward(datagram_stream, target, &self.tunnel_manager).await?;
                         }
@@ -434,8 +480,13 @@ impl TunStackInner {
                                     "invalid server command"
                                 ));
                             }
-                            let limiter = Limiter::new(None, None);
-                            let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
+                            let stream: Box<dyn AsyncStream> = if limiter.is_some() {
+                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                Box::new(stream)
+                            };
 
                             let server_name = list[1].as_str();
                             if let Some(server) = servers.get_server(server_name) {
@@ -484,6 +535,7 @@ pub struct TunStackBuilder {
     global_process_chains: Option<GlobalProcessChainsRef>,
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: Option<TunnelManager>,
+    limiter_manager: Option<LimiterManagerRef>,
 }
 
 impl TunStackBuilder {
@@ -500,6 +552,7 @@ impl TunStackBuilder {
             global_process_chains: None,
             connection_manager: None,
             tunnel_manager: None,
+            limiter_manager: None,
         }
     }
 
@@ -558,6 +611,11 @@ impl TunStackBuilder {
         self
     }
 
+    pub fn limiter_manager(mut self, limiter_manager: LimiterManagerRef) -> Self {
+        self.limiter_manager = Some(limiter_manager);
+        self
+    }
+
     pub async fn build(self) -> StackResult<TunStack> {
         TunStack::create(self).await
     }
@@ -610,6 +668,7 @@ pub struct TunStackFactory {
     global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
+    limiter_manager: LimiterManagerRef,
 }
 
 impl TunStackFactory {
@@ -618,12 +677,14 @@ impl TunStackFactory {
         global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
+        limiter_manager: LimiterManagerRef,
     ) -> Self {
         TunStackFactory {
             servers,
             global_process_chains,
             connection_manager,
             tunnel_manager,
+            limiter_manager,
         }
     }
 }
@@ -648,6 +709,7 @@ impl StackFactory for TunStackFactory {
             .global_process_chains(self.global_process_chains.clone())
             .connection_manager(self.connection_manager.clone())
             .tunnel_manager(self.tunnel_manager.clone())
+            .limiter_manager(self.limiter_manager.clone())
             .build().await?;
         Ok(Arc::new(stack))
     }

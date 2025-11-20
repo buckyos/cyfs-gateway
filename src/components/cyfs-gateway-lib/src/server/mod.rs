@@ -134,7 +134,7 @@ mod test {
         let mut config: serde_json::Value = serde_json::from_str(config_str).unwrap();
         let base_dir = PathBuf::from("/opt/buckyos/etc");
         normalize_all_path_value_config(&mut config,&base_dir);
-        assert_eq!(config.get("path").unwrap().as_str().unwrap(), "/opt/buckyos/etc/test.txt");
-        assert_eq!(config.get("servers").unwrap().as_array().unwrap().get(0).unwrap().as_object().unwrap().get("tls").unwrap().as_object().unwrap().get("cert_path").unwrap().as_str().unwrap(), "/opt/buckyos/etc/cert.pem");
+        assert_eq!(config.get("path").unwrap().as_str().unwrap().replace("\\","/"), "/opt/buckyos/etc/test.txt");
+        assert_eq!(config.get("servers").unwrap().as_array().unwrap().get(0).unwrap().as_object().unwrap().get("tls").unwrap().as_object().unwrap().get("cert_path").unwrap().as_str().unwrap().replace("\\","/"), "/opt/buckyos/etc/cert.pem");
     }
 }

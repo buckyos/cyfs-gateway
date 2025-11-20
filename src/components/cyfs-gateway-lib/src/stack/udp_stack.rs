@@ -15,11 +15,12 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, get_min_priority, DatagramInfo};
+use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, get_min_priority, DatagramInfo, LimiterManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 #[cfg(target_os = "linux")]
 use crate::stack::{has_root_privileges, recv_from, set_socket_opt};
+use crate::stack::get_limit_info;
 
 pub struct UdpSendDatagram {
     socket: Arc<UdpSocket>,
@@ -367,6 +368,7 @@ struct UdpStackInner {
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: TunnelManager,
     global_process_chains: Option<GlobalProcessChainsRef>,
+    limiter_manager: LimiterManagerRef,
     transparent: bool,
     local_ips: Vec<IpAddr>,
     socket_cache: SocketCache,
@@ -389,6 +391,9 @@ impl UdpStackInner {
         if builder.tunnel_manager.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "tunnel_manager is required"));
         }
+        if builder.limiter_manager.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "limiter_manager is required"));
+        }
 
         let (executor, _) = create_process_chain_executor(&builder.hook_point.unwrap(),
                                                           builder.global_process_chains.clone(),
@@ -406,6 +411,7 @@ impl UdpStackInner {
             connection_manager: builder.connection_manager,
             tunnel_manager: builder.tunnel_manager.unwrap(),
             global_process_chains: builder.global_process_chains,
+            limiter_manager: builder.limiter_manager.unwrap(),
             transparent: builder.transparent,
             local_ips,
             socket_cache: SocketCache::new(),
@@ -515,6 +521,7 @@ impl UdpStackInner {
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create chain env error: {}", e))?;
 
         let speed_stat = Arc::new(SfoSpeedStat::new());
+        let chain_env = chain_env.clone();
         let ret = executor.execute_lib().await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "execute chain error: {}", e))?;
         if ret.is_control() {
@@ -536,6 +543,18 @@ impl UdpStackInner {
                         udp_socket.clone()
                     } else {
                         self.socket_cache.get_socket(dest_addr).await?
+                    };
+
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env).await?;
+                    let upper = if limiter_id.is_some() {
+                        self.limiter_manager.get_limiter(limiter_id.unwrap())
+                    } else {
+                        None
+                    };
+                    let limiter = if down_speed.is_some() && up_speed.is_some() {
+                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
+                    } else {
+                        None
                     };
 
                     let cmd = list[0].as_str();
@@ -571,8 +590,13 @@ impl UdpStackInner {
                             if is_limit {
                                 let (sender, receive) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
                                 let send_datagram = Box::new(ChannelDatagram::new(sender));
-                                let limit = Arc::new(Limiter::new(None, None));
-                                let mut receive_datagram = LimitDatagram::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive), limit.clone());
+                                let mut receive_datagram: Box<dyn Datagram<Error=StackError>> = if limiter.is_some() {
+                                    let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                    let receive_datagram = LimitDatagram::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive), read_limit, write_limit);
+                                    Box::new(receive_datagram)
+                                } else {
+                                    Box::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive))
+                                };
                                 let stat = speed_stat.clone();
                                 let send_handle = tokio::spawn(async move {
                                     let mut buffer = vec![0u8; 1024 * 4];
@@ -598,7 +622,13 @@ impl UdpStackInner {
                                 });
 
                                 let stat = speed_stat.clone();
-                                let mut receive_forward_datagram = LimitDatagram::new(UdpSendDatagram::new(udp_socket.clone(), src_addr), limit);
+                                let mut receive_forward_datagram: Box<dyn Datagram<Error=StackError>> = if limiter.is_some() {
+                                    let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                    let datagram = LimitDatagram::new(UdpSendDatagram::new(udp_socket.clone(), src_addr), read_limit, write_limit);
+                                    Box::new(datagram)
+                                } else {
+                                    Box::new(UdpSendDatagram::new(udp_socket.clone(), src_addr))
+                                };
                                 let handle = tokio::spawn(async move {
                                     let mut buffer = vec![0u8; 1024 * 4];
                                     loop {
@@ -686,8 +716,12 @@ impl UdpStackInner {
                                     if is_limit {
                                         let (sender, receive) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
                                         let mut send_datagram = Box::new(ChannelDatagram::new(sender));
-                                        let limit = Arc::new(Limiter::new(None, None));
-                                        let mut receive_datagram = LimitDatagram::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive), limit.clone());
+                                        let mut receive_datagram: Box<dyn Datagram<Error=StackError>> = if limiter.is_some() {
+                                            let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                            Box::new(LimitDatagram::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive), read_limit, write_limit))
+                                        } else {
+                                            Box::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive))
+                                        };
                                         let stat = speed_stat.clone();
                                         let servers = self.servers.clone();
                                         let handle = tokio::spawn(async move {
@@ -1090,6 +1124,7 @@ pub struct UdpStackBuilder {
     global_process_chains: Option<GlobalProcessChainsRef>,
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: Option<TunnelManager>,
+    limiter_manager: Option<LimiterManagerRef>,
     transparent: bool,
 }
 
@@ -1105,6 +1140,7 @@ impl UdpStackBuilder {
             global_process_chains: None,
             connection_manager: None,
             tunnel_manager: None,
+            limiter_manager: None,
             transparent: false,
         }
     }
@@ -1155,6 +1191,11 @@ impl UdpStackBuilder {
 
     pub fn transparent(mut self, transparent: bool) -> Self {
         self.transparent = transparent;
+        self
+    }
+
+    pub fn limiter_manager(mut self, limiter_manager: LimiterManagerRef) -> Self {
+        self.limiter_manager = Some(limiter_manager);
         self
     }
 
@@ -1209,6 +1250,7 @@ pub struct UdpStackFactory {
     global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
+    limiter_manager: LimiterManagerRef,
 }
 
 impl UdpStackFactory {
@@ -1217,12 +1259,14 @@ impl UdpStackFactory {
         global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
+        limiter_manager: LimiterManagerRef,
     ) -> Self {
         Self {
             servers,
             global_process_chains,
             connection_manager,
             tunnel_manager,
+            limiter_manager,
         }
     }
 }
@@ -1245,6 +1289,7 @@ impl StackFactory for UdpStackFactory {
             .concurrency(config.concurrency.unwrap_or(200))
             .session_idle_time(Duration::from_secs(config.session_idle_time.unwrap_or(120)))
             .transparent(config.transparent.unwrap_or(false))
+            .limiter_manager(self.limiter_manager.clone())
             .build().await?;
         Ok(Arc::new(stack))
     }
@@ -1256,7 +1301,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::UdpSocket;
-    use crate::{ConnectionManager, DatagramInfo, ProcessChainConfigs, Server, ServerConfig, ServerManager, ServerResult, Stack, StackFactory, StackProtocol, TunnelManager, UdpStack, UdpStackConfig, UdpStackFactory};
+    use crate::{ConnectionManager, DatagramInfo, LimiterManager, ProcessChainConfigs, Server, ServerConfig, ServerManager, ServerResult, Stack, StackFactory, StackProtocol, TunnelManager, UdpStack, UdpStackConfig, UdpStackFactory};
     use crate::global_process_chains::GlobalProcessChains;
     use crate::server::{DatagramServer};
 
@@ -1286,6 +1331,7 @@ mod tests {
             .hook_point(vec![])
             .servers(Arc::new(ServerManager::new()))
             .tunnel_manager(TunnelManager::new())
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1296,6 +1342,7 @@ mod tests {
             .servers(Arc::new(ServerManager::new()))
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .tunnel_manager(TunnelManager::new())
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1323,6 +1370,7 @@ mod tests {
             .session_idle_time(Duration::from_secs(5))
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .tunnel_manager(tunnel_manager)
+            .limiter_manager(LimiterManager::new())
             .transparent(true)
             .build()
             .await;
@@ -1377,6 +1425,7 @@ mod tests {
             .servers(Arc::new(ServerManager::new()))
             .tunnel_manager(tunnel_manager)
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1446,6 +1495,7 @@ mod tests {
             .servers(datagram_server_manager)
             .tunnel_manager(tunnel_manager)
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1472,6 +1522,7 @@ mod tests {
                                                Arc::new(GlobalProcessChains::new()),
                                                ConnectionManager::new(),
                                                TunnelManager::new(),
+                                               LimiterManager::new()
         );
 
         let config = UdpStackConfig {

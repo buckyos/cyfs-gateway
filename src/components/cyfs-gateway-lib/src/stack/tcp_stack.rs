@@ -1,4 +1,4 @@
-use super::{stream_forward, Stack};
+use super::{get_limit_info, stream_forward, Stack};
 
 #[cfg(target_os = "linux")]
 use super::{get_socket_opt, has_root_privileges, set_socket_opt, sockaddr_to_socket_addr};
@@ -7,7 +7,7 @@ use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_min_priority, get_stream_external_commands};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_min_priority, get_stream_external_commands, LimiterManagerRef};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -29,6 +29,7 @@ struct TcpStackInner {
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: TunnelManager,
     global_process_chains: Option<GlobalProcessChainsRef>,
+    limiter_manager: LimiterManagerRef,
     transparent: bool,
 }
 
@@ -65,6 +66,12 @@ impl TcpStackInner {
                 "tunnel_manager is required"
             ));
         }
+        if config.limiter_manager.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "limiter_manager is required"
+            ));
+        }
 
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
                                                           config.global_process_chains.clone(),
@@ -78,6 +85,7 @@ impl TcpStackInner {
             connection_manager: config.connection_manager,
             tunnel_manager: config.tunnel_manager.unwrap(),
             global_process_chains: config.global_process_chains,
+            limiter_manager: config.limiter_manager.unwrap(),
             transparent: config.transparent,
         })
     }
@@ -220,6 +228,7 @@ impl TcpStackInner {
         let remote_addr = stream.raw_stream().peer_addr().map_err(into_stack_err!(StackErrorCode::ServerError, "read remote addr failed"))?;
         let mut request = StreamRequest::new(Box::new(stream), dest_addr);
         request.source_addr = Some(remote_addr);
+        let chain_env = executor.chain_env().clone();
         let (ret, stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -236,6 +245,18 @@ impl TcpStackInner {
                         return Ok(());
                     }
 
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env).await?;
+                    let upper = if limiter_id.is_some() {
+                        self.limiter_manager.get_limiter(limiter_id.unwrap())
+                    } else {
+                        None
+                    };
+                    let limiter = if down_speed.is_some() && up_speed.is_some() {
+                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
+                    } else {
+                        None
+                    };
+
                     let cmd = list[0].as_str();
                     match cmd {
                         "forward" => {
@@ -246,8 +267,14 @@ impl TcpStackInner {
                                 ));
                             }
                             let target = list[1].as_str();
-                            let limiter = Limiter::new(None, None);
-                            let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                stream
+                            };
+
                             stream_forward(stream, target, &self.tunnel_manager).await?;
                         }
                         "server" => {
@@ -257,8 +284,13 @@ impl TcpStackInner {
                                     "invalid server command"
                                 ));
                             }
-                            let limiter = Limiter::new(None, None);
-                            let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                stream
+                            };
 
                             let server_name = list[1].as_str();
                             if let Some(server) = servers.get_server(server_name) {
@@ -312,6 +344,7 @@ impl TcpStack {
             global_process_chains: None,
             connection_manager: None,
             tunnel_manager: None,
+            limiter_manager: None,
             transparent: false,
         }
     }
@@ -383,6 +416,7 @@ pub struct TcpStackBuilder {
     global_process_chains: Option<GlobalProcessChainsRef>,
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: Option<TunnelManager>,
+    limiter_manager: Option<LimiterManagerRef>,
     transparent: bool,
 }
 
@@ -424,6 +458,11 @@ impl TcpStackBuilder {
 
     pub fn transparent(mut self, transparent: bool) -> Self {
         self.transparent = transparent;
+        self
+    }
+
+    pub fn limiter_manager(mut self, limiter_manager: LimiterManagerRef) -> Self {
+        self.limiter_manager = Some(limiter_manager);
         self
     }
 
@@ -475,6 +514,7 @@ pub struct TcpStackFactory {
     global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
+    limiter_manager: LimiterManagerRef,
 }
 
 impl TcpStackFactory {
@@ -483,12 +523,14 @@ impl TcpStackFactory {
         global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
+        limiter_manager: LimiterManagerRef,
     ) -> Self {
         Self {
             servers,
             global_process_chains,
             connection_manager,
             tunnel_manager,
+            limiter_manager,
         }
     }
 }
@@ -510,6 +552,7 @@ impl StackFactory for TcpStackFactory {
             .servers(self.servers.clone())
             .transparent(config.transparent.unwrap_or(false))
             .hook_point(config.hook_point.clone())
+            .limiter_manager(self.limiter_manager.clone())
             .build().await?;
         Ok(Arc::new(stack))
     }
@@ -519,7 +562,7 @@ impl StackFactory for TcpStackFactory {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo, LimiterManager};
     use buckyos_kit::AsyncStream;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -552,6 +595,7 @@ mod tests {
             .servers(Arc::new(ServerManager::new()))
             .tunnel_manager(TunnelManager::new())
             .hook_point(vec![])
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -562,6 +606,7 @@ mod tests {
             .hook_point(vec![])
             .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -573,6 +618,7 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .connection_manager(ConnectionManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -600,6 +646,7 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -640,6 +687,7 @@ mod tests {
             .hook_point(chains)
             .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -678,6 +726,7 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -736,6 +785,7 @@ mod tests {
             .hook_point(chains)
             .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -801,6 +851,7 @@ mod tests {
             .hook_point(chains)
             .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -825,7 +876,8 @@ mod tests {
         let tcp_factory = TcpStackFactory::new(Arc::new(ServerManager::new()),
                                                Arc::new(GlobalProcessChains::new()),
                                                ConnectionManager::new(),
-                                               TunnelManager::new());
+                                               TunnelManager::new(),
+                                               LimiterManager::new());
         let config = TcpStackConfig {
             id: "test".to_string(),
             protocol: StackProtocol::Tcp,

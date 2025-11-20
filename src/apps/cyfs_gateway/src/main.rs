@@ -88,7 +88,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
     let tunnel_manager = TunnelManager::new();
     let server_manager = Arc::new(ServerManager::new());
     let global_process_chains = Arc::new(GlobalProcessChains::new());
-
+    let limiter_manager = LimiterManager::new();
 
     let mut cert_config = CertManagerConfig::default();
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
@@ -105,7 +105,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
                 cert_config.check_interval = check_interval;
             }
         }
-        
+
         if acme_config.renew_before_expiry.is_some() {
             if let Some(renew_before_expiry) = chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0) {
                 cert_config.renew_before_expiry = renew_before_expiry;
@@ -128,12 +128,14 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         global_process_chains.clone(),
         connect_manager.clone(),
         tunnel_manager.clone(),
+        limiter_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Udp, Arc::new(UdpStackFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
         connect_manager.clone(),
         tunnel_manager.clone(),
+        limiter_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Tls, Arc::new(TlsStackFactory::new(
         server_manager.clone(),
@@ -141,6 +143,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         connect_manager.clone(),
         tunnel_manager.clone(),
         cert_manager.clone(),
+        limiter_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
         server_manager.clone(),
@@ -148,18 +151,21 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         connect_manager.clone(),
         tunnel_manager.clone(),
         cert_manager.clone(),
+        limiter_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
         connect_manager.clone(),
         tunnel_manager.clone(),
+        limiter_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Extension("tun".to_string()), Arc::new(TunStackFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
         connect_manager.clone(),
         tunnel_manager.clone(),
+        limiter_manager.clone(),
     )));
 
     factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
@@ -253,7 +259,6 @@ fn get_config_file_path(matches: &clap::ArgMatches) -> PathBuf {
     let config_file = matches.get_one::<String>("config_file");
     let real_config_file;
     if config_file.is_none() {
-        
         real_config_file = default_config;
     } else {
         real_config_file = PathBuf::from(config_file.unwrap());

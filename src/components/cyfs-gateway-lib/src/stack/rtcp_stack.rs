@@ -4,11 +4,11 @@ use buckyos_kit::AsyncStream;
 use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig, CURRENT_DEVICE_CONFIG};
 use sfo_io::{LimitStream, StatStream};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands, DatagramInfo};
+use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands, DatagramInfo, LimiterManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
-use crate::stack::{datagram_forward, stream_forward};
+use crate::stack::{datagram_forward, get_limit_info, stream_forward};
 use serde::{Deserialize, Serialize};
 
 struct Listener {
@@ -76,6 +76,7 @@ struct RtcpStackInner {
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: TunnelManager,
     global_process_chains: Option<GlobalProcessChainsRef>,
+    limiter_manager: LimiterManagerRef,
 }
 
 impl RtcpStackInner {
@@ -98,6 +99,7 @@ impl RtcpStackInner {
             connection_manager: builder.connection_manager,
             tunnel_manager: builder.tunnel_manager.unwrap(),
             global_process_chains: builder.global_process_chains,
+            limiter_manager: builder.limiter_manager.unwrap(),
         })
     }
 
@@ -117,6 +119,7 @@ impl RtcpStackInner {
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("protocol", CollectionValue::String("tcp".to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        let chain_env = executor.chain_env().clone();
         let ret = execute_chain(executor, map)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -133,6 +136,18 @@ impl RtcpStackInner {
                         return Ok(());
                     }
 
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env).await?;
+                    let upper = if limiter_id.is_some() {
+                        self.limiter_manager.get_limiter(limiter_id.unwrap())
+                    } else {
+                        None
+                    };
+                    let limiter = if down_speed.is_some() && up_speed.is_some() {
+                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
+                    } else {
+                        None
+                    };
+
                     let cmd = list[0].as_str();
                     match cmd {
                         "forward" => {
@@ -143,8 +158,13 @@ impl RtcpStackInner {
                                 ));
                             }
                             let target = list[1].as_str();
-                            let limiter = Limiter::new(None, None);
-                            let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                stream
+                            };
                             stream_forward(stream, target, &self.tunnel_manager).await?;
                         }
                         "server" => {
@@ -154,8 +174,13 @@ impl RtcpStackInner {
                                     "invalid server command"
                                 ));
                             }
-                            let limiter = Limiter::new(None, None);
-                            let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                stream
+                            };
 
                             let server_name = list[1].as_str();
                             if let Some(server) = servers.get_server(server_name) {
@@ -205,6 +230,7 @@ impl RtcpStackInner {
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("protocol", CollectionValue::String("udp".to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        let chain_env = executor.chain_env().clone();
         let ret = execute_chain(executor, map)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -221,6 +247,18 @@ impl RtcpStackInner {
                         return Ok(());
                     }
 
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env).await?;
+                    let upper = if limiter_id.is_some() {
+                        self.limiter_manager.get_limiter(limiter_id.unwrap())
+                    } else {
+                        None
+                    };
+                    let limiter = if down_speed.is_some() && up_speed.is_some() {
+                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
+                    } else {
+                        None
+                    };
+
                     let cmd = list[0].as_str();
                     match cmd {
                         "forward" => {
@@ -231,8 +269,15 @@ impl RtcpStackInner {
                                 ));
                             }
                             let target = list[1].as_str();
-                            let limiter = Limiter::new(None, None);
-                            let stream = Box::new(LimitStream::new(datagram, Arc::new(limiter)));
+
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(datagram, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                datagram
+                            };
+
                             let datagram_stream = Box::new(RTcpTunnelDatagramClient::new(stream));
                             datagram_forward(datagram_stream, target, &self.tunnel_manager).await?;
                         }
@@ -243,8 +288,13 @@ impl RtcpStackInner {
                                     "invalid server command"
                                 ));
                             }
-                            let limiter = Limiter::new(None, None);
-                            let stream = Box::new(LimitStream::new(datagram, Arc::new(limiter)));
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(datagram, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                datagram
+                            };
 
                             let server_name = list[1].as_str();
                             if let Some(server) = servers.get_server(server_name) {
@@ -333,6 +383,9 @@ impl RtcpStack {
         if builder.private_key.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "private_key is required"));
         }
+        if builder.limiter_manager.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "limit_manager is required"));
+        }
 
         let id = builder.id.take().unwrap();
         let bind_addr = builder.bind_addr.clone().unwrap();
@@ -412,6 +465,7 @@ pub struct RtcpStackBuilder {
     global_process_chains: Option<GlobalProcessChainsRef>,
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: Option<TunnelManager>,
+    limiter_manager: Option<LimiterManagerRef>,
 }
 
 impl RtcpStackBuilder {
@@ -426,6 +480,7 @@ impl RtcpStackBuilder {
             global_process_chains: None,
             connection_manager: None,
             tunnel_manager: None,
+            limiter_manager: None,
         }
     }
 
@@ -471,6 +526,11 @@ impl RtcpStackBuilder {
 
     pub fn tunnel_manager(mut self, tunnel_manager: TunnelManager) -> Self {
         self.tunnel_manager = Some(tunnel_manager);
+        self
+    }
+
+    pub fn limiter_manager(mut self, limiter_manager: LimiterManagerRef) -> Self {
+        self.limiter_manager = Some(limiter_manager);
         self
     }
 
@@ -522,6 +582,7 @@ pub struct RtcpStackFactory {
     global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
+    limiter_manager: LimiterManagerRef,
 }
 
 impl RtcpStackFactory {
@@ -530,12 +591,14 @@ impl RtcpStackFactory {
         global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
+        limiter_manager: LimiterManagerRef,
     ) -> Self {
         Self {
             servers,
             global_process_chains,
             connection_manager,
             tunnel_manager,
+            limiter_manager,
         }
     }
 }
@@ -548,7 +611,6 @@ impl StackFactory for RtcpStackFactory {
             .downcast_ref::<RtcpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
 
-        
 
         let private_key = load_raw_private_key(Path::new(config.key_path.as_str()))
             .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "load private key {} failed", config.key_path))?;
@@ -586,6 +648,7 @@ impl StackFactory for RtcpStackFactory {
             .device_config(device_config)
             .private_key(private_key)
             .hook_point(config.hook_point.clone())
+            .limiter_manager(self.limiter_manager.clone())
             .build().await?;
         Ok(Arc::new(stack))
     }
@@ -596,7 +659,7 @@ impl StackFactory for RtcpStackFactory {
 mod tests {
     use std::collections::HashMap;
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo, DatagramInfo};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo, DatagramInfo, LimiterManager};
     use buckyos_kit::{AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, generate_ed25519_key_pair, DeviceConfig, EncodedDocument};
     use std::sync::Arc;
@@ -658,6 +721,7 @@ mod tests {
             .servers(Arc::new(ServerManager::new()))
             .tunnel_manager(TunnelManager::new())
             .hook_point(vec![])
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -670,6 +734,7 @@ mod tests {
             .hook_point(vec![])
             .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -683,6 +748,7 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .connection_manager(ConnectionManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -724,6 +790,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -764,6 +831,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -825,6 +893,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -865,6 +934,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -926,6 +996,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -966,6 +1037,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1043,6 +1115,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1083,6 +1156,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1174,6 +1248,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1216,6 +1291,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1276,6 +1352,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1316,6 +1393,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1377,6 +1455,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1417,6 +1496,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1478,6 +1558,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1518,6 +1599,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1593,6 +1675,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1633,6 +1716,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1722,6 +1806,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1764,6 +1849,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1794,6 +1880,7 @@ mod tests {
             Arc::new(GlobalProcessChains::new()),
             ConnectionManager::new(),
             TunnelManager::new(),
+            LimiterManager::new(),
         );
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key_pair();

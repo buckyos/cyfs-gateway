@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use std::future::poll_fn;
 use std::io;
 use std::io::Read;
@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
+use buckyos_kit::AsyncStream;
 use futures::Stream;
 use h3::error::Code;
 use h3::quic;
@@ -22,17 +23,17 @@ use quinn::Incoming;
 use rustls::{ServerConfig};
 use rustls::server::{ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use sfo_io::{LimitRead, LimitWrite, SfoSpeedStat, SimpleAsyncWrite, SimpleAsyncWriteHolder, SpeedTracker, StatStream};
+use sfo_io::{LimitRead, LimitStream, LimitWrite, SfoSpeedStat, SimpleAsyncWrite, SimpleAsyncWriteHolder, SpeedTracker, StatStream};
 use tokio::io::{AsyncRead, ReadBuf, Take};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_stream_external_commands};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_stream_external_commands, LimiterManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
-use crate::stack::stream_forward;
+use crate::stack::{get_limit_info, stream_forward};
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
 
 pub struct Http3Body<S, B> {
@@ -653,6 +654,7 @@ struct QuicStackInner {
     connection_manager: Option<ConnectionManagerRef>,
     global_process_chains: Option<GlobalProcessChainsRef>,
     tunnel_manager: TunnelManager,
+    limiter_manager: LimiterManagerRef,
 }
 
 impl QuicStackInner {
@@ -732,6 +734,7 @@ impl QuicStackInner {
         let executor = {
             self.executor.lock().unwrap().fork()
         };
+        let chain_env = executor.chain_env().clone();
         let ret = execute_chain(executor, map)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -750,6 +753,17 @@ impl QuicStackInner {
                         return Ok(());
                     }
 
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env).await?;
+                    let upper = if limiter_id.is_some() {
+                        self.limiter_manager.get_limiter(limiter_id.unwrap())
+                    } else {
+                        None
+                    };
+                    let limiter = if down_speed.is_some() && up_speed.is_some() {
+                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
+                    } else {
+                        None
+                    };
                     let cmd = list[0].as_str();
                     match cmd {
                         "forward" => {
@@ -765,9 +779,16 @@ impl QuicStackInner {
                                 let stat_stream = StatStream::new(stream);
                                 let speed = stat_stream.get_speed_stat();
                                 let target = list[1].clone();
+                                let stream: Box<dyn AsyncStream> = if limiter.is_some() {
+                                    let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                    let limit_stream = LimitStream::new(stat_stream, read_limit, write_limit);
+                                    Box::new(limit_stream)
+                                } else {
+                                    Box::new(stat_stream)
+                                };
                                 let tunnel_manager = self.tunnel_manager.clone();
                                 let handle = tokio::spawn(async move {
-                                    if let Err(e) = stream_forward(Box::new(stat_stream), target.as_str(), &tunnel_manager).await {
+                                    if let Err(e) = stream_forward(stream, target.as_str(), &tunnel_manager).await {
                                         log::error!("stream forward error: {}", e);
                                     }
                                 });
@@ -818,6 +839,7 @@ impl QuicStackInner {
                                             if resolver.is_none() {
                                                 break;
                                             }
+                                            let limiter = limiter.clone();
                                             let server = server.clone();
                                             tokio::spawn(async move {
                                                 let ret: StackResult<()> = async move {
@@ -827,10 +849,20 @@ impl QuicStackInner {
                                                     // let stat_stream = StatStream::new(stream);
                                                     let (mut send, recv) = stream.split();
                                                     let recv_stream = Http3Recv::new(recv);
-                                                    let limiter = Arc::new(Limiter::new(None, None));
-                                                    let recv = LimitRead::new(recv_stream, limiter.clone());
-                                                    let body = AsyncReadBody::with_capacity(recv, 4096)
-                                                        .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed();
+                                                    let (read_limit, write_limit) = if limiter.is_some() {
+                                                        let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                                        (Some(read_limit), Some(write_limit))
+                                                    } else {
+                                                        (None, None)
+                                                    };
+
+                                                    let body = if read_limit.is_some() {
+                                                        AsyncReadBody::with_capacity(LimitRead::new(recv_stream, read_limit.unwrap()), 4096)
+                                                            .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed()
+                                                    } else {
+                                                        AsyncReadBody::with_capacity(recv_stream, 4096)
+                                                            .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed()
+                                                    };
                                                     let req = http::Request::from_parts(parts, body);
                                                     let resp = server
                                                         .serve_request(req, StreamInfo::new(local_addr.to_string()))
@@ -842,7 +874,11 @@ impl QuicStackInner {
                                                         .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 send response error"))?;
 
                                                     let send_stream = SimpleAsyncWriteHolder::new(Http3Send::new(send));
-                                                    let mut send = LimitWrite::new(send_stream, limiter);
+                                                    let mut send: Box<dyn AsyncWrite + Unpin + Send> = if write_limit.is_some() {
+                                                        Box::new(LimitWrite::new(send_stream, write_limit.unwrap()))
+                                                    } else {
+                                                        Box::new(send_stream)
+                                                    };
                                                     loop {
                                                         let mut pin_body = Pin::new(&mut body);
                                                         let data = poll_fn(move |cx| {
@@ -877,8 +913,15 @@ impl QuicStackInner {
                                             let stream = sfo_split::Splittable::new(recv, send);
                                             let stat_stream = StatStream::new(stream);
                                             let speed = stat_stream.get_speed_stat();
+                                            let stream: Box<dyn AsyncStream> = if limiter.is_some() {
+                                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                                let limit_stream = LimitStream::new(stat_stream, read_limit, write_limit);
+                                                Box::new(limit_stream)
+                                            } else {
+                                                Box::new(stat_stream)
+                                            };
                                             let handle = tokio::spawn(async move {
-                                                if let Err(e) = server.serve_connection(Box::new(stat_stream), StreamInfo::new(remote_addr.to_string())).await {
+                                                if let Err(e) = server.serve_connection(stream, StreamInfo::new(remote_addr.to_string())).await {
                                                     log::error!("server error: {}", e);
                                                 }
                                             });
@@ -942,6 +985,9 @@ impl QuicStack {
         if builder.tunnel_manager.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "tunnel_manager is required"));
         }
+        if builder.limiter_manager.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "limit_manager is required"));
+        }
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains.clone(),
@@ -980,6 +1026,7 @@ impl QuicStack {
                 connection_manager: builder.connection_manager,
                 global_process_chains: builder.global_process_chains,
                 tunnel_manager: builder.tunnel_manager.unwrap(),
+                limiter_manager: builder.limiter_manager.unwrap(),
             }),
             handle: Mutex::new(None),
         })
@@ -1040,6 +1087,7 @@ pub struct QuicStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: Option<TunnelManager>,
     acme_manager: Option<AcmeCertManagerRef>,
+    limiter_manager: Option<LimiterManagerRef>
 }
 
 impl QuicStackBuilder {
@@ -1056,6 +1104,7 @@ impl QuicStackBuilder {
             connection_manager: None,
             tunnel_manager: None,
             acme_manager: None,
+            limiter_manager: None,
         }
     }
 
@@ -1117,6 +1166,11 @@ impl QuicStackBuilder {
         self
     }
 
+    pub fn limiter_manager(mut self, limiter_manager: LimiterManagerRef) -> Self {
+        self.limiter_manager = Some(limiter_manager);
+        self
+    }
+
     pub async fn build(self) -> StackResult<QuicStack> {
         QuicStack::create(self).await
     }
@@ -1167,6 +1221,7 @@ pub struct QuicStackFactory {
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
     acme_manager: AcmeCertManagerRef,
+    limiter_manager: LimiterManagerRef,
 }
 
 impl QuicStackFactory {
@@ -1176,6 +1231,7 @@ impl QuicStackFactory {
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
         acme_manager: AcmeCertManagerRef,
+        limiter_manager: LimiterManagerRef,
     ) -> Self {
         Self {
             servers,
@@ -1183,6 +1239,7 @@ impl QuicStackFactory {
             connection_manager,
             tunnel_manager,
             acme_manager,
+            limiter_manager,
         }
     }
 }
@@ -1227,6 +1284,7 @@ impl StackFactory for QuicStackFactory {
             .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec![]).iter().map(|s| s.as_bytes().to_vec()).collect())
             .concurrency(config.concurrency.unwrap_or(1024))
             .acme_manager(self.acme_manager.clone())
+            .limiter_manager(self.limiter_manager.clone())
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -1246,7 +1304,7 @@ mod tests {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, Server, ProcessChainHttpServer, Stack, QuicStackFactory, ConnectionManager, StackProtocol, QuicStackConfig, StackFactory, ServerConfig, StreamInfo, CertManagerConfig, AcmeCertManager};
+    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, Server, ProcessChainHttpServer, Stack, QuicStackFactory, ConnectionManager, StackProtocol, QuicStackConfig, StackFactory, ServerConfig, StreamInfo, CertManagerConfig, AcmeCertManager, LimiterManager};
     use crate::global_process_chains::GlobalProcessChains;
 
     #[tokio::test]
@@ -1279,6 +1337,7 @@ mod tests {
             .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
             .tunnel_manager(tunnel_manager.clone())
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1298,6 +1357,7 @@ mod tests {
             }])
             .tunnel_manager(tunnel_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1334,6 +1394,7 @@ mod tests {
                 data: None,
             }])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1394,6 +1455,7 @@ mod tests {
                 data: None,
             }])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1535,6 +1597,7 @@ mod tests {
                 data: None,
             }])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1634,6 +1697,7 @@ mod tests {
             }])
             .alpn_protocols(vec![b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1738,6 +1802,7 @@ mod tests {
                 data: None,
             }])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1792,6 +1857,7 @@ mod tests {
             ConnectionManager::new(),
             TunnelManager::new(),
             cert_manager,
+            LimiterManager::new(),
         );
 
         let config = QuicStackConfig {

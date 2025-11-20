@@ -1,7 +1,7 @@
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands, LimiterManagerRef};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -14,7 +14,7 @@ use sfo_io::{LimitStream, StatStream};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
-use crate::stack::{stream_forward};
+use crate::stack::{get_limit_info, stream_forward};
 use serde::{Deserialize, Serialize};
 use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType, ACME_TLS_ALPN_NAME};
 use crate::stack::limiter::Limiter;
@@ -90,6 +90,7 @@ struct TlsStackInner {
     connection_manager: Option<ConnectionManagerRef>,
     global_process_chains: Option<GlobalProcessChainsRef>,
     tunnel_manager: TunnelManager,
+    limiter_manager: LimiterManagerRef,
     alpn_protocols: Vec<Vec<u8>>,
 }
 
@@ -125,6 +126,12 @@ impl TlsStackInner {
                 "tunnel_manager is required"
             ));
         }
+        if config.limiter_manager.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "limiter_manager is required"
+            ));
+        }
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
                                                           config.global_process_chains.clone(),
                                                           Some(get_stream_external_commands())).await
@@ -158,6 +165,7 @@ impl TlsStackInner {
             connection_manager: config.connection_manager,
             global_process_chains: config.global_process_chains,
             tunnel_manager: config.tunnel_manager.unwrap(),
+            limiter_manager: config.limiter_manager.unwrap(),
             alpn_protocols: config.alpn_protocols,
         })
     }
@@ -248,6 +256,7 @@ impl TlsStackInner {
         let mut request = StreamRequest::new(Box::new(tls_stream), local_addr);
         request.source_addr = Some(remote_addr);
         request.dest_host = server_name;
+        let chain_env = executor.chain_env().clone();
         let (ret, stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -264,6 +273,18 @@ impl TlsStackInner {
                         return Ok(());
                     }
 
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env).await?;
+                    let upper = if limiter_id.is_some() {
+                        self.limiter_manager.get_limiter(limiter_id.unwrap())
+                    } else {
+                        None
+                    };
+                    let limiter = if down_speed.is_some() && up_speed.is_some() {
+                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
+                    } else {
+                        None
+                    };
+
                     let cmd = list[0].as_str();
                     match cmd {
                         "forward" => {
@@ -274,11 +295,16 @@ impl TlsStackInner {
                                 ));
                             }
                             let target = list[1].as_str();
-                            let limiter = Limiter::new(None, None);
-                            let stream = Box::new(LimitStream::new(stream, Arc::new(limiter)));
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                stream
+                            };
                             stream_forward(stream, target, &self.tunnel_manager).await?;
                         }
-                         "server" => {
+                        "server" => {
                             if list.len() < 2 {
                                 return Err(stack_err!(
                                     StackErrorCode::InvalidConfig,
@@ -287,10 +313,18 @@ impl TlsStackInner {
                             }
                             let server_name = list[1].as_str();
 
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                stream
+                            };
+
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
                                     Server::Http(http_server) => {
-                                        if let Err(e) = hyper_serve_http(Box::new(stream),
+                                        if let Err(e) = hyper_serve_http(stream,
                                                                          http_server,
                                                                          StreamInfo::new(local_addr.to_string())).await {
                                             log::error!("hyper serve http failed: {}", e);
@@ -298,7 +332,7 @@ impl TlsStackInner {
                                     }
                                     Server::Stream(server) => {
                                         server
-                                            .serve_connection(Box::new(stream), StreamInfo::new(local_addr.to_string()))
+                                            .serve_connection(stream, StreamInfo::new(local_addr.to_string()))
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
                                     }
@@ -459,6 +493,7 @@ pub struct TlsStackFactory {
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
     acme_manager: AcmeCertManagerRef,
+    limiter_manager: LimiterManagerRef,
 }
 
 impl TlsStackFactory {
@@ -468,6 +503,7 @@ impl TlsStackFactory {
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
         acme_manager: AcmeCertManagerRef,
+        limiter_manager: LimiterManagerRef,
     ) -> Self {
         Self {
             servers,
@@ -475,6 +511,7 @@ impl TlsStackFactory {
             connection_manager,
             tunnel_manager,
             acme_manager,
+            limiter_manager,
         }
     }
 }
@@ -522,6 +559,7 @@ impl crate::StackFactory for TlsStackFactory {
             .tunnel_manager(self.tunnel_manager.clone())
             .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec!["http/1.1".to_string()]).iter().map(|s| s.as_bytes().to_vec()).collect())
             .acme_manager(self.acme_manager.clone())
+            .limiter_manager(self.limiter_manager.clone())
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -540,6 +578,7 @@ pub struct TlsStackBuilder {
     tunnel_manager: Option<TunnelManager>,
     alpn_protocols: Vec<Vec<u8>>,
     acme_manager: Option<AcmeCertManagerRef>,
+    limiter_manager: Option<LimiterManagerRef>,
 }
 
 impl TlsStackBuilder {
@@ -556,6 +595,7 @@ impl TlsStackBuilder {
             tunnel_manager: None,
             alpn_protocols: vec![],
             acme_manager: None,
+            limiter_manager: None,
         }
     }
 
@@ -616,6 +656,11 @@ impl TlsStackBuilder {
         self
     }
 
+    pub fn limiter_manager(mut self, limiter_manager: LimiterManagerRef) -> Self {
+        self.limiter_manager = Some(limiter_manager);
+        self
+    }
+
     pub async fn build(self) -> StackResult<TlsStack> {
         let stack = TlsStack::create(self).await?;
         Ok(stack)
@@ -626,9 +671,9 @@ impl TlsStackBuilder {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo, LimiterManager};
     use crate::{TlsDomainConfig, TlsStack};
-    use buckyos_kit::{AsyncStream};
+    use buckyos_kit::{init_logging, AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use rcgen::generate_simple_self_signed;
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -667,6 +712,7 @@ mod tests {
             .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
             .tunnel_manager(TunnelManager::new())
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -686,6 +732,7 @@ mod tests {
             }])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .tunnel_manager(TunnelManager::new())
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -723,6 +770,7 @@ mod tests {
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -782,6 +830,7 @@ mod tests {
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -843,6 +892,7 @@ mod tests {
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -926,6 +976,7 @@ mod tests {
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1067,6 +1118,7 @@ mod tests {
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1154,6 +1206,7 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1254,6 +1307,7 @@ mod tests {
             }])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .tunnel_manager(TunnelManager::new())
+            .limiter_manager(LimiterManager::new())
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .build()
             .await;
@@ -1313,6 +1367,7 @@ mod tests {
             ConnectionManager::new(),
             TunnelManager::new(),
             cert_manager,
+            LimiterManager::new(),
         );
 
         let config = TlsStackConfig {

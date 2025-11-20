@@ -1,7 +1,5 @@
-use async_trait::async_trait;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::str::FromStr;
-use name_client::{DnsProvider, LocalConfigDnsProvider, NameInfo, NsProvider, RecordType};
+use std::net::{IpAddr};
+use name_client::{NameInfo, RecordType};
 use name_lib::{EncodedDocument, DID};
 
 use crate::ServerResult;
