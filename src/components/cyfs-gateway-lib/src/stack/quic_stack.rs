@@ -762,7 +762,7 @@ impl QuicStackInner {
                     let limiter = if down_speed.is_some() && up_speed.is_some() {
                         Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
                     } else {
-                        None
+                        upper
                     };
                     let cmd = list[0].as_str();
                     match cmd {

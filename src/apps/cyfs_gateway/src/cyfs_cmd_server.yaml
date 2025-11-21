@@ -12,15 +12,4 @@ stacks:
 
 servers:
   - id: __cmd_server__
-    type: http
-    hook_point:
-      - id: main
-        priority: 1
-        blocks:
-          - id: default
-            block: |
-              return "inner_service __cmd_server__";
-
-inner_services:
-  - id: __cmd_server__
     type: cmd_server

@@ -308,7 +308,7 @@ impl TunStackInner {
         request.dest_port = dest_addr.port();
         request.app_protocol = Some("tcp".to_string());
         let chain_env = executor.chain_env().clone();
-        let (ret, mut stream) = execute_stream_chain(executor, request)
+        let (ret, stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         if ret.is_control() {
@@ -333,7 +333,7 @@ impl TunStackInner {
                     let limiter = if down_speed.is_some() && up_speed.is_some() {
                         Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
                     } else {
-                        None
+                        upper
                     };
 
                     let cmd = list[0].as_str();
@@ -450,7 +450,7 @@ impl TunStackInner {
                     let limiter = if down_speed.is_some() && up_speed.is_some() {
                         Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
                     } else {
-                        None
+                        upper
                     };
 
                     let cmd = list[0].as_str();

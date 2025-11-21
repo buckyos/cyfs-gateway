@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -57,13 +57,14 @@ pub struct GatewayFactory {
     servers: ServerManagerRef,
 
     stack_factory: CyfsStackFactoryRef,
- 
+
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
 
     //inner_service_factory: CyfsInnerServiceFactoryRef,
     //inner_service_manager: InnerServiceManagerRef,
     acme_mgr: AcmeCertManagerRef,
+    limiter_manager: LimiterManagerRef,
 }
 
 impl GatewayFactory {
@@ -72,7 +73,8 @@ impl GatewayFactory {
         global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
-        acme_mgr: AcmeCertManagerRef, ) -> Self {
+        acme_mgr: AcmeCertManagerRef,
+        limiter_manager: LimiterManagerRef, ) -> Self {
         Self {
             servers,
             global_process_chains,
@@ -81,6 +83,7 @@ impl GatewayFactory {
             stack_factory: Arc::new(CyfsStackFactory::new()),
             server_factory: Arc::new(CyfsServerFactory::new()),
             acme_mgr,
+            limiter_manager,
         }
     }
 
@@ -123,6 +126,7 @@ impl GatewayFactory {
             acme_mgr: self.acme_mgr.clone(),
             stack_factory: self.stack_factory.clone(),
             server_factory: self.server_factory.clone(),
+            limiter_manager: self.limiter_manager.clone(),
         })
     }
 }
@@ -137,6 +141,7 @@ pub struct Gateway {
     acme_mgr: AcmeCertManagerRef,
     stack_factory: CyfsStackFactoryRef,
     server_factory: CyfsServerFactoryRef,
+    limiter_manager: LimiterManagerRef,
 }
 
 impl Drop for Gateway {
@@ -431,13 +436,13 @@ impl Gateway {
         let mut new_servers = HashMap::new();
         for server_config in config.servers.iter() {
             let new_server = self.server_factory.create(server_config.clone()).await?;
-            if new_servers.contains_key(new_server.id().as_str()) {
+            if new_servers.contains_key(new_server.full_key().as_str()) {
                 Err(cmd_err!(
                     ConfigErrorCode::AlreadyExists,
-                    "Duplicated server: {}", new_server.id(),
+                    "Duplicated server: {}", new_server.full_key(),
                 ))?;
             }
-            new_servers.insert(new_server.id(), new_server);
+            new_servers.insert(new_server.full_key(), new_server);
         }
 
 
@@ -505,9 +510,9 @@ impl Gateway {
             config.stacks.iter().any(|stack| stack.id() == id)
         });
         self.server_manager.retain(|id| {
-            config.servers.iter().any(|server| server.id() == id)
+            new_servers.contains_key(id)
         });
-     
+
         if config.acme_config.is_some() {
             let acme_config = config.acme_config.clone().unwrap();
             let mut cert_config = CertManagerConfig::default();
@@ -534,6 +539,35 @@ impl Gateway {
             if let Err(e) = self.acme_mgr.update(cert_config).await {
                 log::error!("Failed to update acme manager: {}", e);
             }
+        }
+        if config.limiters_config.is_some() {
+            let limiters_config = config.limiters_config.clone().unwrap();
+            let mut limiter_set = HashSet::new();
+            for limiter_config in limiters_config.iter() {
+                limiter_set.insert(limiter_config.id.clone());
+                if let Some(limiter) = self.limiter_manager.get_limiter(limiter_config.id.as_str()) {
+                    if limiter.get_upper_limiter().map(|limiter| limiter.get_id().map(|v| v.to_string())) == Some(limiter_config.upper_limiter.clone()) {
+                        limiter.set_speed(limiter_config.concurrent.map(|v| v as u32),
+                                          limiter_config.download_speed.map(|v| v as u32),
+                                          limiter_config.upload_speed.map(|v| v as u32));
+                        continue;
+                    }
+                }
+                if let Some(upper_limiter) = limiter_config.upper_limiter.clone() {
+                    if self.limiter_manager.get_limiter(upper_limiter.as_str()).is_none() {
+                        log::error!("Update limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
+                    }
+                }
+                let _ = self.limiter_manager.new_limiter(limiter_config.id.clone(),
+                                                         limiter_config.upper_limiter.clone(),
+                                                         limiter_config.concurrent.map(|v| v as u32),
+                                                         limiter_config.download_speed.map(|v| v as u32),
+                                                         limiter_config.upload_speed.map(|v| v as u32));
+            }
+
+            self.limiter_manager.retain(|id, _| {
+                limiter_set.contains(id)
+            });
         }
         *self.config.lock().unwrap() = config;
         Ok(())

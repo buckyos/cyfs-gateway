@@ -8,6 +8,8 @@ use crate::{stack_err, StackErrorCode, StackResult};
 
 #[derive(Clone)]
 pub struct Limiter {
+    id: Option<String>,
+    upper_limiter: Option<Box<Limiter>>,
     read_limiter: SpeedLimiterRef,
     write_limiter: SpeedLimiterRef
 }
@@ -16,15 +18,41 @@ impl Limiter {
     pub fn new(upper: Option<Limiter>, concurrent: Option<u32>, read_speed: Option<u32>, write_speed: Option<u32>) -> Self {
         let (read_rate, read_weight) = Self::get_limit_info(concurrent, read_speed);
         let (write_rate, write_weight) = Self::get_limit_info(concurrent, write_speed);
-        let (upper_read_limiter, upper_write_limiter) = match upper {
+        let (upper_read_limiter, upper_write_limiter) = match upper.clone() {
             Some(upper) => (Some(upper.read_limiter.clone()), Some(upper.write_limiter.clone())),
             None => (None, None),
         };
 
         Limiter {
+            id: None,
+            upper_limiter: upper.map(|v| Box::new(v)),
             read_limiter: SpeedLimiter::new(upper_read_limiter, read_rate, read_weight),
             write_limiter: SpeedLimiter::new(upper_write_limiter, write_rate, write_weight),
         }
+    }
+
+    fn new_named(id: impl Into<String>, upper: Option<Limiter>, concurrent: Option<u32>, read_speed: Option<u32>, write_speed: Option<u32>) -> Self {
+        let (read_rate, read_weight) = Self::get_limit_info(concurrent, read_speed);
+        let (write_rate, write_weight) = Self::get_limit_info(concurrent, write_speed);
+        let (upper_read_limiter, upper_write_limiter) = match upper.clone() {
+            Some(upper) => (Some(upper.read_limiter.clone()), Some(upper.write_limiter.clone())),
+            None => (None, None),
+        };
+
+        Limiter {
+            id: Some(id.into()),
+            upper_limiter: upper.map(|v| Box::new(v)),
+            read_limiter: SpeedLimiter::new(upper_read_limiter, read_rate, read_weight),
+            write_limiter: SpeedLimiter::new(upper_write_limiter, write_rate, write_weight),
+        }
+    }
+
+    pub fn get_id(&self) -> Option<&str> {
+        self.id.as_ref().map(|v| v.as_str())
+    }
+
+    pub fn get_upper_limiter(&self) -> Option<Limiter> {
+        self.upper_limiter.as_ref().map(|v| v.as_ref().clone())
     }
 
     fn get_limit_info(concurrent: Option<u32>, speed: Option<u32>) -> (Option<NonZeroU32>, Option<NonZeroU32>) {
@@ -57,8 +85,6 @@ impl Limiter {
     }
 }
 
-pub const GLOBAL: &str = "global";
-
 pub struct LimiterManager {
     limiters: RwLock<HashMap<String, Limiter>>,
 }
@@ -86,10 +112,19 @@ impl LimiterManager {
             None => None,
         };
 
-        let limiter = Limiter::new(upper, concurrent, read_speed, write_speed);
+        let id = id.into();
+        let limiter = Limiter::new_named(id.clone(), upper, concurrent, read_speed, write_speed);
         let mut limiters = self.limiters.write().unwrap();
-        limiters.insert(id.into(), limiter.clone());
+        limiters.insert(id, limiter.clone());
         limiter
+    }
+
+    pub fn retain<F>(&self, f: F)
+    where
+        F: FnMut(&String, &mut Limiter) -> bool,
+    {
+        let mut limiters = self.limiters.write().unwrap();
+        limiters.retain(f);
     }
 }
 
@@ -100,14 +135,14 @@ pub struct LimitCmd {
 
 impl LimitCmd {
     pub fn new() -> Self {
-        let cmd = Command::new("set_limit")
+        let cmd = Command::new("set-limit")
             .about("Set a speed limit for the connection")
             .after_help(
                 r#"
 Examples:
-    set_limit global
-    set_limit 100KB/s 100KB/s
-    set_limit global 100KB/s 100KB/s
+    set-limit global
+    set-limit 100KB/s 100KB/s
+    set-limit global 100KB/s 100KB/s
                 "#
             )
             .arg(
@@ -129,7 +164,7 @@ Examples:
                     .required(false)
             );
         LimitCmd {
-            name: "set_limit".to_string(),
+            name: "set-limit".to_string(),
             cmd,
         }
     }
@@ -272,7 +307,7 @@ fn is_valid_speed(speed: &str) -> bool {
     re.is_match(speed)
 }
 
-fn parse_speed(speed: &str) -> Result<u64, String> {
+pub fn parse_speed(speed: &str) -> Result<u64, String> {
     let re = regex::Regex::new(r"^(\d+(\.\d+)?)\s*(B|KB|MB|GB)/s$").unwrap();
     if let Some(captures) = re.captures(speed) {
         let num = captures.get(1).ok_or_else(|| {

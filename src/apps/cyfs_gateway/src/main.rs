@@ -3,6 +3,7 @@
 #[macro_use]
 extern crate log;
 
+use std::collections::HashSet;
 use buckyos_kit::*;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
@@ -89,6 +90,24 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
     let server_manager = Arc::new(ServerManager::new());
     let global_process_chains = Arc::new(GlobalProcessChains::new());
     let limiter_manager = LimiterManager::new();
+    if let Some(limiters_config) = config_loader.limiters_config.clone() {
+        for limiter_config in limiters_config.iter() {
+            if limiter_manager.get_limiter(limiter_config.id.as_str()).is_some() {
+                log::error!("Create limiter {} error: limiter already exists", limiter_config.id);
+                continue;
+            }
+            if let Some(upper_limiter) = limiter_config.upper_limiter.clone() {
+                if limiter_manager.get_limiter(upper_limiter.as_str()).is_none() {
+                    log::error!("Create limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
+                }
+            }
+            let _ = limiter_manager.new_limiter(limiter_config.id.clone(),
+                                                limiter_config.upper_limiter.clone(),
+                                                limiter_config.concurrent.map(|v| v as u32),
+                                                limiter_config.download_speed.map(|v| v as u32),
+                                                limiter_config.upload_speed.map(|v| v as u32));
+        }
+    }
 
     let mut cert_config = CertManagerConfig::default();
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
@@ -121,7 +140,8 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         global_process_chains.clone(),
         connect_manager.clone(),
         tunnel_manager.clone(),
-        cert_manager.clone()
+        cert_manager.clone(),
+        limiter_manager.clone(),
     );
     factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
         server_manager.clone(),

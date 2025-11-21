@@ -380,7 +380,23 @@ impl GatewayConfigParser {
             },
             None => None
         };
+
+        let limiters_config: Option<Vec<LimiterConfig>> = match json_value.get("limiters") {
+            Some(config) => {
+                match serde_json::from_value::<Vec<LimiterConfig>>(config.clone()) {
+                    Ok(config) => Some(config),
+                    Err(err) => {
+                        let msg = format!("invalid limiters config: {}", err);
+                        error!("{}", msg);
+                        None
+                    }
+                }
+            },
+            None => None
+        };
+
         Ok(GatewayConfig {
+            limiters_config,
             acme_config,
             stacks,
             servers,
@@ -398,10 +414,108 @@ pub struct AcmeConfig {
     pub renew_before_expiry: Option<u64>,
 }
 
+#[derive(Deserialize, Clone)]
+pub struct LimiterConfig {
+    pub id: String,
+    pub upper_limiter: Option<String>,
+    #[serde(with = "speed_parser")]
+    #[serde(default)]
+    pub download_speed: Option<u64>,
+    #[serde(with = "speed_parser")]
+    #[serde(default)]
+    pub upload_speed: Option<u64>,
+    pub concurrent: Option<u64>,
+}
+
+mod speed_parser {
+    use serde::{Deserialize, Deserializer};
+    use serde::de::Error;
+    use cyfs_gateway_lib::parse_speed;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = Option::<String>::deserialize(deserializer)?;
+        if s.is_none() {
+            return Ok(None);
+        }
+        match parse_speed(s.unwrap().as_str()) {
+            Ok(speed) => Ok(Some(speed)),
+            Err(e) => {
+                Err(D::Error::custom(e))
+            },
+        }
+    }
+}
 
 pub struct GatewayConfig {
+    pub limiters_config: Option<Vec<LimiterConfig>>,
     pub acme_config: Option<AcmeConfig>,
     pub stacks: Vec<Arc<dyn StackConfig>>,
     pub servers: Vec<Arc<dyn ServerConfig>>,
     pub global_process_chains: ProcessChainConfigs,
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_limiter_config_parser() {
+        let json = r#"
+        {
+            "id": "limiter_id",
+            "upper_limiter": "upper_limiter",
+            "download_speed": "100KB/s",
+            "upload_speed": "100KB/s",
+            "concurrent": 100
+        }
+        "#;
+        let config = serde_json::from_str::<super::LimiterConfig>(json).unwrap();
+        assert_eq!(config.upper_limiter, Some("upper_limiter".to_string()));
+        assert_eq!(config.download_speed, Some(100 * 1024));
+        assert_eq!(config.upload_speed, Some(100 * 1024));
+        assert_eq!(config.concurrent, Some(100));
+
+        let json = r#"
+        {
+            "id": "limiter_id",
+            "download_speed": "100KB/s",
+            "upload_speed": "100KB/s",
+            "concurrent": 100
+        }
+        "#;
+        let config = serde_json::from_str::<super::LimiterConfig>(json).unwrap();
+        assert_eq!(config.upper_limiter, None);
+        assert_eq!(config.download_speed, Some(100 * 1024));
+        assert_eq!(config.upload_speed, Some(100 * 1024));
+        assert_eq!(config.concurrent, Some(100));
+
+        let json = r#"
+        {
+            "id": "limiter_id",
+            "upper_limiter": "upper_limiter",
+            "download_speed": "101KB/s",
+            "concurrent": 100
+        }
+        "#;
+        let config = serde_json::from_str::<super::LimiterConfig>(json).unwrap();
+        assert_eq!(config.upper_limiter, Some("upper_limiter".to_string()));
+        assert_eq!(config.upload_speed, None);
+        assert_eq!(config.download_speed, Some(101 * 1024));
+        assert_eq!(config.concurrent, Some(100));
+
+        let json = r#"
+        {
+            "id": "limiter_id",
+            "upper_limiter": "upper_limiter",
+            "download_speed": "100KB/s",
+            "upload_speed": "100KB/s"
+        }
+        "#;
+        let config = serde_json::from_str::<super::LimiterConfig>(json).unwrap();
+        assert_eq!(config.upper_limiter, Some("upper_limiter".to_string()));
+        assert_eq!(config.download_speed, Some(100 * 1024));
+        assert_eq!(config.upload_speed, Some(100 * 1024));
+        assert_eq!(config.concurrent, None);
+    }
 }
