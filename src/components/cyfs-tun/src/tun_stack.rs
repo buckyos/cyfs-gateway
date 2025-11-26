@@ -123,6 +123,7 @@ struct TunStackInner {
     tunnel_manager: TunnelManager,
     global_process_chains: Option<GlobalProcessChainsRef>,
     limiter_manager: LimiterManagerRef,
+    stat_manager: StatManagerRef,
 }
 
 impl TunStackInner {
@@ -160,6 +161,9 @@ impl TunStackInner {
         if builder.limiter_manager.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "limiter_manager is required"));
         }
+        if builder.stat_manager.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "stat_manager is required"));
+        }
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains.clone(),
@@ -178,6 +182,7 @@ impl TunStackInner {
             connection_manager: builder.connection_manager,
             tunnel_manager: builder.tunnel_manager.unwrap(),
             limiter_manager: builder.limiter_manager.unwrap(),
+            stat_manager: builder.stat_manager.unwrap(),
             global_process_chains: builder.global_process_chains,
         })
     }
@@ -238,11 +243,12 @@ impl TunStackInner {
                             IpStackStream::Tcp(stream) => {
                                 let dest_addr = stream.peer_addr();
                                 let src_addr = stream.local_addr();
-                                let stat_stream = StatStream::new(stream);
+                                let compose_stat = MutComposedSpeedStat::new();
+                                let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
                                 let speed = stat_stream.get_speed_stat();
                                 let stack = this.clone();
                                 let handle = tokio::spawn(async move {
-                                    if let Err(e) = stack.on_new_tcp_stream(stat_stream).await {
+                                    if let Err(e) = stack.on_new_tcp_stream(stat_stream, compose_stat).await {
                                         log::error!("handle tcp stream error: {}", e);
                                     }
                                 });
@@ -258,11 +264,12 @@ impl TunStackInner {
                             IpStackStream::Udp(stream) => {
                                 let dest_addr = stream.peer_addr();
                                 let src_addr = stream.local_addr();
-                                let stat_stream = StatStream::new(stream);
+                                let compose_stat = MutComposedSpeedStat::new();
+                                let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
                                 let speed = stat_stream.get_speed_stat();
                                 let stack = this.clone();
                                 let handle = tokio::spawn(async move {
-                                    if let Err(e) = stack.on_new_udp_stream(stat_stream).await {
+                                    if let Err(e) = stack.on_new_udp_stream(stat_stream, compose_stat).await {
                                         log::error!("handle udp stream error: {}", e);
                                     }
                                 });
@@ -296,7 +303,7 @@ impl TunStackInner {
         Ok(handle)
     }
 
-    async fn on_new_tcp_stream(&self, mut stream: StatStream<IpStackTcpStream>) -> StackResult<()> {
+    async fn on_new_tcp_stream(&self, mut stream: StatStream<IpStackTcpStream>, stat: MutComposedSpeedStatRef) -> StackResult<()> {
         let executor = {
             self.executor.lock().unwrap().fork()
         };
@@ -324,7 +331,7 @@ impl TunStackInner {
                         return Ok(());
                     }
 
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env).await?;
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
                     let upper = if limiter_id.is_some() {
                         self.limiter_manager.get_limiter(limiter_id.unwrap())
                     } else {
@@ -335,6 +342,10 @@ impl TunStackInner {
                     } else {
                         upper
                     };
+
+                    let stat_group_ids = get_stat_info(chain_env).await?;
+                    let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
+                    stat.set_external_stats(speed_groups);
 
                     let cmd = list[0].as_str();
                     match cmd {
@@ -406,7 +417,7 @@ impl TunStackInner {
         Ok(())
     }
 
-    async fn on_new_udp_stream(&self, mut stream: StatStream<IpStackUdpStream>) -> StackResult<()> {
+    async fn on_new_udp_stream(&self, mut stream: StatStream<IpStackUdpStream>, stat: MutComposedSpeedStatRef) -> StackResult<()> {
         let executor = {
             self.executor.lock().unwrap().fork()
         };
@@ -441,7 +452,7 @@ impl TunStackInner {
                         return Ok(());
                     }
 
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env).await?;
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
                     let upper = if limiter_id.is_some() {
                         self.limiter_manager.get_limiter(limiter_id.unwrap())
                     } else {
@@ -453,6 +464,10 @@ impl TunStackInner {
                         upper
                     };
 
+                    let stat_group_ids = get_stat_info(chain_env).await?;
+                    let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
+                    stat.set_external_stats(speed_groups);
+                    
                     let cmd = list[0].as_str();
                     match cmd {
                         "forward" => {
@@ -536,6 +551,7 @@ pub struct TunStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: Option<TunnelManager>,
     limiter_manager: Option<LimiterManagerRef>,
+    stat_manager: Option<StatManagerRef>,
 }
 
 impl TunStackBuilder {
@@ -553,6 +569,7 @@ impl TunStackBuilder {
             connection_manager: None,
             tunnel_manager: None,
             limiter_manager: None,
+            stat_manager: None,
         }
     }
 
@@ -616,6 +633,11 @@ impl TunStackBuilder {
         self
     }
 
+    pub fn stat_manager(mut self, stat_manager: StatManagerRef) -> Self {
+        self.stat_manager = Some(stat_manager);
+        self
+    }
+
     pub async fn build(self) -> StackResult<TunStack> {
         TunStack::create(self).await
     }
@@ -669,6 +691,7 @@ pub struct TunStackFactory {
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
     limiter_manager: LimiterManagerRef,
+    stat_manager: StatManagerRef,
 }
 
 impl TunStackFactory {
@@ -678,6 +701,7 @@ impl TunStackFactory {
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
         limiter_manager: LimiterManagerRef,
+        stat_manager: StatManagerRef,
     ) -> Self {
         TunStackFactory {
             servers,
@@ -685,6 +709,7 @@ impl TunStackFactory {
             connection_manager,
             tunnel_manager,
             limiter_manager,
+            stat_manager,
         }
     }
 }
@@ -710,6 +735,7 @@ impl StackFactory for TunStackFactory {
             .connection_manager(self.connection_manager.clone())
             .tunnel_manager(self.tunnel_manager.clone())
             .limiter_manager(self.limiter_manager.clone())
+            .stat_manager(self.stat_manager.clone())
             .build().await?;
         Ok(Arc::new(stack))
     }

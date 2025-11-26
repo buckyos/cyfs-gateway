@@ -114,6 +114,8 @@ print("hello python")
         let server_manager = Arc::new(ServerManager::new());
         let global_process_chains = Arc::new(GlobalProcessChains::new());
         let cert_manager = AcmeCertManager::create(CertManagerConfig::default()).await.unwrap();
+        let limiter_manager = LimiterManager::new();
+        let stat_manager = StatManager::new();
 
         let factory = GatewayFactory::new(
             server_manager.clone(),
@@ -121,18 +123,24 @@ print("hello python")
             connect_manager.clone(),
             tunnel_manager.clone(),
             cert_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
         );
         factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
             server_manager.clone(),
             global_process_chains.clone(),
             connect_manager.clone(),
             tunnel_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
         )));
         factory.register_stack_factory(StackProtocol::Udp, Arc::new(UdpStackFactory::new(
             server_manager.clone(),
             global_process_chains.clone(),
             connect_manager.clone(),
             tunnel_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
         )));
         factory.register_stack_factory(StackProtocol::Tls, Arc::new(TlsStackFactory::new(
             server_manager.clone(),
@@ -140,6 +148,8 @@ print("hello python")
             connect_manager.clone(),
             tunnel_manager.clone(),
             cert_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
         )));
         factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
             server_manager.clone(),
@@ -147,12 +157,16 @@ print("hello python")
             connect_manager.clone(),
             tunnel_manager.clone(),
             cert_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
         )));
         factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
             server_manager.clone(),
             global_process_chains.clone(),
             connect_manager.clone(),
             tunnel_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
         )));
 
         factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(

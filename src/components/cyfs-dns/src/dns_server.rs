@@ -499,7 +499,7 @@ mod tests {
     use hickory_proto::op::{Message, Query};
     use hickory_proto::rr::RecordType;
     use hickory_server::proto::rr::{Name, RData};
-    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, GlobalProcessChains, Server, ServerFactory, ServerManager, StackFactory, TunnelManager, UdpStackConfig, UdpStackFactory};
+    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, GlobalProcessChains, LimiterManager, Server, ServerFactory, ServerManager, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackFactory};
     use cyfs_gateway_lib::server::DatagramServer;
     use crate::{DnsServerConfig, LocalDns, ProcessChainDnsServer, ProcessChainDnsServerFactory};
 
@@ -552,7 +552,7 @@ A = ["192.168.1.106"]
         let dns_server = LocalDns::create("local_dns".to_string(), local_dns.path().to_string_lossy().to_string());
         assert!(dns_server.is_ok());
         let dns_server = dns_server.unwrap();
-      
+
         server_mgr.add_server(Server::NameServer(Arc::new(dns_server))).unwrap();
 
         let config = r#"
@@ -720,7 +720,7 @@ A = ["192.168.1.106"]
         let dns_server = LocalDns::create("local_dns".to_string(), local_dns.path().to_string_lossy().to_string());
         assert!(dns_server.is_ok());
         let dns_server = dns_server.unwrap();
-        
+
         server_mgr.add_server(Server::NameServer(Arc::new(dns_server))).unwrap();
 
         let config = r#"
@@ -760,7 +760,9 @@ hook_point:
         let stack = UdpStackFactory::new(server_manager.clone(),
                                          global_process_chains.clone(),
                                          ConnectionManager::new(),
-                                         TunnelManager::new());
+                                         TunnelManager::new(),
+                                         LimiterManager::new(),
+                                         StatManager::new());
         let ret = stack.create(Arc::new(stack_config)).await;
         assert!(ret.is_ok());
         let stack = ret.unwrap();

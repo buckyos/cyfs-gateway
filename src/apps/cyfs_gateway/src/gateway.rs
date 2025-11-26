@@ -65,6 +65,7 @@ pub struct GatewayFactory {
     //inner_service_manager: InnerServiceManagerRef,
     acme_mgr: AcmeCertManagerRef,
     limiter_manager: LimiterManagerRef,
+    stat_manager: StatManagerRef,
 }
 
 impl GatewayFactory {
@@ -74,7 +75,8 @@ impl GatewayFactory {
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
         acme_mgr: AcmeCertManagerRef,
-        limiter_manager: LimiterManagerRef, ) -> Self {
+        limiter_manager: LimiterManagerRef,
+        stat_manager: StatManagerRef, ) -> Self {
         Self {
             servers,
             global_process_chains,
@@ -84,6 +86,7 @@ impl GatewayFactory {
             server_factory: Arc::new(CyfsServerFactory::new()),
             acme_mgr,
             limiter_manager,
+            stat_manager,
         }
     }
 
@@ -127,6 +130,7 @@ impl GatewayFactory {
             stack_factory: self.stack_factory.clone(),
             server_factory: self.server_factory.clone(),
             limiter_manager: self.limiter_manager.clone(),
+            stat_manager: self.stat_manager.clone(),
         })
     }
 }
@@ -142,6 +146,7 @@ pub struct Gateway {
     stack_factory: CyfsStackFactoryRef,
     server_factory: CyfsServerFactoryRef,
     limiter_manager: LimiterManagerRef,
+    stat_manager: StatManagerRef,
 }
 
 impl Drop for Gateway {

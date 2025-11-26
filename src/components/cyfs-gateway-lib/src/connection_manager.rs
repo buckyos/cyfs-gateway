@@ -1,10 +1,309 @@
-use std::collections::{BTreeMap};
-use std::sync::{Arc, Mutex};
-use sfo_io::SpeedStat;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::AtomicU64;
+use clap::{Arg, Command};
+use sfo_io::{SfoSpeedStat, SpeedStat, SpeedTracker};
 use tokio::task::{AbortHandle, JoinHandle};
-use crate::StackProtocol;
+use cyfs_process_chain::{command_help, CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel, EnvRef, ExternalCommand, MemorySetCollection};
+use crate::{stack_err, StackErrorCode, StackProtocol, StackResult};
 
 pub type SpeedStatRef = Arc<dyn SpeedStat>;
+pub type SpeedTrackerRef = Arc<dyn SpeedTracker>;
+
+pub struct NoSpeedStat {
+    write_stat: AtomicU64,
+    read_stat: AtomicU64,
+}
+
+impl NoSpeedStat {
+    pub fn new() -> Self {
+        Self {
+            write_stat: AtomicU64::new(0),
+            read_stat: AtomicU64::new(0),
+        }
+    }
+}
+
+impl sfo_io::SpeedStat for NoSpeedStat {
+    fn get_write_speed(&self) -> u64 {
+        0
+    }
+
+    fn get_write_sum_size(&self) -> u64 {
+        self.write_stat.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn get_read_speed(&self) -> u64 {
+        0
+    }
+
+    fn get_read_sum_size(&self) -> u64 {
+        self.read_stat.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl sfo_io::SpeedTracker for NoSpeedStat {
+    fn add_write_data_size(&self, size: u64) {
+        self.write_stat.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn add_read_data_size(&self, size: u64) {
+        self.read_stat.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub struct StatManager {
+    speed_stats: RwLock<HashMap<String, SpeedTrackerRef>>,
+}
+pub type StatManagerRef = Arc<StatManager>;
+
+impl StatManager {
+    pub fn new() -> StatManagerRef {
+        Arc::new(Self {
+            speed_stats: RwLock::new(HashMap::new()),
+        })
+    }
+
+    pub fn get_speed_stat(&self, id: &str) -> Option<SpeedTrackerRef> {
+        self.speed_stats.read().unwrap().get(id).cloned()
+    }
+
+    fn get_or_create_speed_stat(&self, id: &str) -> SpeedTrackerRef {
+        if let Some(stat_ref) = self.get_speed_stat(id) {
+            stat_ref
+        } else {
+            let stat = Arc::new(NoSpeedStat::new());
+            self.new_speed_stat(id, stat.clone());
+            stat
+        }
+    }
+
+    pub fn get_speed_stats(&self, ids: &[String]) -> Vec<SpeedTrackerRef> {
+        let mut stats = Vec::with_capacity(ids.len());
+        for id in ids.iter() {
+            stats.push(self.get_or_create_speed_stat(id));
+        }
+        stats
+    }
+
+    pub fn new_speed_stat(&self, id: &str, speed_stat: SpeedTrackerRef) {
+        self.speed_stats.write().unwrap().insert(id.to_string(), speed_stat);
+    }
+}
+
+pub struct MutComposedSpeedStat {
+    local_stat: Arc<SfoSpeedStat>,
+    stats: RwLock<Vec<SpeedTrackerRef>>,
+}
+pub type MutComposedSpeedStatRef = Arc<MutComposedSpeedStat>;
+
+impl MutComposedSpeedStat {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            local_stat: Arc::new(SfoSpeedStat::new()),
+            stats: RwLock::new(Vec::new()),
+        })
+    }
+
+    pub fn set_external_stats(&self, stats: Vec<SpeedTrackerRef>) {
+        for stat in stats.iter() {
+            stat.add_write_data_size(self.local_stat.get_write_sum_size());
+            stat.add_read_data_size(self.local_stat.get_read_sum_size());
+        }
+        *self.stats.write().unwrap() = stats;
+    }
+}
+
+impl sfo_io::SpeedStat for MutComposedSpeedStat {
+    fn get_write_speed(&self) -> u64 {
+        self.local_stat.get_write_speed()
+    }
+
+    fn get_write_sum_size(&self) -> u64 {
+        self.local_stat.get_write_sum_size()
+    }
+
+    fn get_read_speed(&self) -> u64 {
+        self.local_stat.get_read_speed()
+    }
+
+    fn get_read_sum_size(&self) -> u64 {
+        self.local_stat.get_read_sum_size()
+    }
+}
+
+impl sfo_io::SpeedTracker for MutComposedSpeedStat {
+    fn add_write_data_size(&self, size: u64) {
+        self.local_stat.add_write_data_size(size);
+        for stat in self.stats.read().unwrap().iter() {
+            stat.add_write_data_size(size);
+        }
+    }
+
+    fn add_read_data_size(&self, size: u64) {
+        self.local_stat.add_read_data_size(size);
+        for stat in self.stats.read().unwrap().iter() {
+            stat.add_read_data_size(size);
+        }
+    }
+}
+
+pub struct ComposedSpeedStat {
+    local_stat: Arc<SfoSpeedStat>,
+    stats: Vec<SpeedTrackerRef>,
+}
+pub type ComposedSpeedStatRef = Arc<ComposedSpeedStat>;
+
+impl ComposedSpeedStat {
+    pub fn new(stats: Vec<SpeedTrackerRef>) -> Arc<Self> {
+        Arc::new(Self {
+            local_stat: Arc::new(SfoSpeedStat::new()),
+            stats,
+        })
+    }
+}
+
+impl sfo_io::SpeedStat for ComposedSpeedStat {
+    fn get_write_speed(&self) -> u64 {
+        self.local_stat.get_write_speed()
+    }
+
+    fn get_write_sum_size(&self) -> u64 {
+        self.local_stat.get_write_sum_size()
+    }
+
+    fn get_read_speed(&self) -> u64 {
+        self.local_stat.get_read_speed()
+    }
+
+    fn get_read_sum_size(&self) -> u64 {
+        self.local_stat.get_read_sum_size()
+    }
+}
+
+impl sfo_io::SpeedTracker for ComposedSpeedStat {
+    fn add_write_data_size(&self, size: u64) {
+        self.local_stat.add_write_data_size(size);
+        for stat in self.stats.iter() {
+            stat.add_write_data_size(size);
+        }
+    }
+
+    fn add_read_data_size(&self, size: u64) {
+        self.local_stat.add_read_data_size(size);
+        for stat in self.stats.iter() {
+            stat.add_read_data_size(size);
+        }
+    }
+}
+
+pub struct StatCmd {
+    name: String,
+    cmd: Command,
+}
+
+impl StatCmd {
+    pub fn new() -> Self {
+        let cmd = Command::new("set-stat")
+            .about("Set the statistical group IDs for which this connection needs to be counted.")
+            .after_help(
+                r#"
+Examples:
+    set-stat group1
+    set-stat group1 group2
+                "#
+            )
+            .arg(
+                Arg::new("group_id")
+                    .num_args(0..)
+                    .help("Statistical group ID")
+                    .required(true)
+            );
+        Self {
+            name: "set-stat".to_string(),
+            cmd,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+}
+
+#[async_trait::async_trait]
+impl ExternalCommand for StatCmd {
+    fn help(&self, name: &str, help_type: CommandHelpType) -> String {
+        assert_eq!(self.cmd.get_name(), name);
+        command_help(help_type, &self.cmd)
+    }
+
+    fn check(&self, args: &CommandArgs) -> Result<(), String> {
+        let matches = self.cmd
+            .clone()
+            .try_get_matches_from(args.as_str_list())
+            .map_err(|e| {
+                let msg = format!("Invalid resolve command: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let group_ids = matches.get_many::<String>("group_id");
+        if group_ids.is_none() {
+            return Err("group_id is required".to_string());
+        }
+        Ok(())
+    }
+
+    async fn exec(&self, context: &Context, args: &[CollectionValue], _origin_args: &CommandArgs) -> Result<CommandResult, String> {
+        let mut str_args = Vec::with_capacity(args.len());
+        for arg in args.iter() {
+            if !arg.is_string() {
+                let msg = format!("Invalid argument type: expected string, got {:?}", arg);
+                error!("{}", msg);
+                return Err(msg);
+            }
+            str_args.push(arg.as_str().unwrap());
+        }
+
+        let matches = self.cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid resolve command: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let group_ids = matches.get_many::<String>("group_id");
+        if group_ids.is_none() {
+            return Err("group_id is required".to_string());
+        }
+
+        let group_ids = group_ids.unwrap();
+        let set = MemorySetCollection::new_ref();
+        for group_id in group_ids {
+            set.insert(group_id.as_str()).await?;
+        }
+
+        context.env().create("STAT", CollectionValue::Set(set), EnvLevel::Chain).await?;
+        Ok(CommandResult::Success("STAT".to_string()))
+    }
+}
+
+pub async fn get_stat_info(chain_env: EnvRef) -> StackResult<Vec<String>> {
+    let stat = chain_env.get("STAT").await.map_err(
+        |e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+
+    match stat {
+        Some(CollectionValue::Set(set)) => {
+            let stat_ids = set.get_all().await.map_err(
+                |e| stack_err!(StackErrorCode::ProcessChainError, "{e}")
+            )?;
+            Ok(stat_ids)
+        },
+        _ => Ok(vec![]),
+    }
+}
 
 #[async_trait::async_trait]
 pub trait ConnectionController: 'static + Send + Sync {

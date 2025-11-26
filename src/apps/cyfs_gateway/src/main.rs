@@ -90,6 +90,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
     let server_manager = Arc::new(ServerManager::new());
     let global_process_chains = Arc::new(GlobalProcessChains::new());
     let limiter_manager = LimiterManager::new();
+    let stat_manager = StatManager::new();
     if let Some(limiters_config) = config_loader.limiters_config.clone() {
         for limiter_config in limiters_config.iter() {
             if limiter_manager.get_limiter(limiter_config.id.as_str()).is_some() {
@@ -142,6 +143,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         tunnel_manager.clone(),
         cert_manager.clone(),
         limiter_manager.clone(),
+        stat_manager.clone(),
     );
     factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
         server_manager.clone(),
@@ -149,6 +151,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         connect_manager.clone(),
         tunnel_manager.clone(),
         limiter_manager.clone(),
+        stat_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Udp, Arc::new(UdpStackFactory::new(
         server_manager.clone(),
@@ -156,6 +159,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         connect_manager.clone(),
         tunnel_manager.clone(),
         limiter_manager.clone(),
+        stat_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Tls, Arc::new(TlsStackFactory::new(
         server_manager.clone(),
@@ -164,6 +168,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         tunnel_manager.clone(),
         cert_manager.clone(),
         limiter_manager.clone(),
+        stat_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
         server_manager.clone(),
@@ -172,6 +177,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         tunnel_manager.clone(),
         cert_manager.clone(),
         limiter_manager.clone(),
+        stat_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
         server_manager.clone(),
@@ -179,6 +185,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         connect_manager.clone(),
         tunnel_manager.clone(),
         limiter_manager.clone(),
+        stat_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Extension("tun".to_string()), Arc::new(TunStackFactory::new(
         server_manager.clone(),
@@ -186,6 +193,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         connect_manager.clone(),
         tunnel_manager.clone(),
         limiter_manager.clone(),
+        stat_manager.clone(),
     )));
 
     factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(

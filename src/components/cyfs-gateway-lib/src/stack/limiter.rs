@@ -249,13 +249,13 @@ impl ExternalCommand for LimitCmd {
             })?;
 
         let count = matches.ids().count();
-        let limiter_id = matches.get_one::<String>("limiter_id").map(|s| s.to_string());
-        let down_speed = matches.get_one::<String>("down_speed").map(|s| s.to_string());
-        let upload_speed = matches.get_one::<String>("upload_speed").map(|s| s.to_string());
 
         let map = MemoryMapCollection::new_ref();
         match count {
             3 => {
+                let limiter_id = matches.get_one::<String>("limiter_id").map(|s| s.to_string());
+                let down_speed = matches.get_one::<String>("down_speed").map(|s| s.to_string());
+                let upload_speed = matches.get_one::<String>("upload_speed").map(|s| s.to_string());
                 if limiter_id.is_none() {
                     return Err("Invalid set_limit command: missing limiter_id".to_string());
                 }
@@ -273,6 +273,8 @@ impl ExternalCommand for LimitCmd {
                 map.insert("upload_speed", CollectionValue::String(format!("{}", upload_speed))).await?;
             }
             2 => {
+                let down_speed = matches.get_one::<String>("limiter_id").map(|s| s.to_string());
+                let upload_speed = matches.get_one::<String>("down_speed").map(|s| s.to_string());
                 if down_speed.is_none() {
                     return Err("Invalid set_limit command: missing down_speed".to_string());
                 }
@@ -285,6 +287,7 @@ impl ExternalCommand for LimitCmd {
                 map.insert("upload_speed", CollectionValue::String(format!("{}", upload_speed))).await?;
             }
             1 => {
+                let limiter_id = matches.get_one::<String>("limiter_id").map(|s| s.to_string());
                 if limiter_id.is_none() {
                     return Err("Invalid set_limit command: missing limiter_id".to_string());
                 }
@@ -296,7 +299,7 @@ impl ExternalCommand for LimitCmd {
             }
         }
         context.env().create("LIMIT", CollectionValue::Map(map), EnvLevel::Chain).await?;
-        Ok(CommandResult::Success("RESP".to_string()))
+        Ok(CommandResult::Success("LIMIT".to_string()))
     }
 }
 

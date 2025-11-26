@@ -34,6 +34,10 @@ impl MemorySetCollection {
         }
     }
 
+    pub fn new_ref() -> SetCollectionRef {
+        Arc::new(Box::new(Self::new()) as Box<dyn SetCollection>)
+    }
+    
     pub(crate) fn from_set(set: HashSet<String>) -> Self {
         Self {
             data: AsyncRwLock::new(set),

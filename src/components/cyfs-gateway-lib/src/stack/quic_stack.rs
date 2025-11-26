@@ -23,14 +23,14 @@ use quinn::Incoming;
 use rustls::{ServerConfig};
 use rustls::server::{ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use sfo_io::{LimitRead, LimitStream, LimitWrite, SfoSpeedStat, SimpleAsyncWrite, SimpleAsyncWriteHolder, SpeedTracker, StatStream};
+use sfo_io::{LimitRead, LimitStream, LimitWrite, SfoSpeedStat, SimpleAsyncWrite, SimpleAsyncWriteHolder, SpeedTracker, StatRead, StatStream, StatWrite};
 use tokio::io::{AsyncRead, ReadBuf, Take};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_stream_external_commands, LimiterManagerRef};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_stream_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 use crate::stack::{get_limit_info, stream_forward};
@@ -655,6 +655,7 @@ struct QuicStackInner {
     global_process_chains: Option<GlobalProcessChainsRef>,
     tunnel_manager: TunnelManager,
     limiter_manager: LimiterManagerRef,
+    stat_manager: StatManagerRef,
 }
 
 impl QuicStackInner {
@@ -753,7 +754,7 @@ impl QuicStackInner {
                         return Ok(());
                     }
 
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env).await?;
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
                     let upper = if limiter_id.is_some() {
                         self.limiter_manager.get_limiter(limiter_id.unwrap())
                     } else {
@@ -764,6 +765,10 @@ impl QuicStackInner {
                     } else {
                         upper
                     };
+
+                    let stat_group_ids = get_stat_info(chain_env).await?;
+                    let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
+                    let speed_stat = ComposedSpeedStat::new(speed_groups);
                     let cmd = list[0].as_str();
                     match cmd {
                         "forward" => {
@@ -773,10 +778,11 @@ impl QuicStackInner {
                                     "invalid forward command"
                                 ));
                             }
+                            let speed_stat = speed_stat.clone();
                             loop {
                                 let (send, recv) = connection.accept_bi().await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
                                 let stream = sfo_split::Splittable::new(recv, send);
-                                let stat_stream = StatStream::new(stream);
+                                let stat_stream = StatStream::new_with_tracker(stream, speed_stat.clone());
                                 let speed = stat_stream.get_speed_stat();
                                 let target = list[1].clone();
                                 let stream: Box<dyn AsyncStream> = if limiter.is_some() {
@@ -806,6 +812,7 @@ impl QuicStackInner {
                                 ));
                             }
                             let server_name = list[1].as_str();
+                            let speed_stat = speed_stat.clone();
                             if let Some(server) = self.servers.get_server(server_name) {
                                 match server {
                                     Server::Http(server) => {
@@ -839,16 +846,18 @@ impl QuicStackInner {
                                             if resolver.is_none() {
                                                 break;
                                             }
+                                            let speed = speed_stat.clone();
                                             let limiter = limiter.clone();
                                             let server = server.clone();
-                                            tokio::spawn(async move {
+                                            let speed_stat = speed_stat.clone();
+                                            let handle = tokio::spawn(async move {
                                                 let ret: StackResult<()> = async move {
                                                     let (req, stream) = resolver.unwrap().resolve_request().await
                                                         .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 resolve request error"))?;
                                                     let (parts, _) = req.into_parts();
                                                     // let stat_stream = StatStream::new(stream);
                                                     let (mut send, recv) = stream.split();
-                                                    let recv_stream = Http3Recv::new(recv);
+                                                    let recv_stream = StatRead::new_with_tracker(Http3Recv::new(recv), speed_stat.clone());
                                                     let (read_limit, write_limit) = if limiter.is_some() {
                                                         let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
                                                         (Some(read_limit), Some(write_limit))
@@ -873,7 +882,7 @@ impl QuicStackInner {
                                                     send.send_response(http::Response::from_parts(parts, ())).await
                                                         .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 send response error"))?;
 
-                                                    let send_stream = SimpleAsyncWriteHolder::new(Http3Send::new(send));
+                                                    let send_stream = StatWrite::new_with_tracker(SimpleAsyncWriteHolder::new(Http3Send::new(send)), speed_stat.clone());
                                                     let mut send: Box<dyn AsyncWrite + Unpin + Send> = if write_limit.is_some() {
                                                         Box::new(LimitWrite::new(send_stream, write_limit.unwrap()))
                                                     } else {
@@ -904,6 +913,11 @@ impl QuicStackInner {
                                                     log::error!("server error: {}", e);
                                                 }
                                             });
+
+                                            if let Some(connection_manager) = self.connection_manager.as_ref() {
+                                                let controller = HandleConnectionController::new(handle);
+                                                connection_manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), local_addr.to_string(), StackProtocol::Quic, speed, controller));
+                                            }
                                         }
                                     }
                                     Server::Stream(server) => {
@@ -911,7 +925,7 @@ impl QuicStackInner {
                                             let (send, recv) = connection.accept_bi().await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
                                             let server = server.clone();
                                             let stream = sfo_split::Splittable::new(recv, send);
-                                            let stat_stream = StatStream::new(stream);
+                                            let stat_stream = StatStream::new_with_tracker(stream, speed_stat.clone());
                                             let speed = stat_stream.get_speed_stat();
                                             let stream: Box<dyn AsyncStream> = if limiter.is_some() {
                                                 let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
@@ -988,6 +1002,9 @@ impl QuicStack {
         if builder.limiter_manager.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "limit_manager is required"));
         }
+        if builder.stat_manager.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "stat_manager is required"));
+        }
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains.clone(),
@@ -1027,6 +1044,7 @@ impl QuicStack {
                 global_process_chains: builder.global_process_chains,
                 tunnel_manager: builder.tunnel_manager.unwrap(),
                 limiter_manager: builder.limiter_manager.unwrap(),
+                stat_manager: builder.stat_manager.unwrap(),
             }),
             handle: Mutex::new(None),
         })
@@ -1087,7 +1105,8 @@ pub struct QuicStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: Option<TunnelManager>,
     acme_manager: Option<AcmeCertManagerRef>,
-    limiter_manager: Option<LimiterManagerRef>
+    limiter_manager: Option<LimiterManagerRef>,
+    stat_manager: Option<StatManagerRef>,
 }
 
 impl QuicStackBuilder {
@@ -1105,6 +1124,7 @@ impl QuicStackBuilder {
             tunnel_manager: None,
             acme_manager: None,
             limiter_manager: None,
+            stat_manager: None,
         }
     }
 
@@ -1171,6 +1191,11 @@ impl QuicStackBuilder {
         self
     }
 
+    pub fn stat_manager(mut self, stat_manager: StatManagerRef) -> Self {
+        self.stat_manager = Some(stat_manager);
+        self
+    }
+
     pub async fn build(self) -> StackResult<QuicStack> {
         QuicStack::create(self).await
     }
@@ -1222,6 +1247,7 @@ pub struct QuicStackFactory {
     tunnel_manager: TunnelManager,
     acme_manager: AcmeCertManagerRef,
     limiter_manager: LimiterManagerRef,
+    stat_manager: StatManagerRef,
 }
 
 impl QuicStackFactory {
@@ -1232,6 +1258,7 @@ impl QuicStackFactory {
         tunnel_manager: TunnelManager,
         acme_manager: AcmeCertManagerRef,
         limiter_manager: LimiterManagerRef,
+        stat_manager: StatManagerRef,
     ) -> Self {
         Self {
             servers,
@@ -1240,6 +1267,7 @@ impl QuicStackFactory {
             tunnel_manager,
             acme_manager,
             limiter_manager,
+            stat_manager,
         }
     }
 }
@@ -1285,6 +1313,7 @@ impl StackFactory for QuicStackFactory {
             .concurrency(config.concurrency.unwrap_or(1024))
             .acme_manager(self.acme_manager.clone())
             .limiter_manager(self.limiter_manager.clone())
+            .stat_manager(self.stat_manager.clone())
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -1294,7 +1323,8 @@ impl StackFactory for QuicStackFactory {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use buckyos_kit::AsyncStream;
+    use std::time::Instant;
+    use buckyos_kit::{AsyncStream};
     use h3::error::{ConnectionError, StreamError};
     use quinn::crypto::rustls::QuicClientConfig;
     use quinn::Endpoint;
@@ -1304,7 +1334,7 @@ mod tests {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, Server, ProcessChainHttpServer, Stack, QuicStackFactory, ConnectionManager, StackProtocol, QuicStackConfig, StackFactory, ServerConfig, StreamInfo, CertManagerConfig, AcmeCertManager, LimiterManager};
+    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, Server, ProcessChainHttpServer, Stack, QuicStackFactory, ConnectionManager, StackProtocol, QuicStackConfig, StackFactory, StreamInfo, CertManagerConfig, AcmeCertManager, LimiterManager, StatManager};
     use crate::global_process_chains::GlobalProcessChains;
 
     #[tokio::test]
@@ -1338,6 +1368,7 @@ mod tests {
             .hook_point(vec![])
             .tunnel_manager(tunnel_manager.clone())
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1358,6 +1389,7 @@ mod tests {
             .tunnel_manager(tunnel_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1395,10 +1427,11 @@ mod tests {
             }])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
-        let mut stack = result.unwrap();
+        let stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
 
@@ -1456,10 +1489,11 @@ mod tests {
             }])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
-        let mut stack = result.unwrap();
+        let stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
 
@@ -1580,7 +1614,7 @@ mod tests {
         let tunnel_manager = TunnelManager::new();
 
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))));
+        let _ = server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))));
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9185")
@@ -1598,10 +1632,11 @@ mod tests {
             }])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
-        let mut stack = result.unwrap();
+        let stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
 
@@ -1666,7 +1701,7 @@ mod tests {
             .build().await.unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server(Server::Http(Arc::new(http_server)));
+        let _ = server_manager.add_server(Server::Http(Arc::new(http_server)));
 
         let chains = r#"
 - id: main
@@ -1698,10 +1733,11 @@ mod tests {
             .alpn_protocols(vec![b"h2".to_vec(), b"h3".to_vec()])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
-        let mut stack = result.unwrap();
+        let stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
 
@@ -1738,7 +1774,7 @@ mod tests {
             Ok::<_, StreamError>(())
         };
 
-        let (req_res, drive_res) = tokio::join!(request, drive);
+        let (req_res, _drive_res) = tokio::join!(request, drive);
 
         assert!(req_res.is_ok());
 
@@ -1764,7 +1800,7 @@ mod tests {
             Ok::<_, StreamError>(())
         };
 
-        let (req_res, drive_res) = tokio::join!(request, drive);
+        let (req_res, _drive_res) = tokio::join!(request, drive);
 
         assert!(req_res.is_ok());
     }
@@ -1803,10 +1839,11 @@ mod tests {
             }])
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
-        let mut stack = result.unwrap();
+        let stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
 
@@ -1845,6 +1882,387 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_quic_stack_stat_server() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        set-stat test;
+        return "server www.buckyos.com";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let tunnel_manager = TunnelManager::new();
+
+        let stat_manager = StatManager::new();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let result = QuicStack::builder()
+            .id("test")
+            .bind("127.0.0.1:9189")
+            .servers(server_manager)
+            .hook_point(chains)
+            .tunnel_manager(tunnel_manager)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                acme_type: None,
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    cert_key.signing_key.serialize_der()),
+                )),
+                data: None,
+            }])
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
+            .stat_manager(stat_manager.clone())
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        config.enable_early_data = true;
+        // config.alpn_protocols = vec![b"h3".to_vec()];
+        let client_config =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+        let ret = endpoint.connect("127.0.0.1:9189".parse().unwrap(), "www.buckyos.com").unwrap();
+        let ret = ret.await.unwrap();
+        let (mut send, mut recv) = ret.open_bi().await.unwrap();
+        let result = send.write_all(b"test").await;
+        assert!(result.is_ok());
+
+        let mut buf = [0u8; 4];
+        let ret = recv.read_exact(&mut buf).await;
+        assert!(ret.is_ok());
+        assert_eq!(&buf, b"recv");
+        let test_stat = stat_manager.get_speed_stat("test");
+        assert!(test_stat.is_some());
+        let test_stat = test_stat.unwrap();
+        assert_eq!(test_stat.get_read_sum_size(), 4);
+        assert_eq!(test_stat.get_write_sum_size(), 4);
+
+        let ret = endpoint.connect("127.0.0.1:9189".parse().unwrap(), "www.buckyos.com").unwrap();
+        let ret = ret.await.unwrap();
+        let (mut send, mut recv) = ret.open_bi().await.unwrap();
+        let result = send.write_all(b"test").await;
+        assert!(result.is_ok());
+
+        let mut buf = [0u8; 4];
+        let ret = recv.read_exact(&mut buf).await;
+        assert!(ret.is_ok());
+        assert_eq!(&buf, b"recv");
+        assert_eq!(test_stat.get_read_sum_size(), 8);
+        assert_eq!(test_stat.get_write_sum_size(), 8);
+    }
+
+    #[tokio::test]
+    async fn test_quic_stack_stat_limit_server() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        set-stat test;
+        set-limit "2B/s" "2B/s";
+        return "server www.buckyos.com";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let tunnel_manager = TunnelManager::new();
+
+        let stat_manager = StatManager::new();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let result = QuicStack::builder()
+            .id("test")
+            .bind("127.0.0.1:9190")
+            .servers(server_manager)
+            .hook_point(chains)
+            .tunnel_manager(tunnel_manager)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                acme_type: None,
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    cert_key.signing_key.serialize_der()),
+                )),
+                data: None,
+            }])
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
+            .stat_manager(stat_manager.clone())
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        config.enable_early_data = true;
+        // config.alpn_protocols = vec![b"h3".to_vec()];
+        let client_config =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+        let ret = endpoint.connect("127.0.0.1:9190".parse().unwrap(), "www.buckyos.com").unwrap();
+        let ret = ret.await.unwrap();
+        let (mut send, mut recv) = ret.open_bi().await.unwrap();
+        let start = Instant::now();
+        let result = send.write_all(b"test").await;
+        assert!(result.is_ok());
+
+        let mut buf = [0u8; 4];
+        let ret = recv.read_exact(&mut buf).await;
+        ret.unwrap();
+        // assert!(ret.is_ok());
+        assert_eq!(&buf, b"recv");
+        let test_stat = stat_manager.get_speed_stat("test");
+        assert!(test_stat.is_some());
+        let test_stat = test_stat.unwrap();
+        assert_eq!(test_stat.get_read_sum_size(), 4);
+        assert_eq!(test_stat.get_write_sum_size(), 4);
+        assert!(start.elapsed().as_millis() > 1800);
+        assert!(start.elapsed().as_millis() < 2500);
+
+        let ret = endpoint.connect("127.0.0.1:9190".parse().unwrap(), "www.buckyos.com").unwrap();
+        let ret = ret.await.unwrap();
+        let (mut send, mut recv) = ret.open_bi().await.unwrap();
+        let result = send.write_all(b"test").await;
+        assert!(result.is_ok());
+
+        let mut buf = [0u8; 4];
+        let ret = recv.read_exact(&mut buf).await;
+        assert!(ret.is_ok());
+        assert_eq!(&buf, b"recv");
+        assert_eq!(test_stat.get_read_sum_size(), 8);
+        assert_eq!(test_stat.get_write_sum_size(), 8);
+        assert!(start.elapsed().as_millis() > 3800);
+        assert!(start.elapsed().as_millis() < 4500);
+    }
+
+    #[tokio::test]
+    async fn test_quic_stack_stat_group_limit_server() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        set-stat test;
+        set-limit test;
+        return "server www.buckyos.com";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let tunnel_manager = TunnelManager::new();
+
+        let stat_manager = StatManager::new();
+        let limiter_manager = LimiterManager::new();
+        let _ = limiter_manager.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let result = QuicStack::builder()
+            .id("test")
+            .bind("127.0.0.1:9191")
+            .servers(server_manager)
+            .hook_point(chains)
+            .tunnel_manager(tunnel_manager)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                acme_type: None,
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    cert_key.signing_key.serialize_der()),
+                )),
+                data: None,
+            }])
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(limiter_manager)
+            .stat_manager(stat_manager.clone())
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        config.enable_early_data = true;
+        // config.alpn_protocols = vec![b"h3".to_vec()];
+        let client_config =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+        let ret = endpoint.connect("127.0.0.1:9191".parse().unwrap(), "www.buckyos.com").unwrap();
+        let ret = ret.await.unwrap();
+        let (mut send, mut recv) = ret.open_bi().await.unwrap();
+        let start = Instant::now();
+        let result = send.write_all(b"test").await;
+        assert!(result.is_ok());
+
+        let mut buf = [0u8; 4];
+        let ret = recv.read_exact(&mut buf).await;
+        ret.unwrap();
+        // assert!(ret.is_ok());
+        assert_eq!(&buf, b"recv");
+        let test_stat = stat_manager.get_speed_stat("test");
+        assert!(test_stat.is_some());
+        let test_stat = test_stat.unwrap();
+        assert_eq!(test_stat.get_read_sum_size(), 4);
+        assert_eq!(test_stat.get_write_sum_size(), 4);
+        assert!(start.elapsed().as_millis() > 1800);
+        assert!(start.elapsed().as_millis() < 2500);
+
+        let ret = endpoint.connect("127.0.0.1:9191".parse().unwrap(), "www.buckyos.com").unwrap();
+        let ret = ret.await.unwrap();
+        let (mut send, mut recv) = ret.open_bi().await.unwrap();
+        let result = send.write_all(b"test").await;
+        assert!(result.is_ok());
+
+        let mut buf = [0u8; 4];
+        let ret = recv.read_exact(&mut buf).await;
+        assert!(ret.is_ok());
+        assert_eq!(&buf, b"recv");
+        assert_eq!(test_stat.get_read_sum_size(), 8);
+        assert_eq!(test_stat.get_write_sum_size(), 8);
+        assert!(start.elapsed().as_millis() > 3800);
+        assert!(start.elapsed().as_millis() < 4500);
+    }
+
+    #[tokio::test]
+    async fn test_quic_stack_stat_group_limit_server2() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        set-stat test;
+        set-limit test "10KB/s" "10KB/s";
+        return "server www.buckyos.com";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let tunnel_manager = TunnelManager::new();
+
+        let stat_manager = StatManager::new();
+        let limiter_manager = LimiterManager::new();
+        let _ = limiter_manager.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let result = QuicStack::builder()
+            .id("test")
+            .bind("127.0.0.1:9192")
+            .servers(server_manager)
+            .hook_point(chains)
+            .tunnel_manager(tunnel_manager)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                acme_type: None,
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    cert_key.signing_key.serialize_der()),
+                )),
+                data: None,
+            }])
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(limiter_manager)
+            .stat_manager(stat_manager.clone())
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        config.enable_early_data = true;
+        // config.alpn_protocols = vec![b"h3".to_vec()];
+        let client_config =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+        let ret = endpoint.connect("127.0.0.1:9192".parse().unwrap(), "www.buckyos.com").unwrap();
+        let ret = ret.await.unwrap();
+        let (mut send, mut recv) = ret.open_bi().await.unwrap();
+        let start = Instant::now();
+        let result = send.write_all(b"test").await;
+        assert!(result.is_ok());
+
+        let mut buf = [0u8; 4];
+        let ret = recv.read_exact(&mut buf).await;
+        ret.unwrap();
+        // assert!(ret.is_ok());
+        assert_eq!(&buf, b"recv");
+        let test_stat = stat_manager.get_speed_stat("test");
+        assert!(test_stat.is_some());
+        let test_stat = test_stat.unwrap();
+        assert_eq!(test_stat.get_read_sum_size(), 4);
+        assert_eq!(test_stat.get_write_sum_size(), 4);
+        assert!(start.elapsed().as_millis() > 1800);
+        assert!(start.elapsed().as_millis() < 2500);
+
+        let ret = endpoint.connect("127.0.0.1:9192".parse().unwrap(), "www.buckyos.com").unwrap();
+        let ret = ret.await.unwrap();
+        let (mut send, mut recv) = ret.open_bi().await.unwrap();
+        let result = send.write_all(b"test").await;
+        assert!(result.is_ok());
+
+        let mut buf = [0u8; 4];
+        let ret = recv.read_exact(&mut buf).await;
+        assert!(ret.is_ok());
+        assert_eq!(&buf, b"recv");
+        assert_eq!(test_stat.get_read_sum_size(), 8);
+        assert_eq!(test_stat.get_write_sum_size(), 8);
+        assert!(start.elapsed().as_millis() > 3800);
+        assert!(start.elapsed().as_millis() < 4500);
+    }
+
+    #[tokio::test]
     async fn test_factory() {
         let mut cert_config = CertManagerConfig::default();
         let data_dir = tempfile::tempdir().unwrap();
@@ -1858,6 +2276,7 @@ mod tests {
             TunnelManager::new(),
             cert_manager,
             LimiterManager::new(),
+            StatManager::new()
         );
 
         let config = QuicStackConfig {
@@ -1869,6 +2288,6 @@ mod tests {
             certs: vec![],
             alpn_protocols: None,
         };
-        let ret = factory.create(Arc::new(config));
+        let _ret = factory.create(Arc::new(config));
     }
 }

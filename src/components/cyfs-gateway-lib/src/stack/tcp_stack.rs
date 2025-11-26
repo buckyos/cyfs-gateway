@@ -7,7 +7,7 @@ use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_min_priority, get_stream_external_commands, LimiterManagerRef};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_min_priority, get_stream_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, MutComposedSpeedStat, MutComposedSpeedStatRef};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -30,6 +30,7 @@ struct TcpStackInner {
     tunnel_manager: TunnelManager,
     global_process_chains: Option<GlobalProcessChainsRef>,
     limiter_manager: LimiterManagerRef,
+    stat_manager: StatManagerRef,
     transparent: bool,
 }
 
@@ -72,6 +73,12 @@ impl TcpStackInner {
                 "limiter_manager is required"
             ));
         }
+        if config.stat_manager.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "stat_manager is required"
+            ));
+        }
 
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
                                                           config.global_process_chains.clone(),
@@ -86,6 +93,7 @@ impl TcpStackInner {
             tunnel_manager: config.tunnel_manager.unwrap(),
             global_process_chains: config.global_process_chains,
             limiter_manager: config.limiter_manager.unwrap(),
+            stat_manager: config.stat_manager.unwrap(),
             transparent: config.transparent,
         })
     }
@@ -168,11 +176,12 @@ impl TcpStackInner {
                 };
                 log::info!("accept tcp stream from {} to {}", remote_addr, dest_addr);
                 let this_tmp = this.clone();
-                let stat_stream = StatStream::new(stream);
+                let compose_stat = MutComposedSpeedStat::new();
+                let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
                 let speed = stat_stream.get_speed_stat();
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        this_tmp.handle_connect(stat_stream, dest_addr).await
+                        this_tmp.handle_connect(stat_stream, dest_addr, compose_stat).await
                     {
                         log::error!("handle tcp stream failed: {}", e);
                     }
@@ -220,6 +229,7 @@ impl TcpStackInner {
         &self,
         mut stream: StatStream<TcpStream>,
         dest_addr: SocketAddr,
+        compose_stat: MutComposedSpeedStatRef,
     ) -> StackResult<()> {
         let executor = {
             self.executor.lock().unwrap().fork()
@@ -245,7 +255,7 @@ impl TcpStackInner {
                         return Ok(());
                     }
 
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env).await?;
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
                     let upper = if limiter_id.is_some() {
                         self.limiter_manager.get_limiter(limiter_id.unwrap())
                     } else {
@@ -256,6 +266,10 @@ impl TcpStackInner {
                     } else {
                         upper
                     };
+
+                    let stat_group_ids = get_stat_info(chain_env).await?;
+                    let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
+                    compose_stat.set_external_stats(speed_groups);
 
                     let cmd = list[0].as_str();
                     match cmd {
@@ -345,6 +359,7 @@ impl TcpStack {
             connection_manager: None,
             tunnel_manager: None,
             limiter_manager: None,
+            stat_manager: None,
             transparent: false,
         }
     }
@@ -417,6 +432,7 @@ pub struct TcpStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: Option<TunnelManager>,
     limiter_manager: Option<LimiterManagerRef>,
+    stat_manager: Option<StatManagerRef>,
     transparent: bool,
 }
 
@@ -463,6 +479,11 @@ impl TcpStackBuilder {
 
     pub fn limiter_manager(mut self, limiter_manager: LimiterManagerRef) -> Self {
         self.limiter_manager = Some(limiter_manager);
+        self
+    }
+
+    pub fn stat_manager(mut self, stat_manager: StatManagerRef) -> Self {
+        self.stat_manager = Some(stat_manager);
         self
     }
 
@@ -515,6 +536,7 @@ pub struct TcpStackFactory {
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
     limiter_manager: LimiterManagerRef,
+    stat_manager: StatManagerRef,
 }
 
 impl TcpStackFactory {
@@ -524,6 +546,7 @@ impl TcpStackFactory {
         connection_manager: ConnectionManagerRef,
         tunnel_manager: TunnelManager,
         limiter_manager: LimiterManagerRef,
+        stat_manager: StatManagerRef,
     ) -> Self {
         Self {
             servers,
@@ -531,6 +554,7 @@ impl TcpStackFactory {
             connection_manager,
             tunnel_manager,
             limiter_manager,
+            stat_manager,
         }
     }
 }
@@ -553,6 +577,7 @@ impl StackFactory for TcpStackFactory {
             .transparent(config.transparent.unwrap_or(false))
             .hook_point(config.hook_point.clone())
             .limiter_manager(self.limiter_manager.clone())
+            .stat_manager(self.stat_manager.clone())
             .build().await?;
         Ok(Arc::new(stack))
     }
@@ -562,9 +587,10 @@ impl StackFactory for TcpStackFactory {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, ServerConfig, StreamInfo, LimiterManager};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, StreamInfo, LimiterManager, StatManager};
     use buckyos_kit::AsyncStream;
     use std::sync::Arc;
+    use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -596,6 +622,7 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .hook_point(vec![])
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -607,6 +634,7 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -619,6 +647,7 @@ mod tests {
             .connection_manager(ConnectionManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -647,10 +676,11 @@ mod tests {
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
-        let mut stack = result.unwrap();
+        let stack = result.unwrap();
         let result = stack.start().await;
         assert!(result.is_ok());
 
@@ -688,6 +718,7 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -727,6 +758,7 @@ mod tests {
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -773,7 +805,7 @@ mod tests {
   blocks:
     - id: main
       block: |
-        return "forward tcp:///127.0.0.1:8086";
+        return "forward tcp:///127.0.0.1:18086";
         "#;
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
@@ -786,6 +818,7 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -829,6 +862,7 @@ mod tests {
             self.id.clone()
         }
     }
+
     #[tokio::test]
     async fn test_tcp_stack_server() {
         let chains = r#"
@@ -843,7 +877,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))));
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let result = TcpStack::builder()
             .id("test")
             .bind("127.0.0.1:8085")
@@ -852,6 +886,7 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
             .build()
             .await;
         assert!(result.is_ok());
@@ -872,12 +907,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tcp_stack_stat_server() {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        set-stat test;
+        return "server www.buckyos.com";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let stat_manager = StatManager::new();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let result = TcpStack::builder()
+            .id("test")
+            .bind("127.0.0.1:8086")
+            .servers(server_manager)
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
+            .stat_manager(stat_manager.clone())
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let mut stream = TcpStream::connect("127.0.0.1:8086").await.unwrap();
+        let result = stream.write_all(b"test").await;
+        assert!(result.is_ok());
+
+        let mut buf = [0u8; 4];
+        let ret = stream.read_exact(&mut buf).await;
+        assert!(ret.is_ok());
+        assert_eq!(&buf, b"recv");
+        let test_stat = stat_manager.get_speed_stat("test");
+        assert!(test_stat.is_some());
+        let test_stat = test_stat.unwrap();
+        assert_eq!(test_stat.get_read_sum_size(), 4);
+        assert_eq!(test_stat.get_write_sum_size(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_stack_stat_limiter_server() {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        set-stat test;
+        set-limit "2B/s" "2B/s";
+        return "server www.buckyos.com";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let stat_manager = StatManager::new();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let result = TcpStack::builder()
+            .id("test")
+            .bind("127.0.0.1:8087")
+            .servers(server_manager)
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
+            .stat_manager(stat_manager.clone())
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let mut stream = TcpStream::connect("127.0.0.1:8087").await.unwrap();
+        let start = Instant::now();
+        let result = stream.write_all(b"test").await;
+        assert!(result.is_ok());
+
+        let mut buf = [0u8; 4];
+        let ret = stream.read_exact(&mut buf).await;
+        assert!(ret.is_ok());
+        assert_eq!(&buf, b"recv");
+        let test_stat = stat_manager.get_speed_stat("test");
+        assert!(test_stat.is_some());
+        let test_stat = test_stat.unwrap();
+        assert_eq!(test_stat.get_read_sum_size(), 4);
+        assert_eq!(test_stat.get_write_sum_size(), 4);
+        assert!(start.elapsed().as_millis() > 1800);
+        assert!(start.elapsed().as_millis() < 2500);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_stack_stat_group_limiter_server() {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        set-stat test;
+        set-limit test;
+        return "server www.buckyos.com";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let stat_manager = StatManager::new();
+        let limiter_manager = LimiterManager::new();
+        let _ = limiter_manager.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let result = TcpStack::builder()
+            .id("test")
+            .bind("127.0.0.1:8088")
+            .servers(server_manager)
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(limiter_manager)
+            .stat_manager(stat_manager.clone())
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let mut stream = TcpStream::connect("127.0.0.1:8088").await.unwrap();
+        let start = Instant::now();
+        let result = stream.write_all(b"test").await;
+        assert!(result.is_ok());
+
+        let mut buf = [0u8; 4];
+        let ret = stream.read_exact(&mut buf).await;
+        assert!(ret.is_ok());
+        assert_eq!(&buf, b"recv");
+        let test_stat = stat_manager.get_speed_stat("test");
+        assert!(test_stat.is_some());
+        let test_stat = test_stat.unwrap();
+        assert_eq!(test_stat.get_read_sum_size(), 4);
+        assert_eq!(test_stat.get_write_sum_size(), 4);
+        assert!(start.elapsed().as_millis() > 1800);
+        assert!(start.elapsed().as_millis() < 2500);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_stack_stat_group_limiter_server2() {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        set-stat test;
+        set-limit test "10KB/s" "10KB/s";
+        return "server www.buckyos.com";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let stat_manager = StatManager::new();
+        let limiter_manager = LimiterManager::new();
+        let _ = limiter_manager.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let result = TcpStack::builder()
+            .id("test")
+            .bind("127.0.0.1:8089")
+            .servers(server_manager)
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(limiter_manager)
+            .stat_manager(stat_manager.clone())
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        let mut stream = TcpStream::connect("127.0.0.1:8089").await.unwrap();
+        let start = Instant::now();
+        let result = stream.write_all(b"test").await;
+        assert!(result.is_ok());
+
+        let mut buf = [0u8; 4];
+        let ret = stream.read_exact(&mut buf).await;
+        assert!(ret.is_ok());
+        assert_eq!(&buf, b"recv");
+        let test_stat = stat_manager.get_speed_stat("test");
+        assert!(test_stat.is_some());
+        let test_stat = test_stat.unwrap();
+        assert_eq!(test_stat.get_read_sum_size(), 4);
+        assert_eq!(test_stat.get_write_sum_size(), 4);
+        assert!(start.elapsed().as_millis() > 1800);
+        assert!(start.elapsed().as_millis() < 2500);
+    }
+
+    #[tokio::test]
     async fn test_factory() {
         let tcp_factory = TcpStackFactory::new(Arc::new(ServerManager::new()),
                                                Arc::new(GlobalProcessChains::new()),
                                                ConnectionManager::new(),
                                                TunnelManager::new(),
-                                               LimiterManager::new());
+                                               LimiterManager::new(),
+                                               StatManager::new());
         let config = TcpStackConfig {
             id: "test".to_string(),
             protocol: StackProtocol::Tcp,
