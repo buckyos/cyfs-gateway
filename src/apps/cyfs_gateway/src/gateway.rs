@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use super::config_loader::GatewayConfig;
 use cyfs_gateway_lib::*;
 
+use log::*;
 use name_client::*;
 use name_lib::*;
 use buckyos_kit::*;
@@ -22,7 +23,8 @@ use sfo_js::object::builtins::JsArray;
 use sha2::Digest;
 use crate::cyfs_cmd_client::{cmd_err, into_cmd_err};
 use crate::cyfs_cmd_server::{CmdErrorCode, CmdResult, CyfsCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
-use crate::{GatewayConfigParser, CYFS_CMD_SERVER_CONFIG, CYFS_CMD_SERVER_KEY};
+use crate::config_loader::GatewayConfigParser;
+use crate::cyfs_cmd_server::{CYFS_CMD_SERVER_CONFIG, CYFS_CMD_SERVER_KEY};
 
 pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Value> {
     let config_dir = config_file.parent().ok_or_else(|| {

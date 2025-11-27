@@ -1,3 +1,4 @@
+use log::*;
 use std::collections::HashMap;
 use chrono::Utc;
 use serde_json::Value;
