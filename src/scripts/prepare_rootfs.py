@@ -39,6 +39,7 @@ def copy_files(rust_target_dir):
     print("Copying files...")
     # code to copy files
     strip_and_copy_rust_file(rust_target_dir, "cyfs_gateway", root_bin_dir, True)
+    strip_and_copy_rust_file(rust_target_dir, "test_server", root_bin_dir, True)
     #copy_web_apps("apps/sys_test", os.path.join(root_bin_dir, "sys_test"))
 
     print("Files copied successfully!")
