@@ -44,7 +44,7 @@ tokio-socks = "*"
 libsocks_client = "*"
 sfo-result = "0.2"
 sfo-split = { version = "0.1.6", features = ["io"] }
-sfo-io = "0.1.13"
+sfo-io = "0.1.14"
 serde_yaml_ng = "0.10.0"
 shlex = "1.3.0"
 quinn = { version = "0.11.9", default-features = false, features = ["platform-verifier", "rustls", "ring", "runtime-tokio"] }

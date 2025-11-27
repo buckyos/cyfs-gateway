@@ -10,7 +10,7 @@ use name_client::*;
 use name_lib::*;
 use buckyos_kit::*;
 use url::Url;
-use anyhow::{anyhow, Result};
+use anyhow::{Result};
 use chrono::{Utc};
 use json_value_merge::Merge;
 use jsonwebtoken::{DecodingKey, EncodingKey};
@@ -18,7 +18,7 @@ use jsonwebtoken::jwk::Jwk;
 use kRPC::RPCSessionToken;
 use serde::Serialize;
 use serde_json::Value;
-use sfo_js::{js_value, JsEngine, JsString, JsValue};
+use sfo_js::{JsEngine, JsString, JsValue};
 use sfo_js::object::builtins::JsArray;
 use sha2::Digest;
 use crate::cyfs_cmd_client::{cmd_err, into_cmd_err};
@@ -420,7 +420,6 @@ impl Gateway {
     }
 
     pub async fn reload(&self, mut config: GatewayConfig) -> Result<()> {
-        let old_global_chains = self.global_process_chains.get_process_chains();
         let mut new_process_chains = HashMap::new();
         for process_chain_config in config.global_process_chains.iter() {
             let process_chain = Arc::new(process_chain_config.create_process_chain()?);

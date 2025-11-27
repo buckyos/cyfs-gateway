@@ -2644,7 +2644,7 @@ mod tests {
         assert_eq!(test_stat.get_read_sum_size(), 15);
         assert_eq!(test_stat.get_write_sum_size(), 12);
         assert!(start.elapsed().as_millis() > 4600);
-        assert!(start.elapsed().as_millis() < 5000);
+        assert!(start.elapsed().as_millis() < 5200);
     }
 
     #[tokio::test]

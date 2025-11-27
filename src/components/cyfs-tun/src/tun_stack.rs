@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use buckyos_kit::AsyncStream;
 use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use serde::{Deserialize, Serialize};
-use sfo_io::{LimitStream, StatStream};
+use sfo_io::{LimitDatagramRecv, LimitDatagramSend, LimitStream, StatStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::task::JoinHandle;
 use cyfs_gateway_lib::*;
@@ -12,15 +12,64 @@ use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, P
 
 pub const DEFAULT_MTU: u16 = 1500;
 
-#[derive(Clone)]
-struct TunDatagramClient {
-    send: Arc<tokio::sync::Mutex<WriteHalf<Box<dyn AsyncStream>>>>,
-    recv: Arc<tokio::sync::Mutex<ReadHalf<Box<dyn AsyncStream>>>>,
+pub struct TunDatagramSend {
+    send: WriteHalf<Box<dyn AsyncStream>>,
 }
 
-impl TunDatagramClient {
-    fn new(stream: Box<dyn AsyncStream>) -> Self {
-        let (recv, send) = tokio::io::split(stream);
+impl TunDatagramSend {
+    fn new(send: WriteHalf<Box<dyn AsyncStream>>) -> Self {
+        Self {
+            send,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl sfo_io::DatagramSend for TunDatagramSend {
+    type Error = Error;
+    async fn send_to(&mut self, buffer: &[u8]) -> Result<usize, Error> {
+        let n = self.send.write(buffer).await?;
+        Ok(n)
+    }
+}
+
+pub struct TunDatagramRecv {
+    recv: ReadHalf<Box<dyn AsyncStream>>,
+}
+
+impl TunDatagramRecv {
+    fn new(recv: ReadHalf<Box<dyn AsyncStream>>) -> Self {
+        Self {
+            recv,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl sfo_io::DatagramRecv for TunDatagramRecv {
+    type Error = Error;
+    async fn recv_from(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
+        let n = self.recv.read(buffer).await?;
+        Ok(n)
+    }
+}
+
+struct TunDatagramClient<R: sfo_io::DatagramRecv, S: sfo_io::DatagramSend> {
+    send: Arc<tokio::sync::Mutex<S>>,
+    recv: Arc<tokio::sync::Mutex<R>>,
+}
+
+impl<R: sfo_io::DatagramRecv, S: sfo_io::DatagramSend> Clone for TunDatagramClient<R, S> {
+    fn clone(&self) -> Self {
+        Self {
+            send: self.send.clone(),
+            recv: self.recv.clone(),
+        }
+    }
+}
+
+impl<R: sfo_io::DatagramRecv, S: sfo_io::DatagramSend> TunDatagramClient<R, S> {
+    fn new(recv: R, send: S) -> Self {
         Self {
             send: Arc::new(tokio::sync::Mutex::new(send)),
             recv: Arc::new(tokio::sync::Mutex::new(recv)),
@@ -29,16 +78,16 @@ impl TunDatagramClient {
 }
 
 #[async_trait::async_trait]
-impl DatagramClient for TunDatagramClient {
+impl<R: sfo_io::DatagramRecv<Error=Error>, S: sfo_io::DatagramSend<Error=Error>> DatagramClient for TunDatagramClient<R, S> {
     async fn recv_datagram(&self, buffer: &mut [u8]) -> Result<usize, Error> {
         let mut recv = self.recv.lock().await;
-        let n = recv.read(buffer).await?;
+        let n = recv.recv_from(buffer).await?;
         Ok(n)
     }
 
     async fn send_datagram(&self, buffer: &[u8]) -> Result<usize, Error> {
         let mut send = self.send.lock().await;
-        let n = send.write(buffer).await?;
+        let n = send.send_to(buffer).await?;
         Ok(n)
     }
 }
@@ -467,7 +516,16 @@ impl TunStackInner {
                     let stat_group_ids = get_stat_info(chain_env).await?;
                     let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
                     stat.set_external_stats(speed_groups);
-                    
+
+                    let (read, send) = tokio::io::split(Box::new(stream) as Box<dyn AsyncStream>);
+                    let datagram_stream: Box<dyn DatagramClientBox> = if limiter.is_some() {
+                        let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                        Box::new(TunDatagramClient::new(LimitDatagramRecv::new(TunDatagramRecv::new(read), read_limit),
+                                                        LimitDatagramSend::new(TunDatagramSend::new(send), write_limit), ))
+                    } else {
+                        Box::new(TunDatagramClient::new(TunDatagramRecv::new(read), TunDatagramSend::new(send)))
+                    };
+
                     let cmd = list[0].as_str();
                     match cmd {
                         "forward" => {
@@ -478,14 +536,6 @@ impl TunStackInner {
                                 ));
                             }
                             let target = list[1].as_str();
-                            let stream: Box<dyn AsyncStream> = if limiter.is_some() {
-                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
-                                Box::new(limit_stream)
-                            } else {
-                                Box::new(stream)
-                            };
-                            let datagram_stream = Box::new(TunDatagramClient::new(stream));
                             datagram_forward(datagram_stream, target, &self.tunnel_manager).await?;
                         }
                         "server" => {
@@ -495,19 +545,11 @@ impl TunStackInner {
                                     "invalid server command"
                                 ));
                             }
-                            let stream: Box<dyn AsyncStream> = if limiter.is_some() {
-                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
-                                Box::new(limit_stream)
-                            } else {
-                                Box::new(stream)
-                            };
 
                             let server_name = list[1].as_str();
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
                                     Server::Datagram(server) => {
-                                        let datagram_stream = TunDatagramClient::new(stream);
                                         let mut buf = vec![0; 4096];
                                         loop {
                                             let len = datagram_stream.recv_datagram(&mut buf).await
