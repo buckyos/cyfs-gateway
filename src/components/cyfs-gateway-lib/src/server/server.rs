@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU32;
+use ::kRPC::{RPCHandler, RPCRequest, RPCResponse};
 use as_any::AsAny;
 use buckyos_kit::AsyncStream;
 use http::{HeaderName, Request, Uri};
@@ -398,6 +399,123 @@ pub trait HttpServer: Send + Sync + 'static {
     fn id(&self) -> String;
     fn http_version(&self) -> http::Version;
     fn http3_port(&self) -> Option<u16>;
+}
+
+pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
+    req: http::Request<BoxBody<Bytes, ServerError>>,
+    info: StreamInfo,
+    rpc_handler: &T,
+) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    if req.method() != hyper::Method::POST {
+        return Ok(http::Response::builder()
+            .status(hyper::StatusCode::METHOD_NOT_ALLOWED)
+            .body(BoxBody::new(
+                http_body_util::Full::new(Bytes::from_static(b"Method Not Allowed"))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            ))
+            .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?);
+    }
+
+    let client_ip = match info.src_addr.as_ref() {
+        Some(addr) => match addr.parse::<std::net::SocketAddr>() {
+            Ok(sa) => sa.ip(),
+            Err(e) => {
+                error!("parse client ip {} err {}", addr, e);
+                return Ok(http::Response::builder()
+                    .status(hyper::StatusCode::BAD_REQUEST)
+                    .body(BoxBody::new(
+                        http_body_util::Full::new(Bytes::from_static(b"Bad Request"))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    ))
+                    .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?);
+            }
+        },
+        None => {
+            error!("Failed to get client ip");
+            return Ok(http::Response::builder()
+                .status(hyper::StatusCode::BAD_REQUEST)
+                .body(BoxBody::new(
+                    http_body_util::Full::new(Bytes::from_static(b"Bad Request"))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                ))
+                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?);
+        }
+    };
+
+    let body_bytes = match req.collect().await {
+        Ok(data) => data.to_bytes(),
+        Err(e) => {
+            return Ok(http::Response::builder()
+                .status(hyper::StatusCode::BAD_REQUEST)
+                .body(BoxBody::new(
+                    http_body_util::Full::new(Bytes::from(format!("Failed to read body: {:?}", e)))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                ))
+                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?);
+        }
+    };
+
+    let body_str = match String::from_utf8(body_bytes.to_vec()) {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(http::Response::builder()
+                .status(hyper::StatusCode::BAD_REQUEST)
+                .body(BoxBody::new(
+                    http_body_util::Full::new(Bytes::from(format!("Failed to convert body to string: {}", e)))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                ))
+                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?);
+        }
+    };
+
+    debug!("|==>recv kRPC req: {}", body_str);
+
+    let rpc_request: RPCRequest = match serde_json::from_str(body_str.as_str()) {
+        Ok(rpc_request) => rpc_request,
+        Err(e) => {
+            return Ok(http::Response::builder()
+                .status(hyper::StatusCode::BAD_REQUEST)
+                .body(BoxBody::new(
+                    http_body_util::Full::new(Bytes::from(format!(
+                        "Failed to parse request body to RPCRequest: {}",
+                        e
+                    )))
+                    .map_err(|never| match never {})
+                    .boxed(),
+                ))
+                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?);
+        }
+    };
+
+    let resp: RPCResponse = match rpc_handler.handle_rpc_call(rpc_request, client_ip).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Ok(http::Response::builder()
+                .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(BoxBody::new(
+                    http_body_util::Full::new(Bytes::from(format!("Failed to handle rpc call: {}", e)))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                ))
+                .map_err(|e| server_err!(ServerErrorCode::InvalidData, "Failed to build response: {}", e))?);
+        }
+    };
+
+    let body_json = serde_json::to_string(&resp)
+        .map_err(|e| server_err!(ServerErrorCode::EncodeError, "Failed to convert response to string: {}", e))?;
+
+    Ok(http::Response::builder()
+        .body(BoxBody::new(
+            http_body_util::Full::new(Bytes::from(body_json))
+                .map_err(|never| match never {})
+                .boxed(),
+        ))
+        .map_err(|e| server_err!(ServerErrorCode::InvalidData, "Failed to build response: {}", e))?)
 }
 
 pub struct DatagramInfo {

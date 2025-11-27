@@ -14,4 +14,6 @@ tokio = { version = "1.41", features = ["macros", "rt", "rt-multi-thread"] }
 server-runner = { path = "../../components/server-runner" }
 cyfs-gateway-lib = { path = "../../components/cyfs-gateway-lib" }
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", branch = "beta1", package = "buckyos-kit" }
+kRPC = { git = "https://github.com/buckyos/buckyos-base.git", branch = "beta1", package = "kRPC" }
+serde_json = "1"
 
