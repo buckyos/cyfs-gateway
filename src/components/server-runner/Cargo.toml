@@ -9,10 +9,12 @@ tokio = { version = "1.41", features = ["macros", "net", "rt", "rt-multi-thread"
 log = "0.4"
 cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", branch = "beta1", package = "buckyos-kit" }
-
-[dev-dependencies]
 async-trait = "0.1"
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1.6", default-features = false, features = ["http1"] }
+bytes = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
