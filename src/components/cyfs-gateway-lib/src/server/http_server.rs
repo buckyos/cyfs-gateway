@@ -126,7 +126,7 @@ impl ProcessChainHttpServer {
         info!("handle_upstream url: {}", url);
         let upstream_url = Url::parse(target_url);
         if upstream_url.is_err() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "Failed to parse upstream url: {}", upstream_url.err().unwrap()));
+            return Err(server_err!(ServerErrorCode::InvalidConfig, "Failed to parse upstream url: {}", target_url));
         }
         //TODO:support url rewrite
         let upstream_url = upstream_url.unwrap();
