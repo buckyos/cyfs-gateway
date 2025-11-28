@@ -38,15 +38,51 @@ impl ResolvesServerCertUsingSni {
         }
         Ok(())
     }
+
+    // 添加一个辅助函数来检查通配符匹配
+    fn matches_wildcard(domain: &str, wildcard: &str) -> bool {
+        if !wildcard.starts_with("*.") {
+            return false;
+        }
+
+        let wildcard_domain = &wildcard[2..]; // 移除 "*." 前缀
+        if wildcard_domain.is_empty() {
+            return false;
+        }
+
+        // 确保域名至少有两个部分（例如 example.com）
+        if wildcard_domain.matches('.').count() < 1 {
+            return false;
+        }
+
+        // 检查域名是否以通配符后缀结尾，并且前面有一个子域名部分
+        if domain.len() > wildcard_domain.len() {
+            let prefix_len = domain.len() - wildcard_domain.len() - 1;
+            domain.ends_with(wildcard_domain) &&
+                domain.as_bytes()[prefix_len] == b'.' &&
+                !domain[..prefix_len].contains('.')
+        } else {
+            false
+        }
+    }
 }
 
 impl server::ResolvesServerCert for ResolvesServerCertUsingSni {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<sign::CertifiedKey>> {
         if let Some(name) = client_hello.server_name() {
             {
-                let cert = self.by_name.lock().unwrap().get(name).cloned();
-                if cert.is_some() {
-                    return cert;
+                let certs = self.by_name.lock().unwrap();
+
+                // 首先尝试精确匹配
+                if let Some(cert) = certs.get(name).cloned() {
+                    return Some(cert);
+                }
+
+                // 然后尝试通配符匹配
+                for (cert_name, cert) in certs.iter() {
+                    if cert_name.starts_with("*.") && Self::matches_wildcard(name, cert_name) {
+                        return Some(cert.clone());
+                    }
                 }
             }
 
@@ -57,5 +93,16 @@ impl server::ResolvesServerCert for ResolvesServerCertUsingSni {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_matches_wildcard() {
+        assert!(!super::ResolvesServerCertUsingSni::matches_wildcard("example.com", "*.example.com"));
+        assert!(super::ResolvesServerCertUsingSni::matches_wildcard("www.example.com", "*.example.com"));
+        assert!(!super::ResolvesServerCertUsingSni::matches_wildcard("www.example1.com", "*.example.com"));
+        assert!(!super::ResolvesServerCertUsingSni::matches_wildcard("www.example1.com", "example.com"));
     }
 }
