@@ -2,13 +2,13 @@
 #![allow(unused_imports)]
 
 mod gateway;
-mod cyfs_cmd_client;
-mod cyfs_cmd_server;
+mod gateway_control_client;
+mod gateway_control_server;
 mod config_loader;
 
 pub use gateway::*;
-pub use cyfs_cmd_client::*;
-pub use cyfs_cmd_server::*;
+pub use gateway_control_client::*;
+pub use gateway_control_server::*;
 pub use config_loader::*;
 
 
@@ -81,7 +81,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
     parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
     parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
 
-    parser.register_server_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
+    parser.register_server_config_parser("control_server", Arc::new(GatewayControlServerConfigParser::new()));
     parser.register_server_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
     parser.register_server_config_parser("sn", Arc::new(SNServerConfigParser::new()));
 
@@ -236,8 +236,8 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         config_file.to_path_buf(),
         parser);
     factory.register_server_factory(
-        "cmd_server",
-        Arc::new(CyfsCmdServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
+        "control_server",
+        Arc::new(GatewayControlServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
     factory.register_server_factory(
         "local_dns",
         Arc::new(LocalDnsFactory::new(config_dir.to_string_lossy().to_string())));
@@ -330,7 +330,7 @@ fn read_login_token(server: &str) -> Option<String> {
         let _ = create_dir_all(token_dir.as_path());
     }
 
-    if server.to_lowercase() == CMD_SERVER {
+    if server.to_lowercase() == CONTROL_SERVER {
         let private_key = data_dir.join("private_key.pem");
         let encode_key = match load_private_key(private_key.as_path()) {
             Ok(key) => key,
@@ -365,7 +365,7 @@ fn read_login_token(server: &str) -> Option<String> {
 }
 
 fn save_login_token(server: &str, token: &str) {
-    if server.to_lowercase() == CMD_SERVER {
+    if server.to_lowercase() == CONTROL_SERVER {
         return;
     }
     let token_dir = get_buckyos_service_data_dir("cyfs_gateway").join("cli_token");
@@ -430,7 +430,7 @@ pub async fn cyfs_gateway_main() {
                 .short('s')
                 .help("server url")
                 .required(false)
-                .default_value(CMD_SERVER)))
+                .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("show_config")
             .about("Show current config")
             .arg(Arg::new("config_type")
@@ -454,7 +454,7 @@ pub async fn cyfs_gateway_main() {
                 .short('s')
                 .help("server url")
                 .required(false)
-                .default_value(CMD_SERVER)))
+                .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("show_connections")
             .about("Show current connections")
             .arg(Arg::new("format")
@@ -468,7 +468,7 @@ pub async fn cyfs_gateway_main() {
                 .short('s')
                 .help("server url")
                 .required(false)
-                .default_value(CMD_SERVER)))
+                .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("add_chain")
             .about("Add a chain")
             .arg(Arg::new("config_type")
@@ -502,7 +502,7 @@ pub async fn cyfs_gateway_main() {
                 .short('s')
                 .help("server url")
                 .required(false)
-                .default_value(CMD_SERVER))
+                .default_value(CONTROL_SERVER))
             .arg(Arg::new("chain_params")
                 .help("Chain params") // 接受一个或多个值
                 .num_args(1..)
@@ -537,7 +537,7 @@ pub async fn cyfs_gateway_main() {
                 .short('s')
                 .help("server url")
                 .required(false)
-                .default_value(CMD_SERVER))
+                .default_value(CONTROL_SERVER))
         )
         .subcommand(Command::new("reload")
             .about("reload config")
@@ -546,7 +546,7 @@ pub async fn cyfs_gateway_main() {
                 .short('s')
                 .help("server url")
                 .required(false)
-                .default_value(CMD_SERVER)))
+                .default_value(CONTROL_SERVER)))
         .get_matches();
 
     match matches.subcommand() {
@@ -578,10 +578,10 @@ pub async fn cyfs_gateway_main() {
             let user = sub_matches.get_one::<String>("user").unwrap();
             let password = sub_matches.get_one::<String>("password").unwrap();
             let server = sub_matches.get_one::<String>("server").unwrap();
-            if server.to_lowercase() == CMD_SERVER {
+            if server.to_lowercase() == CONTROL_SERVER {
                 std::process::exit(0);
             }
-            let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), None);
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), None);
             let login_result = match cyfs_cmd_client.login(user, password).await {
                 Ok(result) => result,
                 Err(e) => {
@@ -596,7 +596,7 @@ pub async fn cyfs_gateway_main() {
             let config_id = sub_matches.get_one::<String>("config_id");
             let format = sub_matches.get_one::<String>("format").unwrap();
             let server = sub_matches.get_one::<String>("server").unwrap();
-            let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), read_login_token(server.as_str()));
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.get_config(
                 config_type.map(|s| s.to_string()),
                 config_id.map(|s| s.to_string())).await {
@@ -623,7 +623,7 @@ pub async fn cyfs_gateway_main() {
         Some(("show_connections", sub_matches)) => {
             let server = sub_matches.get_one::<String>("server").unwrap();
             let format = sub_matches.get_one::<String>("format").unwrap();
-            let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), read_login_token(server.as_str()));
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.get_connections().await {
                 Ok(result) => {
                     if format == "json" {
@@ -651,7 +651,7 @@ pub async fn cyfs_gateway_main() {
             let chain_id = sub_matches.get_one::<String>("chain_id").expect("chain_id is required");
             let hook_point = sub_matches.get_one::<String>("hook_point").expect("hook_point is required");
             let server = sub_matches.get_one::<String>("server").expect("server is required");
-            let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), read_login_token(server.as_str()));
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.del_chain(config_type, config_id, chain_id, hook_point).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -677,7 +677,7 @@ pub async fn cyfs_gateway_main() {
             let hook_point = sub_matches.get_one::<String>("hook_point").expect("hook_point is required");
             let chain_params = sub_matches.get_many::<String>("chain_params").expect("chain_params is required");
             let server = sub_matches.get_one::<String>("server").expect("server is required");
-            let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), read_login_token(server.as_str()));
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.add_chain(config_type, config_id, hook_point, chain_id, chain_type, chain_params.map(|s| s.clone()).collect::<Vec<_>>().join(" ").as_str()).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -697,7 +697,7 @@ pub async fn cyfs_gateway_main() {
         },
         Some(("reload", sub_matches)) => {
             let server = sub_matches.get_one::<String>("server").unwrap();
-            let cyfs_cmd_client = CyfsCmdClient::new(server.as_str(), read_login_token(server.as_str()));
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.reload().await {
                 Ok(result) => {
                     println!("{}", result.to_string());

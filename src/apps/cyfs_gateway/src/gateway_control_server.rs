@@ -8,11 +8,11 @@ use serde_json::Value;
 use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, ProcessChainConfig, Server, ServerConfig, StreamInfo, config_err, ServerError};
 use cyfs_gateway_lib::{ServerFactory, HttpServer};
 use crate::config_loader::{ServerConfigParser};
-use crate::cyfs_cmd_client::cmd_err;
+use crate::gateway_control_client::cmd_err;
 use cyfs_gateway_lib::{server_err, ServerErrorCode, ServerResult};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum CmdErrorCode {
+pub enum ControlErrorCode {
     Failed,
     RpcError,
     InvalidData,
@@ -32,26 +32,26 @@ pub enum CmdErrorCode {
     SerializeFailed,
     InvalidMethod,
 }
-pub type CmdResult<T> = sfo_result::Result<T, CmdErrorCode>;
-pub type CmdError = sfo_result::Error<CmdErrorCode>;
+pub type ControlResult<T> = sfo_result::Result<T, ControlErrorCode>;
+pub type ControlError = sfo_result::Error<ControlErrorCode>;
 
-pub const CYFS_CMD_SERVER_CONFIG: &str = include_str!("cyfs_cmd_server.yaml");
-pub const CYFS_CMD_SERVER_KEY: &str = "__cmd_server__";
+pub const GATEWAY_CONTROL_SERVER_CONFIG: &str = include_str!("gateway_control_server.yaml");
+pub const GATEWAY_CONTROL_SERVER_KEY: &str = "__control_server__";
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct CyfsCmdServerConfig {
+pub struct GatewayControlServerConfig {
     pub id: String,
     #[serde(rename = "type")]
     pub ty: String,
 }
 
-impl ServerConfig for CyfsCmdServerConfig {
+impl ServerConfig for GatewayControlServerConfig {
     fn id(&self) -> String {
         self.id.clone()
     }
 
     fn server_type(&self) -> String {
-        String::from("cmd_server")
+        String::from("control_server")
     }
 
     fn get_config_json(&self) -> String {
@@ -65,7 +65,7 @@ impl ServerConfig for CyfsCmdServerConfig {
     fn remove_pre_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
         unimplemented!();
     }
-    
+
     fn add_post_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
         unimplemented!();
     }
@@ -76,17 +76,17 @@ impl ServerConfig for CyfsCmdServerConfig {
 }
 
 
-pub struct CyfsCmdServerFactory {
-    handler: Weak<dyn CyfsCmdHandler>,
+pub struct GatewayControlServerFactory {
+    handler: Weak<dyn GatewayControlCmdHandler>,
     token_factory: Arc<dyn CyfsTokenFactory>,
     token_verifier: Arc<dyn CyfsTokenVerifier>,
 }
 
-impl CyfsCmdServerFactory {
-    pub fn new(handler: Arc<dyn CyfsCmdHandler>,
+impl GatewayControlServerFactory {
+    pub fn new(handler: Arc<dyn GatewayControlCmdHandler>,
                token_verifier: Arc<dyn CyfsTokenVerifier>,
                token_factory: Arc<dyn CyfsTokenFactory>, ) -> Self {
-        CyfsCmdServerFactory {
+        GatewayControlServerFactory {
             handler: Arc::downgrade(&handler),
             token_factory,
             token_verifier,
@@ -95,69 +95,69 @@ impl CyfsCmdServerFactory {
 }
 
 #[async_trait::async_trait]
-impl ServerFactory for CyfsCmdServerFactory {
+impl ServerFactory for GatewayControlServerFactory {
     async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
-        let config = config.as_any().downcast_ref::<CyfsCmdServerConfig>()
+        let config = config.as_any().downcast_ref::<GatewayControlServerConfig>()
             .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid CyfsCmdServer config {}", config.server_type()))?;
-        Ok(Server::Http(Arc::new(CyfsCmdServer::new(config.clone(),
-                                                     self.handler.clone(),
-                                                     self.token_factory.clone(),
-                                                     self.token_verifier.clone()))))
+        Ok(Server::Http(Arc::new(GatewayControlServer::new(config.clone(),
+                                                           self.handler.clone(),
+                                                           self.token_factory.clone(),
+                                                           self.token_verifier.clone()))))
     }
 }
 
-pub struct CyfsCmdServerConfigParser {
+pub struct GatewayControlServerConfigParser {
 
 }
 
-impl CyfsCmdServerConfigParser {
+impl GatewayControlServerConfigParser {
     pub fn new() -> Self {
-        CyfsCmdServerConfigParser {}
+        GatewayControlServerConfigParser {}
     }
 }
 
-impl Default for CyfsCmdServerConfigParser {
+impl Default for GatewayControlServerConfigParser {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<D: for<'de> Deserializer<'de>> ServerConfigParser<D> for CyfsCmdServerConfigParser {
+impl<D: for<'de> Deserializer<'de>> ServerConfigParser<D> for GatewayControlServerConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = CyfsCmdServerConfig::deserialize(de)
+        let config = GatewayControlServerConfig::deserialize(de)
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid CyfsCmdServer config {:?}", e))?;
         Ok(Arc::new(config))
     }
 }
 
 #[async_trait::async_trait]
-pub trait CyfsCmdHandler: Send + Sync + 'static {
-    async fn handle(&self, method: &str, params: Value) -> CmdResult<Value>;
+pub trait GatewayControlCmdHandler: Send + Sync + 'static {
+    async fn handle(&self, method: &str, params: Value) -> ControlResult<Value>;
 }
 
 #[async_trait::async_trait]
 pub trait CyfsTokenFactory: Send + Sync + 'static {
-    async fn create(&self, use_name: &str, password: &str, timestamp: u64) -> CmdResult<String>;
+    async fn create(&self, use_name: &str, password: &str, timestamp: u64) -> ControlResult<String>;
 }
 
 #[async_trait::async_trait]
 pub trait CyfsTokenVerifier: Send + Sync + 'static {
-    async fn verify_and_renew(&self, token: &str) -> CmdResult<Option<String>>;
+    async fn verify_and_renew(&self, token: &str) -> ControlResult<Option<String>>;
 }
 
-pub struct CyfsCmdServer {
-    config: CyfsCmdServerConfig,
-    handler: Weak<dyn CyfsCmdHandler>,
+pub struct GatewayControlServer {
+    config: GatewayControlServerConfig,
+    handler: Weak<dyn GatewayControlCmdHandler>,
     token_factory: Arc<dyn CyfsTokenFactory>,
     token_verifier: Arc<dyn CyfsTokenVerifier>,
 }
 
-impl CyfsCmdServer {
-    pub fn new(config: CyfsCmdServerConfig,
-               handler: Weak<dyn CyfsCmdHandler>,
+impl GatewayControlServer {
+    pub fn new(config: GatewayControlServerConfig,
+               handler: Weak<dyn GatewayControlCmdHandler>,
                token_factory: Arc<dyn CyfsTokenFactory>,
                token_verifier: Arc<dyn CyfsTokenVerifier>, ) -> Self {
-        CyfsCmdServer {
+        GatewayControlServer {
             config,
             handler,
             token_factory,
@@ -190,7 +190,7 @@ struct CmdResp<R: Serialize> {
 }
 
 #[async_trait::async_trait]
-impl HttpServer for CyfsCmdServer {
+impl HttpServer for GatewayControlServer {
     fn id(&self) -> String {
         self.config.id.clone()
     }
@@ -210,13 +210,13 @@ impl HttpServer for CyfsCmdServer {
                 .body(Full::new(Bytes::new()).map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap());
         }
         let body = request.into_body();
-        let ret: CmdResult<http::Response<BoxBody<Bytes, ServerError>>> = async move {
+        let ret: ControlResult<http::Response<BoxBody<Bytes, ServerError>>> = async move {
             let data = body.collect().await
                 .map(|chunk| chunk.to_bytes())
-                .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{:?}", e))?;
+                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{:?}", e))?;
 
             let req: CmdReq<Value> = serde_json::from_slice(&data)
-                .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))?;
+                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
 
             if req.method == "login" {
                 if req.sys.len() != 1 {
@@ -262,7 +262,7 @@ impl HttpServer for CyfsCmdServer {
                     }
                 };
                 let data = serde_json::to_vec(&resp)
-                    .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))?;
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 return Ok(http::Response::new(Full::new(Bytes::from(data)).map_err(|e| ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))).boxed()));
             }
 
@@ -301,10 +301,10 @@ impl HttpServer for CyfsCmdServer {
                     error: None,
                 };
                 let data = serde_json::to_vec(&resp)
-                    .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))?;
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(http::Response::new(Full::new(Bytes::from(data)).map_err(|e| ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))).boxed()))
             } else {
-                Err(cmd_err!(CmdErrorCode::Failed, "{}", "cmd handler has released"))
+                Err(cmd_err!(ControlErrorCode::Failed, "{}", "cmd handler has released"))
             }
         }.await;
 

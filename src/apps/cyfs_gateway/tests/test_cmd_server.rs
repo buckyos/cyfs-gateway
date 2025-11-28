@@ -33,26 +33,26 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TokenKeyStore for TempKeyStore {
-        async fn load_key(&self) -> CmdResult<(EncodingKey, DecodingKey)> {
+        async fn load_key(&self) -> ControlResult<(EncodingKey, DecodingKey)> {
             let mut private_key = self.private_key.lock().await;
             let mut content: String = String::new();
             private_key.read_to_string(&mut content)
-                .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
             let private_key = EncodingKey::from_ed_pem(content.as_bytes())
-                .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
             let mut public_key = self.public_key.lock().await;
             let mut content: String = String::new();
             public_key.read_to_string(&mut content)
-                .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
 
             let public_key: Jwk = serde_json::from_str(content.as_str())
-                .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
             let decode_key = DecodingKey::from_jwk(&public_key)
-                .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
             Ok((private_key, decode_key))
         }
 
-        async fn save_key(&self, sign_key: String, public_key: Value) -> CmdResult<()> {
+        async fn save_key(&self, sign_key: String, public_key: Value) -> ControlResult<()> {
             let mut private_key = self.private_key.lock().await;
             private_key.write_all(sign_key.as_bytes()).unwrap();
             let mut public_file = self.public_key.lock().await;
@@ -80,14 +80,14 @@ print("hello python")
 
     #[async_trait::async_trait]
     impl ExternalCmdStore for TempExternalCmdStore {
-        async fn read_external_cmd(&self, cmd: &str) -> CmdResult<String> {
+        async fn read_external_cmd(&self, cmd: &str) -> ControlResult<String> {
             Ok(self.test_cmd.path().to_string_lossy().to_string())
         }
     }
     #[tokio::test]
     async fn test_cmd_server() {
         init_logging("cyfs_gateway", false);
-        let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(CYFS_CMD_SERVER_CONFIG).unwrap();
+        let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
 
         // Load config from json
         let parser = GatewayConfigParser::new();
@@ -99,7 +99,7 @@ print("hello python")
 
         parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
 
-        parser.register_server_config_parser("cmd_server", Arc::new(CyfsCmdServerConfigParser::new()));
+        parser.register_server_config_parser("cmd_server", Arc::new(GatewayControlServerConfigParser::new()));
 
         let load_result = parser.parse(cmd_config);
         if load_result.is_err() {
@@ -181,7 +181,7 @@ print("hello python")
             store).await.unwrap();
         let cmd_store = TempExternalCmdStore::new();
         let handler = GatewayCmdHandler::new(Arc::new(cmd_store), PathBuf::from("config.yaml"), parser);
-        factory.register_server_factory("cmd_server", Arc::new(CyfsCmdServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
+        factory.register_server_factory("cmd_server", Arc::new(GatewayControlServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
 
         let gateway = factory.create_gateway(config_loader).await;
         assert!(gateway.is_ok());
@@ -192,7 +192,7 @@ print("hello python")
         gateway.start(params).await;
         handler.set_gateway(Arc::new(gateway));
 
-        let cmd_client = CyfsCmdClient::new("http://127.0.0.1:13451".to_string(), None);
+        let cmd_client = GatewayControlClient::new("http://127.0.0.1:13451".to_string(), None);
         let ret = cmd_client.get_config(None, None).await;
         assert!(ret.is_err());
 

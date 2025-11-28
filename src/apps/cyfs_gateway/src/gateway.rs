@@ -21,10 +21,10 @@ use serde_json::Value;
 use sfo_js::{JsEngine, JsString, JsValue};
 use sfo_js::object::builtins::JsArray;
 use sha2::Digest;
-use crate::cyfs_cmd_client::{cmd_err, into_cmd_err};
-use crate::cyfs_cmd_server::{CmdErrorCode, CmdResult, CyfsCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
+use crate::gateway_control_client::{cmd_err, into_cmd_err};
+use crate::gateway_control_server::{ControlErrorCode, ControlResult, GatewayControlCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
 use crate::config_loader::GatewayConfigParser;
-use crate::cyfs_cmd_server::{CYFS_CMD_SERVER_CONFIG, CYFS_CMD_SERVER_KEY};
+use crate::gateway_control_server::{GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY};
 
 pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Value> {
     let config_dir = config_file.parent().ok_or_else(|| {
@@ -42,7 +42,7 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Val
 
     info!("Gateway main config: {}", serde_json::to_string_pretty(&config_json).unwrap());
 
-    let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(CYFS_CMD_SERVER_CONFIG).unwrap();
+    let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
     cmd_config.merge(&config_json);
 
     Ok(cmd_config)
@@ -232,7 +232,7 @@ impl Gateway {
         let mut config_value = HashMap::new();
         let mut stacks = vec![];
         for stack in config.stacks.iter() {
-            if stack.id().as_str() == CYFS_CMD_SERVER_KEY {
+            if stack.id().as_str() == GATEWAY_CONTROL_SERVER_KEY {
                 continue;
             }
             let stack_value: Value = serde_json::from_str(stack.get_config_json().as_str())?;
@@ -242,7 +242,7 @@ impl Gateway {
 
         let mut servers = vec![];
         for server in config.servers.iter() {
-            if server.id().as_str() == CYFS_CMD_SERVER_KEY {
+            if server.id().as_str() == GATEWAY_CONTROL_SERVER_KEY {
                 continue;
             }
             let server_value: Value = serde_json::from_str(server.get_config_json().as_str())?;
@@ -258,9 +258,9 @@ impl Gateway {
     }
 
     pub fn get_config(&self, config_type: &str, config_id: &str) -> Result<Value> {
-        if config_id == CYFS_CMD_SERVER_KEY {
+        if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow::Error::new(cmd_err!(
-            CmdErrorCode::ConfigNotFound,
+            ControlErrorCode::ConfigNotFound,
             "Config not found: {}", config_id,
         )));
         }
@@ -289,22 +289,22 @@ impl Gateway {
             }
             _ => {
                 Err(cmd_err!(
-                    CmdErrorCode::InvalidConfigType,
+                    ControlErrorCode::InvalidConfigType,
                     "Invalid config type: {}", config_type,
                 ))?;
             }
         }
 
         Err(anyhow::Error::new(cmd_err!(
-            CmdErrorCode::ConfigNotFound,
+            ControlErrorCode::ConfigNotFound,
             "Config not found: {}", config_id,
         )))
     }
 
     pub async fn add_chain(&self, config_type: &str, config_id: &str, hook_point: Option<String>, chain: ProcessChainConfig) -> Result<()> {
-        if config_id == CYFS_CMD_SERVER_KEY {
+        if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow::Error::new(cmd_err!(
-            CmdErrorCode::ConfigNotFound,
+            ControlErrorCode::ConfigNotFound,
             "Config not found: {}", config_id,
         )));
         }
@@ -355,7 +355,7 @@ impl Gateway {
             }
             _ => {
                 Err(cmd_err!(
-                    CmdErrorCode::InvalidConfigType,
+                    ControlErrorCode::InvalidConfigType,
                     "Invalid config type: {}", config_type,
                 ))?;
             }
@@ -411,7 +411,7 @@ impl Gateway {
             }
             _ => {
                 Err(cmd_err!(
-                    CmdErrorCode::InvalidConfigType,
+                    ControlErrorCode::InvalidConfigType,
                     "Invalid config type: {}", config_type,
                 ))?;
             }
@@ -607,7 +607,7 @@ impl GatewayCmdHandler {
         self.gateway.lock().unwrap().clone()
     }
 
-    async fn run_external_cmd(&self, cmd: impl Into<String>, params: impl Into<String>) -> CmdResult<String> {
+    async fn run_external_cmd(&self, cmd: impl Into<String>, params: impl Into<String>) -> ControlResult<String> {
         let cmd = cmd.into();
         let params = params.into();
 
@@ -615,9 +615,9 @@ impl GatewayCmdHandler {
             let mut js_engine = JsEngine::builder()
                 .enable_fetch(false)
                 .build()
-                .map_err(into_cmd_err!(CmdErrorCode::RunJsFailed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::RunJsFailed))?;
             js_engine.eval_file(Path::new(cmd.as_str()))
-                .map_err(into_cmd_err!(CmdErrorCode::RunJsFailed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::RunJsFailed))?;
 
             let args: Vec<JsValue> = if let Some(args) = shlex::split(params.as_str()) {
                 args.into_iter().map(|arg| JsValue::from(JsString::from(arg))).collect()
@@ -627,13 +627,13 @@ impl GatewayCmdHandler {
             let args = JsArray::from_iter(args.into_iter(), js_engine.context());
             let result = js_engine.call("main",
                                         vec![JsValue::from(args)])
-                .map_err(into_cmd_err!(CmdErrorCode::RunJsFailed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::RunJsFailed))?;
             if result.is_string() {
                 Ok(result.as_string().unwrap().as_str().to_std_string_lossy())
             } else {
-                Err(cmd_err!(CmdErrorCode::RunJsFailed, "result {:?}", result))
+                Err(cmd_err!(ControlErrorCode::RunJsFailed, "result {:?}", result))
             }
-        }).await.map_err(into_cmd_err!(CmdErrorCode::Failed))?
+        }).await.map_err(into_cmd_err!(ControlErrorCode::Failed))?
     }
 }
 
@@ -647,37 +647,37 @@ struct ConnInfo {
 }
 
 #[async_trait::async_trait]
-impl CyfsCmdHandler for GatewayCmdHandler {
-    async fn handle(&self, method: &str, params: Value) -> CmdResult<Value> {
+impl GatewayControlCmdHandler for GatewayCmdHandler {
+    async fn handle(&self, method: &str, params: Value) -> ControlResult<Value> {
         let gateway = self.get_gateway();
         if gateway.is_none() {
-            return Err(cmd_err!(CmdErrorCode::NoGateway, "gateway not init"));
+            return Err(cmd_err!(ControlErrorCode::NoGateway, "gateway not init"));
         }
         let gateway = gateway.unwrap();
         match method {
             "get_config" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)
-                    .map_err(into_cmd_err!(CmdErrorCode::InvalidParams))?;
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
                 let config_type = params.get("config_type");
                 let config_id = params.get("config_id");
                 if config_type.is_none() || config_id.is_none() {
                     gateway.get_all_config()
-                        .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))
                 } else {
                     gateway.get_config(config_type.unwrap(), config_id.unwrap())
-                        .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))
                 }
             },
             "del_chain" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)
-                    .map_err(into_cmd_err!(CmdErrorCode::InvalidParams))?;
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
                 let config_type = params.get("config_type");
                 let config_id = params.get("config_id");
                 let hook_point = params.get("hook_point");
                 let chain_id = params.get("chain_id");
                 if config_type.is_none() || config_id.is_none() || chain_id.is_none() {
                     Err(cmd_err!(
-                        CmdErrorCode::InvalidParams,
+                        ControlErrorCode::InvalidParams,
                         "Invalid params: config_type or chain_id or config_id is None",
                     ))?;
                 }
@@ -686,7 +686,7 @@ impl CyfsCmdHandler for GatewayCmdHandler {
                                      config_id.unwrap(),
                                      hook_point.map(|s| s.to_string()),
                                      params.get("chain_id").unwrap()).await
-                    .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))?;
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
             "get_connections" => {
@@ -699,11 +699,11 @@ impl CyfsCmdHandler for GatewayCmdHandler {
                         download_speed: info.get_download_speed(),
                     }
                 }).collect::<Vec<_>>();
-                Ok(serde_json::to_value(conn_infos).map_err(into_cmd_err!(CmdErrorCode::SerializeFailed))?)
+                Ok(serde_json::to_value(conn_infos).map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
             }
             "add_chain" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)
-                    .map_err(into_cmd_err!(CmdErrorCode::InvalidParams))?;
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
                 let config_type = params.get("config_type");
                 let config_id = params.get("config_id");
                 let hook_point = params.get("hook_point");
@@ -712,7 +712,7 @@ impl CyfsCmdHandler for GatewayCmdHandler {
                 let chain_params = params.get("chain_params");
                 if config_type.is_none() || config_id.is_none() || chain_id.is_none() || chain_type.is_none() || chain_params.is_none() {
                     Err(cmd_err!(
-                        CmdErrorCode::InvalidParams,
+                        ControlErrorCode::InvalidParams,
                         "Invalid params: config_type or chain_id or config_id or chain_type or chain_params is None",
                     ))?;
                 }
@@ -732,20 +732,20 @@ impl CyfsCmdHandler for GatewayCmdHandler {
                     hook_point.map(|s| s.to_string()),
                     process_chain_config,
                 ).await
-                    .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))?;
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
             "reload" => {
                 let gateway_config = load_config_from_file(self.config_file.as_path()).await
-                    .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))?;
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 let gateway_config = self.parser.parse(gateway_config)
-                    .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+                    .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
                 gateway.reload(gateway_config).await
-                    .map_err(|e| cmd_err!(CmdErrorCode::Failed, "{}", e))?;
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
             v => {
-                Err(cmd_err!(CmdErrorCode::InvalidMethod, "Invalid method: {}", v))
+                Err(cmd_err!(ControlErrorCode::InvalidMethod, "Invalid method: {}", v))
             }
         }
     }
@@ -753,8 +753,8 @@ impl CyfsCmdHandler for GatewayCmdHandler {
 
 #[async_trait::async_trait]
 pub trait TokenKeyStore: Send + Sync + 'static {
-    async fn load_key(&self) -> CmdResult<(EncodingKey, DecodingKey)>;
-    async fn save_key(&self, sign_key: String, public_key: Value) -> CmdResult<()>;
+    async fn load_key(&self) -> ControlResult<(EncodingKey, DecodingKey)>;
+    async fn save_key(&self, sign_key: String, public_key: Value) -> ControlResult<()>;
 }
 
 pub struct LocalTokenKeyStore {
@@ -769,28 +769,28 @@ impl LocalTokenKeyStore {
 
 #[async_trait::async_trait]
 impl TokenKeyStore for LocalTokenKeyStore {
-    async fn load_key(&self) -> CmdResult<(EncodingKey, DecodingKey)> {
+    async fn load_key(&self) -> ControlResult<(EncodingKey, DecodingKey)> {
         let private_key = self.data_dir.join("private_key.pem");
         let public_key = self.data_dir.join("public_key.json");
         let encode_key = load_private_key(private_key.as_path())
-            .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
 
         let public_key = tokio::fs::read_to_string(public_key).await
-            .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         let public_key: Jwk = serde_json::from_str(public_key.as_str())
-            .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         let decode_key = DecodingKey::from_jwk(&public_key)
-            .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         Ok((encode_key, decode_key))
     }
 
-    async fn save_key(&self, sign_key: String, public_key: Value) -> CmdResult<()> {
+    async fn save_key(&self, sign_key: String, public_key: Value) -> ControlResult<()> {
         let private_key = self.data_dir.join("private_key.pem");
         let public_key_path = self.data_dir.join("public_key.json");
         tokio::fs::write(private_key.as_path(), sign_key).await
-            .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         tokio::fs::write(public_key_path.as_path(), serde_json::to_string(&public_key).unwrap()).await
-            .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         Ok(())
     }
 }
@@ -806,7 +806,7 @@ pub struct LocalTokenManager<S: TokenKeyStore> {
 impl<S: TokenKeyStore> LocalTokenManager<S> {
     pub async fn new(user_name: Option<String>,
                      password: Option<String>,
-                     store: S) -> CmdResult<Arc<Self>> {
+                     store: S) -> ControlResult<Arc<Self>> {
         let (encode_key, decode_key) = match store.load_key().await {
             Ok(ret) => {
                 ret
@@ -829,41 +829,41 @@ impl<S: TokenKeyStore> LocalTokenManager<S> {
         }))
     }
 
-    fn load(private_key: &Path, public_key: &Path) -> CmdResult<(EncodingKey, DecodingKey)> {
+    fn load(private_key: &Path, public_key: &Path) -> ControlResult<(EncodingKey, DecodingKey)> {
         if !private_key.exists() || !public_key.exists() {
-            return Err(cmd_err!(CmdErrorCode::Failed));
+            return Err(cmd_err!(ControlErrorCode::Failed));
         }
 
         let encode_key = load_private_key(private_key)
-            .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
 
         let public_key = std::fs::read_to_string(public_key)
-            .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         let public_key: Jwk = serde_json::from_str(public_key.as_str())
-            .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         let decode_key = DecodingKey::from_jwk(&public_key)
-            .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         Ok((encode_key, decode_key))
     }
 }
 #[async_trait::async_trait]
 impl<S: TokenKeyStore> CyfsTokenFactory for LocalTokenManager<S> {
-    async fn create(&self, user_name: &str, password: &str, timestamp: u64) -> CmdResult<String> {
+    async fn create(&self, user_name: &str, password: &str, timestamp: u64) -> ControlResult<String> {
         if self.user_name.is_none() || self.password.is_none() {
-            return Err(cmd_err!(CmdErrorCode::NotSupportLogin, "not support login"));
+            return Err(cmd_err!(ControlErrorCode::NotSupportLogin, "not support login"));
         }
         if (Utc::now().timestamp() - timestamp as i64).abs() > 120 {
-            return Err(cmd_err!(CmdErrorCode::Expired, "login session expired"));
+            return Err(cmd_err!(ControlErrorCode::Expired, "login session expired"));
         }
 
         if user_name != self.user_name.as_ref().unwrap() {
-            return Err(cmd_err!(CmdErrorCode::InvalidUserName, "invalid user name"));
+            return Err(cmd_err!(ControlErrorCode::InvalidUserName, "invalid user name"));
         }
 
         let mut sha256 = sha2::Sha256::new();
         sha256.update(format!("{}_{}_{}", user_name, self.password.as_ref().unwrap(), timestamp));
         if hex::encode(sha256.finalize()).to_lowercase() != password.to_lowercase() {
-            return Err(cmd_err!(CmdErrorCode::InvalidPassword, "invalid password"));
+            return Err(cmd_err!(ControlErrorCode::InvalidPassword, "invalid password"));
         }
 
         let (token, _) = RPCSessionToken::generate_jwt_token(
@@ -871,29 +871,29 @@ impl<S: TokenKeyStore> CyfsTokenFactory for LocalTokenManager<S> {
             "cyfs-gateway",
             None,
             &self.token_encode_key, )
-            .map_err(into_cmd_err!(CmdErrorCode::CreateTokenFailed, "create token failed"))?;
+            .map_err(into_cmd_err!(ControlErrorCode::CreateTokenFailed, "create token failed"))?;
         Ok(token)
     }
 }
 
 #[async_trait::async_trait]
 impl<S: TokenKeyStore> CyfsTokenVerifier for LocalTokenManager<S> {
-    async fn verify_and_renew(&self, token: &str) -> CmdResult<Option<String>> {
+    async fn verify_and_renew(&self, token: &str) -> ControlResult<Option<String>> {
         let mut session_token = match RPCSessionToken::from_string(token) {
             Ok(session_token) => session_token,
             Err(e) => {
                 error!("invalid token: {}", e);
-                return Err(cmd_err!(CmdErrorCode::InvalidToken));
+                return Err(cmd_err!(ControlErrorCode::InvalidToken));
             }
         };
 
         if let Err(_) = session_token.verify_by_key(&self.token_decode_key) {
-            return Err(cmd_err!(CmdErrorCode::InvalidToken));
+            return Err(cmd_err!(ControlErrorCode::InvalidToken));
         }
 
         if session_token.exp.is_some() {
             if session_token.exp.unwrap() < Utc::now().timestamp() as u64 {
-                return Err(cmd_err!(CmdErrorCode::Expired));
+                return Err(cmd_err!(ControlErrorCode::Expired));
             }
 
             match RPCSessionToken::generate_jwt_token(
@@ -905,7 +905,7 @@ impl<S: TokenKeyStore> CyfsTokenVerifier for LocalTokenManager<S> {
                     Ok(Some(token))
                 },
                 Err(_) => {
-                    Err(cmd_err!(CmdErrorCode::InvalidToken))
+                    Err(cmd_err!(ControlErrorCode::InvalidToken))
                 }
             }
         } else {
@@ -916,7 +916,7 @@ impl<S: TokenKeyStore> CyfsTokenVerifier for LocalTokenManager<S> {
 
 #[async_trait::async_trait]
 pub trait ExternalCmdStore: Send + Sync + 'static {
-    async fn read_external_cmd(&self, cmd: &str) -> CmdResult<String>;
+    async fn read_external_cmd(&self, cmd: &str) -> ControlResult<String>;
 }
 pub type ExternalCmdStoreRef = Arc<dyn ExternalCmdStore>;
 
@@ -934,10 +934,10 @@ impl LocalExternalCmdStore {
 
 #[async_trait::async_trait]
 impl ExternalCmdStore for LocalExternalCmdStore {
-    async fn read_external_cmd(&self, cmd: &str) -> CmdResult<String> {
+    async fn read_external_cmd(&self, cmd: &str) -> ControlResult<String> {
         let path = self.cmd_path.join(format!("{}.js", cmd));
         if !path.exists() {
-            return Err(cmd_err!(CmdErrorCode::UnknownCmd, "unknown cmd {}", cmd));
+            return Err(cmd_err!(ControlErrorCode::UnknownCmd, "unknown cmd {}", cmd));
         }
 
         Ok(path.to_string_lossy().to_string())
@@ -972,26 +972,26 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TokenKeyStore for TempKeyStore {
-        async fn load_key(&self) -> CmdResult<(EncodingKey, DecodingKey)> {
+        async fn load_key(&self) -> ControlResult<(EncodingKey, DecodingKey)> {
             let mut private_key = self.private_key.lock().await;
             let mut content: String = String::new();
             private_key.read_to_string(&mut content)
-                .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
             let private_key = EncodingKey::from_ed_pem(content.as_bytes())
-                .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
             let mut public_key = self.public_key.lock().await;
             let mut content: String = String::new();
             public_key.read_to_string(&mut content)
-                .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
 
             let public_key: Jwk = serde_json::from_str(content.as_str())
-                .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
             let decode_key = DecodingKey::from_jwk(&public_key)
-                .map_err(into_cmd_err!(CmdErrorCode::Failed))?;
+                .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
             Ok((private_key, decode_key))
         }
 
-        async fn save_key(&self, sign_key: String, public_key: Value) -> CmdResult<()> {
+        async fn save_key(&self, sign_key: String, public_key: Value) -> ControlResult<()> {
             let mut private_key = self.private_key.lock().await;
             private_key.write_all(sign_key.as_bytes()).unwrap();
             let mut public_file = self.public_key.lock().await;
@@ -1036,7 +1036,7 @@ mod tests {
         let result = manager.create(&user_name, &password_hash, timestamp).await;
         assert!(result.is_err());
         let error = result.err().unwrap();
-        assert_eq!(error.code(), CmdErrorCode::Expired);
+        assert_eq!(error.code(), ControlErrorCode::Expired);
     }
 
     #[tokio::test]
@@ -1056,7 +1056,7 @@ mod tests {
         let result = manager.create("wrong_user", &password_hash, timestamp).await;
         assert!(result.is_err());
         let error = result.err().unwrap();
-        assert_eq!(error.code(), CmdErrorCode::InvalidUserName);
+        assert_eq!(error.code(), ControlErrorCode::InvalidUserName);
     }
 
     #[tokio::test]
@@ -1076,7 +1076,7 @@ mod tests {
         let result = manager.create(&user_name, &password_hash, timestamp).await;
         assert!(result.is_err());
         let error = result.err().unwrap();
-        assert_eq!(error.code(), CmdErrorCode::InvalidPassword);
+        assert_eq!(error.code(), ControlErrorCode::InvalidPassword);
     }
 
     #[tokio::test]
@@ -1115,6 +1115,6 @@ mod tests {
 
         assert!(result.is_err());
         let error = result.err().unwrap();
-        assert_eq!(error.code(), CmdErrorCode::InvalidToken);
+        assert_eq!(error.code(), ControlErrorCode::InvalidToken);
     }
 }
