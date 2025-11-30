@@ -337,7 +337,7 @@ impl DirServerFactory {
 
 #[async_trait::async_trait]
 impl ServerFactory for DirServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
         let config = config
             .as_any()
             .downcast_ref::<DirServerConfig>()
@@ -356,7 +356,7 @@ impl ServerFactory for DirServerFactory {
         }
 
         let server = builder.build().await?;
-        Ok(Server::Http(Arc::new(server)))
+        Ok(vec![Server::Http(Arc::new(server))])
     }
 }
 

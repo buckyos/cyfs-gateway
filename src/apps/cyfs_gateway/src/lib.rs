@@ -37,7 +37,7 @@ use cyfs_tun::TunStackFactory;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
+pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
     let mut config_json = load_config_from_file(config_file).await?;
     let base_dir = PathBuf::from(config_file.parent().unwrap());
     normalize_all_path_value_config(&mut config_json,&base_dir);
@@ -80,6 +80,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
     parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
     parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
     parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
+    parser.register_server_config_parser("dir", Arc::new(DirServerConfigParser::new()));
 
     parser.register_server_config_parser("control_server", Arc::new(GatewayControlServerConfigParser::new()));
     parser.register_server_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
@@ -209,6 +210,7 @@ async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Resu
         global_process_chains.clone(),
     )));
 
+    factory.register_server_factory("dir", Arc::new(DirServerFactory::new()));
 
     factory.register_server_factory("socks", Arc::new(SocksServerFactory::new(
         global_process_chains.clone(),

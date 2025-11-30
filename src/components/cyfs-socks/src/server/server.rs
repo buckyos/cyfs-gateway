@@ -53,7 +53,7 @@ impl SocksServerFactory {
 
 #[async_trait::async_trait]
 impl ServerFactory for SocksServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
         let config = config
             .as_any()
             .downcast_ref::<SocksServerConfig>()
@@ -96,6 +96,6 @@ impl ServerFactory for SocksServerFactory {
         let server = SocksServer::new(socks_server);
         let server = Server::Stream(Arc::new(server) as Arc<dyn StreamServer>);
 
-        Ok(server)
+        Ok(vec![server])
     }
 }

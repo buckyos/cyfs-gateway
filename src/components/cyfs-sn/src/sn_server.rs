@@ -964,12 +964,12 @@ impl HttpServer for SNServer {
     fn http_version(&self) -> http::Version {
         http::Version::HTTP_11
     }
-    
+
     fn http3_port(&self) -> Option<u16> {
         None
     }
 
-    async fn serve_request(&self, request: http::Request<BoxBody<Bytes, ServerError>>, info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> { 
+    async fn serve_request(&self, request: http::Request<BoxBody<Bytes, ServerError>>, info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         if request.method() != Method::POST {
             return Ok(Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -1108,12 +1108,12 @@ impl SNServerFactory {
 
 #[async_trait::async_trait]
 impl ServerFactory for SNServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
         let config = config.as_any().downcast_ref::<SNServerConfig>()
             .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid SNServer config {}", config.server_type()))?;
 
         let sn = Arc::new(SNServer::new(config.clone()));
-        Ok(Server::NameServer(sn.clone()))
+        Ok(vec![Server::NameServer(sn.clone()), Server::Http(sn.clone()), Server::QA(sn.clone())])
     }
 }
 

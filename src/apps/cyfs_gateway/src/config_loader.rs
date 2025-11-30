@@ -1,5 +1,5 @@
 use log::*;
-use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig, config_err};
+use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig, config_err, DirServerConfig};
 use cyfs_socks::SocksServerConfig;
 use cyfs_sn::*;
 use std::collections::HashMap;
@@ -268,10 +268,24 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for SocksServe
 }
 
 
+pub struct DirServerConfigParser {}
 
+impl DirServerConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
 
-
-
+impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for DirServerConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
+        let config = DirServerConfig::deserialize(de.clone())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid dir server config.{}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()
+            ))?;
+        Ok(Arc::new(config))
+    }
+}
 
 pub struct LocalDnsConfigParser {}
 

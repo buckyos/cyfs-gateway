@@ -431,7 +431,7 @@ impl ProcessChainDnsServerFactory {
 
 #[async_trait::async_trait]
 impl ServerFactory for ProcessChainDnsServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
         let config = config.as_any().downcast_ref::<DnsServerConfig>()
             .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid config"))?;
 
@@ -441,7 +441,7 @@ impl ServerFactory for ProcessChainDnsServerFactory {
             Some(self.global_process_chains.clone()),
             config.hook_point.clone(),
         ).await?;
-        Ok(Server::Datagram(Arc::new(server)))
+        Ok(vec![Server::Datagram(Arc::new(server))])
     }
 }
 
@@ -739,10 +739,12 @@ hook_point:
         let server_factory = ProcessChainDnsServerFactory::new(server_mgr.clone(), global_process_chains.clone());
         let ret = server_factory.create(Arc::new(config)).await;
         assert!(ret.is_ok());
-        let server = ret.unwrap();
+        let servers = ret.unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server(server);
+        for server in servers {
+            server_manager.add_server(server);
+        }
         let stack_config = r#"
 id: test_dns
 bind: 127.0.0.1:9325

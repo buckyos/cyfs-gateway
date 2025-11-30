@@ -91,17 +91,17 @@ impl LocalDnsFactory {
 
 #[async_trait::async_trait]
 impl ServerFactory for LocalDnsFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
         let config = config.as_any().downcast_ref::<LocalDnsConfig>()
             .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid local dns config {}", config.get_config_json()))?;
         
         let path = Path::new(config.path.as_str());
         if path.is_absolute() {
-            Ok(Server::NameServer(Arc::new(LocalDns::create(config.id.clone(), config.path.clone())?)))
+            Ok(vec![Server::NameServer(Arc::new(LocalDns::create(config.id.clone(), config.path.clone())?))])
         } else {
             let path = Path::new(self.config_path.as_str()).join(config.path.as_str()).canonicalize()
                 .map_err(into_server_err!(ServerErrorCode::InvalidConfig, "invalid local dns config {}", config.path))?;
-            Ok(Server::NameServer(Arc::new(LocalDns::create(config.id.clone(), path.to_string_lossy().to_string())?)))
+            Ok(vec![Server::NameServer(Arc::new(LocalDns::create(config.id.clone(), path.to_string_lossy().to_string())?))])
         }
     }
 }

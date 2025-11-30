@@ -26,7 +26,7 @@ pub trait ServerConfig: AsAny + Send + Sync {
 
 #[async_trait::async_trait]
 pub trait ServerFactory: Send + Sync {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server>;
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>>;
 }
 
 pub struct CyfsServerFactory {
@@ -53,7 +53,7 @@ impl CyfsServerFactory {
 
 #[async_trait::async_trait]
 impl ServerFactory for CyfsServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
         let factory = {
             self.server_factory.lock().unwrap().get(config.server_type().as_str()).cloned()
         };
@@ -68,7 +68,7 @@ impl ServerFactory for CyfsServerFactory {
 pub enum Server {
     Stream(Arc<dyn StreamServer>),
     Datagram(Arc<dyn DatagramServer>),
-    
+
     QA(Arc<dyn QAServer>),
     NameServer(Arc<dyn NameServer>),
     Http(Arc<dyn HttpServer>),
@@ -552,11 +552,11 @@ impl ServerManager {
     /// 同一个 id 的 server 可以注册多个不同的 trait 类型
     pub fn add_server(&self, server: Server) -> ServerResult<()> {
         let full_key = server.full_key();
-        
+
         if self.get_server_by_key(&full_key).is_some() {
             return Err(server_err!(
-                ServerErrorCode::AlreadyExists, 
-                "Server {} already exists", 
+                ServerErrorCode::AlreadyExists,
+                "Server {} already exists",
                 full_key
             ));
         }
@@ -577,7 +577,7 @@ impl ServerManager {
         } else {
             Server::build_key(id, trait_type)
         };
-  
+
         let result = self.get_server_by_key(&key);
         if result.is_none() {
             return None;
@@ -648,13 +648,13 @@ impl ServerManager {
             Server::NameServer(server) => Some(server.clone()),
             _ => None,
         }
-    }   
+    }
     /// 兼容旧接口：通过 id 获取第一个匹配的 server
     /// 如果一个 id 注册了多个 trait，返回任意一个
     pub fn get_server(&self, id: &str) -> Option<Server> {
         let servers = self.servers.lock().unwrap();
         let prefix = format!("{}.", id);
-        
+
         // 先尝试精确匹配（向后兼容没有使用 full_key 的旧代码）
         if let Some(server) = servers.get(id) {
             return Some(server.clone());
@@ -670,7 +670,7 @@ impl ServerManager {
     pub fn get_all_servers_by_id(&self, id: &str) -> Vec<Server> {
         let servers = self.servers.lock().unwrap();
         let prefix = format!("{}.", id);
-        
+
         servers.iter()
             .filter(|(key, _)| key.starts_with(&prefix) || key.as_str() == id)
             .map(|(_, server)| server.clone())

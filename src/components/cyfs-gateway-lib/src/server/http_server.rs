@@ -347,7 +347,7 @@ impl ProcessChainHttpServerFactory {
 
 #[async_trait::async_trait]
 impl ServerFactory for ProcessChainHttpServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
         let config = config.as_any().downcast_ref::<ProcessChainHttpServerConfig>()
             .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid config"))?;
 
@@ -363,7 +363,7 @@ impl ServerFactory for ProcessChainHttpServerFactory {
             builder = builder.version(config.version.clone().unwrap());
         }
         let server = builder.build().await?;
-        Ok(Server::Http(Arc::new(server)))
+        Ok(vec![Server::Http(Arc::new(server))])
     }
 }
 

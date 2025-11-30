@@ -103,7 +103,7 @@ async fn load_obj(
 ) -> ServerResult<LoadedObj> {
     let real_mgr = mgr.lock().await;
     let mgr_id = real_mgr.get_mgr_id();
-    
+
     if obj_id.is_chunk() {
         let chunk_id = ChunkId::from_obj_id(&obj_id);
         let (chunk_reader, chunk_size) = real_mgr
@@ -285,7 +285,7 @@ fn parse_range(range_str: &str, max_size: u64) -> ServerResult<(u64, u64)> {
 
     let range_str = &range_str[6..];
     let parts: Vec<&str> = range_str.split('-').collect();
-    
+
     if parts.len() != 2 {
         return Err(server_err!(ServerErrorCode::BadRequest, "Invalid range format"));
     }
@@ -801,7 +801,7 @@ pub struct NdnServerFactory;
 
 #[async_trait::async_trait]
 impl ServerFactory for NdnServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
         let config_json = config.get_config_json();
         let ndn_config: NdnServerConfig = serde_json::from_str(&config_json).map_err(|e| {
             server_err!(ServerErrorCode::InvalidConfig, "Failed to parse NdnServerConfig: {}", e)
@@ -814,13 +814,34 @@ impl ServerFactory for NdnServerFactory {
             .build()
             .await?;
 
-        Ok(Server::Http(Arc::new(server)))
+        Ok(vec![Server::Http(Arc::new(server))])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use http_body_util::Full;
+    use crate::{hyper_serve_http1, StreamInfo};
+    use hyper_util::rt::TokioIo;
+    use tempfile::TempDir;
+    use std::path::Path;
+    use buckyos_kit::init_logging;
+
+    // Helper function to create a temporary directory with a NamedDataMgr
+    fn create_test_named_data_mgr() -> (TempDir, NamedDataMgrRouteConfig) {
+        let temp_dir = TempDir::new().unwrap();
+        let config = NamedDataMgrRouteConfig {
+            named_data_mgr_id: "default".to_string(),
+            read_only: false,
+            guest_access: true,
+            is_object_id_in_path: true,
+            enable_mgr_file_path: true,
+            enable_zone_put_chunk: true,
+        };
+        (temp_dir, config)
+    }
 
     #[test]
     fn test_ndn_server_config_serialization() {
@@ -834,6 +855,341 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: NdnServerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config.id, deserialized.id);
+    }
+
+    #[tokio::test]
+    async fn test_create_server_without_id() {
+        let (_temp_dir, mgr_config) = create_test_named_data_mgr();
+
+        let result = NdnServer::builder()
+            .config(mgr_config)
+            .build()
+            .await;
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.code(), ServerErrorCode::InvalidConfig);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_server_without_config() {
+        let result = NdnServer::builder()
+            .id("test")
+            .build()
+            .await;
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.code(), ServerErrorCode::InvalidConfig);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_server_with_valid_config() {
+        let (_temp_dir, mgr_config) = create_test_named_data_mgr();
+
+        let result = NdnServer::builder()
+            .id("test")
+            .config(mgr_config)
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    // #[tokio::test]
+    // async fn test_put_chunk_success() {
+    //     // 创建临时目录和配置
+    //     let (_temp_dir, mgr_config) = create_test_named_data_mgr();
+    //
+    //     // 创建服务器
+    //     let server = Arc::new(
+    //         NdnServer::builder()
+    //             .id("test")
+    //             .config(mgr_config)
+    //             .build()
+    //             .await
+    //             .unwrap(),
+    //     );
+    //
+    //     let (client, server_stream) = tokio::io::duplex(1024);
+    //
+    //     // 启动服务器
+    //     tokio::spawn(async move {
+    //         hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
+    //             .await
+    //             .unwrap();
+    //     });
+    //
+    //     // 创建一个测试chunk ID
+    //     let chunk_data = b"Hello, World! This is test chunk data for NDN server PUT test.";
+    //     let chunk_hasher = ChunkHasher::new(None).unwrap();
+    //     let chunk_id = chunk_hasher.calc_mix_chunk_id_from_bytes(chunk_data).unwrap();
+    //
+    //     // 构造PUT请求
+    //     let request = http::Request::builder()
+    //         .method("PUT")
+    //         .uri(format!("http://localhost/{}", chunk_id.to_base32()))
+    //         .header("cyfs-chunk-size", chunk_data.len().to_string())
+    //         .body(Full::new(Bytes::from(chunk_data.to_vec())))
+    //         .unwrap();
+    //
+    //     // 发送请求
+    //     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+    //         .handshake(TokioIo::new(client))
+    //         .await
+    //         .unwrap();
+    //
+    //     tokio::spawn(async move {
+    //         conn.await.unwrap();
+    //     });
+    //
+    //     let resp = sender.send_request(request).await.unwrap();
+    //     // PUT操作应该成功
+    //     assert_eq!(resp.status(), StatusCode::OK);
+    // }
+    //
+    // #[tokio::test]
+    // async fn test_put_chunk_readonly() {
+    //     // 创建只读配置
+    //     let (_temp_dir, mut mgr_config) = create_test_named_data_mgr();
+    //     mgr_config.read_only = true;
+    //
+    //     // 创建服务器
+    //     let server = Arc::new(
+    //         NdnServer::builder()
+    //             .id("test")
+    //             .config(mgr_config)
+    //             .build()
+    //             .await
+    //             .unwrap(),
+    //     );
+    //
+    //     let (client, server_stream) = tokio::io::duplex(1024);
+    //
+    //     // 启动服务器
+    //     tokio::spawn(async move {
+    //         hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
+    //             .await
+    //             .unwrap();
+    //     });
+    //
+    //     // 创建一个测试chunk ID
+    //     let chunk_data = b"Hello, World! This is test chunk data for NDN server PUT test.";
+    //     let chunk_hasher = ChunkHasher::new(None).unwrap();
+    //     let chunk_id = chunk_hasher.calc_mix_chunk_id_from_bytes(chunk_data).unwrap();
+    //
+    //     // 构造PUT请求
+    //     let request = http::Request::builder()
+    //         .method("PUT")
+    //         .uri(format!("http://localhost/{}", chunk_id.to_base32()))
+    //         .header("cyfs-chunk-size", chunk_data.len().to_string())
+    //         .body(Full::new(Bytes::from(chunk_data.to_vec())))
+    //         .unwrap();
+    //
+    //     // 发送请求
+    //     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+    //         .handshake(TokioIo::new(client))
+    //         .await
+    //         .unwrap();
+    //
+    //     tokio::spawn(async move {
+    //         conn.await.unwrap();
+    //     });
+    //
+    //     let resp = sender.send_request(request).await.unwrap();
+    //     // PUT操作应该失败，因为是只读模式
+    //     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // }
+    //
+    // #[tokio::test]
+    // async fn test_get_chunk_status_success() {
+    //     // 创建临时目录和配置
+    //     let (_temp_dir, mgr_config) = create_test_named_data_mgr();
+    //
+    //     // 创建服务器
+    //     let server = Arc::new(
+    //         NdnServer::builder()
+    //             .id("test")
+    //             .config(mgr_config)
+    //             .build()
+    //             .await
+    //             .unwrap(),
+    //     );
+    //
+    //     let (client, server_stream) = tokio::io::duplex(1024);
+    //
+    //     // 启动服务器
+    //     tokio::spawn(async move {
+    //         hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
+    //             .await
+    //             .unwrap();
+    //     });
+    //
+    //     // 创建一个测试chunk ID
+    //     let chunk_data = b"Hello, World! This is test chunk data for NDN server status test.";
+    //     let chunk_hasher = ChunkHasher::new(None).unwrap();
+    //     let chunk_id = chunk_hasher.calc_mix_chunk_id_from_bytes(chunk_data).unwrap();
+    //
+    //     // 构造HEAD请求
+    //     let request = http::Request::builder()
+    //         .method("HEAD")
+    //         .uri(format!("http://localhost/{}", chunk_id.to_base32()))
+    //         .body(Full::new(Bytes::new()))
+    //         .unwrap();
+    //
+    //     // 发送请求
+    //     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+    //         .handshake(TokioIo::new(client))
+    //         .await
+    //         .unwrap();
+    //
+    //     tokio::spawn(async move {
+    //         conn.await.unwrap();
+    //     });
+    //
+    //     let resp = sender.send_request(request).await.unwrap();
+    //     // 状态查询应该成功
+    //     assert_eq!(resp.status(), StatusCode::NOT_FOUND); // Chunk不存在，应该返回NOT_FOUND
+    // }
+    //
+    // #[tokio::test]
+    // async fn test_get_chunk_success() {
+    //     // 创建临时目录和配置
+    //     let (_temp_dir, mgr_config) = create_test_named_data_mgr();
+    //
+    //     // 创建服务器
+    //     let server = Arc::new(
+    //         NdnServer::builder()
+    //             .id("test")
+    //             .config(mgr_config)
+    //             .build()
+    //             .await
+    //             .unwrap(),
+    //     );
+    //
+    //     let (client, server_stream) = tokio::io::duplex(1024);
+    //
+    //     // 启动服务器
+    //     tokio::spawn(async move {
+    //         hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
+    //             .await
+    //             .unwrap();
+    //     });
+    //
+    //     // 创建一个测试chunk ID
+    //     let chunk_data = b"Hello, World! This is test chunk data for NDN server GET test.";
+    //     let chunk_hasher = ChunkHasher::new(None).unwrap();
+    //     let chunk_id = chunk_hasher.calc_mix_chunk_id_from_bytes(chunk_data).unwrap();
+    //
+    //     // 先PUT一个chunk
+    //     let put_request = http::Request::builder()
+    //         .method("PUT")
+    //         .uri(format!("http://localhost/{}", chunk_id.to_base32()))
+    //         .header("cyfs-chunk-size", chunk_data.len().to_string())
+    //         .body(Full::new(Bytes::from(chunk_data.to_vec())))
+    //         .unwrap();
+    //
+    //     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+    //         .handshake(TokioIo::new(client))
+    //         .await
+    //         .unwrap();
+    //
+    //     tokio::spawn(async move {
+    //         conn.await.unwrap();
+    //     });
+    //
+    //     let resp = sender.send_request(put_request).await.unwrap();
+    //     assert_eq!(resp.status(), StatusCode::OK);
+    //
+    //     // 再GET这个chunk
+    //     let get_request = http::Request::builder()
+    //         .method("GET")
+    //         .uri(format!("http://localhost/{}", chunk_id.to_base32()))
+    //         .body(Full::new(Bytes::new()))
+    //         .unwrap();
+    //     //
+    //     // let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+    //     //     .handshake(TokioIo::new(client))
+    //     //     .await
+    //     //     .unwrap();
+    //     //
+    //     // tokio::spawn(async move {
+    //     //     conn.await.unwrap();
+    //     // });
+    //
+    //     let resp = sender.send_request(get_request).await.unwrap();
+    //     // GET操作应该成功
+    //     assert_eq!(resp.status(), StatusCode::OK);
+    //
+    //     let body_bytes = resp.collect().await.unwrap().to_bytes();
+    //     assert_eq!(body_bytes.as_ref(), chunk_data);
+    // }
+    //
+    // #[tokio::test]
+    // async fn test_get_chunk_not_found() {
+    //     // 创建临时目录和配置
+    //     let (_temp_dir, mgr_config) = create_test_named_data_mgr();
+    //
+    //     // 创建服务器
+    //     let server = Arc::new(
+    //         NdnServer::builder()
+    //             .id("test")
+    //             .config(mgr_config)
+    //             .build()
+    //             .await
+    //             .unwrap(),
+    //     );
+    //
+    //     let (client, server_stream) = tokio::io::duplex(1024);
+    //
+    //     // 启动服务器
+    //     tokio::spawn(async move {
+    //         hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
+    //             .await
+    //             .unwrap();
+    //     });
+    //
+    //     // 创建一个测试chunk ID (但不上传)
+    //     let chunk_data = b"Hello, World! This is test chunk data for NDN server GET test.";
+    //     let chunk_hasher = ChunkHasher::new(None).unwrap();
+    //     let chunk_id = chunk_hasher.calc_mix_chunk_id_from_bytes(chunk_data).unwrap();
+    //
+    //     // GET不存在的chunk
+    //     let request = http::Request::builder()
+    //         .method("GET")
+    //         .uri(format!("http://localhost/{}", chunk_id.to_base32()))
+    //         .body(Full::new(Bytes::new()))
+    //         .unwrap();
+    //
+    //     // 发送请求
+    //     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+    //         .handshake(TokioIo::new(client))
+    //         .await
+    //         .unwrap();
+    //
+    //     tokio::spawn(async move {
+    //         conn.await.unwrap();
+    //     });
+    //
+    //     let resp = sender.send_request(request).await.unwrap();
+    //     // GET操作应该返回NOT_FOUND
+    //     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // }
+
+    #[tokio::test]
+    async fn test_factory() {
+        let (_temp_dir, mgr_config) = create_test_named_data_mgr();
+
+        let config = NdnServerConfig {
+            id: "test".to_string(),
+            ty: "ndn".to_string(),
+            version: None,
+            named_mgr: mgr_config,
+        };
+
+        let factory = NdnServerFactory {};
+        let result = factory.create(Arc::new(config)).await;
+        assert!(result.is_ok());
     }
 }
 

@@ -96,13 +96,13 @@ impl GatewayControlServerFactory {
 
 #[async_trait::async_trait]
 impl ServerFactory for GatewayControlServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Server> {
+    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
         let config = config.as_any().downcast_ref::<GatewayControlServerConfig>()
             .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid CyfsCmdServer config {}", config.server_type()))?;
-        Ok(Server::Http(Arc::new(GatewayControlServer::new(config.clone(),
+        Ok(vec![Server::Http(Arc::new(GatewayControlServer::new(config.clone(),
                                                            self.handler.clone(),
                                                            self.token_factory.clone(),
-                                                           self.token_verifier.clone()))))
+                                                                self.token_verifier.clone())))])
     }
 }
 

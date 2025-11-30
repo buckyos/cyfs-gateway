@@ -112,8 +112,10 @@ impl GatewayFactory {
         }
 
         for server_config in config.servers.iter() {
-            let server = self.server_factory.create(server_config.clone()).await?;
-            self.servers.add_server(server)?;
+            let servers = self.server_factory.create(server_config.clone()).await?;
+            for server in servers.into_iter() {
+                self.servers.add_server(server)?;
+            }
         }
 
         for process_chain_config in config.global_process_chains.iter() {
@@ -348,7 +350,9 @@ impl Gateway {
                 }
                 if let Some((index, server_config)) = server_info {
                     let new_server = self.server_factory.create(server_config.clone()).await?;
-                    self.server_manager.replace_server(new_server);
+                    for server in new_server.into_iter() {
+                        self.server_manager.replace_server(server);
+                    }
                     let mut config = self.config.lock().unwrap();
                     config.servers[index] = server_config;
                 }
@@ -404,7 +408,9 @@ impl Gateway {
                 }
                 if let Some((index, server_config)) = server_info {
                     let new_server = self.server_factory.create(server_config.clone()).await?;
-                    self.server_manager.replace_server(new_server);
+                    for server in new_server.into_iter() {
+                        self.server_manager.replace_server(server);
+                    }
                     let mut config = self.config.lock().unwrap();
                     config.servers[index] = server_config;
                 }
@@ -442,13 +448,15 @@ impl Gateway {
         let mut new_servers = HashMap::new();
         for server_config in config.servers.iter() {
             let new_server = self.server_factory.create(server_config.clone()).await?;
-            if new_servers.contains_key(new_server.full_key().as_str()) {
-                Err(cmd_err!(
+            for server in new_server.into_iter() {
+                if new_servers.contains_key(server.full_key().as_str()) {
+                    Err(cmd_err!(
                     ConfigErrorCode::AlreadyExists,
-                    "Duplicated server: {}", new_server.full_key(),
+                    "Duplicated server: {}", server.full_key(),
                 ))?;
+                }
+                new_servers.insert(server.full_key(), server);
             }
-            new_servers.insert(new_server.full_key(), new_server);
         }
 
 
