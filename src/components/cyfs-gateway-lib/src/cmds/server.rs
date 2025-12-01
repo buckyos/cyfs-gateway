@@ -8,12 +8,12 @@ pub struct CallServer {
 
 impl CallServer {
     pub fn new() -> Self {
-        let cmd = Command::new("server")
+        let cmd = Command::new("call-server")
             .about("Call server with specified name to handle request")
             .after_help(
                 r#"
 Examples:
-    call server example-server
+    call-server example-server
 "#
             )
             .arg(
@@ -23,7 +23,7 @@ Examples:
                     .required(true)
             );
         Self {
-            name: "server".to_string(),
+            name: "call-server".to_string(),
             cmd,
         }
     }
