@@ -588,7 +588,7 @@ impl StackFactory for TcpStackFactory {
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
     use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, StreamInfo, LimiterManager, StatManager};
-    use buckyos_kit::AsyncStream;
+    use buckyos_kit::{AsyncStream};
     use std::sync::Arc;
     use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -743,7 +743,7 @@ mod tests {
   blocks:
     - id: main
       block: |
-        return "forward tcp:///127.0.0.1:8083";
+        forward tcp:///127.0.0.1:8083;
         "#;
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
@@ -1075,7 +1075,7 @@ mod tests {
     - id: main
       block: |
         set-stat test;
-        set-limit test "10KB/s" "10KB/s";
+        set-limit test 10KB/s 10KB/s;
         return "server www.buckyos.com";
         "#;
 

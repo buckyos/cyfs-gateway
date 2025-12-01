@@ -822,12 +822,7 @@ impl ServerFactory for NdnServerFactory {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use http_body_util::Full;
-    use crate::{hyper_serve_http1, StreamInfo};
-    use hyper_util::rt::TokioIo;
     use tempfile::TempDir;
-    use std::path::Path;
-    use buckyos_kit::init_logging;
 
     // Helper function to create a temporary directory with a NamedDataMgr
     fn create_test_named_data_mgr() -> (TempDir, NamedDataMgrRouteConfig) {
