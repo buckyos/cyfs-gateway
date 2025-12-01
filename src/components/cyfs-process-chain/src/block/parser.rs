@@ -404,6 +404,8 @@ impl BlockParser {
                     tag("_"),
                     tag("-"),
                     tag("."),
+                    tag(":"),
+                    tag("/"),
                 ))),
             )),
             |s: &str| CommandArg::Literal(s.to_string()),
@@ -584,6 +586,11 @@ mod tests {
         let (input, arg) = BlockParser::parse_literal("test123_").unwrap();
         assert_eq!(input, "");
         assert_eq!(arg.as_literal_str().unwrap(), "test123_");
+
+        // Test parse url tcp://127.0.0.1:8083
+        let (input, arg) = BlockParser::parse_literal("tcp://127.0.0.1:8083").unwrap();
+        assert_eq!(input, "");
+        assert_eq!(arg.as_literal_str().unwrap(), "tcp://127.0.0.1:8083");
     }
 
     #[test]
