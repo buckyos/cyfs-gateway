@@ -197,10 +197,12 @@ impl ProcessChainDnsServer {
         hook_point: ProcessChainConfigs,
     ) -> ServerResult<Self> {
         let resolve_cmd = Resolve::new(server_mgr.clone());
+        let mut commands = get_dns_server_external_commands();
+        commands.push((resolve_cmd.name().to_string(), Arc::new(Box::new(resolve_cmd))));
         let (executor, _) = create_process_chain_executor(
             &hook_point,
             global_process_chains.clone(),
-            Some(vec![(resolve_cmd.name().to_string(), Arc::new(Box::new(resolve_cmd)))])).await
+            Some(commands)).await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
 
         Ok(Self {

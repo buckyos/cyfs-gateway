@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU32;
 use buckyos_kit::AsyncStream;
 use tokio::sync::RwLock;
-use cyfs_process_chain::{CollectionValue, CommandResult, EnvRef, ExternalCommand, ExternalCommandRef, HookPoint, HookPointEnv, HttpProbeCommand, HttpsSniProbeCommand, MapCollection, MapCollectionRef, MapCollectionTraverseCallBackRef, ProcessChainLibExecutor, ProcessChainLibRef, ProcessChainListLib, ProcessChainRef, StreamRequest, TraverseGuard, STREAM_REQUEST_LEN};
-use crate::{config_err, ConfigErrorCode, ConfigResult, SetLimit, ProcessChainConfig, SetStat, Forward};
+use cyfs_process_chain::*;
+use crate::{config_err, ConfigErrorCode, ConfigResult, ProcessChainConfig};
 
 pub struct GlobalProcessChains {
     process_chains: Mutex<Vec<ProcessChainLibRef>>,
@@ -524,48 +524,6 @@ impl MapCollection for StreamRequestMap {
 
         Ok(result)
     }
-}
-
-pub fn get_stream_external_commands() -> Vec<(String, ExternalCommandRef)> {
-    let mut cmds = vec![];
-    let https_sni_probe_command = HttpsSniProbeCommand::new();
-    let name = https_sni_probe_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(https_sni_probe_command) as Box<dyn ExternalCommand>)));
-
-    let http_probe_command = HttpProbeCommand::new();
-    let name = http_probe_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(http_probe_command) as Box<dyn ExternalCommand>)));
-
-    let set_limit_command = SetLimit::new();
-    let name = set_limit_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(set_limit_command) as Box<dyn ExternalCommand>)));
-
-    let set_stat_command = SetStat::new();
-    let name = set_stat_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(set_stat_command) as Box<dyn ExternalCommand>)));
-
-    let forward_command = Forward::new();
-    let name = forward_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(forward_command) as Box<dyn ExternalCommand>)));
-
-    cmds
-}
-
-pub fn get_datagram_external_commands() -> Vec<(String, ExternalCommandRef)> {
-    let mut cmds = vec![];
-    let set_limit_command = SetLimit::new();
-    let name = set_limit_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(set_limit_command) as Box<dyn ExternalCommand>)));
-
-    let set_stat_command = SetStat::new();
-    let name = set_stat_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(set_stat_command) as Box<dyn ExternalCommand>)));
-
-    let forward_command = Forward::new();
-    let name = forward_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(forward_command) as Box<dyn ExternalCommand>)));
-
-    cmds
 }
 
 pub async fn create_process_chain_executor(
