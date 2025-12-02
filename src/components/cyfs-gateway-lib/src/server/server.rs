@@ -4,8 +4,8 @@ use std::sync::atomic::AtomicU32;
 use ::kRPC::{RPCHandler, RPCRequest, RPCResponse};
 use as_any::AsAny;
 use buckyos_kit::AsyncStream;
-use http::{HeaderName, Request, Uri};
-use http_body_util::BodyExt;
+use http::{HeaderName, Request, Response, StatusCode, Uri};
+use http_body_util::{BodyExt, Full};
 use http_body_util::combinators::{BoxBody};
 use hyper::body::{Bytes};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -719,7 +719,17 @@ pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn Http
                     let (parts, body) = req.into_parts();
                     let req = Request::new(BoxBody::new(body)).map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                     let req = Request::from_parts(parts, req);
-                    server.serve_request(req, info).await
+                    match server.serve_request(req, info).await {
+                        Ok(resp) => Ok(resp),
+                        Err(e) => {
+                            log::error!("http error {}", e);
+                            Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Full::new(Bytes::from(e.msg().to_string()))
+                                    .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{:?}", e)).boxed())
+                                .map_err(|e| server_err!(ServerErrorCode::StreamError, "{:?}", e))
+                        }
+                    }
                 }
             })).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
     } else if server.http_version() == http::Version::HTTP_3 && server.http3_port().is_some() {
@@ -741,7 +751,14 @@ pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn Http
                             );
                             Ok(res)
                         },
-                        Err(e) => Err(e),
+                        Err(e) => {
+                            log::error!("http error {}", e);
+                            Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Full::new(Bytes::from(e.msg().to_string()))
+                                    .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{:?}", e)).boxed())
+                                .map_err(|e| server_err!(ServerErrorCode::StreamError, "{:?}", e))
+                        }
                     }
                 }
             })).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
@@ -755,7 +772,17 @@ pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn Http
                     let req = Request::new(BoxBody::new(body))
                         .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                     let req = Request::from_parts(parts, req);
-                    server.serve_request(req, info).await
+                    match server.serve_request(req, info).await {
+                        Ok(resp) => Ok(resp),
+                        Err(e) => {
+                            log::error!("http error {}", e);
+                            Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Full::new(Bytes::from(e.msg().to_string()))
+                                    .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{:?}", e)).boxed())
+                                .map_err(|e| server_err!(ServerErrorCode::StreamError, "{:?}", e))
+                        }
+                    }
                 }
             })).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
     }
@@ -773,7 +800,17 @@ pub async fn hyper_serve_http1(stream: Box<dyn AsyncStream>, server: Arc<dyn Htt
                 let req = Request::new(BoxBody::new(body))
                     .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                 let req = Request::from_parts(parts, req);
-                server.serve_request(req, info).await
+                match server.serve_request(req, info).await {
+                    Ok(resp) => Ok(resp),
+                    Err(e) => {
+                        log::error!("http error {}", e);
+                        Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Full::new(Bytes::from(e.msg().to_string()))
+                                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{:?}", e)).boxed())
+                            .map_err(|e| server_err!(ServerErrorCode::StreamError, "{:?}", e))
+                    }
+                }
             }
         })).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
     Ok(())

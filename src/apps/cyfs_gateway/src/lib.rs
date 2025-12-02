@@ -208,6 +208,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
+        tunnel_manager.clone(),
     )));
 
     factory.register_server_factory("dir", Arc::new(DirServerFactory::new()));

@@ -63,6 +63,11 @@ pub fn get_datagram_external_commands() -> Vec<(String, ExternalCommandRef)> {
 
 pub fn get_server_external_commands() -> Vec<(String, ExternalCommandRef)> {
     let mut cmds = vec![];
+
+    let forward_command = Forward::new();
+    let name = forward_command.name().to_owned();
+    cmds.push((name, Arc::new(Box::new(forward_command) as Box<dyn ExternalCommand>)));
+
     let server_command = CallServer::new();
     let name = server_command.name().to_owned();
     cmds.push((name, Arc::new(Box::new(server_command) as Box<dyn ExternalCommand>)));

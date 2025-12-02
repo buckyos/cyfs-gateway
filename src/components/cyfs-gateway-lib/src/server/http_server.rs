@@ -8,7 +8,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CollectionValue, CommandControl, MapCollection, ProcessChainLibExecutor};
-use crate::{get_server_external_commands, HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerManagerRef, ServerResult, StreamInfo};
+use crate::{get_server_external_commands, HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerManagerRef, ServerResult, StreamInfo, TunnelManager};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err,into_server_err};
 use crate::tunnel_connector::TunnelConnector;
@@ -21,6 +21,7 @@ pub struct ProcessChainHttpServerBuilder {
     hook_point: Option<ProcessChainConfigs>,
     global_process_chains: Option<GlobalProcessChainsRef>,
     server_mgr: Option<ServerManagerRef>,
+    tunnel_manager: Option<TunnelManager>,
 }
 
 // Add setter methods for HttpServerBuilder
@@ -55,6 +56,11 @@ impl ProcessChainHttpServerBuilder {
         self
     }
 
+    pub fn tunnel_manager(mut self, tunnel_manager: TunnelManager) -> Self {
+        self.tunnel_manager = Some(tunnel_manager);
+        self
+    }
+
     pub async fn build(self) -> ServerResult<ProcessChainHttpServer> {
         ProcessChainHttpServer::create_server(self).await
     }
@@ -66,6 +72,7 @@ pub struct ProcessChainHttpServer {
     h3_port: Option<u16>,
     server_mgr: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
+    tunnel_manager: TunnelManager,
 }
 
 impl ProcessChainHttpServer {
@@ -77,6 +84,7 @@ impl ProcessChainHttpServer {
             hook_point: None,
             global_process_chains: None,
             server_mgr: None,
+            tunnel_manager: None,
         }
     }
 
@@ -91,6 +99,10 @@ impl ProcessChainHttpServer {
 
         if builder.server_mgr.is_none() {
             return Err(server_err!(ServerErrorCode::InvalidConfig, "server_mgr is none"));
+        }
+
+        if builder.tunnel_manager.is_none() {
+            return Err(server_err!(ServerErrorCode::InvalidConfig, "tunnel_manager is none"));
         }
 
         let version: http::Version = match builder.version {
@@ -117,6 +129,7 @@ impl ProcessChainHttpServer {
             h3_port: builder.h3_port,
             server_mgr: builder.server_mgr.unwrap(),
             executor: Arc::new(Mutex::new(executor)),
+            tunnel_manager: builder.tunnel_manager.unwrap(),
         })
     }
 
@@ -132,7 +145,7 @@ impl ProcessChainHttpServer {
         let upstream_url = upstream_url.unwrap();
         let scheme = upstream_url.scheme();
         match scheme {
-            "tcp"|"http"|"https" => {
+            "http" | "https" => {
                 let client: Client<_, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>> = Client::builder(TokioExecutor::new()).build_http();
                 let header = req.headers().clone();
                 let method = req.method().clone();
@@ -147,7 +160,7 @@ impl ProcessChainHttpServer {
                 })?;
 
                 *upstream_req.headers_mut() = header;
-            
+
                 let resp = client.request(upstream_req).await.map_err(|e| {
                     server_err!(ServerErrorCode::InvalidConfig, "Failed to request upstream: {}", e)
                 })?;
@@ -157,6 +170,7 @@ impl ProcessChainHttpServer {
             _ => {
                 let tunnel_connector = TunnelConnector {
                     target_stream_url: target_url.to_string(),
+                    tunnel_manager: self.tunnel_manager.clone(),
                 };
 
 
@@ -239,7 +253,7 @@ impl HttpServer for ProcessChainHttpServer {
                             let server_id = list[1].as_str();
                             let post_req= req_map.into_request()
                                 .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
- 
+
                             if let Some(service) = self.server_mgr.get_http_server(server_id) {
                                 let resp = service.serve_request(post_req, info).await;
                                 return resp;
@@ -334,13 +348,17 @@ impl ServerConfig for ProcessChainHttpServerConfig {
 pub struct ProcessChainHttpServerFactory {
     server_mgr: ServerManagerRef,
     global_process_chains: GlobalProcessChainsRef,
+    tunnel_mgr: TunnelManager,
 }
 
 impl ProcessChainHttpServerFactory {
-    pub fn new(server_mgr: ServerManagerRef, global_process_chains: GlobalProcessChainsRef) -> Self {
+    pub fn new(server_mgr: ServerManagerRef,
+               global_process_chains: GlobalProcessChainsRef,
+               tunnel_mgr: TunnelManager) -> Self {
         Self {
             server_mgr,
             global_process_chains,
+            tunnel_mgr,
         }
     }
 }
@@ -355,6 +373,7 @@ impl ServerFactory for ProcessChainHttpServerFactory {
             .hook_point(config.hook_point.clone())
             .id(config.id.clone())
             .server_mgr(self.server_mgr.clone())
+            .tunnel_manager(self.tunnel_mgr.clone())
             .global_process_chains(self.global_process_chains.clone());
         if config.h3_port.is_some() {
             builder = builder.h3_port(config.h3_port.clone().unwrap());
@@ -371,6 +390,7 @@ impl ServerFactory for ProcessChainHttpServerFactory {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use buckyos_kit::init_logging;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use crate::{GlobalProcessChains, ServerManager, StreamInfo, hyper_serve_http, hyper_serve_http1};
 
@@ -428,6 +448,7 @@ mod tests {
             .id("1")
             .version("HTTP/1.1".to_string())
             .hook_point(vec![])
+            .tunnel_manager(TunnelManager::new())
             .server_mgr(mock_server_mgr).build().await;
 
         assert!(result.is_ok());
@@ -441,6 +462,7 @@ mod tests {
             .id("1")
             .version("HTTP/2".to_string())
             .hook_point(vec![])
+            .tunnel_manager(TunnelManager::new())
             .server_mgr(mock_server_mgr).build().await;
         assert!(result.is_ok());
     }
@@ -464,6 +486,7 @@ mod tests {
             .id("1")
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
             .server_mgr(mock_server_mgr).build().await;
 
         assert!(result.is_ok());
@@ -508,6 +531,7 @@ mod tests {
             .id("1")
             .version("HTTP/2".to_string())
             .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
             .server_mgr(mock_server_mgr).build().await;
 
         assert!(result.is_ok());
@@ -552,6 +576,7 @@ mod tests {
             .id("1")
             .version("HTTP/2".to_string())
             .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
             .server_mgr(mock_server_mgr).build().await;
 
         assert!(result.is_ok());
@@ -597,6 +622,7 @@ mod tests {
             .id("1")
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
             .server_mgr(mock_server_mgr).build().await;
 
         assert!(result.is_ok());
@@ -626,6 +652,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_chain_http_server_forward() {
+        // 创建一个监听8090端口的HTTP服务器来处理请求
+        tokio::spawn(async move {
+            use http_body_util::BodyExt;
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:18090").await.unwrap();
+
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = hyper::service::service_fn(|req: http::Request<hyper::body::Incoming>| async move {
+                    println!("{:?}", req.headers());
+                    let _ = req.collect().await; // 消费请求体
+                    Ok::<_, ServerError>(http::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from("forward success")).map_err(|e| match e {}).boxed())
+                        .unwrap())
+                });
+
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        // 等待服务器启动
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        forward http://127.0.0.1:18090;
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let result = ProcessChainHttpServer::builder()
+            .id("test_forward")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .server_mgr(mock_server_mgr)
+            .tunnel_manager(TunnelManager::new())
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+        let http_server = Arc::new(result.unwrap());
+
+        let (client, server) = tokio::io::duplex(128);
+
+        tokio::spawn(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/test")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from("forward success"));
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_http_server_forward_tcp() {
+        tokio::spawn(async move {
+            use http_body_util::BodyExt;
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:18091").await.unwrap();
+
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = hyper::service::service_fn(|req: http::Request<hyper::body::Incoming>| async move {
+                    println!("{:?}", req.headers());
+                    let _ = req.collect().await; // 消费请求体
+                    Ok::<_, ServerError>(http::Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Full::new(Bytes::from("forward success")).map_err(|e| match e {}).boxed())
+                        .unwrap())
+                });
+
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        // 等待服务器启动
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        forward tcp:///127.0.0.1:18091;
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let result = ProcessChainHttpServer::builder()
+            .id("test_forward")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .server_mgr(mock_server_mgr)
+            .tunnel_manager(TunnelManager::new())
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+        let http_server = Arc::new(result.unwrap());
+
+        let (client, server) = tokio::io::duplex(128);
+
+        tokio::spawn(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/test")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from("forward success"));
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_http_server_forward_err() {
+        init_logging("test", false);
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "forward http://127.0.0.1:19999";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let result = ProcessChainHttpServer::builder()
+            .id("test_forward_err")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .server_mgr(mock_server_mgr)
+            .tunnel_manager(TunnelManager::new())
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+        let http_server = Arc::new(result.unwrap());
+
+        let (client, server) = tokio::io::duplex(128);
+
+        tokio::spawn(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/test")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        // 当forward失败时，应该返回500错误
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
     async fn test_factory() {
         let config = ProcessChainHttpServerConfig {
             id: "test".to_string(),
@@ -637,6 +881,7 @@ mod tests {
         let factory = ProcessChainHttpServerFactory::new(
             Arc::new(ServerManager::new()),
             Arc::new(GlobalProcessChains::new()),
+            TunnelManager::new(),
         );
         let result = factory.create(Arc::new(config)).await;
         assert!(result.is_ok());

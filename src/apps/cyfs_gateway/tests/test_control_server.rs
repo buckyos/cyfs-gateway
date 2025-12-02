@@ -172,6 +172,7 @@ print("hello python")
         factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
             server_manager.clone(),
             global_process_chains.clone(),
+            tunnel_manager.clone(),
         )));
 
         let store = TempKeyStore::new();

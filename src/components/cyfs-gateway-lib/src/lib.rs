@@ -76,8 +76,5 @@ pub struct GatewayDevice {
 
 pub type GatewayDeviceRef = Arc<GatewayDevice>;
 
-// FIXME: Because of the limitation of some usage such as tunnel_connector, we need to use static variable to store the gateway device
-pub static CURRENT_GATEWAY_DEVICE: OnceCell<GatewayDeviceRef> = OnceCell::new();
-pub static GATEWAY_TUNNEL_MANAGER: OnceCell<TunnelManager> = OnceCell::new();
 
 

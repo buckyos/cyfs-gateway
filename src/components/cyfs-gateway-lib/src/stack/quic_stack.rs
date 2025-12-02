@@ -1698,6 +1698,7 @@ mod tests {
             .hook_point(chains)
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .server_mgr(Arc::new(ServerManager::new()))
+            .tunnel_manager(TunnelManager::new())
             .build().await.unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
