@@ -105,6 +105,11 @@ impl GatewayFactory {
         &self,
         config: GatewayConfig,
     ) -> Result<Gateway> {
+        for process_chain_config in config.global_process_chains.iter() {
+            let process_chain = process_chain_config.create_process_chain()?;
+            self.global_process_chains.add_process_chain(Arc::new(process_chain))?;
+        }
+
         let stack_manager = StackManager::new();
         for stack_config in config.stacks.iter() {
             let stack = self.stack_factory.create(stack_config.clone()).await?;
@@ -117,12 +122,7 @@ impl GatewayFactory {
                 self.servers.add_server(server)?;
             }
         }
-
-        for process_chain_config in config.global_process_chains.iter() {
-            let process_chain = process_chain_config.create_process_chain()?;
-            self.global_process_chains.add_process_chain(Arc::new(process_chain))?;
-        }
-
+        
         Ok(Gateway {
             config: Mutex::new(config),
             stack_manager,

@@ -6,6 +6,7 @@ use ::kRPC::{RPCHandler, RPCRequest, RPCResponse};
 use as_any::AsAny;
 use buckyos_kit::AsyncStream;
 use http::{HeaderName, Method, Request, Response, StatusCode, Uri, Version};
+use http::uri::{Parts, PathAndQuery};
 use http_body_util::{BodyExt, Full};
 use http_body_util::combinators::{BoxBody};
 use hyper::body::{Bytes};
@@ -281,7 +282,36 @@ impl MapCollection for HttpRequestHeaderMap {
             })?;
             Ok(Some(old_value))
         } else if key == "path" {
-            Err("Cannot insert header 'path'".to_string())
+            let old_value = CollectionValue::String(request.uri().path().to_string());
+            let mut parts = Parts::from(request.uri().clone());
+            parts.path_and_query = if parts.path_and_query.is_none() {
+                Some(PathAndQuery::from_str(value.try_as_str()?).map_err(|e| {
+                    let msg = format!("Invalid path '{}': {}", value, e);
+                    warn!("{}", msg);
+                    msg.to_string()
+                })?)
+            } else {
+                let query = parts.path_and_query.as_ref().unwrap().query();
+                if let Some(query) = query {
+                    Some(PathAndQuery::from_str(format!("{}?{}", value.try_as_str()?, query).as_str()).map_err(|e| {
+                        let msg = format!("Invalid path '{}': {}", value, e);
+                        warn!("{}", msg);
+                        msg.to_string()
+                    })?)
+                } else {
+                    Some(PathAndQuery::from_str(value.try_as_str()?).map_err(|e| {
+                        let msg = format!("Invalid path '{}': {}", value, e);
+                        warn!("{}", msg);
+                        msg.to_string()
+                    })?)
+                }
+            };
+            *request.uri_mut() = Uri::from_parts(parts).map_err(|e| {
+                let msg = format!("Invalid path '{}': {}", value, e);
+                warn!("{}", msg);
+                msg.to_string()
+            })?;
+            Ok(Some(old_value))
         } else {
             let header = value.try_as_str()?.parse().map_err(|e| {
                 let msg = format!("Invalid header value '{}': {}", value, e);

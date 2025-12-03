@@ -48,3 +48,7 @@ sfo-js = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+hyper = { version = "1.8", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+hickory-resolver = { version = "0.24", features = ["tokio"] }
