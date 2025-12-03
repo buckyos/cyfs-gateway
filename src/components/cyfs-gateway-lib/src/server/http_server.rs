@@ -7,7 +7,7 @@ use hyper::{http, StatusCode, Request};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
-use cyfs_process_chain::{CollectionValue, CommandControl, MapCollection, ProcessChainLibExecutor};
+use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
 use crate::{get_server_external_commands, HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerManagerRef, ServerResult, StreamInfo, TunnelManager};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err,into_server_err};
@@ -216,9 +216,6 @@ impl HttpServer for ProcessChainHttpServer {
         let req_map = HttpRequestHeaderMap::new(req);
         let chain_env = executor.chain_env();
         req_map.register_visitors(&chain_env).await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
-
-        let req_collection = Arc::new(Box::new(req_map.clone()) as Box<dyn MapCollection>);
-        chain_env.create("REQ", CollectionValue::Map(req_collection)).await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
         let ret = executor.execute_lib().await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
         if ret.is_control() {

@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU32;
 use ::kRPC::{RPCHandler, RPCRequest, RPCResponse};
 use as_any::AsAny;
 use buckyos_kit::AsyncStream;
-use http::{HeaderName, Request, Response, StatusCode, Uri};
+use http::{HeaderName, Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::{BodyExt, Full};
 use http_body_util::combinators::{BoxBody};
 use hyper::body::{Bytes};
@@ -130,6 +131,17 @@ pub trait StreamServer: Send + Sync {
     fn id(&self) -> String;
 }
 
+pub fn str_to_http_version(version: &str) -> Option<http::Version> {
+    match version.to_lowercase().as_str() {
+        "http/0.9" => Some(http::Version::HTTP_09),
+        "http/1.0" => Some(http::Version::HTTP_10),
+        "http/1.1" => Some(http::Version::HTTP_11),
+        "http/2" => Some(http::Version::HTTP_2),
+        "http/3" => Some(http::Version::HTTP_3),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct HttpRequestHeaderMap {
     request: Arc<RwLock<http::Request<BoxBody<Bytes, ServerError>>>>,
@@ -163,9 +175,8 @@ impl HttpRequestHeaderMap {
     }
 
     pub async fn register_visitors(&self, env: &EnvRef) -> Result<(), String> {
-        // First register visitors for var in header
         let coll = Arc::new(Box::new(self.clone()) as Box<dyn MapCollection>);
-        let mut wrapper = VariableVisitorWrapperForMapCollection::new(coll);
+        let mut wrapper = VariableVisitorWrapperForMapCollection::new(coll.clone());
 
         for item in HTTP_REQUEST_HEADER_VARS {
             wrapper.add_variable(item.0, item.1, item.2);
@@ -173,7 +184,7 @@ impl HttpRequestHeaderMap {
 
         let visitor = Arc::new(Box::new(wrapper) as Box<dyn VariableVisitor>);
         for (id, _, _) in HTTP_REQUEST_HEADER_VARS {
-            env.create(*id, CollectionValue::Visitor(Arc::clone(&visitor)))
+            env.create(*id, CollectionValue::Visitor(visitor.clone()))
                 .await?;
         }
 
@@ -181,6 +192,9 @@ impl HttpRequestHeaderMap {
         let url_visitor = HttpRequestUrlVisitor::new(self.request.clone(), false);
         let visitor = Arc::new(Box::new(url_visitor) as Box<dyn VariableVisitor>);
         env.create("REQ_url", CollectionValue::Visitor(visitor))
+            .await?;
+
+        env.create("REQ", CollectionValue::Map(coll))
             .await?;
 
         Ok(())
@@ -197,6 +211,12 @@ impl MapCollection for HttpRequestHeaderMap {
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
         if self.is_during_traversal() {
             let msg = format!("Cannot insert new header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        if key == "path" || key == "method" || key == "uri" || key == "version" {
+            let msg = format!("Cannot insert new value '{}'", key);
             warn!("{}", msg);
             return Err(msg);
         }
@@ -236,52 +256,94 @@ impl MapCollection for HttpRequestHeaderMap {
         }
 
         let mut request = self.request.write().await;
-        let header = value.try_as_str()?.parse().map_err(|e| {
-            let msg = format!("Invalid header value '{}': {}", value, e);
-            warn!("{}", msg);
-            msg
-        })?;
-
-        let name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
-            let msg = format!("Invalid header name '{}': {}", key, e);
-            warn!("{}", msg);
-            msg.to_string()
-        })?;
-
-        let prev = request.headers_mut().insert(name, header);
-        if let Some(prev_value) = prev {
-            let prev = match prev_value.to_str() {
-                Ok(s) => s.to_string(),
-                Err(_) => {
-                    let msg = format!("Header value for '{}' is not valid UTF-8", key);
-                    warn!("{}", msg);
-                    "".to_string()
-                }
-            };
-            Ok(Some(CollectionValue::String(prev)))
+        if key == "uri" {
+            let old_value = CollectionValue::String(request.uri().to_string());
+            *request.uri_mut() = Uri::try_from(value.try_as_str()?).map_err(|e| {
+                let msg = format!("Invalid URI '{}': {}", value, e);
+                warn!("{}", msg);
+                msg.to_string()
+            })?;
+            Ok(Some(old_value))
+        } else if key == "method" {
+            let old_value = CollectionValue::String(request.method().to_string());
+            *request.method_mut() = Method::from_str(value.try_as_str()?).map_err(|e| {
+                let msg = format!("Invalid method '{}': {}", value, e);
+                warn!("{}", msg);
+                msg.to_string()
+            })?;
+            Ok(Some(old_value))
+        } else if key == "version" {
+            let old_value = CollectionValue::String(format!("{:?}", request.version()));
+            *request.version_mut() = str_to_http_version(value.try_as_str()?).ok_or({
+                let msg = format!("Invalid HTTP version '{}'", value);
+                warn!("{}", msg);
+                msg.to_string()
+            })?;
+            Ok(Some(old_value))
+        } else if key == "path" {
+            Err("Cannot insert header 'path'".to_string())
         } else {
-            Ok(None)
+            let header = value.try_as_str()?.parse().map_err(|e| {
+                let msg = format!("Invalid header value '{}': {}", value, e);
+                warn!("{}", msg);
+                msg
+            })?;
+
+            let name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
+                let msg = format!("Invalid header name '{}': {}", key, e);
+                warn!("{}", msg);
+                msg.to_string()
+            })?;
+
+            let prev = request.headers_mut().insert(name, header);
+            if let Some(prev_value) = prev {
+                let prev = match prev_value.to_str() {
+                    Ok(s) => s.to_string(),
+                    Err(_) => {
+                        let msg = format!("Header value for '{}' is not valid UTF-8", key);
+                        warn!("{}", msg);
+                        "".to_string()
+                    }
+                };
+                Ok(Some(CollectionValue::String(prev)))
+            } else {
+                Ok(None)
+            }
         }
+
     }
 
     async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         let request = self.request.read().await;
-        let ret = request.headers().get(key);
-        if let Some(value) = ret {
-            if let Ok(value_str) = value.to_str() {
-                Ok(Some(CollectionValue::String(value_str.to_string())))
-            } else {
-                warn!("Header value for '{}' is not valid UTF-8", key);
-                Ok(Some(CollectionValue::String("".to_string())))
-            }
+        if key == "path" {
+            Ok(Some(CollectionValue::String(request.uri().path().to_string())))
+        } else if key == "method" {
+            Ok(Some(CollectionValue::String(request.method().to_string())))
+        } else if key == "uri" {
+            Ok(Some(CollectionValue::String(request.uri().to_string())))
+        } else if key == "version" {
+            Ok(Some(CollectionValue::String(format!("{:?}", request.version()))))
         } else {
-            warn!("Header '{}' not found", key);
-            Ok(None)
+            let ret = request.headers().get(key);
+            if let Some(value) = ret {
+                if let Ok(value_str) = value.to_str() {
+                    Ok(Some(CollectionValue::String(value_str.to_string())))
+                } else {
+                    warn!("Header value for '{}' is not valid UTF-8", key);
+                    Ok(Some(CollectionValue::String("".to_string())))
+                }
+            } else {
+                warn!("Header '{}' not found", key);
+                Ok(None)
+            }
         }
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
         let request = self.request.read().await;
+        if key == "path" || key == "method" || key == "uri" || key == "version" {
+            return Ok(true);
+        }
         Ok(request.headers().get(key).is_some())
     }
 
@@ -313,6 +375,18 @@ impl MapCollection for HttpRequestHeaderMap {
         let _guard = TraverseGuard::new(&self.transverse_counter);
 
         let request = self.request.read().await;
+        if !callback.call("path", &CollectionValue::String(request.uri().path().to_string())).await? {
+            return Ok(());
+        }
+        if !callback.call("method", &CollectionValue::String(request.method().to_string())).await? {
+            return Ok(());
+        }
+        if !callback.call("uri", &CollectionValue::String(request.uri().to_string())).await? {
+            return Ok(());
+        }
+        if !callback.call("version", &CollectionValue::String(format!("{:?}", request.version()))).await? {
+            return Ok(());
+        }
         for (key, value) in request.headers().iter() {
             if let Ok(value_str) = value.to_str() {
                 if !callback
@@ -331,6 +405,10 @@ impl MapCollection for HttpRequestHeaderMap {
     async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
         let request = self.request.read().await;
         let mut result = Vec::new();
+        result.push(("path".to_string(), CollectionValue::String(request.uri().path().to_string())));
+        result.push(("method".to_string(), CollectionValue::String(request.method().to_string())));
+        result.push(("uri".to_string(), CollectionValue::String(request.uri().to_string())));
+        result.push(("version".to_string(), CollectionValue::String(format!("{:?}", request.version()))));
         for (key, value) in request.headers().iter() {
             if let Ok(value_str) = value.to_str() {
                 result.push((
