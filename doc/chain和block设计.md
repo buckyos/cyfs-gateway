@@ -11,8 +11,8 @@ Server可以有多个hook_pint（比如pre_req,main,post_resp),由server的开�
 一个Chain由一个block列表组成，会按确定的顺序依次执行block.每个block在一个chain内都有一个唯一的id,不可以在一个chain内插入不同
 任何block中调用return,则该chain的执行结束，得到返回结果
 在block中可以调用另一个block. 有两种调用方法
-- goto $blockid，将当前执行顺序跳到目标block，相当于改变执行顺序。goto后的代码不会被执行。nginx里的`修改当前req后re-route`就比较适合这个场景
-- call $blockid, 在当前执行位置插入目标block, 执行完目标block的指令后，会回到call的下一行 (注意block没有返回值，大家相当于共享一个全局变量环境)
+- goto $blockid | $chainid，将当前执行顺序跳到目标block，相当于改变执行顺序。goto后的代码不会被执行。nginx里的`修改当前req后re-route`就比较适合这个场景
+- exec $blockid, 在当前执行位置插入目标block, 执行完目标block的指令后，会回到call的下一行 (注意block没有返回值，大家相当于共享一个全局变量环境)
 
 ## chain (Process Chain)
 Chain是一个完整的独立执行体，类似进程。每个Chain通过定义都会有一个全进程独立的id(系统实现的时候可能会通过前缀自动构造这个id)
