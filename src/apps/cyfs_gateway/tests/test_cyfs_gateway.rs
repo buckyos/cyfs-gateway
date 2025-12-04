@@ -44,67 +44,67 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-        // {
-        //     //用tokio库创建一个tcpstream
-        //     let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
-        //
-        //     // 用hyper构造一个http请求
-        //     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
-        //         .handshake(TokioIo::new(stream)).await.unwrap();
-        //     let request = hyper::Request::get("/")
-        //         .header("Host", "web3.buckyos.com")
-        //         .version(hyper::Version::HTTP_11)
-        //         .body(Full::new(Bytes::new())).unwrap();
-        //
-        //     tokio::spawn(async move {
-        //         conn.await.unwrap();
-        //     });
-        //
-        //     let response = sender.send_request(request).await.unwrap();
-        //     assert_eq!(response.status(), hyper::StatusCode::OK);
-        //     assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
-        //     assert_eq!(response.headers().get("content-length").unwrap(), format!("{}", "web3.buckyos.com".len()).as_str());
-        //     let body = response.into_body();
-        //     let data = body.collect().await.unwrap();
-        //     assert_eq!(data.to_bytes().as_ref(), b"web3.buckyos.com");
-        //
-        //
-        //     let request = hyper::Request::get("/test.txt")
-        //         .header("Host", "web3.buckyos.com")
-        //         .version(hyper::Version::HTTP_11)
-        //         .body(Full::new(Bytes::new())).unwrap();
-        //     let response = sender.send_request(request).await.unwrap();
-        //     assert_eq!(response.status(), hyper::StatusCode::OK);
-        //     assert_eq!(response.headers().get("content-length").unwrap(), format!("{}", "test".len()).as_str());
-        //     let body = response.into_body();
-        //     let data = body.collect().await.unwrap();
-        //     assert_eq!(data.to_bytes().as_ref(), b"test");
-        // }
-        //
-        // {
-        //     //用tokio库创建一个tcpstream
-        //     let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
-        //
-        //     // 用hyper构造一个http请求
-        //     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
-        //         .handshake(TokioIo::new(stream)).await.unwrap();
-        //     let request = hyper::Request::get("/")
-        //         .header("Host", "www.buckyos.com")
-        //         .version(hyper::Version::HTTP_11)
-        //         .body(Full::new(Bytes::new())).unwrap();
-        //
-        //     tokio::spawn(async move {
-        //         conn.await.unwrap();
-        //     });
-        //
-        //     let response = sender.send_request(request).await.unwrap();
-        //     assert_eq!(response.status(), hyper::StatusCode::OK);
-        //     assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
-        //     assert_eq!(response.headers().get("content-length").unwrap(), format!("{}", "www.buckyos.com".len()).as_str());
-        //     let body = response.into_body();
-        //     let data = body.collect().await.unwrap();
-        //     assert_eq!(data.to_bytes().as_ref(), b"www.buckyos.com");
-        // }
+        {
+            //用tokio库创建一个tcpstream
+            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
+
+            // 用hyper构造一个http请求
+            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream)).await.unwrap();
+            let request = hyper::Request::get("/")
+                .header("Host", "web3.buckyos.com")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::new())).unwrap();
+
+            tokio::spawn(async move {
+                conn.await.unwrap();
+            });
+
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
+            assert_eq!(response.headers().get("content-length").unwrap(), format!("{}", "web3.buckyos.com".len()).as_str());
+            let body = response.into_body();
+            let data = body.collect().await.unwrap();
+            assert_eq!(data.to_bytes().as_ref(), b"web3.buckyos.com");
+
+
+            let request = hyper::Request::get("/test.txt")
+                .header("Host", "web3.buckyos.com")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::new())).unwrap();
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            assert_eq!(response.headers().get("content-length").unwrap(), format!("{}", "test".len()).as_str());
+            let body = response.into_body();
+            let data = body.collect().await.unwrap();
+            assert_eq!(data.to_bytes().as_ref(), b"test");
+        }
+
+        {
+            //用tokio库创建一个tcpstream
+            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
+
+            // 用hyper构造一个http请求
+            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream)).await.unwrap();
+            let request = hyper::Request::get("/")
+                .header("Host", "www.buckyos.com")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::new())).unwrap();
+
+            tokio::spawn(async move {
+                conn.await.unwrap();
+            });
+
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
+            assert_eq!(response.headers().get("content-length").unwrap(), format!("{}", "www.buckyos.com".len()).as_str());
+            let body = response.into_body();
+            let data = body.collect().await.unwrap();
+            assert_eq!(data.to_bytes().as_ref(), b"www.buckyos.com");
+        }
 
         {
             let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();

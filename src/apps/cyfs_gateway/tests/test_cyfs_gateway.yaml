@@ -60,9 +60,11 @@ servers:
       - id: main1
         priority: 1
         blocks:
-          - id: default1
+          - id: default
             block: |
               starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;
+          - id: default1
+            block: |
               call-server web3_dir;
 
   www.buckyos.com:

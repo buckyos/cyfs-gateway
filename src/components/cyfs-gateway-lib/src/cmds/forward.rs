@@ -91,7 +91,7 @@ impl ExternalCommand for Forward {
             return Err("dest_url is required".to_string());
         }
 
-        Ok(CommandResult::return_with_value(CommandControlLevel::Chain,
+        Ok(CommandResult::return_with_value(CommandControlLevel::Lib,
                                             format!(r#"forward {}"#, dest_url.unwrap())))
     }
 }
