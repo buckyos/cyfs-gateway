@@ -363,7 +363,7 @@ pub struct AcmeCertManager {
     check_handler: Mutex<Option<JoinHandle<()>>>,
     responder: Mutex<Option<AcmeChallengeResponderRef>>,
     challenge_certs: Mutex<HashMap<String, Arc<sign::CertifiedKey>>>,
-    http_challenges: Mutex<HashMap<String, (String, String)>>,
+    http_challenges: Mutex<HashMap<String, String>>,
 }
 
 pub struct AcmeCertManagerHolder {
@@ -399,6 +399,10 @@ impl AcmeCertManagerHolder {
 
     pub fn add_acme_item(&self, item: AcmeItem) -> Result<()> {
         self.get_manager().add_acme_item(item)
+    }
+
+    pub fn get_auth_of_token(&self, token: &str) -> Option<String> {
+        self.get_manager().get_auth_of_token(token)
     }
 }
 
@@ -647,7 +651,7 @@ impl AcmeCertManager {
                 ChallengeData::Http01 { ref token, ref key_auth } => {
                     if cert_stub.inner.acme_item.challenge_type == ChallengeType::Http01 {
                         let mut http_challenges = self.http_challenges.lock().unwrap();
-                        http_challenges.insert(challenge.domain.clone(), (token.clone(), key_auth.clone()));
+                        http_challenges.insert(token.clone(), key_auth.clone());
                         return Ok(challenge);
                     } else {
                         continue;
@@ -656,6 +660,11 @@ impl AcmeCertManager {
             }
         }
         Err(anyhow::anyhow!("no challenge responder"))
+    }
+
+    pub fn get_auth_of_token(&self, token: &str) -> Option<String> {
+        let http_challenges = self.http_challenges.lock().unwrap();
+        http_challenges.get(token).cloned()
     }
 
     pub(crate) fn revert_challenge(self: &Arc<Self>, challenge: &Challenge) {

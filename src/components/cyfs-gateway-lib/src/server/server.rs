@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicU32;
 use ::kRPC::{RPCHandler, RPCRequest, RPCResponse};
 use as_any::AsAny;
 use buckyos_kit::AsyncStream;
-use http::{HeaderName, Method, Request, Response, StatusCode, Uri, Version};
+use http::{HeaderName, Method, Request, Response, StatusCode, Uri};
 use http::uri::{Parts, PathAndQuery};
 use http_body_util::{BodyExt, Full};
 use http_body_util::combinators::{BoxBody};

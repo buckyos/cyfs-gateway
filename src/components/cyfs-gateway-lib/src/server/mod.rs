@@ -5,6 +5,7 @@ mod server;
 mod qa_server;
 mod dir_server;
 mod ndn_server;
+mod acme_http_challenge_server;
 
 use std::path::PathBuf;
 
@@ -15,6 +16,8 @@ pub use qa_server::*;
 pub use dns_server::*;
 pub use dir_server::*;
 pub use ndn_server::*;
+pub use acme_http_challenge_server::*;
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ServerErrorCode {
     BindFailed,
@@ -107,7 +110,6 @@ pub fn normalize_all_path_value_config(config:&mut serde_json::Value,base_dir:&P
 mod test {
     use super::*;
     use buckyos_kit::init_logging;
-    use std::path::PathBuf;
     #[test]
     fn test_normalize_all_path_value_config() {
         unsafe {

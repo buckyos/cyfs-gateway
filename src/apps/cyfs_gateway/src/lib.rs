@@ -85,6 +85,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     parser.register_server_config_parser("control_server", Arc::new(GatewayControlServerConfigParser::new()));
     parser.register_server_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
     parser.register_server_config_parser("sn", Arc::new(SNServerConfigParser::new()));
+    parser.register_server_config_parser("acme_response", Arc::new(AcmeHttpChallengeServerConfigParser::new()));
 
     let load_result = parser.parse(config_json);
     if load_result.is_err() {
@@ -221,6 +222,8 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         server_manager.clone(),
         global_process_chains.clone(),
     )));
+    
+    factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new(cert_manager.clone())));
 
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
     if !data_dir.exists() {

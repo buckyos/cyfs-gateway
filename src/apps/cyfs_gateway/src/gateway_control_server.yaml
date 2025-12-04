@@ -13,3 +13,6 @@ stacks:
 servers:
   __control_server__:
     type: control_server
+  
+  acme_response:
+    type: acme_response
