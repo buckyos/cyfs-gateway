@@ -36,7 +36,6 @@ pub use cyfs_acme::*;
 pub use json_collection::*;
 pub use cmds::*;
 
-use once_cell::sync::OnceCell;
 use thiserror::Error;
 use std::sync::Arc;
 use name_lib::DeviceConfig;

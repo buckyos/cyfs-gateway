@@ -355,21 +355,25 @@ impl GatewayConfigParser {
     pub fn parse(&self, json_value: serde_json::Value) -> ConfigResult<GatewayConfig> {
         let mut stacks = vec![];
         if let Some(stacks_value) = json_value.get("stacks") {
-            let stack_value_list = stacks_value.as_array()
+            let stack_value_list = stacks_value.as_object()
                 .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stacks config.\n{}",
                     serde_json::to_string_pretty(stacks_value).unwrap()))?;
-            for stack_value in stack_value_list {
-                stacks.push(self.stack_config_parser.parse(stack_value.clone())?);
+            for (id, stack_value) in stack_value_list {
+                let mut stack_value = stack_value.clone();
+                stack_value["id"] = serde_json::Value::String(id.clone());
+                stacks.push(self.stack_config_parser.parse(stack_value)?);
             }
         }
 
         let mut servers = vec![];
         if let Some(servers_value) = json_value.get("servers") {
-            let servers_value_list = servers_value.as_array()
+            let servers_value_list = servers_value.as_object()
                 .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid servers config.\n{}",
                     serde_json::to_string_pretty(servers_value).unwrap()))?;
-            for server_value in servers_value_list {
-                servers.push(self.server_config_parser.parse(server_value.clone())?);
+            for (id, server_value) in servers_value_list {
+                let mut server_value = server_value.clone();
+                server_value["id"] = serde_json::Value::String(id.clone());
+                servers.push(self.server_config_parser.parse(server_value)?);
             }
         }
 
@@ -396,16 +400,82 @@ impl GatewayConfigParser {
             None => None
         };
 
+
         let limiters_config: Option<Vec<LimiterConfig>> = match json_value.get("limiters") {
             Some(config) => {
-                match serde_json::from_value::<Vec<LimiterConfig>>(config.clone()) {
-                    Ok(config) => Some(config),
-                    Err(err) => {
-                        let msg = format!("invalid limiters config: {}", err);
-                        error!("{}", msg);
-                        None
+                let configs = config.as_object()
+                    .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid limiters config.\n{}",
+                        serde_json::to_string_pretty(config).unwrap()))?;
+                let mut limiters_config = vec![];
+                for (id, config) in configs {
+                    let mut config = config.clone();
+                    config["id"] = serde_json::Value::String(id.clone());
+                    let config: LimiterConfig = serde_json::from_value(config.clone()).map_err(|e| {
+                        config_err!(ConfigErrorCode::InvalidConfig, "invalid limiters: {:?}\n{}", e,
+                        serde_json::to_string_pretty(&config).unwrap())
+                    })?;
+
+
+                    limiters_config.push(config);
+                }
+
+
+                // 数组需要根据upper_limiter的值进行排序，upper_limitter是必须指向LimiterConfig的另外的对象，这个对象必须排列在前面
+                // 根据upper_limiter字段对limiters进行拓扑排序，确保被引用的对象排在前面
+                let mut sorted_indices = Vec::with_capacity(limiters_config.len());
+                let mut processed = std::collections::HashSet::new();
+
+                while sorted_indices.len() < limiters_config.len() {
+                    let mut changed = false;
+                    for (index, limiter) in limiters_config.iter().enumerate() {
+                        // 如果已经处理过了，跳过
+                        if processed.contains(&index) {
+                            continue;
+                        }
+
+                        // 检查是否有依赖或者依赖已经被处理
+                        let can_process = match limiter.upper_limiter {
+                            Some(ref upper_id) => {
+                                // 查找upper_id对应的索引是否已被处理
+                                let mut upper_processed = false;
+                                for (upper_index, upper_limiter) in limiters_config.iter().enumerate() {
+                                    if &upper_limiter.id == upper_id {
+                                        upper_processed = processed.contains(&upper_index);
+                                        break;
+                                    }
+                                }
+                                // 如果找不到upper_id，也认为可以处理
+                                upper_processed || !limiters_config.iter().any(|l| &l.id == upper_id)
+                            },
+                            None => true,
+                        };
+
+                        if can_process {
+                            sorted_indices.push(index);
+                            processed.insert(index);
+                            changed = true;
+                        }
+                    }
+
+                    // 如果一轮下来没有添加任何元素，说明存在循环依赖或无法解决的依赖关系
+                    if !changed {
+                        // 将未处理的元素按原顺序添加到最后
+                        for (index, _) in limiters_config.iter().enumerate() {
+                            if !processed.contains(&index) {
+                                sorted_indices.push(index);
+                            }
+                        }
+                        break;
                     }
                 }
+
+                // 根据排序后的索引构建最终的排序结果
+                let sorted_limiters: Vec<LimiterConfig> = sorted_indices
+                    .into_iter()
+                    .map(|i| limiters_config[i].clone())
+                    .collect();
+
+                Some(sorted_limiters)
             },
             None => None
         };

@@ -1,17 +1,17 @@
 limiters:
-  - id: global
-    download_limit: 1GB/s
-    upload_limit: 1GB/s
-    concurrent: 2048
-
-  - id: test
+  test:
     upper_limiter: global
     download_limit: 1MB/s
     upload_limit: 1MB/s
     concurrent: 256
 
+  global:
+    download_limit: 1GB/s
+    upload_limit: 1GB/s
+    concurrent: 2048
+
 stacks:
-  - id: test1
+  test1:
     bind: 0.0.0.0:18080
     protocol: tcp
     hook_point:
@@ -23,7 +23,7 @@ stacks:
               http-probe && call-server ${REQ.dest_host};
               reject;
 
-  - id: test2
+  test2:
     bind: 0.0.0.0:18081
     protocol: tcp
     hook_point:
@@ -35,7 +35,7 @@ stacks:
               http-probe && call-server ${REQ.dest_host};
               reject;
 
-  - id: test3
+  test3:
     bind: 0.0.0.0:9545
     protocol: udp
     transparent: false
@@ -48,21 +48,24 @@ stacks:
               call-server main_dns;
 
 servers:
-  - id: web3.buckyos.com
+  web3.buckyos.com:
     type: http
     hook_point:
       - id: main
-        priority: 1
+        priority: 0
         blocks:
           - id: default
             block: |
               starts-with ${REQ.path} "/api" && rewrite ${REQ.path} "/api*" "*" && map-add REQ host www.buckyos.com && forward http://127.0.0.1:18081;
+      - id: main1
+        priority: 1
+        blocks:
           - id: default1
             block: |
               starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;
               call-server web3_dir;
 
-  - id: www.buckyos.com
+  www.buckyos.com:
     type: http
     hook_point:
       - id: main
@@ -72,15 +75,15 @@ servers:
             block: |
               call-server www_dir;
 
-  - id: web3_dir
+  web3_dir:
     type: dir
     root_dir: {{web3_dir}}
 
-  - id: www_dir
+  www_dir:
     type: dir
     root_dir: {{www_dir}}
 
-  - id: main_dns
+  main_dns:
     type: dns
     hook_point:
       - id: main
@@ -91,14 +94,14 @@ servers:
               resolve ${REQ.name} ${REQ.record_type} local_dns && return;
               resolve ${REQ.name} ${REQ.record_type} "223.5.5.5:53" && return;
 
-  - id: sn
+  sn:
     type: sn
     host: web3.buckyos.io
     ip: 127.0.0.1
     zone_config_jwt: test
     zone_config_pkx: test
 
-  - id: local_dns
+  local_dns:
     type: local_dns
     path: {{local_dns}}
 

@@ -1,5 +1,5 @@
 stacks:
-  - id: test1
+  test1:
     bind: 0.0.0.0:8080
     protocol: tcp
     hook_point:
@@ -13,7 +13,7 @@ stacks:
               eq ${REQ.ext.method} "CONNECT" && return "forward tcp:///${REQ.dest_host}";
               return "forward tcp:///${REQ.dest_host}:80";
 
-  - id: test2
+  test2:
     bind: 0.0.0.0:5235
     protocol: tcp
     hook_point:
@@ -24,7 +24,7 @@ stacks:
             block: |
               reject;
 
-  - id: test3
+  test3:
     bind: 0.0.0.0:9545
     protocol: udp
     transparent: false
@@ -36,7 +36,7 @@ stacks:
             block: |
               return "server main_dns";
 
-#  - id: test5
+#  test5:
 #    bind: 0.0.0.0:2980
 #    protocol: rtcp
 #    key_path: ./rootfs/etc/device.key.pem
@@ -49,7 +49,8 @@ stacks:
 #            block: |
 #              reject;
 #
-#  - bind: 0.0.0.0:8083
+#  test8083_tls:
+#    bind: 0.0.0.0:8083
 #    protocol: tls
 #    certs:
 #      - domain: "web3.buckyos.com"
@@ -63,7 +64,8 @@ stacks:
 #            block: |
 #              reject;
 #
-#  - bind: 0.0.0.0:8083
+#  test8083_quic:
+#    bind: 0.0.0.0:8083
 #    protocol: quic
 #    certs:
 #      - domain: "web3.buckyos.com"
@@ -78,7 +80,7 @@ stacks:
 #              reject;
 
 servers:
-#  - id: web3.buckyos.com
+  #    web3.buckyos.com:
 #    type: http
 #    hook_point:
 #      - id: main
@@ -88,8 +90,8 @@ servers:
 #            block: |
 #              reject;
 #
-#  - id: proxy
-#    type: socks5
+  #  proxy:
+  #  type: socks5
 #    hook_point:
 #      - id: main
 #        priority: 1
@@ -98,7 +100,7 @@ servers:
 #            block: |
 #              reject;
 #
-  - id: main_dns
+  main_dns:
     type: dns
     hook_point:
       - id: main
@@ -108,23 +110,3 @@ servers:
             block: |
               call resolve ${REQ.name} ${REQ.record_type} local_dns && return;
               call resolve ${REQ.name} ${REQ.record_type} "223.5.5.5:53" && return;
-#
-#global_process_chains:
-#  - id: global1
-#    priority: 1
-#    blocks:
-#      - id: default
-#        block: |
-#          reject;
-#
-#  - id: global2
-#    priority: 1
-#    blocks:
-#      - id: default
-#        block: |
-#          reject;
-
-inner_services:
-  - id: local_dns
-    type: local_dns
-    path: ./local_dns.toml

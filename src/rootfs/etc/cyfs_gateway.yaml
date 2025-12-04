@@ -1,5 +1,5 @@
 stacks:
-  - id: test4
+  test4:
     bind: 0.0.0.0:8089
     protocol: tcp
     hook_point:

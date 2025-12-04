@@ -1,5 +1,5 @@
 stacks:
-  - id: __control_server__
+  __control_server__:
     bind: 127.0.0.1:13451
     protocol: tcp
     hook_point:
@@ -11,5 +11,5 @@ stacks:
               return "server __control_server__";
 
 servers:
-  - id: __control_server__
+  __control_server__:
     type: control_server
