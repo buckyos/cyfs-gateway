@@ -3,14 +3,34 @@ use crate::chain::*;
 use crate::cmd::{ExternalCommand, ExternalCommandRef};
 use crate::collection::*;
 use crate::js::AsyncJavaScriptCommandExecutor;
+use crate::pipe::CommandPipe;
 use crate::pipe::SharedMemoryPipe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// Options for linking a hook point
+pub struct LinkHookPointOptions {
+    // The environment for the hook point, if None, the hook point env in current HookPointEnv will be used
+    pub hook_point_env: Option<EnvRef>,
+
+    // The command pipe for the hook point, if None, the command pipe in current HookPointEnv will be used
+    pub pipe: Option<CommandPipe>,
+}
+
+impl Default for LinkHookPointOptions {
+    fn default() -> Self {
+        Self {
+            hook_point_env: None,
+            pipe: None,
+        }
+    }
+}
+
+
 pub struct HookPointEnv {
     id: String,
     data_dir: PathBuf,
-    global_env: EnvRef,
+    hook_point_env: EnvRef,
     pipe: SharedMemoryPipe,
     parser_context: ParserContextRef,
 
@@ -23,14 +43,14 @@ impl HookPointEnv {
     pub fn new(id: impl Into<String>, data_dir: PathBuf) -> Self {
         let pipe: SharedMemoryPipe = SharedMemoryPipe::new_empty();
 
-        let global_env = Arc::new(Env::new(EnvLevel::Global, None));
+        let hook_point_env = Arc::new(Env::new(EnvLevel::Global, None));
         let parser_context = ParserContext::new();
         let js_command_executor = AsyncJavaScriptCommandExecutor::new();
 
         Self {
             id: id.into(),
             data_dir,
-            global_env,
+            hook_point_env,
             pipe,
             parser_context: Arc::new(parser_context),
             js_command_executor,
@@ -49,8 +69,8 @@ impl HookPointEnv {
         &self.parser_context
     }
 
-    pub fn global_env(&self) -> &EnvRef {
-        &self.global_env
+    pub fn hook_point_env(&self) -> &EnvRef {
+        &self.hook_point_env
     }
 
     pub fn pipe(&self) -> &SharedMemoryPipe {
@@ -90,8 +110,9 @@ impl HookPointEnv {
         self.parser_context.get_external_command(name)
     }
 
+    // Flush all collections in the hook point environment if needed
     pub async fn flush_collections(&self) -> Result<(), String> {
-        self.global_env.flush().await
+        self.hook_point_env.flush().await
     }
 
     pub async fn load_collection(
@@ -128,7 +149,7 @@ impl HookPointEnv {
                 };
 
                 let ret = self
-                    .global_env
+                    .hook_point_env
                     .create(id, CollectionValue::Set(Arc::new(set)))
                     .await?;
                 if !ret {
@@ -152,7 +173,7 @@ impl HookPointEnv {
                 };
 
                 let ret = self
-                    .global_env
+                    .hook_point_env
                     .create(id, CollectionValue::Map(Arc::new(map)))
                     .await?;
                 if !ret {
@@ -176,7 +197,7 @@ impl HookPointEnv {
                 };
 
                 let ret = self
-                    .global_env
+                    .hook_point_env
                     .create(id, CollectionValue::MultiMap(Arc::new(multi_map)))
                     .await?;
                 if !ret {
@@ -197,10 +218,10 @@ impl HookPointEnv {
         Ok(())
     }
 
-    /// Link the hook point with the current environment.
-    pub async fn link_hook_point(
+    pub async fn link_hook_point_opts(
         &self,
         hook_point: &HookPoint,
+        options: LinkHookPointOptions,
     ) -> Result<HookPointExecutorRef, String> {
         let process_chain_manager = hook_point
             .process_chain_manager()
@@ -216,16 +237,39 @@ impl HookPointEnv {
                 msg
             })?;
 
+        let hook_point_env = match options.hook_point_env {
+            Some(env) => env,
+            None => self.hook_point_env.clone(),
+        };
+
+        let pipe = match options.pipe {
+            Some(p) => p,
+            None => self.pipe.pipe().clone(),
+        };
+
         let executor = HookPointExecutor::new(
             hook_point.id(),
             process_chain_manager,
-            self.global_env.clone(),
-            self.pipe.pipe().clone(),
+            hook_point_env,
+            pipe,
         );
         let executor = Arc::new(executor);
 
         Ok(executor)
     }
+
+    /// Link the hook point with the current environment.
+    pub async fn link_hook_point(
+        &self,
+        hook_point: &HookPoint,
+    ) -> Result<HookPointExecutorRef, String> {
+        self.link_hook_point_opts(
+            hook_point,
+            LinkHookPointOptions::default(),
+        )
+        .await
+    }
 }
+
 
 pub type HookPointEnvRef = Arc<HookPointEnv>;

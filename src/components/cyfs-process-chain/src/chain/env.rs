@@ -72,6 +72,10 @@ impl Env {
         self.parent.as_ref()
     }
 
+    pub fn create_child_env(self: &Arc<Self>, level: EnvLevel) -> EnvRef {
+        Arc::new(Env::new(level, Some(self.clone())))
+    }
+    
     /// Check if the environment contains the given key.
     /// This will first check the local environment, then the external environment if set, and will not check parent environment.
     /// If the key does not exist in the local environment or external environment, it will return false.

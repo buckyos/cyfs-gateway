@@ -66,7 +66,7 @@ pub type HookPointRef = Arc<HookPoint>;
 pub struct HookPointExecutor {
     id: String,
     process_chain_manager: ProcessChainLinkedManagerRef,
-    global_env: EnvRef,
+    hook_point_env: EnvRef,
     pipe: CommandPipe,
 }
 
@@ -74,19 +74,23 @@ impl HookPointExecutor {
     pub(crate) fn new(
         id: impl Into<String>,
         process_chain_manager: ProcessChainLinkedManagerRef,
-        global_env: EnvRef,
+        hook_point_env: EnvRef,
         pipe: CommandPipe,
     ) -> Self {
         Self {
             id: id.into(),
             process_chain_manager,
-            global_env,
+            hook_point_env,
             pipe,
         }
     }
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn hook_point_env(&self) -> &EnvRef {
+        &self.hook_point_env
     }
 
     pub fn process_chain_manager(&self) -> &ProcessChainLinkedManagerRef {
@@ -104,7 +108,7 @@ impl HookPointExecutor {
         let exec = ProcessChainLibExecutor::new(
             lib,
             process_chain_manager,
-            self.global_env.clone(),
+            Some(self.hook_point_env.clone()),
             self.pipe.clone(),
         );
 

@@ -38,7 +38,7 @@ impl ProcessChainREPL {
         let counter = Arc::new(GotoCounter::new());
         let context = Context::new(
             process_chain_manager,
-            env.global_env().clone(),
+            env.hook_point_env().create_child_env(EnvLevel::Global),
             counter,
             pipe.pipe().clone(),
         );

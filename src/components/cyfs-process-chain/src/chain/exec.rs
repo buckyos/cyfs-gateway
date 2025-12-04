@@ -6,6 +6,7 @@ use super::stack::{
     ExecPointerBlockGuard, ExecPointerChainGuard, ExecPointerLibGuard, GotoCounter,
 };
 use crate::block::BlockExecuter;
+use crate::chain::{Env, EnvLevel};
 use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
 use crate::pipe::CommandPipe;
 use std::sync::Arc;
@@ -134,16 +135,12 @@ impl ProcessChainLibExecutor {
     pub fn new(
         process_chain_lib: ProcessChainLibRef,
         process_chain_manager: ProcessChainLinkedManagerRef,
-        global_env: EnvRef,
+        hook_point_env: Option<EnvRef>,
         pipe: CommandPipe,
     ) -> Self {
         let counter = Arc::new(GotoCounter::new());
-        let context = Context::new(
-            process_chain_manager,
-            global_env.clone(),
-            counter,
-            pipe.clone(),
-        );
+        let global_env = Arc::new(Env::new(EnvLevel::Global, hook_point_env));
+        let context = Context::new(process_chain_manager, global_env, counter, pipe.clone());
 
         Self {
             process_chain_lib,
@@ -151,7 +148,7 @@ impl ProcessChainLibExecutor {
         }
     }
 
-    pub fn new_with_context(process_chain_lib: ProcessChainLibRef, context: Context) -> Self {
+    pub(crate) fn new_with_context(process_chain_lib: ProcessChainLibRef, context: Context) -> Self {
         Self {
             process_chain_lib,
             context,
@@ -170,16 +167,24 @@ impl ProcessChainLibExecutor {
         self.context.global_env()
     }
 
+    pub fn hook_point_env(&self) -> Option<&EnvRef> {
+        self.context.global_env().parent()
+    }
+
     pub fn pipe(&self) -> &CommandPipe {
         self.context.pipe()
     }
 
     /// Fork the executor to create a new context to execute the process chain lib or chain.
+    /// The new executor will have a new global environment(include global/chain/block envs) and share the same hook point env.
     pub fn fork(&self) -> Self {
         let counter = Arc::new(GotoCounter::new());
+
+        let hook_point_env = self.context.global_env().parent().cloned();
+        let global_env = Arc::new(Env::new(EnvLevel::Global, hook_point_env));
         let context = Context::new(
             self.context.process_chain_manager().clone(),
-            self.context.global_env().clone(),
+            global_env,
             counter,
             self.context.pipe().clone(),
         );
@@ -190,7 +195,7 @@ impl ProcessChainLibExecutor {
         }
     }
 
-    // Consume the executor and execute the process chain lib
+    /// Consume the executor and execute the process chain lib
     pub async fn execute_lib(self) -> Result<CommandResult, String> {
         let mut final_result = CommandResult::success();
 
@@ -247,7 +252,7 @@ impl ProcessChainLibExecutor {
         Ok(final_result)
     }
 
-    // Consume the executor and execute a specific chain in the process chain lib
+    /// Consume the executor and execute a specific chain in the process chain lib
     pub async fn execute_chain(self, chain_id: &str) -> Result<CommandResult, String> {
         let chain = self.process_chain_lib.get_chain(chain_id)?.ok_or_else(|| {
             let msg = format!("Process chain '{}' not found in lib", chain_id);
