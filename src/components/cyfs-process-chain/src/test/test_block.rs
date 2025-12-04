@@ -231,8 +231,8 @@ async fn test_process_chain() -> Result<(), String> {
     let host_db = JsonMultiMapCollection::new(host_db_file.clone()).unwrap();
 
     let host_collections = Arc::new(Box::new(host_db.clone()) as Box<dyn MultiMapCollection>);
-    let global_env = Arc::new(Env::new(EnvLevel::Global, None));
-    global_env
+    let hook_point_env = Arc::new(Env::new(EnvLevel::Global, None));
+    hook_point_env
         .create("host", CollectionValue::MultiMap(host_collections))
         .await
         .unwrap();
@@ -241,12 +241,12 @@ async fn test_process_chain() -> Result<(), String> {
     let ip_db_file = data_dir.join("ip.json");
     let ip_db = JsonMultiMapCollection::new(ip_db_file.clone()).unwrap();
     let ip_collections = Arc::new(Box::new(ip_db.clone()) as Box<dyn MultiMapCollection>);
-    global_env
+    hook_point_env
         .create("ip", CollectionValue::MultiMap(ip_collections))
         .await
         .unwrap();
 
-    global_env.create("PROTOCOL", CollectionValue::String("https".to_string()))
+    hook_point_env.create("PROTOCOL", CollectionValue::String("https".to_string()))
         .await
         .unwrap();
     
@@ -257,12 +257,14 @@ async fn test_process_chain() -> Result<(), String> {
     let exec = ProcessChainLibExecutor::new(
         linked_lib,
         manager.clone(),
-        global_env.clone(),
+        Some(hook_point_env.clone()),
         pipe.pipe().clone(),
     );
 
     // Execute the lib
-    let ret: CommandResult = exec.fork().execute_lib().await.unwrap();
+    let exec2 = exec.fork();
+    let global_env = exec2.global_env().clone();
+    let ret = exec2.execute_lib().await.unwrap();
     info!("Execution result: {:?}", ret);
     assert!(ret.is_accept());
 
@@ -386,12 +388,14 @@ async fn test_hook_point() -> Result<(), String> {
     // Init some visitors
     let test_visitor = TestVisitor::new();
     test_visitor
-        .register(hook_point_env.global_env())
+        .register(hook_point_env.hook_point_env())
         .await
         .unwrap();
 
     let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
-    let ret = exec.execute_lib("main").await.unwrap();
+    let lib_exec = exec.prepare_exec_lib("main").unwrap();
+    let global_env = lib_exec.global_env().clone();
+    let ret = lib_exec.execute_lib().await.unwrap();
     info!("Hook point execution result: {:?}", ret);
     assert!(ret.is_accept(), "Hook point execution failed: {:?}", ret);
 
@@ -402,7 +406,6 @@ async fn test_hook_point() -> Result<(), String> {
     let output = hook_point_env.pipe().stdout.clone_string();
     info!("Hook point output: {}", output);
 
-    let global_env = hook_point_env.global_env();
     assert_eq!(
         global_env.get("key2").await.unwrap().unwrap().as_str(),
         Some("value1_value2")
