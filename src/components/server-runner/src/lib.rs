@@ -91,7 +91,7 @@ impl HttpServer for Router {
         Ok(http::Response::builder()
             .status(http::StatusCode::NOT_FOUND)
             .body(
-                http_body_util::Full::new(Bytes::from("Not Found"))
+                http_body_util::Full::new(Bytes::from("No Router Found"))
                     .map_err(|e| match e {})
                     .boxed(),
             )
