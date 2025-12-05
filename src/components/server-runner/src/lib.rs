@@ -8,11 +8,11 @@ use cyfs_gateway_lib::{
     hyper_serve_http, server_err, DirServer, HttpServer, ServerErrorCode, ServerResult, StreamInfo,
     ServerError,
 };
-use http::Uri;
+
 use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt;
 use hyper::body::Bytes;
-use log::{error, info};
+use log::{error, info,debug};
 use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Clone)]
