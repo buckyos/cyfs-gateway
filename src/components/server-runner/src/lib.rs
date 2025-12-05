@@ -29,8 +29,6 @@ impl Router {
 
     fn add_route(&self, path: String, server: Arc<dyn HttpServer>) {
         let mut routes = self.routes.write().unwrap();
-        // Remove existing route if it exists
-        routes.retain(|(p, _)| p != &path);
         routes.push((path, server));
         // Sort by length descending to match longest prefix first
         routes.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()));
@@ -50,7 +48,7 @@ impl HttpServer for Router {
         info!("{}=>{} {}",src_addr, req.method(), path);
 
         for (prefix, server) in routes {
-            info!("try match router: {}", prefix);
+            debug!("try match router: {}", prefix);
             if path.starts_with(&prefix) {
                 info!(" {} match router: {}",path, prefix);
                 // // Calculate new path by stripping prefix
