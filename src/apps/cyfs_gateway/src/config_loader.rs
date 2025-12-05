@@ -1,5 +1,5 @@
 use log::*;
-use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig, config_err, DirServerConfig, AcmeHttpChallengeServerConfig};
+use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig, config_err, DirServerConfig, AcmeHttpChallengeServerConfig, ProcessChainConfig};
 use cyfs_socks::SocksServerConfig;
 use cyfs_sn::*;
 use std::collections::HashMap;
@@ -53,9 +53,65 @@ impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for CyfsStackCo
                     serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()
                 ))?.clone()
         };
+
         factory.parse(de)
     }
 }
+
+fn blocks_map_to_vector(blocks: &serde_json::Value) -> ConfigResult<serde_json::Value> {
+    if let Some(blocks) = blocks.as_object() {
+        let mut block_list = vec![];
+        for (id, value) in blocks {
+            let mut new_value = value.clone();
+            new_value["id"] = serde_json::Value::String(id.to_string());
+            block_list.push(new_value);
+        }
+        Ok(serde_json::Value::Array(block_list))
+    } else {
+        Err(config_err!(ConfigErrorCode::InvalidConfig, "invalid block config.It must be map\n{}",
+            serde_json::to_string_pretty(blocks).unwrap()))
+    }
+}
+
+fn hook_point_map_to_vector(hook_point: &serde_json::Value) -> ConfigResult<serde_json::Value> {
+    if let Some(chains) = hook_point.as_object() {
+        let mut chain_list = vec![];
+        for (id, value) in chains {
+            let mut new_value = value.clone();
+            new_value["id"] = serde_json::Value::String(id.to_string());
+            if let Some(blocks) = value.get("blocks") {
+                new_value["blocks"] = blocks_map_to_vector(blocks)?;
+            }
+            chain_list.push(new_value);
+        }
+        let new_hook_point = serde_json::Value::Array(chain_list);
+        ProcessChainConfigs::deserialize(new_hook_point.clone()).map_err(|e| {
+            config_err!(ConfigErrorCode::InvalidConfig, "invalid hook point config.{}\n{}",
+                e,
+                serde_json::to_string_pretty(hook_point).unwrap())
+        })?;
+        Ok(new_hook_point)
+    } else {
+        Err(config_err!(ConfigErrorCode::InvalidConfig, "invalid hook point config.It must be map\n{}",
+            serde_json::to_string_pretty(hook_point).unwrap()))
+    }
+}
+
+fn hook_point_value_map_to_vector<D: for<'de> Deserializer<'de> + Clone>(de: D, key_name: &str) -> ConfigResult<serde_json::Value> {
+    let mut stack_config = serde_json::Value::deserialize(de.clone()).map_err(|e| {
+        config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap())
+    })?;
+
+    if let Some(hook_point) = stack_config.get(key_name) {
+        let hook_point = hook_point_map_to_vector(hook_point)?;
+        stack_config["hook_point"] = hook_point;
+    };
+
+    Ok(stack_config)
+}
+
 
 pub struct TcpStackConfigParser {}
 
@@ -67,7 +123,7 @@ impl TcpStackConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for TcpStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let tcp_config = TcpStackConfig::deserialize(de.clone())
+        let tcp_config = TcpStackConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid tcp stack config.{}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
@@ -85,7 +141,7 @@ impl UdpStackConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for UdpStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let udp_config = UdpStackConfig::deserialize(de.clone())
+        let udp_config = UdpStackConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid udp stack config.{}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
@@ -102,7 +158,7 @@ impl TlsStackConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for TlsStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let tls_config = cyfs_gateway_lib::TlsStackConfig::deserialize(de.clone())
+        let tls_config = cyfs_gateway_lib::TlsStackConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid tls stack config: {}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
@@ -120,7 +176,7 @@ impl QuicStackConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for QuicStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let quic_config = QuicStackConfig::deserialize(de.clone())
+        let quic_config = QuicStackConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid quic stack config: {}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
@@ -137,7 +193,7 @@ impl RtcpStackConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for RtcpStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let rtcp_config = RtcpStackConfig::deserialize(de.clone())
+        let rtcp_config = RtcpStackConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid rtcp stack config: {}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
@@ -155,7 +211,7 @@ impl TunStackConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for TunStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let tun_config = TunStackConfig::deserialize(de.clone())
+        let tun_config = TunStackConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid tun stack config: {}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap())
@@ -220,7 +276,7 @@ impl HttpServerConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for HttpServerConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = ProcessChainHttpServerConfig::deserialize(de.clone())
+        let config = ProcessChainHttpServerConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid http server config.{}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
@@ -239,7 +295,7 @@ impl DnsServerConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for DnsServerConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = DnsServerConfig::deserialize(de.clone())
+        let config = DnsServerConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid dns server config.{:?}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()
@@ -258,7 +314,7 @@ impl SocksServerConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for SocksServerConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = SocksServerConfig::deserialize(de.clone())
+        let config = SocksServerConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid socks server config.{}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
@@ -399,10 +455,20 @@ impl GatewayConfigParser {
 
         let mut global_process_chains = vec![];
         if let Some(global_chains_value) = json_value.get("global_process_chains") {
-            global_process_chains = serde_json::from_value(global_chains_value.clone()).map_err(|e| {
-                config_err!(ConfigErrorCode::InvalidConfig, "invalid global_process_chains: {:?}\n{}", e,
-                serde_json::to_string_pretty(global_chains_value).unwrap())
-            })?;
+            if let Some(global_chains_value) = global_chains_value.as_object() {
+                for (id, process_chain) in global_chains_value.iter() {
+                    let mut chain_value = process_chain.clone();
+                    chain_value["id"] = serde_json::Value::String(id.clone());
+                    if let Some(blocks) = chain_value.get("blocks") {
+                        chain_value["blocks"] = blocks_map_to_vector(blocks)?;
+                    }
+                    let chain = serde_json::from_value::<ProcessChainConfig>(chain_value).map_err(|e| {
+                        config_err!(ConfigErrorCode::InvalidConfig, "invalid global_process_chains: {:?}\n{}", e,
+                        serde_json::to_string_pretty(global_chains_value).unwrap())
+                    })?;
+                    global_process_chains.push(chain);
+                }
+            }
         }
 
         let acme_config: Option<AcmeConfig> = match json_value.get("acme") {

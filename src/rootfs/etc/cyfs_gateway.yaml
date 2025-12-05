@@ -3,10 +3,10 @@ stacks:
     bind: 0.0.0.0:8089
     protocol: tcp
     hook_point:
-      - id: main
+      main:
         priority: 1
         blocks:
-          - id: default
+          default:
             block: |
               call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
               call http-probe || reject;

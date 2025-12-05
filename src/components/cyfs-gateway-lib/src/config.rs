@@ -170,10 +170,14 @@ impl WarpServerConfig {
     }
 }
 
-
+fn default_priority() -> i32 {
+    1
+}
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BlockConfig {
     pub id: String,
+    #[serde(default = "default_priority")]
+    pub priority: i32,
     pub block: String,
 }
 
@@ -193,6 +197,7 @@ impl BlockConfig {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ProcessChainConfig {
     pub id: String,
+    #[serde(default = "default_priority")]
     pub priority: i32,
     pub blocks: Vec<BlockConfig>,
 }
@@ -200,7 +205,9 @@ pub struct ProcessChainConfig {
 impl ProcessChainConfig {
     pub fn create_process_chain(&self) -> ConfigResult<ProcessChain> {
         let mut chain = ProcessChain::new(self.id.clone(), self.priority);
-        for block in self.blocks.iter() {
+        let mut blocks = self.blocks.clone();
+        blocks.sort_by(|a, b| a.priority.cmp(&b.priority));
+        for block in blocks.iter() {
             chain.add_block(block.create_block()?).map_err(|e| {
                 config_err!(
                     ConfigErrorCode::InvalidConfig,

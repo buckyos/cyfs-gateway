@@ -3,10 +3,11 @@ stacks:
     bind: 127.0.0.1:13451
     protocol: tcp
     hook_point:
-      - id: main
+      main: 
         priority: 1
         blocks:
-          - id: default
+          default:
+            priority: 1
             block: |
               return "server __control_server__";
 

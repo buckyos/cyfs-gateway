@@ -15,10 +15,11 @@ stacks:
     bind: 0.0.0.0:18080
     protocol: tcp
     hook_point:
-      - id: main
+      main:
         priority: 1
         blocks:
-          - id: default
+          default:
+            priority: 1
             block: |
               http-probe && call-server ${REQ.dest_host};
               reject;
@@ -27,10 +28,11 @@ stacks:
     bind: 0.0.0.0:18081
     protocol: tcp
     hook_point:
-      - id: main
+      main:
         priority: 1
         blocks:
-          - id: default
+          default:
+            priority: 1
             block: |
               http-probe && call-server ${REQ.dest_host};
               reject;
@@ -40,10 +42,11 @@ stacks:
     protocol: udp
     transparent: false
     hook_point:
-      - id: main
+      main:
         priority: 1
         blocks:
-          - id: default
+          default:
+            priority: 1
             block: |
               call-server main_dns;
 
@@ -51,29 +54,34 @@ servers:
   web3.buckyos.com:
     type: http
     hook_point:
-      - id: main
+      main:
         priority: 0
         blocks:
-          - id: default
+          default:
+            priority: 1
             block: |
               starts-with ${REQ.path} "/api" && rewrite ${REQ.path} "/api*" "*" && map-add REQ host www.buckyos.com && forward http://127.0.0.1:18081;
-      - id: main1
+      main1:
         priority: 1
         blocks:
-          - id: default
+          default:
+            priority: 1
             block: |
               starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;
-          - id: default1
+
+          default1:
+            priority: 2
             block: |
               call-server web3_dir;
 
   www.buckyos.com:
     type: http
     hook_point:
-      - id: main
+      main:
         priority: 1
         blocks:
-          - id: default
+          default:
+            priority: 1
             block: |
               call-server www_dir;
 
@@ -88,10 +96,11 @@ servers:
   main_dns:
     type: dns
     hook_point:
-      - id: main
+      main:
         priority: 1
         blocks:
-          - id: default
+          default:
+            priority: 1
             block: |
               resolve ${REQ.name} ${REQ.record_type} local_dns && return;
               resolve ${REQ.name} ${REQ.record_type} "223.5.5.5:53" && return;
@@ -108,9 +117,10 @@ servers:
     path: {{local_dns}}
 
 global_process_chains:
-  - id: global_test1
+  global_test1:
     priority: 1
     blocks:
-      - id: default
+      default:
+        priority: 1
         block: |
           call-server ${REQ.dest_host}

@@ -122,7 +122,7 @@ impl GatewayFactory {
                 self.servers.add_server(server)?;
             }
         }
-        
+
         Ok(Gateway {
             config: Mutex::new(config),
             stack_manager,
@@ -731,6 +731,7 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     priority: 0,
                     blocks: vec![BlockConfig {
                         id: "main".to_string(),
+                        priority: 1,
                         block: block.trim().to_string(),
                     }],
                 };
