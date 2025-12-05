@@ -41,43 +41,47 @@ impl Router {
 impl HttpServer for Router {
     async fn serve_request(
         &self,
-        mut req: http::Request<BoxBody<Bytes, ServerError>>,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let path = req.uri().path().to_string();
         let routes = self.routes.read().unwrap().clone();
+        let src_addr = info.src_addr.as_deref().unwrap_or("unknown");
+        info!("{}=>{} {}",src_addr, req.method(), path);
 
         for (prefix, server) in routes {
             if path.starts_with(&prefix) {
-                // Calculate new path by stripping prefix
-                let new_path = if prefix == "/" {
-                    path.clone()
-                } else {
-                    let p = &path[prefix.len()..];
-                    if p.is_empty() {
-                        "/"
-                    } else {
-                        p
-                    }.to_string()
-                };
-
-                // Rewrite URI
-                let mut parts = req.uri().clone().into_parts();
-                let path_and_query = match parts.path_and_query {
-                    Some(pq) => {
-                        let query = pq.query().map(|q| format!("?{}", q)).unwrap_or_default();
-                        let new_pq = format!("{}{}", new_path, query);
-                        // If creation fails, fallback to original or error? Should be safe usually.
-                        http::uri::PathAndQuery::try_from(new_pq)
-                            .unwrap_or_else(|_| pq)
-                    }
-                    None => http::uri::PathAndQuery::from_static("/"),
-                };
-                parts.path_and_query = Some(path_and_query);
+                info!(" {} match router: {}",path, prefix);
+                // // Calculate new path by stripping prefix
+                // let new_path = if prefix == "/" {
+                //     path.clone()
+                // } else {
+                //     let p = &path[prefix.len()..];
+                //     if p.is_empty() {
+                //         "/"
+                //     } else {
+                //         p
+                //     }.to_string()
+                // };
                 
-                if let Ok(uri) = Uri::from_parts(parts) {
-                    *req.uri_mut() = uri;
-                }
+
+                // // Rewrite URI
+                // let mut parts = req.uri().clone().into_parts();
+                // let path_and_query = match parts.path_and_query {
+                //     Some(pq) => {
+                //         let query = pq.query().map(|q| format!("?{}", q)).unwrap_or_default();
+                //         let new_pq = format!("{}{}", new_path, query);
+                //         // If creation fails, fallback to original or error? Should be safe usually.
+                //         http::uri::PathAndQuery::try_from(new_pq)
+                //             .unwrap_or_else(|_| pq)
+                //     }
+                //     None => http::uri::PathAndQuery::from_static("/"),
+                // };
+                // parts.path_and_query = Some(path_and_query);
+                
+                // if let Ok(uri) = Uri::from_parts(parts) {
+                //     *req.uri_mut() = uri;
+                // }
 
                 return server.serve_request(req, info).await;
             }
@@ -145,6 +149,7 @@ impl Runner {
         let dir_server = DirServer::builder()
             .id(router_url.clone())
             .root_dir(dir)
+            .base_url(router_url.clone())
             .build()
             .await?;
 

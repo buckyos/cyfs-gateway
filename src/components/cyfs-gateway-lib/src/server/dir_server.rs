@@ -16,6 +16,7 @@ pub struct DirServerBuilder {
     version: Option<String>,
     root_dir: Option<PathBuf>,
     index_file: Option<String>,
+    base_url: Option<String>,
 }
 
 impl DirServerBuilder {
@@ -39,6 +40,11 @@ impl DirServerBuilder {
         self
     }
 
+    pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = Some(base_url.into());
+        self
+    }
+
     pub async fn build(self) -> ServerResult<DirServer> {
         DirServer::create_server(self).await
     }
@@ -50,6 +56,7 @@ pub struct DirServer {
     version: http::Version,
     root_dir: PathBuf,
     index_file: String,
+    base_url: String,
 }
 
 impl DirServer {
@@ -59,6 +66,7 @@ impl DirServer {
             version: None,
             root_dir: None,
             index_file: None,
+            base_url: None,
         }
     }
 
@@ -101,6 +109,7 @@ impl DirServer {
             version,
             root_dir,
             index_file,
+            base_url: builder.base_url.unwrap_or_else(|| "/".to_string()),
         })
     }
 
@@ -208,7 +217,7 @@ impl DirServer {
     /// Normalize the request path and resolve to local file path
     fn resolve_path(&self, req_path: &str) -> PathBuf {
         // Remove leading slash
-        let sub_path = req_path.trim_start_matches('/');
+        let sub_path = req_path.trim_start_matches(&self.base_url);
         
         // Resolve the full path
         let mut file_path = self.root_dir.join(sub_path);
