@@ -50,6 +50,7 @@ impl HttpServer for Router {
         info!("{}=>{} {}",src_addr, req.method(), path);
 
         for (prefix, server) in routes {
+            info!("try match router: {}", prefix);
             if path.starts_with(&prefix) {
                 info!(" {} match router: {}",path, prefix);
                 // // Calculate new path by stripping prefix
