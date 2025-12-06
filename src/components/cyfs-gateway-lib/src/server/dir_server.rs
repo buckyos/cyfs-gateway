@@ -103,11 +103,14 @@ impl DirServer {
         };
 
         let index_file = builder.index_file.unwrap_or_else(|| "index.html".to_string());
-
+        let new_root_dir = root_dir.canonicalize().map_err(|e| {
+            server_err!(ServerErrorCode::IOError, "Failed to canonicalize path: {}", e)
+        })?;
+        info!("after normalize,root_dir is : {:?}", new_root_dir);
         Ok(DirServer {
             id: builder.id.unwrap(),
             version,
-            root_dir,
+            root_dir: new_root_dir,
             index_file,
             base_url: builder.base_url.unwrap_or_else(|| "/".to_string()),
         })

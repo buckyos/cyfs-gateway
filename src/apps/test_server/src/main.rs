@@ -24,7 +24,7 @@ async fn main() -> ServerResult<()> {
     runner.add_http_server("/server/".to_string(), Arc::new(SimpleHttpServer::new()))?;
 
     // Add a dir handler for demo
-    let current_dir = std::env::current_dir().unwrap_or(std::path::PathBuf::from("."));
+    let current_dir = std::path::PathBuf::from(".");
     runner.add_dir_handler("/files/".to_string(), current_dir).await?;
 
     info!("test_server listening on http://127.0.0.1:{port}");
