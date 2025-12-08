@@ -277,7 +277,7 @@ impl ExternalCommand for CmdQa {
             })?;
 
         // Store result in ANSWER
-        context.env().create("ANSWER", CollectionValue::Map(answer_map), EnvLevel::Chain).await
+        context.env().create("ANSWER", CollectionValue::Map(answer_map), EnvLevel::Global).await
             .map_err(|e| {
                 let msg = format!("Failed to create ANSWER in environment: {}", e);
                 error!("{}", msg);

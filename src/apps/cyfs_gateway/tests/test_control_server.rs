@@ -100,6 +100,7 @@ print("hello python")
         parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
 
         parser.register_server_config_parser("control_server", Arc::new(GatewayControlServerConfigParser::new()));
+        parser.register_server_config_parser("acme_response", Arc::new(AcmeHttpChallengeServerConfigParser::new()));
 
         let load_result = parser.parse(cmd_config);
         if load_result.is_err() {
@@ -183,7 +184,9 @@ print("hello python")
         let cmd_store = TempExternalCmdStore::new();
         let handler = GatewayCmdHandler::new(Arc::new(cmd_store), PathBuf::from("config.yaml"), parser);
         factory.register_server_factory("control_server", Arc::new(GatewayControlServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
-
+        factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new(
+            cert_manager.clone(),
+        )));
         let gateway = factory.create_gateway(config_loader).await;
         assert!(gateway.is_ok());
         let gateway = gateway.unwrap();

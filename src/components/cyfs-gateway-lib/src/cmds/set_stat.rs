@@ -89,7 +89,7 @@ impl ExternalCommand for SetStat {
             set.insert(group_id.as_str()).await?;
         }
 
-        context.env().create("STAT", CollectionValue::Set(set), EnvLevel::Chain).await?;
+        context.env().create("STAT", CollectionValue::Set(set), EnvLevel::Global).await?;
         Ok(CommandResult::Success("STAT".to_string()))
     }
 }

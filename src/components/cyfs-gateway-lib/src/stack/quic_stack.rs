@@ -735,7 +735,7 @@ impl QuicStackInner {
         let executor = {
             self.executor.lock().unwrap().fork()
         };
-        let chain_env = executor.chain_env().clone();
+        let global_env = executor.global_env().clone();
         let ret = execute_chain(executor, map)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -754,7 +754,7 @@ impl QuicStackInner {
                         return Ok(());
                     }
 
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(global_env.clone()).await?;
                     let upper = if limiter_id.is_some() {
                         self.limiter_manager.get_limiter(limiter_id.unwrap())
                     } else {
@@ -766,7 +766,7 @@ impl QuicStackInner {
                         upper
                     };
 
-                    let stat_group_ids = get_stat_info(chain_env).await?;
+                    let stat_group_ids = get_stat_info(global_env).await?;
                     let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
                     let speed_stat = ComposedSpeedStat::new(speed_groups);
                     let cmd = list[0].as_str();

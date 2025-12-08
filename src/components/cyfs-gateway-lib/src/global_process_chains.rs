@@ -564,8 +564,8 @@ pub async fn create_process_chain_executor(
 
 pub async fn execute_stream_chain(executor: ProcessChainLibExecutor, request: StreamRequest) -> ConfigResult<(CommandResult, Box<dyn AsyncStream>)> {
     let request_map = StreamRequestMap::new(request);
-    let chain_env = executor.chain_env();
-    request_map.register(chain_env)
+    let global_env = executor.global_env();
+    request_map.register(global_env)
         .await
         .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
     let ret = executor
@@ -586,8 +586,8 @@ pub async fn execute_stream_chain(executor: ProcessChainLibExecutor, request: St
 }
 
 pub async fn execute_chain(executor: ProcessChainLibExecutor, coll: MapCollectionRef) -> ConfigResult<CommandResult> {
-    let chain_env = executor.chain_env();
-    chain_env.create("REQ", CollectionValue::Map(coll))
+    let global_env = executor.global_env();
+    global_env.create("REQ", CollectionValue::Map(coll))
         .await
         .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
     let ret = executor

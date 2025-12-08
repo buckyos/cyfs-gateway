@@ -514,7 +514,7 @@ impl UdpStackInner {
         }
 
         let executor = { self.executor.lock().unwrap().fork() };
-        let chain_env = executor.chain_env();
+        let global_env = executor.global_env();
         let map = MemoryMapCollection::new_ref();
         map.insert("source_addr", CollectionValue::String(src_addr.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_addr error: {}", e))?;
@@ -522,10 +522,10 @@ impl UdpStackInner {
         map.insert("dest_addr", CollectionValue::String(dest_addr.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_addr error: {}", e))?;
 
-        chain_env.create("REQ", CollectionValue::Map(map)).await
+        global_env.create("REQ", CollectionValue::Map(map)).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create chain env error: {}", e))?;
 
-        let chain_env = chain_env.clone();
+        let chain_env = global_env.clone();
         let ret = executor.execute_lib().await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "execute chain error: {}", e))?;
         if ret.is_control() {

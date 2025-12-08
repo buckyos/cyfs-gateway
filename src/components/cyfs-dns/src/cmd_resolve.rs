@@ -211,7 +211,7 @@ impl ExternalCommand for Resolve {
         let result = nameinfo_to_map_collection(record_type_str.as_str(), &name_info).await
             .map_err(|e| format!("Failed to convert name info to map collection: {:?}", e))?;
 
-        context.env().create("RESP", CollectionValue::Map(result), EnvLevel::Chain).await?;
+        context.env().create("RESP", CollectionValue::Map(result), EnvLevel::Global).await?;
         Ok(CommandResult::Success("RESP".to_string()))
     }
 }

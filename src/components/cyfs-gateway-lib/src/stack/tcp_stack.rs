@@ -238,7 +238,7 @@ impl TcpStackInner {
         let remote_addr = stream.raw_stream().peer_addr().map_err(into_stack_err!(StackErrorCode::ServerError, "read remote addr failed"))?;
         let mut request = StreamRequest::new(Box::new(stream), dest_addr);
         request.source_addr = Some(remote_addr);
-        let chain_env = executor.chain_env().clone();
+        let global_env = executor.global_env().clone();
         let (ret, stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -255,7 +255,7 @@ impl TcpStackInner {
                         return Ok(());
                     }
 
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(global_env.clone()).await?;
                     let upper = if limiter_id.is_some() {
                         self.limiter_manager.get_limiter(limiter_id.unwrap())
                     } else {
@@ -267,7 +267,7 @@ impl TcpStackInner {
                         upper
                     };
 
-                    let stat_group_ids = get_stat_info(chain_env).await?;
+                    let stat_group_ids = get_stat_info(global_env).await?;
                     let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
                     compose_stat.set_external_stats(speed_groups);
 

@@ -214,8 +214,8 @@ impl HttpServer for ProcessChainHttpServer {
         };
 
         let req_map = HttpRequestHeaderMap::new(req);
-        let chain_env = executor.chain_env();
-        req_map.register_visitors(&chain_env).await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+        let global_env = executor.global_env();
+        req_map.register_visitors(&global_env).await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
         let ret = executor.execute_lib().await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
         if ret.is_control() {
