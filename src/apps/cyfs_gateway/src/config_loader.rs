@@ -432,10 +432,16 @@ impl GatewayConfigParser {
     pub fn parse(&self, json_value: serde_json::Value) -> ConfigResult<GatewayConfig> {
         let mut stacks = vec![];
         if let Some(stacks_value) = json_value.get("stacks") {
-            debug!("stacks_value: {:?}", stacks_value);
-            let stack_value_list = stacks_value.as_object()
-                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stacks config,stacks_value.as_object() is None input:\n{}",
-                    serde_json::to_string_pretty(stacks_value).unwrap()))?;
+            //debug!("stacks_value: {:?}", stacks_value);
+            let stack_value_list = stacks_value.as_object();
+            if stack_value_list.is_none()  {
+                warn!("invalid stacks config,stacks_value.as_object() is None input:\n{:?}", stacks_value);
+                return Err(config_err!(ConfigErrorCode::InvalidConfig, "invalid stacks config,stacks_value.as_object() is None input:\n{}",
+                    serde_json::to_string_pretty(stacks_value).unwrap()));
+            }
+
+            let stack_value_list = stack_value_list.unwrap();
+
             for (id, stack_value) in stack_value_list {
                 let mut stack_value = stack_value.clone();
                 stack_value["id"] = serde_json::Value::String(id.clone());
