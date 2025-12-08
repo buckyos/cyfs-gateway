@@ -1,0 +1,2 @@
+service_name = "cyfs-gateway"
+service_type = "kernel"
