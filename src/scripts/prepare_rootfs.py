@@ -19,7 +19,8 @@ if system == "Windows":
 def strip_and_copy_rust_file(rust_target_dir, name, dest, need_dir=False):
     src_file = os.path.join(rust_target_dir, "release", name)
     if need_dir:
-        dest = os.path.join(dest, name)
+        new_name = name.replace("_", "-")
+        dest = os.path.join(dest, new_name)
         os.makedirs(dest, exist_ok=True)
     shutil.copy(src_file+ext, dest)
 
