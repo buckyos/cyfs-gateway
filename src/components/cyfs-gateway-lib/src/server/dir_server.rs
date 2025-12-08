@@ -353,7 +353,7 @@ impl ServerFactory for DirServerFactory {
         let config = config
             .as_any()
             .downcast_ref::<DirServerConfig>()
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid dir server config"))?;
 
         let mut builder = DirServer::builder()
             .id(config.id.clone())

@@ -290,6 +290,7 @@ impl Gateway {
                 }
             }
             _ => {
+                warn!("Invalid config type: {}", config_type);
                 Err(cmd_err!(
                     ControlErrorCode::InvalidConfigType,
                     "Invalid config type: {}", config_type,

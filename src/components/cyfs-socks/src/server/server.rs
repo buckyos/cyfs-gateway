@@ -59,7 +59,7 @@ impl ServerFactory for SocksServerFactory {
             .downcast_ref::<SocksServerConfig>()
             .ok_or(server_err!(
                 ServerErrorCode::InvalidConfig,
-                "invalid config"
+                "invalid socks server config"
             ))?;
 
         // Load the hook point

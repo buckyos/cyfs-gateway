@@ -123,7 +123,7 @@ impl AcmeHttpChallengeServerFactory {
 impl ServerFactory for AcmeHttpChallengeServerFactory {
     async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
         let config = config.as_any().downcast_ref::<AcmeHttpChallengeServerConfig>()
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid acme http challenge server config"))?;
         let server = AcmeHttpChallengeServer::new(config.id.clone(), self.acme_mgr.clone());
         Ok(vec![Server::Http(Arc::new(server))])
     }

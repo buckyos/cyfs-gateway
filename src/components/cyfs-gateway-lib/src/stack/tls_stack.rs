@@ -417,7 +417,7 @@ impl Stack for TlsStack {
 
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<TlsStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tls stack config"))?;
         if config.id != self.inner.id {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
         }
@@ -539,7 +539,7 @@ impl crate::StackFactory for TlsStackFactory {
         let config = config
             .as_any()
             .downcast_ref::<TlsStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tls stack config"))?;
 
         let mut cert_list = vec![];
         for cert_config in config.certs.iter() {

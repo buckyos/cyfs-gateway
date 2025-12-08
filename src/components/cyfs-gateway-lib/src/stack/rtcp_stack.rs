@@ -464,7 +464,7 @@ impl Stack for RtcpStack {
 
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<RtcpStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid rtcp stack config"))?;
 
         if config.id != self.id {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
@@ -647,7 +647,7 @@ impl StackFactory for RtcpStackFactory {
         let config = config
             .as_any()
             .downcast_ref::<RtcpStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid rtcp stack config"))?;
 
 
         let private_key = load_raw_private_key(Path::new(config.key_path.as_str()))

@@ -403,7 +403,7 @@ impl Stack for TcpStack {
 
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<TcpStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tcp stack config"))?;
 
         if config.id != self.inner.id {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
@@ -566,7 +566,7 @@ impl StackFactory for TcpStackFactory {
         config: Arc<dyn StackConfig>,
     ) -> StackResult<StackRef> {
         let config = config.as_ref().as_any().downcast_ref::<TcpStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tcp stack config"))?;
         let stack = TcpStack::builder()
             .id(config.id.clone())
             .bind(config.bind.to_string())

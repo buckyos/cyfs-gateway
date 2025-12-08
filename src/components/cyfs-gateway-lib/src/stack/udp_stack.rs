@@ -1103,7 +1103,7 @@ impl Stack for UdpStack {
 
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<UdpStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid udp stack config"))?;
 
         if config.id != self.inner.id {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
@@ -1295,7 +1295,7 @@ impl StackFactory for UdpStackFactory {
         let config = config
             .as_any()
             .downcast_ref::<UdpStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid udp stack config"))?;
         let stack = UdpStack::builder()
             .id(config.id.clone())
             .bind(config.bind.to_string())

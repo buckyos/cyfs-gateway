@@ -364,7 +364,7 @@ impl ProcessChainHttpServerFactory {
 impl ServerFactory for ProcessChainHttpServerFactory {
     async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
         let config = config.as_any().downcast_ref::<ProcessChainHttpServerConfig>()
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid process chain http server config"))?;
 
         let mut builder = ProcessChainHttpServer::builder()
             .hook_point(config.hook_point.clone())

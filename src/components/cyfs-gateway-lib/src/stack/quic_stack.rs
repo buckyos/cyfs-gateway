@@ -1073,7 +1073,7 @@ impl Stack for QuicStack {
 
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<QuicStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid quic stack config"))?;
 
         if config.id != self.inner.id {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
@@ -1278,7 +1278,7 @@ impl StackFactory for QuicStackFactory {
         let config = config
             .as_any()
             .downcast_ref::<QuicStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid quic stack config"))?;
         let mut cert_list = vec![];
         for cert_config in config.certs.iter() {
             if cert_config.cert_file.is_some() && cert_config.key_file.is_some() {

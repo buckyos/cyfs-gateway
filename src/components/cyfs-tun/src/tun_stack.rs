@@ -140,7 +140,7 @@ impl Stack for TunStack {
 
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<TunStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tun stack config"))?;
 
         if config.id != self.inner.id {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
@@ -762,7 +762,7 @@ impl StackFactory for TunStackFactory {
         let config = config
             .as_any()
             .downcast_ref::<TunStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid config"))?;
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tun stack config"))?;
 
         let stack = TunStack::builder()
             .id(config.id.clone())
