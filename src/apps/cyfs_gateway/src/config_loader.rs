@@ -46,14 +46,15 @@ impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for CyfsStackCo
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config. error: {} input:\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
-        let factory = {
-            self.parsers.lock().unwrap().get(config.protocol.as_str())
-                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config. error: {} input:\n{}",
-                    format!("unknown protocol: {}", config.protocol),
-                    serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()
-                ))?.clone()
-        };
-
+        let factory = self.parsers.lock().unwrap().get(config.protocol.as_str()).cloned();
+        if factory.is_none() {
+            warn!("invalid stack config. unknown protocol: {}", config.protocol);
+            return Err(config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config. error: {} input:\n{}",
+                format!("unknown protocol: {}", config.protocol),
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()
+            ));
+        }
+        let factory = factory.unwrap();
         factory.parse(de)
     }
 }
@@ -451,9 +452,15 @@ impl GatewayConfigParser {
 
         let mut servers = vec![];
         if let Some(servers_value) = json_value.get("servers") {
-            let servers_value_list = servers_value.as_object()
-                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid servers config,servers_value.as_object() is None input:\n{}",
-                    serde_json::to_string_pretty(servers_value).unwrap()))?;
+            let servers_value_list = servers_value.as_object();
+            if servers_value_list.is_none()  {
+                warn!("invalid servers config,servers_value.as_object() is None input:\n{:?}", servers_value);
+                return Err(config_err!(ConfigErrorCode::InvalidConfig, "invalid servers config,servers_value.as_object() is None input:\n{}",
+                    serde_json::to_string_pretty(servers_value).unwrap()));
+            }
+
+            let servers_value_list = servers_value_list.unwrap();
+
             for (id, server_value) in servers_value_list {
                 let mut server_value = server_value.clone();
                 server_value["id"] = serde_json::Value::String(id.clone());
