@@ -43,13 +43,13 @@ struct StackProtocolConfig {
 impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for CyfsStackConfigParser<D> {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
         let config = StackProtocolConfig::deserialize(de.clone())
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}\n{}",
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config. error: {} input:\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
         let factory = {
             self.parsers.lock().unwrap().get(config.protocol.as_str())
-                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}\n{}",
-                    config.protocol,
+                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config. error: {} input:\n{}",
+                    format!("unknown protocol: {}", config.protocol),
                     serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()
                 ))?.clone()
         };
@@ -99,7 +99,7 @@ fn hook_point_map_to_vector(hook_point: &serde_json::Value) -> ConfigResult<serd
 
 fn hook_point_value_map_to_vector<D: for<'de> Deserializer<'de> + Clone>(de: D, key_name: &str) -> ConfigResult<serde_json::Value> {
     let mut stack_config = serde_json::Value::deserialize(de.clone()).map_err(|e| {
-        config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}\n{}",
+        config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config. error: {} input:\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap())
     })?;
@@ -249,7 +249,9 @@ pub struct ServerConfigType {
 impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for CyfsServerConfigParser<D> {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
         let server_type = ServerConfigType::deserialize(de.clone())
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config.{}", e))?;
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid stack config. error: {} input:\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap()).unwrap()))?;
         let parser = {
             self.parsers.lock().unwrap().get(&server_type.ty).cloned()
         };
@@ -431,7 +433,7 @@ impl GatewayConfigParser {
         let mut stacks = vec![];
         if let Some(stacks_value) = json_value.get("stacks") {
             let stack_value_list = stacks_value.as_object()
-                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stacks config.\n{}",
+                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stacks config: \n{}",
                     serde_json::to_string_pretty(stacks_value).unwrap()))?;
             for (id, stack_value) in stack_value_list {
                 let mut stack_value = stack_value.clone();
