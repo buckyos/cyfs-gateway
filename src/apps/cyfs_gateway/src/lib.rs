@@ -87,6 +87,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     parser.register_server_config_parser("sn", Arc::new(SNServerConfigParser::new()));
     parser.register_server_config_parser("acme_response", Arc::new(AcmeHttpChallengeServerConfigParser::new()));
 
+    info!("Parse cyfs-gatway config...");
     let load_result = parser.parse(config_json);
     if load_result.is_err() {
         let msg = format!("Error loading config: {}", load_result.err().unwrap().msg());
@@ -94,7 +95,8 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         std::process::exit(1);
     }
     let config_loader = load_result.unwrap();
-
+    info!("Parse cyfs-gatway config success");
+    
     let connect_manager = ConnectionManager::new();
     let tunnel_manager = TunnelManager::new();
     let server_manager = Arc::new(ServerManager::new());

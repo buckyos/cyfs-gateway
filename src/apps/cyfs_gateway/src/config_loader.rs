@@ -433,7 +433,7 @@ impl GatewayConfigParser {
         let mut stacks = vec![];
         if let Some(stacks_value) = json_value.get("stacks") {
             let stack_value_list = stacks_value.as_object()
-                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stacks config: \n{}",
+                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid stacks config,stacks_value.as_object() is None input:\n{}",
                     serde_json::to_string_pretty(stacks_value).unwrap()))?;
             for (id, stack_value) in stack_value_list {
                 let mut stack_value = stack_value.clone();
@@ -445,7 +445,7 @@ impl GatewayConfigParser {
         let mut servers = vec![];
         if let Some(servers_value) = json_value.get("servers") {
             let servers_value_list = servers_value.as_object()
-                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid servers config.\n{}",
+                .ok_or(config_err!(ConfigErrorCode::InvalidConfig, "invalid servers config,servers_value.as_object() is None input:\n{}",
                     serde_json::to_string_pretty(servers_value).unwrap()))?;
             for (id, server_value) in servers_value_list {
                 let mut server_value = server_value.clone();
