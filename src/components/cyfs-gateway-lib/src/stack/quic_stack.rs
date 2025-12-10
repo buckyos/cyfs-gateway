@@ -728,6 +728,7 @@ impl QuicStackInner {
 
         let local_addr: SocketAddr = self.bind_addr.parse().unwrap();
         let remote_addr = connection.remote_address();
+        log::info!("quic accept: {} -> {}", remote_addr, local_addr);
         let map = MemoryMapCollection::new_ref();
         map.insert("dest_host", CollectionValue::String(server_name)).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -781,6 +782,7 @@ impl QuicStackInner {
                             let speed_stat = speed_stat.clone();
                             loop {
                                 let (send, recv) = connection.accept_bi().await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
+                                log::info!("quic accept bi: {} -> {}", remote_addr, local_addr);
                                 let stream = sfo_split::Splittable::new(recv, send);
                                 let stat_stream = StatStream::new_with_tracker(stream, speed_stat.clone());
                                 let speed = stat_stream.get_speed_stat();
@@ -874,7 +876,7 @@ impl QuicStackInner {
                                                     };
                                                     let req = http::Request::from_parts(parts, body);
                                                     let resp = server
-                                                        .serve_request(req, StreamInfo::new(local_addr.to_string()))
+                                                        .serve_request(req, StreamInfo::new(remote_addr.to_string()))
                                                         .await
                                                         .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
                                                     let (parts, mut body) = resp.into_parts();
@@ -923,6 +925,7 @@ impl QuicStackInner {
                                     Server::Stream(server) => {
                                         loop {
                                             let (send, recv) = connection.accept_bi().await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
+                                            log::info!("quic accept bi: {} -> {}", remote_addr, local_addr);
                                             let server = server.clone();
                                             let stream = sfo_split::Splittable::new(recv, send);
                                             let stat_stream = StatStream::new_with_tracker(stream, speed_stat.clone());

@@ -165,7 +165,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         limiter_manager.clone(),
         stat_manager.clone(),
     )));
-    info!("Register tcp stack factory");
+    debug!("Register tcp stack factory");
     factory.register_stack_factory(StackProtocol::Udp, Arc::new(UdpStackFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
@@ -174,7 +174,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         limiter_manager.clone(),
         stat_manager.clone(),
     )));
-    info!("Register udp stack factory");
+    debug!("Register udp stack factory");
     factory.register_stack_factory(StackProtocol::Tls, Arc::new(TlsStackFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
@@ -184,7 +184,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         limiter_manager.clone(),
         stat_manager.clone(),
     )));
-    info!("Register tls stack factory");
+    debug!("Register tls stack factory");
     factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
@@ -202,7 +202,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         limiter_manager.clone(),
         stat_manager.clone(),
     )));
-    info!("Register rtcp stack factory");
+    debug!("Register rtcp stack factory");
     factory.register_stack_factory(StackProtocol::Extension("tun".to_string()), Arc::new(TunStackFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
@@ -211,26 +211,26 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         limiter_manager.clone(),
         stat_manager.clone(),
     )));
-    info!("Register tun stack factory");
+    debug!("Register tun stack factory");
     factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
         tunnel_manager.clone(),
     )));
-    info!("Register http server factory");
+    debug!("Register http server factory");
     factory.register_server_factory("dir", Arc::new(DirServerFactory::new()));
 
     factory.register_server_factory("socks", Arc::new(SocksServerFactory::new(
         global_process_chains.clone(),
     )));
-    info!("Register dir server factory");
+    debug!("Register dir server factory");
     factory.register_server_factory("dns", Arc::new(ProcessChainDnsServerFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
     )));
-    info!("Register dns server factory");
+    debug!("Register dns server factory");
     factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new(cert_manager.clone())));
-    info!("Register acme response server factory");
+    debug!("Register acme response server factory");
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
     if !data_dir.exists() {
         create_dir_all(data_dir.clone()).await?;

@@ -100,7 +100,7 @@ impl TcpStackInner {
 
     pub async fn start(self: &Arc<Self>) -> StackResult<JoinHandle<()>> {
         let addr: SocketAddr = self.bind_addr.parse()
-            .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "invalid bind address"))?;
+            .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "invalid bind address {}", self.bind_addr))?;
         let sockaddr: socket2::SockAddr = addr.into();
 
         // 2. 创建原始套接字
@@ -143,7 +143,7 @@ impl TcpStackInner {
                 }
             }
         }
-        socket.bind(&sockaddr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind error"))?;
+        socket.bind(&sockaddr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind {:?} error", sockaddr))?;
         socket.listen(1024).map_err(into_stack_err!(StackErrorCode::ListenFailed, "listen error"))?;
         #[cfg(unix)]
         let std_listener = unsafe {
@@ -162,7 +162,7 @@ impl TcpStackInner {
                 let (stream, remote_addr) = match listener.accept().await {
                     Ok(s) => s,
                     Err(e) => {
-                        log::error!("accept tcp stream failed: {}", e);
+                        log::error!("{:?} accept tcp stream failed: {}", sockaddr, e);
                         continue;
                     }
                 };

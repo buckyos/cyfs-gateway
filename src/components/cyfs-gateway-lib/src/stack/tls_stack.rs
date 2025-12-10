@@ -182,11 +182,11 @@ impl TlsStackInner {
         let bind_addr = self.bind_addr.clone();
         let listener = tokio::net::TcpListener::bind(bind_addr.as_str())
             .await
-            .map_err(into_stack_err!(StackErrorCode::BindFailed))?;
+            .map_err(into_stack_err!(StackErrorCode::BindFailed, "bind address:{}", bind_addr))?;
         let this = self.clone();
         let handle = tokio::spawn(async move {
             loop {
-                let (stream, local_addr) = match listener.accept().await {
+                let (stream, remote_addr) = match listener.accept().await {
                     Ok(s) => s,
                     Err(e) => {
                         log::error!("accept tcp stream failed: {}", e);
@@ -194,7 +194,7 @@ impl TlsStackInner {
                     }
                 };
 
-                let remote_addr = match stream.peer_addr() {
+                let local_addr = match stream.local_addr() {
                     Ok(addr) => addr,
                     Err(e) => {
                         log::error!("get remote addr failed: {}", e);
@@ -202,6 +202,7 @@ impl TlsStackInner {
                     }
                 };
 
+                log::info!("accept tcp stream from {} to {}", remote_addr, local_addr);
                 let this_tmp = this.clone();
                 let compose_stat = MutComposedSpeedStat::new();
                 let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
@@ -263,6 +264,7 @@ impl TlsStackInner {
             let (_, conn) = tls_stream.get_ref();
             conn.server_name().map(|s| s.to_string())
         };
+        log::info!("accept tls stream from {} to {} name {}", remote_addr, local_addr, server_name.as_ref().unwrap_or(&"".to_string()));
         let mut request = StreamRequest::new(Box::new(tls_stream), local_addr);
         request.source_addr = Some(remote_addr);
         request.dest_host = server_name;
@@ -340,13 +342,13 @@ impl TlsStackInner {
                                     Server::Http(http_server) => {
                                         if let Err(e) = hyper_serve_http(stream,
                                                                          http_server,
-                                                                         StreamInfo::new(local_addr.to_string())).await {
+                                                                         StreamInfo::new(remote_addr.to_string())).await {
                                             log::error!("hyper serve http failed: {}", e);
                                         }
                                     }
                                     Server::Stream(server) => {
                                         server
-                                            .serve_connection(stream, StreamInfo::new(local_addr.to_string()))
+                                            .serve_connection(stream, StreamInfo::new(remote_addr.to_string()))
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
                                     }

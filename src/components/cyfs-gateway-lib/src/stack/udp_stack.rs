@@ -513,6 +513,7 @@ impl UdpStackInner {
             return Ok(());
         }
 
+        log::info!("new udp session: {} -> {}", src_addr, dest_addr);
         let executor = { self.executor.lock().unwrap().fork() };
         let global_env = executor.global_env();
         let map = MemoryMapCollection::new_ref();
