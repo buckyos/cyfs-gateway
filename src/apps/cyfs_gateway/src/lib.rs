@@ -250,14 +250,16 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     factory.register_server_factory(
         "control_server",
         Arc::new(GatewayControlServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
+    info!("Register control server factory");
     factory.register_server_factory(
         "local_dns",
         Arc::new(LocalDnsFactory::new(config_dir.to_string_lossy().to_string())));
+    info!("Register local dns server factory");
     factory.register_server_factory(
         "sn",
         Arc::new(SNServerFactory::new())
     );
-
+    info!("Register sn server factory");
     let gateway = match factory.create_gateway(config_loader).await {
         Ok(gateway) => gateway,
         Err(e) => {
@@ -739,7 +741,7 @@ pub async fn cyfs_gateway_main() {
 
     if matches.get_flag("debug") {
         info!("Debug mode enabled");
-        std::env::set_var("RUST_BACKTRACE", "1");
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1"); }
         console_subscriber::init();
     }
 

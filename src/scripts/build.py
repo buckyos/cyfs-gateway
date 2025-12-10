@@ -16,7 +16,7 @@ else:
     temp_dir = "/tmp/"
 
 def build(skip_web_app, skip_install, target, with_tray_controller, auto_win_sdk):
-    project_name = "buckyos"
+    project_name = "cyfs-gateway"
     target_dir = os.path.join(temp_dir, "rust_build", project_name)
 
     if not skip_web_app:

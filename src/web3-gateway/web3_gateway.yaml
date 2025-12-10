@@ -1,0 +1,123 @@
+servers:
+  web3_sn:
+    id: web3_sn
+    type: sn
+    host: "sn.devtests.org"
+    zone_config_jwt: "test"
+    zone_config_pkx: "test"
+    ip: "127.0.0.1"
+
+  main_dns:
+    id: main_dns
+    type: dns
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "server web3_sn";
+
+  main_http:
+    type: http
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              eq ${REQ.host} "sn.devtests.org" && return "server web3_sn";
+              map-add "REQ" "method" "query_by_hostname"
+              call qa "web3_sn" "REQ" && eq ${ANSWER.state} "active" && return "forward rtcp://${ANSWER.did_hostname}/:443";
+stacks:
+  dns_udp:
+    bind: 0.0.0.0:53
+    protocol: udp
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "server main_dns";
+
+  main_rtcp:
+    bind: 0.0.0.0:2980
+    protocol: rtcp
+    key_path: ./device_key.pem
+    device_config_path: ./device.doc.json
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              map-add "REQ" "method" "query_by_did"
+              call qa "web3_sn" "REQ" && eq ${ANSWER.state} "active" && accept;
+              reject;
+
+  main_http_tcp:
+    bind: 0.0.0.0:80
+    protocol: tcp
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "server main_http";
+  
+  main_tls:
+    bind: 0.0.0.0:3443
+    protocol: tls
+    certs:
+      - domain: "sn.devtests.org"
+        cert_path: ./fullchain.cert
+        key_path: ./fullchain.pem
+      - domain: "*.web3.devtests.org"
+        cert_path: ./fullchain.cert
+        key_path: ./fullchain.pem
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "server main_http";
+
+  tls_raw_forward:
+    bind: 0.0.0.0:443
+    protocol: tcp
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              map-add "REQ" "method" "query_by_hostname"
+              call https-sni-probe && call qa "web3_sn" "REQ" && eq ${ANSWER.self_cert} "true" && return "forward rtcp://${ANSWER.did_hostname}/:443";
+              return "forward tcp:///127.0.0.1:3443"
+  
+
+

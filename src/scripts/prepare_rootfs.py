@@ -1,5 +1,6 @@
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import platform
@@ -7,6 +8,7 @@ import platform
 
 src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 root_bin_dir = os.path.join(src_dir, "rootfs/bin")
+web3_gateway_root_dir = os.path.join(src_dir, "web3-gateway/")
 system = platform.system()
 ext = ""
 if system == "Windows":
@@ -40,6 +42,10 @@ def copy_files(rust_target_dir):
     print("Copying files...")
     # code to copy files
     strip_and_copy_rust_file(rust_target_dir, "cyfs_gateway", root_bin_dir, True)
+    web3_gateway_dest_file = os.path.join(web3_gateway_root_dir, "web3_gateway")
+    shutil.copyfile(os.path.join(root_bin_dir, "cyfs-gateway","cyfs_gateway"), web3_gateway_dest_file)
+    st = os.stat(web3_gateway_dest_file)
+    os.chmod(web3_gateway_dest_file, st.st_mode | stat.S_IEXEC)
     strip_and_copy_rust_file(rust_target_dir, "test_server", root_bin_dir, True)
     #copy_web_apps("apps/sys_test", os.path.join(root_bin_dir, "sys_test"))
 

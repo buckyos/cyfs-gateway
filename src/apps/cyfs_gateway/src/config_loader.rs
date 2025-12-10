@@ -645,6 +645,9 @@ pub struct GatewayConfig {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+    use json_value_merge::Merge;
+
     #[test]
     fn test_limiter_config_parser() {
         let json = r#"
@@ -703,5 +706,81 @@ mod tests {
         assert_eq!(config.download_speed, Some(100 * 1024));
         assert_eq!(config.upload_speed, Some(100 * 1024));
         assert_eq!(config.concurrent, None);
+    }
+
+    #[test]
+    fn test_merge_config() {
+        let mut json1 = serde_json::Value::Null;
+        let json2_str = r#"
+{
+  "stacks": {
+    "zone_gateway_http": {
+      "id": "zone_gateway_http",
+      "protocol": "tcp",
+      "bind": "0.0.0.0:80",
+      "hook_point": {
+        "main": {
+          "id": "main",
+          "priority": 1,
+          "blocks": {
+            "default": {
+              "id": "default",
+              "priority": 1,
+              "block": "call http-probe;\nmatch ${REQ.uri} \"/kapi/system_config/*\" && return \"forward http://127.0.0.1:3200\";\nreturn \"server node_gateway\";\n"
+            }
+          }
+        }
+      }
+    },
+    "node_gateway": {
+      "id": "node_gateway",
+      "type": "tcp",
+      "bind": "0.0.0.0:3180",
+      "hook_point": {
+        "main": {
+          "id": "main",
+          "priority": 1,
+          "blocks": {
+            "default": {
+              "id": "default",
+              "priority": 1,
+              "block": "return \"server node_gateway\";\n"
+            }
+          }
+        }
+      }
+    }
+  },
+  "servers": {
+    "node_gateway": {
+      "id": "node_gateway",
+      "type": "http",
+      "hook_point": {
+        "main": {
+          "id": "main",
+          "priority": 1,
+          "blocks": {
+            "default": {
+              "id": "default",
+              "priority": 1,
+              "block": "echo \"node_gateway default block\";"
+            }
+          }
+        }
+      }
+    }
+  }
+
+}
+        "#;
+        let json2 = serde_json::from_str::<serde_json::Value>(json2_str).unwrap();
+        json1.merge(&json2);
+
+        let json3 = json!({
+            "include" : [{"path": "config.json"},{"path": "config2.json"}]
+        });
+        json1.merge(&json3);
+        let json1_str = serde_json::to_string_pretty(&json1).unwrap();
+        println!("merged: {}", json1_str);
     }
 }

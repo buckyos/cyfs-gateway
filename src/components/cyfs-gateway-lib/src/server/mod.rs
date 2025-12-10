@@ -72,10 +72,8 @@ pub fn set_gateway_main_config_dir(path: &PathBuf) {
 pub fn normalize_config_file_path(path: PathBuf,base_dir:&PathBuf) -> PathBuf {
     if path.is_relative() {
         let result_path = base_dir.join(path.clone());
-        debug!("{:?} -> {:?}", path, result_path);
-        return result_path;
+        return result_path.canonicalize().unwrap();
     }
-    debug!("{:?} -> {:?}", path, path);
     path
 }
 
@@ -84,10 +82,10 @@ pub fn normalize_all_path_value_config(config:&mut serde_json::Value,base_dir:&P
     if config.is_object() {
         for (key, value) in config.as_object_mut().unwrap() {
             if value.is_string() {
-                if key.ends_with("path") {
-                    //debug!("normalize_all_path_value_config: {:?} : {:?}", key, value);
+                if key.ends_with("_path") {
                     let value_str = value.as_str().unwrap();
                     let value_path = normalize_config_file_path(PathBuf::from(value_str),base_dir);
+                    info!("normalize_all_path_value_config: key: {}, value: {} -> {}", key, value_str, value_path.to_string_lossy());
                     *value = serde_json::Value::String(value_path.to_string_lossy().to_string());
                 }
             } else {

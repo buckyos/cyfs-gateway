@@ -117,54 +117,6 @@ def copy_configs(config_group_name):
         #    shutil.copytree(config_path, os.path.join(etc_dir, config_file))
         #    print(f"Copied directory {config_path} to {etc_dir}")
 
-def install_apps():
-    temp_dir = os.environ.get('TEMP') or os.environ.get('TMP') or '/tmp'
-    download_dir = os.path.join(temp_dir, "buckyos-apps")
-    version = os.path.join(src_dir, "VERSION")
-    with open(version, "r") as f:
-        version = f.read().strip()
-    print(f"current version: {version},download dir: {download_dir}")
-    
-    # check and download app_pkg_zips
-    # unzip to dest dir
-    os_name = platform.system().lower()
-    arch = platform.machine().lower()
-    if arch == "x86_64":
-        arch = "amd64"
-
-    if not os.path.exists(download_dir):
-        os.makedirs(download_dir)
-    #nightly-apple-aarch64.buckyos-filebrowser-bin.zip
-    preifx = f"nightly-{os_name}-{arch}"
-    img_prefix = f"nightly-linux-{arch}"
-    print(f"app prefix is {preifx}")
-    for app in pre_install_apps:
-        if os_name == "windows" or os_name == "darwin":
-            app_full_id = f"{preifx}.{app['app_id']}-bin.zip"
-            download_url = f"{app['base_url']}{version}/{app_full_id}"
-            download_path = os.path.join(download_dir, f"{app['app_id']}-bin.zip")
-            if download_file(download_url, download_path):
-                print(f"download {app_full_id} OK")
-                unzip_dir = os.path.join(install_root_dir, "bin", f"{app['app_id']}-bin")
-                unzip_to_dir(download_path, unzip_dir)
-                print(f"unzip {app_full_id} OK")
-            else:
-                print(f"download {app_full_id} FAILED")
-        #https://github.com/buckyos/filebrowser/releases/download/0.4.0/nightly-linux-amd64.buckyos-filebrowser-img.zip
-        app_img_full_id = f"{img_prefix}.{app['app_id']}-img.zip"
-        download_url = f"{app['base_url']}{version}/{app_img_full_id}"
-        download_path = os.path.join(download_dir, f"{app['app_id']}-img.zip")
-        if download_file(download_url, download_path):
-            print(f"download {app_img_full_id} OK")
-            unzip_dir = os.path.join(install_root_dir, "bin", f"{app['app_id']}-img")
-            unzip_to_dir(download_path, unzip_dir)
-            print(f"unzip {app_img_full_id} OK")
-        else:
-            print(f"download {app_img_full_id} FAILED")
-
-        print(f"install {app['app_id']} OK")
-
-    return
 
 def install(install_all=False):
     if install_root_dir == "":
@@ -200,14 +152,16 @@ def install(install_all=False):
             shutil.copytree(os.path.join(src_dir, "rootfs"), install_root_dir)
     else:
         bin_dir = os.path.join(install_root_dir, "bin")
+        #遍历bin
 
         print(f'Updating files in {bin_dir}')
-        if os.path.exists(bin_dir):
-            print(f'Removing {bin_dir}')
-            shutil.rmtree(bin_dir)
+
         # Just update bin
-        print(f'Copying {os.path.join(src_dir, "rootfs","bin")} => {bin_dir}')
-        shutil.copytree(os.path.join(src_dir, "rootfs","bin"), bin_dir)
+        print(f'Copying {os.path.join(src_dir, "rootfs","bin","cyfs-gateway")} => {bin_dir}')
+        if os.path.exists(os.path.join(bin_dir, "cyfs-gateway")):
+            shutil.rmtree(os.path.join(bin_dir, "cyfs-gateway"))
+     
+        shutil.copytree(os.path.join(src_dir, "rootfs","bin","cyfs-gateway"), os.path.join(bin_dir, "cyfs-gateway"))
 
     # Set data directory permissions after installation
     set_data_dir_permissions()
@@ -217,4 +171,3 @@ if __name__ == "__main__":
     install_all = "--all" in sys.argv
     print(f"Installing to {install_root_dir}, install_all: {install_all}")
     install(install_all)
-    install_apps()
