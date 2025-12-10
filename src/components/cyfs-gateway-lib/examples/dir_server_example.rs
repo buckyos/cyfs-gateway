@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = Arc::new(
         DirServer::builder()
             .id("demo_server")
-            .root_dir(root_dir)
+            .root_path(root_dir)
             .index_file("index.html")
             .version("HTTP/1.1")
             .build()

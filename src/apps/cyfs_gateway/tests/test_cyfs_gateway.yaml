@@ -88,11 +88,11 @@ servers:
 
   web3_dir:
     type: dir
-    root_dir: {{web3_dir}}
+    root_path: {{web3_dir}}
 
   www_dir:
     type: dir
-    root_dir: {{www_dir}}
+    root_path: {{www_dir}}
 
   main_dns:
     type: dns
@@ -115,7 +115,7 @@ servers:
 
   local_dns:
     type: local_dns
-    path: {{local_dns}}
+    file_path: {{local_dns}}
 
 global_process_chains:
   global_test1:

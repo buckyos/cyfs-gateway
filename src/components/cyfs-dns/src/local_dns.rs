@@ -44,7 +44,7 @@ pub struct LocalDnsConfig {
     id: String,
     #[serde(rename = "type")]
     ty: String,
-    path: String,
+    file_path: String,
 }
 
 impl ServerConfig for LocalDnsConfig {
@@ -95,12 +95,12 @@ impl ServerFactory for LocalDnsFactory {
         let config = config.as_any().downcast_ref::<LocalDnsConfig>()
             .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid local dns config {}", config.get_config_json()))?;
         
-        let path = Path::new(config.path.as_str());
+        let path = Path::new(config.file_path.as_str());
         if path.is_absolute() {
-            Ok(vec![Server::NameServer(Arc::new(LocalDns::create(config.id.clone(), config.path.clone())?))])
+            Ok(vec![Server::NameServer(Arc::new(LocalDns::create(config.id.clone(), config.file_path.clone())?))])
         } else {
-            let path = Path::new(self.config_path.as_str()).join(config.path.as_str()).canonicalize()
-                .map_err(into_server_err!(ServerErrorCode::InvalidConfig, "invalid local dns config {}", config.path))?;
+            let path = Path::new(self.config_path.as_str()).join(config.file_path.as_str()).canonicalize()
+                .map_err(into_server_err!(ServerErrorCode::InvalidConfig, "invalid local dns config {}", config.file_path))?;
             Ok(vec![Server::NameServer(Arc::new(LocalDns::create(config.id.clone(), path.to_string_lossy().to_string())?))])
         }
     }

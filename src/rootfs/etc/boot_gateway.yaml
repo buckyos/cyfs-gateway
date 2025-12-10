@@ -56,8 +56,8 @@ stacks:
 #    protocol: tls
 #    certs:
 #      - domain: "web3.buckyos.com"
-#        cert_file: ./cert.pem
-#        key_file: ./key.pem
+#        cert_path: ./cert.pem
+#        key_path: ./key.pem
 #    hook_point:
 #      main:
 #        priority: 1
@@ -71,8 +71,8 @@ stacks:
 #    protocol: quic
 #    certs:
 #      - domain: "web3.buckyos.com"
-#        cert_file: ./cert.pem
-#        key_file: ./key.pem
+#        cert_path: ./cert.pem
+#        key_path: ./key.pem
 #    hook_point:
 #      main:
 #        priority: 1

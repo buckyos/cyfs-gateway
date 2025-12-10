@@ -545,9 +545,9 @@ impl crate::StackFactory for TlsStackFactory {
 
         let mut cert_list = vec![];
         for cert_config in config.certs.iter() {
-            if cert_config.cert_file.is_some() && cert_config.key_file.is_some() {
-                let certs = load_certs(cert_config.cert_file.as_ref().unwrap().as_str()).await?;
-                let key = load_key(cert_config.key_file.as_ref().unwrap().as_str()).await?;
+            if cert_config.cert_path.is_some() && cert_config.key_path.is_some() {
+                let certs = load_certs(cert_config.cert_path.as_ref().unwrap().as_str()).await?;
+                let key = load_key(cert_config.key_path.as_ref().unwrap().as_str()).await?;
                 cert_list.push(TlsDomainConfig {
                     domain: cert_config.domain.clone(),
                     acme_type: None,

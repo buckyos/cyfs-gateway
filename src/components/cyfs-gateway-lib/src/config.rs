@@ -271,9 +271,9 @@ pub struct StackCertConfig {
     pub domain: String,
     pub acme_type: Option<ChallengeType>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cert_file: Option<String>,
+    pub cert_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub key_file: Option<String>,
+    pub key_path: Option<String>,
     #[serde(flatten)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,

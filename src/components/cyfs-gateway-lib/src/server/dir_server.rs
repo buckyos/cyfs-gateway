@@ -14,7 +14,7 @@ use std::sync::Arc;
 pub struct DirServerBuilder {
     id: Option<String>,
     version: Option<String>,
-    root_dir: Option<PathBuf>,
+    root_path: Option<PathBuf>,
     index_file: Option<String>,
     base_url: Option<String>,
 }
@@ -30,8 +30,8 @@ impl DirServerBuilder {
         self
     }
 
-    pub fn root_dir(mut self, root_dir: impl Into<PathBuf>) -> Self {
-        self.root_dir = Some(root_dir.into());
+    pub fn root_path(mut self, root_path: impl Into<PathBuf>) -> Self {
+        self.root_path = Some(root_path.into());
         self
     }
 
@@ -64,7 +64,7 @@ impl DirServer {
         DirServerBuilder {
             id: None,
             version: None,
-            root_dir: None,
+            root_path: None,
             index_file: None,
             base_url: None,
         }
@@ -75,17 +75,17 @@ impl DirServer {
             return Err(server_err!(ServerErrorCode::InvalidConfig, "id is required"));
         }
 
-        if builder.root_dir.is_none() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "root_dir is required"));
+        if builder.root_path.is_none() {
+            return Err(server_err!(ServerErrorCode::InvalidConfig, "root_path is required"));
         }
 
-        let root_dir = builder.root_dir.unwrap();
-        if !root_dir.exists() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "root_dir does not exist: {:?}", root_dir));
+        let root_path = builder.root_path.unwrap();
+        if !root_path.exists() {
+            return Err(server_err!(ServerErrorCode::InvalidConfig, "root_path does not exist: {:?}", root_path));
         }
 
-        if !root_dir.is_dir() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "root_dir is not a directory: {:?}", root_dir));
+        if !root_path.is_dir() {
+            return Err(server_err!(ServerErrorCode::InvalidConfig, "root_path is not a directory: {:?}", root_path));
         }
 
         let version: http::Version = match builder.version {
@@ -103,7 +103,7 @@ impl DirServer {
         };
 
         let index_file = builder.index_file.unwrap_or_else(|| "index.html".to_string());
-        let new_root_dir = root_dir.canonicalize().map_err(|e| {
+        let new_root_dir = root_path.canonicalize().map_err(|e| {
             server_err!(ServerErrorCode::IOError, "Failed to canonicalize path: {}", e)
         })?;
         info!("after normalize,root_dir is : {:?}", new_root_dir);
@@ -302,7 +302,7 @@ pub struct DirServerConfig {
     pub ty: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    pub root_dir: String,
+    pub root_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_file: Option<String>,
 }
@@ -357,7 +357,7 @@ impl ServerFactory for DirServerFactory {
 
         let mut builder = DirServer::builder()
             .id(config.id.clone())
-            .root_dir(PathBuf::from(config.root_dir.clone()));
+            .root_path(PathBuf::from(config.root_path.clone()));
 
         if let Some(version) = &config.version {
             builder = builder.version(version.clone());
@@ -389,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_server_without_id() {
         let result = DirServer::builder()
-            .root_dir(PathBuf::from("/tmp"))
+            .root_path(PathBuf::from("/tmp"))
             .build()
             .await;
         assert!(result.is_err());
@@ -411,7 +411,7 @@ mod tests {
     async fn test_create_server_with_non_existent_dir() {
         let result = DirServer::builder()
             .id("test")
-            .root_dir(PathBuf::from("/non/existent/dir"))
+            .root_path(PathBuf::from("/non/existent/dir"))
             .build()
             .await;
         assert!(result.is_err());
@@ -427,7 +427,7 @@ mod tests {
         
         let result = DirServer::builder()
             .id("test")
-            .root_dir(temp_dir.path().to_path_buf())
+            .root_path(temp_dir.path().to_path_buf())
             .build()
             .await;
         
@@ -446,7 +446,7 @@ mod tests {
         let server = Arc::new(
             DirServer::builder()
                 .id("test")
-                .root_dir(temp_dir.path().to_path_buf())
+                .root_path(temp_dir.path().to_path_buf())
                 .build()
                 .await
                 .unwrap(),
@@ -489,7 +489,7 @@ mod tests {
         let server = Arc::new(
             DirServer::builder()
                 .id("test")
-                .root_dir(temp_dir.path().to_path_buf())
+                .root_path(temp_dir.path().to_path_buf())
                 .build()
                 .await
                 .unwrap(),
@@ -530,7 +530,7 @@ mod tests {
             id: "test".to_string(),
             ty: "dir".to_string(),
             version: None,
-            root_dir: temp_dir.path().to_string_lossy().to_string(),
+            root_path: temp_dir.path().to_string_lossy().to_string(),
             index_file: None,
         };
         

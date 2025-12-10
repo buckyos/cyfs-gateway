@@ -147,7 +147,7 @@ impl Runner {
         // Create DirServer
         let dir_server = DirServer::builder()
             .id(router_url.clone())
-            .root_dir(dir)
+            .root_path(dir)
             .base_url(router_url.clone())
             .build()
             .await?;
