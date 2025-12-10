@@ -220,10 +220,10 @@ impl HttpServer for ProcessChainHttpServer {
         let ret = executor.execute_lib().await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
         if ret.is_control() {
             if ret.is_drop() {
-                info!("Request dropped by the process chain");
+                debug!("Request dropped by the process chain");
                 return Ok(http::Response::new(Full::new(Bytes::from("Request dropped")).map_err(|e| match e {}).boxed()));
             } else if ret.is_reject() {
-                info!("Request rejected by the process chain");
+                debug!("Request rejected by the process chain");
                 let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 return Ok(response);

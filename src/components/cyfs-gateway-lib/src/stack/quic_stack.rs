@@ -875,6 +875,11 @@ impl QuicStackInner {
                                                             .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed()
                                                     };
                                                     let req = http::Request::from_parts(parts, body);
+                                                    log::info!("recv http request:remote {} method {} host {} path {}",
+                                                        remote_addr,
+                                                        req.method().to_string(),
+                                                        req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
+                                                        req.uri().to_string());
                                                     let resp = server
                                                         .serve_request(req, StreamInfo::new(remote_addr.to_string()))
                                                         .await

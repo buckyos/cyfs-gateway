@@ -827,6 +827,11 @@ pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn Http
                     let (parts, body) = req.into_parts();
                     let req = Request::new(BoxBody::new(body)).map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                     let req = Request::from_parts(parts, req);
+                    log::info!("recv http request:remote {} method {} host {} path {}",
+            info.src_addr.as_ref().unwrap_or(&"new req".to_string()),
+            req.method().to_string(),
+            req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
+            req.uri().to_string());
                     match server.serve_request(req, info).await {
                         Ok(resp) => Ok(resp),
                         Err(e) => {
@@ -851,6 +856,11 @@ pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn Http
                         .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                     let req = Request::from_parts(parts, req);
                     let http3_port = server.http3_port().unwrap();
+                    log::info!("recv http request:remote {} method {} host {} path {}",
+            info.src_addr.as_ref().unwrap_or(&"new req".to_string()),
+            req.method().to_string(),
+            req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
+            req.uri().to_string());
                     match server.serve_request(req, info).await {
                         Ok(mut res) => {
                             res.headers_mut().insert(
@@ -880,6 +890,11 @@ pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn Http
                     let req = Request::new(BoxBody::new(body))
                         .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                     let req = Request::from_parts(parts, req);
+                    log::info!("recv http request:remote {} method {} host {} path {}",
+            info.src_addr.as_ref().unwrap_or(&"new req".to_string()),
+            req.method().to_string(),
+            req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
+            req.uri().to_string());
                     match server.serve_request(req, info).await {
                         Ok(resp) => Ok(resp),
                         Err(e) => {
@@ -908,6 +923,11 @@ pub async fn hyper_serve_http1(stream: Box<dyn AsyncStream>, server: Arc<dyn Htt
                 let req = Request::new(BoxBody::new(body))
                     .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                 let req = Request::from_parts(parts, req);
+                log::info!("recv http request:remote {} method {} host {} path {}",
+            info.src_addr.as_ref().unwrap_or(&"new req".to_string()),
+            req.method().to_string(),
+            req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
+            req.uri().to_string());
                 match server.serve_request(req, info).await {
                     Ok(resp) => Ok(resp),
                     Err(e) => {
