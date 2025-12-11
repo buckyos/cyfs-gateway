@@ -1,17 +1,22 @@
 ["www.buckyos.com"]
 ttl = 300
-A = ["192.168.1.1"]
-TXT="THISISATEST"
-DID="eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbIm9vZDEiXSwiZXhwIjoyMDU4ODM4OTM5LCJpYXQiOjE3NDM0Nzg5Mzl9.6p01rckQkSoZ4kMOQfqZ_JIfHisYI27xNMtmHdYiu_0J_FZC-9j6JzN8PO3PO2A9Eugwo2877LJ5cyHGYEIbCw"
+address = ["192.168.1.1"]
+txt = [
+"THISISATEST",
+"BOOT=eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg;",
+"PKX=qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM;",
+"DEV=eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA;"
+]
 
 ["*.buckyos.com"]
 ttl = 300
-A = ["192.168.1.2"]
+address = ["192.168.1.2"]
 
 ["*.sub.buckyos.com"]
 ttl = 300
-A = ["192.168.1.3"]
+address = ["192.168.1.3"]
+
 
 ["mail.buckyos.com"]
 ttl = 300
-A = ["192.168.1.106"]
+address = ["2600:1700:1150:9440:5cbb:f6ff:fe9e:eefa"]

@@ -509,20 +509,27 @@ hook_point:
         let local_dns_content = r#"
 ["www.buckyos.com"]
 ttl = 300
-A = ["192.168.1.1"]
-TXT="THISISATEST"
+address = ["192.168.1.1"]
+txt = [
+"THISISATEST",
+"BOOT=eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg;",
+"PKX=qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM;",
+"DEV=eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA;"
+]
 
 ["*.buckyos.com"]
 ttl = 300
-A = ["192.168.1.2"]
+address = ["192.168.1.2"]
 
 ["*.sub.buckyos.com"]
 ttl = 300
-A = ["192.168.1.3"]
+address = ["192.168.1.3"]
+
 
 ["mail.buckyos.com"]
 ttl = 300
-A = ["192.168.1.106"]
+address = ["2600:1700:1150:9440:5cbb:f6ff:fe9e:eefa"]
+
         "#;
         let mut local_dns = tempfile::NamedTempFile::new().unwrap();
         local_dns.write_all(local_dns_content.as_bytes()).unwrap();
@@ -677,20 +684,27 @@ hook_point:
         let local_dns_content = r#"
 ["www.buckyos.com"]
 ttl = 300
-A = ["192.168.1.1"]
-TXT="THISISATEST"
+address = ["192.168.1.1"]
+txt = [
+"THISISATEST",
+"BOOT=eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg;",
+"PKX=qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM;",
+"DEV=eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA;"
+]
 
 ["*.buckyos.com"]
 ttl = 300
-A = ["192.168.1.2"]
+address = ["192.168.1.2"]
 
 ["*.sub.buckyos.com"]
 ttl = 300
-A = ["192.168.1.3"]
+address = ["192.168.1.3"]
+
 
 ["mail.buckyos.com"]
 ttl = 300
-A = ["192.168.1.106"]
+address = ["2600:1700:1150:9440:5cbb:f6ff:fe9e:eefa"]
+
         "#;
         let mut local_dns = tempfile::NamedTempFile::new().unwrap();
         local_dns.write_all(local_dns_content.as_bytes()).unwrap();
