@@ -722,7 +722,7 @@ impl SNServer {
             let db = GLOBAL_SN_DB.lock().await;
             let user_info = db.get_user_info_by_domain(req_host);
             if user_info.is_err() {
-                error!("failed to get user info by domain: {}", user_info.err().unwrap());
+                info!("failed to get user info by domain: {}", user_info.err().unwrap());
                 return None;
             }
             let user_info = user_info.unwrap();
