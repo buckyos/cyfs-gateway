@@ -82,7 +82,7 @@ impl TcpStackInner {
 
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
                                                           config.global_process_chains.clone(),
-                                                          Some(get_stream_external_commands())).await
+                                                          Some(get_stream_external_commands(config.servers.clone().unwrap()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
             id: config.id.unwrap(),
@@ -415,7 +415,7 @@ impl Stack for TcpStack {
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
                                                           self.inner.global_process_chains.clone(),
-                                                          Some(get_stream_external_commands())).await
+                                                          Some(get_stream_external_commands(self.inner.servers.clone()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
         Ok(())

@@ -401,7 +401,7 @@ impl UdpStackInner {
 
         let (executor, _) = create_process_chain_executor(&builder.hook_point.unwrap(),
                                                           builder.global_process_chains.clone(),
-                                                          Some(get_datagram_external_commands())).await
+                                                          Some(get_datagram_external_commands(builder.servers.clone().unwrap()))).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create process chain executor error: {}", e))?;
         let local_ips = Self::local_ips()?;
         Ok(Self {
@@ -1116,7 +1116,7 @@ impl Stack for UdpStack {
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
                                                           self.inner.global_process_chains.clone(),
-                                                          Some(get_datagram_external_commands())).await
+                                                          Some(get_datagram_external_commands(self.inner.servers.clone()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
         Ok(())

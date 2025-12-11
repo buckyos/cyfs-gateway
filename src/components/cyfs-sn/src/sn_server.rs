@@ -3,7 +3,7 @@ use crate::sn_db::{self, *};
 use http_body_util::combinators::BoxBody;
 use ::kRPC::*;
 use async_trait::async_trait;
-use cyfs_gateway_lib::{HttpServer, NameServer, ProcessChainConfig, QAServer, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
+use cyfs_gateway_lib::{HttpServer, NameServer, ProcessChainConfig, QAServer, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo, qa_json_to_rpc_request};
 use jsonwebtoken::DecodingKey;
 use lazy_static::lazy_static;
 use log::*;
@@ -602,6 +602,7 @@ impl SNServer {
         req: RPCRequest,
         ip_from: IpAddr,
     ) -> Result<RPCResponse, RPCErrors> {
+        info!("sn server handle rpc call: {}", req.method);
         match req.method.as_str() {
             "get_user_tls_cert" => {
                 //get user tls cert
@@ -703,7 +704,7 @@ impl SNServer {
             let (sub_host,username) = get_result.unwrap();
             let device_info = self.get_device_info(username.as_str(), "ood1").await;
             if device_info.is_some() {
-                //info!("ood1 device info found for {} in sn server",username);
+                info!("ood1 device info found for {} in sn server",username);
                 //let device_did = device_info.unwrap().0.did;
                 let (device_info, device_ip) = device_info.unwrap();
                 let did_hostname = device_info.id.to_host_name();
@@ -719,7 +720,12 @@ impl SNServer {
             }
         } else {
             let db = GLOBAL_SN_DB.lock().await;
-            let user_info = db.get_user_info_by_domain(req_host).unwrap();
+            let user_info = db.get_user_info_by_domain(req_host);
+            if user_info.is_err() {
+                error!("failed to get user info by domain: {}", user_info.err().unwrap());
+                return None;
+            }
+            let user_info = user_info.unwrap();
             if user_info.is_none() {
                 return None;
             }
@@ -750,7 +756,7 @@ impl SNServer {
 #[async_trait]
 impl QAServer for SNServer {
     async fn serve_question(&self, req: &serde_json::Value) -> ServerResult<serde_json::Value> {
-        let rpc_request = serde_json::from_value::<RPCRequest>(req.clone());
+        let rpc_request = qa_json_to_rpc_request(req);
         if rpc_request.is_err() {
             return Err(server_err!(ServerErrorCode::InvalidParam, "invalid request"));
         }

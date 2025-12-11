@@ -121,7 +121,7 @@ impl ProcessChainHttpServer {
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains,
-                                                          Some(get_server_external_commands())).await
+                                                          Some(get_server_external_commands(builder.server_mgr.clone().unwrap()))).await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
         Ok(ProcessChainHttpServer {
             id: builder.id.unwrap(),

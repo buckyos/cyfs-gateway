@@ -99,7 +99,7 @@ impl RtcpStackInner {
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains.clone(),
-                                                          Some(get_stream_external_commands())).await
+                                                          Some(get_stream_external_commands(builder.servers.clone().unwrap()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
             bind_addr: builder.bind_addr.unwrap(),
@@ -476,7 +476,7 @@ impl Stack for RtcpStack {
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
                                                           self.inner.global_process_chains.clone(),
-                                                          Some(get_stream_external_commands())).await
+                                                          Some(get_stream_external_commands(self.inner.servers.clone()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
         Ok(())

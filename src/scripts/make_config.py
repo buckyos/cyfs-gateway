@@ -318,22 +318,6 @@ def get_params_from_group_name(group_name: str) -> Dict[str, object]:
             "force_https": False,
             "ca_name": "buckyos_local",
         }
-    if group_name == "sn_server":
-        return {
-            "username": "sn",
-            "zone_id": "sn.devtests.org",
-            "node_name": "sn",
-            "netid": "wlan",
-            "sn_base_host": "",
-            "web3_bridge": "web3.devtests.org",
-            "trust_did": [
-                "did:web:buckyos.org",
-                "did:web:buckyos.ai",
-                "did:web:buckyos.io",
-            ],
-            "force_https": False,
-            "ca_name": "buckyos_local",
-        }
 
     raise ValueError(f"invalid group name: {group_name}")
 

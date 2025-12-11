@@ -3,9 +3,9 @@ servers:
     id: web3_sn
     type: sn
     host: "sn.devtests.org"
-    zone_config_jwt: "test"
-    zone_config_pkx: "test"
-    ip: "127.0.0.1"
+    zone_config_jwt: "eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg"
+    zone_config_pkx: "qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM"
+    ip: "192.168.100.64"
 
   main_dns:
     id: main_dns
@@ -19,7 +19,7 @@ servers:
             id: default
             priority: 1
             block: |
-              return "server web3_sn";
+              call resolve ${REQ.name} ${REQ.record_type} web3_sn && return;
 
   main_http:
     type: http
@@ -53,8 +53,8 @@ stacks:
   main_rtcp:
     bind: 0.0.0.0:2980
     protocol: rtcp
-    key_path: ./device_key.pem
-    device_config_path: ./device.doc.json
+    key_path: ./sn_private_key.pem
+    device_config_path: ./sn_device_config.json
     hook_point:
       main:
         id: main
@@ -89,7 +89,7 @@ stacks:
       - domain: "sn.devtests.org"
         cert_path: ./fullchain.cert
         key_path: ./fullchain.pem
-      - domain: "*.web3.devtests.org"
+      - domain: "web3.devtests.org"
         cert_path: ./fullchain.cert
         key_path: ./fullchain.pem
     hook_point:
@@ -115,9 +115,13 @@ stacks:
             id: default
             priority: 1
             block: |
-              map-add "REQ" "method" "query_by_hostname"
-              call https-sni-probe && call qa "web3_sn" "REQ" && eq ${ANSWER.self_cert} "true" && return "forward rtcp://${ANSWER.did_hostname}/:443";
-              return "forward tcp:///127.0.0.1:3443"
+              call https-sni-probe || reject; 
+              match ${REQ.dest_host} "sn.devtests.org" && return "forward tcp:///127.0.0.1:3443";
+              match ${REQ.dest_host} "www.devtests.org" && return "forward tcp:///127.0.0.1:3443";
+              match ${REQ.dest_host} "devtests.org" && return "forward tcp:///127.0.0.1:3443";
+              map-create "QUESTION" && map-add "QUESTION" "dest_host" "${REQ.dest_host}" && map-add "QUESTION" "method" "query_by_hostname";
+              call qa "web3_sn" "QUESTION" && eq ${ANSWER.self_cert} "true" && return "forward rtcp://${ANSWER.did_hostname}/:443";
+              reject;
   
 
 

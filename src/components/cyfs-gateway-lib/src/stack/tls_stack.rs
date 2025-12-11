@@ -141,7 +141,7 @@ impl TlsStackInner {
         }
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
                                                           config.global_process_chains.clone(),
-                                                          Some(get_stream_external_commands())).await
+                                                          Some(get_stream_external_commands(config.servers.clone().unwrap()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let crypto_provider = rustls::crypto::ring::default_provider();
         let external_resolver = config.acme_manager.clone().map(|v| v.clone() as Arc<dyn ResolvesServerCert>);
@@ -150,6 +150,7 @@ impl TlsStackInner {
             if cert_config.certs.is_some() && cert_config.key.is_some() {
                 let cert_key = CertifiedKey::from_der(cert_config.certs.unwrap(), cert_config.key.unwrap(), &crypto_provider)
                     .map_err(into_stack_err!(StackErrorCode::InvalidTlsCert))?;
+
                 cert_resolver.add(&cert_config.domain, cert_key)
                     .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "add cert failed"))?;
             } else {
@@ -429,7 +430,7 @@ impl Stack for TlsStack {
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
                                                           self.inner.global_process_chains.clone(),
-                                                          Some(get_stream_external_commands())).await
+                                                          Some(get_stream_external_commands(self.inner.servers.clone()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
         Ok(())

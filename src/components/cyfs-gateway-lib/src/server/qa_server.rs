@@ -1,5 +1,6 @@
 use crate::*;
 use buckyos_kit::AsyncStream;
+use kRPC::RPCRequest;
 use log::*;
 use clap::{Arg, Command};
 use cyfs_process_chain::{CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel, ExternalCommand, MapCollectionRef, command_help};
@@ -116,6 +117,13 @@ pub async fn serve_qa_from_stream(mut stream: Box<dyn AsyncStream>, server: Arc<
 }
 
 
+pub fn qa_json_to_rpc_request(json_req: &serde_json::Value) -> ServerResult<RPCRequest> {
+    let method = json_req.get("method").ok_or_else(|| server_err!(ServerErrorCode::InvalidParam, "method is required"))?;
+    let method_str = method.as_str().ok_or_else(|| server_err!(ServerErrorCode::InvalidParam, "method is not a string"))?;
+    let params = json_req.clone();
+
+    Ok(RPCRequest::new(method_str, params))
+}
 
 //impl process chain command : qa
 // usage:

@@ -26,7 +26,8 @@ pub struct SnDB {
 
 impl SnDB {
     pub fn new() -> Result<SnDB> {
-        let base_dir = PathBuf::from("/opt/web3_bridge/");
+        //获得当前可执行文件所在的目录
+        let base_dir = PathBuf::from(std::env::current_exe().unwrap().parent().unwrap());
         let db_path = base_dir.join("sn_db.sqlite3");
         let conn = Connection::open(db_path);
         if conn.is_err() {
