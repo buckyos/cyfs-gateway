@@ -1025,9 +1025,9 @@ impl QuicStack {
         for cert_config in builder.certs.into_iter() {
             if cert_config.certs.is_some() && cert_config.key.is_some() {
                 let cert_key = CertifiedKey::from_der(cert_config.certs.unwrap(), cert_config.key.unwrap(), &crypto_provider)
-                    .map_err(into_stack_err!(StackErrorCode::InvalidTlsCert))?;
+                    .map_err(into_stack_err!(StackErrorCode::InvalidTlsCert, "parse {} cert failed", cert_config.domain))?;
                 cert_resolver.add(&cert_config.domain, cert_key)
-                    .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "add cert failed"))?;
+                    .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "add {} cert failed.err {}", cert_config.domain, e))?;
             } else {
                 if builder.acme_manager.is_some() {
                     builder.acme_manager.as_ref().unwrap()

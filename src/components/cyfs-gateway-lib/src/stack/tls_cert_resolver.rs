@@ -22,7 +22,12 @@ impl ResolvesServerCertUsingSni {
 
     pub fn add(&self, name: &str, ck: sign::CertifiedKey) -> Result<(), Error> {
         let server_name = {
-            let checked_name = DnsName::try_from(name)
+            let check_name = if name.starts_with("*.") {
+                name.replace("*.", "test.")
+            } else {
+                name.to_string()
+            };
+            let checked_name = DnsName::try_from(check_name)
                 .map_err(|_| Error::General("Bad DNS name".into()))
                 .map(|name| name.to_lowercase_owned())?;
             ServerName::DnsName(checked_name)
@@ -32,10 +37,9 @@ impl ResolvesServerCertUsingSni {
             .and_then(ParsedCertificate::try_from)
             .and_then(|cert| verify_server_name(&cert, &server_name))?;
 
-        if let ServerName::DnsName(name) = server_name {
-            self.by_name.lock().unwrap()
-                .insert(name.as_ref().to_string(), Arc::new(ck));
-        }
+        self.by_name.lock().unwrap()
+            .insert(name.to_lowercase(), Arc::new(ck));
+        
         Ok(())
     }
 
@@ -73,14 +77,15 @@ impl server::ResolvesServerCert for ResolvesServerCertUsingSni {
             {
                 let certs = self.by_name.lock().unwrap();
 
+                let name = name.to_lowercase();
                 // 首先尝试精确匹配
-                if let Some(cert) = certs.get(name).cloned() {
+                if let Some(cert) = certs.get(name.as_str()).cloned() {
                     return Some(cert);
                 }
 
                 // 然后尝试通配符匹配
                 for (cert_name, cert) in certs.iter() {
-                    if cert_name.starts_with("*.") && Self::matches_wildcard(name, cert_name) {
+                    if cert_name.starts_with("*.") && Self::matches_wildcard(name.as_str(), cert_name) {
                         return Some(cert.clone());
                     }
                 }

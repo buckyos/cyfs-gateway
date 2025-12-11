@@ -149,10 +149,9 @@ impl TlsStackInner {
         for cert_config in config.certs.into_iter() {
             if cert_config.certs.is_some() && cert_config.key.is_some() {
                 let cert_key = CertifiedKey::from_der(cert_config.certs.unwrap(), cert_config.key.unwrap(), &crypto_provider)
-                    .map_err(into_stack_err!(StackErrorCode::InvalidTlsCert))?;
-
+                    .map_err(into_stack_err!(StackErrorCode::InvalidTlsCert, "parse {} cert failed", cert_config.domain))?;
                 cert_resolver.add(&cert_config.domain, cert_key)
-                    .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "add cert failed"))?;
+                    .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "add {} cert failed.err {}", cert_config.domain, e))?;
             } else {
                 if config.acme_manager.is_some() {
                     config.acme_manager.as_ref().unwrap()
@@ -430,7 +429,7 @@ impl Stack for TlsStack {
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
                                                           self.inner.global_process_chains.clone(),
-                                                          Some(get_stream_external_commands(self.inner.servers.clone()))).await
+                                                          Some(get_stream_external_commands())).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
         Ok(())
