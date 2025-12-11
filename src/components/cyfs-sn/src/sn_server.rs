@@ -226,20 +226,23 @@ impl SNServer {
         let user_name = req.params.get("user_name");
         let device_name = req.params.get("device_name");
         let device_did = req.params.get("device_did");
+        let mini_config_jwt = req.params.get("mini_config_jwt");
         let device_ip = req.params.get("device_ip");
         let device_info = req.params.get("device_info");
 
         if user_name.is_none()
             || device_name.is_none()
             || device_did.is_none()
+            || mini_config_jwt.is_none()
             || device_ip.is_none()
             || device_info.is_none()
         {
-            return Err(RPCErrors::ParseRequestError("Invalid params, user_name or device_name or device_did or device_ip or device_info is none".to_string()));
+            return Err(RPCErrors::ParseRequestError("Invalid params, user_name or device_name or device_did or mini_config_jwt or device_ip or device_info is none".to_string()));
         }
         let user_name = user_name.unwrap().as_str().unwrap();
         let device_name = device_name.unwrap().as_str().unwrap();
         let device_did = device_did.unwrap().as_str().unwrap();
+        let mini_config_jwt = mini_config_jwt.unwrap().as_str().unwrap();
         let device_ip = device_ip.unwrap().as_str().unwrap();
         let device_info = device_info.unwrap().as_str().unwrap();
 
@@ -276,7 +279,7 @@ impl SNServer {
         }
 
         let db = GLOBAL_SN_DB.lock().await;
-        let ret = db.register_device(user_name, device_name, device_did, device_ip, device_info);
+        let ret = db.register_device(user_name, device_name, device_did, mini_config_jwt, device_ip, device_info);
         if ret.is_err() {
             let err_str = ret.err().unwrap().to_string();
             warn!(
@@ -457,9 +460,9 @@ impl SNServer {
                 return None;
             }
             let device_json = device_json.unwrap();
-            let sn_ip = device_json.3;
+            let sn_ip = &device_json.ip;
             let sn_ip = IpAddr::from_str(sn_ip.as_str()).unwrap();
-            let device_info_json: String = device_json.4;
+            let device_info_json: String = device_json.description.clone();
             //info!("device info json: {}",device_info_json);
             let device_info = serde_json::from_str::<DeviceInfo>(device_info_json.as_str());
             if device_info.is_err() {
@@ -488,10 +491,12 @@ impl SNServer {
             if user_info.is_some() {
                 let user_info = user_info.unwrap();
                 // 只存储前两个字段 (public_key, zone_config)，忽略 sn_ips
-                let (public_key, zone_config, sn_ips) = user_info.clone();
+                let public_key = user_info.public_key.clone();
+                let zone_config = user_info.zone_config.clone();
+                let sn_ips = user_info.sn_ips.clone();
                 let stored_info = (public_key.clone(), zone_config.clone());
                 user_zone_config_map.insert(username.to_string(), stored_info);
-                return Some(user_info);
+                return Some((public_key, zone_config, sn_ips));
             }
             warn!("zone config not found for [{}]", username);
             return None;
@@ -506,7 +511,7 @@ impl SNServer {
         let db = GLOBAL_SN_DB.lock().await;
         let user_info = db.get_user_info(username).unwrap();
         if user_info.is_some() {
-            return Some(user_info.unwrap().0.clone());
+            return Some(user_info.unwrap().public_key.clone());
         }
         return None;
     }
@@ -679,10 +684,9 @@ impl SNServer {
             return None;
         }
         let device_info = device_info.unwrap();
-        let (username, device_name, did, ip, description, created_at, updated_at) = device_info;
         return Some(OODInfo {
-            did_hostname: did.to_string(),
-            owner_id: username.clone(),
+            did_hostname: device_info.did.clone(),
+            owner_id: device_info.owner.clone(),
             self_cert: true,
             state: "active".to_string(),
         });
@@ -722,7 +726,10 @@ impl SNServer {
             if user_info.is_none() {
                 return None;
             }
-            let (username, public_key, zone_config, _) = user_info.unwrap();
+            let user_info = user_info.unwrap();
+            let username = user_info.username.as_ref().unwrap();
+            let public_key = &user_info.public_key;
+            let zone_config = &user_info.zone_config;
             let device_info = self.get_device_info(username.as_str(), "ood1").await;
             if device_info.is_some() {
                 //info!("ood1 device info found for {} in sn server",username);
@@ -731,7 +738,7 @@ impl SNServer {
                 let did_hostname = device_did.to_host_name();
                 let ood_info = OODInfo {
                     did_hostname: did_hostname,
-                    owner_id: username.clone(),
+                    owner_id: username.to_string(),
                     self_cert: true,
                     state: "active".to_string(),
                 };
@@ -912,7 +919,10 @@ impl NameServer for SNServer {
             if user_info.is_none() {
                 return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
             }
-            let (username, public_key, zone_config, _) = user_info.unwrap();
+            let user_info = user_info.unwrap();
+            let username = user_info.username.as_ref().unwrap();
+            let public_key = &user_info.public_key;
+            let zone_config = &user_info.zone_config;
             match record_type {
                 RecordType::TXT => {
                     //TODO:

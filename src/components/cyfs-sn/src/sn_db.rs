@@ -24,6 +24,60 @@ pub struct SnDB {
     pub conn: Connection,
 }
 
+#[derive(Debug, Clone)]
+pub enum UserState {
+    Active,
+    Suspended,
+    Deleted,
+    Banned,
+}
+
+impl ToString for UserState {
+    fn to_string(&self) -> String {
+        match self {
+            UserState::Active => "active".to_string(),
+            UserState::Suspended => "suspended".to_string(),
+            UserState::Deleted => "deleted".to_string(),
+            UserState::Banned => "banned".to_string(),
+        }
+    }
+}
+
+impl UserState {
+    pub fn from_str(s: Option<&str>) -> Self {
+        match s {
+            Some("suspended") => UserState::Suspended,
+            Some("deleted") => UserState::Deleted,
+            Some("banned") => UserState::Banned,
+            _ => UserState::Active, // 默认为 Active
+        }
+    }
+}
+
+
+#[derive(Debug, Clone)]
+pub struct SNUserInfo {
+    pub username: Option<String>,
+    pub state: UserState,
+    pub public_key: String,
+    pub zone_config: String,
+    pub self_cert: bool,
+    pub user_domain: Option<String>,
+    pub sn_ips: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SNDeviceInfo {
+    pub owner: String,
+    pub device_name: String,
+    pub mini_config_jwt: String,
+    pub did: String,
+    pub ip: String,
+    pub description: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
 impl SnDB {
     pub fn new() -> Result<SnDB> {
         //获得当前可执行文件所在的目录
@@ -99,8 +153,8 @@ impl SnDB {
         let mut stmt = self.conn.prepare("SELECT used FROM activation_codes WHERE code =?1")?;
         let used: Option<i32> = stmt.query_row(params![active_code], |row| row.get(0))?;
         if let Some(0) = used {
-            let mut stmt = self.conn.prepare("INSERT INTO users (username, public_key, activation_code, zone_config, user_domain, sn_ips) VALUES (?1,?2,?3,?4,?5,?6)")?;   
-            stmt.execute(params![username, public_key, active_code, zone_config, user_domain, sn_ips])?;    
+            let mut stmt = self.conn.prepare("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain, sn_ips) VALUES (?1,?2,?3,?4,?5,?6,?7)")?;   
+            stmt.execute(params![username, UserState::Active.to_string(), public_key, active_code, zone_config, user_domain, sn_ips])?;    
             let mut stmt = self.conn.prepare("UPDATE activation_codes SET used = 1 WHERE code =?1")?;   
             stmt.execute(params![active_code])?;
             Ok(true)
@@ -171,18 +225,28 @@ impl SnDB {
         current_ips.retain(|x| x != ip);
         self.set_user_sn_ips_from_vec(username, &current_ips)
     }
-    pub fn get_user_info(&self, username: &str) -> Result<Option<(String, String, Option<String>)>> {
-        let mut stmt = self.conn.prepare("SELECT public_key, zone_config, sn_ips FROM users WHERE username =?1")?;
+    pub fn get_user_info(&self, username: &str) -> Result<Option<SNUserInfo>> {
+        let mut stmt = self.conn.prepare("SELECT state, public_key, zone_config, self_cert, user_domain, sn_ips FROM users WHERE username =?1")?;
         let user_info = stmt.query_row(params![username], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            let state_str: Option<String> = row.get(0)?;
+            let self_cert: Option<i32> = row.get(3)?;
+            Ok(SNUserInfo {
+                username: None,
+                state: UserState::from_str(state_str.as_deref()),
+                public_key: row.get(1)?,
+                zone_config: row.get(2)?,
+                self_cert: self_cert.unwrap_or(0) != 0,
+                user_domain: row.get(4)?,
+                sn_ips: row.get(5)?,
+            })
         }) 
         .optional()?;
         Ok(user_info)
     }
-    pub fn register_device(&self, username: &str, device_name: &str, did: &str, ip: &str, description: &str) -> Result<()> {
+    pub fn register_device(&self, username: &str, device_name: &str, did: &str, mini_config_jwt: &str, ip: &str, description: &str) -> Result<()> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let mut stmt = self.conn.prepare("INSERT INTO devices (owner, device_name, did, ip, description, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?6)")?;
-        stmt.execute(params![username, device_name, did, ip, description, now])?;
+        let mut stmt = self.conn.prepare("INSERT INTO devices (owner, device_name, did, ip, description, mini_config_jwt, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?;
+        stmt.execute(params![username, device_name, did, ip, description, mini_config_jwt, now, now])?;
         Ok(())  
     }
     pub fn update_device_by_did(&self, did: &str, ip: &str, description: &str) -> Result<()> {
@@ -197,18 +261,36 @@ impl SnDB {
         stmt.execute(params![ip, description, now, device_name, username])?;
         Ok(())
     }
-    pub fn query_device_by_name(&self, username: &str, device_name: &str) -> Result<Option<(String, String, String, String, String, u64, u64)>> {
-        let mut stmt = self.conn.prepare("SELECT owner, device_name, did, ip, description, created_at, updated_at FROM devices WHERE device_name =?1 AND owner =?2")?;
+    pub fn query_device_by_name(&self, username: &str, device_name: &str) -> Result<Option<SNDeviceInfo>> {
+        let mut stmt = self.conn.prepare("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE device_name =?1 AND owner =?2")?;
         let device_info = stmt.query_row(params![device_name, username], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)) 
+            Ok(SNDeviceInfo {
+                owner: row.get(0)?,
+                device_name: row.get(1)?,
+                mini_config_jwt: row.get(2)?,
+                did: row.get(3)?,
+                ip: row.get(4)?,
+                description: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
         })
         .optional()?;
         Ok(device_info)
     }
-    pub fn query_device_by_did(&self, did: &str) -> Result<Option<(String, String, String, String, String, u64, u64)>> {
-        let mut stmt = self.conn.prepare("SELECT owner, device_name, did, ip, description, created_at, updated_at FROM devices WHERE did =?1")?;
+    pub fn query_device_by_did(&self, did: &str) -> Result<Option<SNDeviceInfo>> {
+        let mut stmt = self.conn.prepare("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE did =?1")?;
         let device_info = stmt.query_row(params![did], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+            Ok(SNDeviceInfo {
+                owner: row.get(0)?,
+                device_name: row.get(1)?,
+                mini_config_jwt: row.get(2)?,
+                did: row.get(3)?,
+                ip: row.get(4)?,
+                description: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
         })
        .optional()?;
         Ok(device_info)
@@ -217,32 +299,43 @@ impl SnDB {
     pub fn initialize_database(&self) -> Result<()> {
         let mut stmt = self.conn.prepare("CREATE TABLE IF NOT EXISTS activation_codes (code TEXT PRIMARY KEY, used INTEGER)")?;
         stmt.execute([])?;
-        let mut stmt = self.conn.prepare("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, public_key TEXT, activation_code TEXT, zone_config TEXT, user_domain TEXT, sn_ips TEXT)")?;   
+        let mut stmt = self.conn.prepare("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, state TEXT, public_key TEXT, activation_code TEXT, zone_config TEXT, self_cert boolean, user_domain TEXT, sn_ips TEXT)")?;   
         stmt.execute([])?; 
-        let mut stmt = self.conn.prepare("CREATE TABLE IF NOT EXISTS devices (owner TEXT, device_name TEXT, did TEXT PRIMARY KEY, ip TEXT, description TEXT, created_at INTEGER, updated_at INTEGER)")?;
+        let mut stmt = self.conn.prepare("CREATE TABLE IF NOT EXISTS devices (owner TEXT, device_name TEXT, did TEXT PRIMARY KEY, ip TEXT, description TEXT, mini_config_jwt TEXT, created_at INTEGER, updated_at INTEGER)")?;
         stmt.execute([])?;
         Ok(())
     }
-    pub fn get_user_info_by_domain(&self, domain: &str) -> Result<Option<(String, String, String, Option<String>)>> {
-        let mut stmt = self.conn.prepare("SELECT username, public_key, zone_config, sn_ips FROM users WHERE ? = user_domain OR ? LIKE '%.' || user_domain")?;
+    pub fn get_user_info_by_domain(&self, domain: &str) -> Result<Option<SNUserInfo>> {
+        let mut stmt = self.conn.prepare("SELECT username, state, public_key, zone_config, self_cert, user_domain, sn_ips FROM users WHERE ? = user_domain OR ? LIKE '%.' || user_domain")?;
         let user_info = stmt.query_row(params![domain, domain], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            let state_str: Option<String> = row.get(1)?;
+            let self_cert: Option<i32> = row.get(4)?;
+            Ok(SNUserInfo {
+                username: Some(row.get(0)?),
+                state: UserState::from_str(state_str.as_deref()),
+                public_key: row.get(2)?,
+                zone_config: row.get(3)?,
+                self_cert: self_cert.unwrap_or(0) != 0,
+                user_domain: row.get(5)?,
+                sn_ips: row.get(6)?,
+            })
         }).optional()?;
         Ok(user_info)
     }
 
-    pub fn query_device(&self, did: &str) -> Result<Option<(String, String, String, String, String, u64, u64)>> {
-        let mut stmt = self.conn.prepare("SELECT owner, device_name, did, ip, description, created_at, updated_at FROM devices WHERE did = ?1")?;
+    pub fn query_device(&self, did: &str) -> Result<Option<SNDeviceInfo>> {
+        let mut stmt = self.conn.prepare("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE did = ?1")?;
         let device_info = stmt.query_row(params![did], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?
-            ))
+            Ok(SNDeviceInfo {
+                owner: row.get(0)?,
+                device_name: row.get(1)?,
+                mini_config_jwt: row.get(2)?,
+                did: row.get(3)?,
+                ip: row.get(4)?,
+                description: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
         }).optional()?;
         Ok(device_info)
     }
@@ -311,19 +404,69 @@ mod tests {
         if let Some(ips_vec) = db.get_user_sn_ips_as_vec("lzc")? {
             println!("User sn_ips after removing: {:?}", ips_vec);
         }
+        // 测试设备注册和查询
         let device_info_str =r#"{"hostname":"ood1","device_type":"ood","did":"did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc","ip":"192.168.1.86","sys_hostname":"LZC-USWORK","base_os_info":"Ubuntu 22.04 5.15.153.1-microsoft-standard-WSL2","cpu_info":"AMD Ryzen 7 5800X 8-Core Processor @ 3800 MHz","cpu_usage":0.0,"total_mem":67392299008,"mem_usage":5.7286677}"#;
         println!("device_info_str: {}",device_info_str);
-        db.register_device( "lzc", "ood1", "did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc", "192.168.1.188", device_info_str)?;
+        let mini_config_jwt = "eyJhbGciOiJFZERTQSJ9.eyJkaWQiOiJkaWQ6ZGV2Om9vZDEiLCJvd25lciI6ImRpZDplbnM6bHpjIiwiZXhwIjoyMDQ0ODIzMzM2fQ.test_signature";
+        db.register_device( "lzc", "ood1", "did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc", mini_config_jwt, "192.168.1.188", device_info_str)?;
         db.update_device_by_name("lzc", "oo1", "75.4.200.194", device_info_str)?;
         
+        // 测试使用 SNDeviceInfo 结构体
         if let Some(device_info) = db.query_device("did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc")? {
+            println!("\n=== Device Info (by DID) ===");
             println!("Device info: {:?}", device_info);
+            println!("Device owner: {}", device_info.owner);
+            println!("Device name: {}", device_info.device_name);
+            println!("Device DID: {}", device_info.did);
+            println!("Device mini_config_jwt: {}", device_info.mini_config_jwt);
+            println!("Device IP: {}", device_info.ip);
+            println!("Device created_at: {}", device_info.created_at);
+            println!("Device updated_at: {}", device_info.updated_at);
         } else {
             println!("Device not found.");
         }
         
-        let user_info = db.get_user_info_by_domain( "app1.www.zhicong.me")?;
-        println!("user_info: {:?}", user_info);
+        // 测试通过设备名查询
+        if let Some(device_info) = db.query_device_by_name("lzc", "ood1")? {
+            println!("\n=== Device Info (by name) ===");
+            println!("Query device by name - owner: {}, did: {}", device_info.owner, device_info.did);
+            println!("Mini config JWT: {}", device_info.mini_config_jwt);
+        }
+        
+        // 测试使用 SNUserInfo 结构体 - 验证所有字段都被正确填充
+        if let Some(user_info) = db.get_user_info("lzc")? {
+            println!("\n=== User Info (by username) ===");
+            println!("User info: {:?}", user_info);
+            println!("State: {:?}", user_info.state);
+            println!("Public key: {}", user_info.public_key);
+            println!("Zone config: {}", user_info.zone_config);
+            println!("Self cert: {}", user_info.self_cert);
+            if let Some(domain) = &user_info.user_domain {
+                println!("User domain: {}", domain);
+            }
+            if let Some(sn_ips) = &user_info.sn_ips {
+                println!("SN IPs: {}", sn_ips);
+            }
+        }
+        
+        // 测试通过域名查询用户信息 - 验证所有字段都被正确填充
+        if let Some(user_info) = db.get_user_info_by_domain("app1.www.zhicong.me")? {
+            println!("\n=== User Info (by domain) ===");
+            println!("User info by domain: {:?}", user_info);
+            if let Some(username) = &user_info.username {
+                println!("Username from domain query: {}", username);
+            }
+            println!("State: {:?}", user_info.state);
+            println!("Public key from domain query: {}", user_info.public_key);
+            println!("Zone config: {}", user_info.zone_config);
+            println!("Self cert: {}", user_info.self_cert);
+            if let Some(domain) = &user_info.user_domain {
+                println!("User domain from query: {}", domain);
+            }
+            if let Some(sn_ips) = &user_info.sn_ips {
+                println!("SN IPs from domain query: {}", sn_ips);
+            }
+        }
 
         Ok(())
     }
