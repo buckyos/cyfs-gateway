@@ -92,7 +92,9 @@ fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RDat
         }
         "TXT" => {
             let mut records = Vec::new();
-            records.push(RData::TXT(TXT::new(name_info.txt.clone())));
+            for txt in name_info.txt.iter() {
+                records.push(RData::TXT(TXT::new(vec![txt.clone()])));
+            }
             return Ok(records);
         }
         _ => {

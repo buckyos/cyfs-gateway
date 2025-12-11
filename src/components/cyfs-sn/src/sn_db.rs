@@ -178,6 +178,12 @@ impl SnDB {
         stmt.execute(params![sn_ips, username])?;
         Ok(())
     }
+
+    pub fn update_user_self_cert(&self, username: &str, self_cert: bool) -> Result<()> {
+        let mut stmt = self.conn.prepare("UPDATE users SET self_cert =?1 WHERE username =?2")?;
+        stmt.execute(params![self_cert, username])?;
+        Ok(())
+    }
     
     pub fn get_user_sn_ips(&self, username: &str) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare("SELECT sn_ips FROM users WHERE username =?1")?;
@@ -225,6 +231,7 @@ impl SnDB {
         current_ips.retain(|x| x != ip);
         self.set_user_sn_ips_from_vec(username, &current_ips)
     }
+
     pub fn get_user_info(&self, username: &str) -> Result<Option<SNUserInfo>> {
         let mut stmt = self.conn.prepare("SELECT state, public_key, zone_config, self_cert, user_domain, sn_ips FROM users WHERE username =?1")?;
         let user_info = stmt.query_row(params![username], |row| {
@@ -243,6 +250,7 @@ impl SnDB {
         .optional()?;
         Ok(user_info)
     }
+
     pub fn register_device(&self, username: &str, device_name: &str, did: &str, mini_config_jwt: &str, ip: &str, description: &str) -> Result<()> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let mut stmt = self.conn.prepare("INSERT INTO devices (owner, device_name, did, ip, description, mini_config_jwt, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?;
@@ -255,7 +263,13 @@ impl SnDB {
         stmt.execute(params![ip, description, now, did])?;
         Ok(())  
     }
-    pub fn update_device_by_name(&self, username: &str, device_name: &str, ip: &str, description: &str) -> Result<()> {
+    pub fn update_device_by_name(&self, username: &str, device_name: &str, did: &str, mini_config_jwt: &str,ip: &str, description: &str) -> Result<()> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();  
+        let mut stmt = self.conn.prepare("UPDATE devices SET did =?1, mini_config_jwt =?2, ip =?3, description =?4, updated_at =?5 WHERE device_name =?6 AND owner =?7")?;    
+        stmt.execute(params![did, mini_config_jwt, ip, description, now, device_name, username])?;
+        Ok(())
+    }
+    pub fn update_device_info_by_name(&self, username: &str, device_name: &str,ip: &str, description: &str) -> Result<()> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();  
         let mut stmt = self.conn.prepare("UPDATE devices SET ip =?1, description =?2, updated_at =?3 WHERE device_name =?4 AND owner =?5")?;    
         stmt.execute(params![ip, description, now, device_name, username])?;
@@ -404,12 +418,22 @@ mod tests {
         if let Some(ips_vec) = db.get_user_sn_ips_as_vec("lzc")? {
             println!("User sn_ips after removing: {:?}", ips_vec);
         }
+        
+        // 测试更新用户 self_cert 字段
+        println!("\n=== Test update_user_self_cert ===");
+        db.update_user_self_cert("lzc", true)?;
+        println!("Updated user self_cert to true");
+        
+        if let Some(user_info) = db.get_user_info("lzc")? {
+            println!("Self cert after update: {}", user_info.self_cert);
+            assert_eq!(user_info.self_cert, true, "self_cert should be true");
+        }
+        
         // 测试设备注册和查询
         let device_info_str =r#"{"hostname":"ood1","device_type":"ood","did":"did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc","ip":"192.168.1.86","sys_hostname":"LZC-USWORK","base_os_info":"Ubuntu 22.04 5.15.153.1-microsoft-standard-WSL2","cpu_info":"AMD Ryzen 7 5800X 8-Core Processor @ 3800 MHz","cpu_usage":0.0,"total_mem":67392299008,"mem_usage":5.7286677}"#;
-        println!("device_info_str: {}",device_info_str);
+        println!("\ndevice_info_str: {}",device_info_str);
         let mini_config_jwt = "eyJhbGciOiJFZERTQSJ9.eyJkaWQiOiJkaWQ6ZGV2Om9vZDEiLCJvd25lciI6ImRpZDplbnM6bHpjIiwiZXhwIjoyMDQ0ODIzMzM2fQ.test_signature";
         db.register_device( "lzc", "ood1", "did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc", mini_config_jwt, "192.168.1.188", device_info_str)?;
-        db.update_device_by_name("lzc", "oo1", "75.4.200.194", device_info_str)?;
         
         // 测试使用 SNDeviceInfo 结构体
         if let Some(device_info) = db.query_device("did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc")? {
@@ -433,14 +457,32 @@ mod tests {
             println!("Mini config JWT: {}", device_info.mini_config_jwt);
         }
         
+        // 测试更新设备信息（包括 did 和 mini_config_jwt）
+        println!("\n=== Test update_device_by_name ===");
+        let updated_device_info_str =r#"{"hostname":"ood1","device_type":"ood","did":"did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc","ip":"192.168.1.100","sys_hostname":"LZC-USWORK-UPDATED","base_os_info":"Ubuntu 22.04","cpu_info":"AMD Ryzen 7 5800X","cpu_usage":1.5,"total_mem":67392299008,"mem_usage":6.0}"#;
+        let updated_did = "did:dev:gubVIszw-u_d5PVTh-oc8CKAhM9C-ne5G_yUK5BDaXc-updated";
+        let updated_mini_config_jwt = "eyJhbGciOiJFZERTQSJ9.eyJkaWQiOiJkaWQ6ZGV2Om9vZDEiLCJvd25lciI6ImRpZDplbnM6bHpjIiwiZXhwIjoyMDQ0ODIzMzM2fQ.updated_signature";
+        db.update_device_by_name("lzc", "ood1", updated_did, updated_mini_config_jwt, "192.168.1.200", updated_device_info_str)?;
+        println!("Updated device by name with new DID, mini_config_jwt, IP and description");
+        
+        if let Some(device_info) = db.query_device_by_name("lzc", "ood1")? {
+            println!("Updated device DID: {}", device_info.did);
+            println!("Updated device IP: {}", device_info.ip);
+            println!("Updated mini_config_jwt: {}", device_info.mini_config_jwt);
+            assert_eq!(device_info.did, updated_did, "DID should be updated");
+            assert_eq!(device_info.ip, "192.168.1.200", "IP should be updated");
+            assert_eq!(device_info.mini_config_jwt, updated_mini_config_jwt, "mini_config_jwt should be updated");
+        }
+        
         // 测试使用 SNUserInfo 结构体 - 验证所有字段都被正确填充
         if let Some(user_info) = db.get_user_info("lzc")? {
-            println!("\n=== User Info (by username) ===");
+            println!("\n=== User Info (by username) - Final State ===");
             println!("User info: {:?}", user_info);
             println!("State: {:?}", user_info.state);
             println!("Public key: {}", user_info.public_key);
             println!("Zone config: {}", user_info.zone_config);
-            println!("Self cert: {}", user_info.self_cert);
+            println!("Self cert: {} (should be true after update)", user_info.self_cert);
+            assert_eq!(user_info.self_cert, true, "self_cert should be true after update");
             if let Some(domain) = &user_info.user_domain {
                 println!("User domain: {}", domain);
             }
@@ -459,7 +501,8 @@ mod tests {
             println!("State: {:?}", user_info.state);
             println!("Public key from domain query: {}", user_info.public_key);
             println!("Zone config: {}", user_info.zone_config);
-            println!("Self cert: {}", user_info.self_cert);
+            println!("Self cert: {} (should be true)", user_info.self_cert);
+            assert_eq!(user_info.self_cert, true, "self_cert should be true in domain query");
             if let Some(domain) = &user_info.user_domain {
                 println!("User domain from query: {}", domain);
             }

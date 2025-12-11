@@ -45,22 +45,13 @@ pub struct SNServer {
     server_host: String,
     server_ip: IpAddr,
     server_aliases: Vec<String>,
-    zone_boot_config: String,
-    zone_boot_config_pkx: String,
-    zone_gateway_list: Option<Vec<String>>, //device_list is the list of device_did
+    boot_jwt: String,
+    owner_pkx: String,
+    device_jwt: Vec<String>,
 }
 
 impl SNServer {
     pub fn new(server_config: SNServerConfig) -> Self {
-        // let conn = get_sn_db_conn();
-        // if conn.is_ok() {
-        //     let conn = conn.unwrap();
-        //     initialize_database(&conn);
-        // } else {
-        //     error!("Failed to open sn_db.sqlite3");
-        //     panic!("Failed to open sn_db.sqlite3");
-        // }
-
         let mut device_list: Option<Vec<String>> = None;
         let current_device_config = CURRENT_DEVICE_CONFIG.get();
         if current_device_config.is_some() {
@@ -74,9 +65,6 @@ impl SNServer {
 
         let server_host = server_config.host;
         let server_ip = IpAddr::from_str(server_config.ip.as_str()).unwrap();
-        //TODO:需要改进
-        let zone_config = server_config.zone_config_jwt;
-        let zone_config_pkx = server_config.zone_config_pkx;
 
         SNServer {
             id: server_config.id,
@@ -85,9 +73,9 @@ impl SNServer {
             server_host: server_host,
             server_ip: server_ip,
             server_aliases: server_config.aliases,
-            zone_boot_config: zone_config,
-            zone_boot_config_pkx: zone_config_pkx,
-            zone_gateway_list: device_list,
+            boot_jwt: server_config.boot_jwt,
+            owner_pkx: server_config.owner_pkx,
+            device_jwt: server_config.device_jwt,
         }
     }
 
@@ -222,6 +210,8 @@ impl SNServer {
         return Ok(resp);
     }
 
+
+
     pub async fn register_device(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
         let user_name = req.params.get("user_name");
         let device_name = req.params.get("device_name");
@@ -277,6 +267,24 @@ impl SNServer {
         {
             return Err(RPCErrors::ParseRequestError("invalid appid".to_string()));
         }
+
+        let mini_device_config = DeviceMiniConfig::from_jwt(mini_config_jwt, &user_public_key);
+        if mini_device_config.is_err() {
+            return Err(RPCErrors::ParseRequestError(format!(
+                "Failed to parse mini device config: {}",
+                mini_device_config.err().unwrap().to_string()
+            )));
+        }
+        let mini_device_config = mini_device_config.unwrap();
+        let dev_did = format!("did:dev:{}",mini_device_config.x.as_str());
+        if dev_did.as_str() != device_did {
+            return Err(RPCErrors::ParseRequestError(format!(
+                "Invalid device did: {} (from jwt) != {} (from request)",
+                dev_did,
+                device_did
+            )));
+        }
+      
 
         let db = GLOBAL_SN_DB.lock().await;
         let ret = db.register_device(user_name, device_name, device_did, mini_config_jwt, device_ip, device_info);
@@ -358,12 +366,14 @@ impl SNServer {
         );
         let ip_str = ip_from.to_string();
         let db = GLOBAL_SN_DB.lock().await;
-        db.update_device_by_name(
+        
+        db.update_device_info_by_name(
             owner_id,
             &device_info.name.clone(),
             ip_str.as_str(),
             device_info_json.to_string().as_str(),
         );
+
         let resp = RPCResponse::new(
             RPCResult::Success(json!({
                 "code":0
@@ -440,6 +450,9 @@ impl SNServer {
         return sn_ip_add;
     }
 
+
+
+
     async fn get_device_info(
         &self,
         owner_id: &str,
@@ -480,31 +493,62 @@ impl SNServer {
             return device_info.cloned();
         }
     }
+    //return (owner_public_key,zone_config_jwt,device_jwt)
+    async fn get_user_zone_config_by_domain(&self, domain: &str) -> Option<(String, String, Option<String>)> {
+        let db: tokio::sync::MutexGuard<'_, SnDB> = GLOBAL_SN_DB.lock().await;
+        let user_info = db
+            .get_user_info_by_domain(domain);
+        drop(db);
 
-    //return (owner_public_key,zone_config_jwt)
-    async fn get_user_zone_config(&self, username: &str) -> Option<(String, String, Option<String>)> {
-        let mut user_zone_config_map = self.all_user_zone_config.lock().await;
-        let zone_config_reuslt = user_zone_config_map.get(username).cloned();
-        if zone_config_reuslt.is_none() {
-            let db = GLOBAL_SN_DB.lock().await;
-            let user_info = db.get_user_info(username).unwrap();
-            if user_info.is_some() {
-                let user_info = user_info.unwrap();
-                // 只存储前两个字段 (public_key, zone_config)，忽略 sn_ips
-                let public_key = user_info.public_key.clone();
-                let zone_config = user_info.zone_config.clone();
-                let sn_ips = user_info.sn_ips.clone();
-                let stored_info = (public_key.clone(), zone_config.clone());
-                user_zone_config_map.insert(username.to_string(), stored_info);
-                return Some((public_key, zone_config, sn_ips));
-            }
-            warn!("zone config not found for [{}]", username);
+        if user_info.is_err() {
+            warn!("failed to get user info by domain {}: {:?}", domain, user_info.err().unwrap());
             return None;
-        } else {
-            // 从缓存中获取的数据只有两个字段，需要添加 None 作为 sn_ips
-            let (public_key, zone_config) = zone_config_reuslt.unwrap();
-            return Some((public_key, zone_config, None));
         }
+        let user_info = user_info.unwrap();
+        if user_info.is_none() {
+            warn!("user info not found for domain {}", domain);
+            return None;
+        }
+        let user_info = user_info.unwrap();
+        let username = user_info.username.as_ref().unwrap();
+        let zone_config_info = self.get_user_zone_config(username.as_str()).await;
+        if zone_config_info.is_none() {
+            warn!("zone config not found for user {}", username);
+            return None;
+        }
+        let (public_key, zone_config, _sn_ips, device_jwt) = zone_config_info.unwrap();
+        return Some((public_key, zone_config, device_jwt));
+    }
+
+    //return (owner_public_key,zone_config_jwt,sn_ip,device_jwt)
+    async fn get_user_zone_config(&self, username: &str) -> Option<(String, String, Option<String>,Option<String>)> {
+        let db = GLOBAL_SN_DB.lock().await;
+        let user_info = db.get_user_info(username).unwrap();
+        if user_info.is_some() {
+            let user_info = user_info.unwrap();
+            // 只存储前两个字段 (public_key, zone_config)，忽略 sn_ips
+            let public_key = user_info.public_key.clone();
+            let zone_config = user_info.zone_config.clone();
+            let sn_ips = user_info.sn_ips.clone();
+            let stored_info = (public_key.clone(), zone_config.clone());
+
+            let device_info = db.query_device_by_name(username, "ood1");
+            if device_info.is_ok() {
+                let device_info = device_info.unwrap();
+                if device_info.is_some() {
+                    let device_info = device_info.unwrap();
+                    let device_jwt = device_info.mini_config_jwt.clone();
+                    if device_jwt.len() > 3 {
+                        return Some((public_key, zone_config, sn_ips, Some(device_jwt)));
+                    } 
+                } 
+            } 
+
+            return Some((public_key, zone_config, sn_ips, None));
+        }
+        warn!("zone config not found for [{}]", username);
+        return None;
+  
     }
 
     async fn get_user_public_key(&self, username: &str) -> Option<String> {
@@ -548,7 +592,28 @@ impl SNServer {
         return None;
     }
 
+    async fn get_user_zonegate_address_by_domain(&self, domain: &str) -> Option<Vec<IpAddr>> {
+        let db = GLOBAL_SN_DB.lock().await;
+        let user_info = db
+            .get_user_info_by_domain(domain);
+        drop(db);
+        if user_info.is_err() {
+            warn!("failed to get user info by domain {}: {:?}", domain, user_info.err().unwrap());
+            return None;
+        }
+        let user_info = user_info.unwrap();
+        if user_info.is_none() {
+            warn!("user info not found for domain {}", domain);
+            return None;
+        }
+        let user_info = user_info.unwrap();
+
+        return self.get_user_zonegate_address(user_info.username.as_ref().unwrap()).await;
+
+    }
+
     async fn get_user_zonegate_address(&self, username: &str) -> Option<Vec<IpAddr>> {
+        //TODO:需要根据zone_boot_config中的gateway device name来获取gateway device info，而不是写死ood1
         let device_info = self.get_device_info(username, "ood1").await;
 
         if device_info.is_some() {
@@ -751,6 +816,21 @@ impl SNServer {
 
         return None;
     }
+
+    pub fn create_name_info_from_zone_config(
+        &self,
+        zone_config: &str,
+        public_key: &str,
+        device_jwt: Option<&String>,
+    ) -> NameInfo {
+        let mut name_info = NameInfo::default();
+        name_info.txt.push(format!("BOOT={};", self.boot_jwt));
+        name_info.txt.push(format!("PKX={};", self.owner_pkx));
+        if device_jwt.is_some() {
+            name_info.txt.push(format!("DEV={};", device_jwt.as_ref().unwrap().as_str()));
+        }
+        return name_info;
+    }
 }
 
 #[async_trait]
@@ -821,24 +901,11 @@ impl NameServer for SNServer {
                     let result_name_info = NameInfo::from_address(name, self.server_ip);
                     return Ok(result_name_info);
                 }
-                //TODO:
-                // RecordType::TXT => {
-                //     let mut gateway_list = Vec::new();
-                //     let current_device_config = CURRENT_DEVICE_CONFIG.get();
-                //     if current_device_config.is_some() {
-                //         let current_device_config = current_device_config.unwrap();
-                //         gateway_list.push(current_device_config.get_id().to_string());
-                //     }
-                //     let gateway_list = Some(gateway_list);
-                //     //返回当前服务器的zoneconfig和auth_key
-                //     let result_name_info = NameInfo::from_zone_config_str(
-                //         name,
-                //         self.zone_boot_config.as_str(),
-                //         self.zone_boot_config_pkx.as_str(),
-                //         &gateway_list,
-                //     );
-                //     return Ok(result_name_info);
-                // }
+                RecordType::TXT => {
+                    let device_jwt = self.device_jwt.get(0);
+                    let name_info = self.create_name_info_from_zone_config(self.boot_jwt.as_str(), self.owner_pkx.as_str(), device_jwt);
+                    return Ok(name_info);
+                }
                 _ => {
                     return Err(server_err!(ServerErrorCode::NotFound,
                         "sn-server not support record type {}",
@@ -871,24 +938,10 @@ impl NameServer for SNServer {
                 RecordType::TXT => {
                     let zone_config = self.get_user_zone_config(username).await;
                     if zone_config.is_some() {
-                        //TODO:
-                        // let zone_config = zone_config.unwrap();
-                        // let pkx = get_x_from_jwk_string(zone_config.0.as_str()).map_err(|e| {
-                        //     error!("failed to get x from jwk string: {:?}", e);
-                        //     server_err!(ServerErrorCode::NotFound,
-                        //         "failed to get x from jwk string: {}",
-                        //         e.to_string()
-                        //     )
-                        // })?;
-                        // let result_name_info = NameInfo::from_zone_config_str(
-                        //     name,
-                        //     zone_config.1.as_str(),
-                        //     pkx.as_str(),
-                        //     &None,
-                        // );
-                        // info!("result_name_info: {:?}", result_name_info);
-                        // return Ok(result_name_info);
-                        unimplemented!();
+                        let mut name_info = NameInfo::default();
+                        let (public_key, zone_config, sn_ips, device_jwt) = zone_config.unwrap();
+                        let name_info = self.create_name_info_from_zone_config(zone_config.as_str(), public_key.as_str(), device_jwt.as_ref());
+                        return Ok(name_info);
                     } else {
                         return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
                     }
@@ -912,33 +965,19 @@ impl NameServer for SNServer {
             }
         } else {
             let real_domain_name = name[0..name.len() - 1].to_string();
-            let db = GLOBAL_SN_DB.lock().await;
-            let user_info = db
-                .get_user_info_by_domain(real_domain_name.as_str())
-                .unwrap();
-            if user_info.is_none() {
-                return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
-            }
-            let user_info = user_info.unwrap();
-            let username = user_info.username.as_ref().unwrap();
-            let public_key = &user_info.public_key;
-            let zone_config = &user_info.zone_config;
             match record_type {
                 RecordType::TXT => {
-                    //TODO:
-                    // let pkx = get_x_from_jwk_string(public_key.as_str())
-                    //     .map_err(into_server_err!(ServerErrorCode::InvalidConfig))?;
-                    // let result_name_info = NameInfo::from_zone_config_str(
-                    //     name,
-                    //     zone_config.as_str(),
-                    //     pkx.as_str(),
-                    //     &None,
-                    // );
-                    // return Ok(result_name_info);
-                    unimplemented!();
+                    let zone_config_info = self.get_user_zone_config_by_domain(&real_domain_name).await;
+                    if zone_config_info.is_some() {
+                        let (public_key, zone_config, device_jwt) = zone_config_info.unwrap();
+                        let name_info = self.create_name_info_from_zone_config(zone_config.as_str(), public_key.as_str(), device_jwt.as_ref());
+                        return Ok(name_info);
+                    } else {
+                        return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
+                    }
                 }
                 RecordType::A | RecordType::AAAA => {
-                    let address_vec = self.get_user_zonegate_address(&username).await;
+                    let address_vec = self.get_user_zonegate_address_by_domain(&real_domain_name).await;
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
@@ -1075,8 +1114,9 @@ pub struct SNServerConfig {
     id: String,
     host: String,
     ip: String,
-    zone_config_jwt: String,
-    zone_config_pkx: String,
+    boot_jwt: String,
+    owner_pkx: String,
+    device_jwt: Vec<String>,
     #[serde(default)]
     aliases: Vec<String>,
 }

@@ -72,7 +72,12 @@ pub fn set_gateway_main_config_dir(path: &PathBuf) {
 pub fn normalize_config_file_path(path: PathBuf,base_dir:&PathBuf) -> PathBuf {
     if path.is_relative() {
         let result_path = base_dir.join(path.clone());
-        return result_path.canonicalize().unwrap();
+        let ret = result_path.canonicalize();
+        if ret.is_err() {
+            error!("normalize_config_file_path {}: error: {}", path.to_string_lossy(), ret.err().unwrap());
+            return path;
+        }
+        return ret.unwrap();
     }
     path
 }
