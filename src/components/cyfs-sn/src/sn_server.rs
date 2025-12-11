@@ -91,9 +91,6 @@ impl SNServer {
         }
     }
 
-    pub async fn get_user_tls_cert(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
-        unimplemented!();
-    }
 
     pub async fn check_username(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
         let username = req.params.get("username");
@@ -604,10 +601,6 @@ impl SNServer {
     ) -> Result<RPCResponse, RPCErrors> {
         info!("sn server handle rpc call: {}", req.method);
         match req.method.as_str() {
-            "get_user_tls_cert" => {
-                //get user tls cert
-                return self.get_user_tls_cert(req).await;
-            }
             "check_active_code" => {
                 //check active code
                 return self.check_active_code(req).await;

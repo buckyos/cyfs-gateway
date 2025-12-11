@@ -91,9 +91,17 @@ pub(crate) async fn nameinfo_to_map_collection(record_type: &str, name_info: &Na
             return Ok(map);
         }
         "TXT" => {
-            //TODO:
-            unimplemented!();
+            if name_info.txt.is_empty() {
+                return Err(server_err!(ServerErrorCode::InvalidParam, "TXT is empty"));
+            }
 
+            let txt_set = MemorySetCollection::new();
+            for txt in name_info.txt.iter() {
+                txt_set.insert(txt).await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "add txt {} err {}", txt, e))?;
+            }
+            map.insert("txt", CollectionValue::Set(Arc::new(Box::new(txt_set)))).await
+                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "add txt err {}", e))?;
             return Ok(map);
         }
         _ => {
@@ -196,39 +204,17 @@ pub(crate) async fn map_collection_to_nameinfo(map: &MapCollectionRef) -> Server
                     CollectionValue::String(s) => {
                         name_info.txt.push(s);
                     },
+                    CollectionValue::Set(s) => {
+                        let all = s.get_all().await
+                            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "get txt set all err {}", e))?;
+                        for item in all.iter() {
+                            name_info.txt.push(item.clone());
+                        }
+                    },
                     _ => return Err(server_err!(ServerErrorCode::ProcessChainError, "txt is not string"))
                 }
             }
-            unimplemented!();
-            // let did_document = map.get("did_document").await
-            //     .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "get did_document err {}", e))?;
-            // if let Some(did_document) = did_document {
-            //     match did_document {
-            //         CollectionValue::String(s) => {
-            //             name_info.did_document = Some(EncodedDocument::from_str(s)
-            //                 .map_err(into_server_err!(ServerErrorCode::ProcessChainError, "parse did_document err"))?);
-            //         }
-            //         _ => return Err(server_err!(ServerErrorCode::ProcessChainError, "did_document is not string"))
-            //     }
-            // }
 
-            // let pk_x_list = map.get("pk_x_list").await
-            //     .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "get pk_x_list err {}", e))?;
-            // if let Some(pk_x_list) = pk_x_list {
-            //     match pk_x_list {
-            //         CollectionValue::Set(s) => {
-            //             let mut pk_x_list = Vec::new();
-            //             let all = s.get_all().await
-            //                 .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "get pk_x_list set all err {}", e))?;
-            //             for item in all.iter() {
-            //                 pk_x_list.push(item.clone());
-            //             }
-            //             name_info.pk_x_list = Some(pk_x_list);
-            //         }
-            //         _ => return Err(server_err!(ServerErrorCode::ProcessChainError, "pk_x_list is not set"))
-            //     }
-            // }
-            // name_info.ttl = Some(ttl);
             Ok(name_info)
         }
         _ => {

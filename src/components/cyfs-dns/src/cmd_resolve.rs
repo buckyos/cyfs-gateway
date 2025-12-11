@@ -8,6 +8,8 @@ use cyfs_gateway_lib::{server_err, Server, ServerManagerRef, ServerResult};
 use cyfs_process_chain::{command_help, CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel, ExternalCommand};
 use crate::nameinfo_to_map_collection;
 
+//todo:implement the cmd_resolve_did
+
 pub struct CmdResolve {
     name: String,
     cmd: Command,
@@ -148,25 +150,6 @@ impl ExternalCommand for CmdResolve {
                 }
             } else {
                 if let Some(dns_service) = self.server_mgr.get_name_server(server_address) {
-                    // if record_type == RecordType::DID {
-                    //     let did = DID::from_str(domain).map_err(|_e| {
-                    //         let msg = format!("Invalid DID: {}", domain);
-                    //         error!("{}", msg);
-                    //         msg
-                    //     })?;
-                    //     match dns_service.query(domain, Some(record_type), None).await
-                    //         .map_err(|e| {
-                    //             let msg = format!("Failed to resolve domain {} record_type {}: {:?}", domain, record_type_str, e);
-                    //             error!("{}", msg);
-                    //             msg
-                    //         }) {
-                    //         Ok(name_info) => name_info,
-                    //         Err(e) => {
-                    //             return Ok(CommandResult::Error(e))
-                    //         }
-                    //     }
-
-                    // } else {
                     match dns_service.query(domain, Some(record_type), None).await
                         .map_err(|e| {
                             let msg = format!("Failed to resolve domain {} record_type {}: {:?}", domain, record_type_str, e);
@@ -178,7 +161,6 @@ impl ExternalCommand for CmdResolve {
                             return Ok(CommandResult::Error(e))
                         }
                     }
-                    //
                 } else {
                     let msg = format!("Invalid resolve command: inner service {} not found", server_address);
                     error!("{}", msg);
