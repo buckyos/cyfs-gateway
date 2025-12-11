@@ -2,19 +2,19 @@ use std::net::{IpAddr, SocketAddr};
 use clap::{Arg, Command};
 use hickory_proto::xfer::Protocol;
 use log::error;
-use name_client::{DnsProvider, NameInfo, NameProof, NsProvider, RecordType};
+use name_client::{DnsProvider, NameInfo, NsProvider, RecordType};
 use name_lib::{EncodedDocument, DID};
 use cyfs_gateway_lib::{server_err, Server, ServerManagerRef, ServerResult};
 use cyfs_process_chain::{command_help, CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel, ExternalCommand};
 use crate::nameinfo_to_map_collection;
 
-pub struct Resolve {
+pub struct CmdResolve {
     name: String,
     cmd: Command,
     server_mgr: ServerManagerRef,
 }
 
-impl Resolve {
+impl CmdResolve {
     pub fn new(server_mgr: ServerManagerRef) -> Self {
         let cmd = Command::new("resolve")
             .about("resolve a domain name")
@@ -59,7 +59,7 @@ Examples:
 }
 
 #[async_trait::async_trait]
-impl ExternalCommand for Resolve {
+impl ExternalCommand for CmdResolve {
     fn help(&self, name: &str, help_type: CommandHelpType) -> String {
         assert_eq!(self.cmd.get_name(), name);
         command_help(help_type, &self.cmd)
@@ -148,59 +148,37 @@ impl ExternalCommand for Resolve {
                 }
             } else {
                 if let Some(dns_service) = self.server_mgr.get_name_server(server_address) {
-                    if record_type == RecordType::DID {
-                        let did = DID::from_str(domain).map_err(|_e| {
-                            let msg = format!("Invalid DID: {}", domain);
+                    // if record_type == RecordType::DID {
+                    //     let did = DID::from_str(domain).map_err(|_e| {
+                    //         let msg = format!("Invalid DID: {}", domain);
+                    //         error!("{}", msg);
+                    //         msg
+                    //     })?;
+                    //     match dns_service.query(domain, Some(record_type), None).await
+                    //         .map_err(|e| {
+                    //             let msg = format!("Failed to resolve domain {} record_type {}: {:?}", domain, record_type_str, e);
+                    //             error!("{}", msg);
+                    //             msg
+                    //         }) {
+                    //         Ok(name_info) => name_info,
+                    //         Err(e) => {
+                    //             return Ok(CommandResult::Error(e))
+                    //         }
+                    //     }
+
+                    // } else {
+                    match dns_service.query(domain, Some(record_type), None).await
+                        .map_err(|e| {
+                            let msg = format!("Failed to resolve domain {} record_type {}: {:?}", domain, record_type_str, e);
                             error!("{}", msg);
                             msg
-                        })?;
-                        match dns_service.query(domain, Some(record_type), None).await
-                            .map_err(|e| {
-                                let msg = format!("Failed to resolve domain {} record_type {}: {:?}", domain, record_type_str, e);
-                                error!("{}", msg);
-                                msg
-                            }) {
-                            Ok(name_info) => name_info,
-                            Err(e) => {
-                                return Ok(CommandResult::Error(e))
-                            }
-                        }
-                        // match dns_service.query_did(&did, None, None).await
-                        //     .map_err(|e| {
-                        //         let msg = format!("Failed to resolve domain {} record_type {}: {:?}", domain, record_type_str, e);
-                        //         error!("{}", msg);
-                        //         msg
-                        //     }) {
-                        //     Ok(name_info) => {
-                        //         NameInfo {
-                        //             name: domain.to_string(),
-                        //             address: vec![],
-                        //             cname: None,
-                        //             txt: None,
-                        //             did_document: Some(name_info),
-                        //             pk_x_list: None,
-                        //             proof_type: NameProof::None,
-                        //             create_time: 0,
-                        //             ttl: None,
-                        //         }
-                        //     },
-                        //     Err(e) => {
-                        //         return Ok(CommandResult::Error(e))
-                        //     }
-                        // }
-                    } else {
-                        match dns_service.query(domain, Some(record_type), None).await
-                            .map_err(|e| {
-                                let msg = format!("Failed to resolve domain {} record_type {}: {:?}", domain, record_type_str, e);
-                                error!("{}", msg);
-                                msg
-                            }) {
-                            Ok(name_info) => name_info,
-                            Err(e) => {
-                                return Ok(CommandResult::Error(e))
-                            }
+                        }) {
+                        Ok(name_info) => name_info,
+                        Err(e) => {
+                            return Ok(CommandResult::Error(e))
                         }
                     }
+                    //
                 } else {
                     let msg = format!("Invalid resolve command: inner service {} not found", server_address);
                     error!("{}", msg);

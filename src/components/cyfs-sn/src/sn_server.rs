@@ -821,23 +821,24 @@ impl NameServer for SNServer {
                     let result_name_info = NameInfo::from_address(name, self.server_ip);
                     return Ok(result_name_info);
                 }
-                RecordType::TXT => {
-                    let mut gateway_list = Vec::new();
-                    let current_device_config = CURRENT_DEVICE_CONFIG.get();
-                    if current_device_config.is_some() {
-                        let current_device_config = current_device_config.unwrap();
-                        gateway_list.push(current_device_config.get_id().to_string());
-                    }
-                    let gateway_list = Some(gateway_list);
-                    //返回当前服务器的zoneconfig和auth_key
-                    let result_name_info = NameInfo::from_zone_config_str(
-                        name,
-                        self.zone_boot_config.as_str(),
-                        self.zone_boot_config_pkx.as_str(),
-                        &gateway_list,
-                    );
-                    return Ok(result_name_info);
-                }
+                //TODO:
+                // RecordType::TXT => {
+                //     let mut gateway_list = Vec::new();
+                //     let current_device_config = CURRENT_DEVICE_CONFIG.get();
+                //     if current_device_config.is_some() {
+                //         let current_device_config = current_device_config.unwrap();
+                //         gateway_list.push(current_device_config.get_id().to_string());
+                //     }
+                //     let gateway_list = Some(gateway_list);
+                //     //返回当前服务器的zoneconfig和auth_key
+                //     let result_name_info = NameInfo::from_zone_config_str(
+                //         name,
+                //         self.zone_boot_config.as_str(),
+                //         self.zone_boot_config_pkx.as_str(),
+                //         &gateway_list,
+                //     );
+                //     return Ok(result_name_info);
+                // }
                 _ => {
                     return Err(server_err!(ServerErrorCode::NotFound,
                         "sn-server not support record type {}",
@@ -870,22 +871,24 @@ impl NameServer for SNServer {
                 RecordType::TXT => {
                     let zone_config = self.get_user_zone_config(username).await;
                     if zone_config.is_some() {
-                        let zone_config = zone_config.unwrap();
-                        let pkx = get_x_from_jwk_string(zone_config.0.as_str()).map_err(|e| {
-                            error!("failed to get x from jwk string: {:?}", e);
-                            server_err!(ServerErrorCode::NotFound,
-                                "failed to get x from jwk string: {}",
-                                e.to_string()
-                            )
-                        })?;
-                        let result_name_info = NameInfo::from_zone_config_str(
-                            name,
-                            zone_config.1.as_str(),
-                            pkx.as_str(),
-                            &None,
-                        );
-                        info!("result_name_info: {:?}", result_name_info);
-                        return Ok(result_name_info);
+                        //TODO:
+                        // let zone_config = zone_config.unwrap();
+                        // let pkx = get_x_from_jwk_string(zone_config.0.as_str()).map_err(|e| {
+                        //     error!("failed to get x from jwk string: {:?}", e);
+                        //     server_err!(ServerErrorCode::NotFound,
+                        //         "failed to get x from jwk string: {}",
+                        //         e.to_string()
+                        //     )
+                        // })?;
+                        // let result_name_info = NameInfo::from_zone_config_str(
+                        //     name,
+                        //     zone_config.1.as_str(),
+                        //     pkx.as_str(),
+                        //     &None,
+                        // );
+                        // info!("result_name_info: {:?}", result_name_info);
+                        // return Ok(result_name_info);
+                        unimplemented!();
                     } else {
                         return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
                     }
@@ -919,15 +922,17 @@ impl NameServer for SNServer {
             let (username, public_key, zone_config, _) = user_info.unwrap();
             match record_type {
                 RecordType::TXT => {
-                    let pkx = get_x_from_jwk_string(public_key.as_str())
-                        .map_err(into_server_err!(ServerErrorCode::InvalidConfig))?;
-                    let result_name_info = NameInfo::from_zone_config_str(
-                        name,
-                        zone_config.as_str(),
-                        pkx.as_str(),
-                        &None,
-                    );
-                    return Ok(result_name_info);
+                    //TODO:
+                    // let pkx = get_x_from_jwk_string(public_key.as_str())
+                    //     .map_err(into_server_err!(ServerErrorCode::InvalidConfig))?;
+                    // let result_name_info = NameInfo::from_zone_config_str(
+                    //     name,
+                    //     zone_config.as_str(),
+                    //     pkx.as_str(),
+                    //     &None,
+                    // );
+                    // return Ok(result_name_info);
+                    unimplemented!();
                 }
                 RecordType::A | RecordType::AAAA => {
                     let address_vec = self.get_user_zonegate_address(&username).await;

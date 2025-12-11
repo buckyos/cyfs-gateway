@@ -29,7 +29,7 @@ use tokio::time::timeout;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
 use crate::map_collection_to_nameinfo;
-use crate::cmd_resolve::Resolve;
+use crate::cmd_resolve::CmdResolve;
 
 //TODO: dns_provider is realy a demo implementation, must refactor before  used in a offical server.
 fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RData>> {
@@ -92,31 +92,7 @@ fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RDat
         }
         "TXT" => {
             let mut records = Vec::new();
-            if name_info.txt.is_some() {
-                let txt = name_info.txt.clone().unwrap();
-                if txt.len() > 255 {
-                    warn!("TXT is too long, split it");
-                    let s1 = txt[0..254].to_string();
-                    let s2 = txt[254..].to_string();
-
-                    records.push(RData::TXT(TXT::new(vec![s1, s2])));
-                } else {
-                    records.push(RData::TXT(TXT::new(vec![txt])));
-                }
-            }
-
-            if name_info.did_document.is_some() {
-                let did_string = name_info.did_document.as_ref().unwrap().to_string();
-                records.push(RData::TXT(TXT::new(vec![format!("DID={};", did_string)])));
-            }
-
-            if name_info.pk_x_list.is_some() {
-                let pk_x_list = name_info.pk_x_list.as_ref().unwrap();
-                for pk_x in pk_x_list.iter() {
-                    records.push(RData::TXT(TXT::new(vec![format!("PKX={};", pk_x)])));
-                }
-            }
-
+            records.push(RData::TXT(TXT::new(name_info.txt.clone())));
             return Ok(records);
         }
         _ => {
@@ -196,7 +172,7 @@ impl ProcessChainDnsServer {
         global_process_chains: Option<GlobalProcessChainsRef>,
         hook_point: ProcessChainConfigs,
     ) -> ServerResult<Self> {
-        let resolve_cmd = Resolve::new(server_mgr.clone());
+        let resolve_cmd = CmdResolve::new(server_mgr.clone());
         let mut commands = get_dns_server_external_commands(server_mgr.clone());
         commands.push((resolve_cmd.name().to_string(), Arc::new(Box::new(resolve_cmd))));
         let (executor, _) = create_process_chain_executor(
