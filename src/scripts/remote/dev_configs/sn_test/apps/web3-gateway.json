@@ -1,0 +1,23 @@
+{
+    "name": "web3-gateway",
+    "version": "latest",
+    "directories": {
+        "source": "/opt/web3-gateway",
+        "target": "/opt/web3-gateway",
+        "source_bin": "/opt/web3-gateway/web3_gateway",
+        "target_bin": "/opt/web3-gateway/web3_gateway"
+    },
+    "commands": {
+      "build": [
+        "python3 {{system.base_dir}}/scripts/build.py aarch64"
+      ],
+      "build_all": [
+        "python3 {{system.base_dir}}/build.py aarch64 && python3 {{system.base_dir}}/scripts/install.py --all"
+      ],
+      "install": [
+        "sudo chmod +x /opt/web3-gateway/web3_gateway"
+      ],
+      "start": ["sudo python3 /opt/web3-gateway/start.py"],
+      "stop": ["sudopython3 /opt/web3-gateway/stop.py"]
+    }
+  }
