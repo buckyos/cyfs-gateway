@@ -42,8 +42,8 @@ def copy_files(rust_target_dir):
     print("Copying files...")
     # code to copy files
     strip_and_copy_rust_file(rust_target_dir, "cyfs_gateway", root_bin_dir, True)
-    web3_gateway_dest_file = os.path.join(web3_gateway_root_dir, "web3_gateway")
-    shutil.copyfile(os.path.join(root_bin_dir, "cyfs-gateway","cyfs_gateway"), web3_gateway_dest_file)
+    web3_gateway_dest_file = os.path.join(web3_gateway_root_dir, "web3_gateway"+ext)
+    shutil.copyfile(os.path.join(root_bin_dir, "cyfs-gateway","cyfs_gateway"+ext), web3_gateway_dest_file)
     st = os.stat(web3_gateway_dest_file)
     os.chmod(web3_gateway_dest_file, st.st_mode | stat.S_IEXEC)
     strip_and_copy_rust_file(rust_target_dir, "test_server", root_bin_dir, True)

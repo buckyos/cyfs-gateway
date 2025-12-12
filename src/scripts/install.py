@@ -1,11 +1,15 @@
 import os
 import shutil
 import platform
+from make_config import make_config_by_group_name
 
 src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-
+system = platform.system()
+ext = ""
+if system == "Windows":
+    ext = ".exe"
 install_root_dir = os.environ.get("BUCKYOS_ROOT", "")
-
+web3_gateway_root = os.path.join(src_dir, "WEB3_GATEWAY_ROOT")
 pre_install_apps = [
     {
         "app_id": "buckyos-filebrowser",
@@ -16,8 +20,11 @@ pre_install_apps = [
 if install_root_dir == "":
     if platform.system() == "Windows":
         install_root_dir = os.path.join(os.path.expandvars("%AppData%"), "buckyos")
+        web3_gateway_root = os.path.join(os.path.expandvars("%AppData%"), "web3-gateway")
+        
     else:
         install_root_dir = "/opt/buckyos"
+        web3_gateway_root = "/opt/web3-gateway"
 
 def set_data_dir_permissions():
     if platform.system() != "Windows":  # Windows doesn't need permission setting
@@ -129,27 +136,35 @@ def install(install_all=False):
         install_all = True
     
     if install_all:
-        print(f'Copying rootfs to {install_root_dir}')
+        print(f'* Install all copying rootfs to {install_root_dir}')
         
         if os.path.exists(install_root_dir):
-            # Remove all items in target directory
-            for item in os.listdir(install_root_dir):
-                item_path = os.path.join(install_root_dir, item)
-                print(f'Removing {item_path}')
-                if os.path.isfile(item_path):
-                    os.remove(item_path)
-                elif os.path.isdir(item_path):
-                    shutil.rmtree(item_path)
+
             # Copy all sub_items from rootfs
-            for item in os.listdir(os.path.join(src_dir, "rootfs")):
-                item_path = os.path.join(src_dir, "rootfs", item)
-                print(f'Copying {item_path} to {install_root_dir}')
+            for item in ["cyfs-gateway","test-server"]:
+                target_item_path = os.path.join(install_root_dir,"bin", item)
+                
+                if os.path.exists(target_item_path):
+                    print(f'- Removing {target_item_path}')
+                    shutil.rmtree(target_item_path)
+
+                item_path = os.path.join(src_dir, "rootfs","bin", item)
+                print(f'* Copying {item_path} to {target_item_path}')
                 if os.path.isfile(item_path):
-                    shutil.copy(item_path, install_root_dir)
+                    shutil.copy(item_path, target_item_path)
                 elif os.path.isdir(item_path):
-                    shutil.copytree(item_path, os.path.join(install_root_dir, item))
+                    shutil.copytree(item_path, target_item_path)
         else:
             shutil.copytree(os.path.join(src_dir, "rootfs"), install_root_dir)
+
+        if os.path.exists(web3_gateway_root):
+            # Remove all items in target directory
+            print(f'- Removing {web3_gateway_root}')
+            shutil.rmtree(web3_gateway_root)
+        print(f'* Copying {os.path.join(src_dir, "web3-gateway")} => {web3_gateway_root}')
+        shutil.copytree(os.path.join(src_dir, "web3-gateway"), web3_gateway_root)
+
+        make_config_by_group_name("sn_server",None,None)
     else:
         bin_dir = os.path.join(install_root_dir, "bin")
         #遍历bin
@@ -162,6 +177,8 @@ def install(install_all=False):
             shutil.rmtree(os.path.join(bin_dir, "cyfs-gateway"))
      
         shutil.copytree(os.path.join(src_dir, "rootfs","bin","cyfs-gateway"), os.path.join(bin_dir, "cyfs-gateway"))
+        print(f'Copying {os.path.join(src_dir, "web3-gateway","web3_gateway"+ext)} => {os.path.join(web3_gateway_root, "web3_gateway"+ext)}')
+        shutil.copyfile(os.path.join(src_dir, "web3-gateway","web3_gateway"+ext), os.path.join(web3_gateway_root, "web3_gateway"+ext))
 
     # Set data directory permissions after installation
     set_data_dir_permissions()
