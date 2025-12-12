@@ -91,10 +91,10 @@ stacks:
     bind: 0.0.0.0:3443
     protocol: tls
     certs:
-      - domain: "sn.devtests.org"
+      - domain: "sn.{{sn_host}}"
         cert_path: ./fullchain.cert
         key_path: ./fullchain.pem
-      - domain: "web3.devtests.org"
+      - domain: "*.web3.{{sn_host}}"
         cert_path: ./fullchain.cert
         key_path: ./fullchain.pem
     hook_point:
