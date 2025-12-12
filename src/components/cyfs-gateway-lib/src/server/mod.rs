@@ -7,6 +7,7 @@ mod dir_server;
 mod ndn_server;
 mod acme_http_challenge_server;
 
+use std::path::Path;
 use std::path::PathBuf;
 
 pub use http_server::*;
@@ -69,7 +70,7 @@ pub fn set_gateway_main_config_dir(path: &PathBuf) {
 }
 
 //will move to buckyos_kit
-pub fn normalize_config_file_path(path: PathBuf,base_dir:&PathBuf) -> PathBuf {
+pub fn normalize_config_file_path(path: PathBuf,base_dir:&Path) -> PathBuf {
     if path.is_relative() {
         let result_path = base_dir.join(path.clone());
         let ret = result_path.canonicalize();
@@ -83,7 +84,7 @@ pub fn normalize_config_file_path(path: PathBuf,base_dir:&PathBuf) -> PathBuf {
 }
 
 //will move to buckyos_kit
-pub fn normalize_all_path_value_config(config:&mut serde_json::Value,base_dir:&PathBuf)  {
+pub fn normalize_all_path_value_config(config:&mut serde_json::Value,base_dir:&Path)  {
     if config.is_object() {
         for (key, value) in config.as_object_mut().unwrap() {
             if value.is_string() {

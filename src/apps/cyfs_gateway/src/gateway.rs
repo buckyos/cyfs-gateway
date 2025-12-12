@@ -40,12 +40,21 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Val
             anyhow::anyhow!(msg)
         })?;
 
-    info!("Gateway main config: {}", serde_json::to_string_pretty(&config_json).unwrap());
+    info!("Gateway config before merge: {}", serde_json::to_string_pretty(&config_json).unwrap());
 
     let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
     cmd_config.merge(&config_json);
 
-    Ok(cmd_config)
+    let mut config_json = buckyos_kit::apply_params_to_json(&cmd_config, None)
+        .map_err(|e| {
+            let msg = format!("apply params to config json failed: {}", e);
+            error!("{}", msg);
+            anyhow::anyhow!(msg)
+        })?;
+    info!("Apply params to gateway config.");
+    normalize_all_path_value_config(&mut config_json,config_dir);
+    info!("normalize_all_path_value_config for gateway config.");
+    Ok(config_json)
 }
 
 //use buckyos_api::{*};
@@ -746,12 +755,14 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 Ok(Value::String("ok".to_string()))
             }
             "reload" => {
+                info!("*** reload gateway config ...");
                 let gateway_config = load_config_from_file(self.config_file.as_path()).await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 let gateway_config = self.parser.parse(gateway_config)
                     .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
                 gateway.reload(gateway_config).await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                info!("*** reload gateway config success !");
                 Ok(Value::String("ok".to_string()))
             }
             v => {

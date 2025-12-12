@@ -38,9 +38,7 @@ use cyfs_tun::TunStackFactory;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
-    let mut config_json = load_config_from_file(config_file).await?;
-    let base_dir = PathBuf::from(config_file.parent().unwrap());
-    normalize_all_path_value_config(&mut config_json,&base_dir);
+    let config_json = load_config_from_file(config_file).await?;
     info!("Gateway config: {}", serde_json::to_string_pretty(&config_json).unwrap());
 
     let config_dir = config_file.parent().ok_or_else(|| {
