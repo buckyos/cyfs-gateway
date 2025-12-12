@@ -699,7 +699,7 @@ mod tests {
     use std::collections::HashMap;
     use crate::global_process_chains::GlobalProcessChains;
     use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory, StreamInfo, DatagramInfo, LimiterManager, StatManager};
-    use buckyos_kit::{AsyncStream};
+    use buckyos_kit::{init_logging, AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, generate_ed25519_key_pair, DeviceConfig, EncodedDocument};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -798,14 +798,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_stack_reject() {
+        init_logging("test", false);
         let _ = init_name_lib(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let mut device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        device_config.iat = chrono::Utc::now().timestamp() as u64;
+        device_config.exp = chrono::Utc::now().timestamp() as u64 + 1000;
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -844,11 +847,13 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let mut device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        device_config.iat = chrono::Utc::now().timestamp() as u64;
+        device_config.exp = chrono::Utc::now().timestamp() as u64 + 1000;
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -910,7 +915,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -953,7 +958,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1015,7 +1020,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1058,7 +1063,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1136,7 +1141,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1179,7 +1184,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1269,7 +1274,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1314,7 +1319,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1377,7 +1382,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1420,7 +1425,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1482,7 +1487,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1525,7 +1530,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1587,7 +1592,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1630,7 +1635,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1706,7 +1711,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1749,7 +1754,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1812,7 +1817,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1860,7 +1865,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1927,7 +1932,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1976,7 +1981,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2046,7 +2051,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2096,7 +2101,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2166,7 +2171,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2216,7 +2221,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2310,7 +2315,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2355,7 +2360,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2417,7 +2422,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2464,7 +2469,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2534,7 +2539,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2583,7 +2588,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2656,7 +2661,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2706,7 +2711,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2779,7 +2784,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -2829,7 +2834,7 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 

@@ -77,6 +77,7 @@ pub struct GatewayFactory {
     acme_mgr: AcmeCertManagerRef,
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
+    self_cert_mgr: SelfCertMgrRef,
 }
 
 impl GatewayFactory {
@@ -87,7 +88,8 @@ impl GatewayFactory {
         tunnel_manager: TunnelManager,
         acme_mgr: AcmeCertManagerRef,
         limiter_manager: LimiterManagerRef,
-        stat_manager: StatManagerRef, ) -> Self {
+        stat_manager: StatManagerRef,
+        self_cert_mgr: SelfCertMgrRef, ) -> Self {
         Self {
             servers,
             global_process_chains,
@@ -98,6 +100,7 @@ impl GatewayFactory {
             acme_mgr,
             limiter_manager,
             stat_manager,
+            self_cert_mgr,
         }
     }
 
@@ -144,6 +147,7 @@ impl GatewayFactory {
             server_factory: self.server_factory.clone(),
             limiter_manager: self.limiter_manager.clone(),
             stat_manager: self.stat_manager.clone(),
+            self_cert_mgr: self.self_cert_mgr.clone(),
         })
     }
 }
@@ -160,6 +164,7 @@ pub struct Gateway {
     server_factory: CyfsServerFactoryRef,
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
+    self_cert_mgr: SelfCertMgrRef,
 }
 
 impl Drop for Gateway {
@@ -436,6 +441,9 @@ impl Gateway {
     }
 
     pub async fn reload(&self, mut config: GatewayConfig) -> Result<()> {
+        let old_config = {
+            self.config.lock().unwrap().clone()
+        };
         let mut new_process_chains = HashMap::new();
         for process_chain_config in config.global_process_chains.iter() {
             let process_chain = Arc::new(process_chain_config.create_process_chain()?);
@@ -537,12 +545,13 @@ impl Gateway {
             new_servers.contains_key(id)
         });
 
-        if config.acme_config.is_some() {
-            let acme_config = config.acme_config.clone().unwrap();
-            let mut cert_config = CertManagerConfig::default();
-            let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
-            let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
-            cert_config.keystore_path = data_dir.to_string_lossy().to_string();
+        if config.acme_config != old_config.acme_config {
+            if config.acme_config.is_some() {
+                let acme_config = config.acme_config.clone().unwrap();
+                let mut cert_config = CertManagerConfig::default();
+                let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+                let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
+                cert_config.keystore_path = data_dir.to_string_lossy().to_string();
                 cert_config.account = acme_config.account;
                 if acme_config.issuer.is_some() {
                     cert_config.acme_server = acme_config.issuer.unwrap();
@@ -559,40 +568,79 @@ impl Gateway {
                         cert_config.renew_before_expiry = renew_before_expiry;
                     }
                 }
-            cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
-            if let Err(e) = self.acme_mgr.update(cert_config).await {
-                log::error!("Failed to update acme manager: {}", e);
+                cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
+                if let Err(e) = self.acme_mgr.update(cert_config).await {
+                    log::error!("Failed to update acme manager: {}", e);
+                }
+            } else {
+                let mut cert_config = CertManagerConfig::default();
+                let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+                let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
+                cert_config.keystore_path = data_dir.to_string_lossy().to_string();
+                cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
+                if let Err(e) = self.acme_mgr.update(cert_config).await {
+                    log::error!("Failed to update acme manager: {}", e);
+                }
             }
         }
-        if config.limiters_config.is_some() {
-            let limiters_config = config.limiters_config.clone().unwrap();
-            let mut limiter_set = HashSet::new();
-            for limiter_config in limiters_config.iter() {
-                limiter_set.insert(limiter_config.id.clone());
-                if let Some(limiter) = self.limiter_manager.get_limiter(limiter_config.id.as_str()) {
-                    if limiter.get_upper_limiter().map(|limiter| limiter.get_id().map(|v| v.to_string())) == Some(limiter_config.upper_limiter.clone()) {
-                        limiter.set_speed(limiter_config.concurrent.map(|v| v as u32),
-                                          limiter_config.download_speed.map(|v| v as u32),
-                                          limiter_config.upload_speed.map(|v| v as u32));
-                        continue;
-                    }
-                }
-                if let Some(upper_limiter) = limiter_config.upper_limiter.clone() {
-                    if self.limiter_manager.get_limiter(upper_limiter.as_str()).is_none() {
-                        log::error!("Update limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
-                    }
-                }
-                let _ = self.limiter_manager.new_limiter(limiter_config.id.clone(),
-                                                         limiter_config.upper_limiter.clone(),
-                                                         limiter_config.concurrent.map(|v| v as u32),
-                                                         limiter_config.download_speed.map(|v| v as u32),
-                                                         limiter_config.upload_speed.map(|v| v as u32));
-            }
 
-            self.limiter_manager.retain(|id, _| {
-                limiter_set.contains(id)
-            });
+        if config.limiters_config != old_config.limiters_config {
+            if config.limiters_config.is_some() {
+                let limiters_config = config.limiters_config.clone().unwrap();
+                let mut limiter_set = HashSet::new();
+                for limiter_config in limiters_config.iter() {
+                    limiter_set.insert(limiter_config.id.clone());
+                    if let Some(limiter) = self.limiter_manager.get_limiter(limiter_config.id.as_str()) {
+                        if limiter.get_upper_limiter().map(|limiter| limiter.get_id().map(|v| v.to_string())) == Some(limiter_config.upper_limiter.clone()) {
+                            limiter.set_speed(limiter_config.concurrent.map(|v| v as u32),
+                                              limiter_config.download_speed.map(|v| v as u32),
+                                              limiter_config.upload_speed.map(|v| v as u32));
+                            continue;
+                        }
+                    }
+                    if let Some(upper_limiter) = limiter_config.upper_limiter.clone() {
+                        if self.limiter_manager.get_limiter(upper_limiter.as_str()).is_none() {
+                            log::error!("Update limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
+                        }
+                    }
+                    let _ = self.limiter_manager.new_limiter(limiter_config.id.clone(),
+                                                             limiter_config.upper_limiter.clone(),
+                                                             limiter_config.concurrent.map(|v| v as u32),
+                                                             limiter_config.download_speed.map(|v| v as u32),
+                                                             limiter_config.upload_speed.map(|v| v as u32));
+                }
+
+                self.limiter_manager.retain(|id, _| {
+                    limiter_set.contains(id)
+                });
+            } else {
+                self.limiter_manager.retain(|_, _| {
+                    false
+                });
+            }
         }
+
+        if config.tls_ca != old_config.tls_ca {
+            if config.tls_ca.is_some() {
+                let tls_ca = config.tls_ca.clone().unwrap();
+                let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
+                let mut self_cert_config = SelfCertConfig::default();
+                self_cert_config.ca_path = Some(tls_ca.cert_path);
+                self_cert_config.key_path = Some(tls_ca.key_path);
+                self_cert_config.store_path = data_dir.to_string_lossy().to_string();
+                if let Err(e) = self.self_cert_mgr.update(self_cert_config).await {
+                    log::error!("Failed to update self cert manager: {}", e);
+                }
+            } else {
+                let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
+                let mut self_cert_config = SelfCertConfig::default();
+                self_cert_config.store_path = data_dir.to_string_lossy().to_string();
+                if let Err(e) = self.self_cert_mgr.update(self_cert_config).await {
+                    log::error!("Failed to update self cert manager: {}", e);
+                }
+            }
+        }
+
         *self.config.lock().unwrap() = config;
         Ok(())
     }

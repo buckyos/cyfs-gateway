@@ -18,6 +18,7 @@ mod connection_manager;
 mod quic_tunnel;
 mod json_collection;
 mod cmds;
+mod self_cert_mgr;
 
 pub use aes_stream::*;
 pub use config::*;
@@ -35,6 +36,7 @@ pub use global_process_chains::*;
 pub use cyfs_acme::*;
 pub use json_collection::*;
 pub use cmds::*;
+pub use self_cert_mgr::*;
 
 use thiserror::Error;
 use std::sync::Arc;

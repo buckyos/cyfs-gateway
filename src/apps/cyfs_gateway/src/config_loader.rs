@@ -501,6 +501,20 @@ impl GatewayConfigParser {
             None => None
         };
 
+        let tls_ca: Option<TlsCA> = match json_value.get("tls_ca") {
+            Some(config) => {
+                match serde_json::from_value::<TlsCA>(config.clone()) {
+                    Ok(config) => Some(config),
+                    Err(err) => {
+                        let msg = format!("invalid ca config: {}", err);
+                        error!("{}", msg);
+                        None
+                    }
+                }
+            },
+            None => None
+        };
+
 
         let limiters_config: Option<Vec<LimiterConfig>> = match json_value.get("limiters") {
             Some(config) => {
@@ -584,6 +598,7 @@ impl GatewayConfigParser {
         Ok(GatewayConfig {
             limiters_config,
             acme_config,
+            tls_ca,
             stacks,
             servers,
             global_process_chains,
@@ -591,7 +606,7 @@ impl GatewayConfigParser {
     }
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Eq, PartialEq)]
 pub struct AcmeConfig {
     pub account: Option<String>,
     pub issuer: Option<String>,
@@ -600,7 +615,7 @@ pub struct AcmeConfig {
     pub renew_before_expiry: Option<u64>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Eq, PartialEq)]
 pub struct LimiterConfig {
     pub id: String,
     pub upper_limiter: Option<String>,
@@ -611,6 +626,12 @@ pub struct LimiterConfig {
     #[serde(default)]
     pub upload_speed: Option<u64>,
     pub concurrent: Option<u64>,
+}
+
+#[derive(Deserialize, Clone, Eq, PartialEq)]
+pub struct TlsCA {
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 mod speed_parser {
@@ -635,9 +656,11 @@ mod speed_parser {
     }
 }
 
+#[derive(Clone)]
 pub struct GatewayConfig {
     pub limiters_config: Option<Vec<LimiterConfig>>,
     pub acme_config: Option<AcmeConfig>,
+    pub tls_ca: Option<TlsCA>,
     pub stacks: Vec<Arc<dyn StackConfig>>,
     pub servers: Vec<Arc<dyn ServerConfig>>,
     pub global_process_chains: ProcessChainConfigs,

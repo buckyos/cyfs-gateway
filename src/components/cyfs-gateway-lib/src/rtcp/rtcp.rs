@@ -1223,7 +1223,7 @@ mod tests {
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
                                                              NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
@@ -1237,7 +1237,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
         let mut rtcp2 = RTcp::new(device_config.id, "127.0.0.1:19024".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
@@ -1264,7 +1264,7 @@ mod tests {
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
         let mut rtcp1 = RTcp::new(device_config.id, "127.0.0.1:19033".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
@@ -1277,7 +1277,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
         let mut rtcp2 = RTcp::new(device_config.id, "127.0.0.1:19034".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
@@ -1301,7 +1301,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
         let mut rtcp1 = RTcp::new(device_config.id, "127.0.0.1:19053".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
@@ -1314,7 +1314,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
         let mut rtcp2 = RTcp::new(device_config.id, "127.0.0.1:19054".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
@@ -1356,7 +1356,7 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
         let mut rtcp1 = RTcp::new(device_config.id, "127.0.0.1:19043".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
@@ -1369,7 +1369,7 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().add_did_cache(device_config.id.clone(), encoded_doc).unwrap();
+        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
         GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
 
         let mut rtcp2 = RTcp::new(device_config.id, "127.0.0.1:19044".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));

@@ -146,6 +146,15 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
 
     let cert_manager = AcmeCertManager::create(cert_config).await?;
 
+    let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
+    let mut self_cert_config = SelfCertConfig::default();
+    if let Some(config) = config_loader.tls_ca.clone() {
+        self_cert_config.ca_path = Some(config.cert_path);
+        self_cert_config.key_path = Some(config.key_path);
+    }
+    self_cert_config.store_path = data_dir.to_string_lossy().to_string();
+    let self_cert_manager = SelfCertMgr::create(self_cert_config).await?;
+
     let factory = GatewayFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
@@ -154,6 +163,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         cert_manager.clone(),
         limiter_manager.clone(),
         stat_manager.clone(),
+        self_cert_manager.clone(),
     );
     factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
         server_manager.clone(),
@@ -181,6 +191,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         cert_manager.clone(),
         limiter_manager.clone(),
         stat_manager.clone(),
+        self_cert_manager.clone(),
     )));
     debug!("Register tls stack factory");
     factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
@@ -191,6 +202,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         cert_manager.clone(),
         limiter_manager.clone(),
         stat_manager.clone(),
+        self_cert_manager.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
         server_manager.clone(),

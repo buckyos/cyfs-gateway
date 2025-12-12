@@ -255,18 +255,6 @@ pub struct UdpConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct CertInfo {
-    pub cert_file: String,
-    pub key_file: String,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub enum CertType {
-    Acme,
-    Local(CertInfo),
-}
-
-#[derive(Serialize, Deserialize, Clone)]
 pub struct StackCertConfig {
     pub domain: String,
     pub acme_type: Option<ChallengeType>,

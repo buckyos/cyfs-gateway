@@ -14,9 +14,10 @@ use sfo_io::{LimitStream, StatStream};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
-use crate::stack::{get_limit_info, stream_forward};
+use crate::stack::{get_limit_info, stream_forward, TlsCertResolver};
 use serde::{Deserialize, Serialize};
 use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType, ACME_TLS_ALPN_NAME};
+use crate::self_cert_mgr::SelfCertMgrRef;
 use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
 
@@ -84,7 +85,7 @@ pub async fn create_server_config(
 struct TlsStackInner {
     id: String,
     bind_addr: String,
-    certs: Arc<ResolvesServerCertUsingSni>,
+    certs: Arc<dyn ResolvesServerCert>,
     servers: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     connection_manager: Option<ConnectionManagerRef>,
@@ -139,6 +140,19 @@ impl TlsStackInner {
                 "stat_manager is required"
             ));
         }
+        if config.acme_manager.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "acme_manager is required"
+            ));
+        }
+        if config.self_cert_mgr.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "self_cert_mgr is required"
+            ));
+        }
+
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
                                                           config.global_process_chains.clone(),
                                                           Some(get_stream_external_commands(config.servers.clone().unwrap()))).await
@@ -146,27 +160,37 @@ impl TlsStackInner {
         let crypto_provider = rustls::crypto::ring::default_provider();
         let external_resolver = config.acme_manager.clone().map(|v| v.clone() as Arc<dyn ResolvesServerCert>);
         let cert_resolver = Arc::new(ResolvesServerCertUsingSni::new(external_resolver));
+        let mut self_cert = false;
         for cert_config in config.certs.into_iter() {
-            if cert_config.certs.is_some() && cert_config.key.is_some() {
-                let cert_key = CertifiedKey::from_der(cert_config.certs.unwrap(), cert_config.key.unwrap(), &crypto_provider)
-                    .map_err(into_stack_err!(StackErrorCode::InvalidTlsCert, "parse {} cert failed", cert_config.domain))?;
-                cert_resolver.add(&cert_config.domain, cert_key)
-                    .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "add {} cert failed.err {}", cert_config.domain, e))?;
+            if cert_config.domain == "*" {
+                self_cert = true;
             } else {
-                if config.acme_manager.is_some() {
-                    config.acme_manager.as_ref().unwrap()
-                        .add_acme_item(AcmeItem::new(cert_config.domain,
-                                                     cert_config.acme_type.unwrap_or(ChallengeType::TlsAlpn01),
-                                                     cert_config.data))
-                        .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
+                if cert_config.certs.is_some() && cert_config.key.is_some() {
+                    let cert_key = CertifiedKey::from_der(cert_config.certs.unwrap(), cert_config.key.unwrap(), &crypto_provider)
+                        .map_err(into_stack_err!(StackErrorCode::InvalidTlsCert, "parse {} cert failed", cert_config.domain))?;
+                    cert_resolver.add(&cert_config.domain, cert_key)
+                        .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "add {} cert failed.err {}", cert_config.domain, e))?;
+                } else {
+                    if config.acme_manager.is_some() {
+                        config.acme_manager.as_ref().unwrap()
+                            .add_acme_item(AcmeItem::new(cert_config.domain,
+                                                         cert_config.acme_type.unwrap_or(ChallengeType::TlsAlpn01),
+                                                         cert_config.data))
+                            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
+                    }
                 }
             }
         }
+        let cert: Arc<dyn ResolvesServerCert> = if self_cert {
+            Arc::new(TlsCertResolver::new(cert_resolver, config.self_cert_mgr))
+        } else {
+            cert_resolver
+        };
 
         Ok(Self {
             id: config.id.unwrap(),
             bind_addr: config.bind.unwrap(),
-            certs: cert_resolver.clone(),
+            certs: cert,
             servers: config.servers.unwrap(),
             executor: Arc::new(Mutex::new(executor)),
             connection_manager: config.connection_manager,
@@ -511,6 +535,7 @@ pub struct TlsStackFactory {
     acme_manager: AcmeCertManagerRef,
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
+    self_cert_mgr: SelfCertMgrRef,
 }
 
 impl TlsStackFactory {
@@ -522,6 +547,7 @@ impl TlsStackFactory {
         acme_manager: AcmeCertManagerRef,
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
+        self_cert_mgr: SelfCertMgrRef,
     ) -> Self {
         Self {
             servers,
@@ -531,6 +557,7 @@ impl TlsStackFactory {
             acme_manager,
             limiter_manager,
             stat_manager,
+            self_cert_mgr,
         }
     }
 }
@@ -580,6 +607,7 @@ impl crate::StackFactory for TlsStackFactory {
             .acme_manager(self.acme_manager.clone())
             .limiter_manager(self.limiter_manager.clone())
             .stat_manager(self.stat_manager.clone())
+            .self_cert_mgr(self.self_cert_mgr.clone())
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -600,6 +628,7 @@ pub struct TlsStackBuilder {
     acme_manager: Option<AcmeCertManagerRef>,
     limiter_manager: Option<LimiterManagerRef>,
     stat_manager: Option<StatManagerRef>,
+    self_cert_mgr: Option<SelfCertMgrRef>,
 }
 
 impl TlsStackBuilder {
@@ -618,6 +647,7 @@ impl TlsStackBuilder {
             acme_manager: None,
             limiter_manager: None,
             stat_manager: None,
+            self_cert_mgr: None,
         }
     }
 
@@ -688,6 +718,11 @@ impl TlsStackBuilder {
         self
     }
 
+    pub fn self_cert_mgr(mut self, self_cert_mgr: SelfCertMgrRef) -> Self {
+        self.self_cert_mgr = Some(self_cert_mgr);
+        self
+    }
+
     pub async fn build(self) -> StackResult<TlsStack> {
         let stack = TlsStack::create(self).await?;
         Ok(stack)
@@ -717,6 +752,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::TlsConnector;
     use cyfs_acme::{AcmeCertManager, CertManagerConfig};
+    use crate::self_cert_mgr::{SelfCertConfig, SelfCertMgr};
 
     #[tokio::test]
     async fn test_tls_stack_creation() {
@@ -741,6 +777,8 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new()) // 添加stat_manager
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -762,6 +800,8 @@ mod tests {
             .tunnel_manager(TunnelManager::new())
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new()) // 添加stat_manager
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -801,6 +841,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new()) // 添加stat_manager
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -862,6 +904,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new()) // 添加stat_manager
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -925,6 +969,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new()) // 添加stat_manager
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1009,6 +1055,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1037,6 +1085,94 @@ mod tests {
         let mut buf = [0u8; 4];
         let ret = stream.read_exact(&mut buf).await;
         assert!(ret.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_tls_stack_self_cert() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "forward tcp:///127.0.0.1:9088";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let tls_self_certs_path = tempfile::env::temp_dir().join("tls_self_certs").to_string_lossy().to_string();
+        let mut self_cert_config = SelfCertConfig::default();
+        self_cert_config.store_path = tls_self_certs_path.clone();
+        let connection_manager = ConnectionManager::new();
+        let result = TlsStack::builder()
+            .id("test")
+            .bind("127.0.0.1:9096")
+            .servers(Arc::new(ServerManager::new()))
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .connection_manager(connection_manager.clone())
+            .add_certs(vec![TlsDomainConfig {
+                domain: "*".to_string(),
+                acme_type: None,
+                certs: None,
+                key: None,
+                data: None,
+            }])
+            .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new()) // 添加stat_manager
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(self_cert_config).await.unwrap())
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+
+        tokio::spawn(async move {
+            let tcp_listener = TcpListener::bind("127.0.0.1:9088").await.unwrap();
+            if let Ok((mut tcp_stream, _)) = tcp_listener.accept().await {
+                let mut buf = [0u8; 4];
+                tcp_stream.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"test");
+                tcp_stream.write_all("recv".as_bytes()).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+
+        {
+            let stream = TcpStream::connect("127.0.0.1:9096").await.unwrap();
+            let connector = TlsConnector::from(Arc::new(config));
+            let mut stream = connector
+                .connect(ServerName::try_from("www.buckyos.com").unwrap(), stream)
+                .await
+                .unwrap();
+            let result = stream
+                .write_all(b"test")
+                .await;
+            assert_eq!(connection_manager.get_all_connection_info().len(), 1);
+            assert!(result.is_ok());
+            let mut buf = [0u8; 4];
+            let ret = stream.read_exact(&mut buf).await;
+            assert!(ret.is_ok());
+            assert_eq!(b"recv", &buf[..ret.unwrap()]);
+            stream.shutdown().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        assert_eq!(connection_manager.get_all_connection_info().len(), 0);
+
+        tokio::fs::remove_dir_all(tls_self_certs_path).await.unwrap();
     }
 
     pub struct MockServer {
@@ -1152,6 +1288,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new()) // 添加stat_manager
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1240,6 +1378,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new()) // 添加stat_manager
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1344,6 +1484,8 @@ mod tests {
             .limiter_manager(LimiterManager::new())
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
             .stat_manager(StatManager::new()) // 添加stat_manager
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1395,7 +1537,7 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         cert_config.keystore_path = data_dir.path().to_string_lossy().to_string();
         let cert_manager = AcmeCertManager::create(cert_config).await.unwrap();
-
+        let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default()).await.unwrap();
         let factory = TlsStackFactory::new(
             Arc::new(ServerManager::new()),
             Arc::new(GlobalProcessChains::new()),
@@ -1404,6 +1546,7 @@ mod tests {
             cert_manager,
             LimiterManager::new(),
             StatManager::new(),
+            self_cert_mgr,
         );
 
         let config = TlsStackConfig {
@@ -1457,6 +1600,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(stat_manager.clone())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1531,6 +1676,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(stat_manager.clone())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1610,6 +1757,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(limiter_manager)
             .stat_manager(stat_manager.clone())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1689,6 +1838,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(limiter_manager)
             .stat_manager(stat_manager.clone())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());

@@ -30,10 +30,10 @@ use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_stream_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_stream_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SelfCertMgrRef};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
-use crate::stack::{get_limit_info, stream_forward};
+use crate::stack::{get_limit_info, stream_forward, TlsCertResolver};
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
 
 pub struct Http3Body<S, B> {
@@ -647,7 +647,7 @@ struct QuicStackInner {
     id: String,
     bind_addr: String,
     concurrency: u32,
-    certs: Arc<ResolvesServerCertUsingSni>,
+    certs: Arc<dyn ResolvesServerCert>,
     alpn_protocols: Vec<Vec<u8>>,
     servers: ServerManagerRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
@@ -1013,6 +1013,12 @@ impl QuicStack {
         if builder.stat_manager.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "stat_manager is required"));
         }
+        if builder.acme_manager.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "acme_manager is required"));
+        }
+        if builder.self_cert_mgr.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "self_cert_mgr is required"));
+        }
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains.clone(),
@@ -1022,29 +1028,39 @@ impl QuicStack {
         let crypto_provider = rustls::crypto::ring::default_provider();
         let external_resolver = builder.acme_manager.clone().map(|v| v.clone() as Arc<dyn ResolvesServerCert>);
         let cert_resolver = Arc::new(ResolvesServerCertUsingSni::new(external_resolver));
+        let mut self_cert = false;
         for cert_config in builder.certs.into_iter() {
-            if cert_config.certs.is_some() && cert_config.key.is_some() {
-                let cert_key = CertifiedKey::from_der(cert_config.certs.unwrap(), cert_config.key.unwrap(), &crypto_provider)
-                    .map_err(into_stack_err!(StackErrorCode::InvalidTlsCert, "parse {} cert failed", cert_config.domain))?;
-                cert_resolver.add(&cert_config.domain, cert_key)
-                    .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "add {} cert failed.err {}", cert_config.domain, e))?;
+            if cert_config.domain == "*" {
+                self_cert = true;
             } else {
-                if builder.acme_manager.is_some() {
-                    builder.acme_manager.as_ref().unwrap()
-                        .add_acme_item(AcmeItem::new(cert_config.domain,
-                                                     cert_config.acme_type.unwrap_or(ChallengeType::TlsAlpn01),
-                                                     cert_config.data))
-                        .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
+                if cert_config.certs.is_some() && cert_config.key.is_some() {
+                    let cert_key = CertifiedKey::from_der(cert_config.certs.unwrap(), cert_config.key.unwrap(), &crypto_provider)
+                        .map_err(into_stack_err!(StackErrorCode::InvalidTlsCert, "parse {} cert failed", cert_config.domain))?;
+                    cert_resolver.add(&cert_config.domain, cert_key)
+                        .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "add {} cert failed.err {}", cert_config.domain, e))?;
+                } else {
+                    if builder.acme_manager.is_some() {
+                        builder.acme_manager.as_ref().unwrap()
+                            .add_acme_item(AcmeItem::new(cert_config.domain,
+                                                         cert_config.acme_type.unwrap_or(ChallengeType::TlsAlpn01),
+                                                         cert_config.data))
+                            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
+                    }
                 }
             }
         }
+        let cert: Arc<dyn ResolvesServerCert> = if self_cert {
+            Arc::new(TlsCertResolver::new(cert_resolver, builder.self_cert_mgr))
+        } else {
+            cert_resolver
+        };
 
         Ok(QuicStack {
             inner: Arc::new(QuicStackInner {
                 id: builder.id.unwrap(),
                 bind_addr: builder.bind.unwrap(),
                 concurrency: builder.concurrency,
-                certs: cert_resolver,
+                certs: cert,
                 alpn_protocols: builder.alpn_protocols,
                 servers: builder.servers.unwrap(),
                 executor: Arc::new(Mutex::new(executor)),
@@ -1115,6 +1131,7 @@ pub struct QuicStackBuilder {
     acme_manager: Option<AcmeCertManagerRef>,
     limiter_manager: Option<LimiterManagerRef>,
     stat_manager: Option<StatManagerRef>,
+    self_cert_mgr: Option<SelfCertMgrRef>,
 }
 
 impl QuicStackBuilder {
@@ -1133,6 +1150,7 @@ impl QuicStackBuilder {
             acme_manager: None,
             limiter_manager: None,
             stat_manager: None,
+            self_cert_mgr: None,
         }
     }
 
@@ -1204,6 +1222,11 @@ impl QuicStackBuilder {
         self
     }
 
+    pub fn self_cert_mgr(mut self, self_cert_mgr: SelfCertMgrRef) -> Self {
+        self.self_cert_mgr = Some(self_cert_mgr);
+        self
+    }
+
     pub async fn build(self) -> StackResult<QuicStack> {
         QuicStack::create(self).await
     }
@@ -1256,6 +1279,7 @@ pub struct QuicStackFactory {
     acme_manager: AcmeCertManagerRef,
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
+    self_cert_mgr: SelfCertMgrRef,
 }
 
 impl QuicStackFactory {
@@ -1267,6 +1291,7 @@ impl QuicStackFactory {
         acme_manager: AcmeCertManagerRef,
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
+        self_cert_mgr: SelfCertMgrRef,
     ) -> Self {
         Self {
             servers,
@@ -1276,6 +1301,7 @@ impl QuicStackFactory {
             acme_manager,
             limiter_manager,
             stat_manager,
+            self_cert_mgr,
         }
     }
 }
@@ -1322,6 +1348,7 @@ impl StackFactory for QuicStackFactory {
             .acme_manager(self.acme_manager.clone())
             .limiter_manager(self.limiter_manager.clone())
             .stat_manager(self.stat_manager.clone())
+            .self_cert_mgr(self.self_cert_mgr.clone())
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -1331,8 +1358,8 @@ impl StackFactory for QuicStackFactory {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Instant;
-    use buckyos_kit::{AsyncStream};
+    use std::time::{Duration, Instant};
+    use buckyos_kit::{init_logging, AsyncStream};
     use h3::error::{ConnectionError, StreamError};
     use quinn::crypto::rustls::QuicClientConfig;
     use quinn::Endpoint;
@@ -1342,7 +1369,7 @@ mod tests {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, Server, ProcessChainHttpServer, Stack, QuicStackFactory, ConnectionManager, StackProtocol, QuicStackConfig, StackFactory, StreamInfo, CertManagerConfig, AcmeCertManager, LimiterManager, StatManager};
+    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, Server, ProcessChainHttpServer, Stack, QuicStackFactory, ConnectionManager, StackProtocol, QuicStackConfig, StackFactory, StreamInfo, CertManagerConfig, AcmeCertManager, LimiterManager, StatManager, SelfCertMgr, SelfCertConfig};
     use crate::global_process_chains::GlobalProcessChains;
 
     #[tokio::test]
@@ -1377,6 +1404,8 @@ mod tests {
             .tunnel_manager(tunnel_manager.clone())
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1398,6 +1427,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1436,6 +1467,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1498,6 +1531,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1525,6 +1560,74 @@ mod tests {
         assert!(result.is_ok());
         let ret = recv.read(&mut [0; 1024]).await;
         assert!(ret.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_quic_stack_self_cert() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        drop;
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let tls_self_certs_path = tempfile::env::temp_dir().join("quic_self_certs").to_string_lossy().to_string();
+        let mut self_cert_config = SelfCertConfig::default();
+        self_cert_config.store_path = tls_self_certs_path.clone();
+
+        let result = QuicStack::builder()
+            .id("test")
+            .bind("127.0.0.1:9193")
+            .servers(Arc::new(ServerManager::new()))
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .add_certs(vec![TlsDomainConfig {
+                domain: "*".to_string(),
+                acme_type: None,
+                certs: None,
+                key: None,
+                data: None,
+            }])
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .limiter_manager(LimiterManager::new())
+            .stat_manager(StatManager::new())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(self_cert_config).await.unwrap())
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let stack = result.unwrap();
+        let result = stack.start().await;
+        assert!(result.is_ok());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        config.enable_early_data = true;
+        // config.alpn_protocols = vec![b"h3".to_vec()];
+        let client_config =
+            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+        let ret = endpoint.connect("127.0.0.1:9193".parse().unwrap(), "www.buckyos.com").unwrap();
+        let ret = ret.await.unwrap();
+        let (mut send, mut recv) = ret.open_bi().await.unwrap();
+        let result = send
+            .write_all(b"GET / HTTP/1.1\r\nHost: httpbin.org\r\n\r\n")
+            .await;
+        assert!(result.is_ok());
+        let ret = recv.read(&mut [0; 1024]).await;
+        assert!(ret.is_err());
+
+        tokio::fs::remove_dir_all(tls_self_certs_path).await.unwrap();
     }
 
     pub struct MockServer {
@@ -1641,6 +1744,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1743,6 +1848,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1849,6 +1956,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(StatManager::new())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -1929,6 +2038,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(stat_manager.clone())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -2019,6 +2130,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(LimiterManager::new())
             .stat_manager(stat_manager.clone())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -2117,6 +2230,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(limiter_manager)
             .stat_manager(stat_manager.clone())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -2215,6 +2330,8 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .limiter_manager(limiter_manager)
             .stat_manager(stat_manager.clone())
+            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
+            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
             .build()
             .await;
         assert!(result.is_ok());
@@ -2285,7 +2402,8 @@ mod tests {
             TunnelManager::new(),
             cert_manager,
             LimiterManager::new(),
-            StatManager::new()
+            StatManager::new(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap()
         );
 
         let config = QuicStackConfig {

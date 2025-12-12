@@ -60,10 +60,11 @@ libc = "0.2"
 socket2 = "0.6.0"
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 local-ip-address = "0.6"
-rcgen = "0.14"
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 clap = "*"
 percent-encoding = "*"
 regex = "*"
+mini-moka = "0.10"
 
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", branch = "beta1", package = "buckyos-kit" }
 kRPC = { git = "https://github.com/buckyos/buckyos-base.git", branch = "beta1", package = "kRPC" }

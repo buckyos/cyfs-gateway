@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use rustls::{server, sign, Error};
 use rustls::client::verify_server_name;
 use rustls::pki_types::{DnsName, ServerName};
-use rustls::server::{ClientHello, ParsedCertificate};
+use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
+use crate::SelfCertMgrRef;
 
 #[derive(Debug)]
 pub(crate) struct ResolvesServerCertUsingSni {
@@ -95,6 +97,46 @@ impl server::ResolvesServerCert for ResolvesServerCertUsingSni {
                 return None;
             }
             self.external_resolver.as_ref().unwrap().resolve(client_hello)
+        } else {
+            None
+        }
+    }
+}
+
+pub struct TlsCertResolver {
+    resolve: Arc<dyn ResolvesServerCert>,
+    self_cert_mgr: Option<SelfCertMgrRef>,
+}
+
+impl Debug for TlsCertResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsCertResolver").finish()
+    }
+}
+
+impl TlsCertResolver {
+    pub fn new(
+        resolve: Arc<dyn ResolvesServerCert>,
+        self_cert_mgr: Option<SelfCertMgrRef>,
+    ) -> Self {
+        Self {
+            resolve,
+            self_cert_mgr,
+        }
+    }
+}
+
+impl ResolvesServerCert for TlsCertResolver {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello,
+    ) -> Option<Arc<CertifiedKey>> {
+        let server_name = client_hello.server_name().map(|v| v.to_string()).unwrap_or("".to_string());
+        if let Some(cert) = self.resolve.resolve(client_hello) {
+            return Some(cert);
+        }
+        if let Some(cert) = self.self_cert_mgr.as_ref() {
+            cert.get().get_cert(server_name.as_str())
         } else {
             None
         }
