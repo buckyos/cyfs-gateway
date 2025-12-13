@@ -7,7 +7,7 @@ mod quic_stack;
 mod limiter;
 mod tls_cert_resolver;
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use buckyos_kit::AsyncStream;
 pub use tcp_stack::*;

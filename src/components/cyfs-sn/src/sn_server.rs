@@ -1,9 +1,16 @@
 #![allow(unused)]
 use crate::sn_db::{self, *};
-use http_body_util::combinators::BoxBody;
 use ::kRPC::*;
 use async_trait::async_trait;
-use cyfs_gateway_lib::{HttpServer, NameServer, ProcessChainConfig, QAServer, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo, qa_json_to_rpc_request};
+use cyfs_gateway_lib::{into_server_err, server_err};
+use cyfs_gateway_lib::{
+    qa_json_to_rpc_request, HttpServer, NameServer, ProcessChainConfig, QAServer, Server,
+    ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo,
+};
+use http::{Method, Response, StatusCode};
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Collected, Full};
+use hyper::body::Bytes;
 use jsonwebtoken::DecodingKey;
 use lazy_static::lazy_static;
 use log::*;
@@ -12,7 +19,7 @@ use name_lib::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use hyper::body::{Bytes};
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{
@@ -20,12 +27,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     result::Result,
 };
-use std::net::SocketAddr;
-use http::{Method, Response, StatusCode};
-use http_body_util::{BodyExt, Collected, Full};
 use tokio::sync::Mutex;
-use cyfs_gateway_lib::{server_err,into_server_err};
-
 
 #[derive(Serialize, Deserialize)]
 pub struct OODInfo {
@@ -33,7 +35,7 @@ pub struct OODInfo {
     pub did_hostname: String,
     pub owner_id: String,
     pub self_cert: bool,
-    pub state: String,//active,suspended,disabled,banned
+    pub state: String, //active,suspended,disabled,banned
 }
 
 #[derive(Clone)]
@@ -79,7 +81,6 @@ impl SNServer {
         }
     }
 
-
     pub async fn check_username(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
         let username = req.params.get("username");
         if username.is_none() {
@@ -114,9 +115,8 @@ impl SNServer {
 
     // 辅助函数：检测字符串是否包含特殊字符
     fn contains_special_chars(s: &str) -> bool {
-        s.chars().any(|c| {
-            !c.is_alphanumeric() && !c.is_whitespace() && c != '_' && c != '-' && c != '.'
-        })
+        s.chars()
+            .any(|c| !c.is_alphanumeric() && !c.is_whitespace() && c != '_' && c != '-' && c != '.')
     }
 
     pub async fn check_active_code(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
@@ -210,8 +210,6 @@ impl SNServer {
         return Ok(resp);
     }
 
-
-
     pub async fn register_device(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
         let user_name = req.params.get("user_name");
         let device_name = req.params.get("device_name");
@@ -276,18 +274,23 @@ impl SNServer {
             )));
         }
         let mini_device_config = mini_device_config.unwrap();
-        let dev_did = format!("did:dev:{}",mini_device_config.x.as_str());
+        let dev_did = format!("did:dev:{}", mini_device_config.x.as_str());
         if dev_did.as_str() != device_did {
             return Err(RPCErrors::ParseRequestError(format!(
                 "Invalid device did: {} (from jwt) != {} (from request)",
-                dev_did,
-                device_did
+                dev_did, device_did
             )));
         }
-      
 
         let db = GLOBAL_SN_DB.lock().await;
-        let ret = db.register_device(user_name, device_name, device_did, mini_config_jwt, device_ip, device_info);
+        let ret = db.register_device(
+            user_name,
+            device_name,
+            device_did,
+            mini_config_jwt,
+            device_ip,
+            device_info,
+        );
         if ret.is_err() {
             let err_str = ret.err().unwrap().to_string();
             warn!(
@@ -366,7 +369,7 @@ impl SNServer {
         );
         let ip_str = ip_from.to_string();
         let db = GLOBAL_SN_DB.lock().await;
-        
+
         db.update_device_info_by_name(
             owner_id,
             &device_info.name.clone(),
@@ -423,11 +426,15 @@ impl SNServer {
         }
     }
 
-    async fn get_user_sn_ips(&self, owner_id: &str) ->Vec<IpAddr> {
+    async fn get_user_sn_ips(&self, owner_id: &str) -> Vec<IpAddr> {
         let db = GLOBAL_SN_DB.lock().await;
         let sn_ips = db.get_user_sn_ips_as_vec(owner_id);
         if sn_ips.is_err() {
-            warn!("failed to get user sn ips for {}: {:?}", owner_id, sn_ips.err().unwrap());
+            warn!(
+                "failed to get user sn ips for {}: {:?}",
+                owner_id,
+                sn_ips.err().unwrap()
+            );
             return vec![];
         }
         let sn_ips = sn_ips.unwrap();
@@ -438,20 +445,17 @@ impl SNServer {
         if sn_ips.is_empty() {
             return vec![];
         }
-        let mut sn_ip_add:Vec<IpAddr> = Vec::new();
+        let mut sn_ip_add: Vec<IpAddr> = Vec::new();
         for ip_str in sn_ips {
             let ip = IpAddr::from_str(ip_str.as_str());
             if ip.is_ok() {
                 sn_ip_add.push(ip.unwrap());
             } else {
-                warn!("failed to parse ip {} {}",ip_str,ip.err().unwrap());
+                warn!("failed to parse ip {} {}", ip_str, ip.err().unwrap());
             }
         }
         return sn_ip_add;
     }
-
-
-
 
     async fn get_device_info(
         &self,
@@ -494,14 +498,20 @@ impl SNServer {
         }
     }
     //return (owner_public_key,zone_config_jwt,device_jwt)
-    async fn get_user_zone_config_by_domain(&self, domain: &str) -> Option<(String, String, Option<String>)> {
+    async fn get_user_zone_config_by_domain(
+        &self,
+        domain: &str,
+    ) -> Option<(String, String, Option<String>)> {
         let db: tokio::sync::MutexGuard<'_, SnDB> = GLOBAL_SN_DB.lock().await;
-        let user_info = db
-            .get_user_info_by_domain(domain);
+        let user_info = db.get_user_info_by_domain(domain);
         drop(db);
 
         if user_info.is_err() {
-            warn!("failed to get user info by domain {}: {:?}", domain, user_info.err().unwrap());
+            warn!(
+                "failed to get user info by domain {}: {:?}",
+                domain,
+                user_info.err().unwrap()
+            );
             return None;
         }
         let user_info = user_info.unwrap();
@@ -521,7 +531,10 @@ impl SNServer {
     }
 
     //return (owner_public_key,zone_config_jwt,sn_ip,device_jwt)
-    async fn get_user_zone_config(&self, username: &str) -> Option<(String, String, Option<String>,Option<String>)> {
+    async fn get_user_zone_config(
+        &self,
+        username: &str,
+    ) -> Option<(String, String, Option<String>, Option<String>)> {
         let db = GLOBAL_SN_DB.lock().await;
         let user_info = db.get_user_info(username).unwrap();
         if user_info.is_some() {
@@ -540,15 +553,14 @@ impl SNServer {
                     let device_jwt = device_info.mini_config_jwt.clone();
                     if device_jwt.len() > 3 {
                         return Some((public_key, zone_config, sn_ips, Some(device_jwt)));
-                    } 
-                } 
-            } 
+                    }
+                }
+            }
 
             return Some((public_key, zone_config, sn_ips, None));
         }
         warn!("zone config not found for [{}]", username);
         return None;
-  
     }
 
     async fn get_user_public_key(&self, username: &str) -> Option<String> {
@@ -560,9 +572,8 @@ impl SNServer {
         return None;
     }
 
-
     //return (subhost,username)
-    pub fn get_user_subhost_from_host(host: &str,server_host: &str) -> Option<(String,String)> {
+    pub fn get_user_subhost_from_host(host: &str, server_host: &str) -> Option<(String, String)> {
         let end_string = format!(".{}", server_host);
         if host.ends_with(&end_string) {
             let sub_name = host[0..host.len() - end_string.len()].to_string();
@@ -594,11 +605,14 @@ impl SNServer {
 
     async fn get_user_zonegate_address_by_domain(&self, domain: &str) -> Option<Vec<IpAddr>> {
         let db = GLOBAL_SN_DB.lock().await;
-        let user_info = db
-            .get_user_info_by_domain(domain);
+        let user_info = db.get_user_info_by_domain(domain);
         drop(db);
         if user_info.is_err() {
-            warn!("failed to get user info by domain {}: {:?}", domain, user_info.err().unwrap());
+            warn!(
+                "failed to get user info by domain {}: {:?}",
+                domain,
+                user_info.err().unwrap()
+            );
             return None;
         }
         let user_info = user_info.unwrap();
@@ -608,8 +622,9 @@ impl SNServer {
         }
         let user_info = user_info.unwrap();
 
-        return self.get_user_zonegate_address(user_info.username.as_ref().unwrap()).await;
-
+        return self
+            .get_user_zonegate_address(user_info.username.as_ref().unwrap())
+            .await;
     }
 
     async fn get_user_zonegate_address(&self, username: &str) -> Option<Vec<IpAddr>> {
@@ -699,30 +714,40 @@ impl SNServer {
                 //query device by hostname
                 let hostname = req.params.get("dest_host");
                 if hostname.is_none() {
-                    return Err(RPCErrors::ParseRequestError("Invalid params, hostname is none".to_string()));
+                    return Err(RPCErrors::ParseRequestError(
+                        "Invalid params, hostname is none".to_string(),
+                    ));
                 }
                 let hostname = hostname.unwrap().as_str();
                 if hostname.is_none() {
-                    return Err(RPCErrors::ParseRequestError("Invalid params, hostname is none".to_string()));
+                    return Err(RPCErrors::ParseRequestError(
+                        "Invalid params, hostname is none".to_string(),
+                    ));
                 }
                 let hostname = hostname.unwrap();
-                let ood_info= self.query_device_by_hostname(hostname).await;
+                let ood_info = self.query_device_by_hostname(hostname).await;
                 if ood_info.is_some() {
                     let ood_info = ood_info.unwrap();
                     let ood_json = serde_json::to_value(ood_info).unwrap();
                     return Ok(RPCResponse::new(RPCResult::Success(ood_json), req.id));
                 } else {
-                    return Err(RPCErrors::ParseRequestError("Invalid params, hostname is none".to_string()));
+                    return Err(RPCErrors::ParseRequestError(
+                        "Invalid params, hostname is none".to_string(),
+                    ));
                 }
             }
             "query_by_did" => {
                 let did = req.params.get("source_device_id");
                 if did.is_none() {
-                    return Err(RPCErrors::ParseRequestError("Invalid params, did is none".to_string()));
+                    return Err(RPCErrors::ParseRequestError(
+                        "Invalid params, did is none".to_string(),
+                    ));
                 }
                 let did = did.unwrap().as_str();
                 if did.is_none() {
-                    return Err(RPCErrors::ParseRequestError("Invalid params, did is none".to_string()));
+                    return Err(RPCErrors::ParseRequestError(
+                        "Invalid params, did is none".to_string(),
+                    ));
                 }
                 let did = did.unwrap();
                 let ood_info = self.query_by_did(did).await;
@@ -731,18 +756,16 @@ impl SNServer {
                     let ood_json = serde_json::to_value(ood_info).unwrap();
                     return Ok(RPCResponse::new(RPCResult::Success(ood_json), req.id));
                 } else {
-                    return Err(RPCErrors::ParseRequestError("Invalid params, did is none".to_string()));
+                    return Err(RPCErrors::ParseRequestError(
+                        "Invalid params, did is none".to_string(),
+                    ));
                 }
             }
             _ => Err(RPCErrors::UnknownMethod(req.method)),
         }
     }
 
-
-    async fn query_by_did(
-        &self,
-        did: &str,
-    ) -> Option<OODInfo> {
+    async fn query_by_did(&self, did: &str) -> Option<OODInfo> {
         let db = GLOBAL_SN_DB.lock().await;
         let device_info = db.query_device_by_did(did).unwrap();
         if device_info.is_none() {
@@ -757,16 +780,13 @@ impl SNServer {
         });
     }
 
-    async fn query_device_by_hostname(
-        &self,
-        req_host: &str,
-    ) -> Option<OODInfo> {
+    async fn query_device_by_hostname(&self, req_host: &str) -> Option<OODInfo> {
         let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
         if get_result.is_some() {
-            let (sub_host,username) = get_result.unwrap();
+            let (sub_host, username) = get_result.unwrap();
             let device_info = self.get_device_info(username.as_str(), "ood1").await;
             if device_info.is_some() {
-                info!("ood1 device info found for {} in sn server",username);
+                info!("ood1 device info found for {} in sn server", username);
                 //let device_did = device_info.unwrap().0.did;
                 let (device_info, device_ip) = device_info.unwrap();
                 let did_hostname = device_info.id.to_host_name();
@@ -784,7 +804,10 @@ impl SNServer {
             let db = GLOBAL_SN_DB.lock().await;
             let user_info = db.get_user_info_by_domain(req_host);
             if user_info.is_err() {
-                info!("failed to get user info by domain: {}", user_info.err().unwrap());
+                info!(
+                    "failed to get user info by domain: {}",
+                    user_info.err().unwrap()
+                );
                 return None;
             }
             let user_info = user_info.unwrap();
@@ -827,7 +850,9 @@ impl SNServer {
         name_info.txt.push(format!("BOOT={};", self.boot_jwt));
         name_info.txt.push(format!("PKX={};", self.owner_pkx));
         if device_jwt.is_some() {
-            name_info.txt.push(format!("DEV={};", device_jwt.as_ref().unwrap().as_str()));
+            name_info
+                .txt
+                .push(format!("DEV={};", device_jwt.as_ref().unwrap().as_str()));
         }
         return name_info;
     }
@@ -838,12 +863,20 @@ impl QAServer for SNServer {
     async fn serve_question(&self, req: &serde_json::Value) -> ServerResult<serde_json::Value> {
         let rpc_request = qa_json_to_rpc_request(req);
         if rpc_request.is_err() {
-            return Err(server_err!(ServerErrorCode::InvalidParam, "invalid request"));
+            return Err(server_err!(
+                ServerErrorCode::InvalidParam,
+                "invalid request"
+            ));
         }
         let rpc_request = rpc_request.unwrap();
-        let rpc_response = self.handle_rpc_call(rpc_request, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).await;
+        let rpc_response = self
+            .handle_rpc_call(rpc_request, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+            .await;
         if rpc_response.is_err() {
-            return Err(server_err!(ServerErrorCode::ProcessChainError, "failed to handle rpc call"));
+            return Err(server_err!(
+                ServerErrorCode::ProcessChainError,
+                "failed to handle rpc call"
+            ));
         }
         let rpc_response = rpc_response.unwrap();
         return Ok(serde_json::to_value(rpc_response).unwrap());
@@ -881,20 +914,18 @@ impl NameServer for SNServer {
         }
 
         if !is_support {
-            return Err(server_err!(ServerErrorCode::NotFound,
+            return Err(server_err!(
+                ServerErrorCode::NotFound,
                 "sn-server not support record type {}",
                 record_type.to_string()
             ));
         }
-        let mut req_real_name:String = name.to_string();
+        let mut req_real_name: String = name.to_string();
         if name.ends_with(".") {
             req_real_name = name.trim_end_matches('.').to_string();
         }
 
-        if req_real_name == self.server_host
-        || self.server_aliases.contains(&req_real_name)
-
-        {
+        if req_real_name == self.server_host || self.server_aliases.contains(&req_real_name) {
             //返回当前服务器的地址
             match record_type {
                 RecordType::A => {
@@ -903,11 +934,16 @@ impl NameServer for SNServer {
                 }
                 RecordType::TXT => {
                     let device_jwt = self.device_jwt.get(0);
-                    let name_info = self.create_name_info_from_zone_config(self.boot_jwt.as_str(), self.owner_pkx.as_str(), device_jwt);
+                    let name_info = self.create_name_info_from_zone_config(
+                        self.boot_jwt.as_str(),
+                        self.owner_pkx.as_str(),
+                        device_jwt,
+                    );
                     return Ok(name_info);
                 }
                 _ => {
-                    return Err(server_err!(ServerErrorCode::NotFound,
+                    return Err(server_err!(
+                        ServerErrorCode::NotFound,
                         "sn-server not support record type {}",
                         record_type.to_string()
                     ));
@@ -927,7 +963,11 @@ impl NameServer for SNServer {
             let subs: Vec<&str> = sub_name.split(".").collect();
             let username = subs.last();
             if username.is_none() {
-                return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
+                return Err(server_err!(
+                    ServerErrorCode::NotFound,
+                    "{}",
+                    name.to_string()
+                ));
             }
             let username = username.unwrap();
             info!(
@@ -940,10 +980,18 @@ impl NameServer for SNServer {
                     if zone_config.is_some() {
                         let mut name_info = NameInfo::default();
                         let (public_key, zone_config, sn_ips, device_jwt) = zone_config.unwrap();
-                        let name_info = self.create_name_info_from_zone_config(zone_config.as_str(), public_key.as_str(), device_jwt.as_ref());
+                        let name_info = self.create_name_info_from_zone_config(
+                            zone_config.as_str(),
+                            public_key.as_str(),
+                            device_jwt.as_ref(),
+                        );
                         return Ok(name_info);
                     } else {
-                        return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
+                        return Err(server_err!(
+                            ServerErrorCode::NotFound,
+                            "{}",
+                            name.to_string()
+                        ));
                     }
                 }
                 RecordType::A | RecordType::AAAA => {
@@ -953,11 +1001,16 @@ impl NameServer for SNServer {
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
                         return Ok(result_name_info);
                     } else {
-                        return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
+                        return Err(server_err!(
+                            ServerErrorCode::NotFound,
+                            "{}",
+                            name.to_string()
+                        ));
                     }
                 }
                 _ => {
-                    return Err(server_err!(ServerErrorCode::NotFound,
+                    return Err(server_err!(
+                        ServerErrorCode::NotFound,
                         "sn-server not support record type {}",
                         record_type.to_string()
                     ));
@@ -967,17 +1020,28 @@ impl NameServer for SNServer {
             let real_domain_name = name[0..name.len() - 1].to_string();
             match record_type {
                 RecordType::TXT => {
-                    let zone_config_info = self.get_user_zone_config_by_domain(&real_domain_name).await;
+                    let zone_config_info =
+                        self.get_user_zone_config_by_domain(&real_domain_name).await;
                     if zone_config_info.is_some() {
                         let (public_key, zone_config, device_jwt) = zone_config_info.unwrap();
-                        let name_info = self.create_name_info_from_zone_config(zone_config.as_str(), public_key.as_str(), device_jwt.as_ref());
+                        let name_info = self.create_name_info_from_zone_config(
+                            zone_config.as_str(),
+                            public_key.as_str(),
+                            device_jwt.as_ref(),
+                        );
                         return Ok(name_info);
                     } else {
-                        return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
+                        return Err(server_err!(
+                            ServerErrorCode::NotFound,
+                            "{}",
+                            name.to_string()
+                        ));
                     }
                 }
                 RecordType::A | RecordType::AAAA => {
-                    let address_vec = self.get_user_zonegate_address_by_domain(&real_domain_name).await;
+                    let address_vec = self
+                        .get_user_zonegate_address_by_domain(&real_domain_name)
+                        .await;
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
@@ -985,14 +1049,19 @@ impl NameServer for SNServer {
                     }
                 }
                 _ => {
-                    return Err(server_err!(ServerErrorCode::NotFound,
+                    return Err(server_err!(
+                        ServerErrorCode::NotFound,
                         "sn-server not support record type {}",
                         record_type.to_string()
                     ));
                 }
             }
 
-            return Err(server_err!(ServerErrorCode::NotFound, "{}", name.to_string()));
+            return Err(server_err!(
+                ServerErrorCode::NotFound,
+                "{}",
+                name.to_string()
+            ));
         }
     }
 
@@ -1002,7 +1071,8 @@ impl NameServer for SNServer {
         fragment: Option<&str>,
         from_ip: Option<IpAddr>,
     ) -> ServerResult<EncodedDocument> {
-        return Err(server_err!(ServerErrorCode::NotFound,
+        return Err(server_err!(
+            ServerErrorCode::NotFound,
             "sn-server not support did query"
         ));
     }
@@ -1022,47 +1092,63 @@ impl HttpServer for SNServer {
         None
     }
 
-    async fn serve_request(&self, request: http::Request<BoxBody<Bytes, ServerError>>, info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    async fn serve_request(
+        &self,
+        request: http::Request<BoxBody<Bytes, ServerError>>,
+        info: StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         if request.method() != Method::POST {
             return Ok(Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
-                .body(BoxBody::new(Full::new(Bytes::from_static(b"Method Not Allowed"))
-                    .map_err(|e| match e {}).boxed())).unwrap());
+                .body(BoxBody::new(
+                    Full::new(Bytes::from_static(b"Method Not Allowed"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                ))
+                .unwrap());
         }
 
         let client_ip = match info.src_addr {
-            Some(addr) => {
-                match addr.parse::<SocketAddr>() {
-                    Ok(socket_addr) => socket_addr.ip(),
-                    Err(e) => {
-                        error!("parse client ip {} err {}", addr.as_str(), e);
-                        return Ok(Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(BoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
-                                .map_err(|e| match e {}).boxed())
-                            .unwrap());
-                    }
+            Some(addr) => match addr.parse::<SocketAddr>() {
+                Ok(socket_addr) => socket_addr.ip(),
+                Err(e) => {
+                    error!("parse client ip {} err {}", addr.as_str(), e);
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(
+                            BoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
+                                .map_err(|e| match e {})
+                                .boxed(),
+                        )
+                        .unwrap());
                 }
-            }
+            },
             None => {
                 error!("Failed to get client ip");
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(BoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
-                        .map_err(|e| match e {}).boxed())
+                    .body(
+                        BoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    )
                     .unwrap());
             }
         };
 
         let body_bytes = match request.collect().await {
-            Ok(data) => {
-                data.to_bytes()
-            }
+            Ok(data) => data.to_bytes(),
             Err(e) => {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(BoxBody::new(Full::new(Bytes::from(format!("Failed to read body: {:?}", e))))
-                        .map_err(|e| match e {}).boxed())
+                    .body(
+                        BoxBody::new(Full::new(Bytes::from(format!(
+                            "Failed to read body: {:?}",
+                            e
+                        ))))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                    )
                     .unwrap());
             }
         };
@@ -1072,21 +1158,33 @@ impl HttpServer for SNServer {
             Err(e) => {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(BoxBody::new(Full::new(Bytes::from(format!("Failed to convert body to string: {}", e))))
-                        .map_err(|e| match e {}).boxed())
+                    .body(
+                        BoxBody::new(Full::new(Bytes::from(format!(
+                            "Failed to convert body to string: {}",
+                            e
+                        ))))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                    )
                     .unwrap());
             }
         };
 
-        info!("|==>recv kRPC req: {}",body_str);
+        info!("|==>recv kRPC req: {}", body_str);
 
         let rpc_request: RPCRequest = match serde_json::from_str(body_str.as_str()) {
             Ok(rpc_request) => rpc_request,
             Err(e) => {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
-                    .body(BoxBody::new(Full::new(Bytes::from(format!("Failed to parse request body to RPCRequest: {}", e))))
-                        .map_err(|e| match e {}).boxed())
+                    .body(
+                        BoxBody::new(Full::new(Bytes::from(format!(
+                            "Failed to parse request body to RPCRequest: {}",
+                            e
+                        ))))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                    )
                     .unwrap());
             }
         };
@@ -1096,18 +1194,26 @@ impl HttpServer for SNServer {
             Err(e) => {
                 return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(BoxBody::new(Full::new(Bytes::from(format!("Failed to handle rpc call: {}", e))))
-                        .map_err(|e| match e {}).boxed())
+                    .body(
+                        BoxBody::new(Full::new(Bytes::from(format!(
+                            "Failed to handle rpc call: {}",
+                            e
+                        ))))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                    )
                     .unwrap());
             }
         };
 
         //parse resp to Response<Body>
-        Ok(Response::new(Full::new(Bytes::from(serde_json::to_string(&resp).unwrap()))
-            .map_err(|never| match never {}).boxed()))
+        Ok(Response::new(
+            Full::new(Bytes::from(serde_json::to_string(&resp).unwrap()))
+                .map_err(|never| match never {})
+                .boxed(),
+        ))
     }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SNServerConfig {
@@ -1134,20 +1240,31 @@ impl ServerConfig for SNServerConfig {
         serde_json::to_string(self).unwrap()
     }
 
-
-    fn add_pre_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
+    fn add_pre_hook_point_process_chain(
+        &self,
+        _process_chain: ProcessChainConfig,
+    ) -> Arc<dyn ServerConfig> {
         Arc::new(self.clone())
     }
 
-    fn remove_pre_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
+    fn remove_pre_hook_point_process_chain(
+        &self,
+        _process_chain_id: &str,
+    ) -> Arc<dyn ServerConfig> {
         Arc::new(self.clone())
     }
 
-    fn add_post_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
+    fn add_post_hook_point_process_chain(
+        &self,
+        _process_chain: ProcessChainConfig,
+    ) -> Arc<dyn ServerConfig> {
         Arc::new(self.clone())
     }
 
-    fn remove_post_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
+    fn remove_post_hook_point_process_chain(
+        &self,
+        _process_chain_id: &str,
+    ) -> Arc<dyn ServerConfig> {
         Arc::new(self.clone())
     }
 }
@@ -1163,11 +1280,21 @@ impl SNServerFactory {
 #[async_trait::async_trait]
 impl ServerFactory for SNServerFactory {
     async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
-        let config = config.as_any().downcast_ref::<SNServerConfig>()
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid SNServer config {}", config.server_type()))?;
+        let config = config
+            .as_any()
+            .downcast_ref::<SNServerConfig>()
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid SNServer config {}",
+                config.server_type()
+            ))?;
 
         let sn = Arc::new(SNServer::new(config.clone()));
-        Ok(vec![Server::NameServer(sn.clone()), Server::Http(sn.clone()), Server::QA(sn.clone())])
+        Ok(vec![
+            Server::NameServer(sn.clone()),
+            Server::Http(sn.clone()),
+            Server::QA(sn.clone()),
+        ])
     }
 }
 
@@ -1199,17 +1326,20 @@ mod tests {
     fn test_get_user_subhost_from_host() {
         let server_host = "web3.buckyos.io".to_string();
         let req_host = "home.lzc.web3.buckyos.io".to_string();
-        let (sub_host,username) = SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
+        let (sub_host, username) =
+            SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
         assert_eq!(sub_host, "home.lzc".to_string());
         assert_eq!(username, "lzc".to_string());
 
         let req_host = "www-lzc.web3.buckyos.io".to_string();
-        let (sub_host,username) = SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
+        let (sub_host, username) =
+            SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
         assert_eq!(sub_host, "www-lzc".to_string());
         assert_eq!(username, "lzc".to_string());
 
         let req_host = "buckyos-filebrowser-lzc.web3.buckyos.io".to_string();
-        let (sub_host,username) = SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
+        let (sub_host, username) =
+            SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
         assert_eq!(sub_host, "buckyos-filebrowser-lzc".to_string());
         assert_eq!(username, "lzc".to_string());
     }
