@@ -19,6 +19,7 @@ mod quic_tunnel;
 mod json_collection;
 mod cmds;
 mod self_cert_mgr;
+mod tls_tunnel;
 
 pub use aes_stream::*;
 pub use config::*;

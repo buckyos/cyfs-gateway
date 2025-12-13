@@ -9,6 +9,7 @@ use buckyos_kit::AsyncStream;
 use log::*;
 use url::Url;
 use crate::quic_tunnel::QuicTunnelBuilder;
+use crate::tls_tunnel::TlsTunnelBuilder;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProtocolCategory {
@@ -26,6 +27,7 @@ pub fn get_protocol_category(str_protocol: &str) -> TunnelResult<ProtocolCategor
         "udp" => Ok(ProtocolCategory::Datagram),
         "rudp" => Ok(ProtocolCategory::Datagram),
         "socks" => Ok(ProtocolCategory::Stream),
+        "tls" => Ok(ProtocolCategory::Stream),
         _ => {
             let msg = format!("Unknown protocol: {}", str_protocol);
             error!("{}", msg);
@@ -53,6 +55,7 @@ impl TunnelManager {
         this.register_tunnel_builder("tcp", Arc::new(IPTunnelBuilder::new()));
         this.register_tunnel_builder("udp", Arc::new(IPTunnelBuilder::new()));
         this.register_tunnel_builder("quic", Arc::new(QuicTunnelBuilder::new()));
+        this.register_tunnel_builder("tls", Arc::new(TlsTunnelBuilder::new()));
 
         this
     }

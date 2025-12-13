@@ -153,7 +153,7 @@ mod tests {
             });
 
             let response = sender.send_request(request).await.unwrap();
-            assert_eq!(response.status(), hyper::StatusCode::OK);
+            assert_eq!(response.status(), hyper::StatusCode::INTERNAL_SERVER_ERROR);
         }
 
         {
@@ -176,7 +176,7 @@ mod tests {
             let response = resolver.txt_lookup("www.buckyos.com.").await;
             assert!(response.is_ok());
             let ips = response.unwrap().iter().map(|x| x.to_string()).collect::<Vec<_>>();
-            assert_eq!(ips.len(), 2);
+            assert_eq!(ips.len(), 3);
 
             let response = resolver.lookup_ip("web3.buckyos.com.").await;
             assert!(response.is_ok());

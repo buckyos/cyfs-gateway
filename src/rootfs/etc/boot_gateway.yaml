@@ -50,21 +50,19 @@ stacks:
 #          default:
 #            block: |
 #              reject;
-#
-#  test8083_tls:
-#    bind: 0.0.0.0:8083
-#    protocol: tls
-#    certs:
-#      - domain: "web3.buckyos.com"
-#        cert_path: ./cert.pem
-#        key_path: ./key.pem
-#    hook_point:
-#      main:
-#        priority: 1
-#        blocks:
-#          default:
-#            block: |
-#              reject;
+
+  test8083_tls:
+    bind: 0.0.0.0:443
+    protocol: tls
+    certs:
+      - domain: "*"
+    hook_point:
+      main:
+        blocks:
+          default:
+            block: |
+              return "forward tls:///${REQ.dest_host}:443";
+
 #
 #  test8083_quic:
 #    bind: 0.0.0.0:8083

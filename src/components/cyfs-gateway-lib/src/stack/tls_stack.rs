@@ -288,6 +288,9 @@ impl TlsStackInner {
             let (_, conn) = tls_stream.get_ref();
             conn.server_name().map(|s| s.to_string())
         };
+        if server_name.is_none() {
+            return Ok(());
+        }
         log::info!("accept tls stream from {} to {} name {}", remote_addr, local_addr, server_name.as_ref().unwrap_or(&"".to_string()));
         let mut request = StreamRequest::new(Box::new(tls_stream), local_addr);
         request.source_addr = Some(remote_addr);
@@ -735,7 +738,7 @@ mod tests {
     use crate::global_process_chains::GlobalProcessChains;
     use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, StreamInfo, LimiterManager, StatManager};
     use crate::{TlsDomainConfig, TlsStack};
-    use buckyos_kit::{AsyncStream};
+    use buckyos_kit::{init_logging, AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use rcgen::generate_simple_self_signed;
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -1089,6 +1092,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tls_stack_self_cert() {
+        init_logging("test", false);
         let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
         let chains = r#"
 - id: main
