@@ -29,16 +29,13 @@ import sys
 from pathlib import Path
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
-from util import get_buckyos_root
-from cert_mgr import CertManager  # type: ignore
+from buckyos_devkit.buckyos_kit import get_buckyos_root
+from buckyos_devkit import CertManager  # type: ignore
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ROOTFS_DIR = SCRIPT_DIR.parent / "rootfs"
-BUCKYCLI_BIN = ROOTFS_DIR / "bin" / "buckycli" / "buckycli"
-if not BUCKYCLI_BIN.exists():
-    BUCKYCLI_BIN = Path(get_buckyos_root()) / "bin" / "buckycli" / "buckycli"
-    if not BUCKYCLI_BIN.exists():
-        raise FileNotFoundError(f"buckycli binary missing at {BUCKYCLI_BIN}")
+
+BUCKYCLI_BIN = Path(get_buckyos_root()) / "bin" / "buckycli" / "buckycli"
+
 
 print(f"* buckycli at {BUCKYCLI_BIN}")
 
@@ -65,7 +62,8 @@ def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> None:
 
 def run_buckycli(args: List[str]) -> None:
     cmd = [str(BUCKYCLI_BIN)] + args
-    run_cmd(cmd, cwd=ROOTFS_DIR)
+    print(f"run_buckycli: {cmd}")
+    run_cmd(cmd)
 
 
 def copy_if_exists(src: Path, dst: Path) -> None:

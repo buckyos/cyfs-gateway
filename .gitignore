@@ -20,8 +20,9 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 Cargo.lock
-src/scripts/__pycache__/
 src/rootfs/bin/cyfs-gateway/cyfs_gateway
 src/rootfs/bin/test-server/test_server
 src/rootfs/bin/__pycache__/
-src/scripts/remote/__pycache__/
+src/_scripts/
+
+

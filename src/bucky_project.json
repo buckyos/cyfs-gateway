@@ -1,0 +1,52 @@
+{
+    "name": "cyfs-gateway",
+    "base_dir": ".",
+    "modules": {
+        "cyfs_gateway": {
+            "type": "rust",
+            "name": "cyfs_gateway"
+        },
+        "test_server": {
+            "type": "rust",
+            "name": "test_server"
+        }
+    },
+    "apps": {
+     "cyfs-gateway": {
+        "name": "cyfs-gateway",
+        "rootfs": "rootfs/",
+        "default_target_rootfs": "/opt/buckyos/",
+        "modules": {
+          "cyfs_gateway": "bin/cyfs-gateway/",
+          "test_server": "bin/test-server/"
+        },
+        "data_paths": [
+        ],
+        "clean_paths": [
+        ]
+      },
+      "web3-gateway": {
+        "name": "web3-gateway",
+        "rootfs": "web3-gateway/",
+        "default_target_rootfs": "/opt/web3-gateway/",
+        "modules": {
+          "cyfs_gateway": "web3_gateway"
+        },
+        "data_paths": [
+            "web3_gateway.yaml",
+            "website.yaml",
+            "params.json",
+            "start.py",
+            "stop.py"
+        ],
+        "clean_paths": [
+            "sn_db.sqlite"
+        ]
+      }
+    },
+    "rust_env": {
+      "OPENSSL_STATIC": "1"
+    }
+  }
+  
+  
