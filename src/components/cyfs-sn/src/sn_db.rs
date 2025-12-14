@@ -210,7 +210,7 @@ impl SnDB {
         user_domain: Option<String>,
     ) -> Result<bool> {
         let sn_ips: Option<String> = None;
-        let mut stmt = self.conn.prepare("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain, sn_ips) VALUES (?1,?2,?3,?4,?5,?6,?7)")?;
+        let mut stmt = self.conn.prepare("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain,self_cert, sn_ips) VALUES (?1,?2,?3,?4,?5,?6,?7)")?;
         stmt.execute(params![
             username,
             UserState::Active.to_string(),
@@ -218,6 +218,7 @@ impl SnDB {
             "DIRECT",
             zone_config,
             user_domain,
+            true,
             sn_ips,
         ])?;
         Ok(true)
