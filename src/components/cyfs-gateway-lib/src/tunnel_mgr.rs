@@ -143,4 +143,48 @@ impl TunnelManager {
             })?;
         return Ok(client);
     }
+
+    pub fn get_instance() -> &'static Self {
+        unimplemented!()
+    }
+}
+
+
+mod tests {
+
+
+    
+    #[tokio::test]
+    async fn test_tunnel_url_in_stream_id() {
+        use url::Url;
+        use percent_encoding::{utf8_percent_encode, percent_decode_str, NON_ALPHANUMERIC};
+        
+        let tunnel_url = "rtcp://sn.buckyos.ai/google.com:443";
+        let url = Url::parse(tunnel_url).unwrap();
+        let stream_id = url.path();
+        println!("stream_id: {}", stream_id);
+        assert_eq!(stream_id, "/google.com:443");
+
+        // 在 path 中嵌入另一个完整的 URL，需要进行 URL 编码
+        // 因为嵌入的 URL 包含特殊字符（://、/ 等），必须编码以避免破坏外层 URL 结构
+        let embedded_url = "rtcp://sn.buckyos.io/google.com:443/";
+        let encoded_url = utf8_percent_encode(embedded_url, NON_ALPHANUMERIC).to_string();
+        
+        let mut url2 = url.clone();
+        let new_path = format!("/{}", encoded_url);
+        url2.set_path(&new_path);
+        let url2_str = url2.to_string();
+        
+        println!("embedded_url: {}", embedded_url);
+        println!("encoded in path: {}", encoded_url);
+        println!("final url: {}", url2_str);
+        
+        // 验证可以正确解码回原始 URL
+        let decoded_path = percent_decode_str(url2.path().trim_start_matches('/'))
+            .decode_utf8()
+            .unwrap();
+        println!("decoded_path: {}", decoded_path);
+        assert_eq!(decoded_path, embedded_url);
+
+    }
 }
