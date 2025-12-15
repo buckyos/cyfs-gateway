@@ -56,13 +56,6 @@ impl ExternalCommand for Forward {
             return Err("dest_url is required".to_string());
         }
 
-        // Check if dest_url is a valid URL
-        if let Some(url) = dest_url {
-            if url::Url::parse(&url).is_err() {
-                return Err(format!("Invalid URL format: {}", url));
-            }
-        }
-
         Ok(())
     }
 
@@ -92,6 +85,6 @@ impl ExternalCommand for Forward {
         }
 
         Ok(CommandResult::return_with_value(CommandControlLevel::Lib,
-                                            format!(r#"forward {}"#, dest_url.unwrap())))
+                                            format!(r#"forward "{}""#, dest_url.unwrap())))
     }
 }
