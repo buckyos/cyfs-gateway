@@ -574,7 +574,7 @@ impl SNServer {
 
     //return (subhost,username)
     pub fn get_user_subhost_from_host(host: &str, server_host: &str) -> Option<(String, String)> {
-        let end_string = format!(".{}", server_host);
+        let end_string = format!(".web3.{}", server_host);
         if host.ends_with(&end_string) {
             let sub_name = host[0..host.len() - end_string.len()].to_string();
             if sub_name.contains(".") {
@@ -900,7 +900,7 @@ impl NameServer for SNServer {
         from_ip: Option<IpAddr>,
     ) -> ServerResult<NameInfo> {
         info!(
-            "sn server process name query: {}, record_type: {:?}",
+            "sn server process name query: {} record_type: {:?}",
             name, record_type
         );
         let record_type = record_type.unwrap_or_default();
@@ -925,7 +925,8 @@ impl NameServer for SNServer {
             req_real_name = name.trim_end_matches('.').to_string();
         }
 
-        if req_real_name == self.server_host || self.server_aliases.contains(&req_real_name) {
+        let sn_full_host = format!("sn.{}", self.server_host);
+        if req_real_name == sn_full_host || req_real_name == self.server_host || self.server_aliases.contains(&req_real_name) {
             //返回当前服务器的地址
             match record_type {
                 RecordType::A => {
@@ -950,33 +951,29 @@ impl NameServer for SNServer {
                 }
             }
         }
-        //query A or AAAA record
-        //端口映射方案: 如果用户存在 返回设备ood1的IP
-        //使用web3桥返连方案:如果用户存在和ood1都存在 返回当前服务器的IP
-
-        //query TXT record
-        //如果用户存在，则返回用户的ZoneConfig
-        let end_string = format!(".{}.", self.server_host.as_str());
-        if name.ends_with(&end_string) {
-            let sub_name = name[0..name.len() - end_string.len()].to_string();
-            //split sub_name by "."
-            let subs: Vec<&str> = sub_name.split(".").collect();
-            let username = subs.last();
-            if username.is_none() {
-                return Err(server_err!(
-                    ServerErrorCode::NotFound,
-                    "{}",
-                    name.to_string()
-                ));
-            }
-            let username = username.unwrap();
+        let get_result = SNServer::get_user_subhost_from_host(&req_real_name, &self.server_host);
+        if get_result.is_some() {
+            let (sub_host, username) = get_result.unwrap();
+        
+        // if req_real_name.ends_with(&sn_full_host) {
+        //     let sub_name = name[0..name.len() - sn_full_host.len()].to_string();
+        //     //split sub_name by "."
+        //     let subs: Vec<&str> = sub_name.split(".").collect();
+        //     let username = subs.last();
+        //     if username.is_none() {
+        //         return Err(server_err!(
+        //             ServerErrorCode::NotFound,
+        //             "{}",
+        //             name.to_string()
+        //         ));
+        //     }
             info!(
-                "sub zone {},enter sn serverquery: {}, record_type: {:?}",
-                username, name, record_type
+                "host {} owner by user {}, sub_host: {}, record_type: {:?}",
+                req_real_name, username, sub_host, record_type
             );
             match record_type {
                 RecordType::TXT => {
-                    let zone_config = self.get_user_zone_config(username).await;
+                    let zone_config = self.get_user_zone_config(username.as_str()).await;
                     if zone_config.is_some() {
                         let mut name_info = NameInfo::default();
                         let (public_key, zone_config, sn_ips, device_jwt) = zone_config.unwrap();
@@ -995,7 +992,7 @@ impl NameServer for SNServer {
                     }
                 }
                 RecordType::A | RecordType::AAAA => {
-                    let address_vec = self.get_user_zonegate_address(username).await;
+                    let address_vec = self.get_user_zonegate_address(username.as_str()).await;
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
