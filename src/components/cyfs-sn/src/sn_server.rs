@@ -628,6 +628,9 @@ impl SNServer {
     }
 
     async fn add_address_to_vec(&self, address_vec: &mut Vec<IpAddr>, ip: IpAddr, record_type: RecordType) {
+        if ip.is_loopback() {
+            return;
+        }
         if record_type == RecordType::A {
             if ip.is_ipv4() {
                 address_vec.push(ip);
