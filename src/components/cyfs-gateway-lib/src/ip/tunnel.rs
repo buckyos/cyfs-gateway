@@ -145,7 +145,7 @@ impl Tunnel for IPTunnel {
         debug!("ip_tunnel open_stream: {}", stream_id);
         let stream_id = stream_id.trim_start_matches('/');
         // 检测stream_id中是否有协议头
-        if !stream_id.contains("://") {
+        if !has_scheme(stream_id) {
             let (dest_host, dest_port) = get_dest_info_from_url_path(stream_id)?;
             self.open_tcp_stream_by_dest(dest_port, dest_host).await
         } else {

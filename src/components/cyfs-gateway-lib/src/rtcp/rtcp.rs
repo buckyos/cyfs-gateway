@@ -4,7 +4,7 @@ use super::protocol::*;
 use super::stream_helper::RTcpStreamBuildHelper;
 
 use crate::tunnel::{TunnelBox};
-use crate::{get_dest_info_from_url_path, DatagramClientBox, EncryptedStream, Tunnel, TunnelEndpoint, TunnelError, TunnelResult};
+use crate::{get_dest_info_from_url_path, has_scheme, DatagramClientBox, EncryptedStream, Tunnel, TunnelEndpoint, TunnelError, TunnelResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use buckyos_kit::{buckyos_get_unix_timestamp, AsyncStream};
@@ -1061,10 +1061,12 @@ impl Tunnel for RTcpTunnel {
         let real_stream_id = percent_decode_str(stream_id.trim_start_matches('/')).decode_utf8();
         if real_stream_id.is_ok() {
             let real_stream_id = real_stream_id.unwrap();
-            let stream_url = Url::parse(&real_stream_id);
-            if stream_url.is_ok() {
-                debug!("will request open stream by url: {}", real_stream_id);
-                return self.open_stream_by_dest(0,Some(real_stream_id.to_string())).await;
+            if has_scheme(real_stream_id.as_ref()) {
+                let stream_url = Url::parse(&real_stream_id);
+                if stream_url.is_ok() {
+                    debug!("will request open stream by url: {}", real_stream_id);
+                    return self.open_stream_by_dest(0, Some(real_stream_id.to_string())).await;
+                }
             }
         } 
         debug!("will rquest open stream by dest: {}", stream_id);
@@ -1089,6 +1091,17 @@ impl Tunnel for RTcpTunnel {
         &self,
         session_id: &str,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
+        let real_stream_id = percent_decode_str(session_id.trim_start_matches('/')).decode_utf8();
+        if real_stream_id.is_ok() {
+            let real_stream_id = real_stream_id.unwrap();
+            if has_scheme(real_stream_id.as_ref()) {
+                let stream_url = Url::parse(&real_stream_id);
+                if stream_url.is_ok() {
+                    debug!("will request open stream by url: {}", real_stream_id);
+                    return self.create_datagram_client_by_dest(0, Some(real_stream_id.to_string())).await;
+                }
+            }
+        }
         let (dest_host, dest_port) = get_dest_info_from_url_path(session_id)?;
         self.create_datagram_client_by_dest(dest_port, dest_host)
             .await
