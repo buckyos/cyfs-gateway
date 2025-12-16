@@ -30,17 +30,17 @@
         "rootfs": "web3-gateway/",
         "default_target_rootfs": "/opt/web3-gateway/",
         "modules": {
-          "cyfs_gateway": "web3_gateway"
+          "cyfs_gateway": "web3_gateway",
+          "web3_gateway_config": "web3_gateway.yaml",
+          "start.py": "start.py",
+          "stop.py": "stop.py"
         },
         "data_paths": [
-            "web3_gateway.yaml",
             "website.yaml",
-            "params.json",
-            "start.py",
-            "stop.py"
+            "params.json"
         ],
         "clean_paths": [
-            "sn_db.sqlite"
+      
         ]
       }
     },

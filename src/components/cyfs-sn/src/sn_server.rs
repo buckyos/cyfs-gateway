@@ -603,7 +603,7 @@ impl SNServer {
         return None;
     }
 
-    async fn get_user_zonegate_address_by_domain(&self, domain: &str) -> Option<Vec<IpAddr>> {
+    async fn get_user_zonegate_address_by_domain(&self, domain: &str, record_type: RecordType) -> Option<Vec<IpAddr>> {
         let db = GLOBAL_SN_DB.lock().await;
         let user_info = db.get_user_info_by_domain(domain);
         drop(db);
@@ -623,11 +623,23 @@ impl SNServer {
         let user_info = user_info.unwrap();
 
         return self
-            .get_user_zonegate_address(user_info.username.as_ref().unwrap())
+            .get_user_zonegate_address(user_info.username.as_ref().unwrap(), record_type)
             .await;
     }
 
-    async fn get_user_zonegate_address(&self, username: &str) -> Option<Vec<IpAddr>> {
+    async fn add_address_to_vec(&self, address_vec: &mut Vec<IpAddr>, ip: IpAddr, record_type: RecordType) {
+        if record_type == RecordType::A {
+            if ip.is_ipv4() {
+                address_vec.push(ip);
+            }
+        } else if record_type == RecordType::AAAA {
+            if ip.is_ipv6() {
+                address_vec.push(ip);
+            }
+        }
+    }
+
+    async fn get_user_zonegate_address(&self, username: &str, record_type: RecordType) -> Option<Vec<IpAddr>> {
         //TODO:需要根据zone_boot_config中的gateway device name来获取gateway device info，而不是写死ood1
         let device_info = self.get_device_info(username, "ood1").await;
 
@@ -640,37 +652,39 @@ impl SNServer {
                     let device_report_ip = device_report_ip.unwrap();
                     match device_report_ip {
                         IpAddr::V4(ip) => {
+                            
                             if ip.is_private() {
-                                address_vec.push(device_ip);
-                                address_vec.push(device_report_ip);
+                                self.add_address_to_vec(&mut address_vec, device_ip, record_type).await;
+                                self.add_address_to_vec(&mut address_vec, device_report_ip, record_type).await;
                             } else {
                                 info!("device {} is wan device with public_v4ip, return report ip {} ",username,device_report_ip);
-                                address_vec.push(device_report_ip);
+                                self.add_address_to_vec(&mut address_vec, device_report_ip, record_type).await;
                             }
+                            
                         }
                         IpAddr::V6(ip) => {
                             info!(
                                 "device {} is wan device with v6, return report ip {} ",
                                 username, device_report_ip
                             );
-                            address_vec.push(device_report_ip);
-                            address_vec.push(device_ip);
-                        }
+                            self.add_address_to_vec(&mut address_vec, device_report_ip, record_type).await;
+                            self.add_address_to_vec(&mut address_vec, device_ip, record_type).await;
+                        } 
                     }
                 } else {
                     info!(
                         "device {} is wan device without self-report ip, return device_ip {}",
                         username, device_ip
                     );
-                    address_vec.push(device_ip);
+                    self.add_address_to_vec(&mut address_vec, device_ip, record_type).await;
                 }
             } else {
                 let sn_ips = self.get_user_sn_ips(username).await;
                 if sn_ips.is_empty() {
-                    address_vec.push(self.server_ip);
+                    self.add_address_to_vec(&mut address_vec, self.server_ip, record_type).await;
                 } else {
                     for ip in sn_ips {
-                        address_vec.push(ip);
+                        self.add_address_to_vec(&mut address_vec, ip, record_type).await;
                     }
                 }
             }
@@ -793,7 +807,7 @@ impl SNServer {
                 let ood_info = OODInfo {
                     did_hostname: did_hostname,
                     owner_id: username.clone(),
-                    self_cert: false,
+                    self_cert: true,
                     state: "active".to_string(),
                 };
                 return Some(ood_info);
@@ -879,7 +893,19 @@ impl QAServer for SNServer {
             ));
         }
         let rpc_response = rpc_response.unwrap();
-        return Ok(serde_json::to_value(rpc_response).unwrap());
+        match rpc_response.result {
+            RPCResult::Success(result) => {
+                return Ok(result);
+            }
+            RPCResult::Failed(error) => {
+                return Err(server_err!(
+                    ServerErrorCode::ProcessChainError,
+                    "failed to handle rpc call: {}",
+                    error
+                ));
+            }
+        }
+
     }
 
     fn id(&self) -> String {
@@ -951,6 +977,8 @@ impl NameServer for SNServer {
                 }
             }
         }
+
+        
         let get_result = SNServer::get_user_subhost_from_host(&req_real_name, &self.server_host);
         if get_result.is_some() {
             let (sub_host, username) = get_result.unwrap();
@@ -992,15 +1020,16 @@ impl NameServer for SNServer {
                     }
                 }
                 RecordType::A | RecordType::AAAA => {
-                    let address_vec = self.get_user_zonegate_address(username.as_str()).await;
+                    let address_vec = self.get_user_zonegate_address(username.as_str(), record_type).await;
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
+                        info!("=>{} result_name_info: {:?}", name, result_name_info);
                         return Ok(result_name_info);
                     } else {
                         return Err(server_err!(
                             ServerErrorCode::NotFound,
-                            "{}",
+                            "no address found for {}",
                             name.to_string()
                         ));
                     }
@@ -1014,6 +1043,7 @@ impl NameServer for SNServer {
                 }
             }
         } else {
+            info!("get user subhost from host: {} failed", req_real_name);
             let real_domain_name = name[0..name.len() - 1].to_string();
             match record_type {
                 RecordType::TXT => {
@@ -1037,11 +1067,12 @@ impl NameServer for SNServer {
                 }
                 RecordType::A | RecordType::AAAA => {
                     let address_vec = self
-                        .get_user_zonegate_address_by_domain(&real_domain_name)
+                        .get_user_zonegate_address_by_domain(&real_domain_name, record_type)
                         .await;
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
+                        info!("=>{} result_name_info: {:?}", name, result_name_info);
                         return Ok(result_name_info);
                     }
                 }
@@ -1056,7 +1087,7 @@ impl NameServer for SNServer {
 
             return Err(server_err!(
                 ServerErrorCode::NotFound,
-                "{}",
+                "no address found for {}",
                 name.to_string()
             ));
         }
@@ -1321,7 +1352,7 @@ mod tests {
 
     #[test]
     fn test_get_user_subhost_from_host() {
-        let server_host = "web3.buckyos.io".to_string();
+        let server_host = "buckyos.io".to_string();
         let req_host = "home.lzc.web3.buckyos.io".to_string();
         let (sub_host, username) =
             SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
@@ -1339,5 +1370,12 @@ mod tests {
             SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
         assert_eq!(sub_host, "buckyos-filebrowser-lzc".to_string());
         assert_eq!(username, "lzc".to_string());
+
+        let server_host = "devtests.org".to_string();
+        let req_host = "alice.web3.devtests.org".to_string();
+        let (sub_host, username) =
+            SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
+        assert_eq!(sub_host, "alice".to_string());
+        assert_eq!(username, "alice".to_string());
     }
 }
