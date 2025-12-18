@@ -15,7 +15,7 @@
      "cyfs-gateway": {
         "name": "cyfs-gateway",
         "rootfs": "rootfs/",
-        "default_target_rootfs": "/opt/buckyos/",
+        "default_target_rootfs": "${BUCKYOS_ROOT}",
         "modules": {
           "cyfs_gateway": "bin/cyfs-gateway/",
           "test_server": "bin/test-server/"
@@ -28,7 +28,7 @@
       "web3-gateway": {
         "name": "web3-gateway",
         "rootfs": "web3-gateway/",
-        "default_target_rootfs": "/opt/web3-gateway/",
+        "default_target_rootfs": "${APPDATA}/web3-gateway/",
         "modules": {
           "cyfs_gateway": "web3_gateway",
           "web3_gateway_config": "web3_gateway.yaml",
