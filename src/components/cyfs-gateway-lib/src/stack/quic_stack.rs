@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_stream_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SelfCertMgrRef};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_stream_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SelfCertMgrRef, GlobalCollectionManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 use crate::stack::{get_limit_info, stream_forward, TlsCertResolver};
@@ -656,6 +656,7 @@ struct QuicStackInner {
     tunnel_manager: TunnelManager,
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
 
 impl QuicStackInner {
@@ -1022,6 +1023,7 @@ impl QuicStack {
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains.clone(),
+                                                          builder.global_collection_manager.clone(),
                                                           Some(get_stream_external_commands(builder.servers.clone().unwrap()))).await
             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
 
@@ -1069,6 +1071,7 @@ impl QuicStack {
                 tunnel_manager: builder.tunnel_manager.unwrap(),
                 limiter_manager: builder.limiter_manager.unwrap(),
                 stat_manager: builder.stat_manager.unwrap(),
+                global_collection_manager: builder.global_collection_manager
             }),
             handle: Mutex::new(None),
         })
@@ -1110,6 +1113,7 @@ impl Stack for QuicStack {
         let (executor, _) = create_process_chain_executor(
             &config.hook_point,
             self.inner.global_process_chains.clone(),
+            self.inner.global_collection_manager.clone(),
             Some(get_stream_external_commands(self.inner.servers.clone())),
         ).await.map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
@@ -1132,6 +1136,7 @@ pub struct QuicStackBuilder {
     limiter_manager: Option<LimiterManagerRef>,
     stat_manager: Option<StatManagerRef>,
     self_cert_mgr: Option<SelfCertMgrRef>,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
 
 impl QuicStackBuilder {
@@ -1151,6 +1156,7 @@ impl QuicStackBuilder {
             limiter_manager: None,
             stat_manager: None,
             self_cert_mgr: None,
+            global_collection_manager: None,
         }
     }
 
@@ -1227,6 +1233,11 @@ impl QuicStackBuilder {
         self
     }
 
+    pub fn global_collection_manager(mut self, global_collection_manager: GlobalCollectionManagerRef) -> Self {
+        self.global_collection_manager = Some(global_collection_manager);
+        self
+    }
+
     pub async fn build(self) -> StackResult<QuicStack> {
         QuicStack::create(self).await
     }
@@ -1280,6 +1291,7 @@ pub struct QuicStackFactory {
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
     self_cert_mgr: SelfCertMgrRef,
+    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl QuicStackFactory {
@@ -1292,6 +1304,7 @@ impl QuicStackFactory {
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
         self_cert_mgr: SelfCertMgrRef,
+        global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         Self {
             servers,
@@ -1302,6 +1315,7 @@ impl QuicStackFactory {
             limiter_manager,
             stat_manager,
             self_cert_mgr,
+            global_collection_manager,
         }
     }
 }
@@ -1359,7 +1373,7 @@ impl StackFactory for QuicStackFactory {
 mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use buckyos_kit::{init_logging, AsyncStream};
+    use buckyos_kit::{AsyncStream};
     use h3::error::{ConnectionError, StreamError};
     use quinn::crypto::rustls::QuicClientConfig;
     use quinn::Endpoint;
@@ -1369,7 +1383,7 @@ mod tests {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, Server, ProcessChainHttpServer, Stack, QuicStackFactory, ConnectionManager, StackProtocol, QuicStackConfig, StackFactory, StreamInfo, CertManagerConfig, AcmeCertManager, LimiterManager, StatManager, SelfCertMgr, SelfCertConfig};
+    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, Server, ProcessChainHttpServer, Stack, QuicStackFactory, ConnectionManager, StackProtocol, QuicStackConfig, StackFactory, StreamInfo, CertManagerConfig, AcmeCertManager, LimiterManager, StatManager, SelfCertMgr, SelfCertConfig, GlobalCollectionManager};
     use crate::global_process_chains::GlobalProcessChains;
 
     #[tokio::test]
@@ -1564,7 +1578,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_quic_stack_self_cert() {
-        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let _subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
         let chains = r#"
 - id: main
   priority: 1
@@ -2403,7 +2417,8 @@ mod tests {
             cert_manager,
             LimiterManager::new(),
             StatManager::new(),
-            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap()
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            GlobalCollectionManager::create(vec![]).await.unwrap(),
         );
 
         let config = QuicStackConfig {

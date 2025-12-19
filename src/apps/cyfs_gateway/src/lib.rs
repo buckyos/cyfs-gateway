@@ -92,7 +92,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         error!("{}", msg);
         std::process::exit(1);
     }
-    let config_loader = load_result.unwrap();
+    let gateway_config = load_result.unwrap();
     info!("Parse cyfs-gatway config success");
     
     let connect_manager = ConnectionManager::new();
@@ -101,7 +101,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     let global_process_chains = Arc::new(GlobalProcessChains::new());
     let limiter_manager = LimiterManager::new();
     let stat_manager = StatManager::new();
-    if let Some(limiters_config) = config_loader.limiters_config.clone() {
+    if let Some(limiters_config) = gateway_config.limiters_config.clone() {
         for limiter_config in limiters_config.iter() {
             if limiter_manager.get_limiter(limiter_config.id.as_str()).is_some() {
                 log::error!("Create limiter {} error: limiter already exists", limiter_config.id);
@@ -124,7 +124,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
     let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
     cert_config.keystore_path = data_dir.to_string_lossy().to_string();
-    if let Some(acme_config) = config_loader.acme_config.clone() {
+    if let Some(acme_config) = gateway_config.acme_config.clone() {
         cert_config.account = acme_config.account;
         if acme_config.issuer.is_some() {
             cert_config.acme_server = acme_config.issuer.unwrap();
@@ -148,12 +148,14 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
 
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
     let mut self_cert_config = SelfCertConfig::default();
-    if let Some(config) = config_loader.tls_ca.clone() {
+    if let Some(config) = gateway_config.tls_ca.clone() {
         self_cert_config.ca_path = Some(config.cert_path);
         self_cert_config.key_path = Some(config.key_path);
     }
     self_cert_config.store_path = data_dir.to_string_lossy().to_string();
     let self_cert_manager = SelfCertMgr::create(self_cert_config).await?;
+
+    let global_collections = GlobalCollectionManager::create(gateway_config.collections.clone()).await?;
 
     let factory = GatewayFactory::new(
         server_manager.clone(),
@@ -164,6 +166,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         limiter_manager.clone(),
         stat_manager.clone(),
         self_cert_manager.clone(),
+        global_collections.clone(),
     );
     factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
         server_manager.clone(),
@@ -172,6 +175,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         tunnel_manager.clone(),
         limiter_manager.clone(),
         stat_manager.clone(),
+        global_collections.clone(),
     )));
     debug!("Register tcp stack factory");
     factory.register_stack_factory(StackProtocol::Udp, Arc::new(UdpStackFactory::new(
@@ -181,6 +185,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         tunnel_manager.clone(),
         limiter_manager.clone(),
         stat_manager.clone(),
+        global_collections.clone(),
     )));
     debug!("Register udp stack factory");
     factory.register_stack_factory(StackProtocol::Tls, Arc::new(TlsStackFactory::new(
@@ -192,6 +197,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         limiter_manager.clone(),
         stat_manager.clone(),
         self_cert_manager.clone(),
+        global_collections.clone(),
     )));
     debug!("Register tls stack factory");
     factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
@@ -203,6 +209,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         limiter_manager.clone(),
         stat_manager.clone(),
         self_cert_manager.clone(),
+        global_collections.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
         server_manager.clone(),
@@ -211,6 +218,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         tunnel_manager.clone(),
         limiter_manager.clone(),
         stat_manager.clone(),
+        global_collections.clone(),
     )));
     debug!("Register rtcp stack factory");
     factory.register_stack_factory(StackProtocol::Extension("tun".to_string()), Arc::new(TunStackFactory::new(
@@ -220,23 +228,27 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         tunnel_manager.clone(),
         limiter_manager.clone(),
         stat_manager.clone(),
+        global_collections.clone(),
     )));
     debug!("Register tun stack factory");
     factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
         tunnel_manager.clone(),
+        global_collections.clone(),
     )));
     debug!("Register http server factory");
     factory.register_server_factory("dir", Arc::new(DirServerFactory::new()));
 
     factory.register_server_factory("socks", Arc::new(SocksServerFactory::new(
         global_process_chains.clone(),
+        global_collections.clone(),
     )));
     debug!("Register dir server factory");
     factory.register_server_factory("dns", Arc::new(ProcessChainDnsServerFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
+        global_collections.clone(),
     )));
     debug!("Register dns server factory");
     factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new(cert_manager.clone())));
@@ -270,7 +282,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         Arc::new(SNServerFactory::new())
     );
     info!("Register sn server factory");
-    let gateway = match factory.create_gateway(config_loader).await {
+    let gateway = match factory.create_gateway(gateway_config).await {
         Ok(gateway) => gateway,
         Err(e) => {
             error!("create gateway failed: {}", e);

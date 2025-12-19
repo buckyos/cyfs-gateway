@@ -8,7 +8,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor};
-use crate::{get_server_external_commands, HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerManagerRef, ServerResult, StreamInfo, TunnelManager};
+use crate::{get_server_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerManagerRef, ServerResult, StreamInfo, TunnelManager};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err,into_server_err};
 use crate::tunnel_connector::TunnelConnector;
@@ -22,6 +22,7 @@ pub struct ProcessChainHttpServerBuilder {
     global_process_chains: Option<GlobalProcessChainsRef>,
     server_mgr: Option<ServerManagerRef>,
     tunnel_manager: Option<TunnelManager>,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
 
 // Add setter methods for HttpServerBuilder
@@ -61,6 +62,11 @@ impl ProcessChainHttpServerBuilder {
         self
     }
 
+    pub fn global_collection_manager(mut self, global_collection_manager: GlobalCollectionManagerRef) -> Self {
+        self.global_collection_manager = Some(global_collection_manager);
+        self
+    }
+
     pub async fn build(self) -> ServerResult<ProcessChainHttpServer> {
         ProcessChainHttpServer::create_server(self).await
     }
@@ -85,6 +91,7 @@ impl ProcessChainHttpServer {
             global_process_chains: None,
             server_mgr: None,
             tunnel_manager: None,
+            global_collection_manager: None,
         }
     }
 
@@ -121,6 +128,7 @@ impl ProcessChainHttpServer {
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains,
+                                                          builder.global_collection_manager,
                                                           Some(get_server_external_commands(builder.server_mgr.clone().unwrap()))).await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
         Ok(ProcessChainHttpServer {
@@ -346,16 +354,19 @@ pub struct ProcessChainHttpServerFactory {
     server_mgr: ServerManagerRef,
     global_process_chains: GlobalProcessChainsRef,
     tunnel_mgr: TunnelManager,
+    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl ProcessChainHttpServerFactory {
     pub fn new(server_mgr: ServerManagerRef,
                global_process_chains: GlobalProcessChainsRef,
-               tunnel_mgr: TunnelManager) -> Self {
+               tunnel_mgr: TunnelManager,
+               global_collection_manager: GlobalCollectionManagerRef, ) -> Self {
         Self {
             server_mgr,
             global_process_chains,
             tunnel_mgr,
+            global_collection_manager,
         }
     }
 }
@@ -371,7 +382,8 @@ impl ServerFactory for ProcessChainHttpServerFactory {
             .id(config.id.clone())
             .server_mgr(self.server_mgr.clone())
             .tunnel_manager(self.tunnel_mgr.clone())
-            .global_process_chains(self.global_process_chains.clone());
+            .global_process_chains(self.global_process_chains.clone())
+            .global_collection_manager(self.global_collection_manager.clone());
         if config.h3_port.is_some() {
             builder = builder.h3_port(config.h3_port.clone().unwrap());
         }
@@ -389,7 +401,7 @@ mod tests {
     use std::sync::Arc;
     use buckyos_kit::init_logging;
     use hyper_util::rt::{TokioExecutor, TokioIo};
-    use crate::{GlobalProcessChains, ServerManager, StreamInfo, hyper_serve_http, hyper_serve_http1};
+    use crate::{GlobalProcessChains, ServerManager, StreamInfo, hyper_serve_http, hyper_serve_http1, GlobalCollectionManager};
 
     #[tokio::test]
     async fn test_http_server_builder_creation() {
@@ -879,6 +891,7 @@ mod tests {
             Arc::new(ServerManager::new()),
             Arc::new(GlobalProcessChains::new()),
             TunnelManager::new(),
+            GlobalCollectionManager::create(vec![]).await.unwrap()
         );
         let result = factory.create(Arc::new(config)).await;
         assert!(result.is_ok());

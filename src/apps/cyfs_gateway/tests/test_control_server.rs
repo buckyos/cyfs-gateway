@@ -117,6 +117,8 @@ print("hello python")
         let cert_manager = AcmeCertManager::create(CertManagerConfig::default()).await.unwrap();
         let limiter_manager = LimiterManager::new();
         let stat_manager = StatManager::new();
+        let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default()).await.unwrap();
+        let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
 
         let factory = GatewayFactory::new(
             server_manager.clone(),
@@ -126,6 +128,8 @@ print("hello python")
             cert_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
+            self_cert_mgr.clone(),
+            collection_manager.clone(),
         );
         factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
             server_manager.clone(),
@@ -134,6 +138,7 @@ print("hello python")
             tunnel_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
+            collection_manager.clone(),
         )));
         factory.register_stack_factory(StackProtocol::Udp, Arc::new(UdpStackFactory::new(
             server_manager.clone(),
@@ -142,6 +147,7 @@ print("hello python")
             tunnel_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
+            collection_manager.clone(),
         )));
         factory.register_stack_factory(StackProtocol::Tls, Arc::new(TlsStackFactory::new(
             server_manager.clone(),
@@ -151,6 +157,8 @@ print("hello python")
             cert_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
+            self_cert_mgr.clone(),
+            collection_manager.clone(),
         )));
         factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
             server_manager.clone(),
@@ -160,6 +168,8 @@ print("hello python")
             cert_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
+            self_cert_mgr.clone(),
+            collection_manager.clone(),
         )));
         factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
             server_manager.clone(),
@@ -168,12 +178,14 @@ print("hello python")
             tunnel_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
+            collection_manager.clone(),
         )));
 
         factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
             server_manager.clone(),
             global_process_chains.clone(),
             tunnel_manager.clone(),
+            collection_manager.clone(),
         )));
 
         let store = TempKeyStore::new();

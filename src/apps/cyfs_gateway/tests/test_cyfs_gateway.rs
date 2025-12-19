@@ -22,6 +22,21 @@ mod tests {
         std::fs::write(local_dns_file.path(), local_dns).unwrap();
         let config = config.replace("{{local_dns}}", local_dns_file.path().to_str().unwrap());
 
+        let json_set = tempfile::NamedTempFile::with_suffix(".json").unwrap();
+        let config = config.replace("{{test_json_set}}", json_set.path().to_str().unwrap());
+
+        let json_map = tempfile::NamedTempFile::with_suffix(".json").unwrap();
+        let config = config.replace("{{test_json_map}}", json_map.path().to_str().unwrap());
+
+        let sqlite_set = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
+        let config = config.replace("{{test_sqlite_set}}", sqlite_set.path().to_str().unwrap());
+
+        let sqlite_map = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
+        let config = config.replace("{{test_sqlite_map}}", sqlite_map.path().to_str().unwrap());
+
+        let text_set = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        let config = config.replace("{{test_text_set}}", text_set.path().to_str().unwrap());
+
         let local_dir = tempfile::TempDir::new().unwrap();
         let config = config.replace("{{web3_dir}}", local_dir.path().to_str().unwrap());
         let path = local_dir.path().join("index.html");

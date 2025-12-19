@@ -152,6 +152,7 @@ impl Stack for TunStack {
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
                                                           self.inner.global_process_chains.clone(),
+                                                          self.inner.global_collection_manager.clone(),
                                                           Some(get_stream_external_commands(self.inner.servers.clone()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
@@ -173,6 +174,7 @@ struct TunStackInner {
     global_process_chains: Option<GlobalProcessChainsRef>,
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
 
 impl TunStackInner {
@@ -216,6 +218,7 @@ impl TunStackInner {
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains.clone(),
+                                                          builder.global_collection_manager.clone(),
                                                           Some(get_stream_external_commands(builder.servers.clone().unwrap()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
 
@@ -233,6 +236,7 @@ impl TunStackInner {
             limiter_manager: builder.limiter_manager.unwrap(),
             stat_manager: builder.stat_manager.unwrap(),
             global_process_chains: builder.global_process_chains,
+            global_collection_manager: builder.global_collection_manager,
         })
     }
 
@@ -594,6 +598,7 @@ pub struct TunStackBuilder {
     tunnel_manager: Option<TunnelManager>,
     limiter_manager: Option<LimiterManagerRef>,
     stat_manager: Option<StatManagerRef>,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
 
 impl TunStackBuilder {
@@ -612,6 +617,7 @@ impl TunStackBuilder {
             tunnel_manager: None,
             limiter_manager: None,
             stat_manager: None,
+            global_collection_manager: None,
         }
     }
 
@@ -680,6 +686,11 @@ impl TunStackBuilder {
         self
     }
 
+    pub fn global_collection_manager(mut self, collection_manager: GlobalCollectionManagerRef) -> Self {
+        self.global_collection_manager = Some(collection_manager);
+        self
+    }
+    
     pub async fn build(self) -> StackResult<TunStack> {
         TunStack::create(self).await
     }
@@ -734,6 +745,7 @@ pub struct TunStackFactory {
     tunnel_manager: TunnelManager,
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
+    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl TunStackFactory {
@@ -744,6 +756,7 @@ impl TunStackFactory {
         tunnel_manager: TunnelManager,
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
+        global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         TunStackFactory {
             servers,
@@ -752,6 +765,7 @@ impl TunStackFactory {
             tunnel_manager,
             limiter_manager,
             stat_manager,
+            global_collection_manager,
         }
     }
 }
@@ -778,6 +792,7 @@ impl StackFactory for TunStackFactory {
             .tunnel_manager(self.tunnel_manager.clone())
             .limiter_manager(self.limiter_manager.clone())
             .stat_manager(self.stat_manager.clone())
+            .global_collection_manager(self.global_collection_manager.clone())
             .build().await?;
         Ok(Arc::new(stack))
     }

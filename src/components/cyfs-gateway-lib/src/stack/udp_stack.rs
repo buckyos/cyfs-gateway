@@ -15,7 +15,7 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, get_min_priority, DatagramInfo, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, get_datagram_external_commands};
+use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, get_min_priority, DatagramInfo, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, get_datagram_external_commands, GlobalCollectionManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 #[cfg(target_os = "linux")]
@@ -373,6 +373,7 @@ struct UdpStackInner {
     transparent: bool,
     local_ips: Vec<IpAddr>,
     socket_cache: SocketCache,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
 
 impl UdpStackInner {
@@ -401,6 +402,7 @@ impl UdpStackInner {
 
         let (executor, _) = create_process_chain_executor(&builder.hook_point.unwrap(),
                                                           builder.global_process_chains.clone(),
+                                                          builder.global_collection_manager.clone(),
                                                           Some(get_datagram_external_commands(builder.servers.clone().unwrap()))).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create process chain executor error: {}", e))?;
         let local_ips = Self::local_ips()?;
@@ -420,6 +422,7 @@ impl UdpStackInner {
             transparent: builder.transparent,
             local_ips,
             socket_cache: SocketCache::new(),
+            global_collection_manager: builder.global_collection_manager,
         })
     }
 
@@ -1116,6 +1119,7 @@ impl Stack for UdpStack {
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
                                                           self.inner.global_process_chains.clone(),
+                                                          self.inner.global_collection_manager.clone(),
                                                           Some(get_datagram_external_commands(self.inner.servers.clone()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
@@ -1135,6 +1139,7 @@ pub struct UdpStackBuilder {
     tunnel_manager: Option<TunnelManager>,
     limiter_manager: Option<LimiterManagerRef>,
     stat_manager: Option<StatManagerRef>,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
     transparent: bool,
 }
 
@@ -1152,6 +1157,7 @@ impl UdpStackBuilder {
             tunnel_manager: None,
             limiter_manager: None,
             stat_manager: None,
+            global_collection_manager: None,
             transparent: false,
         }
     }
@@ -1215,6 +1221,11 @@ impl UdpStackBuilder {
         self
     }
 
+    pub fn global_collection_manager(mut self, global_collection_manager: GlobalCollectionManagerRef) -> Self {
+        self.global_collection_manager = Some(global_collection_manager);
+        self
+    }
+
     pub async fn build(self) -> StackResult<UdpStack> {
         UdpStack::create(self).await
     }
@@ -1268,6 +1279,7 @@ pub struct UdpStackFactory {
     tunnel_manager: TunnelManager,
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
+    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl UdpStackFactory {
@@ -1278,6 +1290,7 @@ impl UdpStackFactory {
         tunnel_manager: TunnelManager,
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
+        global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         Self {
             servers,
@@ -1286,6 +1299,7 @@ impl UdpStackFactory {
             tunnel_manager,
             limiter_manager,
             stat_manager,
+            global_collection_manager,
         }
     }
 }
@@ -1310,6 +1324,7 @@ impl StackFactory for UdpStackFactory {
             .transparent(config.transparent.unwrap_or(false))
             .limiter_manager(self.limiter_manager.clone())
             .stat_manager(self.stat_manager.clone())
+            .global_collection_manager(self.global_collection_manager.clone())
             .build().await?;
         Ok(Arc::new(stack))
     }
@@ -1321,7 +1336,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::net::UdpSocket;
-    use crate::{ConnectionManager, DatagramInfo, LimiterManager, ProcessChainConfigs, Server, ServerManager, ServerResult, Stack, StackFactory, StackProtocol, StatManager, TunnelManager, UdpStack, UdpStackConfig, UdpStackFactory};
+    use crate::{ConnectionManager, DatagramInfo, GlobalCollectionManager, LimiterManager, ProcessChainConfigs, Server, ServerManager, ServerResult, Stack, StackFactory, StackProtocol, StatManager, TunnelManager, UdpStack, UdpStackConfig, UdpStackFactory};
     use crate::global_process_chains::GlobalProcessChains;
     use crate::server::{DatagramServer};
 
@@ -1669,6 +1684,7 @@ mod tests {
                                                TunnelManager::new(),
                                                LimiterManager::new(),
                                                StatManager::new(),
+                                               GlobalCollectionManager::create(vec![]).await.unwrap()
         );
 
         let config = UdpStackConfig {

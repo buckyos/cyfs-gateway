@@ -4,7 +4,7 @@ use buckyos_kit::AsyncStream;
 use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig, CURRENT_DEVICE_CONFIG};
 use sfo_io::{LimitStream, StatStream};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands, DatagramInfo, LimiterManagerRef, StatManagerRef, MutComposedSpeedStat, MutComposedSpeedStatRef, get_stat_info};
+use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands, DatagramInfo, LimiterManagerRef, StatManagerRef, MutComposedSpeedStat, MutComposedSpeedStatRef, get_stat_info, GlobalCollectionManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
@@ -80,6 +80,7 @@ struct RtcpStackInner {
     global_process_chains: Option<GlobalProcessChainsRef>,
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
 
 impl RtcpStackInner {
@@ -99,6 +100,7 @@ impl RtcpStackInner {
 
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains.clone(),
+                                                          builder.global_collection_manager.clone(),
                                                           Some(get_stream_external_commands(builder.servers.clone().unwrap()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
@@ -110,6 +112,7 @@ impl RtcpStackInner {
             global_process_chains: builder.global_process_chains,
             limiter_manager: builder.limiter_manager.unwrap(),
             stat_manager: builder.stat_manager.unwrap(),
+            global_collection_manager: builder.global_collection_manager.clone(),
         })
     }
 
@@ -476,6 +479,7 @@ impl Stack for RtcpStack {
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
                                                           self.inner.global_process_chains.clone(),
+                                                          self.inner.global_collection_manager.clone(),
                                                           Some(get_stream_external_commands(self.inner.servers.clone()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
@@ -495,6 +499,7 @@ pub struct RtcpStackBuilder {
     tunnel_manager: Option<TunnelManager>,
     limiter_manager: Option<LimiterManagerRef>,
     stat_manager: Option<StatManagerRef>,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
 
 impl RtcpStackBuilder {
@@ -511,6 +516,7 @@ impl RtcpStackBuilder {
             tunnel_manager: None,
             limiter_manager: None,
             stat_manager: None,
+            global_collection_manager: None,
         }
     }
 
@@ -569,6 +575,11 @@ impl RtcpStackBuilder {
         self
     }
 
+    pub fn global_collection_manager(mut self, global_collection_manager: GlobalCollectionManagerRef) -> Self {
+        self.global_collection_manager = Some(global_collection_manager);
+        self
+    }
+
     pub async fn build(self) -> StackResult<RtcpStack> {
         RtcpStack::create(self).await
     }
@@ -619,6 +630,7 @@ pub struct RtcpStackFactory {
     tunnel_manager: TunnelManager,
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
+    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl RtcpStackFactory {
@@ -629,6 +641,7 @@ impl RtcpStackFactory {
         tunnel_manager: TunnelManager,
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
+        global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         Self {
             servers,
@@ -637,6 +650,7 @@ impl RtcpStackFactory {
             tunnel_manager,
             limiter_manager,
             stat_manager,
+            global_collection_manager,
         }
     }
 }
@@ -688,6 +702,7 @@ impl StackFactory for RtcpStackFactory {
             .hook_point(config.hook_point.clone())
             .limiter_manager(self.limiter_manager.clone())
             .stat_manager(self.stat_manager.clone())
+            .global_collection_manager(self.global_collection_manager.clone())
             .build().await?;
         Ok(Arc::new(stack))
     }
@@ -698,7 +713,7 @@ impl StackFactory for RtcpStackFactory {
 mod tests {
     use std::collections::HashMap;
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory, StreamInfo, DatagramInfo, LimiterManager, StatManager};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory, StreamInfo, DatagramInfo, LimiterManager, StatManager, GlobalCollectionManager};
     use buckyos_kit::{init_logging, AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, generate_ed25519_key_pair, DeviceConfig, EncodedDocument};
     use std::sync::Arc;
@@ -2907,6 +2922,7 @@ mod tests {
             TunnelManager::new(),
             LimiterManager::new(),
             StatManager::new(),
+            GlobalCollectionManager::create(vec![]).await.unwrap(),
         );
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key_pair();

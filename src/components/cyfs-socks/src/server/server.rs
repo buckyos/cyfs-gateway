@@ -1,10 +1,7 @@
 use super::config::SocksServerConfig;
 use crate::{Socks5Proxy, SocksHookManager, SocksProxyConfig};
 use buckyos_kit::AsyncStream;
-use cyfs_gateway_lib::{
-    server_err, GlobalProcessChainsRef, Server, ServerConfig, ServerErrorCode, ServerFactory,
-    ServerResult, StreamServer, StreamInfo,
-};
+use cyfs_gateway_lib::{server_err, GlobalProcessChainsRef, Server, ServerConfig, ServerErrorCode, ServerFactory, ServerResult, StreamServer, StreamInfo, GlobalCollectionManagerRef};
 use std::sync::Arc;
 
 pub struct SocksServer {
@@ -41,12 +38,15 @@ impl StreamServer for SocksServer {
 
 pub struct SocksServerFactory {
     global_process_chains: GlobalProcessChainsRef,
+    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl SocksServerFactory {
-    pub fn new(global_process_chains: GlobalProcessChainsRef) -> Self {
+    pub fn new(global_process_chains: GlobalProcessChainsRef,
+               global_collection_manager: GlobalCollectionManagerRef,) -> Self {
         Self {
             global_process_chains,
+            global_collection_manager,
         }
     }
 }
@@ -72,7 +72,9 @@ impl ServerFactory for SocksServerFactory {
         })?;
 
         let global_process_chains = self.global_process_chains.get_process_chains();
-        let hook_point = SocksHookManager::create(process_chain_lib, global_process_chains)
+        let hook_point = SocksHookManager::create(process_chain_lib,
+                                                  global_process_chains,
+                                                  self.global_collection_manager.clone())
             .await
             .map_err(|e| {
                 server_err!(

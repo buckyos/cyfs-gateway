@@ -7,7 +7,7 @@ use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_min_priority, get_stream_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, MutComposedSpeedStat, MutComposedSpeedStatRef};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_min_priority, get_stream_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, MutComposedSpeedStat, MutComposedSpeedStatRef, GlobalCollectionManagerRef};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -29,6 +29,7 @@ struct TcpStackInner {
     connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: TunnelManager,
     global_process_chains: Option<GlobalProcessChainsRef>,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
     transparent: bool,
@@ -82,6 +83,7 @@ impl TcpStackInner {
 
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
                                                           config.global_process_chains.clone(),
+                                                          config.global_collection_manager.clone(),
                                                           Some(get_stream_external_commands(config.servers.clone().unwrap()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
@@ -92,6 +94,7 @@ impl TcpStackInner {
             connection_manager: config.connection_manager,
             tunnel_manager: config.tunnel_manager.unwrap(),
             global_process_chains: config.global_process_chains,
+            global_collection_manager: config.global_collection_manager,
             limiter_manager: config.limiter_manager.unwrap(),
             stat_manager: config.stat_manager.unwrap(),
             transparent: config.transparent,
@@ -360,6 +363,7 @@ impl TcpStack {
             tunnel_manager: None,
             limiter_manager: None,
             stat_manager: None,
+            global_collection_manager: None,
             transparent: false,
         }
     }
@@ -415,6 +419,7 @@ impl Stack for TcpStack {
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
                                                           self.inner.global_process_chains.clone(),
+                                                          self.inner.global_collection_manager.clone(),
                                                           Some(get_stream_external_commands(self.inner.servers.clone()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
@@ -433,6 +438,7 @@ pub struct TcpStackBuilder {
     tunnel_manager: Option<TunnelManager>,
     limiter_manager: Option<LimiterManagerRef>,
     stat_manager: Option<StatManagerRef>,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
     transparent: bool,
 }
 
@@ -487,6 +493,11 @@ impl TcpStackBuilder {
         self
     }
 
+    pub fn global_collection_manager(mut self, global_collection_manager: GlobalCollectionManagerRef) -> Self {
+        self.global_collection_manager = Some(global_collection_manager);
+        self
+    }
+
     pub async fn build(self) -> StackResult<TcpStack> {
         let stack = TcpStack::create(self).await?;
         Ok(stack)
@@ -537,6 +548,7 @@ pub struct TcpStackFactory {
     tunnel_manager: TunnelManager,
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
+    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl TcpStackFactory {
@@ -547,6 +559,7 @@ impl TcpStackFactory {
         tunnel_manager: TunnelManager,
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
+        global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         Self {
             servers,
@@ -555,6 +568,7 @@ impl TcpStackFactory {
             tunnel_manager,
             limiter_manager,
             stat_manager,
+            global_collection_manager,
         }
     }
 }
@@ -578,6 +592,7 @@ impl StackFactory for TcpStackFactory {
             .hook_point(config.hook_point.clone())
             .limiter_manager(self.limiter_manager.clone())
             .stat_manager(self.stat_manager.clone())
+            .global_collection_manager(self.global_collection_manager.clone())
             .build().await?;
         Ok(Arc::new(stack))
     }
@@ -587,7 +602,7 @@ impl StackFactory for TcpStackFactory {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, StreamInfo, LimiterManager, StatManager};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, StreamInfo, LimiterManager, StatManager, GlobalCollectionManager};
     use buckyos_kit::{AsyncStream};
     use std::sync::Arc;
     use std::time::Instant;
@@ -1129,7 +1144,8 @@ mod tests {
                                                ConnectionManager::new(),
                                                TunnelManager::new(),
                                                LimiterManager::new(),
-                                               StatManager::new());
+                                               StatManager::new(),
+                                               GlobalCollectionManager::create(vec![]).await.unwrap());
         let config = TcpStackConfig {
             id: "test".to_string(),
             protocol: StackProtocol::Tcp,

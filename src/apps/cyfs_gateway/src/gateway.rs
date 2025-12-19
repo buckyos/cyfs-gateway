@@ -78,6 +78,7 @@ pub struct GatewayFactory {
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
     self_cert_mgr: SelfCertMgrRef,
+    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl GatewayFactory {
@@ -89,7 +90,8 @@ impl GatewayFactory {
         acme_mgr: AcmeCertManagerRef,
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
-        self_cert_mgr: SelfCertMgrRef, ) -> Self {
+        self_cert_mgr: SelfCertMgrRef,
+        global_collection_manager: GlobalCollectionManagerRef, ) -> Self {
         Self {
             servers,
             global_process_chains,
@@ -101,6 +103,7 @@ impl GatewayFactory {
             limiter_manager,
             stat_manager,
             self_cert_mgr,
+            global_collection_manager,
         }
     }
 
@@ -148,6 +151,7 @@ impl GatewayFactory {
             limiter_manager: self.limiter_manager.clone(),
             stat_manager: self.stat_manager.clone(),
             self_cert_mgr: self.self_cert_mgr.clone(),
+            global_collection_manager: self.global_collection_manager.clone(),
         })
     }
 }
@@ -165,6 +169,7 @@ pub struct Gateway {
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
     self_cert_mgr: SelfCertMgrRef,
+    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl Drop for Gateway {

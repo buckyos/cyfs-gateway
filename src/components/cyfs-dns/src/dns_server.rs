@@ -164,6 +164,7 @@ pub struct ProcessChainDnsServer {
     id: String,
     server_mgr: ServerManagerRef,
     global_process_chains: Option<GlobalProcessChainsRef>,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
 }
 
@@ -172,6 +173,7 @@ impl ProcessChainDnsServer {
         id: String,
         server_mgr: ServerManagerRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
+        global_collection_manager: Option<GlobalCollectionManagerRef>,
         hook_point: ProcessChainConfigs,
     ) -> ServerResult<Self> {
         let resolve_cmd = CmdResolve::new(server_mgr.clone());
@@ -180,6 +182,7 @@ impl ProcessChainDnsServer {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
             global_process_chains.clone(),
+            global_collection_manager.clone(),
             Some(commands)).await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
 
@@ -187,6 +190,7 @@ impl ProcessChainDnsServer {
             id,
             server_mgr,
             global_process_chains,
+            global_collection_manager,
             executor: Arc::new(Mutex::new(executor)),
         })
     }
@@ -395,16 +399,19 @@ impl cyfs_gateway_lib::server::DatagramServer for ProcessChainDnsServer {
 pub struct ProcessChainDnsServerFactory {
     server_mgr: ServerManagerRef,
     global_process_chains: GlobalProcessChainsRef,
+    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl ProcessChainDnsServerFactory {
     pub fn new(
         server_mgr: ServerManagerRef,
         global_process_chains: GlobalProcessChainsRef,
+        global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         Self {
             server_mgr,
             global_process_chains,
+            global_collection_manager,
         }
     }
 }
@@ -419,6 +426,7 @@ impl ServerFactory for ProcessChainDnsServerFactory {
             config.id.clone(),
             self.server_mgr.clone(),
             Some(self.global_process_chains.clone()),
+            Some(self.global_collection_manager.clone()),
             config.hook_point.clone(),
         ).await?;
         Ok(vec![Server::Datagram(Arc::new(server))])
@@ -479,7 +487,7 @@ mod tests {
     use hickory_proto::op::{Message, Query};
     use hickory_proto::rr::RecordType;
     use hickory_server::proto::rr::{Name, RData};
-    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, GlobalProcessChains, LimiterManager, Server, ServerFactory, ServerManager, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackFactory};
+    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, GlobalCollectionManager, GlobalProcessChains, LimiterManager, Server, ServerFactory, ServerManager, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackFactory};
     use cyfs_gateway_lib::server::DatagramServer;
     use crate::{DnsServerConfig, LocalDns, ProcessChainDnsServer, ProcessChainDnsServerFactory};
 
@@ -501,6 +509,7 @@ hook_point:
         let factory = ProcessChainDnsServerFactory::new(
             Arc::new(ServerManager::new()),
             Arc::new(GlobalProcessChains::new()),
+            GlobalCollectionManager::create(vec![]).await.unwrap()
         );
         let ret = factory.create(config).await;
         assert!(ret.is_ok());
@@ -558,6 +567,7 @@ hook_point:
             config.id,
             server_mgr.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
+            Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
         ).await;
         assert!(server.is_ok());
@@ -604,6 +614,7 @@ hook_point:
             config.id,
             server_mgr.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
+            Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
         ).await;
         assert!(server.is_ok());
@@ -730,7 +741,10 @@ hook_point:
         "#;
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
         let global_process_chains = Arc::new(GlobalProcessChains::new());
-        let server_factory = ProcessChainDnsServerFactory::new(server_mgr.clone(), global_process_chains.clone());
+        let server_factory = ProcessChainDnsServerFactory::new(
+            server_mgr.clone(),
+            global_process_chains.clone(),
+            GlobalCollectionManager::create(vec![]).await.unwrap());
         let ret = server_factory.create(Arc::new(config)).await;
         assert!(ret.is_ok());
         let servers = ret.unwrap();
@@ -780,6 +794,7 @@ hook_point:
             config.id,
             server_mgr.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
+            Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
         ).await;
         assert!(server.is_ok());

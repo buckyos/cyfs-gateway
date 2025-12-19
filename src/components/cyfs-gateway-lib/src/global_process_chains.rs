@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicU32;
 use buckyos_kit::AsyncStream;
 use tokio::sync::RwLock;
 use cyfs_process_chain::*;
-use crate::{config_err, ConfigErrorCode, ConfigResult, ProcessChainConfig};
+use crate::{config_err, ConfigErrorCode, ConfigResult, GlobalCollectionManagerRef, ProcessChainConfig};
 
 pub struct GlobalProcessChains {
     process_chains: Mutex<Vec<ProcessChainLibRef>>,
@@ -529,6 +529,7 @@ impl MapCollection for StreamRequestMap {
 pub async fn create_process_chain_executor(
     chains: &Vec<ProcessChainConfig>,
     global_process_chains: Option<GlobalProcessChainsRef>,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
     external_commands: Option<Vec<(String, ExternalCommandRef)>>,
 ) -> ConfigResult<(ProcessChainLibExecutor, HookPointEnv)> {
     let hook_point = HookPoint::new("cyfs_server_hook_point");
@@ -551,6 +552,10 @@ pub async fn create_process_chain_executor(
             hook_point_env.register_external_command(name.as_str(), cmd.clone())
                 .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
         }
+    }
+    
+    if let Some(global_collection_manager) = global_collection_manager {
+        global_collection_manager.register_collection(hook_point_env.hook_point_env()).await?;
     }
 
     let executor = hook_point_env

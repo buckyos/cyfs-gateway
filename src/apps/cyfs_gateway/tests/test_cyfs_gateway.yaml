@@ -1,3 +1,24 @@
+collections:
+  test_set:
+    type: memory_set
+  test_map:
+    type: memory_map
+  test_json_set:
+    type: json_set
+    file_path: {{test_json_set}}
+  test_json_map:
+    type: json_map
+    file_path: {{test_json_map}}
+  test_sqlite_set:
+    type: sqlite_set
+    file_path: {{test_sqlite_set}}
+  test_sqlite_map:
+    type: sqlite_map
+    file_path: {{test_sqlite_map}}
+  test_text_set:
+    type: text_set
+    file_path: {{test_text_set}}
+
 limiters:
   test:
     upper_limiter: global
@@ -21,6 +42,13 @@ stacks:
           default:
             priority: 1
             block: |
+              set-add test_set ${REQ.dest_host};
+              set-add test_json_set ${REQ.dest_host};
+              set-add test_sqlite_set ${REQ.dest_host};
+              set-add test_text_set ${REQ.dest_host};
+              map-add test_map ${REQ.dest_host} 1;
+              map-add test_json_map ${REQ.dest_host} 1;
+              map-add test_sqlite_map ${REQ.dest_host} 1;
               http-probe && call-server ${REQ.dest_host};
               reject;
 

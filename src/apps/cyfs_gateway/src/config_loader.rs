@@ -1,5 +1,5 @@
 use log::*;
-use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig, config_err, DirServerConfig, AcmeHttpChallengeServerConfig, ProcessChainConfig};
+use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, ProcessChainConfigs, ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig, config_err, DirServerConfig, AcmeHttpChallengeServerConfig, ProcessChainConfig, CollectionConfig};
 use cyfs_socks::SocksServerConfig;
 use cyfs_sn::*;
 use std::collections::HashMap;
@@ -595,6 +595,21 @@ impl GatewayConfigParser {
             None => None
         };
 
+        let mut collections = Vec::new();
+        if let Some(collections_value) = json_value.get("collections") {
+            if let Some(collections_value) = collections_value.as_object() {
+                for (name, process_chain) in collections_value.iter() {
+                    let mut chain_value = process_chain.clone();
+                    chain_value["name"] = serde_json::Value::String(name.clone());
+                    let chain = serde_json::from_value::<CollectionConfig>(chain_value).map_err(|e| {
+                        config_err!(ConfigErrorCode::InvalidConfig, "invalid collections: {:?}\n{}", e,
+                        serde_json::to_string_pretty(collections_value).unwrap())
+                    })?;
+                    collections.push(chain);
+                }
+            }
+        }
+
         Ok(GatewayConfig {
             limiters_config,
             acme_config,
@@ -602,6 +617,7 @@ impl GatewayConfigParser {
             stacks,
             servers,
             global_process_chains,
+            collections,
         })
     }
 }
@@ -664,6 +680,7 @@ pub struct GatewayConfig {
     pub stacks: Vec<Arc<dyn StackConfig>>,
     pub servers: Vec<Arc<dyn ServerConfig>>,
     pub global_process_chains: ProcessChainConfigs,
+    pub collections: Vec<CollectionConfig>,
 }
 
 #[cfg(test)]

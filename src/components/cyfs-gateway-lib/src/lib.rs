@@ -16,10 +16,11 @@ mod stack;
 mod global_process_chains;
 mod connection_manager;
 mod quic_tunnel;
-mod json_collection;
 mod cmds;
 mod self_cert_mgr;
 mod tls_tunnel;
+mod collections;
+mod global_collection_manager;
 
 pub use aes_stream::*;
 pub use config::*;
@@ -35,9 +36,10 @@ pub use stack::*;
 pub use connection_manager::*;
 pub use global_process_chains::*;
 pub use cyfs_acme::*;
-pub use json_collection::*;
 pub use cmds::*;
 pub use self_cert_mgr::*;
+pub use collections::*;
+pub use global_collection_manager::*;
 
 use thiserror::Error;
 use std::sync::Arc;

@@ -1,7 +1,7 @@
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, MutComposedSpeedStat, MutComposedSpeedStatRef};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, StackConfig, TunnelManager, StackCertConfig, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, MutComposedSpeedStat, MutComposedSpeedStatRef, GlobalCollectionManagerRef};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -94,6 +94,7 @@ struct TlsStackInner {
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
     alpn_protocols: Vec<Vec<u8>>,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
 
 impl TlsStackInner {
@@ -155,6 +156,7 @@ impl TlsStackInner {
 
         let (executor, _) = create_process_chain_executor(config.hook_point.as_ref().unwrap(),
                                                           config.global_process_chains.clone(),
+                                                          config.global_collection_manager.clone(),
                                                           Some(get_stream_external_commands(config.servers.clone().unwrap()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let crypto_provider = rustls::crypto::ring::default_provider();
@@ -199,6 +201,7 @@ impl TlsStackInner {
             limiter_manager: config.limiter_manager.unwrap(),
             stat_manager: config.stat_manager.unwrap(),
             alpn_protocols: config.alpn_protocols,
+            global_collection_manager: config.global_collection_manager,
         })
     }
 
@@ -456,6 +459,7 @@ impl Stack for TlsStack {
 
         let (executor, _) = create_process_chain_executor(&config.hook_point,
                                                           self.inner.global_process_chains.clone(),
+                                                          self.inner.global_collection_manager.clone(),
                                                           Some(get_stream_external_commands(self.inner.servers.clone()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
@@ -539,6 +543,7 @@ pub struct TlsStackFactory {
     limiter_manager: LimiterManagerRef,
     stat_manager: StatManagerRef,
     self_cert_mgr: SelfCertMgrRef,
+    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl TlsStackFactory {
@@ -551,6 +556,7 @@ impl TlsStackFactory {
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
         self_cert_mgr: SelfCertMgrRef,
+        global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         Self {
             servers,
@@ -561,6 +567,7 @@ impl TlsStackFactory {
             limiter_manager,
             stat_manager,
             self_cert_mgr,
+            global_collection_manager,
         }
     }
 }
@@ -611,6 +618,7 @@ impl crate::StackFactory for TlsStackFactory {
             .limiter_manager(self.limiter_manager.clone())
             .stat_manager(self.stat_manager.clone())
             .self_cert_mgr(self.self_cert_mgr.clone())
+            .global_collection_manager(self.global_collection_manager.clone())
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -632,6 +640,7 @@ pub struct TlsStackBuilder {
     limiter_manager: Option<LimiterManagerRef>,
     stat_manager: Option<StatManagerRef>,
     self_cert_mgr: Option<SelfCertMgrRef>,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
 
 impl TlsStackBuilder {
@@ -651,6 +660,7 @@ impl TlsStackBuilder {
             limiter_manager: None,
             stat_manager: None,
             self_cert_mgr: None,
+            global_collection_manager: None,
         }
     }
 
@@ -726,6 +736,11 @@ impl TlsStackBuilder {
         self
     }
 
+    pub fn global_collection_manager(mut self, global_collection_manager: GlobalCollectionManagerRef) -> Self {
+        self.global_collection_manager = Some(global_collection_manager);
+        self
+    }
+
     pub async fn build(self) -> StackResult<TlsStack> {
         let stack = TlsStack::create(self).await?;
         Ok(stack)
@@ -736,7 +751,7 @@ impl TlsStackBuilder {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, StreamInfo, LimiterManager, StatManager};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, StreamInfo, LimiterManager, StatManager, GlobalCollectionManager};
     use crate::{TlsDomainConfig, TlsStack};
     use buckyos_kit::{init_logging, AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
@@ -1093,7 +1108,7 @@ mod tests {
     #[tokio::test]
     async fn test_tls_stack_self_cert() {
         init_logging("test", false);
-        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let _subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
         let chains = r#"
 - id: main
   priority: 1
@@ -1551,6 +1566,7 @@ mod tests {
             LimiterManager::new(),
             StatManager::new(),
             self_cert_mgr,
+            GlobalCollectionManager::create(vec![]).await.unwrap(),
         );
 
         let config = TlsStackConfig {
