@@ -325,7 +325,8 @@ impl SocketCache {
                 }
 
             }
-            socket.bind(&addr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind error"))?;
+            let addr_str = std_addr.to_string();
+            socket.bind(&addr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind error, address:{}", addr_str))?;
             #[cfg(unix)]
             let socket = unsafe {
                 std::net::UdpSocket::from_raw_fd(socket.into_raw_fd())
@@ -879,7 +880,8 @@ impl UdpStackInner {
             }
         }
         // 4. 绑定套接字到指定地址
-        socket.bind(&sockaddr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind error"))?;
+        let sockaddr_str = addr.to_string();
+        socket.bind(&sockaddr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind error, address:{}", sockaddr_str))?;
         #[cfg(unix)]
         let socket = unsafe {
             std::net::UdpSocket::from_raw_fd(socket.into_raw_fd())
