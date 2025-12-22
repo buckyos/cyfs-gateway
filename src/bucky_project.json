@@ -37,7 +37,8 @@
         },
         "data_paths": [
             "website.yaml",
-            "params.json"
+            "params.json",
+            "local_dns.toml"
         ],
         "clean_paths": [
       
