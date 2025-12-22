@@ -5,9 +5,9 @@ use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCod
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
-use std::io::{BufReader, Cursor};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use rustls::pki_types::pem::PemObject;
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use sfo_io::{LimitStream, StatStream};
@@ -22,51 +22,24 @@ use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
 
 pub async fn load_certs(path: &str) -> StackResult<Vec<CertificateDer<'static>>> {
-    let file_content = tokio::fs::read(path)
-        .await
-        .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
-    let mut reader = BufReader::new(Cursor::new(file_content));
-    let mut certs = vec![];
-    for cert in rustls_pemfile::certs(&mut reader) {
-        certs.push(cert.map_err(|_| {
-            stack_err!(
-                StackErrorCode::InvalidTlsCert,
-                "failed to parse certificates"
-            )
-        })?);
-    }
-    Ok(certs)
+    let cert = CertificateDer::from_pem_file(path).map_err(
+        into_stack_err!(
+            StackErrorCode::InvalidTlsCert,
+            "failed to parse certificate, file:{}",
+            path
+        )
+    )?;
+    Ok(vec![cert])
 }
 
 pub async fn load_key(path: &str) -> StackResult<PrivateKeyDer<'static>> {
-    let file_content = tokio::fs::read(path).await.map_err(into_stack_err!(
-        StackErrorCode::InvalidTlsKey,
-        "file:{}",
-        path
-    ))?;
-    let mut reader = BufReader::new(Cursor::new(file_content));
-    let mut keys = vec![];
-    for key in rustls_pemfile::pkcs8_private_keys(&mut reader) {
-        keys.push(key.map_err(|_| {
-            stack_err!(
+    PrivateKeyDer::from_pem_file(path).map_err(
+        into_stack_err!(
             StackErrorCode::InvalidTlsKey,
             "failed to parse private key, file:{}",
             path
         )
-        })?);
-    }
-
-    if keys.is_empty() {
-        return Err(stack_err!(
-            StackErrorCode::InvalidTlsKey,
-            "no private key found, file:{}",
-            path
-        ));
-    }
-
-    Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        keys.into_iter().next().unwrap(),
-    )))
+    )
 }
 pub async fn create_server_config(
     cert_path: &str,
