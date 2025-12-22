@@ -97,11 +97,11 @@ stacks:
     protocol: tls
     certs:
       - domain: "sn.{{sn_host}}"
-        cert_path: ./fullchain.cert
-        key_path: ./fullchain.pem
+        cert_path: ./{{sn_cer}}
+        key_path: ./{{sn_pem}}
       - domain: "*.web3.{{sn_host}}"
-        cert_path: ./fullchain.cert
-        key_path: ./fullchain.pem
+        cert_path: ./{{web3_cer}}
+        key_path: ./{{web3_pem}}
     hook_point:
       main:
         id: main
