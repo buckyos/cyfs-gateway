@@ -754,8 +754,15 @@ pub async fn cyfs_gateway_main() {
         _ => {}
     }
 
+    let log_dir = get_buckyos_log_dir("cyfs_gateway", true);
+    std::fs::create_dir_all(&log_dir).unwrap();
+
+    sfo_log::Logger::new("cyfs_gateway")
+        .set_log_path(log_dir.to_string_lossy().to_string().as_str())
+        .set_log_to_file(true)
+        .start().unwrap();
     // init log
-    init_logging("cyfs_gateway",true);
+    // init_logging("cyfs_gateway",true);
     info!("cyfs_gateway start...");
 
     let config_file = get_config_file_path(&matches);
