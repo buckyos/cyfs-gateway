@@ -30,6 +30,7 @@ jobs:
         - name: install buckyos devkit
           run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
         - name: Build
+          working-directory: ./src
           run: buckyos-build --app=web3-gateway
         - name: Upload Artifact
           uses: actions/upload-artifact@v4
