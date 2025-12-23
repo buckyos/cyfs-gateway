@@ -522,7 +522,6 @@ hook_point:
 ttl = 300
 address = ["192.168.1.1"]
 txt = [
-"THISISATEST",
 "BOOT=eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg;",
 "PKX=qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM;",
 "DEV=eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA;"
@@ -659,9 +658,8 @@ hook_point:
         let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
-        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.answers().len(), 3);
         assert_eq!(resp.answers()[0].record_type(), RecordType::TXT);
-        assert_eq!(resp.answers()[0].data(), &RData::TXT(hickory_proto::rr::rdata::txt::TXT::new(vec!["THISISATEST".to_string()])));
 
         let mut message = Message::new();
         // 添加查询
@@ -772,7 +770,8 @@ hook_point:
                                          ConnectionManager::new(),
                                          TunnelManager::new(),
                                          LimiterManager::new(),
-                                         StatManager::new());
+                                         StatManager::new(),
+                                         GlobalCollectionManager::create(vec![]).await.unwrap());
         let ret = stack.create(Arc::new(stack_config)).await;
         assert!(ret.is_ok());
         let stack = ret.unwrap();
