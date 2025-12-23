@@ -1,0 +1,39 @@
+name: build Web3 Gateway
+on:
+    workflow_dispatch:
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+
+        steps:
+        - uses: Kaven-Universe/github-action-current-date-time@v1
+          id: date
+          with:
+            format: 'YYYYMMDD'
+        - name: short time
+          id: short_time
+          run: |
+            val="${{ steps.date.outputs.time }}"
+            echo "last6=${val: -6}" >> $GITHUB_OUTPUT
+        - name: Checkout
+          uses: actions/checkout@v4
+        - name: Setup Rust
+          uses: dtolnay/rust-toolchain@stable
+          with:
+            toolchain: stable
+            targets: x86-unknown-linux-musl
+        - name: Setup Needed Packages
+          run: |
+            sudo apt update
+            sudo apt install -y musl-tools
+        - name: install buckyos devkit
+          run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
+        - name: Build
+          run: buckyos-build --app=web3-gateway
+        - name: Upload Artifact
+          uses: actions/upload-artifact@v3
+          with:
+            name: web3-gateway-build${{ steps.short_time.outputs.last6 }}
+            path: ./src/web3-gateway
+            if-no-files-found: error
