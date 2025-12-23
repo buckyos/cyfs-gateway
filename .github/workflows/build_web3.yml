@@ -32,7 +32,7 @@ jobs:
         - name: Build
           run: buckyos-build --app=web3-gateway
         - name: Upload Artifact
-          uses: actions/upload-artifact@v3
+          uses: actions/upload-artifact@v4
           with:
             name: web3-gateway-build${{ steps.short_time.outputs.last6 }}
             path: ./src/web3-gateway
