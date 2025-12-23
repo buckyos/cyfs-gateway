@@ -24,5 +24,4 @@ src/rootfs/bin/cyfs-gateway/cyfs_gateway
 src/rootfs/bin/test-server/test_server
 src/rootfs/bin/__pycache__/
 src/_scripts/
-
-
+src/${APPDATA}

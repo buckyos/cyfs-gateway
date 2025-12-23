@@ -1,0 +1,29 @@
+#!/bin/bash
+
+
+
+check_dig() {
+  local label="$1"
+  local cmd="$2"
+  local expect_regex="$3"
+  local output
+
+  echo ""
+  echo "== $label"
+  echo "$ $cmd"
+  output=$(eval "$cmd" 2>&1)
+  if [[ $? -eq 0 && -n "$output" && "$output" =~ $expect_regex ]]; then
+    echo "✓ $label"
+  else
+    echo "✗ $label"
+    echo "$output"
+  fi
+}
+
+check_dig "指定sn IP dig" \
+  "dig @207.246.96.13 sn.buckyos.ai" \
+  "ANSWER SECTION"
+
+check_dig "local dns dig txt" \
+  "dig @207.246.96.13 -t A test-addr.web3.buckyos.ai" \
+  "ANSWER SECTION"
