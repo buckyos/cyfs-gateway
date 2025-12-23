@@ -27,3 +27,7 @@ check_dig "指定sn IP dig" \
 check_dig "local dns dig txt" \
   "dig @207.246.96.13 -t A test-addr.web3.buckyos.ai" \
   "ANSWER SECTION"
+
+check_dig "ns dig web3.buckyos.ai" \
+  "dig -t NS web3.buckyos.ai" \
+  "status: NOERROR"
