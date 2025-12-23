@@ -864,8 +864,13 @@ impl SNServer {
         device_jwt: Option<&String>,
     ) -> NameInfo {
         let mut name_info = NameInfo::default();
-        name_info.txt.push(format!("BOOT={};", self.boot_jwt));
-        name_info.txt.push(format!("PKX={};", self.owner_pkx));
+        let public_key_json:Value = serde_json::from_str(public_key).unwrap();
+        let x = public_key_json.get("x");
+        if x.is_some() {
+            let x = x.unwrap().as_str().unwrap();
+            name_info.txt.push(format!("PKX={};", x));
+        }
+        name_info.txt.push(format!("BOOT={};", zone_config));
         if device_jwt.is_some() {
             name_info
                 .txt
@@ -1013,6 +1018,7 @@ impl NameServer for SNServer {
                             public_key.as_str(),
                             device_jwt.as_ref(),
                         );
+                        info!("<={} zone_config:{} public_key:{} device_jwt:{:?} ", name, zone_config, public_key, device_jwt);
                         return Ok(name_info);
                     } else {
                         return Err(server_err!(
