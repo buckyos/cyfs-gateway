@@ -22,7 +22,7 @@ jobs:
           uses: dtolnay/rust-toolchain@stable
           with:
             toolchain: stable
-            targets: x86-unknown-linux-musl
+            targets: x86_64-unknown-linux-musl
         - name: Setup Needed Packages
           run: |
             sudo apt update
