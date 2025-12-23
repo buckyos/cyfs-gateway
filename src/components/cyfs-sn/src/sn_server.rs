@@ -1128,9 +1128,26 @@ impl HttpServer for SNServer {
         request: http::Request<BoxBody<Bytes, ServerError>>,
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        // Handle OPTIONS preflight request for CORS
+        if request.method() == Method::OPTIONS {
+            return Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .header("Access-Control-Allow-Origin", "*")
+                .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                .header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                .header("Access-Control-Max-Age", "86400")
+                .body(BoxBody::new(
+                    Full::new(Bytes::new())
+                        .map_err(|e| match e {})
+                        .boxed(),
+                ))
+                .unwrap());
+        }
+        
         if request.method() != Method::POST {
             return Ok(Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header("Access-Control-Allow-Origin", "*")
                 .body(BoxBody::new(
                     Full::new(Bytes::from_static(b"Method Not Allowed"))
                         .map_err(|e| match e {})
@@ -1146,6 +1163,7 @@ impl HttpServer for SNServer {
                     error!("parse client ip {} err {}", addr.as_str(), e);
                     return Ok(Response::builder()
                         .status(StatusCode::BAD_REQUEST)
+                        .header("Access-Control-Allow-Origin", "*")
                         .body(
                             BoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
                                 .map_err(|e| match e {})
@@ -1158,6 +1176,7 @@ impl HttpServer for SNServer {
                 error!("Failed to get client ip");
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
+                    .header("Access-Control-Allow-Origin", "*")
                     .body(
                         BoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
                             .map_err(|e| match e {})
@@ -1172,6 +1191,7 @@ impl HttpServer for SNServer {
             Err(e) => {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
+                    .header("Access-Control-Allow-Origin", "*")
                     .body(
                         BoxBody::new(Full::new(Bytes::from(format!(
                             "Failed to read body: {:?}",
@@ -1189,6 +1209,7 @@ impl HttpServer for SNServer {
             Err(e) => {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
+                    .header("Access-Control-Allow-Origin", "*")
                     .body(
                         BoxBody::new(Full::new(Bytes::from(format!(
                             "Failed to convert body to string: {}",
@@ -1208,6 +1229,7 @@ impl HttpServer for SNServer {
             Err(e) => {
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
+                    .header("Access-Control-Allow-Origin", "*")
                     .body(
                         BoxBody::new(Full::new(Bytes::from(format!(
                             "Failed to parse request body to RPCRequest: {}",
@@ -1225,6 +1247,7 @@ impl HttpServer for SNServer {
             Err(e) => {
                 return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("Access-Control-Allow-Origin", "*")
                     .body(
                         BoxBody::new(Full::new(Bytes::from(format!(
                             "Failed to handle rpc call: {}",
@@ -1238,11 +1261,21 @@ impl HttpServer for SNServer {
         };
 
         //parse resp to Response<Body>
-        Ok(Response::new(
-            Full::new(Bytes::from(serde_json::to_string(&resp).unwrap()))
-                .map_err(|never| match never {})
-                .boxed(),
-        ))
+        let mut response_builder = Response::builder()
+            .header("Access-Control-Allow-Origin", "*")
+            .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            .header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            .header("Access-Control-Max-Age", "86400");
+        
+        Ok(response_builder
+            .body(
+                BoxBody::new(
+                    Full::new(Bytes::from(serde_json::to_string(&resp).unwrap()))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+            )
+            .unwrap())
     }
 }
 
