@@ -6,7 +6,7 @@ servers:
   web3_sn:
     id: web3_sn
     type: sn
-    host: "*.web3.{{sn_host}}"
+    host: "{{sn_host}}"
     boot_jwt: "{{sn_boot_jwt}}"
     owner_pkx: "{{sn_owner_pk}}"
     device_jwt: ["{{sn_device_jwt}}"]
