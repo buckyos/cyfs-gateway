@@ -1,7 +1,6 @@
 use sfo_sql::Row;
 use sfo_sql::sqlite::sql_query;
 use cyfs_process_chain::{CollectionValue, MapCollection, MapCollectionTraverseCallBackRef};
-use std::collections::HashMap;
 use crate::{collection_value_to_json_value, json_value_to_collection_value};
 
 pub struct SqliteMap {

@@ -1,3 +1,5 @@
+use log::Level;
+
 use super::env::{Env, EnvLevel};
 use super::stack::*;
 use crate::chain::{
@@ -250,6 +252,10 @@ impl Context {
 
     pub fn env(&self) -> &EnvManager {
         &self.env
+    }
+
+    pub fn get_log_level(&self) -> Level {
+        self.env.get_log_level()
     }
 
     pub fn counter(&self) -> &GotoCounterRef {

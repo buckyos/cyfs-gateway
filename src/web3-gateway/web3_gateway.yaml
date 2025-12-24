@@ -131,6 +131,7 @@ stacks:
               match ${REQ.dest_host} "{{sn_host}}" && return "forward tcp:///:3443";
               map-create "QUESTION" && map-add "QUESTION" "dest_host" "${REQ.dest_host}" && map-add "QUESTION" "method" "query_by_hostname";
               call qa "web3_sn" "QUESTION" && eq ${ANSWER.self_cert} "true" && return "forward rtcp://${ANSWER.did_hostname}/:443";
+              match ${REQ.dest_host} "*.web3.{{sn_host}}" && return "forward tcp:///:3443";
               reject;
   
 

@@ -209,7 +209,8 @@ impl ProcessChainLibExecutor {
         let len = self.process_chain_lib.get_len()?;
         while chain_index < len {
             let chain = self.process_chain_lib.get_chain_by_index(chain_index)?;
-            info!(
+            log!(
+                self.context.env().get_log_level(),
                 "Executing process chain: {}:{}, {}",
                 chain_index,
                 chain.priority(),

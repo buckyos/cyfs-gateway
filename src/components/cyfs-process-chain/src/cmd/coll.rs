@@ -3,6 +3,7 @@ use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, EnvLevel, ParserContext};
 use crate::collection::{CollectionType, CollectionValue};
 use clap::{Arg, Command};
+use log::log;
 use std::sync::Arc;
 
 /*
@@ -192,9 +193,12 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
             CollectionValue::Set(collection) => {
                 // For set collection, we check if the key is included
                 let contains = collection.contains(&key).await?;
-                info!(
+                log!(
+                    context.env().get_log_level(),
                     "MatchInclude command: key='{}', collection='{:?}', contains={}",
-                    key, self.collection, contains
+                    key,
+                    self.collection,
+                    contains
                 );
                 if contains {
                     Ok(CommandResult::success_with_value("true"))
@@ -207,9 +211,12 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                 let value = collection.get(&key).await?;
                 if let Some(value) = value {
                     if values.is_empty() {
-                        info!(
+                        log!(
+                            context.env().get_log_level(),
                             "MatchInclude command: key='{}', collection='{:?}', value='{}' found",
-                            key, self.collection, value
+                            key,
+                            self.collection,
+                            value
                         );
                         return Ok(CommandResult::success_with_value("true"));
                     } else {
@@ -225,9 +232,12 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                         match value {
                             CollectionValue::String(ref v) => {
                                 if values[0] == *v {
-                                    info!(
+                                    log!(
+                                        context.env().get_log_level(),
                                         "match-include command: key='{}', collection='{:?}', value='{}' found",
-                                        key, self.collection, v
+                                        key,
+                                        self.collection,
+                                        v
                                     );
                                     return Ok(CommandResult::success_with_value("true"));
                                 } else {
@@ -246,9 +256,11 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                     }
                 }
 
-                info!(
+                log!(
+                    context.env().get_log_level(),
                     "match-include command: key='{}', collection='{:?}', no matching key or value found",
-                    key, self.collection
+                    key,
+                    self.collection
                 );
 
                 Ok(CommandResult::error_with_value("false"))
@@ -264,16 +276,20 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                 };
 
                 if ret {
-                    info!(
+                    log!(
+                        context.env().get_log_level(),
                         "MatchInclude command: key='{}', collection='{:?}' exists",
-                        key, self.collection
+                        key,
+                        self.collection
                     );
 
                     Ok(CommandResult::success_with_value("true"))
                 } else {
-                    info!(
+                    log!(
+                        context.env().get_log_level(),
                         "MatchInclude command: key='{}', collection='{:?}' does not exist",
-                        key, self.collection
+                        key,
+                        self.collection
                     );
 
                     Ok(CommandResult::error_with_value("false"))
@@ -428,9 +444,11 @@ impl CommandExecutor for SetCreateCommandExecutor {
             .await?
         {
             Some(_) => {
-                info!(
+                log!(
+                    context.env().get_log_level(),
                     "Set collection with id '{:?}' {:?} created successfully",
-                    self.set_id, self.level
+                    self.set_id,
+                    self.level
                 );
                 Ok(CommandResult::success())
             }
@@ -901,9 +919,12 @@ impl CommandExecutor for MapCreateCommandExecutor {
 
         match ret {
             Some(_) => {
-                info!(
+                log!(
+                    context.env().get_log_level(),
                     "Map collection with id '{:?}' multi={} level={:?}, created successfully",
-                    self.map_id, self.is_multi, self.level,
+                    self.map_id,
+                    self.is_multi,
+                    self.level,
                 );
                 Ok(CommandResult::success())
             }
@@ -1091,16 +1112,23 @@ impl CommandExecutor for MapAddCommandExecutor {
                     .await?
                 {
                     None => {
-                        info!(
+                        log!(
+                            context.env().get_log_level(),
                             "Key '{}' with value '{}' added to map collection with id '{:?}'",
-                            key, values[0], self.map
+                            key,
+                            values[0],
+                            self.map
                         );
                         Ok(CommandResult::success())
                     }
                     Some(prev) => {
-                        info!(
+                        log!(
+                            context.env().get_log_level(),
                             "Key '{}' updated from value '{}' to '{}' in map collection with id '{:?}'",
-                            key, prev, values[0], self.map
+                            key,
+                            prev,
+                            values[0],
+                            self.map
                         );
                         Ok(CommandResult::success())
                     }
@@ -1123,9 +1151,12 @@ impl CommandExecutor for MapAddCommandExecutor {
 
                 match ret {
                     true => {
-                        info!(
+                        log!(
+                            context.env().get_log_level(),
                             "Key '{}' with values '{:?}' added to multi-map collection with id '{:?}'",
-                            key, values, self.map
+                            key,
+                            values,
+                            self.map
                         );
                         Ok(CommandResult::success())
                     }
@@ -1318,9 +1349,12 @@ impl CommandExecutor for MapRemoveCommandExecutor {
 
                 match collection.remove(&key).await? {
                     Some(value) => {
-                        info!(
+                        log!(
+                            context.env().get_log_level(),
                             "Key '{}' removed from map collection with id '{:?}': {}",
-                            key, self.map, value,
+                            key,
+                            self.map,
+                            value,
                         );
                         Ok(CommandResult::success_with_value(value.treat_as_str()))
                     }
@@ -1361,9 +1395,12 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                 };
 
                 if let Some(value) = ret {
-                    info!(
+                    log!(
+                        context.env().get_log_level(),
                         "Key '{}' with values '{}' removed from multi-map collection with id '{:?}'",
-                        key, value, self.map
+                        key,
+                        value,
+                        self.map
                     );
                     Ok(CommandResult::success_with_value(value))
                 } else {

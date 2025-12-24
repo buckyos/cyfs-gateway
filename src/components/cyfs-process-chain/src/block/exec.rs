@@ -1,7 +1,7 @@
 use super::block::{Block, CommandItem, Expression, Line, Operator, Statement};
 use crate::chain::Context;
 use crate::cmd::CommandResult;
-use log::{log, Level};
+use log::{log};
 
 pub const MAX_GOTO_COUNT_IN_BLOCK: u32 = 128;
 

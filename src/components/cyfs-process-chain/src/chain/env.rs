@@ -2,7 +2,7 @@ use super::external::EnvExternalManager;
 use crate::collection::*;
 use std::{str::FromStr, sync::Arc};
 
-use log::{log, Level, LevelFilter};
+use log::{log, Level};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum EnvLevel {
