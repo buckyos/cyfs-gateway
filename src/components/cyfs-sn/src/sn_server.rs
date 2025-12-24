@@ -864,11 +864,18 @@ impl SNServer {
         device_jwt: Option<&String>,
     ) -> NameInfo {
         let mut name_info = NameInfo::default();
-        let public_key_json:Value = serde_json::from_str(public_key).unwrap();
-        let x = public_key_json.get("x");
-        if x.is_some() {
-            let x = x.unwrap().as_str().unwrap();
-            name_info.txt.push(format!("PKX={};", x));
+        if public_key.starts_with("{") {
+            let public_key_json= serde_json::from_str(public_key);
+            if public_key_json.is_ok() {
+                let public_key_json:Value = public_key_json.unwrap();
+                let x = public_key_json.get("x");
+                if x.is_some() {
+                    let x = x.unwrap().as_str().unwrap();
+                    name_info.txt.push(format!("PKX={};", x));
+                }
+            }
+        } else {
+            name_info.txt.push(format!("PKX={};", public_key));
         }
         name_info.txt.push(format!("BOOT={};", zone_config));
         if device_jwt.is_some() {
