@@ -956,6 +956,15 @@ impl SNServer {
         let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
         if get_result.is_some() {
             let (sub_host, username) = get_result.unwrap();
+            let db = GLOBAL_SN_DB.lock().await;
+            let user_info = db.get_user_info(username.as_str()).unwrap();
+            drop(db);
+            if user_info.is_none() {
+                warn!("user info not found for {}", username);
+                return None;
+            }
+            let user_info = user_info.unwrap();
+            
             let device_info = self.get_device_info(username.as_str(), "ood1").await;
             if device_info.is_some() {
                 info!("ood1 device info found for {} in sn server", username);
@@ -965,7 +974,7 @@ impl SNServer {
                 let ood_info = OODInfo {
                     did_hostname: did_hostname,
                     owner_id: username.clone(),
-                    self_cert: true,
+                    self_cert: user_info.self_cert,
                     state: "active".to_string(),
                 };
                 return Some(ood_info);
@@ -999,7 +1008,7 @@ impl SNServer {
                 let ood_info = OODInfo {
                     did_hostname: did_hostname,
                     owner_id: username.to_string(),
-                    self_cert: true,
+                    self_cert: user_info.self_cert,
                     state: "active".to_string(),
                 };
                 //info!("select device {} for http upstream:{}",device_did.as_str(),result_str.as_str());

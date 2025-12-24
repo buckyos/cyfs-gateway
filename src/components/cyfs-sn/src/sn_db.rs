@@ -332,13 +332,13 @@ impl SnDB {
         let user_info = stmt
             .query_row(params![username], |row| {
                 let state_str: Option<String> = row.get(0)?;
-                let self_cert: Option<i32> = row.get(3)?;
+                let self_cert: Option<bool> = row.get(3)?;
                 Ok(SNUserInfo {
                     username: None,
                     state: UserState::from_str(state_str.as_deref()),
                     public_key: row.get(1)?,
                     zone_config: row.get(2)?,
-                    self_cert: self_cert.unwrap_or(0) != 0,
+                    self_cert: self_cert.unwrap_or(false),
                     user_domain: row.get(4)?,
                     sn_ips: row.get(5)?,
                 })
@@ -481,13 +481,13 @@ impl SnDB {
         let user_info = stmt
             .query_row(params![domain, domain], |row| {
                 let state_str: Option<String> = row.get(1)?;
-                let self_cert: Option<i32> = row.get(4)?;
+                let self_cert: Option<bool> = row.get(4)?;
                 Ok(SNUserInfo {
                     username: Some(row.get(0)?),
                     state: UserState::from_str(state_str.as_deref()),
                     public_key: row.get(2)?,
                     zone_config: row.get(3)?,
-                    self_cert: self_cert.unwrap_or(0) != 0,
+                    self_cert: self_cert.unwrap_or(false),
                     user_domain: row.get(5)?,
                     sn_ips: row.get(6)?,
                 })

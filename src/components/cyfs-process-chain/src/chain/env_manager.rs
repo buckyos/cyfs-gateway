@@ -1,4 +1,4 @@
-use log::Level;
+use log::{log, Level};
 
 use super::env::{Env, EnvLevel, EnvRef};
 use super::external::EnvExternalRef;
@@ -218,7 +218,8 @@ impl EnvManager {
         match tracker.entry(key.to_string()) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 if entry.get() != &level {
-                    info!(
+                    log!(
+                        self.get_log_level(),
                         "Variable '{}' level changed from '{}' to '{}'",
                         key,
                         entry.get().as_str(),
@@ -232,7 +233,12 @@ impl EnvManager {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 if level != EnvLevel::default() {
                     entry.insert(level);
-                    info!("Variable '{}' set to level '{}'", key, level.as_str());
+                    log!(
+                        self.get_log_level(),
+                        "Variable '{}' set to level '{}'",
+                        key,
+                        level.as_str()
+                    );
                 }
             }
         }
@@ -246,12 +252,22 @@ impl EnvManager {
         if let Some(value) = value {
             let to_end = self.get_env(to);
             if let Some(prev) = to_end.set(key, &value) {
-                info!(
+                log!(
+                    self.get_log_level(),
                     "Moved variable '{}' from '{}' to '{}', replaced value: {}",
-                    key, from.as_str(), to.as_str(), prev
+                    key,
+                    from.as_str(),
+                    to.as_str(),
+                    prev
                 );
             } else {
-                info!("Moved variable '{}' from '{}' to '{}'", key, from.as_str(), to.as_str());
+                log!(
+                    self.get_log_level(),
+                    "Moved variable '{}' from '{}' to '{}'",
+                    key,
+                    from.as_str(),
+                    to.as_str()
+                );
             }
         } else {
             warn!(
@@ -398,7 +414,12 @@ impl EnvManager {
         value: CollectionValue,
         level: Option<EnvLevel>,
     ) -> Result<Option<CollectionValue>, String> {
-        info!("Setting variable '{}' to value: {:?}", key, value);
+        log!(
+            self.get_log_level(),
+            "Setting variable '{}' to value: {:?}",
+            key,
+            value
+        );
         let key_list = Self::parse_var(key);
         let level = match level {
             Some(l) => l,
@@ -451,7 +472,8 @@ impl EnvManager {
         level: EnvLevel,
         key_list: &[&str],
     ) -> Result<Option<CollectionValue>, String> {
-        info!(
+        log!(
+            self.get_log_level(),
             "Getting variable '{}' at level '{}'",
             key_list.join("."),
             level.as_str()
