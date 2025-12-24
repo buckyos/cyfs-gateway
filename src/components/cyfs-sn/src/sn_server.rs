@@ -392,6 +392,126 @@ impl SNServer {
         return Ok(resp);
     }
 
+    pub async fn get_device_by_public_key(
+        &self,
+        req: RPCRequest,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let public_key = req
+            .params
+            .get("public_key")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                RPCErrors::ParseRequestError("Invalid params, public_key is none".to_string())
+            })?
+            .to_string();
+        let pk_preview: String = public_key.chars().take(16).collect();
+        info!(
+            "get_device_by_public_key start: req_id={}, public_key_len={}, pk_preview={}",
+            req.id,
+            public_key.len(),
+            pk_preview
+        );
+        let device_name = "ood1";
+        let user_info = {
+            let db = GLOBAL_SN_DB.lock().await;
+            db.get_user_by_public_key(public_key.as_str())
+                .map_err(|e| {
+                    error!(
+                        "Failed to query user by public_key {}, err: {:?}",
+                        public_key, e
+                    );
+                    RPCErrors::ReasonError(e.to_string())
+                })?
+        };
+
+        if user_info.is_none() {
+            warn!("user not found for public_key {}", public_key);
+            let response_value = json!({
+                "user_name": Value::Null,
+                "public_key": public_key,
+                "device_name": device_name,
+                "zone_config": Value::Null,
+                "sn_ips": Vec::<String>::new(),
+                "device_info": Value::Null,
+                "device_sn_ip": Value::Null,
+                "found": false,
+                "reason": "user not found",
+            });
+            return Ok(RPCResponse::new(RPCResult::Success(response_value), req.id));
+        }
+
+        let (username, zone_config, _) = user_info.unwrap();
+        info!(
+            "get_device_by_public_key matched username={} for req_id={}",
+            username, req.id
+        );
+
+        let device_entry = self.get_device_info(username.as_str(), device_name).await;
+        if device_entry.is_some() {
+            info!(
+                "device info found for {}_{} when querying by public_key",
+                username, device_name
+            );
+        } else {
+            warn!(
+                "device info missing for {}_{} when querying by public_key",
+                username, device_name
+            );
+        }
+
+        let sn_ips_vec = self
+            .get_user_sn_ips(username.as_str())
+            .await
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .collect::<Vec<String>>();
+        debug!(
+            "get_device_by_public_key collected {} sn_ips for user {}",
+            sn_ips_vec.len(),
+            username
+        );
+
+        let (device_info_value, device_sn_ip_value, reason_value) =
+            if let Some((device_info, sn_ip)) = device_entry {
+                let device_value = serde_json::to_value(device_info).map_err(|e| {
+                    error!(
+                        "Failed to serialize device info for {}_{}: {:?}",
+                        username, device_name, e
+                    );
+                    RPCErrors::ReasonError(e.to_string())
+                })?;
+                (Some(device_value), Some(sn_ip.to_string()), Value::Null)
+            } else {
+                (
+                    None,
+                    None,
+                    Value::String("device info not found".to_string()),
+                )
+            };
+        let found = device_info_value.is_some();
+
+        let response_value = json!({
+            "user_name": username,
+            "public_key": public_key,
+            "device_name": device_name,
+            "zone_config": zone_config,
+            "sn_ips": sn_ips_vec,
+            "device_info": device_info_value,
+            "device_sn_ip": device_sn_ip_value,
+            "found": found,
+            "reason": reason_value,
+        });
+        info!(
+            "get_device_by_public_key success for user={}, device={}, device_found={}, sn_ip_cached={}",
+            response_value["user_name"].as_str().unwrap_or_default(),
+            response_value["device_name"].as_str().unwrap_or_default(),
+            response_value["device_info"].is_object(),
+            response_value["device_sn_ip"].is_string()
+        );
+
+        Ok(RPCResponse::new(RPCResult::Success(response_value), req.id))
+    }
+
     //get device info by device_name and owner_name
     pub async fn get_device(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
         //verify request.sesion_token is valid (known device token)
@@ -603,7 +723,11 @@ impl SNServer {
         return None;
     }
 
-    async fn get_user_zonegate_address_by_domain(&self, domain: &str, record_type: RecordType) -> Option<Vec<IpAddr>> {
+    async fn get_user_zonegate_address_by_domain(
+        &self,
+        domain: &str,
+        record_type: RecordType,
+    ) -> Option<Vec<IpAddr>> {
         let db = GLOBAL_SN_DB.lock().await;
         let user_info = db.get_user_info_by_domain(domain);
         drop(db);
@@ -627,7 +751,12 @@ impl SNServer {
             .await;
     }
 
-    async fn add_address_to_vec(&self, address_vec: &mut Vec<IpAddr>, ip: IpAddr, record_type: RecordType) {
+    async fn add_address_to_vec(
+        &self,
+        address_vec: &mut Vec<IpAddr>,
+        ip: IpAddr,
+        record_type: RecordType,
+    ) {
         if ip.is_loopback() {
             return;
         }
@@ -642,7 +771,11 @@ impl SNServer {
         }
     }
 
-    async fn get_user_zonegate_address(&self, username: &str, record_type: RecordType) -> Option<Vec<IpAddr>> {
+    async fn get_user_zonegate_address(
+        &self,
+        username: &str,
+        record_type: RecordType,
+    ) -> Option<Vec<IpAddr>> {
         //TODO:需要根据zone_boot_config中的gateway device name来获取gateway device info，而不是写死ood1
         let device_info = self.get_device_info(username, "ood1").await;
 
@@ -655,39 +788,57 @@ impl SNServer {
                     let device_report_ip = device_report_ip.unwrap();
                     match device_report_ip {
                         IpAddr::V4(ip) => {
-                            
                             if ip.is_private() {
-                                self.add_address_to_vec(&mut address_vec, device_ip, record_type).await;
-                                self.add_address_to_vec(&mut address_vec, device_report_ip, record_type).await;
+                                self.add_address_to_vec(&mut address_vec, device_ip, record_type)
+                                    .await;
+                                self.add_address_to_vec(
+                                    &mut address_vec,
+                                    device_report_ip,
+                                    record_type,
+                                )
+                                .await;
                             } else {
                                 info!("device {} is wan device with public_v4ip, return report ip {} ",username,device_report_ip);
-                                self.add_address_to_vec(&mut address_vec, device_report_ip, record_type).await;
+                                self.add_address_to_vec(
+                                    &mut address_vec,
+                                    device_report_ip,
+                                    record_type,
+                                )
+                                .await;
                             }
-                            
                         }
                         IpAddr::V6(ip) => {
                             info!(
                                 "device {} is wan device with v6, return report ip {} ",
                                 username, device_report_ip
                             );
-                            self.add_address_to_vec(&mut address_vec, device_report_ip, record_type).await;
-                            self.add_address_to_vec(&mut address_vec, device_ip, record_type).await;
-                        } 
+                            self.add_address_to_vec(
+                                &mut address_vec,
+                                device_report_ip,
+                                record_type,
+                            )
+                            .await;
+                            self.add_address_to_vec(&mut address_vec, device_ip, record_type)
+                                .await;
+                        }
                     }
                 } else {
                     info!(
                         "device {} is wan device without self-report ip, return device_ip {}",
                         username, device_ip
                     );
-                    self.add_address_to_vec(&mut address_vec, device_ip, record_type).await;
+                    self.add_address_to_vec(&mut address_vec, device_ip, record_type)
+                        .await;
                 }
             } else {
                 let sn_ips = self.get_user_sn_ips(username).await;
                 if sn_ips.is_empty() {
-                    self.add_address_to_vec(&mut address_vec, self.server_ip, record_type).await;
+                    self.add_address_to_vec(&mut address_vec, self.server_ip, record_type)
+                        .await;
                 } else {
                     for ip in sn_ips {
-                        self.add_address_to_vec(&mut address_vec, ip, record_type).await;
+                        self.add_address_to_vec(&mut address_vec, ip, record_type)
+                            .await;
                     }
                 }
             }
@@ -726,6 +877,10 @@ impl SNServer {
             "get" => {
                 //get device info
                 return self.get_device(req).await;
+            }
+            "get_by_pk" => {
+                // get ood all info by public_key
+                return self.get_device_by_public_key(req).await;
             }
             "query_by_hostname" => {
                 //query device by hostname
@@ -865,9 +1020,9 @@ impl SNServer {
     ) -> NameInfo {
         let mut name_info = NameInfo::default();
         if public_key.starts_with("{") {
-            let public_key_json= serde_json::from_str(public_key);
+            let public_key_json = serde_json::from_str(public_key);
             if public_key_json.is_ok() {
-                let public_key_json:Value = public_key_json.unwrap();
+                let public_key_json: Value = public_key_json.unwrap();
                 let x = public_key_json.get("x");
                 if x.is_some() {
                     let x = x.unwrap().as_str().unwrap();
@@ -920,7 +1075,6 @@ impl QAServer for SNServer {
                 ));
             }
         }
-
     }
 
     fn id(&self) -> String {
@@ -967,7 +1121,10 @@ impl NameServer for SNServer {
         }
 
         let sn_full_host = format!("sn.{}", self.server_host);
-        if req_real_name == sn_full_host || req_real_name == self.server_host || self.server_aliases.contains(&req_real_name) {
+        if req_real_name == sn_full_host
+            || req_real_name == self.server_host
+            || self.server_aliases.contains(&req_real_name)
+        {
             //返回当前服务器的地址
             match record_type {
                 RecordType::A => {
@@ -993,23 +1150,22 @@ impl NameServer for SNServer {
             }
         }
 
-        
         let get_result = SNServer::get_user_subhost_from_host(&req_real_name, &self.server_host);
         if get_result.is_some() {
             let (sub_host, username) = get_result.unwrap();
-        
-        // if req_real_name.ends_with(&sn_full_host) {
-        //     let sub_name = name[0..name.len() - sn_full_host.len()].to_string();
-        //     //split sub_name by "."
-        //     let subs: Vec<&str> = sub_name.split(".").collect();
-        //     let username = subs.last();
-        //     if username.is_none() {
-        //         return Err(server_err!(
-        //             ServerErrorCode::NotFound,
-        //             "{}",
-        //             name.to_string()
-        //         ));
-        //     }
+
+            // if req_real_name.ends_with(&sn_full_host) {
+            //     let sub_name = name[0..name.len() - sn_full_host.len()].to_string();
+            //     //split sub_name by "."
+            //     let subs: Vec<&str> = sub_name.split(".").collect();
+            //     let username = subs.last();
+            //     if username.is_none() {
+            //         return Err(server_err!(
+            //             ServerErrorCode::NotFound,
+            //             "{}",
+            //             name.to_string()
+            //         ));
+            //     }
             info!(
                 "host {} owner by user {}, sub_host: {}, record_type: {:?}",
                 req_real_name, username, sub_host, record_type
@@ -1025,7 +1181,10 @@ impl NameServer for SNServer {
                             public_key.as_str(),
                             device_jwt.as_ref(),
                         );
-                        info!("<={} zone_config:{} public_key:{} device_jwt:{:?} ", name, zone_config, public_key, device_jwt);
+                        info!(
+                            "<={} zone_config:{} public_key:{} device_jwt:{:?} ",
+                            name, zone_config, public_key, device_jwt
+                        );
                         return Ok(name_info);
                     } else {
                         return Err(server_err!(
@@ -1036,7 +1195,9 @@ impl NameServer for SNServer {
                     }
                 }
                 RecordType::A | RecordType::AAAA => {
-                    let address_vec = self.get_user_zonegate_address(username.as_str(), record_type).await;
+                    let address_vec = self
+                        .get_user_zonegate_address(username.as_str(), record_type)
+                        .await;
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
@@ -1147,16 +1308,17 @@ impl HttpServer for SNServer {
                 .status(StatusCode::NO_CONTENT)
                 .header("Access-Control-Allow-Origin", "*")
                 .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                .header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+                .header(
+                    "Access-Control-Allow-Headers",
+                    "Content-Type, Authorization",
+                )
                 .header("Access-Control-Max-Age", "86400")
                 .body(BoxBody::new(
-                    Full::new(Bytes::new())
-                        .map_err(|e| match e {})
-                        .boxed(),
+                    Full::new(Bytes::new()).map_err(|e| match e {}).boxed(),
                 ))
                 .unwrap());
         }
-        
+
         if request.method() != Method::POST {
             return Ok(Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -1277,17 +1439,18 @@ impl HttpServer for SNServer {
         let mut response_builder = Response::builder()
             .header("Access-Control-Allow-Origin", "*")
             .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            .header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-            .header("Access-Control-Max-Age", "86400");
-        
-        Ok(response_builder
-            .body(
-                BoxBody::new(
-                    Full::new(Bytes::from(serde_json::to_string(&resp).unwrap()))
-                        .map_err(|never| match never {})
-                        .boxed(),
-                )
+            .header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Authorization",
             )
+            .header("Access-Control-Max-Age", "86400");
+
+        Ok(response_builder
+            .body(BoxBody::new(
+                Full::new(Bytes::from(serde_json::to_string(&resp).unwrap()))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            ))
             .unwrap())
     }
 }

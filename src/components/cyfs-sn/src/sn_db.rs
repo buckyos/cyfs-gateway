@@ -202,6 +202,25 @@ impl SnDB {
         }
     }
 
+    pub fn get_user_by_public_key(
+        &self,
+        public_key: &str,
+    ) -> Result<Option<(String, String, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT username, zone_config, sn_ips FROM users WHERE public_key =?1")?;
+        let user_info = stmt
+            .query_row(params![public_key], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .optional()?;
+        Ok(user_info)
+    }
+
     pub fn register_user_directly(
         &self,
         username: &str,
