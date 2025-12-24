@@ -1,6 +1,7 @@
 use super::block::{Block, CommandItem, Expression, Line, Operator, Statement};
 use crate::chain::Context;
 use crate::cmd::CommandResult;
+use log::{log, Level};
 
 pub const MAX_GOTO_COUNT_IN_BLOCK: u32 = 128;
 
@@ -28,25 +29,41 @@ impl BlockExecuter {
         block: &Block,
         context: &Context,
     ) -> Result<CommandResult, String> {
-        info!("Executing block: {} lines {}", block.id, block.lines.len());
+        log!(
+            context.env().get_log_level(),
+            "Executing block: {} lines {}",
+            block.id,
+            block.lines.len()
+        );
 
         let mut current_line = 0;
         let mut result = CommandResult::success();
         while current_line < block.lines.len() {
             let line = &block.lines[current_line];
-            info!(
+            log!(
+                context.env().get_log_level(),
                 "Executing line {}:{}: {:?}",
-                self.block_id, current_line, line
+                self.block_id,
+                current_line,
+                line
             );
             let line_result = Self::execute_line(line, context).await?;
-            info!(
+            log!(
+                context.env().get_log_level(),
                 "Line {} executed: {}, {:?}",
-                current_line, line.source, line_result
+                current_line,
+                line.source,
+                line_result
             );
 
             if line_result.is_control() {
                 // If the line result is a control action, we handle it immediately
-                info!("Control action at line {}: {:?}", current_line, line_result);
+                log!(
+                    context.env().get_log_level(),
+                    "Control action at line {}: {:?}",
+                    current_line,
+                    line_result
+                );
                 return Ok(line_result);
             }
 

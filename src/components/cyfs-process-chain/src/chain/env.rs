@@ -2,6 +2,8 @@ use super::external::EnvExternalManager;
 use crate::collection::*;
 use std::{str::FromStr, sync::Arc};
 
+use log::{log, Level, LevelFilter};
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum EnvLevel {
     Global, // Global level environment, used for global settings, used by: export name=value
@@ -45,6 +47,7 @@ pub struct Env {
     values: MapCollectionRef,
     parent: Option<EnvRef>,
     external: EnvExternalManager,
+    debug_level: Level,
 }
 
 impl Env {
@@ -57,6 +60,7 @@ impl Env {
             values,
             parent,
             external,
+            debug_level: Level::Debug,
         }
     }
 
@@ -74,6 +78,11 @@ impl Env {
 
     pub fn create_child_env(self: &Arc<Self>, level: EnvLevel) -> EnvRef {
         Arc::new(Env::new(level, Some(self.clone())))
+    }
+
+    /// Convert LevelFilter to Level for logging
+    pub fn log_level(&self) -> Level {
+        self.debug_level
     }
     
     /// Check if the environment contains the given key.
@@ -100,10 +109,12 @@ impl Env {
     /// The key must not already exist in the environment.
     pub async fn create(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
         let ret = self.values.insert_new(key, value.clone()).await?;
+        let log_level = self.log_level();
         if ret {
-            info!("Created variable '{}' with value: {}", key, value);
+            log!(log_level, "Created variable '{}' with value: {}", key, value);
         } else {
-            info!(
+            log!(
+                log_level,
                 "Replacing existing variable '{}' with value: {}",
                 key, value
             );
@@ -123,7 +134,8 @@ impl Env {
             // Try to set in external environment if it exists
             let (handled, old_value) = self.external.set(key, &value).await?;
             if handled {
-                info!(
+                log!(
+                    self.log_level(),
                     "Set variable '{}' in external environment with value: {}",
                     key, value
                 );
@@ -157,15 +169,16 @@ impl Env {
     }
 
     pub async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        let log_level = self.log_level();
         if let Some(value) = self.values.remove(key).await? {
-            info!("Removed variable '{}' with value: {}", key, value);
+            log!(log_level, "Removed variable '{}' with value: {}", key, value);
             return Ok(Some(value));
         }
 
         // If the key does not exist in the local environment, check external environment
         let (handled, old_value) = self.external.remove(key).await?;
         if handled {
-            info!("Removed variable '{}' from external environment", key);
+            log!(log_level, "Removed variable '{}' from external environment", key);
             return Ok(old_value);
         }
 

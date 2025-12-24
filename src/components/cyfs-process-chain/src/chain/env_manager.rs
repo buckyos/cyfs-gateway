@@ -1,3 +1,5 @@
+use log::Level;
+
 use super::env::{Env, EnvLevel, EnvRef};
 use super::external::EnvExternalRef;
 use crate::collection::*;
@@ -121,6 +123,17 @@ pub struct EnvManager {
 }
 
 impl EnvManager {
+    pub fn get_log_level(&self) -> Level {
+        let global_level = self.global.log_level();
+        let chain_level = self.chain.log_level();
+        let block_level = self.block.log_level();
+        
+        // Return the highest level among the three
+        // Level ordering: Trace < Debug < Info < Warn < Error
+        global_level.max(chain_level).max(block_level)
+    }
+
+    
     pub fn new(global_env: EnvRef, chain_env: EnvRef) -> Self {
         assert!(
             global_env.level() == EnvLevel::Global,
