@@ -1,5 +1,6 @@
 #!/bin/bash
 
+PORT_HOST="${PORT_HOST:-207.246.96.13}"
 
 
 check_dig() {
@@ -20,6 +21,25 @@ check_dig() {
   fi
 }
 
+check_port() {
+  local label="$1"
+  local host="$2"
+  local port="$3"
+  local cmd="nc -z -w 2 $host $port"
+  local output
+
+  echo ""
+  echo "== $label"
+  echo "$ $cmd"
+  output=$(eval "$cmd" 2>&1)
+  if [[ $? -eq 0 ]]; then
+    echo "✓ $label"
+  else
+    echo "✗ $label"
+    echo "$output"
+  fi
+}
+
 check_dig "指定sn IP dig" \
   "dig @207.246.96.13 sn.buckyos.ai" \
   "ANSWER SECTION"
@@ -31,3 +51,5 @@ check_dig "local dns dig txt" \
 check_dig "ns dig web3.buckyos.ai" \
   "dig -t NS web3.buckyos.ai" \
   "status: NOERROR"
+
+check_port "port 2980 open" "$PORT_HOST" "2980"
