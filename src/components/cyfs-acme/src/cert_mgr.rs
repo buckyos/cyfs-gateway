@@ -3,7 +3,7 @@ use tokio::fs;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use rustls::server::{ResolvesServerCert, ClientHello};
 use rustls::sign::CertifiedKey;
 use std::sync::{Arc};
@@ -351,8 +351,66 @@ impl AcmeItem {
     }
 }
 
+#[callback_trait::callback_trait]
+pub trait DnsProvider: Send + Sync + 'static {
+    async fn call(&self, op: String, domain: String, key_hash: String) -> Result<()>;
+}
+pub type DnsProviderRef = Arc<dyn DnsProvider>;
+
+pub struct ExternalDnsProvider {
+    name: String,
+    provider_path: PathBuf,
+    provider_params: serde_json::Value,
+}
+
+impl ExternalDnsProvider {
+    pub fn new(provider_path: PathBuf, name: impl Into<String>, provider_params: serde_json::Value) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.into(),
+            provider_path,
+            provider_params,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl DnsProvider for ExternalDnsProvider {
+    async fn call(&self, op: String, domain: String, key_hash: String) -> Result<()> {
+        let provider_path = self.provider_path.join(self.name.as_str()).join("main.js");
+        let provider_params = self.provider_params.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut js_engine = sfo_js::JsEngine::new()?;
+            js_engine.eval_file(provider_path.as_path())?;
+
+            let domain = JsValue::from(JsString::from(domain));
+            let key_hash = JsValue::from(JsString::from(key_hash));
+            let provider = JsValue::from_json(&provider_params, js_engine.context())
+                .map_err(|e| anyhow::anyhow!("parse plugin data {} failed: {}", serde_json::to_string(&provider_params).unwrap_or("".to_string()), e))?;
+
+            let result = js_engine.call(op.as_str(), vec![provider, domain, key_hash])?;
+            if result.is_boolean() && result.as_boolean().unwrap() {
+                Ok(())
+            } else if result.is_promise() {
+                let result = result.as_promise().unwrap();
+                match result.await_blocking(js_engine.context()) {
+                    Ok(result) => {
+                        if result.is_boolean() && result.as_boolean().unwrap() {
+                            Ok(())
+                        } else {
+                            Err(anyhow::anyhow!("add_challenge failed"))
+                        }
+                    },
+                    Err(e) => Err(anyhow::anyhow!("add_challenge failed: {}", e))
+                }
+            } else {
+                Err(anyhow::anyhow!("add_challenge failed"))
+            }
+        }).await.map_err(|e| anyhow::anyhow!("spawn block failed: {}", e))?
+    }
+}
+
 #[derive(Serialize, Deserialize)]
-struct DnsProvider {
+struct DnsProviderInfo {
     pub dns_provider: String,
 }
 
@@ -364,6 +422,7 @@ pub struct AcmeCertManager {
     responder: Mutex<Option<AcmeChallengeResponderRef>>,
     challenge_certs: Mutex<HashMap<String, Arc<sign::CertifiedKey>>>,
     http_challenges: Mutex<HashMap<String, String>>,
+    dns_providers: RwLock<HashMap<String, DnsProviderRef>>,
 }
 
 pub struct AcmeCertManagerHolder {
@@ -403,6 +462,10 @@ impl AcmeCertManagerHolder {
 
     pub fn get_auth_of_token(&self, token: &str) -> Option<String> {
         self.get_manager().get_auth_of_token(token)
+    }
+
+    pub fn register_dns_provider(&self, name: impl Into<String>, provider: impl DnsProvider) {
+        self.get_manager().register_dns_provider(name, provider);
     }
 }
 
@@ -522,6 +585,20 @@ impl AcmeCertManager {
 
         let acme_client = AcmeClient::new(account, config.acme_server.clone()).await?;
 
+        let mut dns_providers = HashMap::<String, DnsProviderRef>::new();
+        if config.dns_provider_path.is_some() {
+            let dns_provider_path = Path::new(config.dns_provider_path.as_ref().unwrap()).to_path_buf();
+            if let Some(dns_providers_config) = &config.dns_providers {
+                for (name, provider_config) in dns_providers_config.iter() {
+                    let provider = ExternalDnsProvider::new(
+                        dns_provider_path.clone(),
+                        name.as_str(),
+                        provider_config.clone().clone());
+                    dns_providers.insert(name.clone(), provider);
+                }
+            }
+        }
+
         let manager = AcmeCertManagerRef::new(AcmeCertManagerHolder::new(Self {
             config: config.clone(),
             acme_client,
@@ -530,6 +607,7 @@ impl AcmeCertManager {
             responder: Mutex::new(None),
             challenge_certs: Mutex::new(Default::default()),
             http_challenges: Mutex::new(Default::default()),
+            dns_providers: RwLock::new(dns_providers),
         }));
 
         {
@@ -558,6 +636,10 @@ impl AcmeCertManager {
         }
 
         Ok(manager)
+    }
+
+    pub fn register_dns_provider(&self, name: impl Into<String>, provider: impl DnsProvider) {
+        self.dns_providers.write().unwrap().insert(name.into(), Arc::new(provider));
     }
 
     pub fn add_acme_item(&self, item: AcmeItem) -> Result<()> {
@@ -697,34 +779,25 @@ impl AcmeCertManager {
         }
     }
 
+    fn get_provider(&self, provider_name: &str) -> Option<DnsProviderRef> {
+        let providers = self.dns_providers.read().unwrap();
+        providers.get(provider_name).cloned()
+    }
+
     async fn call_dns_provider(&self, cert_stub: &CertStub, key_hash: &str, op: &str) -> Result<()> {
-        if self.config.dns_provider_path.is_none() {
-            return Err(anyhow::anyhow!("dns challenge provider path is none"));
-        }
         if cert_stub.inner.acme_item.data.is_none() {
             return Err(anyhow::anyhow!("dns challenge provider params is empty"));
         }
 
-        if self.config.dns_providers.is_none() {
-            return Err(anyhow::anyhow!("dns challenge provider is empty"));
-        }
-
         let provider_data = cert_stub.inner.acme_item.data.clone().unwrap();
-        let provider: DnsProvider = serde_json::from_value(provider_data.clone())
+        let provider_info: DnsProviderInfo = serde_json::from_value(provider_data.clone())
             .map_err(|e| anyhow::anyhow!("parse plugin data {} failed: {}", serde_json::to_string(&provider_data).unwrap_or("".to_string()), e))?;
 
-        let provider_params = self.config.dns_providers.as_ref().unwrap().get(provider.dns_provider.as_str());
-        if provider_params.is_none() {
-            return Err(anyhow::anyhow!("dns challenge provider {} not exists", provider.dns_provider));
+        let provider = self.get_provider(provider_info.dns_provider.as_str());
+        if provider.is_none() {
+            return Err(anyhow::anyhow!("dns challenge provider {} not exists", provider_info.dns_provider));
         }
-        let provider_params = provider_params.unwrap().clone();
-
-        let provider_path = Path::new(self.config.dns_provider_path.as_ref().unwrap())
-            .join(format!("{}", provider.dns_provider))
-            .join("main.js");
-        if !provider_path.exists() {
-            return Err(anyhow::anyhow!("dns challenge plugin {} not exists", provider_path.to_str().unwrap()));
-        }
+        let provider = provider.unwrap().clone();
 
         let domain = if cert_stub.inner.acme_item.domain.starts_with("*.") {
             format!("_acme-challenge{}", &cert_stub.inner.acme_item.domain[1..])
@@ -732,36 +805,7 @@ impl AcmeCertManager {
             format!("_acme-challenge.{}", cert_stub.inner.acme_item.domain)
         };
 
-        let key_hash = key_hash.to_string();
-        let op = op.to_string();
-        tokio::task::spawn_blocking(move || {
-            let mut js_engine = sfo_js::JsEngine::new()?;
-            js_engine.eval_file(provider_path.as_path())?;
-
-            let domain = JsValue::from(JsString::from(domain));
-            let key_hash = JsValue::from(JsString::from(key_hash));
-            let provider = JsValue::from_json(&provider_params, js_engine.context())
-                .map_err(|e| anyhow::anyhow!("parse plugin data {} failed: {}", serde_json::to_string(&provider_params).unwrap_or("".to_string()), e))?;
-
-            let result = js_engine.call(op.as_str(), vec![provider, domain, key_hash])?;
-            if result.is_boolean() && result.as_boolean().unwrap() {
-                Ok(())
-            } else if result.is_promise() {
-                let result = result.as_promise().unwrap();
-                match result.await_blocking(js_engine.context()) {
-                    Ok(result) => {
-                        if result.is_boolean() && result.as_boolean().unwrap() {
-                            Ok(())
-                        } else {
-                            Err(anyhow::anyhow!("add_challenge failed"))
-                        }
-                    },
-                    Err(e) => Err(anyhow::anyhow!("add_challenge failed: {}", e))
-                }
-            } else {
-                Err(anyhow::anyhow!("add_challenge failed"))
-            }
-        }).await.map_err(|e| anyhow::anyhow!("spawn block failed: {}", e))?
+        provider.call(op.to_string(), domain, key_hash.to_string()).await
     }
 }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::f32::consts::E;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
@@ -19,7 +20,7 @@ use anyhow::Result;
 use cyfs_gateway_lib::*;
 use futures::stream::{self, StreamExt};
 use name_client::{DnsProvider, LocalConfigDnsProvider, NameInfo, NsProvider, RecordType};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use hickory_proto::{ProtoError, ProtoErrorKind};
 use hickory_proto::op::message::EmitAndCount;
@@ -159,6 +160,73 @@ impl EmitAndCount for CyfsQueriesEmitAndCount {
     }
 }
 
+pub struct InnerDnsRecordManager {
+    records: RwLock<HashMap<String, HashMap<String, NameInfo>>>,
+}
+pub type InnerDnsRecordManagerRef = Arc<InnerDnsRecordManager>;
+
+impl InnerDnsRecordManager {
+    pub fn new() -> Arc<Self> {
+        Arc::new(InnerDnsRecordManager {
+            records: RwLock::new(HashMap::new()),
+        })
+    }
+
+    pub fn add_record(&self, name: impl Into<String>, record_type: impl Into<String>, value: impl Into<String>) -> ServerResult<()> {
+        let name = name.into();
+        let record_type = record_type.into();
+        let value = value.into();
+        let mut records = self.records.write().unwrap();
+        match record_type.as_str() {
+            "A" | "AAAA" => {
+                let ip = IpAddr::from_str(value.as_str())
+                    .map_err(into_server_err!(ServerErrorCode::InvalidParam, "invalid ip {}", value))?;
+                let info = records
+                    .entry(name.clone())
+                    .or_insert(HashMap::new()).entry(record_type).or_insert(NameInfo::new(name.as_str()));
+                info.address.push(ip);
+            },
+            "TXT" => {
+                let info = records
+                    .entry(name.clone())
+                    .or_insert(HashMap::new()).entry(record_type).or_insert(NameInfo::new(name.as_str()));
+                info.txt.push(value);
+            },
+            "CNAME" => {
+                let info = records
+                    .entry(name.clone())
+                    .or_insert(HashMap::new()).entry(record_type).or_insert(NameInfo::new(name.as_str()));
+                info.cname = Some(value);
+            }
+            _ => {
+                return Err(ServerError::new(
+                    ServerErrorCode::InvalidParam,
+                    format!("Invalid record type:{}", record_type),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn remove_record(&self, name: impl Into<String>, record_type: impl Into<String>) {
+        let name = name.into();
+        let record_type = record_type.into();
+        let mut records = self.records.write().unwrap();
+        if let Some(record) = records.get_mut(name.as_str()) {
+            record.remove(record_type.as_str());
+            if record.is_empty() {
+                records.remove(name.as_str());
+            }
+        }
+    }
+
+    pub fn get_record(&self, name: impl Into<String>, record_type: impl Into<String>) -> Option<NameInfo> {
+        let name = name.into();
+        let record_type = record_type.into();
+        let records = self.records.read().unwrap();
+        records.get(name.as_str()).and_then(|record| record.get(record_type.as_str()).cloned())
+    }
+}
 
 pub struct ProcessChainDnsServer {
     id: String,
@@ -166,6 +234,7 @@ pub struct ProcessChainDnsServer {
     global_process_chains: Option<GlobalProcessChainsRef>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
+    inner_record_manager: InnerDnsRecordManagerRef,
 }
 
 impl ProcessChainDnsServer {
@@ -175,6 +244,7 @@ impl ProcessChainDnsServer {
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
         hook_point: ProcessChainConfigs,
+        inner_record_manager: InnerDnsRecordManagerRef,
     ) -> ServerResult<Self> {
         let resolve_cmd = CmdResolve::new(server_mgr.clone());
         let mut commands = get_dns_server_external_commands(server_mgr.clone());
@@ -192,6 +262,7 @@ impl ProcessChainDnsServer {
             global_process_chains,
             global_collection_manager,
             executor: Arc::new(Mutex::new(executor)),
+            inner_record_manager,
         })
     }
 
@@ -253,6 +324,12 @@ impl ProcessChainDnsServer {
         let reqeust_info = request.request_info().map_err(into_server_err!(ServerErrorCode::BadRequest))?;
         let name = reqeust_info.query.name().to_string();
         let record_type_str = reqeust_info.query.query_type().to_string();
+
+        // First, check if the record exists in the inner record manager
+        if let Some(name_info) = self.inner_record_manager.get_record(&name, &record_type_str) {
+            debug!("Found record in inner record manager: {} {}", name, record_type_str);
+            return self.name_info_to_buffer(request, &reqeust_info, record_type_str.as_str(), name_info).await;
+        }
 
         let map = MemoryMapCollection::new_ref();
         map.insert("name", CollectionValue::String(name)).await
@@ -400,6 +477,7 @@ pub struct ProcessChainDnsServerFactory {
     server_mgr: ServerManagerRef,
     global_process_chains: GlobalProcessChainsRef,
     global_collection_manager: GlobalCollectionManagerRef,
+    inner_record_manager: InnerDnsRecordManagerRef,
 }
 
 impl ProcessChainDnsServerFactory {
@@ -407,11 +485,13 @@ impl ProcessChainDnsServerFactory {
         server_mgr: ServerManagerRef,
         global_process_chains: GlobalProcessChainsRef,
         global_collection_manager: GlobalCollectionManagerRef,
+        inner_record_manager: InnerDnsRecordManagerRef,
     ) -> Self {
         Self {
             server_mgr,
             global_process_chains,
             global_collection_manager,
+            inner_record_manager,
         }
     }
 }
@@ -428,6 +508,7 @@ impl ServerFactory for ProcessChainDnsServerFactory {
             Some(self.global_process_chains.clone()),
             Some(self.global_collection_manager.clone()),
             config.hook_point.clone(),
+            self.inner_record_manager.clone(),
         ).await?;
         Ok(vec![Server::Datagram(Arc::new(server))])
     }
@@ -489,7 +570,7 @@ mod tests {
     use hickory_server::proto::rr::{Name, RData};
     use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, GlobalCollectionManager, GlobalProcessChains, LimiterManager, Server, ServerFactory, ServerManager, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackFactory};
     use cyfs_gateway_lib::server::DatagramServer;
-    use crate::{DnsServerConfig, LocalDns, ProcessChainDnsServer, ProcessChainDnsServerFactory};
+    use crate::{DnsServerConfig, InnerDnsRecordManager, LocalDns, ProcessChainDnsServer, ProcessChainDnsServerFactory};
 
     #[tokio::test]
     async fn test_process_chain_dns_server_factory() {
@@ -509,7 +590,8 @@ hook_point:
         let factory = ProcessChainDnsServerFactory::new(
             Arc::new(ServerManager::new()),
             Arc::new(GlobalProcessChains::new()),
-            GlobalCollectionManager::create(vec![]).await.unwrap()
+            GlobalCollectionManager::create(vec![]).await.unwrap(),
+            InnerDnsRecordManager::new(),
         );
         let ret = factory.create(config).await;
         assert!(ret.is_ok());
@@ -562,12 +644,14 @@ hook_point:
            call resolve ${REQ.name} ${REQ.record_type} ttt && return;
         "#;
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
+        let inner_record_manager = InnerDnsRecordManager::new();
         let server = ProcessChainDnsServer::create_server(
             config.id,
             server_mgr.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
             Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
+            inner_record_manager,
         ).await;
         assert!(server.is_ok());
         let server = server.unwrap();
@@ -609,12 +693,14 @@ hook_point:
            call resolve ${REQ.name} ${REQ.record_type} local_dns && return;
         "#;
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
+        let inner_record_manager = InnerDnsRecordManager::new();
         let server = ProcessChainDnsServer::create_server(
             config.id,
             server_mgr.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
             Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
+            inner_record_manager,
         ).await;
         assert!(server.is_ok());
         let server = server.unwrap();
@@ -742,7 +828,8 @@ hook_point:
         let server_factory = ProcessChainDnsServerFactory::new(
             server_mgr.clone(),
             global_process_chains.clone(),
-            GlobalCollectionManager::create(vec![]).await.unwrap());
+            GlobalCollectionManager::create(vec![]).await.unwrap(),
+            InnerDnsRecordManager::new(), );
         let ret = server_factory.create(Arc::new(config)).await;
         assert!(ret.is_ok());
         let servers = ret.unwrap();
@@ -789,12 +876,14 @@ hook_point:
            call resolve ${REQ.name} ${REQ.record_type} "127.0.0.1:9325" && return;
         "#;
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
+        let inner_record_manager = InnerDnsRecordManager::new();
         let server = ProcessChainDnsServer::create_server(
             config.id,
             server_mgr.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
             Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
+            inner_record_manager,
         ).await;
         assert!(server.is_ok());
         let server = server.unwrap();

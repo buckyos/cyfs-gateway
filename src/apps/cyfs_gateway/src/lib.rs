@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use buckyos_kit::*;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
-use cyfs_dns::{LocalDnsFactory, ProcessChainDnsServerFactory};
+use cyfs_dns::{InnerDnsRecordManager, LocalDnsFactory, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
 
 use log::*;
@@ -25,6 +25,7 @@ use name_lib::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use anyhow::anyhow;
 use json_value_merge::Merge;
 use kRPC::RPCSessionToken;
 use serde_json::{Value};
@@ -145,6 +146,21 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
 
     let cert_manager = AcmeCertManager::create(cert_config).await?;
+    let inner_dns_record_manager = InnerDnsRecordManager::new();
+    let record_manager = inner_dns_record_manager.clone();
+    cert_manager.register_dns_provider("local", move |op: String, domain: String, key_hash: String| {
+        let record_manager = record_manager.clone();
+        async move {
+            if op == "add_challenge" {
+                record_manager.add_record(domain, "TXT", key_hash).map_err(|e| anyhow!(e.to_string()))
+            } else if op == "del_challenge" {
+                record_manager.remove_record(domain, "TXT");
+                Ok(())
+            } else {
+                Err(anyhow!("Unsupported op: {}", op))
+            }
+        }
+    });
 
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
     let mut self_cert_config = SelfCertConfig::default();
@@ -154,6 +170,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     }
     self_cert_config.store_path = data_dir.to_string_lossy().to_string();
     let self_cert_manager = SelfCertMgr::create(self_cert_config).await?;
+
 
     let global_collections = GlobalCollectionManager::create(gateway_config.collections.clone()).await?;
 
@@ -244,11 +261,13 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         global_process_chains.clone(),
         global_collections.clone(),
     )));
+
     debug!("Register dir server factory");
     factory.register_server_factory("dns", Arc::new(ProcessChainDnsServerFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
         global_collections.clone(),
+        inner_dns_record_manager
     )));
     debug!("Register dns server factory");
     factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new(cert_manager.clone())));
