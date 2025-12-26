@@ -316,6 +316,89 @@ impl SNServer {
         return Ok(resp);
     }
 
+    pub async fn bind_zone_to_user(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
+        let user_name = req.params.get("user_name");
+        let user_domain = req.params.get("user_domain");
+        let zone_config_jwt = req.params.get("zone_config");
+
+        if user_name.is_none() || zone_config_jwt.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, user_name or zone_config is none".to_string(),
+            ));
+        }
+        let user_name = user_name.unwrap().as_str().unwrap();
+        let zone_config_jwt = zone_config_jwt.unwrap().as_str().unwrap();
+
+        let mut real_user_domain = None;
+        if user_domain.is_some() {
+            let user_domain = user_domain.unwrap();
+            let user_domain_str = user_domain.as_str();
+            if user_domain_str.is_some() {
+                real_user_domain = Some(user_domain_str.unwrap().to_string());
+            }
+        }
+
+        //check token is valid (verify pub key is user's public key)
+        let session_token = req.token;
+        if session_token.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, session_token is none".to_string(),
+            ));
+        }
+        let session_token = session_token.unwrap();
+        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
+        let user_public_key = self.get_user_public_key(user_name).await;
+        if user_public_key.is_none() {
+            warn!("user {} not found", user_name);
+            return Err(RPCErrors::ParseRequestError("user not found".to_string()));
+        }
+        let user_public_key_str = user_public_key.unwrap();
+        let user_public_key: jsonwebtoken::jwk::Jwk =
+            serde_json::from_str(user_public_key_str.as_str()).map_err(|e| {
+                error!("Failed to parse user public key: {:?}", e);
+                RPCErrors::ParseRequestError(e.to_string())
+            })?;
+
+        let user_public_key = DecodingKey::from_jwk(&user_public_key).map_err(|e| {
+            error!("Failed to decode user public key: {:?}", e);
+            RPCErrors::ParseRequestError(e.to_string())
+        })?;
+
+        rpc_session_token.verify_by_key(&user_public_key)?;
+        if rpc_session_token.appid.is_none() || rpc_session_token.appid.unwrap() != "active_service"
+        {
+            return Err(RPCErrors::ParseRequestError("invalid appid".to_string()));
+        }
+
+        // Update zone_config and user_domain in database
+        let db = GLOBAL_SN_DB.lock().await;
+        db.update_user_zone_config(user_name, zone_config_jwt).map_err(|e| {
+            error!("Failed to update zone_config for user {}: {:?}", user_name, e);
+            RPCErrors::ParseRequestError(format!("Failed to update zone_config: {}", e))
+        })?;
+
+        if let Some(domain) = &real_user_domain {
+            db.update_user_domain(user_name, Some(domain.clone())).map_err(|e| {
+                error!("Failed to update user_domain for user {}: {:?}", user_name, e);
+                RPCErrors::ParseRequestError(format!("Failed to update user_domain: {}", e))
+            })?;
+        }
+        drop(db);
+
+        info!(
+            "user {} zone_config and user_domain updated successfully",
+            user_name
+        );
+
+        let resp = RPCResponse::new(
+            RPCResult::Success(json!({
+                "code":0
+            })),
+            req.id,
+        );
+        return Ok(resp);
+    }
+
     pub async fn update_device(
         &self,
         req: RPCRequest,
@@ -368,21 +451,22 @@ impl SNServer {
             device_info_json
         );
         let ip_str = ip_from.to_string();
-        let db = GLOBAL_SN_DB.lock().await;
-
-        db.update_device_info_by_name(
-            owner_id,
-            &device_info.name.clone(),
-            ip_str.as_str(),
-            device_info_json.to_string().as_str(),
-        );
-
+        {
+            let db = GLOBAL_SN_DB.lock().await;
+            db.update_device_info_by_name(
+                owner_id,
+                &device_info.name.clone(),
+                ip_str.as_str(),
+                device_info_json.to_string().as_str(),
+            );
+        }
         let resp = RPCResponse::new(
             RPCResult::Success(json!({
                 "code":0
             })),
             req.id,
         );
+        
 
         let mut device_info_map = self.all_device_info.lock().await;
         let key = format!("{}_{}", owner_id, device_info.name.clone());
@@ -549,6 +633,7 @@ impl SNServer {
     async fn get_user_sn_ips(&self, owner_id: &str) -> Vec<IpAddr> {
         let db = GLOBAL_SN_DB.lock().await;
         let sn_ips = db.get_user_sn_ips_as_vec(owner_id);
+        drop(db);
         if sn_ips.is_err() {
             warn!(
                 "failed to get user sn ips for {}: {:?}",
@@ -592,12 +677,13 @@ impl SNServer {
             );
             let db = GLOBAL_SN_DB.lock().await;
             let device_json = db.query_device_by_name(owner_id, device_name).unwrap();
+            drop(db);
             if device_json.is_none() {
                 warn!("device info not found for {} in db", key);
                 return None;
             }
             let device_json = device_json.unwrap();
-            let sn_ip = &device_json.ip;
+            let sn_ip: &String = &device_json.ip;
             let sn_ip = IpAddr::from_str(sn_ip.as_str()).unwrap();
             let device_info_json: String = device_json.description.clone();
             //info!("device info json: {}",device_info_json);
@@ -657,6 +743,7 @@ impl SNServer {
     ) -> Option<(String, String, Option<String>, Option<String>)> {
         let db = GLOBAL_SN_DB.lock().await;
         let user_info = db.get_user_info(username).unwrap();
+        drop(db);
         if user_info.is_some() {
             let user_info = user_info.unwrap();
             // 只存储前两个字段 (public_key, zone_config)，忽略 sn_ips
@@ -664,8 +751,9 @@ impl SNServer {
             let zone_config = user_info.zone_config.clone();
             let sn_ips = user_info.sn_ips.clone();
             let stored_info = (public_key.clone(), zone_config.clone());
-
+            let db = GLOBAL_SN_DB.lock().await;
             let device_info = db.query_device_by_name(username, "ood1");
+            drop(db);
             if device_info.is_ok() {
                 let device_info = device_info.unwrap();
                 if device_info.is_some() {
@@ -866,6 +954,10 @@ impl SNServer {
                 //register user
                 return self.register_user(req).await;
             }
+            "bind_zone_config" => {
+                //bind zone config to user
+                return self.bind_zone_to_user(req).await;
+            }
             "register" => {
                 //register device
                 return self.register_device(req).await;
@@ -984,6 +1076,7 @@ impl SNServer {
         } else {
             let db = GLOBAL_SN_DB.lock().await;
             let user_info = db.get_user_info_by_domain(req_host);
+            drop(db);
             if user_info.is_err() {
                 info!(
                     "failed to get user info by domain: {}",

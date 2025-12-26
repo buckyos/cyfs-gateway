@@ -274,6 +274,14 @@ impl SnDB {
         Ok(())
     }
 
+    pub fn update_user_domain(&self, username: &str, user_domain: Option<String>) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("UPDATE users SET user_domain =?1 WHERE username =?2")?;
+        stmt.execute(params![user_domain, username])?;
+        Ok(())
+    }
+
     pub fn get_user_sn_ips(&self, username: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
