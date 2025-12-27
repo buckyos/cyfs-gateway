@@ -32,7 +32,7 @@ use serde_json::{Value};
 use tokio::fs::create_dir_all;
 use tokio::task;
 use url::Url;
-use cyfs_sn::SNServerFactory;
+use cyfs_sn::{SnServerFactory, SqliteDBFactory};
 use cyfs_socks::SocksServerFactory;
 use cyfs_tun::TunStackFactory;
 
@@ -296,9 +296,11 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         "local_dns",
         Arc::new(LocalDnsFactory::new(config_dir.to_string_lossy().to_string())));
     info!("Register local dns server factory");
+    let mut sn_factory = SnServerFactory::new();
+    sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
     factory.register_server_factory(
         "sn",
-        Arc::new(SNServerFactory::new())
+        Arc::new(sn_factory)
     );
     info!("Register sn server factory");
     let gateway = match factory.create_gateway(gateway_config).await {

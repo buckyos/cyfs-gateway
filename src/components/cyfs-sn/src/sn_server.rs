@@ -28,6 +28,7 @@ use std::{
     result::Result,
 };
 use tokio::sync::Mutex;
+use crate::sqlite_db::SqliteSnDB;
 
 #[derive(Serialize, Deserialize)]
 pub struct OODInfo {
@@ -42,18 +43,17 @@ pub struct OODInfo {
 pub struct SNServer {
     id: String,
     //ipaddress is the ip from update_op's ip_from
-    all_device_info: Arc<Mutex<HashMap<String, (DeviceInfo, IpAddr)>>>,
-    all_user_zone_config: Arc<Mutex<HashMap<String, (String, String)>>>,
     server_host: String,
     server_ip: IpAddr,
     server_aliases: Vec<String>,
     boot_jwt: String,
     owner_pkx: String,
     device_jwt: Vec<String>,
+    db: SnDBRef,
 }
 
 impl SNServer {
-    pub fn new(server_config: SNServerConfig) -> Self {
+    pub async fn new(server_config: SNServerConfig, db: SnDBRef) -> Self {
         let mut device_list: Option<Vec<String>> = None;
         let current_device_config = CURRENT_DEVICE_CONFIG.get();
         if current_device_config.is_some() {
@@ -70,14 +70,13 @@ impl SNServer {
 
         SNServer {
             id: server_config.id,
-            all_device_info: Arc::new(Mutex::new(HashMap::new())),
-            all_user_zone_config: Arc::new(Mutex::new(HashMap::new())),
             server_host: server_host,
             server_ip: server_ip,
             server_aliases: server_config.aliases,
             boot_jwt: server_config.boot_jwt,
             owner_pkx: server_config.owner_pkx,
             device_jwt: server_config.device_jwt,
+            db,
         }
     }
 
@@ -99,8 +98,7 @@ impl SNServer {
             ));
         }
 
-        let db = GLOBAL_SN_DB.lock().await;
-        let ret = db.is_user_exist(username.as_str()).map_err(|e| {
+        let ret = self.db.is_user_exist(username.as_str()).await.map_err(|e| {
             error!("Failed to check username: {:?}", e);
             RPCErrors::ReasonError(e.to_string())
         })?;
@@ -133,8 +131,7 @@ impl SNServer {
             ));
         }
         let active_code = active_code.unwrap();
-        let db = GLOBAL_SN_DB.lock().await;
-        let ret = db.check_active_code(active_code);
+        let ret = self.db.check_active_code(active_code).await;
         if ret.is_err() {
             return Err(RPCErrors::ReasonError(ret.err().unwrap().to_string()));
         }
@@ -175,14 +172,13 @@ impl SNServer {
             }
         }
 
-        let db = GLOBAL_SN_DB.lock().await;
-        let ret = db.register_user(
+        let ret = self.db.register_user(
             active_code,
             user_name,
             public_key,
             zone_config_jwt,
             real_user_domain,
-        );
+        ).await;
         if ret.is_err() {
             let err_str = ret.err().unwrap().to_string();
             warn!(
@@ -282,15 +278,14 @@ impl SNServer {
             )));
         }
 
-        let db = GLOBAL_SN_DB.lock().await;
-        let ret = db.register_device(
+        let ret = self.db.register_device(
             user_name,
             device_name,
             device_did,
             mini_config_jwt,
             device_ip,
             device_info,
-        );
+        ).await;
         if ret.is_err() {
             let err_str = ret.err().unwrap().to_string();
             warn!(
@@ -451,15 +446,14 @@ impl SNServer {
             device_info_json
         );
         let ip_str = ip_from.to_string();
-        {
-            let db = GLOBAL_SN_DB.lock().await;
-            db.update_device_info_by_name(
-                owner_id,
-                &device_info.name.clone(),
-                ip_str.as_str(),
-                device_info_json.to_string().as_str(),
-            );
-        }
+
+        self.db.update_device_info_by_name(
+            owner_id,
+            &device_info.name.clone(),
+            ip_str.as_str(),
+            device_info_json.to_string().as_str(),
+        ).await.map_err(|e| RPCErrors::ReasonError(format!("{}", e)));
+
         let resp = RPCResponse::new(
             RPCResult::Success(json!({
                 "code":0
@@ -468,9 +462,7 @@ impl SNServer {
         );
         
 
-        let mut device_info_map = self.all_device_info.lock().await;
         let key = format!("{}_{}", owner_id, device_info.name.clone());
-        device_info_map.insert(key.clone(), (device_info.clone(), ip_from));
 
         info!("update device info done: for {}", key);
         return Ok(resp);
@@ -497,8 +489,7 @@ impl SNServer {
         );
         let device_name = "ood1";
         let user_info = {
-            let db = GLOBAL_SN_DB.lock().await;
-            db.get_user_by_public_key(public_key.as_str())
+            self.db.get_user_by_public_key(public_key.as_str()).await
                 .map_err(|e| {
                     error!(
                         "Failed to query user by public_key {}, err: {:?}",
@@ -631,9 +622,7 @@ impl SNServer {
     }
 
     async fn get_user_sn_ips(&self, owner_id: &str) -> Vec<IpAddr> {
-        let db = GLOBAL_SN_DB.lock().await;
-        let sn_ips = db.get_user_sn_ips_as_vec(owner_id);
-        drop(db);
+        let sn_ips = self.db.get_user_sn_ips_as_vec(owner_id).await;
         if sn_ips.is_err() {
             warn!(
                 "failed to get user sn ips for {}: {:?}",
@@ -668,49 +657,47 @@ impl SNServer {
         device_name: &str,
     ) -> Option<(DeviceInfo, IpAddr)> {
         let key = format!("{}_{}", owner_id, device_name);
-        let mut device_info_map = self.all_device_info.lock().await;
-        let device_info = device_info_map.get(&key);
-        if device_info.is_none() {
-            warn!(
+        warn!(
                 "device info not found for {} in memory cache, try to query from db",
                 key
             );
-            let db = GLOBAL_SN_DB.lock().await;
-            let device_json = db.query_device_by_name(owner_id, device_name).unwrap();
-            drop(db);
-            if device_json.is_none() {
-                warn!("device info not found for {} in db", key);
-                return None;
-            }
-            let device_json = device_json.unwrap();
-            let sn_ip: &String = &device_json.ip;
-            let sn_ip = IpAddr::from_str(sn_ip.as_str()).unwrap();
-            let device_info_json: String = device_json.description.clone();
-            //info!("device info json: {}",device_info_json);
-            let device_info = serde_json::from_str::<DeviceInfo>(device_info_json.as_str());
-            if device_info.is_err() {
-                warn!(
+        let device_json = self.db.query_device_by_name(owner_id, device_name).await;
+        if device_json.is_err() {
+            warn!(
+                    "failed to query device info for {} from db: {:?}",
+                    key,
+                    device_json.err().unwrap()
+                );
+            return None;
+        };
+        let device_json = device_json.unwrap();
+        if device_json.is_none() {
+            warn!("device info not found for {} in db", key);
+            return None;
+        }
+        let device_json = device_json.unwrap();
+        let sn_ip = &device_json.ip;
+        let sn_ip = IpAddr::from_str(sn_ip.as_str()).unwrap();
+        let device_info_json: String = device_json.description.clone();
+        //info!("device info json: {}",device_info_json);
+        let device_info = serde_json::from_str::<DeviceInfo>(device_info_json.as_str());
+        if device_info.is_err() {
+            warn!(
                     "failed to parse device info from db for {}: {:?}",
                     key,
                     device_info.err().unwrap()
                 );
-                return None;
-            }
-            let device_info = device_info.unwrap();
-            device_info_map.insert(key.clone(), (device_info.clone(), sn_ip));
-            return Some((device_info.clone(), sn_ip));
-        } else {
-            return device_info.cloned();
+            return None;
         }
+        let device_info = device_info.unwrap();
+        Some((device_info.clone(), sn_ip))
     }
     //return (owner_public_key,zone_config_jwt,device_jwt)
     async fn get_user_zone_config_by_domain(
         &self,
         domain: &str,
     ) -> Option<(String, String, Option<String>)> {
-        let db: tokio::sync::MutexGuard<'_, SnDB> = GLOBAL_SN_DB.lock().await;
-        let user_info = db.get_user_info_by_domain(domain);
-        drop(db);
+        let user_info = self.db.get_user_info_by_domain(domain).await;
 
         if user_info.is_err() {
             warn!(
@@ -741,9 +728,16 @@ impl SNServer {
         &self,
         username: &str,
     ) -> Option<(String, String, Option<String>, Option<String>)> {
-        let db = GLOBAL_SN_DB.lock().await;
-        let user_info = db.get_user_info(username).unwrap();
-        drop(db);
+        let user_info = self.db.get_user_info(username).await;
+        if user_info.is_err() {
+            warn!(
+                "failed to get user info for {}: {:?}",
+                username,
+                user_info.err().unwrap()
+            );
+            return None;
+        }
+        let user_info = user_info.unwrap();
         if user_info.is_some() {
             let user_info = user_info.unwrap();
             // 只存储前两个字段 (public_key, zone_config)，忽略 sn_ips
@@ -751,9 +745,8 @@ impl SNServer {
             let zone_config = user_info.zone_config.clone();
             let sn_ips = user_info.sn_ips.clone();
             let stored_info = (public_key.clone(), zone_config.clone());
-            let db = GLOBAL_SN_DB.lock().await;
-            let device_info = db.query_device_by_name(username, "ood1");
-            drop(db);
+
+            let device_info = self.db.query_device_by_name(username, "ood1").await;
             if device_info.is_ok() {
                 let device_info = device_info.unwrap();
                 if device_info.is_some() {
@@ -772,8 +765,16 @@ impl SNServer {
     }
 
     async fn get_user_public_key(&self, username: &str) -> Option<String> {
-        let db = GLOBAL_SN_DB.lock().await;
-        let user_info = db.get_user_info(username).unwrap();
+        let user_info = self.db.get_user_info(username).await;
+        if user_info.is_err() {
+            warn!(
+                "failed to get user info for {}: {:?}",
+                username,
+                user_info.err().unwrap()
+            );
+            return None;
+        }
+        let user_info = user_info.unwrap();
         if user_info.is_some() {
             return Some(user_info.unwrap().public_key.clone());
         }
@@ -816,9 +817,7 @@ impl SNServer {
         domain: &str,
         record_type: RecordType,
     ) -> Option<Vec<IpAddr>> {
-        let db = GLOBAL_SN_DB.lock().await;
-        let user_info = db.get_user_info_by_domain(domain);
-        drop(db);
+        let user_info = self.db.get_user_info_by_domain(domain).await;
         if user_info.is_err() {
             warn!(
                 "failed to get user info by domain {}: {:?}",
@@ -989,8 +988,12 @@ impl SNServer {
     }
 
     async fn query_by_did(&self, did: &str) -> Option<OODInfo> {
-        let db = GLOBAL_SN_DB.lock().await;
-        let device_info = db.query_device_by_did(did).unwrap();
+        let device_info = self.db.query_device_by_did(did).await;
+        if device_info.is_err() {
+            warn!("query device by did error: {}", device_info.err().unwrap());
+            return None;
+        }
+        let device_info = device_info.unwrap();
         if device_info.is_none() {
             return None;
         }
@@ -1007,9 +1010,12 @@ impl SNServer {
         let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
         if get_result.is_some() {
             let (sub_host, username) = get_result.unwrap();
-            let db = GLOBAL_SN_DB.lock().await;
-            let user_info = db.get_user_info(username.as_str()).unwrap();
-            drop(db);
+            let user_info = self.db.get_user_info(username.as_str()).await;
+            if user_info.is_err() {
+                warn!("get user info error: {}", user_info.err().unwrap());
+                return None;
+            }
+            let user_info = user_info.unwrap();
             if user_info.is_none() {
                 warn!("user info not found for {}", username);
                 return None;
@@ -1033,9 +1039,7 @@ impl SNServer {
                 warn!("ood1 device info not found for {} in sn server", username);
             }
         } else {
-            let db = GLOBAL_SN_DB.lock().await;
-            let user_info = db.get_user_info_by_domain(req_host);
-            drop(db);
+            let user_info = self.db.get_user_info_by_domain(req_host).await;
             if user_info.is_err() {
                 info!(
                     "failed to get user info by domain: {}",
@@ -1518,14 +1522,19 @@ impl HttpServer for SNServer {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SNServerConfig {
-    id: String,
-    host: String,
-    ip: String,
-    boot_jwt: String,
-    owner_pkx: String,
-    device_jwt: Vec<String>,
+    pub id: String,
+    pub host: String,
+    pub ip: String,
+    pub boot_jwt: String,
+    pub owner_pkx: String,
+    pub device_jwt: Vec<String>,
     #[serde(default)]
-    aliases: Vec<String>,
+    pub aliases: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_type: Option<String>,
+    #[serde(flatten)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_params: Option<Value>,
 }
 
 impl ServerConfig for SNServerConfig {
@@ -1570,16 +1579,30 @@ impl ServerConfig for SNServerConfig {
     }
 }
 
-pub struct SNServerFactory {}
+#[async_trait::async_trait]
+#[callback_trait::callback_trait]
+pub trait SnDBFactory: Send + Sync + 'static {
+    async fn create(&self, params: Value) -> ServerResult<SnDBRef>;
+}
 
-impl SNServerFactory {
+pub struct SnServerFactory {
+    db_factorys: HashMap<String, Arc<dyn SnDBFactory>>,
+}
+
+impl SnServerFactory {
     pub fn new() -> Self {
-        SNServerFactory {}
+        SnServerFactory {
+            db_factorys: HashMap::new(),
+        }
+    }
+
+    pub fn register_db_factory(&mut self, db_type: &str, factory: impl SnDBFactory) {
+        self.db_factorys.insert(db_type.to_string(), Arc::new(factory));
     }
 }
 
 #[async_trait::async_trait]
-impl ServerFactory for SNServerFactory {
+impl ServerFactory for SnServerFactory {
     async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
         let config = config
             .as_any()
@@ -1590,7 +1613,18 @@ impl ServerFactory for SNServerFactory {
                 config.server_type()
             ))?;
 
-        let sn = Arc::new(SNServer::new(config.clone()));
+        let db_type = config.db_type.clone().unwrap_or("sqlite".to_string());
+        let db_factory = self.db_factorys.get(db_type.as_str());
+        if db_factory.is_none() {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid db type {}",
+                db_type
+            ));
+        }
+        let db = db_factory.unwrap().create(config.db_params.clone().unwrap_or(Value::Null)).await?;
+
+        let sn = Arc::new(SNServer::new(config.clone(), db).await);
         Ok(vec![
             Server::NameServer(sn.clone()),
             Server::Http(sn.clone()),

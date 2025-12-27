@@ -27,6 +27,7 @@ pub trait ServerConfig: AsAny + Send + Sync {
 }
 
 #[async_trait::async_trait]
+#[callback_trait::callback_trait]
 pub trait ServerFactory: Send + Sync {
     async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>>;
 }

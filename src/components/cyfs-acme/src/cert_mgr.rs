@@ -593,7 +593,7 @@ impl AcmeCertManager {
                     let provider = ExternalDnsProvider::new(
                         dns_provider_path.clone(),
                         name.as_str(),
-                        provider_config.clone().clone());
+                        provider_config.clone());
                     dns_providers.insert(name.clone(), provider);
                 }
             }

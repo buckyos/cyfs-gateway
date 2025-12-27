@@ -28,4 +28,6 @@ kRPC.workspace = true
 name-client.workspace = true
 name-lib.workspace = true
 cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
+async-named-locker = "0.1"
+callback-trait = "0.1"
 #buckyos-api = { path = "../../kernel/buckyos-api" }

@@ -37,6 +37,9 @@ mod tests {
         let text_set = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
         let config = config.replace("{{test_text_set}}", text_set.path().to_str().unwrap());
 
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let config = config.replace("{{sn_db}}", db.path().to_str().unwrap());
+
         let local_dir = tempfile::TempDir::new().unwrap();
         let config = config.replace("{{web3_dir}}", local_dir.path().to_str().unwrap());
         let path = local_dir.path().join("index.html");
@@ -168,7 +171,7 @@ mod tests {
             });
 
             let response = sender.send_request(request).await.unwrap();
-            assert_eq!(response.status(), hyper::StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(response.status(), hyper::StatusCode::OK);
         }
 
         {
