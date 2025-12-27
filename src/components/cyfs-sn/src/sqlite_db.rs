@@ -38,6 +38,12 @@ impl SqliteSnDB {
             .map_err(into_sn_err!(SnErrorCode::DBError, "create users table failed"))?;
         conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS devices (owner TEXT, device_name TEXT, did TEXT PRIMARY KEY, ip TEXT, description TEXT, mini_config_jwt TEXT, created_at INTEGER, updated_at INTEGER)")).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create devices table failed"))?;
+        conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS user_dns_records (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT, domain TEXT, record_type TEXT, record TEXT, ttl INTEGER, created_at INTEGER, updated_at INTEGER)")).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "create user_dns_records table failed"))?;
+        conn.execute_sql(sql_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_domain_record_type ON user_dns_records (owner, domain, record_type)")).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "create unique index on user_dns_records failed"))?;
+        conn.execute_sql(sql_query("CREATE INDEX IF NOT EXISTS user_dns_records_domain_index ON user_dns_records (domain, id)")).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "create user_dns_records_domain_index failed"))?;
         Ok(())
     }
 }
@@ -482,6 +488,80 @@ impl SnDB for SqliteSnDB {
             Err(_) => Ok(None)
         }
     }
+
+    async fn add_user_domain(&self, username: &str, domain: &str, record_type: &str, record: &str, ttl: u32) -> SnResult<()> {
+        let mut conn = self.pool.get_conn().await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // 使用 INSERT ... ON CONFLICT 在单个 SQL 语句中完成：如果 (owner, domain, record_type) 组合已存在则更新，否则插入新记录
+        conn.execute_sql(sql_query("INSERT INTO user_dns_records (owner, domain, record_type, record, ttl, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?6, ?5, ?5) ON CONFLICT(owner, domain, record_type) DO UPDATE SET record = ?4, updated_at = ?5")
+            .bind(username)
+            .bind(domain)
+            .bind(record_type)
+            .bind(record)
+            .bind(now as i64)
+            .bind(ttl as i64)).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "insert on conflict user dns record failed"))?;
+
+        Ok(())
+    }
+
+    async fn remove_user_domain(&self, username: &str, domain: &str, record_type: &str) -> SnResult<()> {
+        let mut conn = self.pool.get_conn().await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        conn.execute_sql(sql_query("DELETE FROM user_dns_records WHERE owner = ?1 AND domain = ?2 AND record_type = ?3")
+            .bind(username)
+            .bind(domain)
+            .bind(record_type)).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "delete user dns record failed"))?;
+
+        Ok(())
+    }
+
+    async fn query_domain_record(&self, domain: &str, record_type: &str) -> SnResult<Option<(String, u32)>> {
+        let mut conn = self.pool.get_conn().await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        match conn.query_one(sql_query("SELECT record, ttl FROM user_dns_records WHERE domain = ?1 AND record_type = ?2")
+            .bind(domain)
+            .bind(record_type)).await {
+            Ok(row) => {
+                let record: String = row.get(0);
+                Ok(Some((record, row.get::<i64, _>(1) as u32)))
+            }
+            Err(_) => Ok(None)
+        }
+    }
+
+    async fn query_domain_records(&self, domain: &str) -> SnResult<Vec<(String, String, u32)>> {
+        let mut conn = self.pool.get_conn().await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        let rows = conn.query_all(sql_query("SELECT record_type, record, ttl FROM user_dns_records WHERE domain = ?1")
+            .bind(domain)).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "query user dns records failed"))?;
+
+        let records: Vec<(String, String, u32)> = rows.into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get::<i64, _>(2) as u32))
+            .collect();
+
+        Ok(records)
+    }
+
+    async fn query_user_domain_records(&self, username: &str) -> SnResult<Vec<(String, String, String, u32)>> {
+        let mut conn = self.pool.get_conn().await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        let rows = conn.query_all(sql_query("SELECT domain, record_type, record, ttl FROM user_dns_records WHERE owner = ?1")
+            .bind(username)).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "query user dns records failed"))?;
+        Ok(rows.into_iter().map(|row| (row.get(0), row.get(1), row.get(2), row.get::<i64, _>(3) as u32)).collect())
+    }
 }
 
 #[derive(Deserialize)]
@@ -548,6 +628,40 @@ mod tests {
         } else {
             println!("Registration failed.");
         }
+
+        let ret = db.add_user_domain("lzc", "example.com", "A", "192.168.1.100", 3600).await;
+        assert!(ret.is_ok());
+
+        let ret = db.query_domain_record("example.com", "A").await;
+        assert!(ret.is_ok());
+        assert_eq!(ret.unwrap(), Some(("192.168.1.100".to_string(), 3600)));
+
+        let ret = db.query_domain_record("example.com", "AAAA").await;
+        assert!(ret.is_ok());
+        assert_eq!(ret.unwrap(), None);
+
+        let ret = db.query_domain_records("example.com").await;
+        assert!(ret.is_ok());
+        assert_eq!(ret.unwrap(), vec![("A".to_string(), "192.168.1.100".to_string(), 3600)]);
+
+        let ret = db.query_user_domain_records("lzc").await;
+        assert!(ret.is_ok());
+        assert_eq!(ret.unwrap(), vec![("example.com".to_string(), "A".to_string(), "192.168.1.100".to_string(), 3600)]);
+
+        let ret = db.remove_user_domain("lzc", "example.com", "A").await;
+        assert!(ret.is_ok());
+
+        let ret = db.query_domain_record("example.com", "A").await;
+        assert!(ret.is_ok());
+        assert_eq!(ret.unwrap(), None);
+
+        let ret = db.query_domain_records("example.com").await;
+        assert!(ret.is_ok());
+        assert_eq!(ret.unwrap(), vec![]);
+
+        let ret = db.query_user_domain_records("lzc").await;
+        assert!(ret.is_ok());
+        assert_eq!(ret.unwrap(), vec![]);
 
         // 测试 sn_ips 功能
         if let Some(sn_ips) = db.get_user_sn_ips("lzc").await? {

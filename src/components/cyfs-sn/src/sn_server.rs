@@ -893,6 +893,259 @@ impl SNServer {
         return None;
     }
 
+    async fn add_dns_record(
+        &self,
+        req: RPCRequest,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let session_token = req.token;
+        if session_token.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, session_token is none".to_string(),
+            ));
+        }
+        let session_token = session_token.unwrap();
+        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
+
+        let user_name = req.params.get("user_name");
+        if user_name.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, user_name is none".to_string()
+            ));
+        }
+        let user_name = user_name.unwrap().as_str();
+        if user_name.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, user_name is none".to_string()
+            ));
+        }
+        let user_name = user_name.unwrap();
+
+        let user_public_key = self.get_user_public_key(user_name).await;
+        if user_public_key.is_none() {
+            warn!("user {} not found", user_name);
+            return Err(RPCErrors::ParseRequestError("user not found".to_string()));
+        }
+        let user_public_key_str = user_public_key.unwrap();
+        let user_public_key: jsonwebtoken::jwk::Jwk =
+            serde_json::from_str(user_public_key_str.as_str()).map_err(|e| {
+                error!("Failed to parse user public key: {:?}", e);
+                RPCErrors::ParseRequestError(e.to_string())
+            })?;
+
+        let user_public_key = DecodingKey::from_jwk(&user_public_key).map_err(|e| {
+            error!("Failed to decode user public key: {:?}", e);
+            RPCErrors::ParseRequestError(e.to_string())
+        })?;
+
+        rpc_session_token.verify_by_key(&user_public_key)?;
+
+        let domain = req.params.get("domain");
+        if domain.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, domain is none".to_string()
+            ));
+        }
+        let domain = domain.unwrap().as_str();
+        if domain.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, domain is none".to_string()
+            ));
+        }
+        let domain = domain.unwrap();
+        let record_type = req.params.get("record_type");
+        if record_type.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, record_type is none".to_string()
+            ));
+        }
+        let record_type = record_type.unwrap().as_str();
+        if record_type.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, record_type is none".to_string()
+            ));
+        }
+        let record_type = record_type.unwrap();
+
+        let record_value = req.params.get("record");
+        if record_value.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, record is none".to_string()
+            ));
+        }
+        let record_value = record_value.unwrap().as_str();
+        if record_value.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, record is none".to_string()
+            ));
+        }
+        let record_value = record_value.unwrap();
+
+        let ttl = req.params.get("ttl");
+        if ttl.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, ttl is none".to_string()
+            ));
+        }
+        let ttl = ttl.unwrap().as_i64();
+        let ttl = if ttl.is_some() {
+            ttl.unwrap()
+        } else {
+            600
+        };
+
+        let end_string = format!(".{}.web3.{}", user_name, self.server_host);
+        if !domain.ends_with(end_string.as_str()) {
+            return Err(RPCErrors::ParseRequestError(
+                format!("Invalid params, domain is not end with {}", end_string)
+            ));
+        }
+
+        let ret = self.db.add_user_domain(user_name, domain, record_type, record_value, ttl as u32).await;
+        if ret.is_err() {
+            let err_str = ret.err().unwrap().to_string();
+            warn!(
+                "Failed to add dns record {}_{}: {:?}",
+                user_name,
+                domain,
+                err_str.as_str()
+            );
+            return Err(RPCErrors::ParseRequestError(format!(
+                "Failed to add dns record: {}",
+                err_str
+            )));
+        }
+
+        info!("add dns record {} {} success", user_name, domain);
+
+        let resp = RPCResponse::new(
+            RPCResult::Success(json!({
+                "code":0
+            })),
+            req.id,
+        );
+        Ok(resp)
+    }
+
+    async fn remove_dns_record(
+        &self,
+        req: RPCRequest,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let session_token = req.token;
+        if session_token.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, session_token is none".to_string(),
+            ));
+        }
+        let session_token = session_token.unwrap();
+        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
+
+        let user_name = req.params.get("user_name");
+        if user_name.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, user_name is none".to_string()
+            ));
+        }
+        let user_name = user_name.unwrap().as_str();
+        if user_name.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, user_name is none".to_string()
+            ));
+        }
+        let user_name = user_name.unwrap();
+
+        let user_public_key = self.get_user_public_key(user_name).await;
+        if user_public_key.is_none() {
+            warn!("user {} not found", user_name);
+            return Err(RPCErrors::ParseRequestError("user not found".to_string()));
+        }
+        let user_public_key_str = user_public_key.unwrap();
+        let user_public_key: jsonwebtoken::jwk::Jwk =
+            serde_json::from_str(user_public_key_str.as_str()).map_err(|e| {
+                error!("Failed to parse user public key: {:?}", e);
+                RPCErrors::ParseRequestError(e.to_string())
+            })?;
+
+        let user_public_key = DecodingKey::from_jwk(&user_public_key).map_err(|e| {
+            error!("Failed to decode user public key: {:?}", e);
+            RPCErrors::ParseRequestError(e.to_string())
+        })?;
+
+        rpc_session_token.verify_by_key(&user_public_key)?;
+
+        let domain = req.params.get("domain");
+        if domain.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, domain is none".to_string()
+            ));
+        }
+        let domain = domain.unwrap().as_str();
+        if domain.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, domain is none".to_string()
+            ));
+        }
+        let domain = domain.unwrap();
+        let record_type = req.params.get("record_type");
+        if record_type.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, record_type is none".to_string()
+            ));
+        }
+        let record_type = record_type.unwrap().as_str();
+        if record_type.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, record_type is none".to_string()
+            ));
+        }
+        let record_type = record_type.unwrap();
+
+        let record_value = req.params.get("record");
+        if record_value.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, record is none".to_string()
+            ));
+        }
+        let record_value = record_value.unwrap().as_str();
+        if record_value.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, record is none".to_string()
+            ));
+        }
+        let record_value = record_value.unwrap();
+
+        let end_string = format!(".{}.web3.{}", user_name, self.server_host);
+        if !domain.ends_with(end_string.as_str()) {
+            return Err(RPCErrors::ParseRequestError(
+                format!("Invalid params, domain is not end with {}", end_string)
+            ));
+        }
+
+        let ret = self.db.remove_user_domain(user_name, domain, record_type).await;
+        if ret.is_err() {
+            let err_str = ret.err().unwrap().to_string();
+            warn!(
+                "Failed to remove dns record {}_{}: {:?}",
+                user_name,
+                domain,
+                err_str.as_str()
+            );
+            return Err(RPCErrors::ParseRequestError(format!(
+                "Failed to remove dns record: {}",
+                err_str
+            )));
+        }
+
+        info!("remove dns record {} {} success", user_name, domain);
+
+        let resp = RPCResponse::new(
+            RPCResult::Success(json!({
+                "code":0
+            })),
+            req.id,
+        );
+        Ok(resp)
+    }
+
     async fn handle_rpc_call(
         &self,
         req: RPCRequest,
@@ -982,7 +1235,13 @@ impl SNServer {
                         "Invalid params, did is none".to_string(),
                     ));
                 }
-            }
+            },
+            "add_dns_record" => {
+                self.add_dns_record(req).await
+            },
+            "remove_dns_record" => {
+                self.remove_dns_record(req).await
+            },
             _ => Err(RPCErrors::UnknownMethod(req.method)),
         }
     }
@@ -1252,11 +1511,19 @@ impl NameServer for SNServer {
                         );
                         return Ok(name_info);
                     } else {
-                        return Err(server_err!(
+                        let ret = self.db.query_domain_record(req_real_name.as_str(), "TXT").await;
+                        return if let Ok(Some((record, ttl))) = ret {
+                            let mut name_info = NameInfo::default();
+                            name_info.ttl = Some(ttl);
+                            name_info.txt.push(record);
+                            Ok(name_info)
+                        } else {
+                            Err(server_err!(
                             ServerErrorCode::NotFound,
                             "{}",
                             name.to_string()
-                        ));
+                        ))
+                        }
                     }
                 }
                 RecordType::A | RecordType::AAAA => {
@@ -1269,11 +1536,26 @@ impl NameServer for SNServer {
                         info!("=>{} result_name_info: {:?}", name, result_name_info);
                         return Ok(result_name_info);
                     } else {
-                        return Err(server_err!(
+                        let ret = self.db.query_domain_record(req_real_name.as_str(), record_type.to_string().as_str()).await;
+                        return if let Ok(Some((record, ttl))) = ret {
+                            let mut address_vec = Vec::new();
+                            record.split(',').for_each(|x| {
+                                if let Ok(ip) = IpAddr::from_str(x) {
+                                    address_vec.push(ip);
+                                }
+                            });
+
+                            let mut result_name_info = NameInfo::from_address_vec(name, address_vec);
+                            result_name_info.ttl = Some(ttl);
+                            info!("=>{} result_name_info: {:?}", name, result_name_info);
+                            Ok(result_name_info)
+                        } else {
+                            Err(server_err!(
                             ServerErrorCode::NotFound,
                             "no address found for {}",
                             name.to_string()
-                        ));
+                        ))
+                        }
                     }
                 }
                 _ => {

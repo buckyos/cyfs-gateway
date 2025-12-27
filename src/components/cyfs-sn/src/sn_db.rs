@@ -137,5 +137,10 @@ pub trait SnDB: Send + Sync + 'static {
     async fn query_device_by_did(&self, did: &str) -> SnResult<Option<SNDeviceInfo>>;
     async fn get_user_info_by_domain(&self, domain: &str) -> SnResult<Option<SNUserInfo>>;
     async fn query_device(&self, did: &str) -> SnResult<Option<SNDeviceInfo>>;
+    async fn add_user_domain(&self, username: &str, domain: &str, record_type: &str, record: &str, ttl: u32) -> SnResult<()>;
+    async fn remove_user_domain(&self, username: &str, domain: &str, record_type: &str) -> SnResult<()>;
+    async fn query_domain_record(&self, domain: &str, record_type: &str) -> SnResult<Option<(String, u32)>>;
+    async fn query_domain_records(&self, domain: &str) -> SnResult<Vec<(String, String, u32)>>;
+    async fn query_user_domain_records(&self, username: &str) -> SnResult<Vec<(String, String, String, u32)>>;
 }
 pub type SnDBRef = std::sync::Arc<dyn SnDB>;
