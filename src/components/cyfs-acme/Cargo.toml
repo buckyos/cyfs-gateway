@@ -4,21 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "*", features = ["full"] }
-reqwest = { version = "*", features = ["json", "rustls-tls"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-openssl = "0.10"
-serde = { version = "1.0.217", features = ["derive"] }
-rcgen = "0.14"
-base64 = "0.22"
-anyhow = "*"
-sha2 = "*"
-log = "0.4"
-serde_json = "*"
-async-trait = "0.1"
-hex = "0.4"
-buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", branch = "beta1", package = "buckyos-kit" }
-rand = "*"
-chrono = "0.4"
-rustls-pemfile = "2.0"
-sfo-js = "0.1"
+tokio.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+openssl.workspace = true
+serde.workspace = true
+rcgen.workspace = true
+base64.workspace = true
+anyhow.workspace = true
+sha2.workspace = true
+log.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+buckyos-kit.workspace = true
+rand.workspace = true
+chrono.workspace = true
+rustls-pemfile.workspace = true
+sfo-js = "*"

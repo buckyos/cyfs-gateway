@@ -870,55 +870,7 @@ impl SNServer {
         if device_info.is_some() {
             let (device_info, device_ip) = device_info.unwrap();
             let mut address_vec: Vec<IpAddr> = Vec::new();
-            let device_report_ip = device_info.ip;
-            if device_info.is_wan_device() {
-                if device_report_ip.is_some() {
-                    let device_report_ip = device_report_ip.unwrap();
-                    match device_report_ip {
-                        IpAddr::V4(ip) => {
-                            if ip.is_private() {
-                                self.add_address_to_vec(&mut address_vec, device_ip, record_type)
-                                    .await;
-                                self.add_address_to_vec(
-                                    &mut address_vec,
-                                    device_report_ip,
-                                    record_type,
-                                )
-                                .await;
-                            } else {
-                                info!("device {} is wan device with public_v4ip, return report ip {} ",username,device_report_ip);
-                                self.add_address_to_vec(
-                                    &mut address_vec,
-                                    device_report_ip,
-                                    record_type,
-                                )
-                                .await;
-                            }
-                        }
-                        IpAddr::V6(ip) => {
-                            info!(
-                                "device {} is wan device with v6, return report ip {} ",
-                                username, device_report_ip
-                            );
-                            self.add_address_to_vec(
-                                &mut address_vec,
-                                device_report_ip,
-                                record_type,
-                            )
-                            .await;
-                            self.add_address_to_vec(&mut address_vec, device_ip, record_type)
-                                .await;
-                        }
-                    }
-                } else {
-                    info!(
-                        "device {} is wan device without self-report ip, return device_ip {}",
-                        username, device_ip
-                    );
-                    self.add_address_to_vec(&mut address_vec, device_ip, record_type)
-                        .await;
-                }
-            } else {
+            if !device_info.is_wan_device() {
                 let sn_ips = self.get_user_sn_ips(username).await;
                 if sn_ips.is_empty() {
                     self.add_address_to_vec(&mut address_vec, self.server_ip, record_type)
@@ -930,6 +882,13 @@ impl SNServer {
                     }
                 }
             }
+
+            self.add_address_to_vec(&mut address_vec, device_ip, record_type).await;
+
+            for device_report_ip in device_info.all_ip.iter() {
+                self.add_address_to_vec(&mut address_vec, device_report_ip.clone(), record_type).await;
+            }
+
             return Some(address_vec);
         }
         return None;
