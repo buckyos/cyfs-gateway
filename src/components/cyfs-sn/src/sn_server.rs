@@ -904,38 +904,46 @@ impl SNServer {
         let session_token = session_token.unwrap();
         let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
 
-        let user_name = req.params.get("user_name");
-        if user_name.is_none() {
+        let device_did = req.params.get("device_did");
+        if device_did.is_none() {
             return Err(RPCErrors::ParseRequestError(
                 "Invalid params, user_name is none".to_string()
             ));
         }
-        let user_name = user_name.unwrap().as_str();
-        if user_name.is_none() {
+        let device_did = device_did.unwrap().as_str();
+        if device_did.is_none() {
             return Err(RPCErrors::ParseRequestError(
                 "Invalid params, user_name is none".to_string()
             ));
         }
-        let user_name = user_name.unwrap();
+        let device_did = device_did.unwrap();
 
-        let user_public_key = self.get_user_public_key(user_name).await;
-        if user_public_key.is_none() {
-            warn!("user {} not found", user_name);
-            return Err(RPCErrors::ParseRequestError("user not found".to_string()));
+        let device_info = self.db.query_device_by_did(device_did).await;
+        if device_info.is_err() {
+            warn!("device {} not found", device_did);
+            return Err(RPCErrors::ParseRequestError("device not found".to_string()));
         }
-        let user_public_key_str = user_public_key.unwrap();
-        let user_public_key: jsonwebtoken::jwk::Jwk =
-            serde_json::from_str(user_public_key_str.as_str()).map_err(|e| {
-                error!("Failed to parse user public key: {:?}", e);
+        let device_info = device_info.unwrap();
+        if device_info.is_none() {
+            warn!("device {} not found", device_did);
+            return Err(RPCErrors::ParseRequestError("device not found".to_string()));
+        }
+        let device_info = device_info.unwrap();
+        let user_name = device_info.owner.as_str();
+        let device_did = DID::from_str(device_info.did.as_str());
+        if device_did.is_err() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, device_id is invalid".to_string()
+            ));
+        }
+        let device_did = device_did.unwrap();
+
+        let verify_public_key =
+            DecodingKey::from_ed_components(device_did.id.as_str()).map_err(|e| {
+                error!("Failed to decode device public key: {:?}", e);
                 RPCErrors::ParseRequestError(e.to_string())
             })?;
-
-        let user_public_key = DecodingKey::from_jwk(&user_public_key).map_err(|e| {
-            error!("Failed to decode user public key: {:?}", e);
-            RPCErrors::ParseRequestError(e.to_string())
-        })?;
-
-        rpc_session_token.verify_by_key(&user_public_key)?;
+        rpc_session_token.verify_by_key(&verify_public_key)?;
 
         let domain = req.params.get("domain");
         if domain.is_none() {
@@ -1037,38 +1045,46 @@ impl SNServer {
         let session_token = session_token.unwrap();
         let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
 
-        let user_name = req.params.get("user_name");
-        if user_name.is_none() {
+        let device_did = req.params.get("device_did");
+        if device_did.is_none() {
             return Err(RPCErrors::ParseRequestError(
                 "Invalid params, user_name is none".to_string()
             ));
         }
-        let user_name = user_name.unwrap().as_str();
-        if user_name.is_none() {
+        let device_did = device_did.unwrap().as_str();
+        if device_did.is_none() {
             return Err(RPCErrors::ParseRequestError(
                 "Invalid params, user_name is none".to_string()
             ));
         }
-        let user_name = user_name.unwrap();
+        let device_did = device_did.unwrap();
 
-        let user_public_key = self.get_user_public_key(user_name).await;
-        if user_public_key.is_none() {
-            warn!("user {} not found", user_name);
-            return Err(RPCErrors::ParseRequestError("user not found".to_string()));
+        let device_info = self.db.query_device_by_did(device_did).await;
+        if device_info.is_err() {
+            warn!("device {} not found", device_did);
+            return Err(RPCErrors::ParseRequestError("device not found".to_string()));
         }
-        let user_public_key_str = user_public_key.unwrap();
-        let user_public_key: jsonwebtoken::jwk::Jwk =
-            serde_json::from_str(user_public_key_str.as_str()).map_err(|e| {
-                error!("Failed to parse user public key: {:?}", e);
+        let device_info = device_info.unwrap();
+        if device_info.is_none() {
+            warn!("device {} not found", device_did);
+            return Err(RPCErrors::ParseRequestError("device not found".to_string()));
+        }
+        let device_info = device_info.unwrap();
+        let user_name = device_info.owner.as_str();
+        let device_did = DID::from_str(device_info.did.as_str());
+        if device_did.is_err() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, device_id is invalid".to_string()
+            ));
+        }
+        let device_did = device_did.unwrap();
+
+        let verify_public_key =
+            DecodingKey::from_ed_components(device_did.id.as_str()).map_err(|e| {
+                error!("Failed to decode device public key: {:?}", e);
                 RPCErrors::ParseRequestError(e.to_string())
             })?;
-
-        let user_public_key = DecodingKey::from_jwk(&user_public_key).map_err(|e| {
-            error!("Failed to decode user public key: {:?}", e);
-            RPCErrors::ParseRequestError(e.to_string())
-        })?;
-
-        rpc_session_token.verify_by_key(&user_public_key)?;
+        rpc_session_token.verify_by_key(&verify_public_key)?;
 
         let domain = req.params.get("domain");
         if domain.is_none() {
@@ -1915,6 +1931,10 @@ impl ServerFactory for SnServerFactory {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+    use hyper_util::rt::TokioIo;
+    use cyfs_gateway_lib::hyper_serve_http;
+    use crate::SqliteDBFactory;
     use super::*;
 
     #[test]
@@ -1964,5 +1984,90 @@ mod tests {
             SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
         assert_eq!(sub_host, "alice".to_string());
         assert_eq!(username, "alice".to_string());
+    }
+
+    #[tokio::test]
+    async fn test_sn_api() {
+        let (user_signing_key, user_pkcs8_bytes) = generate_ed25519_key();
+        let user_public_key = encode_ed25519_sk_to_pk_jwk(&user_signing_key);
+        let user_encoding_key = jsonwebtoken::EncodingKey::from_ed_der(user_pkcs8_bytes.as_slice());
+
+        let now = SystemTime::now();
+        let zone_boot_config = json!({
+            "oods": ["test1"],
+            "exp": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + 3600,
+            "iat": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+        });
+        let zone_boot_config: ZoneBootConfig = serde_json::from_value(zone_boot_config).unwrap();
+        let zone_jwt = zone_boot_config.encode(Some(&user_encoding_key)).unwrap().to_string();
+
+
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+
+        let encoding_key = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes.as_slice());
+        let (token, session) = RPCSessionToken::generate_jwt_token("cyfs_gateway", "cyfs_gateway", None, &encoding_key).unwrap();
+
+
+        let mut sn_factory = SnServerFactory::new();
+        sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
+
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+
+        {
+            let db = SqliteSnDB::new_by_path(db.path().to_str().unwrap()).await.unwrap();
+            db.initialize_database().await.unwrap();
+            db.insert_activation_code("test_code").await.unwrap();
+        }
+        let config = json!({
+            "id": "test",
+            "host": "buckyos.ai",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "db_type": "sqlite",
+            "db_path": db.path().to_str().unwrap(),
+        });
+        let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        let servers = sn_factory.create(Arc::new(config)).await.unwrap();
+        let mut http_server = None;
+        for server in servers {
+            if let Server::Http(server) = server {
+                http_server = Some(server);
+            }
+        }
+        let http_server = http_server.unwrap();
+
+        tokio::spawn(async move {
+            use http_body_util::BodyExt;
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:19091").await.unwrap();
+
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                hyper_serve_http(Box::new(stream), http_server.clone(), StreamInfo::new("127.0.0.1:19091".to_string())).await.unwrap();
+            }
+        });
+
+        // 等待服务器启动
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token));
+        let result = krpc.call("check_username", json!({
+            "username": "test"
+        })).await.unwrap();
+        assert!(result.as_object().unwrap().get("valid").unwrap().as_bool().unwrap());
+
+        let result = krpc.call("register_user", json!({
+            "user_name": "test2",
+            "public_key": user_public_key.to_string(),
+            "active_code": "test_code",
+            "zone_config": zone_jwt,
+            "user_domain": "test.buckyos.ai",
+        })).await.unwrap();
+        println!("result: {:?}", result);
     }
 }
