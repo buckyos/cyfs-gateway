@@ -232,6 +232,14 @@ impl SnDB for SqliteSnDB {
         Ok(())
     }
 
+    async fn update_user_domain(&self, username: &str, user_domain: Option<String>) -> SnResult<()> {
+        let mut conn = self.pool.get_conn().await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        conn.execute_sql(sql_query("UPDATE users SET user_domain =?1 WHERE username =?2").bind(user_domain).bind(username)).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "update user user_domain failed"))?;
+        Ok(())
+    }
+
     async fn get_user_sn_ips(&self, username: &str) -> SnResult<Option<String>> {
         let mut conn = self.pool.get_conn().await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;

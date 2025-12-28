@@ -14,7 +14,6 @@ serde.workspace = true
 serde_json.workspace = true
 env_logger.workspace = true
 url.workspace = true
-rusqlite = { version = "*", features = ["bundled"] }
 rand.workspace = true
 once_cell.workspace = true
 jsonwebtoken.workspace = true
@@ -30,4 +29,6 @@ name-lib.workspace = true
 cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
 async-named-locker = "0.1"
 callback-trait = "0.1"
+sfo-sql = "0.4"
+sfo-result = "0.2"
 #buckyos-api = { path = "../../kernel/buckyos-api" }

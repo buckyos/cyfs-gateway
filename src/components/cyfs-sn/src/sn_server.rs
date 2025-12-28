@@ -366,19 +366,17 @@ impl SNServer {
         }
 
         // Update zone_config and user_domain in database
-        let db = GLOBAL_SN_DB.lock().await;
-        db.update_user_zone_config(user_name, zone_config_jwt).map_err(|e| {
+        self.db.update_user_zone_config(user_name, zone_config_jwt).await.map_err(|e| {
             error!("Failed to update zone_config for user {}: {:?}", user_name, e);
             RPCErrors::ParseRequestError(format!("Failed to update zone_config: {}", e))
         })?;
 
         if let Some(domain) = &real_user_domain {
-            db.update_user_domain(user_name, Some(domain.clone())).map_err(|e| {
+            self.db.update_user_domain(user_name, Some(domain.clone())).await.map_err(|e| {
                 error!("Failed to update user_domain for user {}: {:?}", user_name, e);
                 RPCErrors::ParseRequestError(format!("Failed to update user_domain: {}", e))
             })?;
         }
-        drop(db);
 
         info!(
             "user {} zone_config and user_domain updated successfully",
