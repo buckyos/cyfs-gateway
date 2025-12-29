@@ -25,3 +25,4 @@ src/rootfs/bin/test-server/test_server
 src/rootfs/bin/__pycache__/
 src/_scripts/
 src/${APPDATA}
+src/web3-gateway/web3_gateway

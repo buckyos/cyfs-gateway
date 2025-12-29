@@ -151,17 +151,17 @@ impl SNServer {
         let active_code = req.params.get("active_code");
         let zone_config_jwt = req.params.get("zone_config");
         let user_domain = req.params.get("user_domain");
-        if user_name.is_none()
-            || public_key.is_none()
-            || active_code.is_none()
-            || zone_config_jwt.is_none()
-        {
-            return Err(RPCErrors::ParseRequestError("Invalid params, user_name or public_key or active_code or zone_config (jwt) is none".to_string()));
+        if user_name.is_none() || public_key.is_none() || active_code.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, user_name or public_key or active_code is none".to_string(),
+            ));
         }
         let user_name = user_name.unwrap().as_str().unwrap();
         let public_key = public_key.unwrap().as_str().unwrap();
         let active_code = active_code.unwrap().as_str().unwrap();
-        let zone_config_jwt = zone_config_jwt.unwrap().as_str().unwrap();
+        let zone_config_jwt = zone_config_jwt
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
 
         let mut real_user_domain = None;
         if user_domain.is_some() {
