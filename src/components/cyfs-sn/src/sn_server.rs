@@ -257,9 +257,9 @@ impl SNServer {
         })?;
 
         rpc_session_token.verify_by_key(&user_public_key)?;
-        if rpc_session_token.appid.is_none() || rpc_session_token.appid.unwrap() != "active_service"
+        if rpc_session_token.appid.is_none() || rpc_session_token.appid.as_ref().unwrap() != "active_service"
         {
-            return Err(RPCErrors::ParseRequestError("invalid appid".to_string()));
+            return Err(RPCErrors::ParseRequestError(format!("invalid appid {} expect active_service", rpc_session_token.appid.clone().unwrap_or("None".to_string()))));
         }
 
         let mini_device_config = DeviceMiniConfig::from_jwt(mini_config_jwt, &user_public_key);
@@ -420,6 +420,13 @@ impl SNServer {
 
         //check session_token is valid (verify pub key is device's public key)
 
+        let old_device_info = self.get_device_info(owner_id, device_info.name.as_str()).await;
+        if old_device_info.is_none() {
+            warn!("device {} not found", owner_id);
+            return Err(RPCErrors::ParseRequestError("device not found".to_string()));
+        }
+        let (old_device_info, _) = old_device_info.unwrap();
+
         let session_token = req.token;
         if session_token.is_none() {
             return Err(RPCErrors::ParseRequestError(
@@ -431,7 +438,7 @@ impl SNServer {
         let device_did = device_info.id.clone();
 
         let verify_public_key =
-            DecodingKey::from_ed_components(device_did.id.as_str()).map_err(|e| {
+            DecodingKey::from_ed_components(old_device_info.id.id.as_str()).map_err(|e| {
                 error!("Failed to decode device public key: {:?}", e);
                 RPCErrors::ParseRequestError(e.to_string())
             })?;
@@ -604,7 +611,7 @@ impl SNServer {
         }
         let device_id = device_id.unwrap();
         let owner_id = owner_id.unwrap();
-        let device_info = self.get_device_info(device_id, owner_id).await;
+        let device_info = self.get_device_info(owner_id, device_id).await;
         if device_info.is_some() {
             let device_info = device_info.unwrap();
             let device_value = serde_json::to_value(device_info.0).map_err(|e| {
@@ -655,10 +662,6 @@ impl SNServer {
         device_name: &str,
     ) -> Option<(DeviceInfo, IpAddr)> {
         let key = format!("{}_{}", owner_id, device_name);
-        warn!(
-                "device info not found for {} in memory cache, try to query from db",
-                key
-            );
         let device_json = self.db.query_device_by_name(owner_id, device_name).await;
         if device_json.is_err() {
             warn!(
@@ -1113,20 +1116,6 @@ impl SNServer {
         }
         let record_type = record_type.unwrap();
 
-        let record_value = req.params.get("record");
-        if record_value.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, record is none".to_string()
-            ));
-        }
-        let record_value = record_value.unwrap().as_str();
-        if record_value.is_none() {
-            return Err(RPCErrors::ParseRequestError(
-                "Invalid params, record is none".to_string()
-            ));
-        }
-        let record_value = record_value.unwrap();
-
         let end_string = format!(".{}.web3.{}", user_name, self.server_host);
         if !domain.ends_with(end_string.as_str()) {
             return Err(RPCErrors::ParseRequestError(
@@ -1510,6 +1499,13 @@ impl NameServer for SNServer {
             );
             match record_type {
                 RecordType::TXT => {
+                    let ret = self.db.query_domain_record(req_real_name.as_str(), "TXT").await;
+                    if let Ok(Some((record, ttl))) = ret {
+                        let mut name_info = NameInfo::default();
+                        name_info.ttl = Some(ttl);
+                        name_info.txt.push(record);
+                        return Ok(name_info);
+                    }
                     let zone_config = self.get_user_zone_config(username.as_str()).await;
                     if zone_config.is_some() {
                         let mut name_info = NameInfo::default();
@@ -1523,24 +1519,30 @@ impl NameServer for SNServer {
                             "<={} zone_config:{} public_key:{} device_jwt:{:?} ",
                             name, zone_config, public_key, device_jwt
                         );
-                        return Ok(name_info);
+                        Ok(name_info)
                     } else {
-                        let ret = self.db.query_domain_record(req_real_name.as_str(), "TXT").await;
-                        return if let Ok(Some((record, ttl))) = ret {
-                            let mut name_info = NameInfo::default();
-                            name_info.ttl = Some(ttl);
-                            name_info.txt.push(record);
-                            Ok(name_info)
-                        } else {
-                            Err(server_err!(
+                        Err(server_err!(
                             ServerErrorCode::NotFound,
                             "{}",
                             name.to_string()
                         ))
-                        }
                     }
                 }
                 RecordType::A | RecordType::AAAA => {
+                    let ret = self.db.query_domain_record(req_real_name.as_str(), record_type.to_string().as_str()).await;
+                    if let Ok(Some((record, ttl))) = ret {
+                        let mut address_vec = Vec::new();
+                        record.split(',').for_each(|x| {
+                            if let Ok(ip) = IpAddr::from_str(x) {
+                                address_vec.push(ip);
+                            }
+                        });
+
+                        let mut result_name_info = NameInfo::from_address_vec(name, address_vec);
+                        result_name_info.ttl = Some(ttl);
+                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        return Ok(result_name_info);
+                    }
                     let address_vec = self
                         .get_user_zonegate_address(username.as_str(), record_type)
                         .await;
@@ -1548,28 +1550,13 @@ impl NameServer for SNServer {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
                         info!("=>{} result_name_info: {:?}", name, result_name_info);
-                        return Ok(result_name_info);
+                        Ok(result_name_info)
                     } else {
-                        let ret = self.db.query_domain_record(req_real_name.as_str(), record_type.to_string().as_str()).await;
-                        return if let Ok(Some((record, ttl))) = ret {
-                            let mut address_vec = Vec::new();
-                            record.split(',').for_each(|x| {
-                                if let Ok(ip) = IpAddr::from_str(x) {
-                                    address_vec.push(ip);
-                                }
-                            });
-
-                            let mut result_name_info = NameInfo::from_address_vec(name, address_vec);
-                            result_name_info.ttl = Some(ttl);
-                            info!("=>{} result_name_info: {:?}", name, result_name_info);
-                            Ok(result_name_info)
-                        } else {
-                            Err(server_err!(
+                        Err(server_err!(
                             ServerErrorCode::NotFound,
                             "no address found for {}",
                             name.to_string()
                         ))
-                        }
                     }
                 }
                 _ => {
@@ -1781,14 +1768,16 @@ impl HttpServer for SNServer {
         let resp = match self.handle_rpc_call(rpc_request, client_ip).await {
             Ok(resp) => resp,
             Err(e) => {
+                let msg = format!(
+                    "Failed to handle rpc call: {}",
+                    e
+                );
+                error!("{}", msg);
                 return Ok(Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header("Access-Control-Allow-Origin", "*")
                     .body(
-                        BoxBody::new(Full::new(Bytes::from(format!(
-                            "Failed to handle rpc call: {}",
-                            e
-                        ))))
+                        BoxBody::new(Full::new(Bytes::from(msg)))
                         .map_err(|e| match e {})
                         .boxed(),
                     )
@@ -1932,6 +1921,7 @@ impl ServerFactory for SnServerFactory {
 #[cfg(test)]
 mod tests {
     use std::time::SystemTime;
+    use buckyos_kit::init_logging;
     use hyper_util::rt::TokioIo;
     use cyfs_gateway_lib::hyper_serve_http;
     use crate::SqliteDBFactory;
@@ -1988,26 +1978,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_sn_api() {
+        init_logging("sn", false);
         let (user_signing_key, user_pkcs8_bytes) = generate_ed25519_key();
         let user_public_key = encode_ed25519_sk_to_pk_jwk(&user_signing_key);
         let user_encoding_key = jsonwebtoken::EncodingKey::from_ed_der(user_pkcs8_bytes.as_slice());
 
         let now = SystemTime::now();
         let zone_boot_config = json!({
-            "oods": ["test1"],
+            "oods": ["ood1"],
             "exp": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + 3600,
             "iat": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
         });
         let zone_boot_config: ZoneBootConfig = serde_json::from_value(zone_boot_config).unwrap();
         let zone_jwt = zone_boot_config.encode(Some(&user_encoding_key)).unwrap().to_string();
 
+        let (user_token, user_session) = RPCSessionToken::generate_jwt_token("test", "active_service", None, &user_encoding_key).unwrap();
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config = DeviceConfig::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
+        let mini_config_jwt = DeviceMiniConfig::new_by_device_config(&device_config);
+        let mini_config_jwt = mini_config_jwt.to_jwt(&user_encoding_key).unwrap().to_string();
+        let device_info = DeviceInfo::from_device_doc(&device_config);
 
         let encoding_key = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes.as_slice());
-        let (token, session) = RPCSessionToken::generate_jwt_token("cyfs_gateway", "cyfs_gateway", None, &encoding_key).unwrap();
+        let (token, session) = RPCSessionToken::generate_jwt_token("test", "cyfs_gateway", None, &encoding_key).unwrap();
+
+        let (signing_key2, pkcs8_bytes2) = generate_ed25519_key();
+        let jwk2 = encode_ed25519_sk_to_pk_jwk(&signing_key2);
+        let device_config2 = DeviceConfig::new_by_jwk("ood2", serde_json::from_value(jwk2).unwrap());
+
+        let encoding_key2 = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes2.as_slice());
+        let (token2, session2) = RPCSessionToken::generate_jwt_token("test", "cyfs_gateway", None, &encoding_key2).unwrap();
+
 
 
         let mut sn_factory = SnServerFactory::new();
@@ -2033,12 +2036,20 @@ mod tests {
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
         let servers = sn_factory.create(Arc::new(config)).await.unwrap();
         let mut http_server = None;
-        for server in servers {
+        for server in servers.iter() {
             if let Server::Http(server) = server {
-                http_server = Some(server);
+                http_server = Some(server.clone());
             }
         }
         let http_server = http_server.unwrap();
+
+        let mut dns_server = None;
+        for server in servers.iter() {
+            if let Server::NameServer(server) = server {
+                dns_server = Some(server.clone());
+            }
+        }
+        let dns_server = dns_server.unwrap();
 
         tokio::spawn(async move {
             use http_body_util::BodyExt;
@@ -2055,19 +2066,158 @@ mod tests {
         // 等待服务器启动
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token));
+        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
         let result = krpc.call("check_username", json!({
             "username": "test"
         })).await.unwrap();
         assert!(result.as_object().unwrap().get("valid").unwrap().as_bool().unwrap());
 
         let result = krpc.call("register_user", json!({
-            "user_name": "test2",
+            "user_name": "test",
             "public_key": user_public_key.to_string(),
             "active_code": "test_code",
             "zone_config": zone_jwt,
             "user_domain": "test.buckyos.ai",
         })).await.unwrap();
-        println!("result: {:?}", result);
+        assert_eq!(result.as_object().unwrap().get("code").unwrap().as_i64().unwrap(), 0);
+
+        let result = krpc.call("check_username", json!({
+            "username": "test"
+        })).await.unwrap();
+        assert!(!result.as_object().unwrap().get("valid").unwrap().as_bool().unwrap());
+
+        let result = krpc.call("register", json!({
+            "user_name": "test",
+            "device_name": "ood1",
+            "device_did": device_config.id.clone(),
+            "mini_config_jwt": mini_config_jwt.clone(),
+            "device_ip": "127.0.0.1",
+            "device_info": serde_json::to_string(&device_info).unwrap(),
+        })).await;
+        assert!(result.is_err());
+
+        let krpc = kRPC::new("http://127.0.0.1:19091", Some(user_token.clone()));
+        let result = krpc.call("register", json!({
+            "user_name": "test",
+            "device_name": "ood1",
+            "device_did": device_config.id.clone(),
+            "mini_config_jwt": mini_config_jwt.clone(),
+            "device_ip": "127.0.0.1",
+            "device_info": serde_json::to_string(&device_info).unwrap(),
+        })).await;
+        assert!(result.is_ok());
+
+        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
+        let result = krpc.call("get", json!({
+            "device_id": device_config.name,
+            "owner_id": "test"
+        })).await;
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let ret = serde_json::from_value::<DeviceInfo>(result);
+        assert!(ret.is_ok());
+
+        let result = krpc.call("get_by_pk", json!({
+            "public_key": user_public_key.to_string()
+        })).await;
+        assert!(result.is_ok());
+
+        let result = krpc.call("add_dns_record", json!({
+            "device_did": device_config2.id.to_string(),
+            "domain": "test.buckyos.ai",
+            "record_type": "A",
+            "record": "127.0.0.1",
+        })).await;
+        assert!(result.is_err());
+
+        let result = krpc.call("add_dns_record", json!({
+            "device_did": device_config.id.to_string(),
+            "domain": "test.test.web3.buckyos.ai",
+            "record_type": "A",
+            "record": "127.0.0.1",
+            "ttl": 600
+        })).await;
+        assert!(result.is_ok());
+
+        let result = krpc.call("add_dns_record", json!({
+            "device_did": device_config.id.to_string(),
+            "domain": "test.buckyos.ai",
+            "record_type": "A",
+            "record": "127.0.0.1",
+            "ttl": 600
+        })).await;
+        assert!(result.is_err());
+
+        let result = krpc.call("add_dns_record", json!({
+            "device_did": device_config.id.to_string(),
+            "domain": "_acme-challenge.test.web3.buckyos.ai",
+            "record_type": "TXT",
+            "record": "ERWSSDFERWERSD",
+            "ttl": 600
+        })).await;
+        assert!(result.is_ok());
+
+        let result = dns_server.query("_acme-challenge.test.web3.buckyos.ai", Some(RecordType::TXT), None).await;
+        assert!(result.is_ok());
+        let name_info = result.unwrap();
+        assert_eq!(name_info.txt.len(), 1);
+        assert_eq!(name_info.txt[0], "ERWSSDFERWERSD");
+
+        let result = dns_server.query("test.test.web3.buckyos.ai", Some(RecordType::A), None).await;
+        assert!(result.is_ok());
+        let name_info = result.unwrap();
+        assert_eq!(name_info.address.len(), 1);
+        assert_eq!(name_info.address[0].to_string(), "127.0.0.1");
+
+        let result = krpc.call("remove_dns_record", json!({
+            "device_did": device_config.id.to_string(),
+            "domain": "_acme-challenge.test.web3.buckyos.ai",
+            "record_type": "TXT",
+        })).await;
+        assert!(result.is_ok());
+
+        let result = dns_server.query("_acme-challenge.test.web3.buckyos.ai", Some(RecordType::TXT), None).await;
+        assert!(result.is_ok());
+        let name_info = result.unwrap();
+        assert_eq!(name_info.txt.len(), 3);
+
+        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token2.clone()));
+        let device_info2 = DeviceInfo::from_device_doc(&device_config2);
+        let result = krpc.call("update", json!({
+            "device_info": device_info2,
+            "owner_id": "test"
+        })).await;
+        assert!(result.is_err());
+
+        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
+        let mut device_info = DeviceInfo::from_device_doc(&device_config);
+        device_info.cpu_info = Some("AMD".to_string());
+        let result = krpc.call("update", json!({
+            "device_info": device_info,
+            "owner_id": "test"
+        })).await;
+        assert!(result.is_ok());
+
+        let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
+        let result = krpc.call("get", json!({
+            "device_id": device_config.name,
+            "owner_id": "test"
+        })).await;
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let ret = serde_json::from_value::<DeviceInfo>(result);
+        assert!(ret.is_ok());
+        let device_info = ret.unwrap();
+        assert_eq!(device_info.cpu_info.unwrap(), "AMD");
+
+        let result = krpc.call("query_by_did", json!({
+            "source_device_id": device_config.id.to_string(),
+        })).await;
+        assert!(result.is_ok());
+
+        let result = krpc.call("query_by_hostname", json!({
+            "dest_host": "test.test.web3.buckyos.ai"
+        })).await;
+        assert!(result.is_ok());
     }
 }

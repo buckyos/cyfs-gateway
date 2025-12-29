@@ -431,7 +431,10 @@ impl SnDB for SqliteSnDB {
                     updated_at: row.get::<i64, _>(7) as u64,
                 }))
             }
-            Err(_) => Ok(None)
+            Err(e) => {
+                log::error!("query device by name failed: {}", e);
+                Ok(None)
+            }
         }
     }
 
