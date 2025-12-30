@@ -1116,6 +1116,22 @@ impl SNServer {
         }
         let record_type = record_type.unwrap();
 
+        let has_cert = req.params.get("has_cert");
+        if let Some(has_cert) = has_cert {
+            let has_cert = has_cert.as_bool();
+            if has_cert.is_some() && has_cert.unwrap() {
+                let ret = self.db.update_user_self_cert(user_name, true).await;
+                if ret.is_err() {
+                    let err_str = ret.err().unwrap().to_string();
+                    warn!("Failed to update user self cert: {}", err_str);
+                    return Err(RPCErrors::ParseRequestError(format!(
+                        "Failed to update user self cert: {}",
+                        err_str
+                    )));
+                }
+            }
+        }
+
         let end_string = format!(".{}.web3.{}", user_name, self.server_host);
         if !domain.ends_with(end_string.as_str()) {
             return Err(RPCErrors::ParseRequestError(
@@ -2169,10 +2185,19 @@ mod tests {
         assert_eq!(name_info.address.len(), 1);
         assert_eq!(name_info.address[0].to_string(), "127.0.0.1");
 
+        let result = krpc.call("query_by_hostname", json!({
+            "dest_host": "test.test.web3.buckyos.ai"
+        })).await;
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert!(!ood_info.self_cert);
+        
         let result = krpc.call("remove_dns_record", json!({
             "device_did": device_config.id.to_string(),
             "domain": "_acme-challenge.test.web3.buckyos.ai",
             "record_type": "TXT",
+            "has_cert": true
         })).await;
         assert!(result.is_ok());
 
@@ -2219,5 +2244,8 @@ mod tests {
             "dest_host": "test.test.web3.buckyos.ai"
         })).await;
         assert!(result.is_ok());
+        let result = result.unwrap();
+        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert!(ood_info.self_cert);
     }
 }

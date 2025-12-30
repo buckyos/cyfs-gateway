@@ -203,6 +203,7 @@ impl Gateway {
         let sn_list = params.keep_tunnel.clone();
         if sn_list.len() > 0 {
             let sn = sn_list[0].clone();
+            let weak_acme_mgr = Arc::downgrade(&self.acme_mgr);
             self.acme_mgr.register_dns_provider("sn-dns", move |op: String, domain: String, key_hash: String| {
                 let sn = sn.clone();
                 let mut rtcp_config = None;
@@ -212,6 +213,7 @@ impl Gateway {
                         rtcp_config = Some(config.clone());
                     }
                 }
+                let weak_acme_mgr = weak_acme_mgr.clone();
                 async move {
                     let mut token = None;
                     let mut did = None;
@@ -243,10 +245,19 @@ impl Gateway {
                             "ttl": 600
                         })).await.map_err(|_| anyhow!(format!("add_dns_record failed")))?;
                     } else if op == "del_challenge" {
+                        let mut has_cert = false;
+                        if let Some(acme_mgr) = weak_acme_mgr.upgrade() {
+                            if let Some(cert) = acme_mgr.get_cert_by_host(domain.as_str()) {
+                                if let Some(_) = cert.get_cert() {
+                                    has_cert = true;
+                                }
+                            }
+                        }
                         krpc.call("remove_dns_record", json!({
                             "device_did": did.unwrap().to_string(),
                             "domain": domain,
-                            "record_type": "TXT"
+                            "record_type": "TXT",
+                            "has_cert": has_cert,
                         })).await.map_err(|_| anyhow!(format!("add_dns_record failed")))?;
                     }
                     Ok(())
