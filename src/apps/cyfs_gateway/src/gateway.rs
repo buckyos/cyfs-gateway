@@ -10,14 +10,14 @@ use name_client::*;
 use name_lib::*;
 use buckyos_kit::*;
 use url::Url;
-use anyhow::{Result};
+use anyhow::{anyhow, Result};
 use chrono::{Utc};
 use json_value_merge::Merge;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use jsonwebtoken::jwk::Jwk;
 use kRPC::RPCSessionToken;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sfo_js::{JsEngine, JsString, JsValue};
 use sfo_js::object::builtins::JsArray;
 use sha2::Digest;
@@ -63,6 +63,7 @@ pub struct GatewayParams {
 }
 
 pub struct GatewayFactory {
+    stacks: StackManagerRef,
     global_process_chains: GlobalProcessChainsRef,
     server_factory: CyfsServerFactoryRef,
     servers: ServerManagerRef,
@@ -83,6 +84,7 @@ pub struct GatewayFactory {
 
 impl GatewayFactory {
     pub fn new(
+        stacks: StackManagerRef,
         servers: ServerManagerRef,
         global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
@@ -93,6 +95,7 @@ impl GatewayFactory {
         self_cert_mgr: SelfCertMgrRef,
         global_collection_manager: GlobalCollectionManagerRef, ) -> Self {
         Self {
+            stacks,
             servers,
             global_process_chains,
             connection_manager,
@@ -125,7 +128,7 @@ impl GatewayFactory {
             self.global_process_chains.add_process_chain(Arc::new(process_chain))?;
         }
 
-        let stack_manager = StackManager::new();
+        let stack_manager = self.stacks.clone();
         for stack_config in config.stacks.iter() {
             let stack = self.stack_factory.create(stack_config.clone()).await?;
             stack_manager.add_stack(stack)?;
@@ -139,7 +142,7 @@ impl GatewayFactory {
         }
 
         Ok(Gateway {
-            config: Mutex::new(config),
+            config: Arc::new(Mutex::new(config)),
             stack_manager,
             tunnel_manager: self.tunnel_manager.clone(),
             server_manager: self.servers.clone(),
@@ -157,7 +160,7 @@ impl GatewayFactory {
 }
 
 pub struct Gateway {
-    config: Mutex<GatewayConfig>,
+    config: Arc<Mutex<GatewayConfig>>,
     stack_manager: StackManagerRef,
     tunnel_manager: TunnelManager,
     server_manager: ServerManagerRef,
@@ -196,12 +199,67 @@ impl Gateway {
         }
         info!("init default name client OK!");
 
-        if !params.keep_tunnel.is_empty() {
-            self.keep_tunnels(params.keep_tunnel).await;
+        let config = self.config.clone();
+        let sn_list = params.keep_tunnel.clone();
+        if sn_list.len() > 0 {
+            let sn = sn_list[0].clone();
+            self.acme_mgr.register_dns_provider("sn-dns", move |op: String, domain: String, key_hash: String| {
+                let sn = sn.clone();
+                let mut rtcp_config = None;
+                let config = config.lock().unwrap();
+                for config in config.stacks.iter() {
+                    if config.stack_protocol() == StackProtocol::Rtcp {
+                        rtcp_config = Some(config.clone());
+                    }
+                }
+                async move {
+                    let mut token = None;
+                    let mut did = None;
+                    if let Some(config) = rtcp_config {
+                        let config = config.as_ref().as_any().downcast_ref::<RtcpStackConfig>()
+                            .ok_or(anyhow!("invalid rtcp stack config"))?;
+                        let private_key = load_raw_private_key(Path::new(config.key_path.as_str()))
+                            .map_err(|_| anyhow!(format!("load private key {} failed", config.key_path)))?;
+                        let public_key = encode_ed25519_pkcs8_sk_to_pk(&private_key);
+
+                        let encoding_key = jsonwebtoken::EncodingKey::from_ed_der(private_key.as_slice());
+                        let (token_str, _) = RPCSessionToken::generate_jwt_token("cyfs_gateway", "cyfs_gateway", None, &encoding_key)
+                            .map_err(|_| anyhow!(format!("generate jwt token failed")))?;
+                        let device_config = DeviceConfig::new("cyfs_gateway", public_key);
+                        token = Some(token_str);
+                        did = Some(device_config.id);
+                    }
+
+                    if token.is_none() {
+                        return Err(anyhow!("no rtcp stack found"));
+                    }
+                    let krpc = kRPC::kRPC::new(format!("http://{}", sn).as_str(), token);
+                    if op == "add_challenge" {
+                        krpc.call("add_dns_record", json!({
+                            "device_did": did.unwrap().to_string(),
+                            "domain": domain,
+                            "record_type": "TXT",
+                            "record": key_hash,
+                            "ttl": 600
+                        })).await.map_err(|_| anyhow!(format!("add_dns_record failed")))?;
+                    } else if op == "del_challenge" {
+                        krpc.call("remove_dns_record", json!({
+                            "device_did": did.unwrap().to_string(),
+                            "domain": domain,
+                            "record_type": "TXT"
+                        })).await.map_err(|_| anyhow!(format!("add_dns_record failed")))?;
+                    }
+                    Ok(())
+                }
+            });
         }
 
         if let Err(e) = self.stack_manager.start().await {
             error!("start stack manager failed, err:{}", e);
+        }
+
+        if !params.keep_tunnel.is_empty() {
+            self.keep_tunnels(params.keep_tunnel).await;
         }
     }
     async fn keep_tunnels(&self, keep_tunnel: Vec<String>) {

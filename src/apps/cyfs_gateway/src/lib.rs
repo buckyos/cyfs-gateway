@@ -98,6 +98,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     
     let connect_manager = ConnectionManager::new();
     let tunnel_manager = TunnelManager::new();
+    let stack_manager = StackManager::new();
     let server_manager = Arc::new(ServerManager::new());
     let global_process_chains = Arc::new(GlobalProcessChains::new());
     let limiter_manager = LimiterManager::new();
@@ -175,6 +176,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     let global_collections = GlobalCollectionManager::create(gateway_config.collections.clone()).await?;
 
     let factory = GatewayFactory::new(
+        stack_manager.clone(),
         server_manager.clone(),
         global_process_chains.clone(),
         connect_manager.clone(),

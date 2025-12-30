@@ -426,6 +426,7 @@ pub struct AcmeCertManager {
 }
 
 pub struct AcmeCertManagerHolder {
+    provider_cache: Mutex<HashMap<String, DnsProviderRef>>,
     inner: RwLock<Arc<AcmeCertManager>>,
 }
 
@@ -438,12 +439,18 @@ impl Debug for AcmeCertManagerHolder {
 impl AcmeCertManagerHolder {
     fn new(cert_manager: AcmeCertManager) -> Self {
         Self {
+            provider_cache: Mutex::new(HashMap::new()),
             inner: RwLock::new(Arc::new(cert_manager))
         }
     }
 
     pub async fn update(&self, config: CertManagerConfig) -> Result<()> {
         let new_manager = AcmeCertManager::create(config).await?;
+        {
+            for (name, provider) in self.provider_cache.lock().unwrap().iter() {
+                new_manager.get_manager().register_dns_provider(name.clone(), provider.clone());
+            }
+        }
         *self.inner.write().unwrap() = new_manager.get_manager();
         Ok(())
     }
@@ -465,6 +472,11 @@ impl AcmeCertManagerHolder {
     }
 
     pub fn register_dns_provider(&self, name: impl Into<String>, provider: impl DnsProvider) {
+        let name = name.into();
+        let provider = Arc::new(provider);
+        {
+            self.provider_cache.lock().unwrap().insert(name.clone(), provider.clone());
+        }
         self.get_manager().register_dns_provider(name, provider);
     }
 }
@@ -638,8 +650,8 @@ impl AcmeCertManager {
         Ok(manager)
     }
 
-    pub fn register_dns_provider(&self, name: impl Into<String>, provider: impl DnsProvider) {
-        self.dns_providers.write().unwrap().insert(name.into(), Arc::new(provider));
+    pub fn register_dns_provider(&self, name: impl Into<String>, provider: DnsProviderRef) {
+        self.dns_providers.write().unwrap().insert(name.into(), provider);
     }
 
     pub fn add_acme_item(&self, item: AcmeItem) -> Result<()> {

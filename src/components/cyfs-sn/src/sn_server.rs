@@ -2002,7 +2002,7 @@ mod tests {
         let device_info = DeviceInfo::from_device_doc(&device_config);
 
         let encoding_key = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes.as_slice());
-        let (token, session) = RPCSessionToken::generate_jwt_token("test", "cyfs_gateway", None, &encoding_key).unwrap();
+        let (token, session) = RPCSessionToken::generate_jwt_token("test23123123123", "cyfs_gateway", None, &encoding_key).unwrap();
 
         let (signing_key2, pkcs8_bytes2) = generate_ed25519_key();
         let jwk2 = encode_ed25519_sk_to_pk_jwk(&signing_key2);
