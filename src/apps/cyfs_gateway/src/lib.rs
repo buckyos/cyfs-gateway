@@ -603,6 +603,11 @@ pub async fn cyfs_gateway_main() {
                 .required(false)
                 .default_value(CONTROL_SERVER))
         )
+        .subcommand(Command::new("start")
+            .allow_external_subcommands(true)
+            .allow_missing_positional(true)
+            .ignore_errors(true)
+            .about("start a new server"))
         .subcommand(Command::new("reload")
             .about("reload config")
             .arg(Arg::new("server")
@@ -778,6 +783,22 @@ pub async fn cyfs_gateway_main() {
                     std::process::exit(1);
                 }
             }
+        }
+        Some(("start", sub_matches)) => {
+            if let Some((subcommand, matches)) = sub_matches.subcommand() {
+                println!("starting server subcommand: {:?}", matches);
+                let ids = matches.ids();
+                for id in ids {
+                    if let Some(raws) = matches.get_raw(id.as_str()) {
+                        for raw in raws {
+                            println!("starting server subcommand: {} name {:?}", subcommand, raw);
+                        }
+                    }
+                }
+            } else {
+                println!("starting server error");
+            }
+            std::process::exit(0);
         }
         _ => {}
     }
