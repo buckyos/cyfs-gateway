@@ -235,7 +235,7 @@ impl Gateway {
                     if token.is_none() {
                         return Err(anyhow!("no rtcp stack found"));
                     }
-                    let krpc = kRPC::kRPC::new(format!("http://{}", sn).as_str(), token);
+                    let krpc = kRPC::kRPC::new(format!("https://{}", sn).as_str(), token);
                     if op == "add_challenge" {
                         krpc.call("add_dns_record", json!({
                             "device_did": did.unwrap().to_string(),
