@@ -120,7 +120,9 @@ print("hello python")
         let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default()).await.unwrap();
         let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
 
+        let stack_manager = StackManager::new();
         let factory = GatewayFactory::new(
+            stack_manager.clone(),
             server_manager.clone(),
             global_process_chains.clone(),
             connect_manager.clone(),

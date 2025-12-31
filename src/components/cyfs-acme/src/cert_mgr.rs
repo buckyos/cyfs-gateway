@@ -271,7 +271,7 @@ impl CertStub {
 
     async fn order_inner(&self) -> Result<(CertifiedKey, chrono::DateTime<chrono::Utc>)> {
         let order = AcmeOrderSession::new(
-            vec![self.inner.acme_item.domain.clone()],
+            self.inner.acme_item.domain.clone(),
             self.inner.acme_client.clone(),
             self.inner.responder.clone()
         );

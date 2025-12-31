@@ -225,7 +225,7 @@ pub type AcmeChallengeResponderRef = Arc<dyn AcmeChallengeResponder>;
 
 /// 证书订单会话
 pub struct AcmeOrderSession {
-    domains: Vec<String>,
+    domain: String,
     valid_days: u32,
     key_type: KeyType,
     status: OrderStatus,
@@ -237,18 +237,18 @@ pub struct AcmeOrderSession {
 
 impl std::fmt::Display for AcmeOrderSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AcmeOrderSession(domains: {})", self.domains.join(","))
+        write!(f, "AcmeOrderSession(domains: {})", self.domain)
     }
 }
 
 impl AcmeOrderSession {
     pub fn new(
-        domains: Vec<String>,
+        domain: String,
         client: AcmeClient,
         responder: AcmeChallengeResponderRef,
     ) -> Self {
         Self {
-            domains,
+            domain,
             valid_days: 90,
             key_type: KeyType::Rsa2048,
             status: OrderStatus::New,
@@ -263,7 +263,7 @@ impl AcmeOrderSession {
     pub async fn start(mut self) -> Result<(Vec<u8>, Vec<u8>)> {
         let directory = self.client.get_directory().await?;
         // 1. 创建订单
-        let (authorizations, finalize_url) = self.client.create_order(&self.domains, directory.clone()).await?;
+        let (authorizations, finalize_url) = self.client.create_order(&[self.domain.clone()], directory.clone()).await?;
 
         // 更新订单信息和状态
         self.order_info = Some(OrderInfo {
@@ -276,10 +276,13 @@ impl AcmeOrderSession {
         if let Some(order_info) = &self.order_info {
             for auth_url in &order_info.authorizations {
                 // 获取挑战信息
-                let challenge = self.client.get_challenge(auth_url).await?;
-                info!("got acme challenge, client: {}, challenge: {:?}", self, challenge);
+                let mut challenges = self.client.get_challenge(auth_url).await?;
+                for challenge in challenges.iter_mut() {
+                    challenge.domain = self.domain.clone();
+                }
+                info!("got acme challenge, client: {}, challenge: {:?}", self, challenges);
                 // 准备挑战响应
-                let resp_challenge = self.responder.respond_challenge(&challenge).await?;
+                let resp_challenge = self.responder.respond_challenge(&challenges).await?;
 
                 // 通知服务器验证挑战
                 self.client.verify_challenge(&resp_challenge.url, directory.clone()).await?;
@@ -294,7 +297,7 @@ impl AcmeOrderSession {
         // 3. 完成订单
         if let Some(order_info) = &self.order_info {
             // 生成CSR
-            let (csr, private_key) = self.client.generate_csr(&self.domains)?;
+            let (csr, private_key) = self.client.generate_csr(&[self.domain.clone()])?;
 
             // Finalize订单
             let cert_url = self.client.finalize_order(&order_info.finalize_url, directory.clone(), &csr).await?;
