@@ -5,11 +5,13 @@ mod gateway;
 mod gateway_control_client;
 mod gateway_control_server;
 mod config_loader;
+mod acme_sn_provider;
 
 pub use gateway::*;
 pub use gateway_control_client::*;
 pub use gateway_control_server::*;
 pub use config_loader::*;
+use acme_sn_provider::*;
 
 
 use std::collections::HashSet;
@@ -122,6 +124,8 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         }
     }
 
+    let sn_provider_factory = AcmeSnProviderFactory::new();
+    AcmeCertManager::register_dns_provider_factory("sn-dns", sn_provider_factory.clone());
     let mut cert_config = CertManagerConfig::default();
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
     let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
@@ -147,6 +151,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
 
     let cert_manager = AcmeCertManager::create(cert_config).await?;
+    sn_provider_factory.set_acme_mgr(cert_manager.clone());
     let inner_dns_record_manager = InnerDnsRecordManager::new();
     let record_manager = inner_dns_record_manager.clone();
     cert_manager.register_dns_provider("local", move |op: String, domain: String, key_hash: String| {

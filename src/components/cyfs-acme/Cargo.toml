@@ -21,5 +21,6 @@ buckyos-kit.workspace = true
 rand.workspace = true
 chrono.workspace = true
 rustls-pemfile.workspace = true
+lazy_static.workspace = true
 sfo-js = "*"
 callback-trait = "0.1"
