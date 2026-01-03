@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use buckyos_kit::AsyncStream;
-use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig, CURRENT_DEVICE_CONFIG};
+use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig};
 use sfo_io::{LimitStream, StatStream};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
 use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands, DatagramInfo, LimiterManagerRef, StatManagerRef, MutComposedSpeedStat, MutComposedSpeedStatRef, get_stat_info, GlobalCollectionManagerRef};
@@ -423,8 +423,6 @@ impl RtcpStack {
         let device_config = builder.device_config.take().unwrap();
         let private_key = builder.private_key.take();
         let inner = Arc::new(RtcpStackInner::create(builder).await?);
-
-        let _ = CURRENT_DEVICE_CONFIG.set(device_config.clone());
 
         let rtcp = RTcp::new(device_config.id.clone(), bind_addr.clone(), private_key, Arc::new(Listener::new(inner.clone())));
         Ok(Self {

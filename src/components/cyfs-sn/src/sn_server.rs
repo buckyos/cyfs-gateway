@@ -54,17 +54,6 @@ pub struct SNServer {
 
 impl SNServer {
     pub async fn new(server_config: SNServerConfig, db: SnDBRef) -> Self {
-        let mut device_list: Option<Vec<String>> = None;
-        let current_device_config = CURRENT_DEVICE_CONFIG.get();
-        if current_device_config.is_some() {
-            info!(
-                "current device config (GATEWAY) is set: {:?}",
-                current_device_config.unwrap()
-            );
-            let current_device_config = current_device_config.unwrap();
-            device_list = Some(vec![current_device_config.get_id().to_string()]);
-        }
-
         let server_host = server_config.host;
         let server_ip = IpAddr::from_str(server_config.ip.as_str()).unwrap();
 
