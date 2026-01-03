@@ -34,5 +34,4 @@ sfo-result = "0.2"
 #buckyos-api = { path = "../../kernel/buckyos-api" }
 
 [dev-dependencies]
-jsonwebtoken.workspace = true
 tempfile = "3"

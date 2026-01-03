@@ -409,6 +409,16 @@ impl DnsProvider for ExternalDnsProvider {
     }
 }
 
+#[async_trait::async_trait]
+pub trait DnsProviderFactory: Send + Sync + 'static {
+    async fn create(&self, params: serde_json::Value) -> Result<DnsProviderRef>;
+}
+pub type DnsProviderFactoryRef = Arc<dyn DnsProviderFactory>;
+
+lazy_static::lazy_static! {
+    static ref DNS_PROVIDER_FACTORYS: RwLock<HashMap<String, DnsProviderFactoryRef>> = RwLock::new(HashMap::new());
+}
+
 #[derive(Serialize, Deserialize)]
 struct DnsProviderInfo {
     pub dns_provider: String,
@@ -479,6 +489,8 @@ impl AcmeCertManagerHolder {
         }
         self.get_manager().register_dns_provider(name, provider);
     }
+
+    pub fn register_dns_provider_factory(&self, name: impl Into<String>, factory: impl DnsProviderFactory) {}
 }
 
 impl ResolvesServerCert for AcmeCertManagerHolder {
@@ -541,6 +553,13 @@ impl Drop for AcmeCertManager {
 }
 
 impl AcmeCertManager {
+    pub fn register_dns_provider_factory(
+        name: impl Into<String>,
+        factory: DnsProviderFactoryRef,
+    ) {
+        DNS_PROVIDER_FACTORYS.write().unwrap().insert(name.into(), factory);
+    }
+
     pub async fn create(config: CertManagerConfig) -> Result<AcmeCertManagerRef> {
         info!("create cert manager, config: {:?}", config);
 
@@ -598,15 +617,23 @@ impl AcmeCertManager {
         let acme_client = AcmeClient::new(account, config.acme_server.clone()).await?;
 
         let mut dns_providers = HashMap::<String, DnsProviderRef>::new();
-        if config.dns_provider_path.is_some() {
-            let dns_provider_path = Path::new(config.dns_provider_path.as_ref().unwrap()).to_path_buf();
-            if let Some(dns_providers_config) = &config.dns_providers {
-                for (name, provider_config) in dns_providers_config.iter() {
-                    let provider = ExternalDnsProvider::new(
-                        dns_provider_path.clone(),
-                        name.as_str(),
-                        provider_config.clone());
+        if let Some(dns_providers_config) = &config.dns_providers {
+            for (name, provider_config) in dns_providers_config.iter() {
+                let factory = {
+                    DNS_PROVIDER_FACTORYS.read().unwrap().get(name).cloned()
+                };
+                if let Some(factory) = factory {
+                    let provider = factory.create(provider_config.clone()).await?;
                     dns_providers.insert(name.clone(), provider);
+                } else {
+                    if config.dns_provider_path.is_some() {
+                        let dns_provider_path = Path::new(config.dns_provider_path.as_ref().unwrap()).to_path_buf();
+                        let provider = ExternalDnsProvider::new(
+                            dns_provider_path.clone(),
+                            name.as_str(),
+                            provider_config.clone());
+                        dns_providers.insert(name.clone(), provider);
+                    }
                 }
             }
         }
