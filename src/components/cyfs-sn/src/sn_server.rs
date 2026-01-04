@@ -1692,79 +1692,45 @@ impl SNServer {
         }
         let resolve_type = Self::normalize_resolve_type(resolve_type);
 
-        // Rules:
-        // - did:web:$user_domain -> resolve user by domain -> treat as did:bns:$username
-        // - did:bns:$device_name.$user_domain -> resolve user by domain -> treat as did:bns:$device_name.$username
-        // - did:bns:$username
-        //   - type=zone (or none): return zone config derived from boot
-        //   - type=boot: return boot jwt
-        //   - type=$device_name: return device_config for that device
-        // - did:bns:$device_name.$username
-        //   - type=doc (or none): return device_config
-        //   - type=info: return device info (merge ip)
-        // - did:dev:$public_key
-        //   - type=doc (or none): return device_config
-        //   - type=info: return device info (merge ip)
+        // Treat HTTP `type` as NameServer::query_did doc_type.
+        let doc_type = resolve_type.as_deref();
 
-        match did.method.as_str() {
-            "web" => {
-                let domain = did.id.as_str();
-                let user_info = self.resolve_user_by_domain(domain).await?;
-                let username = user_info.username.clone().ok_or(server_err!(
-                    ServerErrorCode::NotFound,
-                    "user has no username bound for domain {}",
-                    domain
-                ))?;
-                return self
-                    .handle_bns_username_resolve(username.as_str(), resolve_type.as_deref())
-                    .await;
+        // best-effort parse client ip from StreamInfo
+        let from_ip = info
+            .src_addr
+            .as_ref()
+            .and_then(|addr| addr.parse::<SocketAddr>().ok())
+            .map(|s| s.ip());
+
+        match self.query_did(&did, doc_type, from_ip).await {
+            Ok(doc) => {
+                let body = doc.to_string();
+                let content_type = match doc {
+                    EncodedDocument::JsonLd(_) => "application/json",
+                    EncodedDocument::Jwt(_) => "application/jwt",
+                };
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Content-Type", content_type)
+                    .body(BoxBody::new(
+                        Full::new(Bytes::from(body))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    ))
+                    .unwrap())
             }
-            "bns" => {
-                let id = did.id.as_str();
-
-                // did:bns:username OR did:bns:device.username OR did:bns:device.user_domain
-                if let Some((device_name, tail)) = id.split_once('.') {
-                    let username = if tail.contains('.') {
-                        let user_info = self.resolve_user_by_domain(tail).await?;
-                        user_info.username.clone().ok_or(server_err!(
-                            ServerErrorCode::NotFound,
-                            "user has no username bound for domain {}",
-                            tail
-                        ))?
-                    } else {
-                        tail.to_string()
-                    };
-
-                    return self
-                        .handle_bns_device_resolve(
-                            username.as_str(),
-                            device_name,
-                            resolve_type.as_deref(),
-                        )
-                        .await;
-                }
-
-                return self
-                    .handle_bns_username_resolve(id, resolve_type.as_deref())
-                    .await;
+            Err(e) => {
+                let (status, msg) = match e.code() {
+                    ServerErrorCode::NotFound => (StatusCode::NOT_FOUND, e.to_string()),
+                    ServerErrorCode::BadRequest | ServerErrorCode::InvalidParam => {
+                        (StatusCode::BAD_REQUEST, e.to_string())
+                    }
+                    _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                };
+                Self::builder_error_http_response(status, msg)
             }
-            "dev" => {
-                let did_str = format!("did:{}:{}", did.method.as_str(), did.id.as_str());
-                return self
-                    .handle_dev_resolve(did_str.as_str(), resolve_type.as_deref())
-                    .await;
-            }
-            _ => {}
         }
-
-        Self::builder_error_http_response(
-            StatusCode::NOT_FOUND,
-            format!(
-                "sn-server does not support did resolve for {} with type {:?}",
-                format!("{:?}", did),
-                resolve_type
-            ),
-        )
     }
 }
 
@@ -2030,25 +1996,62 @@ impl NameServer for SNServer {
 
         match did.method.as_str() {
             // did:web:$user_domain -> resolve user by domain -> treat as did:bns:$username
+            // did:web:$device_name.$user_domain -> resolve user by domain -> treat as did:bns:$device_name.$username
             "web" => {
-                let domain = did.id.as_str();
-                let user_info = self.resolve_user_by_domain(domain).await?;
-                let username = user_info.username.clone().ok_or(server_err!(
-                    ServerErrorCode::NotFound,
-                    "user has no username bound for domain {}",
-                    domain
-                ))?;
+                let id = did.id.as_str();
 
-                let bns_did_str = format!("did:bns:{}", username);
-                let bns_did = DID::from_str(bns_did_str.as_str()).map_err(|e| {
-                    server_err!(ServerErrorCode::InvalidParam, "invalid mapped bns did: {}", e)
-                })?;
-                return self.query_did(&bns_did, doc_type, from_ip).await;
+                // First, try treating the whole id as user_domain (did:web:$user_domain).
+                match self.resolve_user_by_domain(id).await {
+                    Ok(user_info) => {
+                        let username = user_info.username.clone().ok_or(server_err!(
+                            ServerErrorCode::NotFound,
+                            "user has no username bound for domain {}",
+                            id
+                        ))?;
+
+                        let bns_did_str = format!("did:bns:{}", username);
+                        let bns_did = DID::from_str(bns_did_str.as_str()).map_err(|e| {
+                            server_err!(
+                                ServerErrorCode::InvalidParam,
+                                "invalid mapped bns did: {}",
+                                e
+                            )
+                        })?;
+                        return self.query_did(&bns_did, doc_type, from_ip).await;
+                    }
+                    Err(e) if e.code() == ServerErrorCode::NotFound => {
+                        // Then, try did:web:$device_name.$user_domain
+                        if let Some((device_name, domain)) = id.split_once('.') {
+                            let user_info = self.resolve_user_by_domain(domain).await?;
+                            let username = user_info.username.clone().ok_or(server_err!(
+                                ServerErrorCode::NotFound,
+                                "user has no username bound for domain {}",
+                                domain
+                            ))?;
+
+                            let bns_did_str = format!("did:bns:{}.{}", device_name, username);
+                            let bns_did = DID::from_str(bns_did_str.as_str()).map_err(|e| {
+                                server_err!(
+                                    ServerErrorCode::InvalidParam,
+                                    "invalid mapped bns did: {}",
+                                    e
+                                )
+                            })?;
+                            return self.query_did(&bns_did, doc_type, from_ip).await;
+                        }
+
+                        Err(server_err!(
+                            ServerErrorCode::NotFound,
+                            "user not found for domain {}",
+                            id
+                        ))
+                    }
+                    Err(e) => Err(e),
+                }?
             }
 
             // did:bns:username
             // did:bns:device_name.username
-            // did:bns:device_name.user_domain
             "bns" => {
                 let id = did.id.as_str();
 
