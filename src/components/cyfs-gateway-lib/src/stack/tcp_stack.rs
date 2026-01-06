@@ -1,7 +1,7 @@
 use super::{get_limit_info, stream_forward, Stack};
 
 #[cfg(target_os = "linux")]
-use super::{get_socket_opt, has_root_privileges, set_socket_opt, sockaddr_to_socket_addr};
+use super::{has_root_privileges, set_socket_opt};
 
 use super::StackResult;
 use crate::global_process_chains::{
@@ -131,7 +131,6 @@ impl TcpStackInner {
                 socket.set_ip_transparent_v4(true)
                     .map_err(into_stack_err!(StackErrorCode::IoError, "set ip transparent error"))?;
 
-                unsafe {
                     if domain == socket2::Domain::IPV4 {
                         set_socket_opt(&socket,
                                        libc::SOL_IP,
@@ -143,7 +142,6 @@ impl TcpStackInner {
                                        libc::IP_TRANSPARENT,
                                        libc::c_int::from(1))?;
                     }
-                }
             }
         }
         socket.bind(&sockaddr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind {:?} error", sockaddr))?;

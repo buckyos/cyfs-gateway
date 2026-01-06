@@ -46,12 +46,21 @@ impl DnsProviderFactory for AcmeSnProviderFactory {
             let device_config = serde_json::from_str::<DeviceConfig>(content.as_str())
                 .map_err(|e| anyhow!("parse device config {} failed.{}", config.device_config_path.as_ref().unwrap(), e))?;
 
-            let default_key = device_config.get_default_key()
-                .ok_or(anyhow!("device config {} no default key found", config.device_config_path.as_ref().unwrap()))?;
-            let x_of_auth_key = get_x_from_jwk(&default_key)
-                .map_err(|e| anyhow!("device config {} has no auth key", config.device_config_path.as_ref().unwrap()))?;
+            let default_key = device_config.get_default_key().ok_or(anyhow!(
+                "device config {} no default key found",
+                config.device_config_path.as_ref().unwrap()
+            ))?;
+            let x_of_auth_key = get_x_from_jwk(&default_key).map_err(|_e| {
+                anyhow!(
+                    "device config {} has no auth key",
+                    config.device_config_path.as_ref().unwrap()
+                )
+            })?;
             if x_of_auth_key != public_key {
-                return Err(anyhow!("device config {} auth key not match", config.device_config_path.as_ref().unwrap()));
+                return Err(anyhow!(
+                    "device config {} auth key not match",
+                    config.device_config_path.as_ref().unwrap()
+                ));
             }
             device_config
         } else {
