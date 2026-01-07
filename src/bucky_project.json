@@ -25,6 +25,18 @@
         "clean_paths": [
         ]
       },
+      "cyfs-gateway-product": {
+        "name": "cyfs-gateway-product",
+        "rootfs": "rootfs/",
+        "default_target_rootfs": "${BUCKYOS_ROOT}",
+        "modules": {
+          "cyfs_gateway": "bin/cyfs-gateway/"
+        },
+        "data_paths": [
+        ],
+        "clean_paths": [
+        ]
+      },
       "web3-gateway": {
         "name": "web3-gateway",
         "rootfs": "web3-gateway/",

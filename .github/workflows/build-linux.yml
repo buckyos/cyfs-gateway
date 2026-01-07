@@ -58,16 +58,16 @@ jobs:
       run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
     - name: build buckyos
       working-directory: ./src
-      run: buckyos-build --apps=cyfs-gateway
+      run: buckyos-build --apps=cyfs-gateway-product
     - name: Tar Rootfs
       run:
-        cd ./src/rootfs/bin/cyfs-gateway && tar -cvf ../../../../gateway.tar .
+        cd ./src/rootfs && tar -cvf ../../rootfs.tar .
     - name: Upload
       uses: actions/upload-artifact@v4
       id: upload
       with:
         name: gateway-linux-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}-${{inputs.version}}+build${{ steps.short_time.outputs.last6 }}
-        path: gateway.tar
+        path: rootfs.tar
         if-no-files-found: error
     - name: Report Upload Urls
       run: |
