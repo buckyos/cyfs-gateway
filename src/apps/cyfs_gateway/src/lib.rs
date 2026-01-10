@@ -6,6 +6,7 @@ mod gateway_control_client;
 mod gateway_control_server;
 mod config_loader;
 mod acme_sn_provider;
+mod js_pkg_manager;
 
 pub use gateway::*;
 pub use gateway_control_client::*;
@@ -441,6 +442,7 @@ fn save_login_token(server: &str, token: &str) {
 pub async fn cyfs_gateway_main() {
     let matches = Command::new("CYFS Gateway Service")
         .version(buckyos_kit::get_version())
+        .disable_help_flag(true)
         .arg(
             Arg::new("config")
                 .long("config")
