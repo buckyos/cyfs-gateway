@@ -1154,6 +1154,96 @@ impl SNServer {
         Ok(resp)
     }
 
+    async fn set_user_self_cert(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
+        // set_user_self_cert(name:String,self_cert:boolean)
+        // `name` is username, but signature must be from any registered device of that user.
+        let session_token = req.token.clone().ok_or_else(|| {
+            RPCErrors::ParseRequestError("Invalid params, session_token is none".to_string())
+        })?;
+
+        let username = req
+            .params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                RPCErrors::ParseRequestError("Invalid params, name is none".to_string())
+            })?;
+
+        // self_cert is a bool flag; treat missing/null as false (delete).
+        let self_cert = req
+            .params
+            .get("self_cert")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Parse token once, use token.userid as device_name (e.g. "ood1") to locate the device.
+        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
+        let device_name = rpc_session_token.userid.clone().ok_or_else(|| {
+            RPCErrors::ParseRequestError("Invalid token: userid is none".to_string())
+        })?;
+        if device_name.trim().is_empty() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid token: userid is empty".to_string(),
+            ));
+        }
+
+        // Make sure user exists
+        let user = self.db.get_user_info(username).await.map_err(|e| {
+            RPCErrors::ReasonError(format!("failed to query user {}: {}", username, e))
+        })?;
+        if user.is_none() {
+            return Err(RPCErrors::ParseRequestError("user not found".to_string()));
+        }
+
+        // Resolve device by (username, device_name), then verify token signature with that device's key.
+        let device = self
+            .db
+            .query_device_by_name(username, device_name.as_str())
+            .await
+            .map_err(|e| RPCErrors::ReasonError(format!("query device failed: {}", e)))?;
+        let device = device.ok_or_else(|| RPCErrors::ParseRequestError("device not found".to_string()))?;
+
+        if device.owner != username {
+            return Err(RPCErrors::ParseRequestError(
+                "device has no permission".to_string(),
+            ));
+        }
+
+        let device_did = DID::from_str(device.did.as_str()).map_err(|_| {
+            RPCErrors::ParseRequestError("Invalid params, device_id is invalid".to_string())
+        })?;
+        let verify_public_key =
+            DecodingKey::from_ed_components(device_did.id.as_str()).map_err(|e| {
+                error!("Failed to decode device public key: {:?}", e);
+                RPCErrors::ParseRequestError(e.to_string())
+            })?;
+        rpc_session_token.verify_by_key(&verify_public_key)?;
+
+        let ret = self.db.update_user_self_cert(username, self_cert).await;
+        if ret.is_err() {
+            let err_str = ret.err().unwrap().to_string();
+            warn!(
+                "Failed to update user self cert for user {}: {}",
+                username, err_str
+            );
+            return Err(RPCErrors::ParseRequestError(format!(
+                "Failed to update user self cert: {}",
+                err_str
+            )));
+        }
+
+        info!(
+            "set_user_self_cert success: user={}, device={}, self_cert={}",
+            username,
+            device.did.clone(),
+            self_cert
+        );
+        Ok(RPCResponse::new(
+            RPCResult::Success(json!({ "code": 0 })),
+            req.id,
+        ))
+    }
+
     async fn handle_rpc_call(
         &self,
         req: RPCRequest,
@@ -1176,6 +1266,18 @@ impl SNServer {
             "bind_zone_config" => {
                 //bind zone config to user
                 return self.bind_zone_to_user(req).await;
+            }
+            "set_user_self_cert" => {
+                //update user self cert
+                // set_user_self_cert(name:String,self_cert:boolean) ,如果cert为空，则删除对应的cert
+                // 只需要有设备的签名就可以更新用户的self cert
+                return self.set_user_self_cert(req).await;
+            }
+            "set_user_did_document" => {
+                //update user did document : did:bns.$name.$user_name + doc_type,后续可以在query_did_document中查询到
+                // set_user_did_document(name:String,document:String,doc_type:String) ,如果document为空，则删除对应的document
+                // 需要有用户的签名才可以更新用户的did document
+                unimplemented!();
             }
             "register" => {
                 //register device
@@ -2597,7 +2699,10 @@ mod tests {
         let device_info = DeviceInfo::from_device_doc(&device_config);
 
         let encoding_key = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes.as_slice());
-        let (token, session) = RPCSessionToken::generate_jwt_token("test23123123123", "cyfs_gateway", None, &encoding_key).unwrap();
+        // device signed token: userid is device_name (e.g. "ood1")
+        let (token, session) =
+            RPCSessionToken::generate_jwt_token("ood1", "cyfs_gateway", None, &encoding_key)
+                .unwrap();
 
         // token and user_token are used by different flows below:
         // - token: used for cyfs_gateway (should NOT be allowed to register device)
@@ -2935,5 +3040,36 @@ mod tests {
         let result = result.unwrap();
         let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
         assert!(ood_info.self_cert);
+
+        // --- set_user_self_cert (device-signed) ---
+        let result = krpc
+            .call(
+                "set_user_self_cert",
+                json!({
+                    "name": "test",
+                    "self_cert": false
+                }),
+            )
+            .await;
+        assert!(result.is_ok());
+
+        let result = krpc.call("query_by_hostname", json!({
+            "dest_host": "test.test.web3.buckyos.ai"
+        })).await;
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert!(!ood_info.self_cert);
+
+        let result = krpc
+            .call(
+                "set_user_self_cert",
+                json!({
+                    "name": "test",
+                    "self_cert": true
+                }),
+            )
+            .await;
+        assert!(result.is_ok());
     }
 }
