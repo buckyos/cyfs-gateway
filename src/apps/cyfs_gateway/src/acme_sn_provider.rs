@@ -118,9 +118,18 @@ impl DnsProvider for AcmeSnProvider {
             };
             if let Some(weak_acme_mgr) = weak_acme_mgr {
                 if let Some(acme_mgr) = weak_acme_mgr.upgrade() {
-                    if let Some(cert) = acme_mgr.get_cert_by_host(domain.as_str()) {
+                    let original = domain.replace("_acme-challenge.", "*.");
+                    if let Some(cert) = acme_mgr.get_cert_by_host(original.as_str()) {
                         if let Some(_) = cert.get_cert() {
                             has_cert = true;
+                        }
+                    }
+                    if !has_cert {
+                        let original = domain.replace("_acme-challenge.", "");
+                        if let Some(cert) = acme_mgr.get_cert_by_host(original.as_str()) {
+                            if let Some(_) = cert.get_cert() {
+                                has_cert = true;
+                            }
                         }
                     }
                 }

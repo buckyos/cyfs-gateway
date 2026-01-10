@@ -269,8 +269,8 @@ impl CertStub {
         Ok(())
     }
 
-    async fn order_inner(&self) -> Result<(CertifiedKey, chrono::DateTime<chrono::Utc>)> {
-        let order = AcmeOrderSession::new(
+    async fn order_inner(&self) -> Result<()> {
+        let mut order = AcmeOrderSession::new(
             self.inner.acme_item.domain.clone(),
             self.inner.acme_client.clone(),
             self.inner.responder.clone()
@@ -290,7 +290,15 @@ impl CertStub {
         info!("save cert success, stub: {}, cert_path: {}, key_path: {}, expires: {}",
             self, cert_path, key_path, expires);
 
-        Ok((certified_key, expires))
+        {
+            let mut mut_part = self.inner.mut_part.lock().unwrap();
+            mut_part.state = CertState::Ready(CertInfo {
+                key: Arc::new(certified_key),
+                expires,
+            });
+        }
+
+        Ok(())
     }
 
     async fn start_order(&self) -> Result<()> {
@@ -299,12 +307,7 @@ impl CertStub {
             let result = self.order_inner().await;
 
             match result {
-                Ok((certified_key, expires)) => {
-                    let mut mut_part = self.inner.mut_part.lock().unwrap();
-                    mut_part.state = CertState::Ready(CertInfo {
-                        key: Arc::new(certified_key),
-                        expires,
-                    });
+                Ok(()) => {
                     break Ok(());
                 }
                 Err(e) => {

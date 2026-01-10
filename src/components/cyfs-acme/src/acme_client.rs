@@ -260,7 +260,7 @@ impl AcmeOrderSession {
     }
 
     /// 开始证书申请流程
-    pub async fn start(mut self) -> Result<(Vec<u8>, Vec<u8>)> {
+    pub async fn start(&mut self) -> Result<(Vec<u8>, Vec<u8>)> {
         let directory = self.client.get_directory().await?;
         // 1. 创建订单
         let (authorizations, finalize_url) = self.client.create_order(&[self.domain.clone()], directory.clone()).await?;
