@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use clap::{Arg, Command};
 use hickory_proto::xfer::Protocol;
-use log::error;
+use log::{error, warn};
 use name_client::{DnsProvider, NameInfo, NsProvider, RecordType};
 use name_lib::{EncodedDocument, DID};
 use cyfs_gateway_lib::{server_err, Server, ServerManagerRef, ServerResult};
@@ -152,8 +152,19 @@ impl ExternalCommand for CmdResolve {
                 if let Some(dns_service) = self.server_mgr.get_name_server(server_address) {
                     match dns_service.query(domain, Some(record_type), None).await
                         .map_err(|e| {
-                            let msg = format!("Failed to resolve domain {} record_type {}: {:?}", domain, record_type_str, e);
-                            error!("{}", msg);
+                            let msg = format!(
+                                "Resolve miss via {} for domain {} record_type {}: {:?}",
+                                server_address, domain, record_type_str, e
+                            );
+                            match e.code() {
+                                cyfs_gateway_lib::ServerErrorCode::NotFound
+                                | cyfs_gateway_lib::ServerErrorCode::DnsQueryError => {
+                                    warn!("{}", msg);
+                                }
+                                _ => {
+                                    error!("{}", msg);
+                                }
+                            }
                             msg
                         }) {
                         Ok(name_info) => name_info,
