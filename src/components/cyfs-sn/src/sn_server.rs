@@ -409,7 +409,10 @@ impl SNServer {
 
         //check session_token is valid (verify pub key is device's public key)
 
-        let old_device_info = self.get_device_info(owner_id, device_info.name.as_str()).await;
+        let old_device_info = self
+            .get_device_info(owner_id, device_info.name.as_str())
+            .await
+            .map_err(|e| RPCErrors::ReasonError(format!("device info error: {}", e)))?;
         if old_device_info.is_none() {
             warn!("device {} not found", owner_id);
             return Err(RPCErrors::ParseRequestError("device not found".to_string()));
@@ -515,7 +518,18 @@ impl SNServer {
             username, req.id
         );
 
-        let device_entry = self.get_device_info(username.as_str(), device_name).await;
+        let mut device_info_err: Option<String> = None;
+        let device_entry = match self.get_device_info(username.as_str(), device_name).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!(
+                    "device info parse failed for {}_{}: {}",
+                    username, device_name, e
+                );
+                device_info_err = Some(e.to_string());
+                None
+            }
+        };
         if device_entry.is_some() {
             info!(
                 "device info found for {}_{} when querying by public_key",
@@ -551,11 +565,9 @@ impl SNServer {
                 })?;
                 (Some(device_value), Some(sn_ip.to_string()), Value::Null)
             } else {
-                (
-                    None,
-                    None,
-                    Value::String("device info not found".to_string()),
-                )
+                let reason = device_info_err
+                    .unwrap_or_else(|| "device info not found".to_string());
+                (None, None, Value::String(reason))
             };
         let found = device_info_value.is_some();
 
@@ -600,7 +612,10 @@ impl SNServer {
         }
         let device_id = device_id.unwrap();
         let owner_id = owner_id.unwrap();
-        let device_info = self.get_device_info(owner_id, device_id).await;
+        let device_info = self
+            .get_device_info(owner_id, device_id)
+            .await
+            .map_err(|e| RPCErrors::ReasonError(format!("device info error: {}", e)))?;
         if device_info.is_some() {
             let device_info = device_info.unwrap();
             let device_value = serde_json::to_value(device_info.0).map_err(|e| {
@@ -649,7 +664,7 @@ impl SNServer {
         &self,
         owner_id: &str,
         device_name: &str,
-    ) -> Option<(DeviceInfo, IpAddr)> {
+    ) -> ServerResult<Option<(DeviceInfo, IpAddr)>> {
         let key = format!("{}_{}", owner_id, device_name);
         let device_json = self.db.query_device_by_name(owner_id, device_name).await;
         if device_json.is_err() {
@@ -658,12 +673,12 @@ impl SNServer {
                     key,
                     device_json.err().unwrap()
                 );
-            return None;
+            return Ok(None);
         };
         let device_json = device_json.unwrap();
         if device_json.is_none() {
             warn!("device info not found for {} in db", key);
-            return None;
+            return Ok(None);
         }
         let device_json = device_json.unwrap();
         let sn_ip = &device_json.ip;
@@ -672,15 +687,21 @@ impl SNServer {
         //info!("device info json: {}",device_info_json);
         let device_info = serde_json::from_str::<DeviceInfo>(device_info_json.as_str());
         if device_info.is_err() {
+            let parse_err = device_info.err().unwrap();
             warn!(
-                    "failed to parse device info from db for {}: {:?}",
-                    key,
-                    device_info.err().unwrap()
-                );
-            return None;
+                "failed to parse device info from db for {}: {} (schema/version mismatch, e.g. missing `iss`)",
+                key,
+                parse_err
+            );
+            return Err(server_err!(
+                ServerErrorCode::InvalidData,
+                "device info schema mismatch for {}: {}",
+                key,
+                parse_err
+            ));
         }
         let device_info = device_info.unwrap();
-        Some((device_info.clone(), sn_ip))
+        Ok(Some((device_info.clone(), sn_ip)))
     }
     //return (owner_public_key,zone_config_jwt,device_jwt)
     async fn get_user_zone_config_by_domain(
@@ -806,7 +827,7 @@ impl SNServer {
         &self,
         domain: &str,
         record_type: RecordType,
-    ) -> Option<Vec<IpAddr>> {
+    ) -> ServerResult<Option<Vec<IpAddr>>> {
         let user_info = self.db.get_user_info_by_domain(domain).await;
         if user_info.is_err() {
             warn!(
@@ -814,12 +835,12 @@ impl SNServer {
                 domain,
                 user_info.err().unwrap()
             );
-            return None;
+            return Ok(None);
         }
         let user_info = user_info.unwrap();
         if user_info.is_none() {
             warn!("user info not found for domain {}", domain);
-            return None;
+            return Ok(None);
         }
         let user_info = user_info.unwrap();
 
@@ -852,9 +873,9 @@ impl SNServer {
         &self,
         username: &str,
         record_type: RecordType,
-    ) -> Option<Vec<IpAddr>> {
+    ) -> ServerResult<Option<Vec<IpAddr>>> {
         //TODO:需要根据zone_boot_config中的gateway device name来获取gateway device info，而不是写死ood1
-        let device_info = self.get_device_info(username, "ood1").await;
+        let device_info = self.get_device_info(username, "ood1").await?;
 
         if device_info.is_some() {
             let (device_info, device_ip) = device_info.unwrap();
@@ -878,9 +899,9 @@ impl SNServer {
                 self.add_address_to_vec(&mut address_vec, device_report_ip.clone(), record_type).await;
             }
 
-            return Some(address_vec);
+            return Ok(Some(address_vec));
         }
-        return None;
+        return Ok(None);
     }
 
     async fn add_dns_record(
@@ -1391,7 +1412,13 @@ impl SNServer {
             }
             let user_info = user_info.unwrap();
             
-            let device_info = self.get_device_info(username.as_str(), "ood1").await;
+            let device_info = match self.get_device_info(username.as_str(), "ood1").await {
+                Ok(info) => info,
+                Err(e) => {
+                    warn!("ood1 device info parse failed for {}: {}", username, e);
+                    None
+                }
+            };
             if device_info.is_some() {
                 info!("ood1 device info found for {} in sn server", username);
                 //let device_did = device_info.unwrap().0.did;
@@ -1424,7 +1451,13 @@ impl SNServer {
             let username = user_info.username.as_ref().unwrap();
             let public_key = &user_info.public_key;
             let zone_config = &user_info.zone_config;
-            let device_info = self.get_device_info(username.as_str(), "ood1").await;
+            let device_info = match self.get_device_info(username.as_str(), "ood1").await {
+                Ok(info) => info,
+                Err(e) => {
+                    warn!("ood1 device info parse failed for {}: {}", username, e);
+                    None
+                }
+            };
             if device_info.is_some() {
                 //info!("ood1 device info found for {} in sn server",username);
                 //let device_did = device_info.unwrap().0.did;
@@ -2012,7 +2045,7 @@ impl NameServer for SNServer {
                     }
                     let address_vec = self
                         .get_user_zonegate_address(username.as_str(), record_type)
-                        .await;
+                        .await?;
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
@@ -2060,7 +2093,7 @@ impl NameServer for SNServer {
                 RecordType::A | RecordType::AAAA => {
                     let address_vec = self
                         .get_user_zonegate_address_by_domain(&real_domain_name, record_type)
-                        .await;
+                        .await?;
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
