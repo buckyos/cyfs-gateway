@@ -724,25 +724,28 @@ impl TlsStackBuilder {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use super::{load_certs, load_key};
     use crate::global_process_chains::GlobalProcessChains;
     use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, StreamInfo, LimiterManager, StatManager, GlobalCollectionManager};
     use crate::{TlsDomainConfig, TlsStack};
     use buckyos_kit::{init_logging, AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
-    use rcgen::generate_simple_self_signed;
+    use rcgen::{generate_simple_self_signed, BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{
         CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
     };
-    use rustls::{ClientConfig, DigitallySignedStruct, Error, SignatureScheme};
+    use rustls::{ClientConfig, DigitallySignedStruct, Error, RootCertStore, ServerConfig, SignatureScheme};
     use std::sync::Arc;
     use std::time::Duration;
     use http_body_util::Full;
     use hyper::body::Bytes;
     use hyper_util::rt::{TokioExecutor, TokioIo};
+    use tempfile::tempdir;
+    use tokio::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio_rustls::TlsConnector;
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
     use cyfs_acme::{AcmeCertManager, CertManagerConfig};
     use crate::self_cert_mgr::{SelfCertConfig, SelfCertMgr};
 
@@ -1870,5 +1873,120 @@ mod tests {
         assert!(test_stat.get_write_sum_size() > 880);
         assert!(start.elapsed().as_millis() > 1800);
         assert!(start.elapsed().as_millis() < 2500);
+    }
+
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    fn build_test_chain() -> (String, String, String, CertificateDer<'static>) {
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["Test Root CA".to_string()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let intermediate_key = KeyPair::generate().unwrap();
+        let mut intermediate_params =
+            CertificateParams::new(vec!["Test Intermediate CA".to_string()]).unwrap();
+        intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
+        let intermediate_cert = intermediate_params
+            .signed_by(&intermediate_key, &ca_issuer)
+            .unwrap();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_params = CertificateParams::new(vec!["sn.buckyos.ai".to_string()]).unwrap();
+        let intermediate_issuer = Issuer::from_params(&intermediate_params, &intermediate_key);
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &intermediate_issuer)
+            .unwrap();
+
+        let intermediate_pem = intermediate_cert.pem();
+        let leaf_pem = leaf_cert.pem();
+        let leaf_key_pem = leaf_key.serialize_pem();
+        let root_der = CertificateDer::from(ca_cert.clone());
+
+        let fullchain_pem = format!("{leaf_pem}\n{intermediate_pem}");
+        (fullchain_pem, leaf_pem, leaf_key_pem, root_der)
+    }
+
+    #[tokio::test]
+    async fn test_tls_fullchain_allows_client_verify() {
+        ensure_crypto_provider();
+        let (fullchain_pem, _leaf_pem, leaf_key_pem, root_der) = build_test_chain();
+        let tmp_dir = tempdir().unwrap();
+        let cert_path = tmp_dir.path().join("fullchain.pem");
+        let key_path = tmp_dir.path().join("leaf.key");
+        fs::write(&cert_path, fullchain_pem).await.unwrap();
+        fs::write(&key_path, leaf_key_pem).await.unwrap();
+
+        let certs = load_certs(cert_path.to_str().unwrap()).await.unwrap();
+        let key = load_key(key_path.to_str().unwrap()).await.unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(stream).await;
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(root_der).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let result = connector
+            .connect(ServerName::try_from("sn.buckyos.ai").unwrap(), stream)
+            .await;
+        assert!(result.is_ok());
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tls_missing_intermediate_fails_client_verify() {
+        ensure_crypto_provider();
+        let (_fullchain_pem, leaf_pem, leaf_key_pem, root_der) = build_test_chain();
+        let tmp_dir = tempdir().unwrap();
+        let cert_path = tmp_dir.path().join("leaf.pem");
+        let key_path = tmp_dir.path().join("leaf.key");
+        fs::write(&cert_path, leaf_pem).await.unwrap();
+        fs::write(&key_path, leaf_key_pem).await.unwrap();
+
+        let certs = load_certs(cert_path.to_str().unwrap()).await.unwrap();
+        let key = load_key(key_path.to_str().unwrap()).await.unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(stream).await;
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(root_der).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let result = connector
+            .connect(ServerName::try_from("sn.buckyos.ai").unwrap(), stream)
+            .await;
+        assert!(result.is_err());
+
+        server_handle.await.unwrap();
     }
 }
