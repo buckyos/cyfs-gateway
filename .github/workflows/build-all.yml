@@ -1,4 +1,4 @@
-name: Build Cyfa Gateway on All Platforms
+name: Build Cyfs Gateway on All Platforms
 
 on:
   workflow_dispatch:
@@ -60,21 +60,21 @@ jobs:
     - name: Create Github Release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: cyfs-gateway-${{job.build-linux.outputs.full_version}}
-        name: CYFS Gateway Release ${{job.build-linux.outputs.full_version}}
+        tag_name: cyfs-gateway-${{ needs.build-linux.outputs.full_version }}
+        name: CYFS Gateway Release ${{ needs.build-linux.outputs.full_version }}
         generate_release_notes: true
         fail_on_unmatched_files: true
-        files: *.tar.gz
+        files: "*.tar.gz"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   report-build-result:
-    needs: publish-release
+    needs: [publish-release, build-linux]
     runs-on: ubuntu-latest
     steps:
     - name: Report Upload Urls
       run: |
         npm install @buckyos/test-server-client
-        npx test-server-client seturl gateway ${{job.build-linux.outputs.short_version}} linux amd64 https://nosense ${{github.sha}}
+        npx test-server-client seturl gateway ${{ needs.build-linux.outputs.short_version }} linux amd64 https://nosense ${{ github.sha }}
       env:
         USERNAME: ${{ secrets.TEST_SERVER_USERNAME }}
         PRIVATE_KEY: ${{ secrets.TEST_SERVER_PRIVATE_KEY }}
