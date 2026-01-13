@@ -34,7 +34,7 @@ impl Tunnel for IPTunnel {
             Some(host) => format!("{}:{}", host, dest_port),
             None => {
                 if self.ip_stack_id.is_none() {
-                    format!("0.0.0.0:{}", dest_port)
+                    format!("127.0.0.1:{}", dest_port)
                 } else {
                     format!("{}:{}", self.ip_stack_id.as_ref().unwrap(), dest_port)
                 }
@@ -80,7 +80,7 @@ impl Tunnel for IPTunnel {
         let real_dest_host;
         if dest_host.is_none() {
             if self.ip_stack_id.is_none() {
-                real_dest_host = "0.0.0.0".to_string();
+                real_dest_host = "127.0.0.1".to_string();
             } else {
                 real_dest_host = self.ip_stack_id.as_ref().unwrap().to_string();
             }
