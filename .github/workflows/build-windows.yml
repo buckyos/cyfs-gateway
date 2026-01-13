@@ -1,10 +1,7 @@
-name: Build CYFS Gateway Windows Components
+name: Build CYFS Gateway for Windows
 on: 
     workflow_call:
         inputs:
-            version:
-                required: true
-                type: string
             arch:
                 required: true
                 type: string
@@ -12,26 +9,12 @@ on:
                 required: false
                 type: boolean
                 default: false
-        outputs:
-            build_time:
-                value: ${{jobs.build.outputs.build_time}}
 
 jobs:
   build:
     name: build
     runs-on: ${{ inputs.arch == 'aarch64' && 'windows-11-arm' || 'windows-2025' }}
     steps:
-    - name: Set up current date and time
-      uses: Kaven-Universe/github-action-current-date-time@v1
-      id: date
-      with:
-        format: 'YYYYMMDD'
-    - name: short time
-      id: short_time
-      run: |
-        $val = "${{ steps.date.outputs.time }}"
-        $last6 = $val.Substring($val.Length - 6)
-        echo "last6=$last6" >> $env:GITHUB_OUTPUT
     - name: Checkout
       uses: actions/checkout@v4
     - name: Setup pnpm
@@ -60,24 +43,17 @@ jobs:
       run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
     - name: build buckyos
       working-directory: ./src
-      run: buckyos-build --apps=cyfs-gateway-product
+      run: buckyos-build
       env:
         PYTHONIOENCODING: 'utf-8'
         PYTHONLEGACYWINDOWSSTDIO: "utf-8"
+    - name: Tar Rootfs
+      run:
+        cd .\src\rootfs && tar -czvf ../../gateway-windows-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}.tar.gz .
     - name: Upload
       id: upload
       uses: actions/upload-artifact@v4
       with:
-        name: gateway-windows-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}-${{inputs.version}}+build${{ steps.short_time.outputs.last6 }}
-        path: src/rootfs
+        name: gateway-windows-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}
+        path: gateway-windows-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}.tar.gz
         if-no-files-found: error
-    - name: Report Upload Urls
-      run: |
-        npm install @buckyos/test-server-client
-        npx test-server-client seturl gateway ${{inputs.version}}+build${{ steps.short_time.outputs.last6 }} windows ${{inputs.arch}} ${{steps.upload.outputs.artifact-url}} ${{github.sha}}
-      env:
-        USERNAME: ${{ secrets.TEST_SERVER_USERNAME }}
-        PRIVATE_KEY: ${{ secrets.TEST_SERVER_PRIVATE_KEY }}
-        ENDPOINT: "https://buckyos.ai"
-    outputs:
-      build_time: ${{ steps.date.outputs.time }}

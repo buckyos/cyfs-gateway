@@ -1,5 +1,6 @@
 {
     "name": "cyfs-gateway",
+    "version": "0.5.1",
     "base_dir": ".",
     "modules": {
         "cyfs_gateway": {
@@ -19,18 +20,6 @@
         "modules": {
           "cyfs_gateway": "bin/cyfs-gateway/",
           "test_server": "bin/test-server/"
-        },
-        "data_paths": [
-        ],
-        "clean_paths": [
-        ]
-      },
-      "cyfs-gateway-product": {
-        "name": "cyfs-gateway-product",
-        "rootfs": "rootfs/",
-        "default_target_rootfs": "${BUCKYOS_ROOT}",
-        "modules": {
-          "cyfs_gateway": "bin/cyfs-gateway/"
         },
         "data_paths": [
         ],
