@@ -217,40 +217,61 @@ fi
 if [[ -n "$SERVICE_NAME" ]]; then
   if command -v systemctl >/dev/null 2>&1; then
     # Service restart is optional and controlled via SERVICE_NAME.
-    echo "Current service status: ${SERVICE_NAME}"
-    systemctl status "$SERVICE_NAME" --no-pager || true
     read -r -p "Restart service ${SERVICE_NAME}? (y/N): " restart_answer
     if [[ "${restart_answer}" == "y" || "${restart_answer}" == "Y" ]]; then
-      echo "Restarting service: ${SERVICE_NAME}"
-      systemctl restart "$SERVICE_NAME"
-      systemctl status "$SERVICE_NAME" --no-pager || true
-
       check_port_53() {
         if ! command -v lsof >/dev/null 2>&1; then
-          echo "WARN: lsof not found, skip port check." >&2
-          return 0
+          echo "ERROR: lsof not found, cannot verify ports." >&2
+          return 1
         fi
-        lsof -i :53 -i :domain 2>/dev/null || true
+        lsof -i UDP:53 -i UDP:domain 2>/dev/null || true
       }
 
-      echo "Checking port 53..."
-      port_output="$(check_port_53)"
-      if [[ -z "$port_output" ]]; then
-        echo "Port 53 check failed after restart. Details:"
-        lsof -i :53 -i :domain || true
-        echo "Restarting service again: ${SERVICE_NAME}"
-        systemctl restart "$SERVICE_NAME"
-        systemctl status "$SERVICE_NAME" --no-pager || true
-        echo "Re-checking port 53..."
-        port_output="$(check_port_53)"
-        if [[ -n "$port_output" ]]; then
-          echo "Port 53 is now OK."
-        else
-          echo "ERROR: Port 53 still not listening after second restart." >&2
+      check_tcp_port() {
+        local port="$1"
+        if ! command -v lsof >/dev/null 2>&1; then
+          echo "ERROR: lsof not found, cannot verify ports." >&2
+          return 1
         fi
-      else
-        echo "Port 53 is OK."
-      fi
+        lsof -i TCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+      }
+
+      check_ports() {
+        local missing=0
+        local output
+        local port
+        for port in 53 80 443 2980 3443; do
+          if [[ "$port" == "53" ]]; then
+            output="$(check_port_53)"
+          else
+            output="$(check_tcp_port "$port")"
+          fi
+          echo "lsof -i for port ${port}:"
+          if [[ -n "$output" ]]; then
+            printf '%s\n' "$output"
+          else
+            echo "(no listeners found)"
+            missing=1
+          fi
+        done
+        return "$missing"
+      }
+
+      echo "Restarting service: ${SERVICE_NAME}"
+      systemctl restart "$SERVICE_NAME"
+      sleep 2
+
+      while true; do
+        if check_ports; then
+          echo "All required ports are listening."
+          break
+        fi
+        echo "Ports not ready, restarting service..."
+        systemctl stop "$SERVICE_NAME"
+        sleep 5
+        systemctl start "$SERVICE_NAME"
+        sleep 2
+      done
     else
       echo "Restart skipped."
     fi
