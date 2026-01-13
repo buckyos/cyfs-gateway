@@ -308,10 +308,12 @@ impl HttpServer for GatewayControlServer {
             }
         }.await;
 
-        Ok(ret.unwrap_or_else(|_e| {
+        Ok(ret.unwrap_or_else(|e| {
+            let msg = format!("{}", e);
+            log::error!("control server err {}", msg);
             http::Response::builder()
                 .status(http::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::new())
+                .body(Full::new(Bytes::from(msg.as_bytes().to_vec()))
                     .map_err(|e| ServerError::new(ServerErrorCode::IOError, format!("{:?}", e))).boxed()).unwrap()
         }))
     }

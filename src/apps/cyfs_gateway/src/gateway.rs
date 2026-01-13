@@ -16,9 +16,9 @@ use json_value_merge::Merge;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use jsonwebtoken::jwk::Jwk;
 use kRPC::RPCSessionToken;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sfo_js::{JsEngine, JsString, JsValue};
+use sfo_js::{JsEngine, JsPkgManagerRef, JsString, JsValue};
 use sfo_js::object::builtins::JsArray;
 use sha2::Digest;
 use crate::gateway_control_client::{cmd_err, into_cmd_err};
@@ -80,6 +80,7 @@ pub struct GatewayFactory {
     stat_manager: StatManagerRef,
     self_cert_mgr: SelfCertMgrRef,
     global_collection_manager: GlobalCollectionManagerRef,
+    external_cmds: JsPkgManagerRef,
 }
 
 impl GatewayFactory {
@@ -93,7 +94,8 @@ impl GatewayFactory {
         limiter_manager: LimiterManagerRef,
         stat_manager: StatManagerRef,
         self_cert_mgr: SelfCertMgrRef,
-        global_collection_manager: GlobalCollectionManagerRef, ) -> Self {
+        global_collection_manager: GlobalCollectionManagerRef,
+        external_cmds: JsPkgManagerRef, ) -> Self {
         Self {
             stacks,
             servers,
@@ -107,6 +109,7 @@ impl GatewayFactory {
             stat_manager,
             self_cert_mgr,
             global_collection_manager,
+            external_cmds,
         }
     }
 
@@ -155,6 +158,7 @@ impl GatewayFactory {
             stat_manager: self.stat_manager.clone(),
             self_cert_mgr: self.self_cert_mgr.clone(),
             global_collection_manager: self.global_collection_manager.clone(),
+            external_cmds: self.external_cmds.clone(),
         })
     }
 }
@@ -173,6 +177,7 @@ pub struct Gateway {
     stat_manager: StatManagerRef,
     self_cert_mgr: SelfCertMgrRef,
     global_collection_manager: GlobalCollectionManagerRef,
+    external_cmds: JsPkgManagerRef,
 }
 
 impl Drop for Gateway {
@@ -654,6 +659,12 @@ impl Gateway {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct ExternalCmd {
+    pub name: String,
+    pub description: String,
+}
+
 pub struct GatewayCmdHandler {
     gateway: Mutex<Option<Arc<Gateway>>>,
     external_cmd_store: ExternalCmdStoreRef,
@@ -708,6 +719,32 @@ impl GatewayCmdHandler {
                 Err(cmd_err!(ControlErrorCode::RunJsFailed, "result {:?}", result))
             }
         }).await.map_err(into_cmd_err!(ControlErrorCode::Failed))?
+    }
+
+    async fn get_external_cmds(&self) -> ControlResult<Vec<ExternalCmd>> {
+        let mut cmds = Vec::new();
+        if let Some(gateway) = self.get_gateway() {
+            let external_cmds = gateway.external_cmds.list_pkgs().await
+                .map_err(into_cmd_err!(ControlErrorCode::Failed, "list pkgs failed"))?;
+            for external_cmd in external_cmds {
+                cmds.push(ExternalCmd {
+                    name: external_cmd.name().to_string(),
+                    description: external_cmd.description().to_string(),
+                });
+            }
+        }
+        Ok(cmds)
+    }
+
+    async fn get_external_cmd_help(&self, cmd: &str) -> ControlResult<String> {
+        if let Some(gateway) = self.get_gateway() {
+            let external_cmd = gateway.external_cmds.get_pkg(cmd)
+                .await
+                .map_err(into_cmd_err!(ControlErrorCode::Failed, "get pkg failed"))?;
+            external_cmd.help().await.map_err(into_cmd_err!(ControlErrorCode::Failed, "get help failed"))
+        } else {
+            Ok("".to_string())
+        }
     }
 }
 
@@ -820,6 +857,17 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 info!("*** reload gateway config success !");
                 Ok(Value::String("ok".to_string()))
+            }
+            "external_cmds" => {
+                let cmds = self.get_external_cmds().await?;
+                Ok(serde_json::to_value(cmds).map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
+            }
+            "cmd_help" => {
+                let params = serde_json::from_value::<HashMap<String, String>>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let cmd = params.get("cmd").unwrap();
+                let help = self.get_external_cmd_help(cmd).await?;
+                Ok(serde_json::to_value(help).map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
             }
             v => {
                 Err(cmd_err!(ControlErrorCode::InvalidMethod, "Invalid method: {}", v))

@@ -5,6 +5,7 @@ use serde_json::Value;
 pub use sfo_result::err as cmd_err;
 pub use sfo_result::into_err as into_cmd_err;
 use sha2::Digest;
+use crate::ExternalCmd;
 use crate::gateway_control_server::{ControlErrorCode, ControlResult, LoginReq};
 //TODO： CmdClient / CmdServer 的名字太通用了，叫gateway_control_panel_client / gateway_control_panel 更好一些？
 pub const CONTROL_SERVER: &str = "http://127.0.0.1:13451";
@@ -89,5 +90,19 @@ impl GatewayControlClient {
         let result = self.krpc.call("reload", Value::Null).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
+    }
+    
+    pub async fn get_external_cmds(&self) -> ControlResult<Vec<ExternalCmd>> {
+        let result = self.krpc.call("external_cmds", Value::Null).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+        Ok(serde_json::from_value(result).map_err(into_cmd_err!(ControlErrorCode::InvalidData))?)
+    }
+    
+    pub async fn get_external_cmd_help(&self, cmd: &str) -> ControlResult<String> {
+        let mut params = HashMap::new();
+        params.insert("cmd", cmd);
+        let result = self.krpc.call("cmd_help", serde_json::to_value(&params).unwrap()).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+        Ok(serde_json::from_value(result).map_err(into_cmd_err!(ControlErrorCode::InvalidData))?)
     }
 }

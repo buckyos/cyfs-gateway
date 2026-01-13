@@ -6,7 +6,6 @@ mod gateway_control_client;
 mod gateway_control_server;
 mod config_loader;
 mod acme_sn_provider;
-mod js_pkg_manager;
 
 pub use gateway::*;
 pub use gateway_control_client::*;
@@ -32,6 +31,7 @@ use anyhow::anyhow;
 use json_value_merge::Merge;
 use kRPC::RPCSessionToken;
 use serde_json::{Value};
+use sfo_js::JsPkgManager;
 use tokio::fs::create_dir_all;
 use tokio::task;
 use url::Url;
@@ -181,6 +181,8 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
 
     let global_collections = GlobalCollectionManager::create(gateway_config.collections.clone()).await?;
 
+    let chain_cmds = get_buckyos_system_etc_dir().join("cyfs_gateway").join("chain_cmds");
+    let external_cmds = JsPkgManager::new(chain_cmds);
     let factory = GatewayFactory::new(
         stack_manager.clone(),
         server_manager.clone(),
@@ -192,6 +194,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         stat_manager.clone(),
         self_cert_manager.clone(),
         global_collections.clone(),
+        external_cmds
     );
     factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
         server_manager.clone(),
@@ -440,9 +443,17 @@ fn save_login_token(server: &str, token: &str) {
 
 
 pub async fn cyfs_gateway_main() {
-    let matches = Command::new("CYFS Gateway Service")
+    let mut command = Command::new("CYFS Gateway Service")
         .version(buckyos_kit::get_version())
         .disable_help_flag(true)
+        .disable_help_subcommand(true)
+        .arg(
+            Arg::new("help")
+                .long("help")
+                .short('h')
+                .help("Show help information")
+                .action(ArgAction::SetTrue),
+        )
         .arg(
             Arg::new("config")
                 .long("config")
@@ -618,9 +629,48 @@ pub async fn cyfs_gateway_main() {
                 .help("server url")
                 .required(false)
                 .default_value(CONTROL_SERVER)))
-        .get_matches();
+        .subcommand(Command::new("help")
+            .about("Show help for a command or subcommand")
+            .arg(
+                Arg::new("subcommand")
+                    .help("Subcommand to display help for")
+                    .required(false),
+            ));
+
+    let matches = command.clone().get_matches();
+
+    if matches.get_flag("help") {
+        let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+        if let Ok(cmds) = cyfs_cmd_client.get_external_cmds().await {
+            for cmd in cmds {
+                command = command.subcommand(Command::new(cmd.name)
+                    .about(cmd.description));
+            }
+        }
+        command.print_help().unwrap();
+        std::process::exit(0);
+    }
 
     match matches.subcommand() {
+        Some(("help", sub_matches)) => {
+            if let Some(sub_name) = sub_matches.get_one::<String>("subcommand") {
+                if let Some(sub_cmd) = command.find_subcommand_mut(sub_name) {
+                    sub_cmd.print_help().unwrap();
+                    println!();
+                } else {
+                    let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                    if let Ok(help) = cyfs_cmd_client.get_external_cmd_help(sub_name).await {
+                        println!("{}", help);
+                    } else {
+                        println!("Unknown command: {}", sub_name);
+                    }
+                }
+            } else {
+                command.print_help().unwrap();
+                println!();
+            }
+            std::process::exit(0);
+        }
         Some(("gen_rtcp_key", sub_matches)) => {
             let name = sub_matches.get_one::<String>("name").expect("Missing key 'name'");
             // Get temp path
