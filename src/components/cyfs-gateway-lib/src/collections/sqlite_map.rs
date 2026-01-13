@@ -296,6 +296,7 @@ impl MapCollection for SqliteMap {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use super::*;
     use cyfs_process_chain::MapCollection;
 

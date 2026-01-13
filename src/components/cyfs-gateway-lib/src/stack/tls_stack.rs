@@ -22,14 +22,15 @@ use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
 
 pub async fn load_certs(path: &str) -> StackResult<Vec<CertificateDer<'static>>> {
-    let cert = CertificateDer::from_pem_file(path).map_err(
+    let certs = CertificateDer::pem_file_iter(path).map_err(
         into_stack_err!(
             StackErrorCode::InvalidTlsCert,
             "failed to parse certificate, file:{}",
             path
         )
-    )?;
-    Ok(vec![cert])
+    )?.filter(|item| item.is_ok())
+        .map(|item| item.unwrap()).collect();
+    Ok(certs)
 }
 
 pub async fn load_key(path: &str) -> StackResult<PrivateKeyDer<'static>> {
