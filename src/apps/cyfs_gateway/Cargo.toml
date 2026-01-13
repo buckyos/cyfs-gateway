@@ -23,7 +23,7 @@ once_cell.workspace = true
 anyhow.workspace = true
 json_value_merge = "2"
 serde_yaml_ng.workspace = true
-sfo-result = "0.2"
+sfo-result = "0.2.16"
 sha2.workspace = true
 chrono.workspace = true
 hex.workspace = true
@@ -44,7 +44,7 @@ cyfs-tun = { path = "../../components/cyfs-tun"}
 http-body-util.workspace = true
 http.workspace = true
 shlex.workspace = true
-sfo-js = "0.1"
+sfo-js = { version = "0.1" }
 
 [dev-dependencies]
 tempfile.workspace = true
