@@ -58,9 +58,9 @@ jobs:
     - name: Get Version
       id: get_version
       run: |
-        full_version=`./src/rootfs/cyfs-gateway/cyfs_gateway --version|grep -oP '\d+(?:\.\d+)*\+build\S+'`
+        full_version=`./src/rootfs/bin/cyfs-gateway/cyfs_gateway --version|grep -oP '\d+(?:\.\d+)*\+build\S+'`
         echo "full_version=$full_version" >> $GITHUB_OUTPUT
-        short_version=`./src/rootfs/cyfs-gateway/cyfs_gateway --version|grep -oP '\d+(?:\.\d+)*\+build\d+'`
+        short_version=`./src/rootfs/bin/cyfs-gateway/cyfs_gateway --version|grep -oP '\d+(?:\.\d+)*\+build\d+'`
         echo "short_version=$short_version" >> $GITHUB_OUTPUT
     - name: Upload
       uses: actions/upload-artifact@v4
