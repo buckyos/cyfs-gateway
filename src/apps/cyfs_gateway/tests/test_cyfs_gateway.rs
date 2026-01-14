@@ -328,5 +328,38 @@ mod tests {
             let response = sender.send_request(request).await.unwrap();
             assert_eq!(response.status(), hyper::StatusCode::METHOD_NOT_ALLOWED);
         }
+
+        {
+            let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+            let ret = cyfs_cmd_client.append_rule("server:www.buckyos.com:main:test2", r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;"#).await;
+            assert!(ret.is_ok());
+
+            let ret = cyfs_cmd_client.append_rule("server:www_dir:main:test2", r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;"#).await;
+            assert!(ret.is_err());
+
+            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
+
+            let body = json!({
+                    "method": "check_username",
+                    "params": {
+                        "username": "test",
+                    },
+                    "sys": [1]
+                });
+            // 用hyper构造一个http请求
+            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream)).await.unwrap();
+            let request = hyper::Request::post("/sn")
+                .header("Host", "test2.buckyos.com")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::from(serde_json::to_string(&body).unwrap().as_bytes().to_vec()))).unwrap();
+
+            tokio::spawn(async move {
+                conn.await.unwrap();
+            });
+
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::METHOD_NOT_ALLOWED);
+        }
     }
 }
