@@ -23,6 +23,7 @@ use sfo_js::object::builtins::JsArray;
 use sha2::Digest;
 use rand::{Rng};
 use rand::distr::Alphanumeric;
+use rand::thread_rng;
 use crate::gateway_control_client::{cmd_err, into_cmd_err};
 use crate::gateway_control_server::{ControlErrorCode, ControlResult, GatewayControlCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
 use crate::config_loader::GatewayConfigParserRef;
@@ -457,7 +458,7 @@ impl Gateway {
 
     fn gen_unique_id(map: &Map<String, Value>) -> String {
         loop {
-            let candidate: String = rand::rng()
+            let candidate: String = thread_rng()
                 .sample_iter(&Alphanumeric)
                 .take(5)
                 .map(char::from)
@@ -493,6 +494,119 @@ impl Gateway {
             }
         }
         max_priority.map(|p| p + 1).unwrap_or(1)
+    }
+
+    fn insert_rule_to_config(mut raw_config: Value, id: &str, pos: i32, rule: &str) -> Result<Value> {
+        let id_list = id.split(':').collect::<Vec<&str>>();
+        if id_list.len() < 2 {
+            return Err(anyhow!("Invalid config id: {}", id));
+        }
+        let config_type = id_list[0];
+        if config_type != "stack" && config_type != "server" {
+            return Err(anyhow!("Invalid config type: {}", config_type));
+        }
+        let config_id = id_list[1];
+        if config_id == GATEWAY_CONTROL_SERVER_KEY {
+            return Err(anyhow!(cmd_err!(
+                ControlErrorCode::ConfigNotFound,
+                "Config not found: {}", config_id,
+            )));
+        }
+
+        let mut index = 2;
+        if id_list.len() > index && id_list[index] == "hook_point" {
+            index += 1;
+        }
+        let chain_id = if id_list.len() > index { Some(id_list[index]) } else { None };
+        index += 1;
+        if id_list.len() > index && id_list[index] == "blocks" {
+            index += 1;
+        }
+        let block_id = if id_list.len() > index { Some(id_list[index]) } else { None };
+
+        let root_key = if config_type == "stack" { "stacks" } else { "servers" };
+        let stacks_or_servers = raw_config
+            .get_mut(root_key)
+            .ok_or_else(|| anyhow!("{} not found in config", root_key))?;
+        let stacks_or_servers = stacks_or_servers
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("{} must be an object", root_key))?;
+        let target_config = stacks_or_servers
+            .get_mut(config_id)
+            .ok_or_else(|| anyhow!("Config not found: {}", config_id))?;
+        let target_config = target_config
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("Invalid {} config: {}", config_type, config_id))?;
+
+        if config_type == "server" {
+            let server_type = target_config.get("type");
+            if server_type != Some(&Value::String("http".to_string())) {
+                return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
+            }
+        }
+
+        let hook_point_value = target_config
+            .entry("hook_point")
+            .or_insert_with(|| Value::Object(Map::new()));
+        let hook_point = hook_point_value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("hook_point must be an object"))?;
+
+        let chain_id = if let Some(chain_id) = chain_id {
+            chain_id.to_string()
+        } else {
+            Self::gen_unique_id(hook_point)
+        };
+
+        let chain_value = hook_point.entry(chain_id.clone()).or_insert_with(|| {
+            let mut map = Map::new();
+            map.insert("priority".to_string(), Value::Number(pos.into()));
+            map.insert("blocks".to_string(), Value::Object(Map::new()));
+            Value::Object(map)
+        });
+        let chain_value = chain_value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("chain {} must be an object", chain_id))?;
+        let blocks_value = chain_value
+            .entry("blocks")
+            .or_insert_with(|| Value::Object(Map::new()));
+        let blocks = blocks_value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("blocks must be an object"))?;
+
+        match block_id {
+            None => {
+                let new_block_id = Self::gen_unique_id(blocks);
+                let mut block = Map::new();
+                block.insert("priority".to_string(), Value::Number(pos.into()));
+                block.insert("block".to_string(), Value::String(rule.to_string()));
+                blocks.insert(new_block_id, Value::Object(block));
+            }
+            Some(block_id) => {
+                if let Some(block_value) = blocks.get_mut(block_id) {
+                    let block_value = block_value
+                        .as_object_mut()
+                        .ok_or_else(|| anyhow!("block {} must be an object", block_id))?;
+                    let content = block_value
+                        .get("block")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let mut lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
+                    let insert_at = if pos <= 0 { 0 } else { (pos as usize).saturating_sub(1) };
+                    let insert_at = insert_at.min(lines.len());
+                    let mut new_lines: Vec<String> = rule.split('\n').map(|s| s.to_string()).collect();
+                    lines.splice(insert_at..insert_at, new_lines.drain(..));
+                    let new_content = lines.join("\n");
+                    block_value.insert("block".to_string(), Value::String(new_content));
+                } else {
+                    let mut block = Map::new();
+                    block.insert("priority".to_string(), Value::Number(pos.into()));
+                    block.insert("block".to_string(), Value::String(rule.to_string()));
+                    blocks.insert(block_id.to_string(), Value::Object(block));
+                }
+            }
+        }
+        Ok(raw_config)
     }
 
     fn append_rule_to_config(mut raw_config: Value, id: &str, rule: &str) -> Result<Value> {
@@ -688,6 +802,66 @@ impl Gateway {
             self.config.lock().unwrap().raw_config.clone()
         };
         let raw_config = Self::append_rule_to_config(raw_config, id, rule)?;
+        let gateway_config = self.parser
+            .parse(raw_config)
+            .map_err(|e| anyhow!("parse config failed: {}", e))?;
+        match config_type {
+            "stack" => {
+                let new_stack_config = gateway_config
+                    .stacks
+                    .iter()
+                    .find(|s| s.id() == config_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("stack config not found after parse: {}", config_id))?;
+
+                if let Some(stack) = self.stack_manager.get_stack(config_id) {
+                    stack.update_config(new_stack_config.clone()).await?;
+                }
+            }
+            "server" => {
+                let new_server_config = gateway_config
+                    .servers
+                    .iter()
+                    .find(|s| s.id() == config_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
+
+                let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+                for server in new_servers.into_iter() {
+                    self.server_manager.replace_server(server);
+                }
+            }
+            _ => {
+                return Err(anyhow!(cmd_err!(
+                    ControlErrorCode::InvalidConfigType,
+                    "Invalid config type: {}", config_type,
+                )));
+            }
+        }
+
+        let mut guard = self.config.lock().unwrap();
+        *guard = gateway_config;
+        Ok(())
+    }
+
+    pub async fn insert_rule(&self, id: &str, pos: i32, rule: &str) -> Result<()> {
+        let id_list = id.split(':').collect::<Vec<&str>>();
+        if id_list.len() < 2 {
+            return Err(anyhow!("Invalid config id: {}", id));
+        }
+        let config_type = id_list[0];
+        let config_id = id_list[1];
+        if config_id == GATEWAY_CONTROL_SERVER_KEY {
+            return Err(anyhow!(cmd_err!(
+                ControlErrorCode::ConfigNotFound,
+                "Config not found: {}", config_id,
+            )));
+        }
+
+        let raw_config = {
+            self.config.lock().unwrap().raw_config.clone()
+        };
+        let raw_config = Self::insert_rule_to_config(raw_config, id, pos, rule)?;
         let gateway_config = self.parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
@@ -1322,6 +1496,29 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
+            "insert_rule" => {
+                let params = serde_json::from_value::<HashMap<String, String>>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let id = params.get("id");
+                let rule = params.get("rule");
+                let pos = params.get("pos");
+                if id.is_none() || rule.is_none() || pos.is_none() {
+                    Err(cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "Invalid params: id or rule or pos is None",
+                    ))?;
+                }
+                let pos: i32 = pos.unwrap().parse().map_err(|_| {
+                    cmd_err!(ControlErrorCode::InvalidParams, "pos must be integer")
+                })?;
+                gateway.insert_rule(
+                    id.unwrap(),
+                    pos,
+                    rule.unwrap(),
+                ).await
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                Ok(Value::String("ok".to_string()))
+            }
             "reload" => {
                 info!("*** reload gateway config ...");
                 let gateway_config = load_config_from_file(self.config_file.as_path()).await
@@ -1767,6 +1964,51 @@ mod tests {
         let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].clone();
         let updated = Gateway::append_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
         let blocks = updated["stacks"]["s1"]["hook_point"].clone();
+    }
+
+    #[tokio::test]
+    async fn test_insert_rule_to_config() {
+        let raw_config = json!({
+            "stacks": {
+                "s1": {
+                    "protocol": "tcp",
+                    "bind": "0.0.0.0:1",
+                    "hook_point": {
+                        "main": {
+                            "priority": 5,
+                            "blocks": {
+                                "b1": {
+                                    "priority": 5,
+                                    "block": "l1\nl3"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // insert inside existing block
+        let updated = Gateway::insert_rule_to_config(raw_config.clone(), "stack:s1:hook_point:main:b1", 2, "l2").unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"].as_object().unwrap();
+        assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(5));
+        let lines: Vec<&str> = block.get("block").and_then(|v| v.as_str()).unwrap().lines().collect();
+        assert_eq!(lines, vec!["l1", "l2", "l3"]);
+
+        // insert new block with given priority
+        let updated = Gateway::insert_rule_to_config(raw_config.clone(), "stack:s1:hook_point:main:b2", 10, "nb").unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b2"].as_object().unwrap();
+        assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(10));
+        assert_eq!(block.get("block").and_then(|v| v.as_str()), Some("nb"));
+
+        // insert new chain and block with given priority
+        let updated = Gateway::insert_rule_to_config(raw_config.clone(), "stack:s1:new_chain", 7, "nc").unwrap();
+        let chain = updated["stacks"]["s1"]["hook_point"]["new_chain"].as_object().unwrap();
+        assert_eq!(chain.get("priority").and_then(|v| v.as_i64()), Some(7));
+        let blocks = chain.get("blocks").and_then(|v| v.as_object()).unwrap();
+        let b = blocks.values().next().unwrap().as_object().unwrap();
+        assert_eq!(b.get("priority").and_then(|v| v.as_i64()), Some(7));
+        assert_eq!(b.get("block").and_then(|v| v.as_str()), Some("nc"));
     }
 
     #[tokio::test]

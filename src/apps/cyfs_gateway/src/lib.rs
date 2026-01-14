@@ -568,6 +568,23 @@ pub async fn cyfs_gateway_main() {
                 .help("server url")
                 .required(false)
                 .default_value(CONTROL_SERVER)))
+        .subcommand(Command::new("insert_rule")
+            .about("Insert a rule at specific position/priority")
+            .arg(Arg::new("id")
+                .help("rule id")
+                .required(true))
+            .arg(Arg::new("pos")
+                .help("priority or line position")
+                .required(true))
+            .arg(Arg::new("rule")
+                .help("rule content")
+                .required(true))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("del_rule")
             .about("Delete a rule")
             .arg(Arg::new("id")
@@ -788,6 +805,30 @@ pub async fn cyfs_gateway_main() {
                 }
                 Err(e) => {
                     println!("append rule error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(("insert_rule", sub_matches)) => {
+            let id = sub_matches.get_one::<String>("id").expect("id is required");
+            let pos = sub_matches.get_one::<String>("pos").expect("pos is required");
+            let rule = sub_matches.get_one::<String>("rule").expect("rule is required");
+            let pos: i32 = pos.parse().expect("pos must be integer");
+            let server = sub_matches.get_one::<String>("server").expect("server is required");
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.insert_rule(id, pos, rule).await {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("insert rule error: {}", e);
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
