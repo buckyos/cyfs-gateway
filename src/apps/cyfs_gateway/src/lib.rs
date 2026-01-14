@@ -71,7 +71,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     };
 
     // Load config from json
-    let parser = GatewayConfigParser::new();
+    let parser = Arc::new(GatewayConfigParser::new());
     parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
     parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
     parser.register_stack_config_parser("rtcp", Arc::new(RtcpStackConfigParser::new()));
@@ -90,7 +90,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     parser.register_server_config_parser("acme_response", Arc::new(AcmeHttpChallengeServerConfigParser::new()));
 
     info!("Parse cyfs-gatway config...");
-    let load_result = parser.parse(config_json);
+    let load_result = parser.parse(config_json.clone());
     if load_result.is_err() {
         let msg = format!("Error loading config: {}", load_result.err().unwrap().msg());
         error!("{}", msg);
@@ -194,7 +194,8 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         stat_manager.clone(),
         self_cert_manager.clone(),
         global_collections.clone(),
-        external_cmds
+        external_cmds,
+        parser.clone()
     );
     factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
         server_manager.clone(),
@@ -298,7 +299,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     let handler = GatewayCmdHandler::new(
         Arc::new(external_cmd_store),
         config_file.to_path_buf(),
-        parser);
+        parser.clone());
     factory.register_server_factory(
         "control_server",
         Arc::new(GatewayControlServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
@@ -391,7 +392,7 @@ fn generate_ed25519_key_pair_to_local() {
     println!("Public key saved to: {:?}", pk_file);
 }
 
-fn read_login_token(server: &str) -> Option<String> {
+pub fn read_login_token(server: &str) -> Option<String> {
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
     let token_dir = get_buckyos_service_data_dir("cyfs_gateway").join("cli_token");
     if !token_dir.exists() {
@@ -510,16 +511,9 @@ pub async fn cyfs_gateway_main() {
                 .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("show_config")
             .about("Show current config")
-            .arg(Arg::new("config_type")
-                .long("config_type")
-                .short('t')
-                .help("Config type, optional stack | server | inner_service | global_process_chain")
-                .required(false))
-            .arg(Arg::new("config_id")
-                .long("config_id")
-                .short('i')
-                .help("Config id")
-                .required(false))
+            .arg(Arg::new("id")
+                .help("config id")
+                .required(true))
             .arg(Arg::new("format")
                 .long("format")
                 .short('f')
@@ -546,69 +540,25 @@ pub async fn cyfs_gateway_main() {
                 .help("server url")
                 .required(false)
                 .default_value(CONTROL_SERVER)))
-        .subcommand(Command::new("add_chain")
-            .about("Add a chain")
-            .arg(Arg::new("config_type")
-                .long("config_type")
-                .short('t')
-                .help("Config type, optional stack | server | inner_service | global_process_chain")
+        .subcommand(Command::new("add_rule")
+            .about("Add a rule")
+            .arg(Arg::new("id")
+                .help("rule id")
                 .required(true))
-            .arg(Arg::new("config_id")
-                .long("config_id")
-                .short('i')
-                .help("Config id")
-                .required(true))
-            .arg(Arg::new("chain_id")
-                .long("chain_id")
-                .short('n')
-                .help("Chain id")
-                .required(false))
-            .arg(Arg::new("hook_point")
-                .long("hook_point")
-                .short('k')
-                .help("The hook point to which the chain belongs, optional pre | post")
-                .required(false)
-                .default_value("pre"))
-            .arg(Arg::new("chain_type")
-                .long("chain_type")
-                .short('y')
-                .help("Chain type")
+            .arg(Arg::new("rule")
+                .help("rule content")
                 .required(true))
             .arg(Arg::new("server")
                 .long("server")
                 .short('s')
                 .help("server url")
                 .required(false)
-                .default_value(CONTROL_SERVER))
-            .arg(Arg::new("chain_params")
-                .help("Chain params") // 接受一个或多个值
-                .num_args(1..)
-                .value_delimiter(None) // 禁用分隔符解析，保持参数原样
-                .last(true)     // 确保此参数必须放在最后
-                .required(false)))
-        .subcommand(Command::new("del_chain")
-            .about("Delete a chain")
-            .arg(Arg::new("config_type")
-                .long("config_type")
-                .short('t')
-                .help("Config type, optional stack | server | inner_service | global_process_chain")
+                .default_value(CONTROL_SERVER)))
+        .subcommand(Command::new("del_rule")
+            .about("Delete a rule")
+            .arg(Arg::new("id")
+                .help("rule id")
                 .required(true))
-            .arg(Arg::new("config_id")
-                .long("config_id")
-                .short('i')
-                .help("Config id")
-                .required(true))
-            .arg(Arg::new("chain_id")
-                .long("chain_id")
-                .short('n')
-                .help("Chain id")
-                .required(true))
-            .arg(Arg::new("hook_point")
-                .long("hook_point")
-                .short('k')
-                .help("The hook point to which the chain belongs, optional pre | post")
-                .required(false)
-                .default_value("pre"))
             .arg(Arg::new("server")
                 .long("server")
                 .short('s')
@@ -790,16 +740,12 @@ pub async fn cyfs_gateway_main() {
                 }
             }
         }
-        Some(("add_chain", sub_matches)) => {
-            let config_type = sub_matches.get_one::<String>("config_type").expect("config_type is required");
-            let config_id = sub_matches.get_one::<String>("config_id").expect("config_id is required");
-            let chain_id = sub_matches.get_one::<String>("chain_id").expect("chain_id is required");
-            let chain_type = sub_matches.get_one::<String>("chain_type").expect("chain_type is required");
-            let hook_point = sub_matches.get_one::<String>("hook_point").expect("hook_point is required");
-            let chain_params = sub_matches.get_many::<String>("chain_params").expect("chain_params is required");
+        Some(("add_rule", sub_matches)) => {
+            let config_type = sub_matches.get_one::<String>("id").expect("id is required");
+            let config_id = sub_matches.get_one::<String>("rule").expect("rule is required");
             let server = sub_matches.get_one::<String>("server").expect("server is required");
             let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
-            match cyfs_cmd_client.add_chain(config_type, config_id, hook_point, chain_id, chain_type, chain_params.map(|s| s.clone()).collect::<Vec<_>>().join(" ").as_str()).await {
+            match cyfs_cmd_client.add_rule(config_type, config_id).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {

@@ -17,14 +17,18 @@ use jsonwebtoken::{DecodingKey, EncodingKey};
 use jsonwebtoken::jwk::Jwk;
 use kRPC::RPCSessionToken;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sfo_js::{JsEngine, JsPkgManagerRef, JsString, JsValue};
 use sfo_js::object::builtins::JsArray;
 use sha2::Digest;
+use rand::{Rng};
+use rand::distr::Alphanumeric;
 use crate::gateway_control_client::{cmd_err, into_cmd_err};
 use crate::gateway_control_server::{ControlErrorCode, ControlResult, GatewayControlCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
-use crate::config_loader::GatewayConfigParser;
-use crate::gateway_control_server::{GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY};
+use crate::config_loader::GatewayConfigParserRef;
+use crate::gateway_control_server::{
+    GatewayControlServerConfigParser, GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY,
+};
 
 pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Value> {
     let config_dir = config_file.parent().ok_or_else(|| {
@@ -69,6 +73,7 @@ pub struct GatewayFactory {
     servers: ServerManagerRef,
 
     stack_factory: CyfsStackFactoryRef,
+    parser: GatewayConfigParserRef,
 
     connection_manager: ConnectionManagerRef,
     tunnel_manager: TunnelManager,
@@ -95,7 +100,8 @@ impl GatewayFactory {
         stat_manager: StatManagerRef,
         self_cert_mgr: SelfCertMgrRef,
         global_collection_manager: GlobalCollectionManagerRef,
-        external_cmds: JsPkgManagerRef, ) -> Self {
+        external_cmds: JsPkgManagerRef,
+        parser: GatewayConfigParserRef, ) -> Self {
         Self {
             stacks,
             servers,
@@ -110,6 +116,7 @@ impl GatewayFactory {
             self_cert_mgr,
             global_collection_manager,
             external_cmds,
+            parser,
         }
     }
 
@@ -149,6 +156,7 @@ impl GatewayFactory {
             stack_manager,
             tunnel_manager: self.tunnel_manager.clone(),
             server_manager: self.servers.clone(),
+            parser: self.parser.clone(),
             global_process_chains: self.global_process_chains.clone(),
             connection_manager: self.connection_manager.clone(),
             acme_mgr: self.acme_mgr.clone(),
@@ -168,6 +176,7 @@ pub struct Gateway {
     stack_manager: StackManagerRef,
     tunnel_manager: TunnelManager,
     server_manager: ServerManagerRef,
+    parser: GatewayConfigParserRef,
     global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
     acme_mgr: AcmeCertManagerRef,
@@ -331,67 +340,197 @@ impl Gateway {
         )))
     }
 
-    pub async fn add_chain(&self, config_type: &str, config_id: &str, hook_point: Option<String>, chain: ProcessChainConfig) -> Result<()> {
-        if config_id == GATEWAY_CONTROL_SERVER_KEY {
-            return Err(anyhow::Error::new(cmd_err!(
-            ControlErrorCode::ConfigNotFound,
-            "Config not found: {}", config_id,
-        )));
+    fn add_rule_to_config(mut raw_config: Value, id: &str, rule: &str) -> Result<Value> {
+        let id_list = id.split(':').collect::<Vec<&str>>();
+        if id_list.len() < 2 {
+            return Err(anyhow!("Invalid config id: {}", id));
         }
+        let config_type = id_list[0];
+        if config_type != "stack" && config_type != "server" {
+            return Err(anyhow!("Invalid config type: {}", config_type));
+        }
+        let config_id = id_list[1];
+        if config_id == GATEWAY_CONTROL_SERVER_KEY {
+            return Err(anyhow!(cmd_err!(
+                ControlErrorCode::ConfigNotFound,
+                "Config not found: {}", config_id,
+            )));
+        }
+
+        let mut index = 2;
+        if id_list.len() > index && id_list[index] == "hook_point" {
+            index += 1;
+        }
+
+        let chain_id = if id_list.len() > index { Some(id_list[index]) } else { None };
+        index += 1;
+        if id_list.len() > index && id_list[index] == "blocks" {
+            index += 1;
+        }
+        let block_id = if id_list.len() > index { Some(id_list[index]) } else { None };
+
+        let root_key = if config_type == "stack" { "stacks" } else { "servers" };
+        let stacks_or_servers = raw_config
+            .get_mut(root_key)
+            .ok_or_else(|| anyhow!("{} not found in config", root_key))?;
+        let stacks_or_servers = stacks_or_servers
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("{} must be an object", root_key))?;
+        let target_config = stacks_or_servers
+            .get_mut(config_id)
+            .ok_or_else(|| anyhow!("Config not found: {}", config_id))?;
+        let target_config = target_config
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("Invalid {} config: {}", config_type, config_id))?;
+        if config_type == "server" {
+            let server_type = target_config.get("type");
+            if server_type != Some(&Value::String("http".to_string())) {
+                return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
+            }
+        }
+
+        let hook_point_value = target_config
+            .entry("hook_point")
+            .or_insert_with(|| Value::Object(Map::new()));
+        let hook_point = hook_point_value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("hook_point must be an object"))?;
+
+        let chain_id = if let Some(chain_id) = chain_id {
+            chain_id.to_string()
+        } else {
+            Self::gen_unique_id(hook_point)
+        };
+
+        let chain_priority = Self::next_highest_priority(hook_point);
+        let chain_value = hook_point.entry(chain_id.clone()).or_insert_with(|| {
+            let mut map = Map::new();
+            map.insert("priority".to_string(), Value::Number(chain_priority.into()));
+            map.insert("blocks".to_string(), Value::Object(Map::new()));
+            Value::Object(map)
+        });
+        let chain_value = chain_value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("chain {} must be an object", chain_id))?;
+        let blocks_value = chain_value
+            .entry("blocks")
+            .or_insert_with(|| Value::Object(Map::new()));
+        let blocks = blocks_value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("blocks must be an object"))?;
+
+        match block_id {
+            None => {
+                let block_priority = Self::next_highest_priority(blocks);
+                let new_block_id = Self::gen_unique_id(blocks);
+                let mut block = Map::new();
+                block.insert("priority".to_string(), Value::Number(block_priority.into()));
+                block.insert("block".to_string(), Value::String(rule.to_string()));
+                blocks.insert(new_block_id, Value::Object(block));
+            }
+            Some(block_id) => {
+                if let Some(_) = blocks.get_mut(block_id) {
+                    return Err(anyhow!(
+                        "Block {} already exists in chain {}",
+                        block_id,
+                        chain_id
+                    ));
+                } else {
+                    let block_priority = Self::next_highest_priority(blocks);
+                    let mut block = Map::new();
+                    block.insert("priority".to_string(), Value::Number(block_priority.into()));
+                    block.insert("block".to_string(), Value::String(rule.to_string()));
+                    blocks.insert(block_id.to_string(), Value::Object(block));
+                }
+            }
+        }
+        Ok(raw_config)
+    }
+
+    fn gen_unique_id(map: &Map<String, Value>) -> String {
+        loop {
+            let candidate: String = rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(5)
+                .map(char::from)
+                .collect();
+            let candidate = candidate.to_lowercase();
+            if !map.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    fn next_highest_priority(map: &Map<String, Value>) -> i32 {
+        let mut min_priority: Option<i32> = None;
+        for value in map.values() {
+            if let Some(obj) = value.as_object() {
+                if let Some(p) = obj.get("priority").and_then(|v| v.as_i64()) {
+                    let p = p as i32;
+                    min_priority = Some(min_priority.map_or(p, |m| m.min(p)));
+                }
+            }
+        }
+        min_priority.map(|p| p - 1).unwrap_or(1)
+    }
+
+    pub async fn add_rule(&self, id: &str, rule: &str) -> Result<()> {
+        let id_list = id.split(':').collect::<Vec<&str>>();
+        if id_list.len() < 2 {
+            return Err(anyhow!("Invalid config id: {}", id));
+        }
+        let config_type = id_list[0];
+        let config_id = id_list[1];
+        if config_id == GATEWAY_CONTROL_SERVER_KEY {
+            return Err(anyhow!(cmd_err!(
+                ControlErrorCode::ConfigNotFound,
+                "Config not found: {}", config_id,
+            )));
+        }
+
+        let raw_config = {
+            self.config.lock().unwrap().raw_config.clone()
+        };
+        let raw_config = Self::add_rule_to_config(raw_config, id, rule)?;
+        let gateway_config = self.parser
+            .parse(raw_config)
+            .map_err(|e| anyhow!("parse config failed: {}", e))?;
         match config_type {
             "stack" => {
-                let mut stack_info = None;
-                {
-                    let config = self.config.lock().unwrap();
-                    for (index, stack) in config.stacks.iter().enumerate() {
-                        if stack.id() == config_id {
-                            let new_stack = stack.add_process_chain(chain);
-                            stack_info = Some((index, new_stack));
-                            break;
-                        }
-                    }
-                }
-                if let Some((index, stack_config)) = stack_info {
-                    if let Some(stack) = self.stack_manager.get_stack(config_id) {
-                        stack.update_config(stack_config.clone()).await?;
-                        let mut config = self.config.lock().unwrap();
-                        config.stacks[index] = stack_config;
-                    }
+                let new_stack_config = gateway_config
+                    .stacks
+                    .iter()
+                    .find(|s| s.id() == config_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("stack config not found after parse: {}", config_id))?;
+
+                if let Some(stack) = self.stack_manager.get_stack(config_id) {
+                    stack.update_config(new_stack_config.clone()).await?;
                 }
             }
             "server" => {
-                let hook_point = hook_point.unwrap_or("pre".to_string());
-                let mut server_info = None;
-                {
-                    let config = self.config.lock().unwrap();
-                    for (index, server) in config.servers.iter().enumerate() {
-                        if server.id() == config_id {
-                            let new_server = if hook_point == "pre" {
-                                server.add_pre_hook_point_process_chain(chain)
-                            } else {
-                                server.add_post_hook_point_process_chain(chain)
-                            };
-                            server_info = Some((index, new_server));
-                            break;
-                        }
-                    }
-                }
-                if let Some((index, server_config)) = server_info {
-                    let new_server = self.server_factory.create(server_config.clone()).await?;
-                    for server in new_server.into_iter() {
-                        self.server_manager.replace_server(server);
-                    }
-                    let mut config = self.config.lock().unwrap();
-                    config.servers[index] = server_config;
+                let new_server_config = gateway_config
+                    .servers
+                    .iter()
+                    .find(|s| s.id() == config_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
+
+                let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+                for server in new_servers.into_iter() {
+                    self.server_manager.replace_server(server);
                 }
             }
             _ => {
-                Err(cmd_err!(
+                return Err(anyhow!(cmd_err!(
                     ControlErrorCode::InvalidConfigType,
                     "Invalid config type: {}", config_type,
-                ))?;
+                )));
             }
         }
+
+        let mut guard = self.config.lock().unwrap();
+        *guard = gateway_config;
         Ok(())
     }
 
@@ -669,13 +808,13 @@ pub struct GatewayCmdHandler {
     gateway: Mutex<Option<Arc<Gateway>>>,
     external_cmd_store: ExternalCmdStoreRef,
     config_file: PathBuf,
-    parser: GatewayConfigParser,
+    parser: GatewayConfigParserRef,
 }
 
 impl GatewayCmdHandler {
     pub fn new(external_cmd_store: ExternalCmdStoreRef,
                config_file: PathBuf,
-               parser: GatewayConfigParser, ) -> Arc<Self> {
+               parser: GatewayConfigParserRef, ) -> Arc<Self> {
         Arc::new(Self {
             gateway: Mutex::new(None),
             external_cmd_store,
@@ -812,37 +951,20 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 }).collect::<Vec<_>>();
                 Ok(serde_json::to_value(conn_infos).map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
             }
-            "add_chain" => {
+            "add_rule" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)
                     .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
-                let config_type = params.get("config_type");
-                let config_id = params.get("config_id");
-                let hook_point = params.get("hook_point");
-                let chain_id = params.get("chain_id");
-                let chain_type = params.get("chain_type");
-                let chain_params = params.get("chain_params");
-                if config_type.is_none() || config_id.is_none() || chain_id.is_none() || chain_type.is_none() || chain_params.is_none() {
+                let id = params.get("id");
+                let rule = params.get("rule");
+                if id.is_none() || rule.is_none() {
                     Err(cmd_err!(
                         ControlErrorCode::InvalidParams,
-                        "Invalid params: config_type or chain_id or config_id or chain_type or chain_params is None",
+                        "Invalid params: id or rule is None",
                     ))?;
                 }
-                let cmd = self.external_cmd_store.read_external_cmd(chain_type.unwrap()).await?;
-                let block = self.run_external_cmd(cmd.as_str(), chain_params.unwrap().as_str()).await?;
-                let process_chain_config = ProcessChainConfig {
-                    id: chain_id.unwrap().to_string(),
-                    priority: 0,
-                    blocks: vec![BlockConfig {
-                        id: "main".to_string(),
-                        priority: 1,
-                        block: block.trim().to_string(),
-                    }],
-                };
-                gateway.add_chain(
-                    config_type.unwrap(),
-                    config_id.unwrap(),
-                    hook_point.map(|s| s.to_string()),
-                    process_chain_config,
+                gateway.add_rule(
+                    id.unwrap(),
+                    rule.unwrap(),
                 ).await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
@@ -1072,9 +1194,12 @@ impl ExternalCmdStore for LocalExternalCmdStore {
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
+    use std::path::PathBuf;
     use super::super::gateway::*;
     use kRPC::RPCSessionToken;
     use chrono::Utc;
+    use serde_json::json;
+    use tempfile::TempDir;
 
     pub struct TempKeyStore {
         private_key: tokio::sync::Mutex<tempfile::NamedTempFile>,
@@ -1123,6 +1248,84 @@ mod tests {
             public_file.write_all(serde_json::to_string(&public_key).unwrap().as_bytes()).unwrap();
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn test_add_rule_to_existing_block_preserves_priority_and_prepends() {
+        let raw_config = json!({
+            "stacks": {
+                "s1": {
+                    "protocol": "tcp",
+                    "bind": "0.0.0.0:1",
+                    "hook_point": {
+                        "main": {
+                            "priority": 2,
+                            "blocks": {
+                                "default": {
+                                    "priority": 2,
+                                    "block": "old;"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "servers": {
+                "s1": {
+                    "type": "http",
+                    "hook_point": {
+                        "main": {
+                            "priority": 2,
+                            "blocks": {
+                                "default": {
+                                    "priority": 2,
+                                    "block": "old;"
+                                }
+                            }
+                        }
+                    }
+                },
+                "s2": {
+                    "type": "dir",
+                    "root_path": ""
+                }
+            }
+        });
+
+        let ret = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:hook_point:main:default", "new;");
+        assert!(ret.is_err());
+        let ret = Gateway::add_rule_to_config(raw_config.clone(), "stack:s2:hook_point:main", "new;");
+        assert!(ret.is_err());        
+        let ret = Gateway::add_rule_to_config(raw_config.clone(), "server:s2", "new;");
+        assert!(ret.is_err());
+
+        let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:hook_point:main:default1", "new;").unwrap();
+
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"].as_object().unwrap();
+        assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(1));
+        let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
+
+        let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main:default1", "new;").unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"].as_object().unwrap();
+        assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(1));
+        let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(block_str, "new;");
+
+        let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main:blocks:default1", "new;").unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"].as_object().unwrap();
+        assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(1));
+        let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(block_str, "new;");
+
+        let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main", "new;").unwrap();
+        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].clone();
+        let block_str = serde_json::to_string(&blocks).unwrap();
+        println!("{}", block_str);
+
+        let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
+        let blocks = updated["stacks"]["s1"]["hook_point"].clone();
+        let block_str = serde_json::to_string(&blocks).unwrap();
+        println!("{}", block_str);
     }
 
     #[tokio::test]

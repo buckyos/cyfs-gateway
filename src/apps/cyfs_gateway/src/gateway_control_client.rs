@@ -66,15 +66,11 @@ impl GatewayControlClient {
         Ok(result)
     }
 
-    pub async fn add_chain(&self, config_type: &str, config_id: &str, hook_point: &str, chain_id: &str, chain_type: &str, chain_params: &str) -> ControlResult<Value> {
+    pub async fn add_rule(&self, id: &str, rule: &str) -> ControlResult<Value> {
         let mut params = HashMap::new();
-        params.insert("config_type", config_type);
-        params.insert("config_id", config_id);
-        params.insert("chain_type", chain_type);
-        params.insert("chain_params", chain_params);
-        params.insert("hook_point", hook_point);
-        params.insert("chain_id", chain_id);
-        let result = self.krpc.call("add_chain", serde_json::to_value(&params).unwrap()).await
+        params.insert("id", id);
+        params.insert("rule", rule);
+        let result = self.krpc.call("add_rule", serde_json::to_value(&params).unwrap()).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
 
         Ok(result)
