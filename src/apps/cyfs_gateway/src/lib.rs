@@ -716,14 +716,11 @@ pub async fn cyfs_gateway_main() {
                 }
             }
         }
-        Some(("del_chain", sub_matches)) => {
-            let config_type = sub_matches.get_one::<String>("config_type").expect("config_type is required");
-            let config_id = sub_matches.get_one::<String>("config_id").expect("config_id is required");
-            let chain_id = sub_matches.get_one::<String>("chain_id").expect("chain_id is required");
-            let hook_point = sub_matches.get_one::<String>("hook_point").expect("hook_point is required");
+        Some(("del_rule", sub_matches)) => {
+            let id = sub_matches.get_one::<String>("id").expect("id is required");
             let server = sub_matches.get_one::<String>("server").expect("server is required");
             let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
-            match cyfs_cmd_client.del_chain(config_type, config_id, chain_id, hook_point).await {
+            match cyfs_cmd_client.del_rule(id).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
@@ -732,7 +729,7 @@ pub async fn cyfs_gateway_main() {
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("del chain error: {}", e);
+                    println!("del rule error: {}", e);
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }

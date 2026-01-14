@@ -54,13 +54,10 @@ impl GatewayControlClient {
         Ok(result)
     }
 
-    pub async fn del_chain(&self, config_type: &str, config_id: &str, chain_id: &str, hook_point: &str) -> ControlResult<Value> {
+    pub async fn del_rule(&self, id: &str) -> ControlResult<Value> {
         let mut params = HashMap::new();
-        params.insert("config_type", config_type);
-        params.insert("config_id", config_id);
-        params.insert("chain_id", chain_id);
-        params.insert("hook_point", hook_point);
-        let result = self.krpc.call("del_chain", serde_json::to_value(&params).unwrap()).await
+        params.insert("id", id);
+        let result = self.krpc.call("del_rule", serde_json::to_value(&params).unwrap()).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
 
         Ok(result)

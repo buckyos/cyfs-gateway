@@ -429,12 +429,20 @@ impl Gateway {
                 blocks.insert(new_block_id, Value::Object(block));
             }
             Some(block_id) => {
-                if let Some(_) = blocks.get_mut(block_id) {
-                    return Err(anyhow!(
-                        "Block {} already exists in chain {}",
-                        block_id,
-                        chain_id
-                    ));
+                if let Some(block_value) = blocks.get_mut(block_id) {
+                    let block_value = block_value
+                        .as_object_mut()
+                        .ok_or_else(|| anyhow!("block {} must be an object", block_id))?;
+                    let old_rule = block_value
+                        .get("block")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let mut new_rule = rule.to_string();
+                    if !rule.ends_with('\n') {
+                        new_rule.push('\n');
+                    }
+                    new_rule.push_str(old_rule);
+                    block_value.insert("block".to_string(), Value::String(new_rule));
                 } else {
                     let block_priority = Self::next_highest_priority(blocks);
                     let mut block = Map::new();
@@ -534,61 +542,207 @@ impl Gateway {
         Ok(())
     }
 
-    pub async fn remove_chain(&self, config_type: &str, config_id: &str, hook_point: Option<String>, chain_id: &str) -> Result<()> {
+    fn remove_rule_from_config(mut raw_config: Value, id: &str) -> Result<Value> {
+        let id_list = id.split(':').collect::<Vec<&str>>();
+        if id_list.len() < 3 {
+            return Err(anyhow!("Invalid rule id: {}", id));
+        }
+        let config_type = id_list[0];
+        if config_type != "stack" && config_type != "server" {
+            return Err(anyhow!("Invalid config type: {}", config_type));
+        }
+        let config_id = id_list[1];
+        if config_id == GATEWAY_CONTROL_SERVER_KEY {
+            return Err(anyhow!(cmd_err!(
+                ControlErrorCode::ConfigNotFound,
+                "Config not found: {}", config_id,
+            )));
+        }
+
+        let mut index = 2;
+        if id_list.len() > index && id_list[index] == "hook_point" {
+            index += 1;
+        }
+        let chain_id = id_list.get(index).ok_or_else(|| anyhow!("Missing chain id in {}", id))?;
+        index += 1;
+        if id_list.len() > index && id_list[index] == "blocks" {
+            index += 1;
+        }
+        let block_id = id_list.get(index).copied();
+
+        let root_key = if config_type == "stack" { "stacks" } else { "servers" };
+        let stacks_or_servers = raw_config
+            .get_mut(root_key)
+            .ok_or_else(|| anyhow!("{} not found in config", root_key))?;
+        let stacks_or_servers = stacks_or_servers
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("{} must be an object", root_key))?;
+        let target_config = stacks_or_servers
+            .get_mut(config_id)
+            .ok_or_else(|| anyhow!("Config not found: {}", config_id))?;
+        let target_config = target_config
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("Invalid {} config: {}", config_type, config_id))?;
+
+        if config_type == "server" {
+            let server_type = target_config.get("type");
+            if server_type != Some(&Value::String("http".to_string())) {
+                return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
+            }
+        }
+
+        let hook_point_value = target_config
+            .get_mut("hook_point")
+            .ok_or_else(|| anyhow!("hook_point not found"))?;
+        let hook_point = hook_point_value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("hook_point must be an object"))?;
+
+        let only_chain = hook_point.len() == 1;
+        let line_spec = if id_list.len() > index + 1 { Some(id_list[index + 1..].join(":")) } else { None };
+        if line_spec.is_some() && block_id.is_none() {
+            return Err(anyhow!("line range can only be used when block id is specified"));
+        }
+
+        let chain_value = hook_point
+            .get_mut(*chain_id)
+            .ok_or_else(|| anyhow!("chain not found: {}", chain_id))?;
+        let chain_obj = chain_value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("chain {} must be an object", chain_id))?;
+        let blocks_value = chain_obj
+            .get_mut("blocks")
+            .ok_or_else(|| anyhow!("blocks not found in chain {}", chain_id))?;
+        let blocks = blocks_value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("blocks must be an object"))?;
+
+        let only_block = blocks.len() == 1;
+        if only_chain && only_block && block_id.is_some() && line_spec.is_none() {
+            return Err(anyhow!("cannot delete the last block of the last chain"));
+        }
+
+        if let Some(block_id) = block_id {
+            let block_value = blocks
+                .get_mut(block_id)
+                .ok_or_else(|| anyhow!("block not found: {}", block_id))?;
+            let mut block_obj = block_value
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow!("block {} must be an object", block_id))?;
+
+            if let Some(line_spec) = line_spec.as_deref() {
+                let block_content = block_obj
+                    .get("block")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("block content not found"))?;
+                let ends_with_newline = block_content.ends_with('\n');
+                let mut lines: Vec<String> = block_content.lines().map(|s| s.to_string()).collect();
+                if lines.is_empty() {
+                    return Err(anyhow!("block content is empty"));
+                }
+
+                let (start_str, end_str) = if let Some((s, e)) = line_spec.split_once(':') {
+                    (s, e)
+                } else {
+                    (line_spec, line_spec)
+                };
+                let start: usize = start_str.parse().map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
+                let end: usize = end_str.parse().map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
+                if start == 0 || end == 0 || start > end || end > lines.len() {
+                    return Err(anyhow!("line range out of bounds"));
+                }
+
+                lines.drain((start - 1)..end);
+                if lines.is_empty() {
+                    if only_chain && only_block {
+                        return Err(anyhow!("cannot delete the last block of the last chain"));
+                    }
+                    blocks.remove(block_id);
+                } else {
+                    let mut new_content = lines.join("\n");
+                    if ends_with_newline && !new_content.is_empty() && !new_content.ends_with('\n') {
+                        new_content.push('\n');
+                    }
+                    block_obj.insert("block".to_string(), Value::String(new_content));
+                    *block_value = Value::Object(block_obj);
+                }
+            } else {
+                blocks.remove(block_id);
+            }
+        } else {
+            // remove entire chain
+            if only_chain && only_block {
+                return Err(anyhow!("cannot delete the last block of the last chain"));
+            }
+            hook_point.remove(*chain_id);
+            return Ok(raw_config);
+        }
+
+        if blocks.is_empty() {
+            hook_point.remove(*chain_id);
+        }
+        Ok(raw_config)
+    }
+
+    pub async fn remove_rule(&self, id: &str) -> Result<()> {
+        let id_list = id.split(':').collect::<Vec<&str>>();
+        if id_list.len() < 3 {
+            return Err(anyhow!("Invalid rule id: {}", id));
+        }
+        let config_type = id_list[0];
+        let config_id = id_list[1];
+        if config_id == GATEWAY_CONTROL_SERVER_KEY {
+            return Err(anyhow!(cmd_err!(
+                ControlErrorCode::ConfigNotFound,
+                "Config not found: {}", config_id,
+            )));
+        }
+
+        let raw_config = {
+            self.config.lock().unwrap().raw_config.clone()
+        };
+        let raw_config = Self::remove_rule_from_config(raw_config, id)?;
+        let gateway_config = self.parser
+            .parse(raw_config)
+            .map_err(|e| anyhow!("parse config failed: {}", e))?;
+
         match config_type {
             "stack" => {
-                let mut stack_info = None;
-                {
-                    let config = self.config.lock().unwrap();
-                    for (index, stack) in config.stacks.iter().enumerate() {
-                        if stack.id() == config_id {
-                            let new_stack = stack.remove_process_chain(chain_id);
-                            stack_info = Some((index, new_stack));
-                            break;
-                        }
-                    }
-                }
-                if let Some((index, stack_config)) = stack_info {
-                    if let Some(stack) = self.stack_manager.get_stack(config_id) {
-                        stack.update_config(stack_config.clone()).await?;
-                        let mut config = self.config.lock().unwrap();
-                        config.stacks[index] = stack_config;
-                    }
+                let new_stack_config = gateway_config
+                    .stacks
+                    .iter()
+                    .find(|s| s.id() == config_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("stack config not found after parse: {}", config_id))?;
+
+                if let Some(stack) = self.stack_manager.get_stack(config_id) {
+                    stack.update_config(new_stack_config.clone()).await?;
                 }
             }
             "server" => {
-                let hook_point = hook_point.unwrap_or("pre".to_string());
-                let mut server_info = None;
-                {
-                    let config = self.config.lock().unwrap();
-                    for (index, server) in config.servers.iter().enumerate() {
-                        if server.id() == config_id {
-                            let new_server = if hook_point == "pre" {
-                                server.remove_pre_hook_point_process_chain(chain_id)
-                            } else {
-                                server.remove_post_hook_point_process_chain(chain_id)
-                            };
-                            server_info = Some((index, new_server));
-                            break;
-                        }
-                    }
-                }
-                if let Some((index, server_config)) = server_info {
-                    let new_server = self.server_factory.create(server_config.clone()).await?;
-                    for server in new_server.into_iter() {
-                        self.server_manager.replace_server(server);
-                    }
-                    let mut config = self.config.lock().unwrap();
-                    config.servers[index] = server_config;
+                let new_server_config = gateway_config
+                    .servers
+                    .iter()
+                    .find(|s| s.id() == config_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
+
+                let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+                for server in new_servers.into_iter() {
+                    self.server_manager.replace_server(server);
                 }
             }
             _ => {
-                Err(cmd_err!(
+                return Err(anyhow!(cmd_err!(
                     ControlErrorCode::InvalidConfigType,
                     "Invalid config type: {}", config_type,
-                ))?;
+                )));
             }
         }
+
+        let mut guard = self.config.lock().unwrap();
+        *guard = gateway_config;
         Ok(())
     }
 
@@ -918,24 +1072,17 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))
                 }
             },
-            "del_chain" => {
+            "del_rule" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)
                     .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
-                let config_type = params.get("config_type");
-                let config_id = params.get("config_id");
-                let hook_point = params.get("hook_point");
-                let chain_id = params.get("chain_id");
-                if config_type.is_none() || config_id.is_none() || chain_id.is_none() {
+                let id = params.get("id");
+                if id.is_none() {
                     Err(cmd_err!(
                         ControlErrorCode::InvalidParams,
-                        "Invalid params: config_type or chain_id or config_id is None",
+                        "Invalid params: id is None",
                     ))?;
                 }
-
-                gateway.remove_chain(config_type.unwrap(),
-                                     config_id.unwrap(),
-                                     hook_point.map(|s| s.to_string()),
-                                     params.get("chain_id").unwrap()).await
+                gateway.remove_rule(id.unwrap()).await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
@@ -1293,7 +1440,14 @@ mod tests {
         });
 
         let ret = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:hook_point:main:default", "new;");
-        assert!(ret.is_err());
+        assert!(ret.is_ok());
+        let updated = ret.unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default"].as_object().unwrap();
+        assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(2));
+        let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
+        println!("{}", block_str);
+        assert_eq!(block_str, "new;\nold;");
+
         let ret = Gateway::add_rule_to_config(raw_config.clone(), "stack:s2:hook_point:main", "new;");
         assert!(ret.is_err());        
         let ret = Gateway::add_rule_to_config(raw_config.clone(), "server:s2", "new;");
@@ -1319,13 +1473,129 @@ mod tests {
 
         let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main", "new;").unwrap();
         let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].clone();
-        let block_str = serde_json::to_string(&blocks).unwrap();
-        println!("{}", block_str);
-
         let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
         let blocks = updated["stacks"]["s1"]["hook_point"].clone();
-        let block_str = serde_json::to_string(&blocks).unwrap();
-        println!("{}", block_str);
+    }
+
+    #[tokio::test]
+    async fn test_remove_rule_from_config() {
+        let raw_config = json!({
+            "stacks": {
+                "s1": {
+                    "protocol": "tcp",
+                    "bind": "0.0.0.0:1",
+                    "hook_point": {
+                        "main": {
+                            "priority": 2,
+                            "blocks": {
+                                "b1": {
+                                    "priority": 2,
+                                    "block": "old;"
+                                },
+                                "b2": {
+                                    "priority": 3,
+                                    "block": "old2;"
+                                }
+                            }
+                        },
+                        "main2": {
+                            "priority": 2,
+                            "blocks": {
+                                "b1": {
+                                    "priority": 2,
+                                    "block": "old;"
+                                },
+                                "b2": {
+                                    "priority": 3,
+                                    "block": "old2;"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // remove a specific block
+        let updated = Gateway::remove_rule_from_config(raw_config.clone(), "stack:s1:hook_point:main:b1").unwrap();
+        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].as_object().unwrap();
+        assert!(!blocks.contains_key("b1"));
+        assert!(blocks.contains_key("b2"));
+
+        // remove last block should drop chain
+        let updated = Gateway::remove_rule_from_config(updated, "stack:s1:hook_point:main:b2").unwrap();
+        assert!(updated["stacks"]["s1"]["hook_point"].get("main").is_none());
+
+        // single chain/block guard
+        let single = json!({
+            "stacks": {
+                "s1": {
+                    "protocol": "tcp",
+                    "bind": "0.0.0.0:1",
+                    "hook_point": {
+                        "main": {
+                            "priority": 1,
+                            "blocks": {
+                                "b1": {
+                                    "priority": 1,
+                                    "block": "only;"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let err = Gateway::remove_rule_from_config(single, "stack:s1:hook_point:main:b1");
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_remove_rule_from_config_line_range() {
+        let raw_config = json!({
+            "stacks": {
+                "s1": {
+                    "protocol": "tcp",
+                    "bind": "0.0.0.0:1",
+                    "hook_point": {
+                        "main": {
+                            "priority": 1,
+                            "blocks": {
+                                "b1": {
+                                    "priority": 1,
+                                    "block": "line1\nline2\nline3\n"
+                                },
+                                "b2": {
+                                    "priority": 2,
+                                    "block": "keep;"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // remove middle line
+        let updated = Gateway::remove_rule_from_config(raw_config.clone(), "stack:s1:hook_point:main:b1:2").unwrap();
+        let content = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(content.contains("line1"));
+        assert!(content.contains("line3"));
+        assert!(!content.contains("line2"));
+
+        // remove remaining lines, block should be removed but chain stays because b2 exists
+        let updated = Gateway::remove_rule_from_config(updated, "stack:s1:hook_point:main:b1:1:2").unwrap();
+        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]
+            .as_object()
+            .unwrap();
+        assert!(!blocks.contains_key("b1"));
+        assert!(blocks.contains_key("b2"));
+
+        let updated = Gateway::remove_rule_from_config(updated, "stack:s1:hook_point:main:b2:1:2");
+        assert!(updated.is_err());
     }
 
     #[tokio::test]
