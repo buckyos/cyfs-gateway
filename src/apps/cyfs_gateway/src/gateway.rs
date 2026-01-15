@@ -370,7 +370,13 @@ impl Gateway {
         }
         let block_id = if id_list.len() > index { Some(id_list[index]) } else { None };
 
-        let root_key = if config_type == "stack" { "stacks" } else { "servers" };
+        let root_key = if config_type == "stack" {
+            "stacks"
+        } else if config_type == "server" {
+            "servers"
+        } else {
+            return Err(anyhow!("Invalid config type: {}", config_type));
+        };
         let stacks_or_servers = raw_config
             .get_mut(root_key)
             .ok_or_else(|| anyhow!("{} not found in config", root_key))?;
@@ -385,7 +391,7 @@ impl Gateway {
             .ok_or_else(|| anyhow!("Invalid {} config: {}", config_type, config_id))?;
         if config_type == "server" {
             let server_type = target_config.get("type");
-            if server_type != Some(&Value::String("http".to_string())) {
+            if server_type != Some(&Value::String("http".to_string())) && server_type != Some(&Value::String("dns".to_string())) {
                 return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
             }
         }
@@ -524,7 +530,13 @@ impl Gateway {
         }
         let block_id = if id_list.len() > index { Some(id_list[index]) } else { None };
 
-        let root_key = if config_type == "stack" { "stacks" } else { "servers" };
+        let root_key = if config_type == "stack" {
+            "stacks"
+        } else if config_type == "server" {
+            "servers"
+        } else {
+            return Err(anyhow!("Invalid config type: {}", config_type));
+        };
         let stacks_or_servers = raw_config
             .get_mut(root_key)
             .ok_or_else(|| anyhow!("{} not found in config", root_key))?;
@@ -540,7 +552,7 @@ impl Gateway {
 
         if config_type == "server" {
             let server_type = target_config.get("type");
-            if server_type != Some(&Value::String("http".to_string())) {
+            if server_type != Some(&Value::String("http".to_string())) && server_type != Some(&Value::String("dns".to_string())) {
                 return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
             }
         }
@@ -609,6 +621,147 @@ impl Gateway {
         Ok(raw_config)
     }
 
+    fn move_rule_in_config(mut raw_config: Value, id: &str, new_pos: i32) -> Result<Value> {
+        let id_list = id.split(':').collect::<Vec<&str>>();
+        if id_list.len() < 3 {
+            return Err(anyhow!("Invalid id: {}", id));
+        }
+        let config_type = id_list[0];
+        if config_type != "stack" && config_type != "server" {
+            return Err(anyhow!("Invalid config type: {}", config_type));
+        }
+        let config_id = id_list[1];
+        if config_id == GATEWAY_CONTROL_SERVER_KEY {
+            return Err(anyhow!(cmd_err!(
+                ControlErrorCode::ConfigNotFound,
+                "Config not found: {}", config_id,
+            )));
+        }
+
+        let mut index = 2;
+        if id_list.len() > index && id_list[index] == "hook_point" {
+            index += 1;
+        }
+        let chain_id = id_list.get(index).ok_or_else(|| anyhow!("Missing chain id in {}", id))?;
+        index += 1;
+        if id_list.len() > index && id_list[index] == "blocks" {
+            index += 1;
+        }
+        let block_id = id_list.get(index).copied();
+        let line_spec = if id_list.len() > index + 1 {
+            Some(id_list[index + 1..].join(":"))
+        } else {
+            None
+        };
+        if line_spec.is_some() && block_id.is_none() {
+            return Err(anyhow!("line position can only be used when block id is specified"));
+        }
+
+        let root_key = if config_type == "stack" {
+            "stacks"
+        } else if config_type == "server" {
+            "servers"
+        } else {
+            return Err(anyhow!("Invalid config type: {}", config_type));
+        };
+        let stacks_or_servers = raw_config
+            .get_mut(root_key)
+            .ok_or_else(|| anyhow!("{} not found in config", root_key))?;
+        let stacks_or_servers = stacks_or_servers
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("{} must be an object", root_key))?;
+        let target_config = stacks_or_servers
+            .get_mut(config_id)
+            .ok_or_else(|| anyhow!("Config not found: {}", config_id))?;
+        let target_config = target_config
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("Invalid {} config: {}", config_type, config_id))?;
+
+        if config_type == "server" {
+            let server_type = target_config.get("type");
+            if server_type != Some(&Value::String("http".to_string())) && server_type != Some(&Value::String("dns".to_string())) {
+                return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
+            }
+        }
+
+        let hook_point_value = target_config
+            .get_mut("hook_point")
+            .ok_or_else(|| anyhow!("hook_point not found"))?;
+        let hook_point = hook_point_value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("hook_point must be an object"))?;
+
+        let chain_value = hook_point
+            .get_mut(*chain_id)
+            .ok_or_else(|| anyhow!("chain not found: {}", chain_id))?;
+        let chain_obj = chain_value
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("chain {} must be an object", chain_id))?;
+
+        if let Some(block_id) = block_id {
+            let blocks_value = chain_obj
+                .get_mut("blocks")
+                .ok_or_else(|| anyhow!("blocks not found in chain {}", chain_id))?;
+            let blocks = blocks_value
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("blocks must be an object"))?;
+
+            let block_value = blocks
+                .get_mut(block_id)
+                .ok_or_else(|| anyhow!("block not found: {}", block_id))?;
+            let block_obj = block_value
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("block {} must be an object", block_id))?;
+
+            if let Some(line_spec) = line_spec {
+                let block_content = block_obj
+                    .get("block")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("block content not found"))?;
+                let ends_with_newline = block_content.ends_with('\n');
+                let mut lines: Vec<String> = block_content.lines().map(|s| s.to_string()).collect();
+                if lines.is_empty() {
+                    return Err(anyhow!("block content is empty"));
+                }
+
+                let (start_str, end_str) = if let Some((s, e)) = line_spec.split_once(':') {
+                    (s, e)
+                } else {
+                    (line_spec.as_str(), line_spec.as_str())
+                };
+                let start: usize = start_str.parse().map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
+                let end: usize = end_str.parse().map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
+                if start == 0 || end == 0 || start > end || end > lines.len() {
+                    return Err(anyhow!("line range out of bounds"));
+                }
+                let start_idx = start - 1;
+                let end_idx = end - 1;
+                let mut moving: Vec<String> = lines.drain(start_idx..=end_idx).collect();
+                let remaining_len = lines.len();
+                let mut insert_at: usize = if new_pos <= 0 {
+                    0
+                } else {
+                    (new_pos as usize).saturating_sub(1)
+                };
+                if insert_at > remaining_len {
+                    insert_at = remaining_len;
+                }
+                lines.splice(insert_at..insert_at, moving.drain(..));
+                let mut new_content = lines.join("\n");
+                if ends_with_newline && !new_content.is_empty() && !new_content.ends_with('\n') {
+                    new_content.push('\n');
+                }
+                block_obj.insert("block".to_string(), Value::String(new_content));
+            } else {
+                block_obj.insert("priority".to_string(), Value::Number(new_pos.into()));
+            }
+        } else {
+            chain_obj.insert("priority".to_string(), Value::Number(new_pos.into()));
+        }
+
+        Ok(raw_config)
+    }
+
     fn append_rule_to_config(mut raw_config: Value, id: &str, rule: &str) -> Result<Value> {
         let id_list = id.split(':').collect::<Vec<&str>>();
         if id_list.len() < 2 {
@@ -637,7 +790,13 @@ impl Gateway {
         }
         let block_id = if id_list.len() > index { Some(id_list[index]) } else { None };
 
-        let root_key = if config_type == "stack" { "stacks" } else { "servers" };
+        let root_key = if config_type == "stack" {
+            "stacks"
+        } else if config_type == "server" {
+            "servers"
+        } else {
+            return Err(anyhow!("Invalid config type: {}", config_type));
+        };
         let stacks_or_servers = raw_config
             .get_mut(root_key)
             .ok_or_else(|| anyhow!("{} not found in config", root_key))?;
@@ -653,7 +812,7 @@ impl Gateway {
 
         if config_type == "server" {
             let server_type = target_config.get("type");
-            if server_type != Some(&Value::String("http".to_string())) {
+            if server_type != Some(&Value::String("http".to_string())) && server_type != Some(&Value::String("dns".to_string())) {
                 return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
             }
         }
@@ -904,6 +1063,67 @@ impl Gateway {
         Ok(())
     }
 
+    pub async fn move_rule(&self, id: &str, new_pos: i32) -> Result<()> {
+        let id_list = id.split(':').collect::<Vec<&str>>();
+        if id_list.len() < 3 {
+            return Err(anyhow!("Invalid rule id: {}", id));
+        }
+        let config_type = id_list[0];
+        let config_id = id_list[1];
+        if config_id == GATEWAY_CONTROL_SERVER_KEY {
+            return Err(anyhow!(cmd_err!(
+                ControlErrorCode::ConfigNotFound,
+                "Config not found: {}", config_id,
+            )));
+        }
+
+        let raw_config = {
+            self.config.lock().unwrap().raw_config.clone()
+        };
+        let raw_config = Self::move_rule_in_config(raw_config, id, new_pos)?;
+        let gateway_config = self.parser
+            .parse(raw_config)
+            .map_err(|e| anyhow!("parse config failed: {}", e))?;
+
+        match config_type {
+            "stack" => {
+                let new_stack_config = gateway_config
+                    .stacks
+                    .iter()
+                    .find(|s| s.id() == config_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("stack config not found after parse: {}", config_id))?;
+
+                if let Some(stack) = self.stack_manager.get_stack(config_id) {
+                    stack.update_config(new_stack_config.clone()).await?;
+                }
+            }
+            "server" => {
+                let new_server_config = gateway_config
+                    .servers
+                    .iter()
+                    .find(|s| s.id() == config_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
+
+                let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+                for server in new_servers.into_iter() {
+                    self.server_manager.replace_server(server);
+                }
+            }
+            _ => {
+                return Err(anyhow!(cmd_err!(
+                    ControlErrorCode::InvalidConfigType,
+                    "Invalid config type: {}", config_type,
+                )));
+            }
+        }
+
+        let mut guard = self.config.lock().unwrap();
+        *guard = gateway_config;
+        Ok(())
+    }
+
     fn remove_rule_from_config(mut raw_config: Value, id: &str) -> Result<Value> {
         let id_list = id.split(':').collect::<Vec<&str>>();
         if id_list.len() < 3 {
@@ -932,7 +1152,13 @@ impl Gateway {
         }
         let block_id = id_list.get(index).copied();
 
-        let root_key = if config_type == "stack" { "stacks" } else { "servers" };
+        let root_key = if config_type == "stack" {
+            "stacks"
+        } else if config_type == "server" {
+            "servers"
+        } else {
+            return Err(anyhow!("Invalid config type: {}", config_type));
+        };
         let stacks_or_servers = raw_config
             .get_mut(root_key)
             .ok_or_else(|| anyhow!("{} not found in config", root_key))?;
@@ -948,7 +1174,7 @@ impl Gateway {
 
         if config_type == "server" {
             let server_type = target_config.get("type");
-            if server_type != Some(&Value::String("http".to_string())) {
+            if server_type != Some(&Value::String("http".to_string())) && server_type != Some(&Value::String("dns".to_string())) {
                 return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
             }
         }
@@ -1519,6 +1745,27 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
+            "move_rule" => {
+                let params = serde_json::from_value::<HashMap<String, String>>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let id = params.get("id");
+                let pos = params.get("new_pos");
+                if id.is_none() || pos.is_none() {
+                    Err(cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "Invalid params: id or new_pos is None",
+                    ))?;
+                }
+                let pos: i32 = pos.unwrap().parse().map_err(|_| {
+                    cmd_err!(ControlErrorCode::InvalidParams, "new_pos must be integer")
+                })?;
+                gateway.move_rule(
+                    id.unwrap(),
+                    pos,
+                ).await
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                Ok(Value::String("ok".to_string()))
+            }
             "reload" => {
                 info!("*** reload gateway config ...");
                 let gateway_config = load_config_from_file(self.config_file.as_path()).await
@@ -2009,6 +2256,86 @@ mod tests {
         let b = blocks.values().next().unwrap().as_object().unwrap();
         assert_eq!(b.get("priority").and_then(|v| v.as_i64()), Some(7));
         assert_eq!(b.get("block").and_then(|v| v.as_str()), Some("nc"));
+    }
+
+    #[tokio::test]
+    async fn test_move_rule_updates_priority_and_lines() {
+        let raw_config = json!({
+            "stacks": {
+                "s1": {
+                    "protocol": "tcp",
+                    "bind": "0.0.0.0:1",
+                    "hook_point": {
+                        "main": {
+                            "priority": 5,
+                            "blocks": {
+                                "b1": {
+                                    "priority": 10,
+                                    "block": "l1\nl2\nl3\nl4\n"
+                                },
+                                "b2": {
+                                    "priority": 20,
+                                    "block": "keep;"
+                                }
+                            }
+                        },
+                        "other": {
+                            "priority": 8,
+                            "blocks": {
+                                "x1": {
+                                    "priority": 1,
+                                    "block": "x;"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // move chain priority
+        let updated = Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:hook_point:other", 2).unwrap();
+        let chains = updated["stacks"]["s1"]["hook_point"].as_object().unwrap();
+        assert_eq!(chains.get("other").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(chains.get("main").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()), Some(5));
+
+        let updated = Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:other", 2).unwrap();
+        let chains = updated["stacks"]["s1"]["hook_point"].as_object().unwrap();
+        assert_eq!(chains.get("other").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()), Some(2));
+        assert_eq!(chains.get("main").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()), Some(5));
+
+        let updated = Gateway::move_rule_in_config(raw_config.clone(), "stack:2other", 2);
+        assert!(updated.is_err());
+
+        // move block priority
+        let updated = Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b2", -1).unwrap();
+        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].as_object().unwrap();
+        assert_eq!(blocks.get("b2").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()), Some(-1));
+        assert_eq!(blocks.get("b1").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()), Some(10));
+
+        // move single line to top, keep trailing newline
+        let updated = Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b1:3", 1).unwrap();
+        let content = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(content, "l3\nl1\nl2\nl4\n");
+
+        // move multiple lines toward end
+        let updated = Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b1:1:2", 3).unwrap();
+        let content = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(content, "l3\nl4\nl1\nl2\n");
+
+        // move multiple lines toward end
+        let updated = Gateway::move_rule_in_config(raw_config, "stack:s1:hook_point:main:b1:1:2", 30).unwrap();
+        let content = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(content, "l3\nl4\nl1\nl2\n");
     }
 
     #[tokio::test]
