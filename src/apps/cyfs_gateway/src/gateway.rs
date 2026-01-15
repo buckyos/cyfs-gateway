@@ -1876,7 +1876,7 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))
                 }
             },
-            "del_rule" => {
+            "remove_rule" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)
                     .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
                 let id = params.get("id");

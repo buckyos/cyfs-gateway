@@ -613,7 +613,7 @@ pub async fn cyfs_gateway_main() {
                 .help("server url")
                 .required(false)
                 .default_value(CONTROL_SERVER)))
-        .subcommand(Command::new("del_rule")
+        .subcommand(Command::new("remove_rule")
             .about("Delete a rule")
             .arg(Arg::new("id")
                 .help("rule id")
@@ -775,11 +775,11 @@ pub async fn cyfs_gateway_main() {
                 }
             }
         }
-        Some(("del_rule", sub_matches)) => {
+        Some(("remove_rule", sub_matches)) => {
             let id = sub_matches.get_one::<String>("id").expect("id is required");
             let server = sub_matches.get_one::<String>("server").expect("server is required");
             let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
-            match cyfs_cmd_client.del_rule(id).await {
+            match cyfs_cmd_client.remove_rule(id).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {

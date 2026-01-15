@@ -298,10 +298,10 @@ mod tests {
 
         {
             let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
-            let ret = cyfs_cmd_client.del_rule("server:www.buckyos.com:main:test2").await;
+            let ret = cyfs_cmd_client.remove_rule("server:www.buckyos.com:main:test2").await;
             assert!(ret.is_ok());
 
-            let ret = cyfs_cmd_client.del_rule("server:www.buckyos.com:main:test2").await;
+            let ret = cyfs_cmd_client.remove_rule("server:www.buckyos.com:main:test2").await;
             assert!(ret.is_err());
 
             let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
