@@ -599,6 +599,20 @@ pub async fn cyfs_gateway_main() {
                 .help("server url")
                 .required(false)
                 .default_value(CONTROL_SERVER)))
+        .subcommand(Command::new("set_rule")
+            .about("Replace a chain/block/line rule content")
+            .arg(Arg::new("id")
+                .help("rule id")
+                .required(true))
+            .arg(Arg::new("rule")
+                .help("new rule content")
+                .required(true))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("del_rule")
             .about("Delete a rule")
             .arg(Arg::new("id")
@@ -866,6 +880,28 @@ pub async fn cyfs_gateway_main() {
                 }
                 Err(e) => {
                     println!("move rule error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(("set_rule", sub_matches)) => {
+            let id = sub_matches.get_one::<String>("id").expect("id is required");
+            let rule = sub_matches.get_one::<String>("rule").expect("rule is required");
+            let server = sub_matches.get_one::<String>("server").expect("server is required");
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.set_rule(id, rule).await {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("set rule error: {}", e);
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }

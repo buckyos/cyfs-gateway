@@ -106,6 +106,16 @@ impl GatewayControlClient {
         Ok(result)
     }
 
+    pub async fn set_rule(&self, id: &str, rule: &str) -> ControlResult<Value> {
+        let mut params = HashMap::new();
+        params.insert("id", id);
+        params.insert("rule", rule);
+        let result = self.krpc.call("set_rule", serde_json::to_value(&params).unwrap()).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+
+        Ok(result)
+    }
+
     pub async fn get_connections(&self) -> ControlResult<Value> {
         let result = self.krpc.call("get_connections", Value::Null).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
