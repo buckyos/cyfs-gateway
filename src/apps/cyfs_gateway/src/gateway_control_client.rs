@@ -116,6 +116,31 @@ impl GatewayControlClient {
         Ok(result)
     }
 
+    pub async fn add_dispatch(&self, local: &str, target: &str, protocol: Option<&str>) -> ControlResult<Value> {
+        let mut params = HashMap::new();
+        params.insert("local", local);
+        params.insert("target", target);
+        if let Some(protocol) = protocol {
+            params.insert("protocol", protocol);
+        }
+        let result = self.krpc.call("add_dispatch", serde_json::to_value(&params).unwrap()).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+
+        Ok(result)
+    }
+
+    pub async fn remove_dispatch(&self, local: &str, protocol: Option<&str>) -> ControlResult<Value> {
+        let mut params = HashMap::new();
+        params.insert("local", local);
+        if let Some(protocol) = protocol {
+            params.insert("protocol", protocol);
+        }
+        let result = self.krpc.call("remove_dispatch", serde_json::to_value(&params).unwrap()).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+
+        Ok(result)
+    }
+
     pub async fn get_connections(&self) -> ControlResult<Value> {
         let result = self.krpc.call("get_connections", Value::Null).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;

@@ -762,6 +762,119 @@ impl Gateway {
         Ok(raw_config)
     }
 
+    fn normalize_protocol(protocol: Option<&str>) -> Result<String> {
+        let protocol = protocol.unwrap_or("tcp").to_lowercase();
+        if protocol != "tcp" && protocol != "udp" {
+            return Err(anyhow!("Invalid protocol: {}", protocol));
+        }
+        Ok(protocol)
+    }
+
+    fn parse_local_endpoint(local: &str) -> Result<(String, String, u16)> {
+        if local.contains(':') {
+            let mut parts = local.splitn(2, ':');
+            let ip = parts
+                .next()
+                .ok_or_else(|| anyhow!("invalid local: {}", local))?
+                .trim();
+            let port = parts
+                .next()
+                .ok_or_else(|| anyhow!("invalid local: {}", local))?
+                .trim();
+            let ip_addr: std::net::IpAddr = ip.parse().map_err(|_| anyhow!("invalid ip: {}", ip))?;
+            let port: u16 = port.parse().map_err(|_| anyhow!("invalid port: {}", local))?;
+            Ok((format!("{}:{}", ip_addr, port), ip_addr.to_string(), port))
+        } else {
+            let port: u16 = local.trim().parse().map_err(|_| anyhow!("invalid port: {}", local))?;
+            let ip = "0.0.0.0".to_string();
+            Ok((format!("{}:{}", ip, port), ip, port))
+        }
+    }
+
+    fn parse_target_endpoint(target: &str) -> Result<String> {
+        let mut parts = target.splitn(2, ':');
+        let ip = parts
+            .next()
+            .ok_or_else(|| anyhow!("invalid target: {}", target))?
+            .trim();
+        let port = parts
+            .next()
+            .ok_or_else(|| anyhow!("invalid target: {}", target))?
+            .trim();
+        let ip_addr: std::net::IpAddr = ip.parse().map_err(|_| anyhow!("invalid target ip: {}", ip))?;
+        let port: u16 = port.parse().map_err(|_| anyhow!("invalid target port: {}", target))?;
+        Ok(format!("{}:{}", ip_addr, port))
+    }
+
+    fn dispatch_stack_id(protocol: &str, local_ip: &str, local_port: u16) -> String {
+        let ip_for_id = local_ip.replace('.', "_");
+        format!("dispatch_{}_{}_{}", protocol, ip_for_id, local_port)
+    }
+
+    fn add_dispatch_to_config(
+        mut raw_config: Value,
+        local: &str,
+        target: &str,
+        protocol: Option<&str>,
+    ) -> Result<(Value, String)> {
+        let protocol = Self::normalize_protocol(protocol)?;
+        let (local_bind, local_ip, local_port) = Self::parse_local_endpoint(local)?;
+        let target = Self::parse_target_endpoint(target)?;
+        let stack_id = Self::dispatch_stack_id(&protocol, &local_ip, local_port);
+
+        let stacks = raw_config
+            .get_mut("stacks")
+            .ok_or_else(|| anyhow!("stacks not found in config"))?;
+        let stacks = stacks
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("stacks must be an object"))?;
+        if stacks.contains_key(&stack_id) {
+            return Err(anyhow!("dispatch already exists: {}", stack_id));
+        }
+
+        let mut block = Map::new();
+        block.insert("block".to_string(), Value::String(format!("forward \"{}:///{}\";", protocol, target)));
+        let mut blocks = Map::new();
+        blocks.insert("default".to_string(), Value::Object(block));
+
+        let mut main = Map::new();
+        main.insert("priority".to_string(), Value::Number(1.into()));
+        main.insert("blocks".to_string(), Value::Object(blocks));
+
+        let mut hook_point = Map::new();
+        hook_point.insert("main".to_string(), Value::Object(main));
+
+        let mut stack = Map::new();
+        stack.insert("bind".to_string(), Value::String(local_bind));
+        stack.insert("protocol".to_string(), Value::String(protocol.clone()));
+        stack.insert("hook_point".to_string(), Value::Object(hook_point));
+
+        stacks.insert(stack_id.clone(), Value::Object(stack));
+        Ok((raw_config, stack_id))
+    }
+
+    fn remove_dispatch_from_config(
+        mut raw_config: Value,
+        local: &str,
+        protocol: Option<&str>,
+    ) -> Result<(Value, String)> {
+        let protocol = Self::normalize_protocol(protocol)?;
+        let (_, local_ip, local_port) = Self::parse_local_endpoint(local)?;
+        let stack_id = Self::dispatch_stack_id(&protocol, &local_ip, local_port);
+
+        let stacks = raw_config
+            .get_mut("stacks")
+            .ok_or_else(|| anyhow!("stacks not found in config"))?;
+        let stacks = stacks
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("stacks must be an object"))?;
+        if stacks.remove(&stack_id).is_none() {
+            return Err(anyhow!("dispatch not found: {}", stack_id));
+        }
+
+        Ok((raw_config, stack_id))
+    }
+
     fn set_rule_in_config(mut raw_config: Value, id: &str, rule: &str) -> Result<Value> {
         let id_list = id.split(':').collect::<Vec<&str>>();
         if id_list.len() < 3 {
@@ -1273,6 +1386,46 @@ impl Gateway {
                 )));
             }
         }
+
+        let mut guard = self.config.lock().unwrap();
+        *guard = gateway_config;
+        Ok(())
+    }
+
+    pub async fn add_dispatch(&self, local: &str, target: &str, protocol: Option<&str>) -> Result<()> {
+        let raw_config = {
+            self.config.lock().unwrap().raw_config.clone()
+        };
+        let (raw_config, stack_id) = Self::add_dispatch_to_config(raw_config, local, target, protocol)?;
+        let gateway_config = self.parser
+            .parse(raw_config)
+            .map_err(|e| anyhow!("parse config failed: {}", e))?;
+
+        let new_stack_config = gateway_config
+            .stacks
+            .iter()
+            .find(|s| s.id() == stack_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("stack config not found after parse: {}", stack_id))?;
+        let new_stack = self.stack_factory.create(new_stack_config.clone()).await?;
+        self.stack_manager.add_stack(new_stack.clone())?;
+        new_stack.start().await?;
+
+        let mut guard = self.config.lock().unwrap();
+        *guard = gateway_config;
+        Ok(())
+    }
+
+    pub async fn remove_dispatch(&self, local: &str, protocol: Option<&str>) -> Result<()> {
+        let raw_config = {
+            self.config.lock().unwrap().raw_config.clone()
+        };
+        let (raw_config, stack_id) = Self::remove_dispatch_from_config(raw_config, local, protocol)?;
+        let gateway_config = self.parser
+            .parse(raw_config)
+            .map_err(|e| anyhow!("parse config failed: {}", e))?;
+
+        self.stack_manager.remove(stack_id.as_str());
 
         let mut guard = self.config.lock().unwrap();
         *guard = gateway_config;
@@ -1917,6 +2070,37 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     id.unwrap(),
                     rule.unwrap(),
                 ).await
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                Ok(Value::String("ok".to_string()))
+            }
+            "add_dispatch" => {
+                let params = serde_json::from_value::<HashMap<String, String>>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let local = params.get("local");
+                let target = params.get("target");
+                let protocol = params.get("protocol").map(|s| s.as_str());
+                if local.is_none() || target.is_none() {
+                    Err(cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "Invalid params: local or target is None",
+                    ))?;
+                }
+                gateway.add_dispatch(local.unwrap(), target.unwrap(), protocol).await
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                Ok(Value::String("ok".to_string()))
+            }
+            "remove_dispatch" => {
+                let params = serde_json::from_value::<HashMap<String, String>>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let local = params.get("local");
+                let protocol = params.get("protocol").map(|s| s.as_str());
+                if local.is_none() {
+                    Err(cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "Invalid params: local is None",
+                    ))?;
+                }
+                gateway.remove_dispatch(local.unwrap(), protocol).await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
@@ -2687,6 +2871,54 @@ mod tests {
             .as_object()
             .unwrap();
         assert_eq!(block.get("block").and_then(|v| v.as_str()), Some("b;"));
+    }
+
+    #[tokio::test]
+    async fn test_add_and_remove_dispatch_to_config() {
+        let raw_config = json!({
+            "stacks": {}
+        });
+
+        // default protocol tcp, port only
+        let (updated, stack_id) = Gateway::add_dispatch_to_config(raw_config.clone(), "18080", "192.168.0.1:1900", None).unwrap();
+        assert_eq!(stack_id, "dispatch_tcp_0_0_0_0_18080");
+        let stack = updated["stacks"][stack_id.as_str()].as_object().unwrap();
+        assert_eq!(stack.get("bind").and_then(|v| v.as_str()), Some("0.0.0.0:18080"));
+        assert_eq!(stack.get("protocol").and_then(|v| v.as_str()), Some("tcp"));
+        let block = stack["hook_point"]["main"]["blocks"]["default"].as_object().unwrap();
+        let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
+        assert!(block_str.contains("tcp:///192.168.0.1:1900"));
+
+        // udp with explicit ip
+        let (updated, stack_id_udp) = Gateway::add_dispatch_to_config(raw_config.clone(), "0.0.0.0:8080", "10.0.0.1:9000", Some("udp")).unwrap();
+        assert_eq!(stack_id_udp, "dispatch_udp_0_0_0_0_8080");
+        let stack = updated["stacks"][stack_id_udp.as_str()].as_object().unwrap();
+        assert_eq!(stack.get("bind").and_then(|v| v.as_str()), Some("0.0.0.0:8080"));
+        assert_eq!(stack.get("protocol").and_then(|v| v.as_str()), Some("udp"));
+        let block = stack["hook_point"]["main"]["blocks"]["default"].as_object().unwrap();
+        let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
+        assert!(block_str.contains("udp:///10.0.0.1:9000"));
+
+        // duplicate add
+        let dup = Gateway::add_dispatch_to_config(updated.clone(), "0.0.0.0:8080", "10.0.0.1:9000", Some("udp"));
+        assert!(dup.is_err());
+
+        // remove existing
+        let (removed, removed_id) = Gateway::remove_dispatch_from_config(updated, "0.0.0.0:8080", Some("udp")).unwrap();
+        assert_eq!(removed_id, "dispatch_udp_0_0_0_0_8080");
+        assert!(removed["stacks"].get(removed_id).is_none());
+
+        // remove missing
+        let err = Gateway::remove_dispatch_from_config(removed, "0.0.0.0:8080", Some("udp"));
+        assert!(err.is_err());
+
+        // invalid target
+        let err = Gateway::add_dispatch_to_config(raw_config.clone(), "18080", "bad_target", None);
+        assert!(err.is_err());
+
+        // invalid protocol
+        let err = Gateway::add_dispatch_to_config(raw_config, "18080", "192.168.0.1:1900", Some("http"));
+        assert!(err.is_err());
     }
 
     #[tokio::test]

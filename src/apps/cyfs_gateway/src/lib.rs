@@ -613,6 +613,41 @@ pub async fn cyfs_gateway_main() {
                 .help("server url")
                 .required(false)
                 .default_value(CONTROL_SERVER)))
+        .subcommand(Command::new("add_dispatch")
+            .about("Add a local port dispatch to target")
+            .arg(Arg::new("local")
+                .help("local endpoint, such as 18080 or 0.0.0.0:18080")
+                .required(true))
+            .arg(Arg::new("target")
+                .help("target endpoint, ip:port format")
+                .required(true))
+            .arg(Arg::new("protocol")
+                .long("protocol")
+                .short('p')
+                .help("tcp or udp, default tcp")
+                .required(false))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CONTROL_SERVER)))
+        .subcommand(Command::new("remove_dispatch")
+            .about("Remove a local port dispatch")
+            .arg(Arg::new("local")
+                .help("local endpoint, such as 18080 or 0.0.0.0:18080")
+                .required(true))
+            .arg(Arg::new("protocol")
+                .long("protocol")
+                .short('p')
+                .help("tcp or udp, default tcp")
+                .required(false))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("remove_rule")
             .about("Delete a rule")
             .arg(Arg::new("id")
@@ -902,6 +937,51 @@ pub async fn cyfs_gateway_main() {
                 }
                 Err(e) => {
                     println!("set rule error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(("add_dispatch", sub_matches)) => {
+            let local = sub_matches.get_one::<String>("local").expect("local is required");
+            let target = sub_matches.get_one::<String>("target").expect("target is required");
+            let protocol = sub_matches.get_one::<String>("protocol").map(|s| s.as_str());
+            let server = sub_matches.get_one::<String>("server").expect("server is required");
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.add_dispatch(local, target, protocol).await {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("add dispatch error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(("remove_dispatch", sub_matches)) => {
+            let local = sub_matches.get_one::<String>("local").expect("local is required");
+            let protocol = sub_matches.get_one::<String>("protocol").map(|s| s.as_str());
+            let server = sub_matches.get_one::<String>("server").expect("server is required");
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.remove_dispatch(local, protocol).await {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("remove dispatch error: {}", e);
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
