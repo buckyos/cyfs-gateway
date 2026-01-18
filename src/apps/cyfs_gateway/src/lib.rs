@@ -655,6 +655,48 @@ pub async fn cyfs_gateway_main() {
                 .help("server url")
                 .required(false)
                 .default_value(CONTROL_SERVER)))
+        .subcommand(Command::new("add_router")
+            .about("Add a router rule to http server")
+            .after_help("Examples:\n  cyfs_gateway add_router --uri /sn --target /www\n  cyfs_gateway add_router --uri /api --target http://127.0.0.1:9000/ --id api_router")
+            .arg(Arg::new("id")
+                .long("id")
+                .help("http server id, optional; if missing will create router_<rand>")
+                .required(false))
+            .arg(Arg::new("uri")
+                .long("uri")
+                .help("uri match rule, supports =/path, /path (prefix), /path/*, ~regex")
+                .required(true))
+            .arg(Arg::new("target")
+                .long("target")
+                .help("target mapping, supports dir path or http(s) url")
+                .required(true))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CONTROL_SERVER)))
+        .subcommand(Command::new("remove_router")
+            .about("Remove a router rule from http server")
+            .after_help("Examples:\n  cyfs_gateway remove_router --id api_router --uri /api --target http://127.0.0.1:9000/")
+            .arg(Arg::new("id")
+                .long("id")
+                .help("http server id")
+                .required(true))
+            .arg(Arg::new("uri")
+                .long("uri")
+                .help("uri match rule used when adding router")
+                .required(true))
+            .arg(Arg::new("target")
+                .long("target")
+                .help("target mapping used when adding router")
+                .required(true))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("remove_rule")
             .about("Delete a rule")
             .after_help("Examples:\n  cyfs_gateway remove_rule stack:s1:main:b1\n  cyfs_gateway remove_rule stack:s1:main:b1:2")
@@ -968,6 +1010,52 @@ pub async fn cyfs_gateway_main() {
                 }
                 Err(e) => {
                     println!("add dispatch error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(("add_router", sub_matches)) => {
+            let server_id = sub_matches.get_one::<String>("id").map(|s| s.as_str());
+            let uri = sub_matches.get_one::<String>("uri").expect("uri is required");
+            let target = sub_matches.get_one::<String>("target").expect("target is required");
+            let server = sub_matches.get_one::<String>("server").expect("server is required");
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.add_router(server_id, uri, target).await {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("add router error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(("remove_router", sub_matches)) => {
+            let server_id = sub_matches.get_one::<String>("id").expect("id is required");
+            let uri = sub_matches.get_one::<String>("uri").expect("uri is required");
+            let target = sub_matches.get_one::<String>("target").expect("target is required");
+            let server = sub_matches.get_one::<String>("server").expect("server is required");
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.remove_router(server_id, uri, target).await {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("remove router error: {}", e);
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }

@@ -476,6 +476,20 @@ impl Gateway {
         }
     }
 
+    fn gen_unique_id_with_prefix(map: &Map<String, Value>, prefix: &str) -> String {
+        loop {
+            let candidate: String = thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(5)
+                .map(char::from)
+                .collect();
+            let candidate = format!("{}{}", prefix, candidate.to_lowercase());
+            if !map.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
     fn next_highest_priority(map: &Map<String, Value>) -> i32 {
         let mut min_priority: Option<i32> = None;
         for value in map.values() {
@@ -811,6 +825,266 @@ impl Gateway {
         format!("dispatch_{}_{}_{}", protocol, ip_for_id, local_port)
     }
 
+    fn router_block_id(uri: &str, target: &str) -> String {
+        let mut sha = sha2::Sha256::new();
+        sha.update(uri.as_bytes());
+        sha.update(b"|");
+        sha.update(target.as_bytes());
+        let digest = sha.finalize();
+        let hex = format!("{:x}", digest);
+        format!("router_{}", &hex[..12])
+    }
+
+    fn router_priority(uri: &str) -> i32 {
+        // smaller number => higher priority
+        if let Some(stripped) = uri.strip_prefix('=') {
+            return -3_000_000 - stripped.len() as i32;
+        }
+        if uri.starts_with('~') {
+            return -2_000_000;
+        }
+        if uri.ends_with("/*") || uri.ends_with('/') {
+            let prefix = uri.trim_end_matches('*').trim_end_matches('/');
+            return -1_000_000 - prefix.len() as i32;
+        }
+        -500_000 - uri.len() as i32
+    }
+
+    fn ensure_http_server(raw_config: &mut Value, id: &str) -> Result<()> {
+        let servers = raw_config
+            .get_mut("servers")
+            .ok_or_else(|| anyhow!("servers not found in config"))?
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("servers must be an object"))?;
+
+        if let Some(existing) = servers.get(id) {
+            let obj = existing
+                .as_object()
+                .ok_or_else(|| anyhow!("server {} must be an object", id))?;
+            let server_type = obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("server {} type not found", id))?;
+            if server_type != "http" {
+                return Err(anyhow!("server {} must be http", id));
+            }
+            return Ok(());
+        }
+
+        let mut hook_point = Map::new();
+        let mut main = Map::new();
+        main.insert("priority".to_string(), Value::Number(1.into()));
+        main.insert("blocks".to_string(), Value::Object(Map::new()));
+        hook_point.insert("main".to_string(), Value::Object(main));
+
+        let mut server = Map::new();
+        server.insert("type".to_string(), Value::String("http".to_string()));
+        server.insert("hook_point".to_string(), Value::Object(hook_point));
+        servers.insert(id.to_string(), Value::Object(server));
+        Ok(())
+    }
+
+    fn ensure_dir_server(raw_config: &mut Value, root_path: &str) -> Result<String> {
+        let servers = raw_config
+            .get_mut("servers")
+            .ok_or_else(|| anyhow!("servers not found in config"))?
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("servers must be an object"))?;
+        let mut sha = sha2::Sha256::new();
+        sha.update(root_path.as_bytes());
+        let digest = sha.finalize();
+        let hex = format!("{:x}", digest);
+        let server_id = format!("router_dir_{}", &hex[..12]);
+
+        if !servers.contains_key(&server_id) {
+            let mut server = Map::new();
+            server.insert("type".to_string(), Value::String("dir".to_string()));
+            server.insert("root_path".to_string(), Value::String(root_path.to_string()));
+            servers.insert(server_id.clone(), Value::Object(server));
+        }
+        Ok(server_id)
+    }
+
+    fn parse_router_uri(uri: &str) -> Result<(String, String)> {
+        if uri.is_empty() {
+            return Err(anyhow!("uri cannot be empty"));
+        }
+        if uri.starts_with('=') {
+            let u = uri.trim_start_matches('=').to_string();
+            return Ok(("exact".to_string(), u));
+        }
+        if uri.starts_with('~') {
+            let u = uri.trim_start_matches('~').to_string();
+            return Ok(("regex".to_string(), u));
+        }
+        if uri.ends_with("/*") || uri.ends_with('*') {
+            let mut u = uri.to_string();
+            u = uri.trim_end_matches('*').to_string();
+            return Ok(("wildcard".to_string(), u));
+        }
+        Ok(("prefix".to_string(), uri.to_string()))
+    }
+
+    fn normalize_regex_uri(uri: &str) -> String {
+        if uri.ends_with("/*") {
+            let trimmed = uri.trim_end_matches("/*");
+            return format!("{}(.*)$", trimmed);
+        }
+        uri.to_string()
+    }
+
+    fn build_router_rule(
+        raw_config: &mut Value,
+        uri: &str,
+        target: &str,
+    ) -> Result<(String, i32, String, Option<String>)> {
+        let (kind, uri_value) = Self::parse_router_uri(uri)?;
+        let regex_value = if kind == "regex" {
+            Self::normalize_regex_uri(&uri_value)
+        } else {
+            uri_value.clone()
+        };
+        let block_id = Self::router_block_id(uri, target);
+        let priority = Self::router_priority(uri);
+
+        // match part
+        let match_cmd = match kind.as_str() {
+            "exact" => format!(r#"eq ${{REQ.path}} "{}""#, uri_value),
+            "regex" => format!(r#"match-reg ${{REQ.path}} "{}""#, regex_value),
+            "wildcard" => format!(r#"match ${{REQ.path}} "{}*""#, uri_value),
+            _ => format!(r#"starts-with ${{REQ.path}} "{}""#, uri_value),
+        };
+
+        let target_trim = target.trim();
+        let is_http = target_trim.starts_with("http://") || target_trim.starts_with("https://");
+        let is_unix = target_trim.starts_with("unix:");
+        let is_local = target_trim.starts_with('/');
+
+        if !is_http && !is_unix && !is_local {
+            return Err(anyhow!("invalid target: {}", target));
+        }
+
+        let mut actions: Vec<String> = Vec::new();
+        actions.push(match_cmd);
+
+        let mut forward_to = None;
+        let mut call_server = None;
+        let mut rewrite = None;
+
+        if is_local {
+            let mut dir_root = target_trim.to_string();
+            if kind == "regex" {
+                if let Some(idx) = target_trim.find('$') {
+                    dir_root = target_trim[..idx].trim_end_matches('/').to_string();
+                    let placeholder = target_trim[idx..].trim_start_matches('/');
+                    if !placeholder.is_empty() {
+                        let replace = format!("/{}", placeholder);
+                        rewrite = Some(format!(
+                            r#"rewrite ${{REQ.path}} "{}" "{}""#,
+                            regex_value, replace
+                        ));
+                    }
+                }
+            } else {
+                if target_trim.ends_with('/') {
+                    rewrite = if uri_value.ends_with('/') {
+                        Some(format!(
+                            r#"rewrite ${{REQ.path}} "{}*" "/*""#,
+                            uri_value,
+                        ))
+                    } else {
+                        Some(format!(
+                            r#"rewrite ${{REQ.path}} "{}*" "*""#,
+                            uri_value,
+                        ))
+                    };
+                }
+            }
+            if dir_root.is_empty() {
+                dir_root.push('/');
+            }
+            let server_id = Self::ensure_dir_server(raw_config, &dir_root)?;
+            call_server = Some(server_id);
+        } else if is_http || is_unix {
+            if is_http {
+                let url = Url::parse(target_trim)
+                    .map_err(|e| anyhow!("invalid target url {}: {}", target_trim, e))?;
+                let host = url.host_str().ok_or_else(|| anyhow!("invalid target url host"))?;
+                let port = url.port().map(|p| format!(":{}", p)).unwrap_or_default();
+                let base = format!("{}://{}{}", url.scheme(), host, port);
+                forward_to = Some(base);
+                let path = url.path().to_string();
+                if kind == "regex" {
+                    if let Some(_) = path.find('$') {
+                        rewrite = Some(format!(
+                            r#"rewrite ${{REQ.path}} "{}" "{}""#,
+                            regex_value, path
+                        ));
+                    } else if path.len() > 1 {
+                        if path.ends_with('/') {
+                            rewrite = Some(format!(
+                                r#"rewrite ${{REQ.path}} "/*" "{}*""#,
+                                path
+                            ));
+                        } else {
+                            rewrite = Some(format!(
+                                r#"rewrite ${{REQ.path}} "/*" "{}/*""#,
+                                path
+                            ));
+                        }
+                    }
+                } else {
+                    let trailing_slash = target_trim.ends_with('/');
+
+                    if trailing_slash {
+                        let from_pattern = if kind == "wildcard" {
+                            format!("{}*", uri_value)
+                        } else if kind == "exact" {
+                            uri_value.clone()
+                        } else if kind == "regex" {
+                            uri_value.clone()
+                        } else {
+                            format!("{}*", uri_value)
+                        };
+                        let replace = if kind == "regex" {
+                            path.to_string()
+                        } else {
+                            let mut p = path.trim_end_matches('/').to_string();
+                            if uri_value.ends_with('/') {
+                                if !p.starts_with('/') {
+                                    p.insert(0, '/');
+                                }
+                                if !p.ends_with('/') {
+                                    p.push('/');
+                                }
+                            }
+                            format!("{}*", p.trim_end_matches('*'))
+                        };
+                        if kind == "regex" {
+                            rewrite = Some(format!(r#"rewrite-reg ${{REQ.path}} "{}" "{}""#, regex_value, replace));
+                        } else {
+                            rewrite = Some(format!(r#"rewrite ${{REQ.path}} "{}" "{}""#, from_pattern, replace));
+                        }
+                    }
+                }
+            } else {
+                forward_to = Some(target_trim.to_string());
+            }
+        }
+
+        if let Some(rw) = rewrite {
+            actions.push(rw);
+        }
+        if let Some(server_id) = &call_server {
+            actions.push(format!(r#"call-server {}"#, server_id));
+        } else if let Some(forward) = forward_to {
+            actions.push(format!(r#"forward "{}""#, forward));
+        }
+
+        let rule = format!("{};", actions.join(" && "));
+        Ok((rule, priority, block_id, call_server))
+    }
+
     fn add_dispatch_to_config(
         mut raw_config: Value,
         local: &str,
@@ -873,6 +1147,118 @@ impl Gateway {
         }
 
         Ok((raw_config, stack_id))
+    }
+
+    fn add_router_to_config(
+        mut raw_config: Value,
+        server_id: Option<&str>,
+        uri: &str,
+        target: &str,
+    ) -> Result<(Value, String, Option<String>)> {
+        let server_id = if let Some(id) = server_id {
+            id.to_string()
+        } else {
+            let default_map = Map::new();
+            let server_map = raw_config
+                .get("servers")
+                .and_then(|v| v.as_object())
+                .unwrap_or_else(|| &default_map);
+            Self::gen_unique_id_with_prefix(server_map, "router_")
+        };
+
+        Self::ensure_http_server(&mut raw_config, &server_id)?;
+        let (rule, priority, block_id, _maybe_dir) = Self::build_router_rule(&mut raw_config, uri, target)?;
+
+        let servers = raw_config
+            .get_mut("servers")
+            .and_then(|v| v.as_object_mut())
+            .unwrap();
+        let server = servers.get_mut(&server_id).unwrap().as_object_mut().unwrap();
+        let hook_point = server
+            .entry("hook_point")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("hook_point must be object"))?;
+        let main = hook_point
+            .entry("main")
+            .or_insert_with(|| {
+                let mut m = Map::new();
+                m.insert("priority".to_string(), Value::Number(1.into()));
+                m.insert("blocks".to_string(), Value::Object(Map::new()));
+                Value::Object(m)
+            })
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("main must be object"))?;
+        let blocks = main
+            .entry("blocks")
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("blocks must be object"))?;
+
+        if blocks.contains_key(&block_id) {
+            return Err(anyhow!("router rule already exists: {}", block_id));
+        }
+
+        let mut block_obj = Map::new();
+        block_obj.insert("priority".to_string(), Value::Number(priority.into()));
+        block_obj.insert("block".to_string(), Value::String(rule));
+        blocks.insert(block_id, Value::Object(block_obj));
+
+        Ok((raw_config, server_id, _maybe_dir))
+    }
+
+    fn remove_router_from_config(
+        mut raw_config: Value,
+        server_id: &str,
+        uri: &str,
+        target: &str,
+    ) -> Result<Value> {
+        let block_id = Self::router_block_id(uri, target);
+        let servers = raw_config
+            .get_mut("servers")
+            .ok_or_else(|| anyhow!("servers not found"))?
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("servers must be object"))?;
+        let server = servers
+            .get_mut(server_id)
+            .ok_or_else(|| anyhow!("server not found: {}", server_id))?
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("server {} must be object", server_id))?;
+        let server_type = server
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if server_type != "http" {
+            return Err(anyhow!("server {} must be http", server_id));
+        }
+        let hook_point = server
+            .get_mut("hook_point")
+            .ok_or_else(|| anyhow!("hook_point not found in server {}", server_id))?
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("hook_point must be object"))?;
+        let main = hook_point
+            .get_mut("main")
+            .ok_or_else(|| anyhow!("main hook point not found"))?
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("main must be object"))?;
+        let blocks = main
+            .get_mut("blocks")
+            .ok_or_else(|| anyhow!("blocks not found"))?
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("blocks must be object"))?;
+
+        if blocks.remove(&block_id).is_none() {
+            return Err(anyhow!("router rule not found"));
+        }
+
+        if blocks.is_empty() {
+            hook_point.remove("main");
+        }
+        if hook_point.is_empty() && server_id.starts_with("router_") {
+            servers.remove(server_id);
+        }
+
+        Ok(raw_config)
     }
 
     fn set_rule_in_config(mut raw_config: Value, id: &str, rule: &str) -> Result<Value> {
@@ -1410,6 +1796,79 @@ impl Gateway {
         let new_stack = self.stack_factory.create(new_stack_config.clone()).await?;
         self.stack_manager.add_stack(new_stack.clone())?;
         new_stack.start().await?;
+
+        let mut guard = self.config.lock().unwrap();
+        *guard = gateway_config;
+        Ok(())
+    }
+
+    pub async fn add_router(&self, server_id: Option<&str>, uri: &str, target: &str) -> Result<String> {
+        let raw_config = {
+            self.config.lock().unwrap().raw_config.clone()
+        };
+        let (raw_config, server_id, dir_server) = Self::add_router_to_config(raw_config, server_id, uri, target)?;
+        let gateway_config = self.parser
+            .parse(raw_config)
+            .map_err(|e| anyhow!("parse config failed: {}", e))?;
+
+        if let Some(dir_server) = dir_server {
+            let new_server_config = gateway_config
+                .servers
+                .iter()
+                .find(|s| s.id() == dir_server)
+                .cloned()
+                .ok_or_else(|| anyhow!("server config not found after parse: {}", server_id))?;
+
+            let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+            for server in new_servers.into_iter() {
+                self.server_manager.replace_server(server);
+            }
+        }
+
+        let new_server_config = gateway_config
+            .servers
+            .iter()
+            .find(|s| s.id() == server_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("server config not found after parse: {}", server_id))?;
+
+        let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+        for server in new_servers.into_iter() {
+            self.server_manager.replace_server(server);
+        }
+
+        let mut guard = self.config.lock().unwrap();
+        *guard = gateway_config;
+        Ok(server_id)
+    }
+
+    pub async fn remove_router(&self, server_id: &str, uri: &str, target: &str) -> Result<()> {
+        let raw_config = {
+            self.config.lock().unwrap().raw_config.clone()
+        };
+        let raw_config = Self::remove_router_from_config(raw_config, server_id, uri, target)?;
+        let gateway_config = self.parser
+            .parse(raw_config)
+            .map_err(|e| anyhow!("parse config failed: {}", e))?;
+
+        if gateway_config
+            .servers
+            .iter()
+            .any(|s| s.id() == server_id)
+        {
+            let new_server_config = gateway_config
+                .servers
+                .iter()
+                .find(|s| s.id() == server_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("server config not found after parse: {}", server_id))?;
+            let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+            for server in new_servers.into_iter() {
+                self.server_manager.replace_server(server);
+            }
+        } else {
+            self.server_manager.remove_server(server_id);
+        }
 
         let mut guard = self.config.lock().unwrap();
         *guard = gateway_config;
@@ -2101,6 +2560,38 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     ))?;
                 }
                 gateway.remove_dispatch(local.unwrap(), protocol).await
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                Ok(Value::String("ok".to_string()))
+            }
+            "add_router" => {
+                let params = serde_json::from_value::<HashMap<String, String>>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let uri = params.get("uri");
+                let target = params.get("target");
+                if uri.is_none() || target.is_none() {
+                    Err(cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "Invalid params: uri or target is None",
+                    ))?;
+                }
+                let server_id = params.get("id").map(|s| s.as_str());
+                let server_id = gateway.add_router(server_id, uri.unwrap(), target.unwrap()).await
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                Ok(Value::String(server_id))
+            }
+            "remove_router" => {
+                let params = serde_json::from_value::<HashMap<String, String>>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let id = params.get("id");
+                let uri = params.get("uri");
+                let target = params.get("target");
+                if id.is_none() || uri.is_none() || target.is_none() {
+                    Err(cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "Invalid params: id or uri or target is None",
+                    ))?;
+                }
+                gateway.remove_router(id.unwrap(), uri.unwrap(), target.unwrap()).await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
@@ -2919,6 +3410,161 @@ mod tests {
         // invalid protocol
         let err = Gateway::add_dispatch_to_config(raw_config, "18080", "192.168.0.1:1900", Some("http"));
         assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_add_and_remove_router_to_config() {
+        let raw_config = json!({
+            "servers": {}
+        });
+
+        // create with generated server id, http target with trailing slash
+        let (updated, sid, _) = Gateway::add_router_to_config(raw_config.clone(), None, "/sn", "http://127.0.0.1:9000/").unwrap();
+        assert!(sid.starts_with("router_"));
+        let server = updated["servers"][sid.as_str()].as_object().unwrap();
+        assert_eq!(server.get("type").and_then(|v| v.as_str()), Some("http"));
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        assert_eq!(blocks.len(), 1);
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert_eq!(rule, r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "*" && forward "http://127.0.0.1:9000";"#);
+
+        let updated = Gateway::remove_router_from_config(updated, sid.as_str(), "/sn", "http://127.0.0.1:9000/").unwrap();
+        assert!(updated["servers"].get(sid).is_none());
+
+        let (updated, sid, _) = Gateway::add_router_to_config(raw_config.clone(), None, "/sn/", "http://127.0.0.1:9000/").unwrap();
+        assert!(sid.starts_with("router_"));
+        let server = updated["servers"][sid.as_str()].as_object().unwrap();
+        assert_eq!(server.get("type").and_then(|v| v.as_str()), Some("http"));
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        assert_eq!(blocks.len(), 1);
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert_eq!(rule, r#"starts-with ${REQ.path} "/sn/" && rewrite ${REQ.path} "/sn/*" "/*" && forward "http://127.0.0.1:9000";"#);
+
+        let (updated, sid, _) = Gateway::add_router_to_config(raw_config.clone(), None, "/sn/*", "http://127.0.0.1:9000/").unwrap();
+        assert!(sid.starts_with("router_"));
+        let server = updated["servers"][sid.as_str()].as_object().unwrap();
+        assert_eq!(server.get("type").and_then(|v| v.as_str()), Some("http"));
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        assert_eq!(blocks.len(), 1);
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert_eq!(rule, r#"match ${REQ.path} "/sn/*" && rewrite ${REQ.path} "/sn/*" "/*" && forward "http://127.0.0.1:9000";"#);
+
+        let (updated, sid, _) = Gateway::add_router_to_config(raw_config.clone(), None, "/sn/*", "http://127.0.0.1:9000/api/").unwrap();
+        assert!(sid.starts_with("router_"));
+        let server = updated["servers"][sid.as_str()].as_object().unwrap();
+        assert_eq!(server.get("type").and_then(|v| v.as_str()), Some("http"));
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        assert_eq!(blocks.len(), 1);
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert_eq!(rule, r#"match ${REQ.path} "/sn/*" && rewrite ${REQ.path} "/sn/*" "/api/*" && forward "http://127.0.0.1:9000";"#);
+
+
+        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "http://127.0.0.1:9000/$1").unwrap();
+        assert_eq!(sid2, "router_test");
+        let server = updated["servers"][sid2.as_str()].as_object().unwrap();
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "^/static/(.*)$" "/$1" && forward "http://127.0.0.1:9000";"#));
+
+        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "http://127.0.0.1:9000/api/$1").unwrap();
+        assert_eq!(sid2, "router_test");
+        let server = updated["servers"][sid2.as_str()].as_object().unwrap();
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "^/static/(.*)$" "/api/$1" && forward "http://127.0.0.1:9000";"#));
+
+        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "http://127.0.0.1:9000/api/").unwrap();
+        assert_eq!(sid2, "router_test");
+        let server = updated["servers"][sid2.as_str()].as_object().unwrap();
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert_eq!(rule, r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "/*" "/api/*" && forward "http://127.0.0.1:9000";"#);
+
+        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "http://127.0.0.1:9000").unwrap();
+        assert_eq!(sid2, "router_test");
+        let server = updated["servers"][sid2.as_str()].as_object().unwrap();
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert_eq!(rule, r#"match-reg ${REQ.path} "^/static/(.*)$" && forward "http://127.0.0.1:9000";"#);
+
+        // create with local dir target and explicit server id
+        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "/static/*", "/www/").unwrap();
+        assert_eq!(sid2, "router_test");
+        let server = updated["servers"][sid2.as_str()].as_object().unwrap();
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert!(rule.starts_with(r#"match ${REQ.path} "/static/*" && rewrite ${REQ.path} "/static/*" "/*" && call-server"#));
+        // dir server created
+        assert!(updated["servers"].as_object().unwrap().keys().any(|k| k.starts_with("router_dir_")));
+
+        let updated = Gateway::remove_router_from_config(updated, "router_test", "/static/*", "/www/").unwrap();
+        let servers = updated["servers"].as_object().unwrap();
+        let server = servers.get("router_test");
+        assert!(server.is_none());
+
+        // create with local dir target and explicit server id
+        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "/static/", "/www/").unwrap();
+        assert_eq!(sid2, "router_test");
+        let server = updated["servers"][sid2.as_str()].as_object().unwrap();
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert!(rule.starts_with(r#"starts-with ${REQ.path} "/static/" && rewrite ${REQ.path} "/static/*" "/*" && call-server"#));
+
+        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "/static/", "/www").unwrap();
+        assert_eq!(sid2, "router_test");
+        let server = updated["servers"][sid2.as_str()].as_object().unwrap();
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        println!("{}", serde_json::to_string_pretty(&updated).unwrap());
+        assert!(rule.starts_with(r#"starts-with ${REQ.path} "/static/" && call-server"#));
+
+        // create with local dir target and explicit server id
+        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "/static", "/www/").unwrap();
+        assert_eq!(sid2, "router_test");
+        let server = updated["servers"][sid2.as_str()].as_object().unwrap();
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert!(rule.starts_with(r#"starts-with ${REQ.path} "/static" && rewrite ${REQ.path} "/static*" "*" && call-server"#));
+
+        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "/static", "/www").unwrap();
+        assert_eq!(sid2, "router_test");
+        let server = updated["servers"][sid2.as_str()].as_object().unwrap();
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert!(rule.starts_with(r#"starts-with ${REQ.path} "/static" && call-server"#));
+
+        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "/www/$1").unwrap();
+        assert_eq!(sid2, "router_test");
+        let server = updated["servers"][sid2.as_str()].as_object().unwrap();
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "^/static/(.*)$" "/$1" && call-server"#));
+        let updated = Gateway::remove_router_from_config(updated, "router_test", "~^/static/(.*)$", "/www/$1").unwrap();
+        let servers = updated["servers"].as_object().unwrap();
+        let server = servers.get("router_test");
+        assert!(server.is_none());
+
+        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "/www/").unwrap();
+        assert_eq!(sid2, "router_test");
+        let server = updated["servers"][sid2.as_str()].as_object().unwrap();
+        let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        println!("{}", rule);
+        assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && call-server"#));
     }
 
     #[tokio::test]
