@@ -788,6 +788,8 @@ pub async fn cyfs_gateway_main() {
     sfo_log::Logger::new("cyfs_gateway")
         .set_log_path(log_dir.to_string_lossy().to_string().as_str())
         .set_log_to_file(true)
+        .set_log_file_count(50)
+        .set_log_file_size(100 * 1024 * 1024)
         .start().unwrap();
     // init log
     // init_logging("cyfs_gateway",true);
