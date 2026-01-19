@@ -171,7 +171,11 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         }
     }
 
-    let sn_provider_factory = AcmeSnProviderFactory::new();
+    let sn_acme_data = get_buckyos_service_data_dir("cyfs_gateway").join("sn_dns");
+    if !sn_acme_data.exists() {
+        std::fs::create_dir_all(&sn_acme_data).unwrap();
+    }
+    let sn_provider_factory = AcmeSnProviderFactory::new(sn_acme_data);
     AcmeCertManager::register_dns_provider_factory("sn-dns", sn_provider_factory.clone());
     let mut cert_config = CertManagerConfig::default();
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
