@@ -657,10 +657,10 @@ pub async fn cyfs_gateway_main() {
                 .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("add_router")
             .about("Add a router rule to http server")
-            .after_help("Examples:\n  cyfs_gateway add_router --uri /sn --target /www\n  cyfs_gateway add_router --uri /api --target http://127.0.0.1:9000/ --id api_router")
+            .after_help("Examples:\n  cyfs_gateway add_router --uri /sn --target /www\n  cyfs_gateway add_router --uri /api --target http://127.0.0.1:9000/ --id server:api:main")
             .arg(Arg::new("id")
                 .long("id")
-                .help("http server id, optional; if missing will create router_<rand>")
+                .help("rule id (same format as add_rule, e.g. server:<id>:<chain>[:blocks:<block>]), optional; if missing will create router_<rand>")
                 .required(false))
             .arg(Arg::new("uri")
                 .long("uri")
@@ -681,8 +681,8 @@ pub async fn cyfs_gateway_main() {
             .after_help("Examples:\n  cyfs_gateway remove_router --id api_router --uri /api --target http://127.0.0.1:9000/")
             .arg(Arg::new("id")
                 .long("id")
-                .help("http server id")
-                .required(true))
+                .help("rule id (same format as add_rule, optional if unique match can be found)")
+                .required(false))
             .arg(Arg::new("uri")
                 .long("uri")
                 .help("uri match rule used when adding router")
@@ -1041,7 +1041,7 @@ pub async fn cyfs_gateway_main() {
             }
         }
         Some(("remove_router", sub_matches)) => {
-            let server_id = sub_matches.get_one::<String>("id").expect("id is required");
+            let server_id = sub_matches.get_one::<String>("id").map(|s| s.as_str());
             let uri = sub_matches.get_one::<String>("uri").expect("uri is required");
             let target = sub_matches.get_one::<String>("target").expect("target is required");
             let server = sub_matches.get_one::<String>("server").expect("server is required");

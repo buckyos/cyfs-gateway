@@ -153,9 +153,11 @@ impl GatewayControlClient {
         Ok(result)
     }
 
-    pub async fn remove_router(&self, server_id: &str, uri: &str, target: &str) -> ControlResult<Value> {
+    pub async fn remove_router(&self, server_id: Option<&str>, uri: &str, target: &str) -> ControlResult<Value> {
         let mut params = HashMap::new();
-        params.insert("id", server_id);
+        if let Some(id) = server_id {
+            params.insert("id", id);
+        }
         params.insert("uri", uri);
         params.insert("target", target);
         let result = self.krpc.call("remove_router", serde_json::to_value(&params).unwrap()).await

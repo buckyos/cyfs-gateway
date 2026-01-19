@@ -905,6 +905,42 @@ impl Gateway {
         Ok(server_id)
     }
 
+    fn parse_router_server_id(id: &str) -> Result<String> {
+        if let Some(rest) = id.strip_prefix("server:") {
+            if rest.is_empty() {
+                return Err(anyhow!("router id must target server config: {}", id));
+            }
+            return Ok(rest.to_string());
+        }
+        Ok(id.to_string())
+    }
+
+    fn find_router_server_by_block(raw_config: &Value, block_id: &str) -> Result<String> {
+        let servers = raw_config
+            .get("servers")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| anyhow!("servers not found"))?;
+        for (server_id, server) in servers.iter() {
+            if server
+                .get("type")
+                .and_then(|v| v.as_str())
+                != Some("http")
+            {
+                continue;
+            }
+            if let Some(hook_point) = server.get("hook_point").and_then(|v| v.as_object()) {
+                if let Some(main) = hook_point.get("main").and_then(|v| v.as_object()) {
+                    if let Some(blocks) = main.get("blocks").and_then(|v| v.as_object()) {
+                        if blocks.contains_key(block_id) {
+                            return Ok(server_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Err(anyhow!("router rule not found: {}", block_id))
+    }
+
     fn parse_router_uri(uri: &str) -> Result<(String, String)> {
         if uri.is_empty() {
             return Err(anyhow!("uri cannot be empty"));
@@ -1151,12 +1187,12 @@ impl Gateway {
 
     fn add_router_to_config(
         mut raw_config: Value,
-        server_id: Option<&str>,
+        router_id: Option<&str>,
         uri: &str,
         target: &str,
     ) -> Result<(Value, String, Option<String>)> {
-        let server_id = if let Some(id) = server_id {
-            id.to_string()
+        let server_id = if let Some(id) = router_id {
+            Self::parse_router_server_id(id)?
         } else {
             let default_map = Map::new();
             let server_map = raw_config
@@ -1209,18 +1245,23 @@ impl Gateway {
 
     fn remove_router_from_config(
         mut raw_config: Value,
-        server_id: &str,
+        router_id: Option<&str>,
         uri: &str,
         target: &str,
-    ) -> Result<Value> {
+    ) -> Result<(Value, String)> {
         let block_id = Self::router_block_id(uri, target);
+        let server_id = if let Some(id) = router_id {
+            Self::parse_router_server_id(id)?
+        } else {
+            Self::find_router_server_by_block(&raw_config, &block_id)?
+        };
         let servers = raw_config
             .get_mut("servers")
             .ok_or_else(|| anyhow!("servers not found"))?
             .as_object_mut()
             .ok_or_else(|| anyhow!("servers must be object"))?;
         let server = servers
-            .get_mut(server_id)
+            .get_mut(&server_id)
             .ok_or_else(|| anyhow!("server not found: {}", server_id))?
             .as_object_mut()
             .ok_or_else(|| anyhow!("server {} must be object", server_id))?;
@@ -1255,10 +1296,10 @@ impl Gateway {
             hook_point.remove("main");
         }
         if hook_point.is_empty() && server_id.starts_with("router_") {
-            servers.remove(server_id);
+            servers.remove(&server_id);
         }
 
-        Ok(raw_config)
+        Ok((raw_config, server_id))
     }
 
     fn set_rule_in_config(mut raw_config: Value, id: &str, rule: &str) -> Result<Value> {
@@ -1842,11 +1883,11 @@ impl Gateway {
         Ok(server_id)
     }
 
-    pub async fn remove_router(&self, server_id: &str, uri: &str, target: &str) -> Result<()> {
+    pub async fn remove_router(&self, server_id: Option<&str>, uri: &str, target: &str) -> Result<()> {
         let raw_config = {
             self.config.lock().unwrap().raw_config.clone()
         };
-        let raw_config = Self::remove_router_from_config(raw_config, server_id, uri, target)?;
+        let (raw_config, removed_server_id) = Self::remove_router_from_config(raw_config, server_id, uri, target)?;
         let gateway_config = self.parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
@@ -1854,20 +1895,20 @@ impl Gateway {
         if gateway_config
             .servers
             .iter()
-            .any(|s| s.id() == server_id)
+            .any(|s| s.id() == removed_server_id)
         {
             let new_server_config = gateway_config
                 .servers
                 .iter()
-                .find(|s| s.id() == server_id)
+                .find(|s| s.id() == removed_server_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("server config not found after parse: {}", server_id))?;
+                .ok_or_else(|| anyhow!("server config not found after parse"))?;
             let new_servers = self.server_factory.create(new_server_config.clone()).await?;
             for server in new_servers.into_iter() {
                 self.server_manager.replace_server(server);
             }
         } else {
-            self.server_manager.remove_server(server_id);
+            self.server_manager.remove_server(&removed_server_id);
         }
 
         let mut guard = self.config.lock().unwrap();
@@ -2585,13 +2626,14 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 let id = params.get("id");
                 let uri = params.get("uri");
                 let target = params.get("target");
-                if id.is_none() || uri.is_none() || target.is_none() {
+                if uri.is_none() || target.is_none() {
                     Err(cmd_err!(
                         ControlErrorCode::InvalidParams,
-                        "Invalid params: id or uri or target is None",
+                        "Invalid params: uri or target is None",
                     ))?;
                 }
-                gateway.remove_router(id.unwrap(), uri.unwrap(), target.unwrap()).await
+                let id = id.map(|s| s.as_str());
+                gateway.remove_router(id, uri.unwrap(), target.unwrap()).await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
@@ -3429,8 +3471,9 @@ mod tests {
         println!("{}", rule);
         assert_eq!(rule, r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "*" && forward "http://127.0.0.1:9000";"#);
 
-        let updated = Gateway::remove_router_from_config(updated, sid.as_str(), "/sn", "http://127.0.0.1:9000/").unwrap();
-        assert!(updated["servers"].get(sid).is_none());
+        let (updated, removed_id) = Gateway::remove_router_from_config(updated, Some(sid.as_str()), "/sn", "http://127.0.0.1:9000/").unwrap();
+        assert_eq!(removed_id, sid);
+        assert!(updated["servers"].get(&removed_id).is_none());
 
         let (updated, sid, _) = Gateway::add_router_to_config(raw_config.clone(), None, "/sn/", "http://127.0.0.1:9000/").unwrap();
         assert!(sid.starts_with("router_"));
@@ -3506,9 +3549,9 @@ mod tests {
         // dir server created
         assert!(updated["servers"].as_object().unwrap().keys().any(|k| k.starts_with("router_dir_")));
 
-        let updated = Gateway::remove_router_from_config(updated, "router_test", "/static/*", "/www/").unwrap();
+        let (updated, removed_id) = Gateway::remove_router_from_config(updated, Some("router_test"), "/static/*", "/www/").unwrap();
         let servers = updated["servers"].as_object().unwrap();
-        let server = servers.get("router_test");
+        let server = servers.get(&removed_id);
         assert!(server.is_none());
 
         // create with local dir target and explicit server id
@@ -3553,9 +3596,9 @@ mod tests {
         let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
         println!("{}", rule);
         assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "^/static/(.*)$" "/$1" && call-server"#));
-        let updated = Gateway::remove_router_from_config(updated, "router_test", "~^/static/(.*)$", "/www/$1").unwrap();
+        let (updated, removed_id) = Gateway::remove_router_from_config(updated, Some("router_test"), "~^/static/(.*)$", "/www/$1").unwrap();
         let servers = updated["servers"].as_object().unwrap();
-        let server = servers.get("router_test");
+        let server = servers.get(&removed_id);
         assert!(server.is_none());
 
         let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "/www/").unwrap();
