@@ -368,7 +368,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
             std::process::exit(1);
         }
     };
-    gateway.start(params).await;
+    gateway.start(params).await?;
     handler.set_gateway(Arc::new(gateway));
 
     // Sleep forever

@@ -186,7 +186,7 @@ impl Gateway {
         &self.tunnel_manager
     }
 
-    pub async fn start(&self, params: GatewayParams) {
+    pub async fn start(&self, params: GatewayParams) -> Result<()> {
         let mut real_machine_config = BuckyOSMachineConfig::default();
         let machine_config = BuckyOSMachineConfig::load_machine_config();
         if machine_config.is_some() {
@@ -194,18 +194,21 @@ impl Gateway {
         }
         let init_result = init_name_lib(&real_machine_config.web3_bridge).await;
         if init_result.is_err() {
-            error!("init default name client failed, err:{}", init_result.err().unwrap());
-            return;
+            let msg = format!("init default name client failed, err:{}", init_result.err().unwrap());
+            error!("{}", msg);
+            return Err(anyhow!("{}", msg));
         }
         info!("init default name client OK!");
 
         if let Err(e) = self.stack_manager.start().await {
             error!("start stack manager failed, err:{}", e);
+            return Err(anyhow!("start stack manager failed, err:{}", e));
         }
 
         if !params.keep_tunnel.is_empty() {
             self.keep_tunnels(params.keep_tunnel).await;
         }
+        Ok(())
     }
     async fn keep_tunnels(&self, keep_tunnel: Vec<String>) {
         for tunnel in keep_tunnel {
