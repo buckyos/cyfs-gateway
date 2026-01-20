@@ -423,6 +423,104 @@ mod tests {
         }
 
         {
+            let router_dir = tempfile::TempDir::new().unwrap();
+            let router_target = format!("{}/", router_dir.path().to_string_lossy());
+            std::fs::write(router_dir.path().join("index.html"), "router").unwrap();
+
+            let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+            let ret = cyfs_cmd_client.add_router(Some("server:www.buckyos.com"), "/router/", router_target.as_str()).await;
+            assert!(ret.is_ok());
+
+            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
+
+            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream)).await.unwrap();
+            let request = hyper::Request::get("/router/index.html")
+                .header("Host", "www.buckyos.com")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::new())).unwrap();
+
+            tokio::spawn(async move {
+                conn.await.unwrap();
+            });
+
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            assert_eq!(response.headers().get("content-length").unwrap(), format!("{}", "router".len()).as_str());
+            let body = response.into_body();
+            let data = body.collect().await.unwrap();
+            assert_eq!(data.to_bytes().as_ref(), b"router");
+
+            let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+            let ret = cyfs_cmd_client.remove_router(Some("server:www.buckyos.com"), "/router/", router_target.as_str()).await;
+            assert!(ret.is_ok());
+            let ret = cyfs_cmd_client.remove_router(Some("server:www.buckyos.com"), "/router/", router_target.as_str()).await;
+            assert!(ret.is_err());
+
+            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
+
+            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream)).await.unwrap();
+            let request = hyper::Request::get("/router/index.html")
+                .header("Host", "www.buckyos.com")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::new())).unwrap();
+
+            tokio::spawn(async move {
+                conn.await.unwrap();
+            });
+
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::NOT_FOUND);
+        }
+
+        {
+            let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+            let ret = cyfs_cmd_client.add_router(Some("server:www.buckyos.com"), "/reverse/", "http://127.0.0.1:18081/").await;
+            assert!(ret.is_ok());
+
+            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
+
+            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream)).await.unwrap();
+            let request = hyper::Request::get("/reverse/index.html")
+                .header("Host", "www.buckyos.com")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::new())).unwrap();
+
+            tokio::spawn(async move {
+                conn.await.unwrap();
+            });
+
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            assert_eq!(response.headers().get("content-length").unwrap(), format!("{}", "www.buckyos.com".len()).as_str());
+            let body = response.into_body();
+            let data = body.collect().await.unwrap();
+            assert_eq!(data.to_bytes().as_ref(), b"www.buckyos.com");
+
+            let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+            let ret = cyfs_cmd_client.remove_router(Some("server:www.buckyos.com"), "/reverse/", "http://127.0.0.1:18081/").await;
+            assert!(ret.is_ok());
+
+            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
+
+            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream)).await.unwrap();
+            let request = hyper::Request::get("/reverse/index.html")
+                .header("Host", "www.buckyos.com")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::new())).unwrap();
+
+            tokio::spawn(async move {
+                conn.await.unwrap();
+            });
+
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::NOT_FOUND);
+        }
+
+        {
             let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client.add_dispatch("19080", "127.0.0.1:18080", None).await;
             assert!(ret.is_ok());

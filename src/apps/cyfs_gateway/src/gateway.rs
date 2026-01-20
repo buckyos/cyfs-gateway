@@ -994,7 +994,8 @@ impl Gateway {
         let target_trim = target.trim();
         let is_http = target_trim.starts_with("http://") || target_trim.starts_with("https://");
         let is_unix = target_trim.starts_with("unix:");
-        let is_local = target_trim.starts_with('/');
+        let has_scheme = target_trim.contains("://");
+        let is_local = target_trim.starts_with('/') || (!is_http && !is_unix && !has_scheme);
 
         if !is_http && !is_unix && !is_local {
             return Err(anyhow!("invalid target: {}", target));
@@ -1036,8 +1037,21 @@ impl Gateway {
                     };
                 }
             }
+            let dir_root_had_trailing_slash = dir_root.ends_with('/');
             if dir_root.is_empty() {
                 dir_root.push('/');
+            }
+            if !Path::new(&dir_root).is_absolute() {
+                let base_dir = std::env::current_dir()
+                    .map_err(|e| anyhow!("get current dir failed: {}", e))?;
+                let mut resolved = base_dir.join(&dir_root).to_string_lossy().to_string();
+                if dir_root_had_trailing_slash
+                    && !resolved.ends_with(std::path::MAIN_SEPARATOR)
+                    && !resolved.ends_with('/')
+                {
+                    resolved.push(std::path::MAIN_SEPARATOR);
+                }
+                dir_root = resolved;
             }
             let server_id = Self::ensure_dir_server(raw_config, &dir_root)?;
             call_server = Some(server_id);
