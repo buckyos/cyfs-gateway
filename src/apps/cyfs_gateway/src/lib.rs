@@ -5,17 +5,18 @@ mod gateway;
 mod gateway_control_client;
 mod gateway_control_server;
 mod config_loader;
+mod config_merger;
 mod acme_sn_provider;
 
 pub use gateway::*;
 pub use gateway_control_client::*;
 pub use gateway_control_server::*;
 pub use config_loader::*;
+pub use config_merger::*;
 use acme_sn_provider::*;
 
 
 use std::collections::HashSet;
-use buckyos_kit::*;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
 use cyfs_dns::{InnerDnsRecordManager, LocalDnsFactory, ProcessChainDnsServerFactory};
@@ -28,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::anyhow;
+use buckyos_kit::{get_buckyos_log_dir, get_buckyos_service_data_dir, get_buckyos_system_etc_dir};
 use json_value_merge::Merge;
 use kRPC::RPCSessionToken;
 use serde_json::{Value};
@@ -351,16 +353,13 @@ async fn load_config_from_args(matches: &clap::ArgMatches) -> Result<(PathBuf, P
         msg
     })?;
 
-    let config_json = buckyos_kit::ConfigMerger::load_dir_with_root(&config_dir, &real_config_file).await?;
+    let config_json = crate::ConfigMerger::load_dir_with_root(&config_dir, &real_config_file, None).await?;
 
     Ok((config_dir.to_path_buf(), real_config_file, config_json))
 }
 
 fn get_config_file_path(matches: &clap::ArgMatches) -> PathBuf {
-    let mut default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.yaml");
-    if !default_config.exists() {
-        default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
-    }
+    let default_config = get_default_config_path();
     let config_file = matches.get_one::<String>("config_file");
     let real_config_file;
     if config_file.is_none() {
@@ -520,6 +519,19 @@ pub async fn cyfs_gateway_main() {
                 .help("Show format, optional json | yaml")
                 .required(false)
                 .default_value("yaml"))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CONTROL_SERVER)))
+        .subcommand(Command::new("save")
+            .about("Save current config to device")
+            .arg(Arg::new("config")
+                .long("config")
+                .short('c')
+                .help("save path")
+                .required(false))
             .arg(Arg::new("server")
                 .long("server")
                 .short('s')
@@ -828,6 +840,31 @@ pub async fn cyfs_gateway_main() {
                 }
                 Err(e) => {
                     println!("show config error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(("save", sub_matches)) => {
+            let server = sub_matches.get_one::<String>("server").unwrap();
+            let path = sub_matches.get_one::<String>("config");
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.save_config(path.map(|s| s.as_str())).await {
+                Ok(result) => {
+                    if let Some(path) = result.as_str() {
+                        println!("config saved: {}", path);
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    }
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("save config error: {}", e);
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }

@@ -31,6 +31,104 @@ use crate::gateway_control_server::{
     GatewayControlServerConfigParser, GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY,
 };
 
+fn get_default_saved_gateway_config_path() -> PathBuf {
+    get_buckyos_service_data_dir("cyfs_gateway").join("cyfs_gateway_saved.json")
+}
+
+pub fn get_default_config_path() -> PathBuf {
+    let mut default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.yaml");
+    if !default_config.exists() {
+        default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
+    }
+    default_config
+}
+
+fn strip_includes_field(mut config: Value) -> Value {
+    if let Some(obj) = config.as_object_mut() {
+        obj.remove("includes");
+    }
+    config
+}
+
+fn read_config_value(path: &Path) -> Result<Value> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("read config {} failed: {}", path.to_string_lossy(), e))?;
+    let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let value = match ext.to_ascii_lowercase().as_str() {
+        "yaml" | "yml" => serde_yaml_ng::from_str(&content)?,
+        "json" => serde_json::from_str(&content)?,
+        _ => serde_json::from_str(&content).or_else(|_| serde_yaml_ng::from_str(&content))?,
+    };
+    Ok(value)
+}
+
+fn load_include_paths(config: &Value, config_dir: &Path) -> Vec<PathBuf> {
+    let mut includes = Vec::new();
+    let include_value = match config.get("include") {
+        Some(value) => value,
+        None => return includes,
+    };
+    let include_list = match include_value.as_array() {
+        Some(list) => list,
+        None => return includes,
+    };
+    for entry in include_list {
+        let path_value = match entry {
+            Value::String(path) => Some(path.as_str()),
+            Value::Object(map) => map.get("path").and_then(|v| v.as_str()),
+            _ => None,
+        };
+        if let Some(path) = path_value {
+            includes.push(config_dir.join(path));
+        }
+    }
+    includes
+}
+
+fn saved_config_newer_than_others(saved_path: &Path, config_file: &Path, config_dir: &Path) -> bool {
+    let saved_mtime = match std::fs::metadata(saved_path).and_then(|meta| meta.modified()) {
+        Ok(time) => time,
+        Err(_) => return false,
+    };
+    let mut other_paths = vec![config_file.to_path_buf()];
+    if let Ok(root_config) = read_config_value(config_file) {
+        other_paths.extend(load_include_paths(&root_config, config_dir));
+    }
+    for path in other_paths {
+        if let Ok(other_time) = std::fs::metadata(path).and_then(|meta| meta.modified()) {
+            if saved_mtime <= other_time {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn is_default_gateway_config(config_file: &Path) -> bool {
+    let default_config = get_default_config_path();
+    config_file == default_config
+}
+
+fn resolve_save_path(requested: Option<&str>) -> PathBuf {
+    let default_path = get_default_saved_gateway_config_path();
+    let requested = match requested {
+        Some(path) if !path.is_empty() => path,
+        _ => return default_path,
+    };
+    let mut path = PathBuf::from(requested);
+    if path.is_relative() {
+        path = std::env::current_dir().unwrap_or(PathBuf::new()).join(path);
+    }
+    if path.exists() && path.is_dir() {
+        return path.join(default_path.file_name().unwrap());
+    }
+    let ends_with_sep = requested.ends_with('/') || requested.ends_with('\\');
+    if path.extension().is_none() && ends_with_sep {
+        return path.join(default_path.file_name().unwrap());
+    }
+    path
+}
+
 pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Value> {
     let config_dir = config_file.parent().ok_or_else(|| {
         let msg = format!("cannot get config dir: {:?}", config_file);
@@ -38,12 +136,42 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Val
         anyhow::anyhow!(msg)
     })?;
 
-    let config_json = buckyos_kit::ConfigMerger::load_dir_with_root(&config_dir, &config_file).await
+    let saved_path = get_default_saved_gateway_config_path();
+    let saved_mtime = if is_default_gateway_config(config_file) && saved_path.exists() {
+        std::fs::metadata(saved_path.as_path())
+            .and_then(|meta| meta.modified())
+            .ok()
+    } else {
+        None
+    };
+    let saved_config = if saved_mtime.is_some() {
+        match read_config_value(saved_path.as_path()) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                warn!("load saved config {} failed: {}", saved_path.to_string_lossy(), e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut config_json = crate::ConfigMerger::load_dir_with_root(
+        &config_dir,
+        &config_file,
+        saved_mtime,
+    )
+        .await
         .map_err(|e| {
             let msg = format!("local config {} failed {:?}", config_file.to_string_lossy().to_string(), e);
             error!("{}", msg);
             anyhow::anyhow!(msg)
         })?;
+    if let Some(mut saved_config) = saved_config.clone() {
+        saved_config.merge(&config_json);
+        config_json = saved_config;
+        info!("Merge saved gateway config {}", saved_path.to_string_lossy());
+    }
 
     info!("Gateway config before merge: {}", serde_json::to_string_pretty(&config_json).unwrap());
 
@@ -2510,6 +2638,26 @@ impl GatewayCmdHandler {
             Ok("".to_string())
         }
     }
+
+    async fn save_config_to_device(&self, requested_path: Option<&str>) -> ControlResult<String> {
+        let gateway = self.get_gateway().ok_or_else(|| cmd_err!(ControlErrorCode::NoGateway, "gateway not init"))?;
+        let raw_config = {
+            let config = gateway.config.lock().unwrap();
+            strip_includes_field(config.raw_config.clone())
+        };
+        let save_path = resolve_save_path(requested_path);
+        if let Some(parent) = save_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(into_cmd_err!(ControlErrorCode::Failed, "create config dir failed"))?;
+        }
+        let content = serde_json::to_string_pretty(&raw_config)
+            .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?;
+        tokio::fs::write(save_path.as_path(), content)
+            .await
+            .map_err(into_cmd_err!(ControlErrorCode::Failed, "write config failed"))?;
+        Ok(save_path.to_string_lossy().to_string())
+    }
 }
 
 #[derive(Serialize)]
@@ -2542,6 +2690,17 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     gateway.get_config(config_type.unwrap(), config_id.unwrap())
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))
                 }
+            },
+            "save_config" => {
+                let requested_path = if params.is_null() {
+                    None
+                } else {
+                    let params = serde_json::from_value::<HashMap<String, String>>(params)
+                        .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                    params.get("config").cloned()
+                };
+                let saved_path = self.save_config_to_device(requested_path.as_deref()).await?;
+                Ok(Value::String(saved_path))
             },
             "remove_rule" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)

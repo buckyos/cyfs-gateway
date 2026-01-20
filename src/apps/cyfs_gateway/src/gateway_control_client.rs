@@ -176,6 +176,19 @@ impl GatewayControlClient {
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
+
+    pub async fn save_config(&self, config: Option<&str>) -> ControlResult<Value> {
+        let params = if let Some(config) = config {
+            let mut params = HashMap::new();
+            params.insert("config", config);
+            serde_json::to_value(&params).unwrap()
+        } else {
+            Value::Null
+        };
+        let result = self.krpc.call("save_config", params).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+        Ok(result)
+    }
     
     pub async fn get_external_cmds(&self) -> ControlResult<Vec<ExternalCmd>> {
         let result = self.krpc.call("external_cmds", Value::Null).await
