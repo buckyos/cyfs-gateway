@@ -12,7 +12,6 @@ use buckyos_kit::*;
 use url::Url;
 use anyhow::{anyhow, Result};
 use chrono::{Utc};
-use json_value_merge::Merge;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use jsonwebtoken::jwk::Jwk;
 use kRPC::RPCSessionToken;
@@ -30,6 +29,7 @@ use crate::config_loader::GatewayConfigParserRef;
 use crate::gateway_control_server::{
     GatewayControlServerConfigParser, GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY,
 };
+use crate::merge;
 
 fn get_default_saved_gateway_config_path() -> PathBuf {
     get_buckyos_service_data_dir("cyfs_gateway").join("cyfs_gateway_saved.json")
@@ -168,7 +168,7 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Val
             anyhow::anyhow!(msg)
         })?;
     if let Some(mut saved_config) = saved_config.clone() {
-        saved_config.merge(&config_json);
+        merge(&mut saved_config, &config_json);
         config_json = saved_config;
         info!("Merge saved gateway config {}", saved_path.to_string_lossy());
     }
@@ -176,7 +176,7 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Val
     info!("Gateway config before merge: {}", serde_json::to_string_pretty(&config_json).unwrap());
 
     let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
-    cmd_config.merge(&config_json);
+    merge(&mut cmd_config, &config_json);
 
     let mut config_json = buckyos_kit::apply_params_to_json(&cmd_config, None)
         .map_err(|e| {
@@ -2679,7 +2679,7 @@ impl GatewayCmdHandler {
         let template_config: Value = serde_json::from_str(output.as_str())
             .map_err(into_cmd_err!(ControlErrorCode::InvalidParams, "invalid template config"))?;
         let mut raw_config = current_config.raw_config.clone();
-        raw_config.merge(&template_config);
+        merge(&mut raw_config, &template_config);
         let gateway_config = self.parser
             .parse(raw_config)
             .map_err(into_cmd_err!(ControlErrorCode::Failed, "parse config failed"))?;

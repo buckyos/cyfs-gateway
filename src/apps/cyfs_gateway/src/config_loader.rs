@@ -431,6 +431,7 @@ impl GatewayConfigParser {
     }
 
     pub fn parse(&self, json_value: serde_json::Value) -> ConfigResult<GatewayConfig> {
+        let raw_config = json_value.clone();
         let mut stacks = vec![];
         if let Some(stacks_value) = json_value.get("stacks") {
             //debug!("stacks_value: {:?}", stacks_value);
@@ -611,7 +612,7 @@ impl GatewayConfigParser {
         }
 
         Ok(GatewayConfig {
-            raw_config: json_value,
+            raw_config,
             limiters_config,
             acme_config,
             tls_ca,

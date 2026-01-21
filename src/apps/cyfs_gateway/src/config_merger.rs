@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use async_recursion::async_recursion;
-use json_value_merge::Merge;
 use log::*;
 use serde::Deserialize;
 use serde_json::value::Value as JsonValue;
@@ -86,10 +85,36 @@ fn merge_configs(configs: &[ConfigItem]) -> Result<JsonValue> {
     let mut merged = configs[0].clone();
     for config in configs.iter().skip(1) {
         info!("Will merge config: {:?} -> {:?}", config.path, merged.path);
-        merged.value.merge(&config.value);
+        merge(&mut merged.value, &config.value);
     }
 
     Ok(merged.value)
+}
+
+pub fn merge(current: &mut JsonValue, new_value: &JsonValue) {
+    match (current, new_value) {
+        (JsonValue::Object(current_map), JsonValue::Object(new_map)) => {
+            for (key, value) in new_map {
+                merge(current_map.entry(key).or_insert_with(|| JsonValue::Null), value);
+            }
+        }
+        (JsonValue::Array(current_array), JsonValue::Array(new_array)) => {
+            current_array.reserve(new_array.len());
+            for value in new_array.iter() {
+                if !current_array.iter().any(|existing| existing == value) {
+                    current_array.push(value.clone());
+                }
+            }
+        }
+        (JsonValue::Array(current_array), new_value) => {
+            if !current_array.iter().any(|existing| existing == new_value) {
+                current_array.push(new_value.clone());
+            }
+        }
+        (current, new_value) => {
+            *current = new_value.clone();
+        }
+    }
 }
 
 fn get_root_file(dir: &Path) -> Option<PathBuf> {
