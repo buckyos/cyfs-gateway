@@ -27,23 +27,23 @@ impl CollectionWrapperHelper {
         context: &mut JsContext,
     ) -> JsResult<JsValue> {
         match value {
-            CollectionValue::String(s) => Ok(JsValue::String(JsString::from(s))),
+            CollectionValue::String(s) => Ok(JsValue::new(JsString::from(s))),
             CollectionValue::Map(map) => {
                 let wrapper = MapCollectionWrapper::new(map);
-                wrapper.into_js_object(context).map(JsValue::Object)
+                wrapper.into_js_object(context).map(Into::into)
             }
             CollectionValue::Set(set) => {
                 let wrapper = SetCollectionWrapper::new(set);
-                wrapper.into_js_object(context).map(JsValue::Object)
+                wrapper.into_js_object(context).map(Into::into)
             }
             CollectionValue::MultiMap(map) => {
                 let wrapper = MultiMapCollectionWrapper::new(map);
-                wrapper.into_js_object(context).map(JsValue::Object)
+                wrapper.into_js_object(context).map(Into::into)
             }
             _ => {
                 let msg = format!("Unsupported CollectionValue type: {:?}", value);
                 warn!("{}", msg);
-                Ok(JsValue::Null)
+                Ok(JsValue::null())
             }
         }
     }
@@ -156,7 +156,12 @@ impl SetCollectionWrapper {
     }
 
     fn insert(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -179,7 +184,7 @@ impl SetCollectionWrapper {
 
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.insert(&value)) {
-            Ok(inserted) => Ok(JsValue::Boolean(inserted)),
+            Ok(inserted) => Ok(JsValue::from(inserted)),
             Err(e) => {
                 let msg = format!("Failed to insert into set collection: {}", e);
                 error!("{}", msg);
@@ -189,7 +194,12 @@ impl SetCollectionWrapper {
     }
 
     fn contains(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -207,7 +217,7 @@ impl SetCollectionWrapper {
 
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.contains(&key)) {
-            Ok(contains) => Ok(JsValue::Boolean(contains)),
+            Ok(contains) => Ok(JsValue::from(contains)),
             Err(e) => {
                 let msg = format!("Failed to check if set contains key '{}': {}", key, e);
                 error!("{}", msg);
@@ -217,7 +227,12 @@ impl SetCollectionWrapper {
     }
 
     fn remove(this: &JsValue, args: &[JsValue], _context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -235,7 +250,7 @@ impl SetCollectionWrapper {
 
         let rt = _context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.remove(&key)) {
-            Ok(removed) => Ok(JsValue::Boolean(removed)),
+            Ok(removed) => Ok(JsValue::from(removed)),
             Err(e) => {
                 let msg = format!("Failed to remove key '{}' from set collection: {}", key, e);
                 error!("{}", msg);
@@ -245,7 +260,12 @@ impl SetCollectionWrapper {
     }
 
     fn get_all(this: &JsValue, _args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -260,7 +280,7 @@ impl SetCollectionWrapper {
             Ok(values) => {
                 let values_iter = values
                     .into_iter()
-                    .map(|x| JsValue::String(JsString::from(x)));
+                    .map(|x| JsValue::new(JsString::from(x)));
                 let array = JsArray::from_iter(values_iter, context);
                 Ok(JsValue::from(array))
             }
@@ -348,7 +368,12 @@ impl MapCollectionWrapper {
     }
 
     fn insert_new(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -373,7 +398,7 @@ impl MapCollectionWrapper {
 
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.insert_new(&key, value)) {
-            Ok(prev) => Ok(JsValue::Boolean(prev)),
+            Ok(prev) => Ok(JsValue::from(prev)),
             Err(e) => {
                 let msg = format!("Failed to insert into map collection: {}", e);
                 error!("{}", msg);
@@ -383,7 +408,12 @@ impl MapCollectionWrapper {
     }
 
     fn insert(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -414,7 +444,7 @@ impl MapCollectionWrapper {
                 // Convert previous value to JsValue
                 let prev_js_value = match prev_value {
                     Some(v) => CollectionWrapperHelper::collection_value_to_js_value(v, context)?,
-                    None => JsValue::Null,
+                    None => JsValue::null(),
                 };
 
                 Ok(prev_js_value)
@@ -428,7 +458,12 @@ impl MapCollectionWrapper {
     }
 
     fn get(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -448,7 +483,7 @@ impl MapCollectionWrapper {
         match rt.block_on(collection.get(&key)) {
             Ok(value) => match value {
                 Some(v) => CollectionWrapperHelper::collection_value_to_js_value(v, context),
-                None => Ok(JsValue::Null),
+                None => Ok(JsValue::null()),
             },
             Err(e) => {
                 let msg = format!("Failed to get from map collection: {}", e);
@@ -459,7 +494,12 @@ impl MapCollectionWrapper {
     }
 
     fn contains_key(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -477,7 +517,7 @@ impl MapCollectionWrapper {
 
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.contains_key(&key)) {
-            Ok(contains) => Ok(JsValue::Boolean(contains)),
+            Ok(contains) => Ok(JsValue::from(contains)),
             Err(e) => {
                 let msg = format!("Failed to check if map contains key '{}': {}", key, e);
                 error!("{}", msg);
@@ -487,7 +527,12 @@ impl MapCollectionWrapper {
     }
 
     fn remove(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -512,7 +557,7 @@ impl MapCollectionWrapper {
                 // Convert previous value to JsValue
                 let prev_js_value = match prev_value {
                     Some(v) => CollectionWrapperHelper::collection_value_to_js_value(v, context)?,
-                    None => JsValue::Null,
+                    None => JsValue::null(),
                 };
 
                 Ok(prev_js_value)
@@ -608,7 +653,12 @@ impl MultiMapCollectionWrapper {
     }
 
     pub fn insert(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -636,7 +686,7 @@ impl MultiMapCollectionWrapper {
 
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.insert(&key, &value)) {
-            Ok(inserted) => Ok(JsValue::Boolean(inserted)),
+            Ok(inserted) => Ok(JsValue::from(inserted)),
             Err(e) => {
                 let msg = format!("Failed to insert into multi-map collection: {}", e);
                 error!("{}", msg);
@@ -650,7 +700,12 @@ impl MultiMapCollectionWrapper {
         args: &[JsValue],
         context: &mut JsContext,
     ) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -676,7 +731,7 @@ impl MultiMapCollectionWrapper {
 
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.insert_many(&key, &value)) {
-            Ok(changed) => Ok(JsValue::Boolean(changed)),
+            Ok(changed) => Ok(JsValue::from(changed)),
             Err(e) => {
                 let msg = format!("Failed to insert many into multi-map collection: {}", e);
                 error!("{}", msg);
@@ -686,7 +741,12 @@ impl MultiMapCollectionWrapper {
     }
 
     fn get(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -710,8 +770,8 @@ impl MultiMapCollectionWrapper {
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.get(&key)) {
             Ok(value) => match value {
-                Some(v) => Ok(JsValue::String(JsString::from(v))),
-                None => Ok(JsValue::Null),
+                Some(v) => Ok(JsValue::new(JsString::from(v))),
+                None => Ok(JsValue::null()),
             },
             Err(e) => {
                 let msg = format!("Failed to get from multi-map collection: {}", e);
@@ -722,7 +782,12 @@ impl MultiMapCollectionWrapper {
     }
 
     fn get_many(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -743,10 +808,10 @@ impl MultiMapCollectionWrapper {
             Ok(ret) => match ret {
                 Some(set) => {
                     let set = SetCollectionWrapper::new(set);
-                    let value = set.into_js_object(context).map(JsValue::Object)?;
+                    let value = set.into_js_object(context).map(Into::into)?;
                     Ok(value)
                 }
-                None => Ok(JsValue::Null),
+                None => Ok(JsValue::null()),
             },
             Err(e) => {
                 let msg = format!("Failed to get from multi-map collection: {}", e);
@@ -761,7 +826,12 @@ impl MultiMapCollectionWrapper {
         args: &[JsValue],
         context: &mut JsContext,
     ) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -784,7 +854,7 @@ impl MultiMapCollectionWrapper {
 
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.contains_key(&key)) {
-            Ok(contains) => Ok(JsValue::Boolean(contains)),
+            Ok(contains) => Ok(JsValue::from(contains)),
             Err(e) => {
                 let msg = format!("Failed to check if multi-map contains key '{}': {}", key, e);
                 error!("{}", msg);
@@ -798,7 +868,12 @@ impl MultiMapCollectionWrapper {
         args: &[JsValue],
         context: &mut JsContext,
     ) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -824,7 +899,7 @@ impl MultiMapCollectionWrapper {
 
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.contains_value(&key, &value)) {
-            Ok(contains) => Ok(JsValue::Boolean(contains)),
+            Ok(contains) => Ok(JsValue::from(contains)),
             Err(e) => {
                 let msg = format!("Failed to check if multi-map contains value '{:?}': {}", value, e);
                 error!("{}", msg);
@@ -834,7 +909,12 @@ impl MultiMapCollectionWrapper {
     }
 
     pub fn remove(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -862,7 +942,7 @@ impl MultiMapCollectionWrapper {
 
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.remove(&key, &value)) {
-            Ok(removed) => Ok(JsValue::Boolean(removed)),
+            Ok(removed) => Ok(JsValue::from(removed)),
             Err(e) => {
                 let msg = format!("Failed to remove from multi-map collection: {}", e);
                 error!("{}", msg);
@@ -876,7 +956,12 @@ impl MultiMapCollectionWrapper {
         args: &[JsValue],
         context: &mut JsContext,
     ) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -915,10 +1000,10 @@ impl MultiMapCollectionWrapper {
             Ok(ret) => match ret {
                 Some(values) => {
                     let set = SetCollectionWrapper::new(values);
-                    let value = set.into_js_object(context).map(JsValue::Object)?;
+                    let value = set.into_js_object(context).map(Into::into)?;
                     Ok(value)
                 }
-                None => Ok(JsValue::Null),
+                None => Ok(JsValue::null()),
             },
             Err(e) => {
                 let msg = format!("Failed to remove all from multi-map collection: {}", e);
@@ -933,7 +1018,12 @@ impl MultiMapCollectionWrapper {
         args: &[JsValue],
         context: &mut JsContext,
     ) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
@@ -962,10 +1052,10 @@ impl MultiMapCollectionWrapper {
             Ok(ret) => match ret {
                 Some(values) => {
                     let set = SetCollectionWrapper::new(values);
-                    let value = set.into_js_object(context).map(JsValue::Object)?;
+                    let value = set.into_js_object(context).map(Into::into)?;
                     Ok(value)
                 }
-                None => Ok(JsValue::Null),
+                None => Ok(JsValue::null()),
             },
             Err(e) => {
                 let msg = format!("Failed to remove all from multi-map collection: {}", e);

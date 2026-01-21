@@ -1,4 +1,4 @@
-use super::req::HTTP_REQUEST_HEADER_VARS;
+use super::vars::HTTP_REQUEST_HEADER_VARS;
 use crate::chain::EnvRef;
 use crate::collection::*;
 use hyper::{Uri, header::HeaderName};

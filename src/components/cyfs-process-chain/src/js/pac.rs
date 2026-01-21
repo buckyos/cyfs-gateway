@@ -1,5 +1,5 @@
 use boa_engine::prelude::*;
-use boa_engine::{Context as JsContext, JsResult, js_string};
+use boa_engine::{Context as JsContext, JsResult, JsString, js_string};
 use std::net::{IpAddr, Ipv4Addr};
 use trust_dns_resolver::Resolver;
 use trust_dns_resolver::config::*;
@@ -332,7 +332,7 @@ impl PACEnvFunctionsWrapper {
         })?;
 
         match ip {
-            Some(ip) => Ok(JsValue::String(ip.to_string().into())),
+            Some(ip) => Ok(JsValue::new(JsString::from(ip.to_string()))),
             None => Ok(JsValue::undefined()),
         }
     }

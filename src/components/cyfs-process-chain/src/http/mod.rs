@@ -1,10 +1,10 @@
 mod body;
 mod hyper_req;
-mod req;
+mod vars;
 
 #[cfg(test)]
 mod example;
 
 pub use body::*;
 pub use hyper_req::*;
-pub use req::*;
+pub use vars::*;
