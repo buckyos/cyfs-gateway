@@ -18,12 +18,12 @@ use jsonwebtoken::jwk::Jwk;
 use kRPC::RPCSessionToken;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sfo_js::{JsEngine, JsPkgManagerRef, JsString, JsValue, NativeFunction};
+use sfo_js::{JsEngine, JsPkg, JsPkgManagerRef, JsString, JsValue, NativeFunction};
 use sfo_js::object::builtins::JsArray;
 use sha2::Digest;
 use rand::{Rng};
 use rand::distr::Alphanumeric;
-use rand::thread_rng;
+use rand::rng;
 use crate::gateway_control_client::{cmd_err, into_cmd_err};
 use crate::gateway_control_server::{ControlErrorCode, ControlResult, GatewayControlCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
 use crate::config_loader::GatewayConfigParserRef;
@@ -188,6 +188,18 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Val
     normalize_all_path_value_config(&mut config_json,config_dir);
     info!("normalize_all_path_value_config for gateway config.");
     Ok(config_json)
+}
+
+pub(crate) async fn run_server_tempalte_pkg(mut pkg: JsPkg, args: Vec<String>) -> ControlResult<String> {
+    pkg.enable_fetch(false)
+        .init_callback(move |engine| {
+            engine.register_global_builtin_callable("currentDir".to_string(), 0, NativeFunction::from_copy_closure(|_, _, _| {
+                Ok(JsValue::from(JsString::from(std::env::current_dir().unwrap_or(PathBuf::new()).to_string_lossy().to_string())))
+            }))?;
+            Ok(())
+        });
+    let output = pkg.run(args).await.map_err(into_cmd_err!(ControlErrorCode::Failed, "run pkg failed"))?;
+    Ok(output)
 }
 
 //use buckyos_api::{*};
@@ -592,7 +604,7 @@ impl Gateway {
 
     fn gen_unique_id(map: &Map<String, Value>) -> String {
         loop {
-            let candidate: String = thread_rng()
+            let candidate: String = rng()
                 .sample_iter(&Alphanumeric)
                 .take(5)
                 .map(char::from)
@@ -606,7 +618,7 @@ impl Gateway {
 
     fn gen_unique_id_with_prefix(map: &Map<String, Value>, prefix: &str) -> String {
         loop {
-            let candidate: String = thread_rng()
+            let candidate: String = rng()
                 .sample_iter(&Alphanumeric)
                 .take(5)
                 .map(char::from)
@@ -1082,8 +1094,7 @@ impl Gateway {
             return Ok(("regex".to_string(), u));
         }
         if uri.ends_with("/*") || uri.ends_with('*') {
-            let mut u = uri.to_string();
-            u = uri.trim_end_matches('*').to_string();
+            let u = uri.trim_end_matches('*').to_string();
             return Ok(("wildcard".to_string(), u));
         }
         Ok(("prefix".to_string(), uri.to_string()))
@@ -2565,18 +2576,15 @@ struct StartTemplateParams {
 
 pub struct GatewayCmdHandler {
     gateway: Mutex<Option<Arc<Gateway>>>,
-    external_cmd_store: ExternalCmdStoreRef,
-    config_file: PathBuf,
+    config_file: Option<PathBuf>,
     parser: GatewayConfigParserRef,
 }
 
 impl GatewayCmdHandler {
-    pub fn new(external_cmd_store: ExternalCmdStoreRef,
-               config_file: PathBuf,
+    pub fn new(config_file: Option<PathBuf>,
                parser: GatewayConfigParserRef, ) -> Arc<Self> {
         Arc::new(Self {
             gateway: Mutex::new(None),
-            external_cmd_store,
             config_file,
             parser,
         })
@@ -2595,16 +2603,10 @@ impl GatewayCmdHandler {
         let current_config = {
             gateway.config.lock().unwrap().clone()
         };
-        let mut pkg = gateway.external_cmds.get_pkg(template_id)
+        let pkg = gateway.external_cmds.get_pkg(template_id)
             .await
             .map_err(into_cmd_err!(ControlErrorCode::Failed, "get pkg failed"))?;
-        pkg.init_callback(move |engine| {
-            engine.register_global_builtin_callable("currentDir".to_string(), 0, NativeFunction::from_copy_closure(|_, _, _| {
-                Ok(JsValue::from(JsString::from(std::env::current_dir().unwrap_or(PathBuf::new()).to_string_lossy().to_string())))
-            }))?;
-            Ok(())
-        });
-        let output = pkg.run(args).await.map_err(into_cmd_err!(ControlErrorCode::Failed, "run pkg failed"))?;
+        let output = run_server_tempalte_pkg(pkg, args).await?;
         let template_config: Value = serde_json::from_str(output.as_str())
             .map_err(into_cmd_err!(ControlErrorCode::InvalidParams, "invalid template config"))?;
         let mut raw_config = current_config.raw_config.clone();
@@ -2972,8 +2974,14 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 Ok(Value::String("ok".to_string()))
             }
             "reload" => {
+                if self.config_file.is_none() {
+                    Err(cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "Invalid params: config_file is None",
+                    ))?;
+                }
                 info!("*** reload gateway config ...");
-                let gateway_config = load_config_from_file(self.config_file.as_path()).await
+                let gateway_config = load_config_from_file(self.config_file.as_ref().unwrap().as_path()).await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 let gateway_config = self.parser.parse(gateway_config)
                     .map_err(into_cmd_err!(ControlErrorCode::Failed))?;

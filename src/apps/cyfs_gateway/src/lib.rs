@@ -29,11 +29,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::anyhow;
+use anyhow::Result;
 use buckyos_kit::{get_buckyos_log_dir, get_buckyos_service_data_dir, get_buckyos_system_etc_dir};
 use json_value_merge::Merge;
 use kRPC::RPCSessionToken;
 use serde_json::{Value};
-use sfo_js::JsPkgManager;
+use sfo_js::{JsEngine, JsPkgManager, JsString, JsValue};
+use sfo_js::object::builtins::JsArray;
 use tokio::fs::create_dir_all;
 use tokio::task;
 use url::Url;
@@ -41,38 +43,37 @@ use cyfs_sn::{SnServerFactory, SqliteDBFactory};
 use cyfs_socks::SocksServerFactory;
 use cyfs_tun::TunStackFactory;
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
 pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
     let config_json = load_config_from_file(config_file).await?;
     info!("Gateway config: {}", serde_json::to_string_pretty(&config_json).unwrap());
 
-    let config_dir = config_file.parent().ok_or_else(|| {
-        let msg = format!("cannot get config dir: {:?}", config_file);
-        error!("{}", msg);
-        msg
-    })?;
+    run_gateway_with_config(config_json, Some(config_file), params).await
+}
+
+async fn run_gateway_with_config(
+    config_json: Value,
+    config_file: Option<&Path>,
+    params: GatewayParams,
+) -> Result<()> {
+    let config_dir = if let Some(config_file) = config_file {
+        Some(config_file.parent().ok_or_else(|| {
+            let msg = format!("cannot get config dir: {:?}", config_file);
+            error!("{}", msg);
+            anyhow!(msg)
+        })?)
+    } else {
+        None
+    };
 
     let user_name: Option<String> = match config_json.get("user_name") {
-        Some(user_name) => {
-            match user_name.as_str() {
-                Some(user_name) => Some(user_name.to_string()),
-                None => None,
-            }
-        },
+        Some(user_name) => user_name.as_str().map(|value| value.to_string()),
         None => None,
     };
     let password: Option<String> = match config_json.get("password") {
-        Some(password) => {
-            match password.as_str() {
-                Some(password) => Some(password.to_string()),
-                None => None,
-            }
-        },
+        Some(password) => password.as_str().map(|value| value.to_string()),
         None => None,
     };
 
-    // Load config from json
     let parser = Arc::new(GatewayConfigParser::new());
     parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
     parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
@@ -85,22 +86,19 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
     parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
     parser.register_server_config_parser("dir", Arc::new(DirServerConfigParser::new()));
-
     parser.register_server_config_parser("control_server", Arc::new(GatewayControlServerConfigParser::new()));
     parser.register_server_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
     parser.register_server_config_parser("sn", Arc::new(SNServerConfigParser::new()));
     parser.register_server_config_parser("acme_response", Arc::new(AcmeHttpChallengeServerConfigParser::new()));
 
     info!("Parse cyfs-gatway config...");
-    let load_result = parser.parse(config_json.clone());
-    if load_result.is_err() {
-        let msg = format!("Error loading config: {}", load_result.err().unwrap().msg());
+    let gateway_config = parser.parse(config_json.clone()).map_err(|e| {
+        let msg = format!("Error loading config: {}", e.msg());
         error!("{}", msg);
-        std::process::exit(1);
-    }
-    let gateway_config = load_result.unwrap();
+        anyhow::anyhow!(msg)
+    })?;
     info!("Parse cyfs-gatway config success");
-    
+
     let connect_manager = ConnectionManager::new();
     let tunnel_manager = TunnelManager::new();
     let stack_manager = StackManager::new();
@@ -119,11 +117,13 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
                     log::error!("Create limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
                 }
             }
-            let _ = limiter_manager.new_limiter(limiter_config.id.clone(),
-                                                limiter_config.upper_limiter.clone(),
-                                                limiter_config.concurrent.map(|v| v as u32),
-                                                limiter_config.download_speed.map(|v| v as u32),
-                                                limiter_config.upload_speed.map(|v| v as u32));
+            let _ = limiter_manager.new_limiter(
+                limiter_config.id.clone(),
+                limiter_config.upper_limiter.clone(),
+                limiter_config.concurrent.map(|v| v as u32),
+                limiter_config.download_speed.map(|v| v as u32),
+                limiter_config.upload_speed.map(|v| v as u32),
+            );
         }
     }
 
@@ -180,7 +180,6 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     self_cert_config.store_path = data_dir.to_string_lossy().to_string();
     let self_cert_manager = SelfCertMgr::create(self_cert_config).await?;
 
-
     let global_collections = GlobalCollectionManager::create(gateway_config.collections.clone()).await?;
 
     let chain_cmds = get_buckyos_system_etc_dir().join("cyfs_gateway").join("server_templates");
@@ -197,7 +196,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
         self_cert_manager.clone(),
         global_collections.clone(),
         external_cmds,
-        parser.clone()
+        parser.clone(),
     );
     factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
         server_manager.clone(),
@@ -270,18 +269,16 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
     )));
     debug!("Register http server factory");
     factory.register_server_factory("dir", Arc::new(DirServerFactory::new()));
-
     factory.register_server_factory("socks", Arc::new(SocksServerFactory::new(
         global_process_chains.clone(),
         global_collections.clone(),
     )));
-
     debug!("Register dir server factory");
     factory.register_server_factory("dns", Arc::new(ProcessChainDnsServerFactory::new(
         server_manager.clone(),
         global_process_chains.clone(),
         global_collections.clone(),
-        inner_dns_record_manager
+        inner_dns_record_manager,
     )));
     debug!("Register dns server factory");
     factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new(cert_manager.clone())));
@@ -293,41 +290,29 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
 
     let store = LocalTokenKeyStore::new(data_dir);
     let token_manager = LocalTokenManager::new(user_name, password, store).await?;
-    let external_cmd_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("add_chain_cmds");
-    if !external_cmd_dir.exists() {
-        create_dir_all(external_cmd_dir.clone()).await?;
-    }
-    let external_cmd_store = LocalExternalCmdStore::new(external_cmd_dir);
-    let handler = GatewayCmdHandler::new(
-        Arc::new(external_cmd_store),
-        config_file.to_path_buf(),
-        parser.clone());
+    let handler = GatewayCmdHandler::new(config_file.map(|v| v.to_path_buf()), parser.clone());
     factory.register_server_factory(
         "control_server",
-        Arc::new(GatewayControlServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
+        Arc::new(GatewayControlServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())),
+    );
     info!("Register control server factory");
     factory.register_server_factory(
         "local_dns",
-        Arc::new(LocalDnsFactory::new(config_dir.to_string_lossy().to_string())));
+        Arc::new(LocalDnsFactory::new(config_dir.map(|v| v.to_string_lossy().to_string()))),
+    );
     info!("Register local dns server factory");
     let mut sn_factory = SnServerFactory::new();
     sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
-    factory.register_server_factory(
-        "sn",
-        Arc::new(sn_factory)
-    );
+    factory.register_server_factory("sn", Arc::new(sn_factory));
     info!("Register sn server factory");
-    let gateway = match factory.create_gateway(gateway_config).await {
-        Ok(gateway) => gateway,
-        Err(e) => {
-            error!("create gateway failed: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let gateway = factory.create_gateway(gateway_config).await.map_err(|e| {
+        let msg = format!("create gateway failed: {}", e);
+        error!("{}", msg);
+        anyhow::anyhow!(msg)
+    })?;
     gateway.start(params).await;
     handler.set_gateway(Arc::new(gateway));
 
-    // Sleep forever
     let _ = tokio::signal::ctrl_c().await;
 
     Ok(())
@@ -350,7 +335,7 @@ async fn load_config_from_args(matches: &clap::ArgMatches) -> Result<(PathBuf, P
     let config_dir = real_config_file.parent().ok_or_else(|| {
         let msg = format!("cannot get config dir: {:?}", real_config_file);
         error!("{}", msg);
-        msg
+        anyhow!(msg)
     })?;
 
     let config_json = crate::ConfigMerger::load_dir_with_root(&config_dir, &real_config_file, None).await?;
@@ -447,13 +432,13 @@ struct StartTemplateArgs {
     help: bool,
 }
 
-fn parse_start_template_args() -> StartTemplateArgs {
+fn parse_template_args(command: &str, ignore_server: bool) -> StartTemplateArgs {
     let mut args = Vec::new();
     let mut seen_start = false;
     for arg in std::env::args() {
         if seen_start {
             args.push(arg);
-        } else if arg == "start" {
+        } else if arg == command {
             seen_start = true;
         }
     }
@@ -461,6 +446,10 @@ fn parse_start_template_args() -> StartTemplateArgs {
     let mut filtered = Vec::new();
     let mut skip_next = false;
     for arg in args {
+        if !ignore_server {
+            filtered.push(arg);
+            continue;
+        }
         if skip_next {
             skip_next = false;
             continue;
@@ -495,6 +484,30 @@ fn parse_start_template_args() -> StartTemplateArgs {
         args: template_args,
         help,
     }
+}
+
+async fn run_template_local(template_id: &str, args: Vec<String>) -> Result<()> {
+    let template_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("server_templates");
+    let external_cmds = JsPkgManager::new(template_dir);
+    let pkg = external_cmds.get_pkg(template_id)
+        .await
+        .map_err(|e| anyhow!("get pkg failed: {:?}", e))?;
+    let output = run_server_tempalte_pkg(pkg, args).await.map_err(|e| {
+        let msg = format!("run template failed: {}", e);
+        error!("{}", msg);
+        anyhow!(msg)
+    })?;
+    let output = output.trim();
+    if output.is_empty() {
+        return Err(anyhow!("template returned empty config"));
+    }
+    let template_config: Value = serde_json::from_str(output)
+        .map_err(|e| anyhow!("invalid template config: {}", e))?;
+    let mut config_json = buckyos_kit::apply_params_to_json(&template_config, None)
+        .map_err(|e| anyhow!("apply params failed: {}", e))?;
+    let config_dir = std::env::current_dir().map_err(|e| anyhow!("read current dir failed: {}", e))?;
+    normalize_all_path_value_config(&mut config_json, config_dir.as_path());
+    run_gateway_with_config(config_json, None, GatewayParams { keep_tunnel: vec![] }).await
 }
 
 
@@ -789,6 +802,11 @@ pub async fn cyfs_gateway_main() {
                 .help("server url")
                 .required(false)
                 .default_value(CONTROL_SERVER)))
+        .subcommand(Command::new("run")
+            .allow_external_subcommands(true)
+            .allow_missing_positional(true)
+            .ignore_errors(true)
+            .about("run a server template locally"))
         .subcommand(Command::new("reload")
             .about("reload config")
             .arg(Arg::new("server")
@@ -1206,7 +1224,7 @@ pub async fn cyfs_gateway_main() {
         }
         Some(("start", sub_matches)) => {
             let server = sub_matches.get_one::<String>("server").unwrap();
-            let start_args = parse_start_template_args();
+            let start_args = parse_template_args("start", true);
             let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             if start_args.template_id.is_none() {
                 match cyfs_cmd_client.get_external_cmds().await {
@@ -1271,6 +1289,73 @@ pub async fn cyfs_gateway_main() {
                 }
             }
         }
+        Some(("run", _sub_matches)) => {
+            let run_args = parse_template_args("run", false);
+            let template_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("server_templates");
+            let external_cmds = JsPkgManager::new(template_dir);
+            if run_args.template_id.is_none() {
+                match external_cmds.list_pkgs().await {
+                    Ok(cmds) => {
+                        println!("Available templates ({}):", cmds.len());
+                        for cmd in cmds {
+                            if cmd.description().is_empty() {
+                                println!("  {}", cmd.name());
+                            } else {
+                                println!("  {} - {}", cmd.name(), cmd.description());
+                            }
+                        }
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        println!("run template list error: {:?}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            let template_id = run_args.template_id.unwrap();
+            if run_args.help {
+                match external_cmds.get_pkg(template_id.as_str()).await {
+                    Ok(pkg) => match pkg.help().await {
+                        Ok(help) => {
+                            println!("{}", help);
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            println!("run template help error: {:?}", e);
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(e) => {
+                        println!("run template help error: {:?}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            let log_dir = get_buckyos_log_dir("cyfs_gateway", true);
+            std::fs::create_dir_all(&log_dir).unwrap();
+
+            sfo_log::Logger::new("cyfs_gateway")
+                .set_log_path(log_dir.to_string_lossy().to_string().as_str())
+                .set_log_to_file(true)
+                .start().unwrap();
+            info!("cyfs_gateway start...");
+
+            if matches.get_flag("debug") {
+                info!("Debug mode enabled");
+                unsafe { std::env::set_var("RUST_BACKTRACE", "1"); }
+                console_subscriber::init();
+            }
+            match run_template_local(template_id.as_str(), run_args.args).await {
+                Ok(_) => {
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("run template error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         _ => {}
     }
 
@@ -1285,14 +1370,13 @@ pub async fn cyfs_gateway_main() {
     // init_logging("cyfs_gateway",true);
     info!("cyfs_gateway start...");
 
-    let config_file = get_config_file_path(&matches);
-
-
     if matches.get_flag("debug") {
         info!("Debug mode enabled");
         unsafe { std::env::set_var("RUST_BACKTRACE", "1"); }
         console_subscriber::init();
     }
+
+    let config_file = get_config_file_path(&matches);
 
     // Extract necessary params from command line
     let params = GatewayParams {
