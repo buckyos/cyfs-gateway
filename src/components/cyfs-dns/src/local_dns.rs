@@ -78,11 +78,11 @@ impl ServerConfig for LocalDnsConfig {
 }
 
 pub struct LocalDnsFactory {
-    config_path: String,
+    config_path: Option<String>,
 }
 
 impl LocalDnsFactory {
-    pub fn new(config_path: String) -> Self {
+    pub fn new(config_path: Option<String>) -> Self {
         LocalDnsFactory {
             config_path,
         }
@@ -99,7 +99,14 @@ impl ServerFactory for LocalDnsFactory {
         if path.is_absolute() {
             Ok(vec![Server::NameServer(Arc::new(LocalDns::create(config.id.clone(), config.file_path.clone())?))])
         } else {
-            let path = Path::new(self.config_path.as_str()).join(config.file_path.as_str()).canonicalize()
+            let config_path = if let Some(ref config_path) = self.config_path {
+                config_path.to_string()
+            } else {
+                std::env::current_dir()
+                    .map_err(into_server_err!(ServerErrorCode::InvalidConfig, "invalid local dns config {}", config.file_path))?
+                    .to_string_lossy().to_string()
+            };
+            let path = Path::new(config_path.as_str()).join(config.file_path.as_str()).canonicalize()
                 .map_err(into_server_err!(ServerErrorCode::InvalidConfig, "invalid local dns config {}", config.file_path))?;
             Ok(vec![Server::NameServer(Arc::new(LocalDns::create(config.id.clone(), path.to_string_lossy().to_string())?))])
         }

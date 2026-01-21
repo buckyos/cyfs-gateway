@@ -406,8 +406,8 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for AcmeHttpCh
 pub struct GatewayConfigParser {
     stack_config_parser: CyfsStackConfigParser<serde_json::Value>,
     server_config_parser: CyfsServerConfigParser<serde_json::Value>,
-
 }
+pub type GatewayConfigParserRef = Arc<GatewayConfigParser>;
 
 impl GatewayConfigParser {
     pub fn new() -> Self {
@@ -431,6 +431,7 @@ impl GatewayConfigParser {
     }
 
     pub fn parse(&self, json_value: serde_json::Value) -> ConfigResult<GatewayConfig> {
+        let raw_config = json_value.clone();
         let mut stacks = vec![];
         if let Some(stacks_value) = json_value.get("stacks") {
             //debug!("stacks_value: {:?}", stacks_value);
@@ -611,6 +612,7 @@ impl GatewayConfigParser {
         }
 
         Ok(GatewayConfig {
+            raw_config,
             limiters_config,
             acme_config,
             tls_ca,
@@ -674,6 +676,7 @@ mod speed_parser {
 
 #[derive(Clone)]
 pub struct GatewayConfig {
+    pub raw_config: serde_json::Value,
     pub limiters_config: Option<Vec<LimiterConfig>>,
     pub acme_config: Option<AcmeConfig>,
     pub tls_ca: Option<TlsCA>,
