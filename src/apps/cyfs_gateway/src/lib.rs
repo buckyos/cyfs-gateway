@@ -581,7 +581,7 @@ pub async fn cyfs_gateway_main() {
             .about("Show current config")
             .arg(Arg::new("id")
                 .help("config id")
-                .required(true))
+                .required(false))
             .arg(Arg::new("format")
                 .long("format")
                 .short('f')
@@ -899,14 +899,12 @@ pub async fn cyfs_gateway_main() {
             save_login_token(server.as_str(), login_result.as_str());
         }
         Some(("show_config", sub_matches)) => {
-            let config_type = sub_matches.get_one::<String>("config_type");
-            let config_id = sub_matches.get_one::<String>("config_id");
+            let id = sub_matches.get_one::<String>("id");
             let format = sub_matches.get_one::<String>("format").unwrap();
             let server = sub_matches.get_one::<String>("server").unwrap();
             let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
-            match cyfs_cmd_client.get_config(
-                config_type.map(|s| s.to_string()),
-                config_id.map(|s| s.to_string())).await {
+            let result = cyfs_cmd_client.get_config_by_id(id.map(|value| value.as_str())).await;
+            match result {
                 Ok(result) => {
                     if format == "json" {
                         println!("{}", serde_json::to_string_pretty(&result).unwrap());

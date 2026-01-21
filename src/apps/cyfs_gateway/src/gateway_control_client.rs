@@ -40,17 +40,16 @@ impl GatewayControlClient {
         result.as_str().ok_or_else(|| cmd_err!(ControlErrorCode::Failed)).map(|s| s.to_string())
     }
 
-    pub async fn get_config(&self, config_type: Option<String>, config_id: Option<String>) -> ControlResult<Value> {
-        let mut params = HashMap::new();
-        if config_type.is_some() {
-            params.insert("config_type", config_type.unwrap());
-        }
-        if config_id.is_some() {
-            params.insert("config_id", config_id.unwrap());
-        }
-        let result = self.krpc.call("get_config", serde_json::to_value(&params).unwrap()).await
+    pub async fn get_config_by_id(&self, id: Option<&str>) -> ControlResult<Value> {
+        let params = if let Some(id) = id {
+            let mut params = HashMap::new();
+            params.insert("id", id);
+            serde_json::to_value(&params).unwrap()
+        } else {
+            Value::Null
+        };
+        let result = self.krpc.call("get_config", params).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
-
         Ok(result)
     }
 

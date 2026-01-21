@@ -215,13 +215,13 @@ print("hello python")
         handler.set_gateway(Arc::new(gateway));
 
         let cmd_client = GatewayControlClient::new("http://127.0.0.1:13451".to_string(), None);
-        let ret = cmd_client.get_config(None, None).await;
+        let ret = cmd_client.get_config_by_id(None).await;
         assert!(ret.is_err());
 
         let ret = cmd_client.login("test", "123456").await;
         assert!(ret.is_ok());
 
-        let ret = cmd_client.get_config(None, None).await;
+        let ret = cmd_client.get_config_by_id(None).await;
         assert!(ret.is_ok());
     }
 }

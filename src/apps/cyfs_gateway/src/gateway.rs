@@ -408,32 +408,24 @@ impl Gateway {
 
     pub fn get_all_config(&self) -> Result<Value> {
         let config = self.config.lock().unwrap();
-        let mut config_value = HashMap::new();
-        let mut stacks = vec![];
-        for stack in config.stacks.iter() {
-            if stack.id().as_str() == GATEWAY_CONTROL_SERVER_KEY {
-                continue;
+        let mut raw_config = config.raw_config.clone();
+        let control_config: Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG)
+            .unwrap_or(Value::Null);
+        if let Some(stacks) = control_config.get("stacks").and_then(|v| v.as_object()) {
+            if let Some(raw_stacks) = raw_config.get_mut("stacks").and_then(|v| v.as_object_mut()) {
+                for key in stacks.keys() {
+                    raw_stacks.remove(key);
+                }
             }
-            let stack_value: Value = serde_json::from_str(stack.get_config_json().as_str())?;
-            stacks.push(stack_value);
         }
-        config_value.insert("stacks".to_string(), Value::Array(stacks));
-
-        let mut servers = vec![];
-        for server in config.servers.iter() {
-            if server.id().as_str() == GATEWAY_CONTROL_SERVER_KEY {
-                continue;
+        if let Some(servers) = control_config.get("servers").and_then(|v| v.as_object()) {
+            if let Some(raw_servers) = raw_config.get_mut("servers").and_then(|v| v.as_object_mut()) {
+                for key in servers.keys() {
+                    raw_servers.remove(key);
+                }
             }
-            let server_value: Value = serde_json::from_str(server.get_config_json().as_str())?;
-            servers.push(server_value);
         }
-        config_value.insert("servers".to_string(), Value::Array(servers));
-
-
-        let global_config = serde_json::to_value(&config.global_process_chains)?;
-        config_value.insert("global_process_chains".to_string(), global_config);
-
-        Ok(serde_json::to_value(&config_value)?)
+        Ok(raw_config)
     }
 
     pub fn get_config(&self, config_type: &str, config_id: &str) -> Result<Value> {
@@ -479,6 +471,83 @@ impl Gateway {
             ControlErrorCode::ConfigNotFound,
             "Config not found: {}", config_id,
         )))
+    }
+
+    pub fn get_config_by_id(&self, id: &str) -> Result<Value> {
+        let id_list = id.split(':').collect::<Vec<&str>>();
+        if id_list.len() < 2 {
+            return Err(anyhow!("Invalid config id: {}", id));
+        }
+        let config_type = id_list[0];
+        if config_type != "stack" && config_type != "server" {
+            return Err(anyhow!("Invalid config type: {}", config_type));
+        }
+        let config_id = id_list[1];
+        if config_id == GATEWAY_CONTROL_SERVER_KEY {
+            return Err(anyhow!(cmd_err!(
+                ControlErrorCode::ConfigNotFound,
+                "Config not found: {}", config_id,
+            )));
+        }
+
+        let mut index = 2;
+        if id_list.len() > index && id_list[index] == "hook_point" {
+            index += 1;
+        }
+        let chain_id = if id_list.len() > index { Some(id_list[index]) } else { None };
+        index += 1;
+        if id_list.len() > index && id_list[index] == "blocks" {
+            index += 1;
+        }
+        let block_id = if id_list.len() > index { Some(id_list[index]) } else { None };
+        if id_list.len() > index + 1 {
+            return Err(anyhow!("Invalid config id: {}", id));
+        }
+
+        let config_value = self.get_config(config_type, config_id)?;
+        if chain_id.is_none() {
+            return Ok(config_value);
+        }
+
+        let target_config = config_value
+            .as_object()
+            .ok_or_else(|| anyhow!("Invalid {} config: {}", config_type, config_id))?;
+        if config_type == "server" {
+            let server_type = target_config
+                .get("type")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow!("Invalid server type: null"))?;
+            if server_type != "http" && server_type != "dns" {
+                return Err(anyhow!("Invalid server type: {}", server_type));
+            }
+        }
+
+        let hook_point = target_config
+            .get("hook_point")
+            .ok_or_else(|| anyhow!("hook_point not found"))?
+            .as_object()
+            .ok_or_else(|| anyhow!("hook_point must be an object"))?;
+        let chain_id = chain_id.unwrap();
+        let chain_value = hook_point
+            .get(chain_id)
+            .ok_or_else(|| anyhow!("chain not found: {}", chain_id))?;
+        if block_id.is_none() {
+            return Ok(chain_value.clone());
+        }
+
+        let chain_obj = chain_value
+            .as_object()
+            .ok_or_else(|| anyhow!("chain {} must be an object", chain_id))?;
+        let blocks = chain_obj
+            .get("blocks")
+            .ok_or_else(|| anyhow!("blocks not found in chain {}", chain_id))?
+            .as_object()
+            .ok_or_else(|| anyhow!("blocks must be an object"))?;
+        let block_id = block_id.unwrap();
+        let block_value = blocks
+            .get(block_id)
+            .ok_or_else(|| anyhow!("block not found: {}", block_id))?;
+        Ok(block_value.clone())
     }
 
     fn add_rule_to_config(mut raw_config: Value, id: &str, rule: &str) -> Result<Value> {
@@ -2762,15 +2831,17 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
         let gateway = gateway.unwrap();
         match method {
             "get_config" => {
+                if params.is_null() {
+                    return gateway.get_all_config()
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e));
+                }
                 let params = serde_json::from_value::<HashMap<String, String>>(params)
                     .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
-                let config_type = params.get("config_type");
-                let config_id = params.get("config_id");
-                if config_type.is_none() || config_id.is_none() {
-                    gateway.get_all_config()
-                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))
+                if let Some(id) = params.get("id") {
+                    return gateway.get_config_by_id(id)
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e));
                 } else {
-                    gateway.get_config(config_type.unwrap(), config_id.unwrap())
+                    gateway.get_all_config()
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))
                 }
             },
