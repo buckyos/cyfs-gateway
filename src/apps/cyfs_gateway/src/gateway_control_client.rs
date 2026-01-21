@@ -53,6 +53,12 @@ impl GatewayControlClient {
         Ok(result)
     }
 
+    pub async fn get_init_config(&self) -> ControlResult<Value> {
+        let result = self.krpc.call("get_init_config", Value::Null).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+        Ok(result)
+    }
+
     pub async fn remove_rule(&self, id: &str) -> ControlResult<Value> {
         let mut params = HashMap::new();
         params.insert("id", id);

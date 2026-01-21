@@ -293,6 +293,7 @@ impl GatewayFactory {
         }
 
         Ok(Gateway {
+            init_config: config.clone(),
             config: Arc::new(Mutex::new(config)),
             stack_manager,
             tunnel_manager: self.tunnel_manager.clone(),
@@ -313,6 +314,7 @@ impl GatewayFactory {
 }
 
 pub struct Gateway {
+    init_config: GatewayConfig,
     config: Arc<Mutex<GatewayConfig>>,
     stack_manager: StackManagerRef,
     tunnel_manager: TunnelManager,
@@ -409,6 +411,17 @@ impl Gateway {
     pub fn get_all_config(&self) -> Result<Value> {
         let config = self.config.lock().unwrap();
         let mut raw_config = config.raw_config.clone();
+        Self::strip_control_config(&mut raw_config);
+        Ok(raw_config)
+    }
+
+    pub fn get_init_config(&self) -> Result<Value> {
+        let mut raw_config = self.init_config.raw_config.clone();
+        Self::strip_control_config(&mut raw_config);
+        Ok(raw_config)
+    }
+
+    fn strip_control_config(raw_config: &mut Value) {
         let control_config: Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG)
             .unwrap_or(Value::Null);
         if let Some(stacks) = control_config.get("stacks").and_then(|v| v.as_object()) {
@@ -425,7 +438,6 @@ impl Gateway {
                 }
             }
         }
-        Ok(raw_config)
     }
 
     pub fn get_config(&self, config_type: &str, config_id: &str) -> Result<Value> {
@@ -2844,6 +2856,10 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     gateway.get_all_config()
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))
                 }
+            },
+            "get_init_config" => {
+                gateway.get_init_config()
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))
             },
             "save_config" => {
                 let requested_path = if params.is_null() {
