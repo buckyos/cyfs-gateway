@@ -356,7 +356,7 @@ async fn run_gateway_with_config(
     sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
     factory.register_server_factory("sn", Arc::new(sn_factory));
     info!("Register sn server factory");
-    let gateway = match factory.create_gateway(gateway_config).await.map_err(|e| {
+    let gateway = factory.create_gateway(gateway_config).await.map_err(|e| {
         let msg = format!("create gateway failed: {}", e);
         error!("{}", msg);
         anyhow::anyhow!(msg)
