@@ -32,6 +32,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use buckyos_kit::{get_buckyos_log_dir, get_buckyos_service_data_dir, get_buckyos_system_etc_dir};
 use kRPC::RPCSessionToken;
+use serde::{Deserialize};
 use serde_json::{Value};
 use sfo_js::{JsEngine, JsPkgManager, JsString, JsValue};
 use sfo_js::object::builtins::JsArray;
@@ -41,6 +42,53 @@ use url::Url;
 use cyfs_sn::{SnServerFactory, SqliteDBFactory};
 use cyfs_socks::SocksServerFactory;
 use cyfs_tun::TunStackFactory;
+
+
+#[derive(Deserialize)]
+pub struct LogParams {
+    pub level: Option<String>,
+    pub path: Option<String>,
+    pub file_size: Option<String>,
+    pub file_count: Option<usize>,
+}
+
+fn parse_size_bytes(input: &str) -> Result<u64> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("size is empty").into());
+    }
+
+    let upper = trimmed.to_ascii_uppercase();
+    let (number_part, unit) = if upper.ends_with("GB") {
+        (&upper[..upper.len() - 2], "GB")
+    } else if upper.ends_with("MB") {
+        (&upper[..upper.len() - 2], "MB")
+    } else if upper.ends_with("KB") {
+        (&upper[..upper.len() - 2], "KB")
+    } else if upper.ends_with('B') {
+        (&upper[..upper.len() - 1], "B")
+    } else {
+        (upper.as_str(), "B")
+    };
+
+    let number_part = number_part.trim();
+    if number_part.is_empty() {
+        return Err(anyhow!("size missing number: {}", input).into());
+    }
+
+    let value: u64 = number_part
+        .parse()
+        .map_err(|_| anyhow!("invalid size number: {}", input))?;
+    let multiplier = match unit {
+        "GB" => 1024_u64.pow(3),
+        "MB" => 1024_u64.pow(2),
+        "KB" => 1024_u64,
+        "B" => 1,
+        _ => return Err(anyhow!("unsupported size unit: {}", input).into()),
+    };
+
+    Ok(value.saturating_mul(multiplier))
+}
 
 pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
     let config_json = load_config_from_file(config_file).await?;
@@ -126,7 +174,11 @@ async fn run_gateway_with_config(
         }
     }
 
-    let sn_provider_factory = AcmeSnProviderFactory::new();
+    let sn_acme_data = get_buckyos_service_data_dir("cyfs_gateway").join("sn_dns");
+    if !sn_acme_data.exists() {
+        std::fs::create_dir_all(&sn_acme_data).unwrap();
+    }
+    let sn_provider_factory = AcmeSnProviderFactory::new(sn_acme_data);
     AcmeCertManager::register_dns_provider_factory("sn-dns", sn_provider_factory.clone());
     let mut cert_config = CertManagerConfig::default();
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
@@ -304,12 +356,12 @@ async fn run_gateway_with_config(
     sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
     factory.register_server_factory("sn", Arc::new(sn_factory));
     info!("Register sn server factory");
-    let gateway = factory.create_gateway(gateway_config).await.map_err(|e| {
+    let gateway = match factory.create_gateway(gateway_config).await.map_err(|e| {
         let msg = format!("create gateway failed: {}", e);
         error!("{}", msg);
         anyhow::anyhow!(msg)
     })?;
-    gateway.start(params).await;
+    gateway.start(params).await?;
     handler.set_gateway(Arc::new(gateway));
 
     let _ = tokio::signal::ctrl_c().await;
@@ -1400,12 +1452,30 @@ pub async fn cyfs_gateway_main() {
         _ => {}
     }
 
+    let log_config = get_buckyos_service_data_dir("cyfs_gateway").join("log.yaml");
+    let mut log_params = LogParams {
+        level: None,
+        path: None,
+        file_size: None,
+        file_count: None,
+    };
+    if log_config.exists() {
+        if let Ok(config) = tokio::fs::read_to_string(log_config).await {
+            if let Ok(params) = serde_yaml_ng::from_str::<LogParams>(config.as_str()) {
+                log_params = params;
+            }
+        }
+    }
+
     let log_dir = get_buckyos_log_dir("cyfs_gateway", true);
     std::fs::create_dir_all(&log_dir).unwrap();
 
     sfo_log::Logger::new("cyfs_gateway")
-        .set_log_path(log_dir.to_string_lossy().to_string().as_str())
+        .set_log_level(log_params.level.unwrap_or("info".to_string()).as_str())
+        .set_log_path(log_params.path.unwrap_or(log_dir.to_string_lossy().to_string()).as_str())
         .set_log_to_file(true)
+        .set_log_file_count(log_params.file_count.unwrap_or(10))
+        .set_log_file_size(parse_size_bytes(log_params.file_size.unwrap_or("20MB".to_string()).as_str()).unwrap_or(20 * 1024 * 1024))
         .start().unwrap();
     // init log
     // init_logging("cyfs_gateway",true);

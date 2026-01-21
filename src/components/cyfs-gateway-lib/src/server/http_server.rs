@@ -143,7 +143,11 @@ impl ProcessChainHttpServer {
 
     async fn handle_forward_upstream(&self, req: http::Request<BoxBody<Bytes, ServerError>>, target_url: &str) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let org_url = req.uri().to_string();
-        let url = format!("{}{}", target_url, org_url);
+        // Trim URL boundary slashes so we don't end up with "//" when target_url ends with '/'
+        // and org_url starts with '/'.
+        let base = target_url.trim_end_matches('/');
+        let path = org_url.trim_start_matches('/');
+        let url = format!("{}/{}", base, path);
         info!("handle_upstream url: {}", url);
         let upstream_url = Url::parse(target_url);
         if upstream_url.is_err() {

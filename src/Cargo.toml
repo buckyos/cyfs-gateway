@@ -74,3 +74,7 @@ buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", branch = "b
 kRPC = { git = "https://github.com/buckyos/buckyos-base.git", branch = "beta1", package = "kRPC" }
 name-client = { git = "https://github.com/buckyos/buckyos-base.git", branch = "beta1", package = "name-client" }
 name-lib = { git = "https://github.com/buckyos/buckyos-base.git", branch = "beta1", package = "name-lib" }
+
+[profile.test]
+debug = 0
+split-debuginfo = "off"

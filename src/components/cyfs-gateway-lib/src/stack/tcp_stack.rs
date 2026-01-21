@@ -144,7 +144,7 @@ impl TcpStackInner {
                     }
             }
         }
-        socket.bind(&sockaddr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind {:?} error", sockaddr))?;
+        socket.bind(&sockaddr).map_err(into_stack_err!(StackErrorCode::BindFailed, "bind {} error", self.bind_addr))?;
         socket.listen(1024).map_err(into_stack_err!(StackErrorCode::ListenFailed, "listen error"))?;
         #[cfg(unix)]
         let std_listener = unsafe {

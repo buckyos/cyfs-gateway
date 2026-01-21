@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use http::{Version, StatusCode};
 use http_body_util::combinators::{BoxBody};
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -16,6 +16,7 @@ pub struct DirServerBuilder {
     version: Option<String>,
     root_path: Option<PathBuf>,
     index_file: Option<String>,
+    fallback_file: Option<String>,
     base_url: Option<String>,
 }
 
@@ -40,6 +41,11 @@ impl DirServerBuilder {
         self
     }
 
+    pub fn fallback_file(mut self, fallback_file: impl Into<String>) -> Self {
+        self.fallback_file = Some(fallback_file.into());
+        self
+    }
+
     pub fn base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = Some(base_url.into());
         self
@@ -56,6 +62,7 @@ pub struct DirServer {
     version: http::Version,
     root_dir: PathBuf,
     index_file: String,
+    fallback_file: Option<String>,
     base_url: String,
 }
 
@@ -66,6 +73,7 @@ impl DirServer {
             version: None,
             root_path: None,
             index_file: None,
+            fallback_file: None,
             base_url: None,
         }
     }
@@ -103,6 +111,27 @@ impl DirServer {
         };
 
         let index_file = builder.index_file.unwrap_or_else(|| "index.html".to_string());
+        let fallback_file = if let Some(fallback_file) = builder.fallback_file {
+            let fallback_path = Path::new(&fallback_file);
+            if fallback_path.is_absolute() {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "fallback_file must be a relative path"
+                ));
+            }
+            if fallback_path
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+            {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "fallback_file must not contain '..'"
+                ));
+            }
+            Some(fallback_file)
+        } else {
+            None
+        };
         let new_root_dir = root_path.canonicalize().map_err(|e| {
             server_err!(ServerErrorCode::IOError, "Failed to canonicalize path: {}", e)
         })?;
@@ -112,6 +141,7 @@ impl DirServer {
             version,
             root_dir: new_root_dir,
             index_file,
+            fallback_file,
             base_url: builder.base_url.unwrap_or_else(|| "/".to_string()),
         })
     }
@@ -269,6 +299,24 @@ impl HttpServer for DirServer {
         // Check if file exists
         if !file_path.exists() || !file_path.is_file() {
             warn!("File not found: {:?}", file_path);
+            if let Some(fallback_file) = &self.fallback_file {
+                let fallback_path = self.root_dir.join(fallback_file);
+                match fallback_path.canonicalize() {
+                    Ok(fallback_path) => {
+                        if fallback_path.starts_with(&self.root_dir)
+                            && fallback_path.exists()
+                            && fallback_path.is_file()
+                        {
+                            info!("Fallback to file: {:?}", fallback_path);
+                            return self.serve_file(&fallback_path, &req).await;
+                        }
+                        warn!("Fallback file not found: {:?}", fallback_path);
+                    }
+                    Err(e) => {
+                        warn!("Failed to resolve fallback file: {:?}, error: {}", fallback_path, e);
+                    }
+                }
+            }
             return Ok(http::Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Full::new(Bytes::from("Not found")).map_err(|e| match e {}).boxed())
@@ -305,6 +353,8 @@ pub struct DirServerConfig {
     pub root_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_file: Option<String>,
 }
 
 impl ServerConfig for DirServerConfig {
@@ -365,6 +415,10 @@ impl ServerFactory for DirServerFactory {
 
         if let Some(index_file) = &config.index_file {
             builder = builder.index_file(index_file.clone());
+        }
+
+        if let Some(fallback_file) = &config.fallback_file {
+            builder = builder.fallback_file(fallback_file.clone());
         }
 
         let server = builder.build().await?;
@@ -532,6 +586,7 @@ mod tests {
             version: None,
             root_path: temp_dir.path().to_string_lossy().to_string(),
             index_file: None,
+            fallback_file: None,
         };
         
         let factory = DirServerFactory::new();
@@ -539,4 +594,3 @@ mod tests {
         assert!(result.is_ok());
     }
 }
-
