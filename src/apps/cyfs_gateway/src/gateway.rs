@@ -18,7 +18,7 @@ use jsonwebtoken::jwk::Jwk;
 use kRPC::RPCSessionToken;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sfo_js::{JsEngine, JsPkgManagerRef, JsString, JsValue};
+use sfo_js::{JsEngine, JsPkgManagerRef, JsString, JsValue, NativeFunction};
 use sfo_js::object::builtins::JsArray;
 use sha2::Digest;
 use rand::{Rng};
@@ -2557,6 +2557,12 @@ pub struct ExternalCmd {
     pub description: String,
 }
 
+#[derive(Deserialize)]
+struct StartTemplateParams {
+    template_id: String,
+    args: Option<Vec<String>>,
+}
+
 pub struct GatewayCmdHandler {
     gateway: Mutex<Option<Arc<Gateway>>>,
     external_cmd_store: ExternalCmdStoreRef,
@@ -2584,33 +2590,100 @@ impl GatewayCmdHandler {
         self.gateway.lock().unwrap().clone()
     }
 
-    async fn run_external_cmd(&self, cmd: impl Into<String>, params: impl Into<String>) -> ControlResult<String> {
-        let cmd = cmd.into();
-        let params = params.into();
+    async fn start_template(&self, template_id: &str, args: Vec<String>) -> ControlResult<Value> {
+        let gateway = self.get_gateway().ok_or_else(|| cmd_err!(ControlErrorCode::NoGateway, "gateway not init"))?;
+        let current_config = {
+            gateway.config.lock().unwrap().clone()
+        };
+        let mut pkg = gateway.external_cmds.get_pkg(template_id)
+            .await
+            .map_err(into_cmd_err!(ControlErrorCode::Failed, "get pkg failed"))?;
+        pkg.init_callback(move |engine| {
+            engine.register_global_builtin_callable("currentDir".to_string(), 0, NativeFunction::from_copy_closure(|_, _, _| {
+                Ok(JsValue::from(JsString::from(std::env::current_dir().unwrap_or(PathBuf::new()).to_string_lossy().to_string())))
+            }))?;
+            Ok(())
+        });
+        let output = pkg.run(args).await.map_err(into_cmd_err!(ControlErrorCode::Failed, "run pkg failed"))?;
+        let template_config: Value = serde_json::from_str(output.as_str())
+            .map_err(into_cmd_err!(ControlErrorCode::InvalidParams, "invalid template config"))?;
+        let mut raw_config = current_config.raw_config.clone();
+        raw_config.merge(&template_config);
+        let gateway_config = self.parser
+            .parse(raw_config)
+            .map_err(into_cmd_err!(ControlErrorCode::Failed, "parse config failed"))?;
+        let existing_stack_ids: HashSet<String> = current_config.stacks.iter()
+            .map(|stack| stack.id().to_string())
+            .collect();
+        let existing_server_ids: HashSet<String> = current_config.servers.iter()
+            .map(|server| server.id().to_string())
+            .collect();
+        let existing_chain_ids: HashSet<String> = current_config.global_process_chains.iter()
+            .map(|chain| chain.id.clone())
+            .collect();
 
-        tokio::spawn(async move {
-            let mut js_engine = JsEngine::builder()
-                .enable_fetch(false)
-                .build()
-                .map_err(into_cmd_err!(ControlErrorCode::RunJsFailed))?;
-            js_engine.eval_file(Path::new(cmd.as_str()))
-                .map_err(into_cmd_err!(ControlErrorCode::RunJsFailed))?;
-
-            let args: Vec<JsValue> = if let Some(args) = shlex::split(params.as_str()) {
-                args.into_iter().map(|arg| JsValue::from(JsString::from(arg))).collect()
-            } else {
-                vec![]
-            };
-            let args = JsArray::from_iter(args.into_iter(), js_engine.context());
-            let result = js_engine.call("main",
-                                        vec![JsValue::from(args)])
-                .map_err(into_cmd_err!(ControlErrorCode::RunJsFailed))?;
-            if result.is_string() {
-                Ok(result.as_string().unwrap().as_str().to_std_string_lossy())
-            } else {
-                Err(cmd_err!(ControlErrorCode::RunJsFailed, "result {:?}", result))
+        let mut added_chains = Vec::new();
+        for chain_config in gateway_config.global_process_chains.iter() {
+            if existing_chain_ids.contains(chain_config.id.as_str()) {
+                continue;
             }
-        }).await.map_err(into_cmd_err!(ControlErrorCode::Failed))?
+            let process_chain = Arc::new(chain_config.create_process_chain()
+                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create process chain {} failed: {}", chain_config.id, e))?);
+            gateway.global_process_chains.add_process_chain(process_chain)
+                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "add process chain {} failed: {}", chain_config.id, e))?;
+            added_chains.push(chain_config.clone());
+        }
+
+        let mut added_stacks = Vec::new();
+        for stack_config in gateway_config.stacks.iter() {
+            if existing_stack_ids.contains(stack_config.id().as_str()) {
+                continue;
+            }
+            let new_stack = gateway.stack_factory.create(stack_config.clone()).await
+                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create stack {} failed: {}", stack_config.id(), e))?;
+            gateway.stack_manager.add_stack(new_stack.clone())
+                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "add stack {} failed: {}", stack_config.id(), e))?;
+            if let Err(e) = new_stack.start().await {
+                gateway.stack_manager.remove(stack_config.id().as_str());
+                return Err(cmd_err!(ControlErrorCode::Failed, "start stack {} failed: {}", stack_config.id(), e));
+            }
+            added_stacks.push(stack_config.clone());
+        }
+
+        let mut added_servers = Vec::new();
+        for server_config in gateway_config.servers.iter() {
+            if existing_server_ids.contains(server_config.id().as_str()) {
+                continue;
+            }
+            let new_servers = gateway.server_factory.create(server_config.clone()).await
+                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create server {} failed: {}", server_config.id(), e))?;
+            let mut added_any = false;
+            for server in new_servers.into_iter() {
+                if gateway.server_manager.get_server_by_key(server.full_key().as_str()).is_some() {
+                    continue;
+                }
+                gateway.server_manager.add_server(server)
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "add server failed: {}", e))?;
+                added_any = true;
+            }
+            if added_any {
+                added_servers.push(server_config.clone());
+            }
+        }
+
+        let mut updated_config = current_config.clone();
+        updated_config.raw_config = gateway_config.raw_config.clone();
+        if !added_chains.is_empty() {
+            updated_config.global_process_chains.extend(added_chains);
+        }
+        if !added_stacks.is_empty() {
+            updated_config.stacks.extend(added_stacks);
+        }
+        if !added_servers.is_empty() {
+            updated_config.servers.extend(added_servers);
+        }
+        *gateway.config.lock().unwrap() = updated_config;
+        Ok(template_config)
     }
 
     async fn get_external_cmds(&self) -> ControlResult<Vec<ExternalCmd>> {
@@ -2630,10 +2703,18 @@ impl GatewayCmdHandler {
 
     async fn get_external_cmd_help(&self, cmd: &str) -> ControlResult<String> {
         if let Some(gateway) = self.get_gateway() {
-            let external_cmd = gateway.external_cmds.get_pkg(cmd)
+            let mut pkg = gateway.external_cmds.get_pkg(cmd)
                 .await
                 .map_err(into_cmd_err!(ControlErrorCode::Failed, "get pkg failed"))?;
-            external_cmd.help().await.map_err(into_cmd_err!(ControlErrorCode::Failed, "get help failed"))
+
+            pkg.init_callback(move |engine| {
+                engine.register_global_builtin_callable("currentDir".to_string(), 0, NativeFunction::from_copy_closure(|_, _, _| {
+                    Ok(JsValue::from(JsString::from(std::env::current_dir().unwrap_or(PathBuf::new()).to_string_lossy().to_string())))
+                }))?;
+                Ok(())
+            });
+
+            pkg.help().await.map_err(into_cmd_err!(ControlErrorCode::Failed, "get help failed"))
         } else {
             Ok("".to_string())
         }
@@ -2900,6 +2981,13 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 info!("*** reload gateway config success !");
                 Ok(Value::String("ok".to_string()))
+            }
+            "start" => {
+                let params = serde_json::from_value::<StartTemplateParams>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let args = params.args.unwrap_or_default();
+                let result = self.start_template(params.template_id.as_str(), args).await?;
+                Ok(result)
             }
             "external_cmds" => {
                 let cmds = self.get_external_cmds().await?;

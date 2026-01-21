@@ -183,7 +183,7 @@ pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> 
 
     let global_collections = GlobalCollectionManager::create(gateway_config.collections.clone()).await?;
 
-    let chain_cmds = get_buckyos_system_etc_dir().join("cyfs_gateway").join("chain_cmds");
+    let chain_cmds = get_buckyos_system_etc_dir().join("cyfs_gateway").join("server_templates");
     let external_cmds = JsPkgManager::new(chain_cmds);
     let factory = GatewayFactory::new(
         stack_manager.clone(),
@@ -439,6 +439,62 @@ fn save_login_token(server: &str, token: &str) {
     let token_dir = get_buckyos_service_data_dir("cyfs_gateway").join("cli_token");
     let token_file = token_dir.join(hex::encode(server.to_lowercase()));
     let _ = std::fs::write(token_file, token);
+}
+
+struct StartTemplateArgs {
+    template_id: Option<String>,
+    args: Vec<String>,
+    help: bool,
+}
+
+fn parse_start_template_args() -> StartTemplateArgs {
+    let mut args = Vec::new();
+    let mut seen_start = false;
+    for arg in std::env::args() {
+        if seen_start {
+            args.push(arg);
+        } else if arg == "start" {
+            seen_start = true;
+        }
+    }
+
+    let mut filtered = Vec::new();
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--server" || arg == "-s" {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with("--server=") || arg.starts_with("-s=") {
+            continue;
+        }
+        filtered.push(arg);
+    }
+
+    let mut help = false;
+    let mut template_id = None;
+    let mut template_args = Vec::new();
+    for arg in filtered {
+        if arg == "--help" || arg == "-h" {
+            help = true;
+            continue;
+        }
+        if template_id.is_none() && !arg.starts_with('-') {
+            template_id = Some(arg);
+        } else if template_id.is_some() {
+            template_args.push(arg);
+        }
+    }
+
+    StartTemplateArgs {
+        template_id,
+        args: template_args,
+        help,
+    }
 }
 
 
@@ -726,7 +782,13 @@ pub async fn cyfs_gateway_main() {
             .allow_external_subcommands(true)
             .allow_missing_positional(true)
             .ignore_errors(true)
-            .about("start a new server"))
+            .about("start a new server")
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("reload")
             .about("reload config")
             .arg(Arg::new("server")
@@ -1143,20 +1205,71 @@ pub async fn cyfs_gateway_main() {
             }
         }
         Some(("start", sub_matches)) => {
-            if let Some((subcommand, matches)) = sub_matches.subcommand() {
-                println!("starting server subcommand: {:?}", matches);
-                let ids = matches.ids();
-                for id in ids {
-                    if let Some(raws) = matches.get_raw(id.as_str()) {
-                        for raw in raws {
-                            println!("starting server subcommand: {} name {:?}", subcommand, raw);
+            let server = sub_matches.get_one::<String>("server").unwrap();
+            let start_args = parse_start_template_args();
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            if start_args.template_id.is_none() {
+                match cyfs_cmd_client.get_external_cmds().await {
+                    Ok(cmds) => {
+                        println!("Available templates ({}):", cmds.len());
+                        for cmd in cmds {
+                            if cmd.description.is_empty() {
+                                println!("  {}", cmd.name);
+                            } else {
+                                println!("  {} - {}", cmd.name, cmd.description);
+                            }
                         }
+                        if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                            save_login_token(server.as_str(), token.as_str());
+                        }
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        println!("start template list error: {}", e);
+                        if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                            save_login_token(server.as_str(), token.as_str());
+                        }
+                        std::process::exit(1);
                     }
                 }
-            } else {
-                println!("starting server error");
             }
-            std::process::exit(0);
+
+            let template_id = start_args.template_id.unwrap();
+            if start_args.help {
+                match cyfs_cmd_client.get_external_cmd_help(template_id.as_str()).await {
+                    Ok(help) => {
+                        println!("{}", help);
+                        if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                            save_login_token(server.as_str(), token.as_str());
+                        }
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        println!("start template help error: {}", e);
+                        if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                            save_login_token(server.as_str(), token.as_str());
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            match cyfs_cmd_client.start_template(template_id.as_str(), start_args.args).await {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("start template error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(1);
+                }
+            }
         }
         _ => {}
     }

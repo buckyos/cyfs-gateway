@@ -1,7 +1,7 @@
 use log::*;
 use std::collections::HashMap;
 use chrono::Utc;
-use serde_json::Value;
+use serde_json::{json, Value};
 pub use sfo_result::err as cmd_err;
 pub use sfo_result::into_err as into_cmd_err;
 use sha2::Digest;
@@ -202,5 +202,15 @@ impl GatewayControlClient {
         let result = self.krpc.call("cmd_help", serde_json::to_value(&params).unwrap()).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(serde_json::from_value(result).map_err(into_cmd_err!(ControlErrorCode::InvalidData))?)
+    }
+
+    pub async fn start_template(&self, template_id: &str, args: Vec<String>) -> ControlResult<Value> {
+        let params = json!({
+            "template_id": template_id,
+            "args": args,
+        });
+        let result = self.krpc.call("start", params).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+        Ok(result)
     }
 }
