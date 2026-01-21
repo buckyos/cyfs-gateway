@@ -293,7 +293,7 @@ impl GatewayFactory {
         }
 
         Ok(Gateway {
-            init_config: config.clone(),
+            init_config: Mutex::new(config.clone()),
             config: Arc::new(Mutex::new(config)),
             stack_manager,
             tunnel_manager: self.tunnel_manager.clone(),
@@ -314,7 +314,7 @@ impl GatewayFactory {
 }
 
 pub struct Gateway {
-    init_config: GatewayConfig,
+    init_config: Mutex<GatewayConfig>,
     config: Arc<Mutex<GatewayConfig>>,
     stack_manager: StackManagerRef,
     tunnel_manager: TunnelManager,
@@ -416,7 +416,8 @@ impl Gateway {
     }
 
     pub fn get_init_config(&self) -> Result<Value> {
-        let mut raw_config = self.init_config.raw_config.clone();
+        let init_config = self.init_config.lock().unwrap();
+        let mut raw_config = init_config.raw_config.clone();
         Self::strip_control_config(&mut raw_config);
         Ok(raw_config)
     }
@@ -2820,6 +2821,9 @@ impl GatewayCmdHandler {
         tokio::fs::write(save_path.as_path(), content)
             .await
             .map_err(into_cmd_err!(ControlErrorCode::Failed, "write config failed"))?;
+        let config = gateway.config.lock().unwrap().clone();
+        let mut init_config = gateway.init_config.lock().unwrap();
+        *init_config = config;
         Ok(save_path.to_string_lossy().to_string())
     }
 }
