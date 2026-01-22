@@ -4,7 +4,7 @@ use buckyos_kit::AsyncStream;
 use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig};
 use sfo_io::{LimitStream, StatStream};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, ProcessChainConfig, get_min_priority, get_stream_external_commands, DatagramInfo, LimiterManagerRef, StatManagerRef, MutComposedSpeedStat, MutComposedSpeedStatRef, get_stat_info, GlobalCollectionManagerRef};
+use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, ProcessChainConfig, get_min_priority, get_external_commands, DatagramInfo, LimiterManagerRef, StatManagerRef, MutComposedSpeedStat, MutComposedSpeedStatRef, get_stat_info, GlobalCollectionManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
@@ -101,7 +101,7 @@ impl RtcpStackInner {
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains.clone(),
                                                           builder.global_collection_manager.clone(),
-                                                          Some(get_stream_external_commands(builder.servers.clone().unwrap()))).await
+                                                          Some(get_external_commands(builder.servers.clone().unwrap()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
             bind_addr: builder.bind_addr.unwrap(),
@@ -478,7 +478,7 @@ impl Stack for RtcpStack {
         let (executor, _) = create_process_chain_executor(&config.hook_point,
                                                           self.inner.global_process_chains.clone(),
                                                           self.inner.global_collection_manager.clone(),
-                                                          Some(get_stream_external_commands(self.inner.servers.clone()))).await
+                                                          Some(get_external_commands(self.inner.servers.clone()))).await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         *self.inner.executor.lock().unwrap() = executor;
         Ok(())

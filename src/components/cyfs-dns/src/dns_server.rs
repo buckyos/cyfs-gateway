@@ -247,7 +247,7 @@ impl ProcessChainDnsServer {
         inner_record_manager: InnerDnsRecordManagerRef,
     ) -> ServerResult<Self> {
         let resolve_cmd = CmdResolve::new(server_mgr.clone());
-        let mut commands = get_dns_server_external_commands(server_mgr.clone());
+        let mut commands = get_external_commands(server_mgr.clone());
         commands.push((resolve_cmd.name().to_string(), Arc::new(Box::new(resolve_cmd))));
         let (executor, _) = create_process_chain_executor(
             &hook_point,

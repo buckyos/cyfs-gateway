@@ -16,6 +16,7 @@ use cyfs_process_chain::{CollectionValue, MapCollectionRef, MemoryMapCollection,
 use cyfs_process_chain::SetCollection;
 pub use dns_server::*;
 pub use local_dns::*;
+pub use cmd_resolve::*;
 
 pub(crate) async fn nameinfo_to_map_collection(record_type: &str, name_info: &NameInfo) -> ServerResult<MapCollectionRef> {
     let map = MemoryMapCollection::new_ref();

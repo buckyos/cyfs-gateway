@@ -7,6 +7,7 @@ mod gateway_control_server;
 mod config_loader;
 mod config_merger;
 mod acme_sn_provider;
+mod process_chain_doc;
 
 pub use gateway::*;
 pub use gateway_control_client::*;
@@ -21,6 +22,7 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
 use cyfs_dns::{InnerDnsRecordManager, LocalDnsFactory, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
+use process_chain_doc::GatewayProcessChainDoc;
 
 use log::*;
 use name_client::*;
@@ -863,6 +865,22 @@ pub async fn cyfs_gateway_main() {
             .allow_missing_positional(true)
             .ignore_errors(true)
             .about("run a server template locally"))
+        .subcommand(Command::new("process_chain")
+            .about("Show process chain command help")
+            .arg(Arg::new("command")
+                .help("process chain command name")
+                .required(false))
+            .arg(Arg::new("all")
+                .long("all")
+                .short('a')
+                .help("show full documentation for all commands")
+                .action(ArgAction::SetTrue))
+            .arg(Arg::new("file")
+                .long("file")
+                .short('f')
+                .help("write output to file")
+                .value_name("PATH")
+                .required(false)))
         .subcommand(Command::new("reload")
             .about("reload config")
             .arg(Arg::new("server")
@@ -1247,6 +1265,35 @@ pub async fn cyfs_gateway_main() {
                     std::process::exit(1);
                 }
             }
+        }
+        Some(("process_chain", sub_matches)) => {
+            let doc = match GatewayProcessChainDoc::new() {
+                Ok(doc) => doc,
+                Err(e) => {
+                    println!("process_chain init error: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let cmd = sub_matches.get_one::<String>("command");
+            let output = if sub_matches.get_flag("all") {
+                doc.render_all_docs()
+            } else if let Some(cmd) = cmd {
+                doc.render_command_help(cmd)
+            } else {
+                doc.render_command_list()
+            };
+
+            if let Some(path) = sub_matches.get_one::<String>("file") {
+                if let Err(e) = std::fs::write(path, output) {
+                    println!("process_chain write error: {}", e);
+                    std::process::exit(1);
+                }
+                println!("Documentation saved to {}", path);
+            } else {
+                println!("{}", output);
+            }
+            std::process::exit(0);
         }
         Some(("reload", sub_matches)) => {
             let server = sub_matches.get_one::<String>("server").unwrap();

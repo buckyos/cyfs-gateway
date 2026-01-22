@@ -12,8 +12,9 @@ pub use server::*;
 use crate::{CmdQa, ServerManagerRef};
 
 
-pub fn get_stream_external_commands(server_manager: ServerManagerRef) -> Vec<(String, ExternalCommandRef)> {
+pub fn get_external_commands(server_manager: ServerManagerRef) -> Vec<(String, ExternalCommandRef)> {
     let mut cmds = vec![];
+
     let https_sni_probe_command = HttpsSniProbeCommand::new();
     let name = https_sni_probe_command.name().to_owned();
     cmds.push((name, Arc::new(Box::new(https_sni_probe_command) as Box<dyn ExternalCommand>)));
@@ -34,62 +35,6 @@ pub fn get_stream_external_commands(server_manager: ServerManagerRef) -> Vec<(St
     let name = forward_command.name().to_owned();
     cmds.push((name, Arc::new(Box::new(forward_command) as Box<dyn ExternalCommand>)));
 
-    let server_command = CallServer::new();
-    let name = server_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(server_command) as Box<dyn ExternalCommand>)));
-
-    let qa_command = CmdQa::new(server_manager.clone());
-    let name = qa_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(qa_command) as Box<dyn ExternalCommand>)));
-
-    cmds
-}
-
-pub fn get_datagram_external_commands(server_manager: ServerManagerRef) -> Vec<(String, ExternalCommandRef)> {
-    let mut cmds = vec![];
-    let set_limit_command = SetLimit::new();
-    let name = set_limit_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(set_limit_command) as Box<dyn ExternalCommand>)));
-
-    let set_stat_command = SetStat::new();
-    let name = set_stat_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(set_stat_command) as Box<dyn ExternalCommand>)));
-
-    let forward_command = Forward::new();
-    let name = forward_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(forward_command) as Box<dyn ExternalCommand>)));
-
-    let server_command = CallServer::new();
-    let name = server_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(server_command) as Box<dyn ExternalCommand>)));
-
-    let qa_command = CmdQa::new(server_manager.clone());
-    let name = qa_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(qa_command) as Box<dyn ExternalCommand>)));
-
-    cmds
-}
-
-pub fn get_server_external_commands(server_manager: ServerManagerRef) -> Vec<(String, ExternalCommandRef)> {
-    let mut cmds = vec![];
-
-    let forward_command = Forward::new();
-    let name = forward_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(forward_command) as Box<dyn ExternalCommand>)));
-
-    let server_command = CallServer::new();
-    let name = server_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(server_command) as Box<dyn ExternalCommand>)));
-
-    let qa_command = CmdQa::new(server_manager.clone());
-    let name = qa_command.name().to_owned();
-    cmds.push((name, Arc::new(Box::new(qa_command) as Box<dyn ExternalCommand>)));
-
-    cmds
-}
-
-pub fn get_dns_server_external_commands(server_manager: ServerManagerRef) -> Vec<(String, ExternalCommandRef)> {
-    let mut cmds = vec![];
     let server_command = CallServer::new();
     let name = server_command.name().to_owned();
     cmds.push((name, Arc::new(Box::new(server_command) as Box<dyn ExternalCommand>)));
