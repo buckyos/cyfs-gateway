@@ -565,15 +565,6 @@ async fn run_template_local(template_id: &str, args: Vec<String>) -> Result<()> 
 pub async fn cyfs_gateway_main() {
     let mut command = Command::new("CYFS Gateway Service")
         .version(buckyos_kit::get_version())
-        .disable_help_flag(true)
-        .disable_help_subcommand(true)
-        .arg(
-            Arg::new("help")
-                .long("help")
-                .short('h')
-                .help("Show help information")
-                .action(ArgAction::SetTrue),
-        )
         .arg(
             Arg::new("config")
                 .long("config")
@@ -629,7 +620,7 @@ pub async fn cyfs_gateway_main() {
                 .required(false)
                 .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("show")
-            .about("Show init config")
+            .about("Show config")
             .arg(Arg::new("format")
                 .long("format")
                 .short('f')
@@ -879,49 +870,11 @@ pub async fn cyfs_gateway_main() {
                 .short('s')
                 .help("server url")
                 .required(false)
-                .default_value(CONTROL_SERVER)))
-        .subcommand(Command::new("help")
-            .about("Show help for a command or subcommand")
-            .arg(
-                Arg::new("subcommand")
-                    .help("Subcommand to display help for")
-                    .required(false),
-            ));
+                .default_value(CONTROL_SERVER)));
 
     let matches = command.clone().get_matches();
 
-    if matches.get_flag("help") {
-        let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
-        if let Ok(cmds) = cyfs_cmd_client.get_external_cmds().await {
-            for cmd in cmds {
-                command = command.subcommand(Command::new(cmd.name)
-                    .about(cmd.description));
-            }
-        }
-        command.print_help().unwrap();
-        std::process::exit(0);
-    }
-
     match matches.subcommand() {
-        Some(("help", sub_matches)) => {
-            if let Some(sub_name) = sub_matches.get_one::<String>("subcommand") {
-                if let Some(sub_cmd) = command.find_subcommand_mut(sub_name) {
-                    sub_cmd.print_help().unwrap();
-                    println!();
-                } else {
-                    let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
-                    if let Ok(help) = cyfs_cmd_client.get_external_cmd_help(sub_name).await {
-                        println!("{}", help);
-                    } else {
-                        println!("Unknown command: {}", sub_name);
-                    }
-                }
-            } else {
-                command.print_help().unwrap();
-                println!();
-            }
-            std::process::exit(0);
-        }
         Some(("gen_rtcp_key", sub_matches)) => {
             let name = sub_matches.get_one::<String>("name").expect("Missing key 'name'");
             // Get temp path

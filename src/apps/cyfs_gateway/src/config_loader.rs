@@ -689,7 +689,7 @@ pub struct GatewayConfig {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use json_value_merge::Merge;
+    use crate::merge;
 
     #[test]
     fn test_limiter_config_parser() {
@@ -817,12 +817,12 @@ mod tests {
 }
         "#;
         let json2 = serde_json::from_str::<serde_json::Value>(json2_str).unwrap();
-        json1.merge(&json2);
+        merge(&mut json1, &json2);
 
         let json3 = json!({
             "include" : [{"path": "config.json"},{"path": "config2.json"}]
         });
-        json1.merge(&json3);
+        merge(&mut json1, &json3);
         let json1_str = serde_json::to_string_pretty(&json1).unwrap();
         println!("merged: {}", json1_str);
     }

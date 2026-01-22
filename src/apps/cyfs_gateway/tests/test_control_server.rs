@@ -62,29 +62,6 @@ mod tests {
         }
     }
 
-    pub struct TempExternalCmdStore {
-        test_cmd: tempfile::NamedTempFile,
-    }
-
-    impl TempExternalCmdStore {
-        pub fn new() -> Self {
-            let mut test_cmd = tempfile::NamedTempFile::with_suffix(".js").unwrap();
-            let cmd = r#"
-print("hello python")
-            "#;
-            test_cmd.write_all(cmd.as_bytes()).unwrap();
-            TempExternalCmdStore {
-                test_cmd,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ExternalCmdStore for TempExternalCmdStore {
-        async fn read_external_cmd(&self, cmd: &str) -> ControlResult<String> {
-            Ok(self.test_cmd.path().to_string_lossy().to_string())
-        }
-    }
     #[tokio::test]
     async fn test_cmd_server() {
         init_logging("cyfs_gateway", false);
@@ -199,8 +176,7 @@ print("hello python")
             Some("test".to_string()),
             Some("123456".to_string()),
             store).await.unwrap();
-        let cmd_store = TempExternalCmdStore::new();
-        let handler = GatewayCmdHandler::new(Arc::new(cmd_store), PathBuf::from("config.yaml"), parser.clone());
+        let handler = GatewayCmdHandler::new(Some(PathBuf::from("config.yaml")), parser.clone());
         factory.register_server_factory("control_server", Arc::new(GatewayControlServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
         factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new(
             cert_manager.clone(),
@@ -211,7 +187,7 @@ print("hello python")
         let params = GatewayParams {
             keep_tunnel: vec![],
         };
-        gateway.start(params).await;
+        gateway.start(params).await.unwrap();
         handler.set_gateway(Arc::new(gateway));
 
         let cmd_client = GatewayControlClient::new("http://127.0.0.1:13451".to_string(), None);

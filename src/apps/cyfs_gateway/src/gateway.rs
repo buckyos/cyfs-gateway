@@ -3272,36 +3272,6 @@ impl<S: TokenKeyStore> CyfsTokenVerifier for LocalTokenManager<S> {
     }
 }
 
-#[async_trait::async_trait]
-pub trait ExternalCmdStore: Send + Sync + 'static {
-    async fn read_external_cmd(&self, cmd: &str) -> ControlResult<String>;
-}
-pub type ExternalCmdStoreRef = Arc<dyn ExternalCmdStore>;
-
-pub struct LocalExternalCmdStore {
-    cmd_path: PathBuf,
-}
-
-impl LocalExternalCmdStore {
-    pub fn new(cmd_path: PathBuf) -> Self {
-        LocalExternalCmdStore {
-            cmd_path,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl ExternalCmdStore for LocalExternalCmdStore {
-    async fn read_external_cmd(&self, cmd: &str) -> ControlResult<String> {
-        let path = self.cmd_path.join(format!("{}.js", cmd));
-        if !path.exists() {
-            return Err(cmd_err!(ControlErrorCode::UnknownCmd, "unknown cmd {}", cmd));
-        }
-
-        Ok(path.to_string_lossy().to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
