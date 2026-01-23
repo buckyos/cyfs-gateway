@@ -1223,9 +1223,13 @@ mod tests {
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let mut rtcp1 = RTcp::new(device_config.id, "127.0.0.1:19023".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
         rtcp1.start().await.unwrap();
@@ -1237,8 +1241,13 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let mut rtcp2 = RTcp::new(device_config.id, "127.0.0.1:19024".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
         rtcp2.start().await.unwrap();
@@ -1257,15 +1266,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_ping() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+        update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+        add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).await.unwrap();
 
         let mut rtcp1 = RTcp::new(device_config.id, "127.0.0.1:19033".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
         rtcp1.start().await.unwrap();
@@ -1277,8 +1286,13 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let mut rtcp2 = RTcp::new(device_config.id, "127.0.0.1:19034".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
         rtcp2.start().await.unwrap();
@@ -1294,15 +1308,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_stream() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let mut rtcp1 = RTcp::new(device_config.id, "127.0.0.1:19053".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
         rtcp1.start().await.unwrap();
@@ -1314,8 +1333,13 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let mut rtcp2 = RTcp::new(device_config.id, "127.0.0.1:19054".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
         rtcp2.start().await.unwrap();
@@ -1349,15 +1373,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_datagram() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await.unwrap();
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let mut rtcp1 = RTcp::new(device_config.id, "127.0.0.1:19043".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
         rtcp1.start().await.unwrap();
@@ -1369,8 +1398,13 @@ mod tests {
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(), NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let mut rtcp2 = RTcp::new(device_config.id, "127.0.0.1:19044".to_string(), Some(pkcs8_bytes), Arc::new(MockRTcpListener::new()));
         rtcp2.start().await.unwrap();

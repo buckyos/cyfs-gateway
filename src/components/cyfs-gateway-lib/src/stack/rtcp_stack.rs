@@ -716,7 +716,7 @@ mod tests {
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, generate_ed25519_key_pair, DeviceConfig, EncodedDocument};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use name_client::{init_name_lib, NameInfo, GLOBAL_NAME_CLIENT};
+    use name_client::{add_nameinfo_cache, init_name_lib_for_test, update_did_cache, NameInfo};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
     use url::Url;
@@ -812,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn test_rtcp_stack_reject() {
         init_logging("test", false);
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let mut device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
@@ -821,9 +821,13 @@ mod tests {
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -866,9 +870,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -921,16 +929,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_stack_drop() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -971,9 +983,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1026,16 +1042,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_stack_forward() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1076,9 +1096,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1147,16 +1171,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_stack_forward_err() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1197,9 +1225,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1280,16 +1312,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_stack_server() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1332,9 +1368,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1388,16 +1428,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rudp_stack_reject() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1438,9 +1482,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1493,16 +1541,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_udp_stack_drop() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1543,9 +1595,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1598,16 +1654,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_udp_stack_forward() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1648,9 +1708,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1717,16 +1781,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rudp_stack_forward_err() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1767,9 +1835,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1823,16 +1895,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_stack_stat_server() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1878,9 +1954,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1938,16 +2018,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_stack_stat_limiter_server() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -1994,9 +2078,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2057,16 +2145,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_stack_stat_group_limiter_server() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2114,9 +2206,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2177,16 +2273,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_stack_stat_group_limiter_server2() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2234,9 +2334,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2321,16 +2425,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rudp_stack_server() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2373,9 +2481,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2428,16 +2540,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rudp_stack_stat_server() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2482,9 +2598,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2545,16 +2665,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rudp_stack_stat_limiter_server() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2601,9 +2725,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2667,16 +2795,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rudp_stack_stat_group_limiter_server() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2724,9 +2856,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2790,16 +2926,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_rudp_stack_stat_group_limiter_server2() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
@@ -2847,9 +2987,13 @@ mod tests {
         let _id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        GLOBAL_NAME_CLIENT.get().unwrap().update_did_cache(device_config.id.clone(), encoded_doc).unwrap();
-        GLOBAL_NAME_CLIENT.get().unwrap().add_nameinfo_cache(device_config.id.to_string().as_str(),
-                                                             NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).unwrap();
+         update_did_cache(device_config.id.clone(), None, encoded_doc).await.unwrap();
+         add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(device_config.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+         )
+         .await
+         .unwrap();
 
         let chains = r#"
 - id: main
