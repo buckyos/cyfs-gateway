@@ -1216,7 +1216,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rtcp_err() {
-        let _ = init_name_lib(&HashMap::new()).await;
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
