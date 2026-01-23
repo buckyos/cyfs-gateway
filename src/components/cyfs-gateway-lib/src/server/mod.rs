@@ -115,8 +115,6 @@ mod test {
 
     #[test]
     fn test_normalize_all_path_value_config() {
-        use std::path::PathBuf;
-        use crate::normalize_all_path_value_config;
         use buckyos_kit::init_logging;
         use std::path::PathBuf;
         use crate::normalize_all_path_value_config;
