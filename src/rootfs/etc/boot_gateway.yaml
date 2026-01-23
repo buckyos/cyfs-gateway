@@ -61,7 +61,7 @@ stacks:
         blocks:
           default:
             block: |
-              return "forward tls:///${REQ.dest_host}:443";
+              return "forward tcp:///tls://${REQ.dest_host}:443";
 
 #
 #  test8083_quic:

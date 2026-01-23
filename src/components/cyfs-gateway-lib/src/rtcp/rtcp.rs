@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use super::package::*;
 use super::protocol::*;
 use super::stream_helper::RTcpStreamBuildHelper;
+
 use crate::tunnel::{TunnelBox};
-use crate::{get_dest_info_from_url_path, DatagramClientBox, EncryptedStream, Tunnel, TunnelEndpoint, TunnelError, TunnelResult};
+use crate::{get_dest_info_from_url_path, has_scheme, DatagramClientBox, EncryptedStream, Tunnel, TunnelEndpoint, TunnelError, TunnelResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use buckyos_kit::{buckyos_get_unix_timestamp, AsyncStream};
@@ -12,7 +13,9 @@ use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, 
 use log::*;
 use name_client::*;
 use name_lib::*;
+use percent_encoding::percent_decode_str;
 use sha2::{Digest, Sha256};
+use url::Url;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -694,6 +697,7 @@ impl RTcpTunnel {
             ropen_package.body.dest_host, ropen_package.body.dest_port, ropen_package.body.purpose
         );
 
+
         // 1. open stream to remote and send hello stream
         let mut target_addr = self.peer_addr.clone();
         target_addr.set_port(self.target.stack_port);
@@ -937,7 +941,7 @@ impl RTcpTunnel {
         self.build_helper.wait_ropen_stream(&real_key).await
     }
 
-    async fn open_stream(
+    async fn request_open_stream(
         &self,
         purpose: Option<StreamPurpose>,
         dest_port: u16,
@@ -1048,11 +1052,24 @@ impl Tunnel for RTcpTunnel {
         dest_port: u16,
         dest_host: Option<String>,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
-        self.open_stream(Some(StreamPurpose::Stream), dest_port, dest_host)
+        self.request_open_stream(Some(StreamPurpose::Stream), dest_port, dest_host)
             .await
     }
 
     async fn open_stream(&self, stream_id: &str) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+        //TODO: support stream_id is a tunnel url like rtcp://sn.buckyos.ai/google.com:443/
+        let real_stream_id = percent_decode_str(stream_id.trim_start_matches('/')).decode_utf8();
+        if real_stream_id.is_ok() {
+            let real_stream_id = real_stream_id.unwrap();
+            if has_scheme(real_stream_id.as_ref()) {
+                let stream_url = Url::parse(&real_stream_id);
+                if stream_url.is_ok() {
+                    debug!("will request open stream by url: {}", real_stream_id);
+                    return self.open_stream_by_dest(0, Some(real_stream_id.to_string())).await;
+                }
+            }
+        } 
+        debug!("will rquest open stream by dest: {}", stream_id);
         let (dest_host, dest_port) = get_dest_info_from_url_path(stream_id)?;
         self.open_stream_by_dest(dest_port, dest_host).await
     }
@@ -1064,7 +1081,7 @@ impl Tunnel for RTcpTunnel {
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
         //todo 是否可以支持配置成udp session,而不是强制使用tcp stream
         let stream = self
-            .open_stream(Some(StreamPurpose::Datagram), dest_port, dest_host)
+            .request_open_stream(Some(StreamPurpose::Datagram), dest_port, dest_host)
             .await?;
         let client = RTcpTunnelDatagramClient::new(Box::new(stream));
         Ok(Box::new(client) as Box<dyn DatagramClientBox>)
@@ -1074,6 +1091,17 @@ impl Tunnel for RTcpTunnel {
         &self,
         session_id: &str,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
+        let real_stream_id = percent_decode_str(session_id.trim_start_matches('/')).decode_utf8();
+        if real_stream_id.is_ok() {
+            let real_stream_id = real_stream_id.unwrap();
+            if has_scheme(real_stream_id.as_ref()) {
+                let stream_url = Url::parse(&real_stream_id);
+                if stream_url.is_ok() {
+                    debug!("will request open stream by url: {}", real_stream_id);
+                    return self.create_datagram_client_by_dest(0, Some(real_stream_id.to_string())).await;
+                }
+            }
+        }
         let (dest_host, dest_port) = get_dest_info_from_url_path(session_id)?;
         self.create_datagram_client_by_dest(dest_port, dest_host)
             .await
