@@ -27,3 +27,4 @@ src/rootfs/bin/__pycache__/
 src/_scripts/
 src/${APPDATA}
 src/web3-gateway/web3_gateway
+src/apps/cyfs_gateway/web/node_modules/
