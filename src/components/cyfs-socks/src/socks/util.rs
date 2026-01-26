@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use crate::error::{SocksError, SocksResult};
 use buckyos_kit::AsyncStream;
 use fast_socks5::consts;

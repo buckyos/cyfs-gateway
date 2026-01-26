@@ -195,9 +195,8 @@ servers:
   # socks_example:
   #   type: socks
   #   target: "http://127.0.0.1:1080"
-  #   auth: None                  # 或 [Password, "user", "pass"]
-  #   enable_tunnel: ["rtcp://example"]
-  #   rule_config: "rules.json"
+  #   username: ""  # 没有username和password字段则表示不设置密码
+  #   password: ""
   #   hook_point:
   #     main:
   #       priority: 1

@@ -5,7 +5,7 @@ export function main(argv) {
         "",
         "Options:",
         "  --bind  Bind address, default 0.0.0.0:8080",
-        "  --path  Root directory, default current_dir()",
+        "  --path  Root directory, default current dir",
         "  --help  Show this help",
     ].join("\n");
 

@@ -1,18 +1,16 @@
+#![allow(deprecated)]
+
 use super::config::{SocksProxyAuth, SocksProxyConfig};
 use super::util::{parse_hook_point_return_value, ProxyAccessMethod, Socks5Util};
 use crate::error::{SocksError, SocksResult};
 use crate::hook::*;
 use buckyos_kit::AsyncStream;
-use cyfs_gateway_lib::StreamInfo;
-use cyfs_process_chain::{CommandResult, EnvExternal};
-use fast_socks5::{
-    server::{Config, SimpleUserPassword},
-    util::target_addr::TargetAddr,
-    Socks5Command,
-};
+use cyfs_gateway_lib::{StreamInfo};
+use cyfs_process_chain::{CommandControl, EnvExternal};
+use fast_socks5::{server::{Config, SimpleUserPassword}, util::target_addr::TargetAddr, Socks5Command};
 use once_cell::sync::OnceCell;
 use std::sync::{Arc, Mutex};
-use fast_socks5::server::Socks5Socket;
+use fast_socks5::server::{Socks5Socket};
 use tokio::{net::TcpStream, task::JoinHandle};
 use url::Url;
 
@@ -129,12 +127,14 @@ impl Socks5Proxy {
         }
     }
 
-    async fn build_data_tunnel(&self, target: &TargetAddr) -> SocksResult<Box<dyn AsyncStream>> {
+    async fn build_data_tunnel(&self,
+                               proxy: Option<Url>,
+                               target: &TargetAddr) -> SocksResult<Box<dyn AsyncStream>> {
         debug!("Will build tunnel for {}", target);
 
         if let Some(builder) = self.data_tunnel_provider.get() {
             builder
-                .build(target, &self.config.target, &self.config.enable_tunnel)
+                .build(target, proxy.as_ref().unwrap_or(&self.config.target), &self.config.enable_tunnel)
                 .await
         } else {
             let msg = format!(
@@ -173,17 +173,22 @@ impl Socks5Proxy {
             SocksError::HookPointError(msg)
         })?;
 
-        let hook_point_ret = match ret {
-            CommandResult::Success(value) => value,
-            CommandResult::Error(value) => value,
-            CommandResult::Control(ctrl) => {
-                let msg = format!(
-                    "Socks hook point returned control, will use direct {:?}",
-                    ctrl
-                );
-                warn!("{}", msg);
-                "DIRECT".to_string()
+        let hook_point_ret = if ret.is_control() {
+            if ret.is_drop() || ret.is_reject() {
+                "REJECT".to_string()
+            } else {
+                if let Some(CommandControl::Return(ret)) = ret.as_control() {
+                    ret.value.clone()
+                } else {
+                    "DIRECT".to_string()
+                }
             }
+        } else {
+            let msg = format!(
+                "Socks hook point returned {:?}, will use direct", ret
+            );
+            warn!("{}", msg);
+            "DIRECT".to_string()
         };
 
         let access_method = match parse_hook_point_return_value(&hook_point_ret) {
@@ -221,7 +226,18 @@ impl Socks5Proxy {
                     "Will process socks5 connection to {} via proxy {:?}",
                     target, proxy_target
                 );
-                self.process_socket_via_proxy(socket, target).await
+                let proxy = if let Some(proxy_target) = proxy_target {
+                    let url = Url::parse(proxy_target.as_str())
+                        .map_err(|e| {
+                            let msg = format!("parse proxy {} failed. {:?}", proxy_target, e);
+                            error!("{}", msg);
+                            SocksError::InvalidParam(msg)
+                        })?;
+                    Some(url)
+                } else {
+                    None
+                };
+                self.process_socket_via_proxy(socket, proxy, target).await
             }
             ProxyAccessMethod::Reject => {
                 let msg = format!("Rule engine blocked connection to {}", target);
@@ -277,9 +293,10 @@ impl Socks5Proxy {
     async fn process_socket_via_proxy(
         &self,
         mut socket: fast_socks5::server::Socks5Socket<Box<dyn AsyncStream>, SimpleUserPassword>,
+        proxy: Option<Url>,
         target: TargetAddr,
     ) -> SocksResult<()> {
-        let mut tunnel = match self.build_data_tunnel(&target).await {
+        let mut tunnel = match self.build_data_tunnel(proxy, &target).await {
             Ok(tunnel) => {
                 // Reply success after data tunnel connected
                 Socks5Util::reply_error(&mut socket, fast_socks5::ReplyError::Succeeded).await?;

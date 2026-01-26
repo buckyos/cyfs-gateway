@@ -1,5 +1,5 @@
 use super::config::SocksServerConfig;
-use crate::{Socks5Proxy, SocksDataTunnelProviderRef, SocksHookManager, SocksProxyConfig};
+use crate::{Socks5Proxy, SocksDataTunnelProviderRef, SocksHookManager, SocksProxyAuth, SocksProxyConfig};
 use buckyos_kit::AsyncStream;
 use cyfs_gateway_lib::{server_err, GlobalProcessChainsRef, Server, ServerConfig, ServerErrorCode, ServerFactory, ServerResult, StreamServer, StreamInfo, GlobalCollectionManagerRef};
 use std::sync::Arc;
@@ -88,11 +88,16 @@ impl ServerFactory for SocksServerFactory {
             })?;
         let hook_point = Arc::new(hook_point);
 
+        let auth = if config.username.is_some() && config.password.is_some() {
+            SocksProxyAuth::Password(config.username.clone().unwrap(), config.password.clone().unwrap())
+        } else {
+            SocksProxyAuth::None
+        };
         let proxy_config = SocksProxyConfig {
             id: config.id.clone(),
             target: config.target.clone(),
             enable_tunnel: config.enable_tunnel.clone(),
-            auth: config.auth.clone(),
+            auth,
             rule_config: config.rule_config.clone(),
             rule_engine: None,
         };
