@@ -6,12 +6,13 @@ use buckyos_kit::AsyncStream;
 use cyfs_gateway_lib::StreamInfo;
 use cyfs_process_chain::{CommandResult, EnvExternal};
 use fast_socks5::{
-    server::{Config, SimpleUserPassword, Socks5Socket},
+    server::{Config, SimpleUserPassword},
     util::target_addr::TargetAddr,
     Socks5Command,
 };
 use once_cell::sync::OnceCell;
 use std::sync::{Arc, Mutex};
+use fast_socks5::server::Socks5Socket;
 use tokio::{net::TcpStream, task::JoinHandle};
 use url::Url;
 

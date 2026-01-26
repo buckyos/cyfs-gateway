@@ -11,7 +11,6 @@ use percent_encoding::percent_decode;
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use rustls_platform_verifier::BuilderVerifierExt;
-use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use url::Url;
 

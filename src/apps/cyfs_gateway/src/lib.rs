@@ -8,6 +8,7 @@ mod config_loader;
 mod config_merger;
 mod acme_sn_provider;
 mod process_chain_doc;
+mod socks;
 
 pub use gateway::*;
 pub use gateway_control_client::*;
@@ -325,6 +326,7 @@ async fn run_gateway_with_config(
     factory.register_server_factory("socks", Arc::new(SocksServerFactory::new(
         global_process_chains.clone(),
         global_collections.clone(),
+        socks::SocksTunnelBuilder::new_ref(tunnel_manager.clone())
     )));
     debug!("Register dir server factory");
     factory.register_server_factory("dns", Arc::new(ProcessChainDnsServerFactory::new(
