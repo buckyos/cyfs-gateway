@@ -18,7 +18,8 @@ use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::{PrivateKeyDer};
 use rustls::sign;
 use serde::{Deserialize, Serialize};
-use sfo_js::{JsString, JsValue};
+use serde_json::Value;
+use sfo_js::{JsPkgManager, JsPkgManagerRef, JsString, JsValue};
 use tokio::task::JoinHandle;
 use crate::{Challenge, ChallengeData, ChallengeType};
 use crate::default_challenge_responder::DefaultChallengeResponder;
@@ -362,16 +363,17 @@ pub type DnsProviderRef = Arc<dyn DnsProvider>;
 
 pub struct ExternalDnsProvider {
     name: String,
-    provider_path: PathBuf,
-    provider_params: serde_json::Value,
+    provider_params: Value,
+    js_pkg_manager: JsPkgManagerRef,
 }
 
 impl ExternalDnsProvider {
-    pub fn new(provider_path: PathBuf, name: impl Into<String>, provider_params: serde_json::Value) -> Arc<Self> {
+    pub fn new(js_pkg_manager: JsPkgManagerRef, name: impl Into<String>, provider_params: Value) -> Arc<Self> {
+
         Arc::new(Self {
             name: name.into(),
-            provider_path,
             provider_params,
+            js_pkg_manager,
         })
     }
 }
@@ -379,36 +381,11 @@ impl ExternalDnsProvider {
 #[async_trait::async_trait]
 impl DnsProvider for ExternalDnsProvider {
     async fn call(&self, op: String, domain: String, key_hash: String) -> Result<()> {
-        let provider_path = self.provider_path.join(self.name.as_str()).join("main.js");
-        let provider_params = self.provider_params.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut js_engine = sfo_js::JsEngine::new()?;
-            js_engine.eval_file(provider_path.as_path())?;
-
-            let domain = JsValue::from(JsString::from(domain));
-            let key_hash = JsValue::from(JsString::from(key_hash));
-            let provider = JsValue::from_json(&provider_params, js_engine.context())
-                .map_err(|e| anyhow::anyhow!("parse plugin data {} failed: {}", serde_json::to_string(&provider_params).unwrap_or("".to_string()), e))?;
-
-            let result = js_engine.call(op.as_str(), vec![provider, domain, key_hash])?;
-            if result.is_boolean() && result.as_boolean().unwrap() {
-                Ok(())
-            } else if result.is_promise() {
-                let result = result.as_promise().unwrap();
-                match result.await_blocking(js_engine.context()) {
-                    Ok(result) => {
-                        if result.is_boolean() && result.as_boolean().unwrap() {
-                            Ok(())
-                        } else {
-                            Err(anyhow::anyhow!("add_challenge failed"))
-                        }
-                    },
-                    Err(e) => Err(anyhow::anyhow!("add_challenge failed: {}", e))
-                }
-            } else {
-                Err(anyhow::anyhow!("add_challenge failed"))
-            }
-        }).await.map_err(|e| anyhow::anyhow!("spawn block failed: {}", e))?
+        let pkg = self.js_pkg_manager.get_pkg(self.name.clone()).await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        pkg.run_with_json(vec![Value::String(op), self.provider_params.clone(), Value::String(domain), Value::String(key_hash)]).await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(())
     }
 }
 
@@ -621,6 +598,13 @@ impl AcmeCertManager {
 
         let mut dns_providers = HashMap::<String, DnsProviderRef>::new();
         if let Some(dns_providers_config) = &config.dns_providers {
+            let provider_manager = if config.dns_provider_path.is_some() {
+                let dns_provider_path = Path::new(config.dns_provider_path.as_ref().unwrap()).to_path_buf();
+                let js_pkg_manager = JsPkgManager::new(dns_provider_path);
+                Some(js_pkg_manager)
+            } else {
+                None
+            };
             for (name, provider_config) in dns_providers_config.iter() {
                 let factory = {
                     DNS_PROVIDER_FACTORYS.read().unwrap().get(name).cloned()
@@ -629,10 +613,9 @@ impl AcmeCertManager {
                     let provider = factory.create(provider_config.clone()).await?;
                     dns_providers.insert(name.clone(), provider);
                 } else {
-                    if config.dns_provider_path.is_some() {
-                        let dns_provider_path = Path::new(config.dns_provider_path.as_ref().unwrap()).to_path_buf();
+                    if provider_manager.is_some() {
                         let provider = ExternalDnsProvider::new(
-                            dns_provider_path.clone(),
+                            provider_manager.as_ref().unwrap().clone(),
                             name.as_str(),
                             provider_config.clone());
                         dns_providers.insert(name.clone(), provider);
