@@ -373,31 +373,6 @@ async fn run_gateway_with_config(
     Ok(())
 }
 
-// Parse config first, then config file if supplied by user
-async fn load_config_from_args(matches: &clap::ArgMatches) -> Result<(PathBuf, PathBuf, serde_json::Value)> {
-    let mut default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.yaml");
-    if !default_config.exists() {
-        default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
-    }
-    let config_file = matches.get_one::<String>("config_file");
-    let real_config_file;
-    if config_file.is_none() {
-        real_config_file = default_config;
-    } else {
-        real_config_file = PathBuf::from(config_file.unwrap());
-    }
-
-    let config_dir = real_config_file.parent().ok_or_else(|| {
-        let msg = format!("cannot get config dir: {:?}", real_config_file);
-        error!("{}", msg);
-        anyhow!(msg)
-    })?;
-
-    let config_json = crate::ConfigMerger::load_dir_with_root(&config_dir, &real_config_file, None).await?;
-
-    Ok((config_dir.to_path_buf(), real_config_file, config_json))
-}
-
 fn get_config_file_path(matches: &clap::ArgMatches) -> PathBuf {
     let default_config = get_default_config_path();
     let config_file = matches.get_one::<String>("config_file");

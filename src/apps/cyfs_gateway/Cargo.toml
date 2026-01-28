@@ -48,6 +48,8 @@ http.workspace = true
 shlex.workspace = true
 sfo-js = { version = "0.1.8" }
 rand = "0.9.2"
+reqwest.workspace = true
+httpdate = "1.0"
 
 [dev-dependencies]
 tempfile.workspace = true

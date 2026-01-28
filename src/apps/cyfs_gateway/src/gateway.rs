@@ -23,6 +23,7 @@ use sha2::Digest;
 use rand::{Rng};
 use rand::distr::Alphanumeric;
 use rand::rng;
+use tokio::fs::create_dir_all;
 use crate::gateway_control_client::{cmd_err, into_cmd_err};
 use crate::gateway_control_server::{ControlErrorCode, ControlResult, GatewayControlCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
 use crate::config_loader::GatewayConfigParserRef;
@@ -33,6 +34,14 @@ use crate::merge;
 
 fn get_default_saved_gateway_config_path() -> PathBuf {
     get_buckyos_service_data_dir("cyfs_gateway").join("cyfs_gateway_saved.json")
+}
+
+async fn get_gateway_remote_config_cache_path() -> PathBuf {
+    let cache_dir = get_buckyos_service_data_dir("cyfs_gateway").join("config_cache");
+    if !cache_dir.exists() {
+        let _ = create_dir_all(cache_dir.clone()).await;
+    }
+    cache_dir
 }
 
 pub fn get_default_config_path() -> PathBuf {
@@ -156,10 +165,12 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Val
         None
     };
 
+    let cache_dir = get_gateway_remote_config_cache_path().await;
     let mut config_json = crate::ConfigMerger::load_dir_with_root(
         &config_dir,
         &config_file,
         saved_mtime,
+        &cache_dir,
     )
         .await
         .map_err(|e| {
