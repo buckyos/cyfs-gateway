@@ -1403,7 +1403,7 @@ mod tests {
         let tunnel_manager = TunnelManager::new();
         let result = UdpStack::builder()
             .id("test")
-            .bind("0.0.0.0:8930")
+            .bind("0.0.0.0:8932")
             .hook_point(chains)
             .servers(Arc::new(ServerManager::new()))
             .session_idle_time(Duration::from_secs(5))
@@ -1432,7 +1432,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let ret = udp_client.send_to(b"test", "127.0.0.1:8930").await;
+        let ret = udp_client.send_to(b"test", "127.0.0.1:8932").await;
         assert!(ret.is_ok());
 
         let mut buf = [0; 1024];

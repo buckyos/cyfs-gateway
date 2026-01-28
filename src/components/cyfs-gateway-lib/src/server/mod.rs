@@ -69,16 +69,28 @@ pub fn set_gateway_main_config_dir(path: &PathBuf) {
     }
 }
 
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            _ => result.push(comp),
+        }
+    }
+
+    result
+}
+
 //will move to buckyos_kit
 pub fn normalize_config_file_path(path: PathBuf,base_dir:&Path) -> PathBuf {
     if path.is_relative() {
         let result_path = base_dir.join(path.clone());
-        let ret = result_path.canonicalize();
-        if ret.is_err() {
-            error!("normalize_config_file_path {}: error: {}", path.to_string_lossy(), ret.err().unwrap());
-            return path;
-        }
-        return ret.unwrap();
+        let ret = normalize_path(result_path.as_path());
+        return ret;
     }
     path
 }
@@ -109,9 +121,90 @@ pub fn normalize_all_path_value_config(config:&mut serde_json::Value,base_dir:&P
 
 }
 
-
 // normalize_all_path_value_config test case
 mod test {
+    use std::path::Path;
+    use crate::server::normalize_path;
+
+    #[test]
+    fn test_normalize_path() {
+        // Test simple path normalization (removing current directory references)
+        let path = Path::new("./simple/path");
+        let normalized = normalize_path(path);
+        let normalized_str = normalized.to_string_lossy().replace("\\", "/");
+        assert_eq!(normalized_str, "simple/path");
+
+        // Test path with parent directory references
+        let path = Path::new("a/b/../c/d/../../e");
+        let normalized = normalize_path(path);
+        let normalized_str = normalized.to_string_lossy().replace("\\", "/");
+        assert_eq!(normalized_str, "a/e");
+
+        // Test path with current directory references
+        let path = Path::new("a/./b/./c");
+        let normalized = normalize_path(path);
+        let normalized_str = normalized.to_string_lossy().replace("\\", "/");
+        assert_eq!(normalized_str, "a/b/c");
+
+        // Test path with mixed components
+        let path = Path::new("a/./b/../c/./d/../../e");
+        let normalized = normalize_path(path);
+        let normalized_str = normalized.to_string_lossy().replace("\\", "/");
+        assert_eq!(normalized_str, "a/e");
+
+        // Test Windows-style path
+        let path = Path::new(".\\windows\\style\\path");
+        let normalized = normalize_path(path);
+        // Should remove the current directory reference
+        let normalized_str = normalized.to_string_lossy().to_string();
+        assert_eq!(normalized_str, "windows\\style\\path");
+
+        // Test Windows-style path
+        let path = Path::new("C:\\windows\\.\\style\\path");
+        let normalized = normalize_path(path);
+        // Should remove the current directory reference
+        let normalized_str = normalized.to_string_lossy().to_string();
+        assert_eq!(normalized_str, "C:\\windows\\style\\path");
+
+        // Test Windows-style path
+        let path = Path::new("C:\\windows\\..\\style\\path");
+        let normalized = normalize_path(path);
+        // Should remove the current directory reference
+        let normalized_str = normalized.to_string_lossy().to_string();
+        assert_eq!(normalized_str, "C:\\style\\path");
+
+        // Test path with parent directory at the beginning
+        let path = Path::new("../a/b/c");
+        let normalized = normalize_path(path);
+        // The result should still contain a, b, c but may have a leading ..
+        let normalized_str = normalized.to_string_lossy().to_string();
+        assert!(normalized_str.contains("a") && normalized_str.contains("b") && normalized_str.contains("c"));
+
+        // Test complex path with multiple parent directories
+        let path = Path::new("a/b/c/d/../../../e/f/g/../../h");
+        let normalized = normalize_path(path);
+        let normalized_str = normalized.to_string_lossy().replace("\\", "/");
+        assert_eq!(normalized_str, "a/e/h");
+
+        // Test path that goes completely up to root
+        let path = Path::new("a/b/../../c");
+        let normalized = normalize_path(path);
+        let normalized_str = normalized.to_string_lossy().replace("\\", "/");
+        assert_eq!(normalized_str, "c");
+
+        // Test single component paths
+        let path = Path::new(".");
+        let normalized = normalize_path(path);
+        // On Windows, this results in an empty path, on Unix it might stay as current dir
+        let normalized_str = normalized.to_string_lossy();
+        assert!(normalized_str.is_empty() || normalized_str == ".");
+
+        // Test empty path
+        let path = Path::new("");
+        let normalized = normalize_path(path);
+        let normalized_str = normalized.to_string_lossy();
+        assert_eq!(normalized_str, "");
+    }
 
     #[test]
     fn test_normalize_all_path_value_config() {
@@ -143,6 +236,6 @@ mod test {
         let base_dir = PathBuf::from("/opt/buckyos/etc");
         normalize_all_path_value_config(&mut config,&base_dir);
         assert_eq!(config.get("path").unwrap().as_str().unwrap().replace("\\","/"), "/opt/buckyos/etc/cyfs_gateway.yaml");
-        //assert_eq!(config.get("servers").unwrap().as_array().unwrap().get(0).unwrap().as_object().unwrap().get("tls").unwrap().as_object().unwrap().get("cert_path").unwrap().as_str().unwrap().replace("\\","/"), "/opt/buckyos/etc/cert.pem");
+        assert_eq!(config.get("servers").unwrap().as_array().unwrap().get(0).unwrap().as_object().unwrap().get("tls").unwrap().as_object().unwrap().get("cert_path").unwrap().as_str().unwrap().replace("\\","/"), "/opt/buckyos/etc/cyfs_gateway.yaml");
     }
 }
