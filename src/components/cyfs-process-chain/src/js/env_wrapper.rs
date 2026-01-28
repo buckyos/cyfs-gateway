@@ -44,7 +44,12 @@ impl EnvManagerWrapper {
     }
 
     pub fn create(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let env_manager = match this {
             Some(this) => this.env_manager.clone(),
             None => {
@@ -90,14 +95,19 @@ impl EnvManagerWrapper {
 
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(env_manager.create(&key, value, env_level)) {
-            Ok(ret) => Ok(JsValue::Boolean(ret)),
+            Ok(ret) => Ok(JsValue::from(ret)),
             Err(e) => Err(JsNativeError::error().with_message(e).into()),
         }
     }
 
     pub fn set(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
         info!("Calling EnvManagerWrapper.set");
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let env_manager = match this {
             Some(this) => this.env_manager.clone(),
             None => {
@@ -147,13 +157,18 @@ impl EnvManagerWrapper {
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(env_manager.set(&key, value, env_level)) {
             Ok(Some(v)) => CollectionWrapperHelper::collection_value_to_js_value(v, context),
-            Ok(None) => Ok(JsValue::Null),
+            Ok(None) => Ok(JsValue::null()),
             Err(e) => Err(JsNativeError::error().with_message(e).into()),
         }
     }
 
     pub fn get(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let env_manager = match this {
             Some(this) => this.env_manager.clone(),
             None => {
@@ -207,13 +222,18 @@ impl EnvManagerWrapper {
         let runtime_handle = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match runtime_handle.block_on(env_manager.get(&key, env_level)) {
             Ok(Some(v)) => CollectionWrapperHelper::collection_value_to_js_value(v, context),
-            Ok(None) => Ok(JsValue::Null),
+            Ok(None) => Ok(JsValue::null()),
             Err(e) => Err(JsNativeError::error().with_message(e).into()),
         }
     }
 
     pub fn remove(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Expected this to be an object".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+        let this = obj.downcast_ref::<Self>();
         let env_manager = match this {
             Some(this) => this.env_manager.clone(),
             None => {
@@ -262,7 +282,7 @@ impl EnvManagerWrapper {
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(env_manager.remove(&key, env_level)) {
             Ok(Some(v)) => CollectionWrapperHelper::collection_value_to_js_value(v, context),
-            Ok(None) => Ok(JsValue::Null),
+            Ok(None) => Ok(JsValue::null()),
             Err(e) => Err(JsNativeError::error().with_message(e).into()),
         }
     }

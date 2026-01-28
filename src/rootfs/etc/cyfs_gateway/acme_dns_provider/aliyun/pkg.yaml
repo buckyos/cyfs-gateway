@@ -1,0 +1,3 @@
+name: aliyun
+description: Aliyun Dns provider
+main: main.js

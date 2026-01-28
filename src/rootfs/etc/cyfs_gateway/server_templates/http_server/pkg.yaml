@@ -1,0 +1,3 @@
+name: http_server
+description: Local HTTP Server
+main: main.js

@@ -1,19 +1,24 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use anyhow::anyhow;
 use kRPC::RPCSessionToken;
 use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig, DID};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use cyfs_gateway_lib::{AcmeCertManagerHolder, AcmeCertManagerRef, DnsProvider, DnsProviderFactory, DnsProviderRef, RtcpStackConfig, StackProtocol};
+use cyfs_sn::OODInfo;
 
 pub struct AcmeSnProviderFactory {
+    data_path: PathBuf,
     weak_acme_mgr: Arc<Mutex<Option<Weak<AcmeCertManagerHolder>>>>,
 }
 
 impl AcmeSnProviderFactory {
-    pub fn new() -> Arc<AcmeSnProviderFactory> {
+    pub fn new(data_path: PathBuf) -> Arc<AcmeSnProviderFactory> {
         Arc::new(AcmeSnProviderFactory {
+            data_path,
             weak_acme_mgr: Arc::new(Mutex::new(None))
         })
     }
@@ -68,42 +73,182 @@ impl DnsProviderFactory for AcmeSnProviderFactory {
         };
         let private_key = jsonwebtoken::EncodingKey::from_ed_der(private_key.as_slice());
 
-        Ok(Arc::new(AcmeSnProvider::new(self.weak_acme_mgr.clone(), config.sn, private_key, device_config.id, device_config.name)))
+        Ok(AcmeSnProvider::new(self.data_path.clone(), self.weak_acme_mgr.clone(), config.sn, private_key, device_config.id, device_config.name))
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Eq, PartialEq)]
+struct CertStateItem {
+    did: String,
+    domain: String,
+    state: bool,
+}
+
 struct AcmeSnProvider {
+    data_path: PathBuf,
     weak_acme_mgr: Arc<Mutex<Option<Weak<AcmeCertManagerHolder>>>>,
     sn: String,
     private_key: jsonwebtoken::EncodingKey,
     did: DID,
     user_name: String,
+    cert_state_cache: Mutex<Vec<CertStateItem>>,
+    handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for AcmeSnProvider {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.lock().unwrap().take() {
+            handle.abort();
+        }
+    }
 }
 
 impl AcmeSnProvider {
     pub fn new(
+        data_path: PathBuf,
         weak_acme_mgr: Arc<Mutex<Option<Weak<AcmeCertManagerHolder>>>>,
         sn: String,
         private_key: jsonwebtoken::EncodingKey,
         did: DID,
-        user_name: String) -> AcmeSnProvider {
-        AcmeSnProvider {
+        user_name: String) -> Arc<AcmeSnProvider> {
+        let this = Arc::new(AcmeSnProvider {
+            data_path,
             weak_acme_mgr,
             sn,
             private_key,
             did,
             user_name,
+            cert_state_cache: Mutex::new(Default::default()),
+            handle: Mutex::new(None),
+        });
+
+        let obj = this.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let _ = obj.load_cert_state().await;
+            loop {
+                if let Err(e) = obj.update_cert_state().await {
+                    log::error!("update cert state failed.{}", e);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+
+        *this.handle.lock().unwrap() = Some(handle);
+        this
+    }
+
+    async fn add_cert(&self, domain: impl Into<String>) -> anyhow::Result<()> {
+        let state_content = {
+            let mut cache = self.cert_state_cache.lock().unwrap();
+            let item = CertStateItem {
+                did: self.did.to_string(),
+                domain: domain.into(),
+                state: false,
+            };
+            if cache.contains(&item) {
+                return Ok(());
+            }
+            cache.push(item);
+            serde_json::to_string(cache.deref()).map_err(|_| anyhow!("save cert state cache failed"))?
+        };
+        tokio::fs::write(self.data_path.join("self_cert_state.json"), state_content)
+            .await
+            .map_err(|_| anyhow!("save cert state cache failed"))?;
+        Ok(())
+    }
+
+    async fn load_cert_state(&self) -> anyhow::Result<()> {
+        let content = tokio::fs::read_to_string(self.data_path.join("self_cert_state.json"))
+            .await
+            .map_err(|_| anyhow!("load cert state cache failed"))?;
+        let cache: Vec<CertStateItem> = serde_json::from_str(content.as_str()).map_err(|_| anyhow!("parse cert state cache failed"))?;
+        *self.cert_state_cache.lock().unwrap() = cache;
+        Ok(())
+    }
+
+    async fn update_cert_state(&self) -> anyhow::Result<()> {
+        let cache = {
+            let cache = self.cert_state_cache.lock().unwrap();
+            cache.clone()
+        };
+
+        for item in cache.iter() {
+            if item.state {
+                continue;
+            }
+            if item.did != self.did.to_string() {
+                continue;
+            }
+
+            let mut has_cert = false;
+            let weak_acme_mgr = {
+                self.weak_acme_mgr.lock().unwrap().clone()
+            };
+            if let Some(weak_acme_mgr) = weak_acme_mgr {
+                if let Some(acme_mgr) = weak_acme_mgr.upgrade() {
+                    if let Some(cert) = acme_mgr.get_cert_by_host(item.domain.as_str()) {
+                        if let Some(_) = cert.get_cert() {
+                            has_cert = true;
+                        }
+                    }
+                }
+            }
+            if !has_cert {
+                continue;
+            }
+            self.report_user_cert_ok().await?;
+            self.set_cert_ok().await?;
         }
+        Ok(())
+    }
+    fn get_krpc(&self) -> anyhow::Result<kRPC::kRPC> {
+        let (token, _) = RPCSessionToken::generate_jwt_token(self.user_name.as_str(), "cyfs_gateway", None, &self.private_key)
+            .map_err(|_| anyhow!("generate jwt token failed"))?;
+        let krpc = kRPC::kRPC::new(self.sn.as_str(), Some(token));
+        Ok(krpc)
+    }
+
+    async fn report_user_cert_ok(&self) -> anyhow::Result<()> {
+        let krpc = self.get_krpc()?;
+        let result = krpc.call("query_by_did", json!({
+            "source_device_id": self.did.to_string()
+        })).await.map_err(|e| anyhow!("query_by_hostname failed.{:?}", e))?;
+        let ood_info = serde_json::from_value::<OODInfo>(result)
+            .map_err(|_| anyhow!("parse query_by_hostname result failed"))?;
+        
+        krpc.call("set_user_self_cert", json!({
+            "name": ood_info.owner_id,
+            "self_cert": true
+        })).await.map_err(|e| anyhow!("set_user_self_cert failed.{:?}", e))?;
+        Ok(())
+    }
+
+    async fn set_cert_ok(&self) -> anyhow::Result<()> {
+        let state_content = {
+            let mut cache = self.cert_state_cache.lock().unwrap();
+            for item in cache.iter_mut() {
+                if item.did != self.did.to_string() {
+                    continue;
+                }
+                item.state = true;
+            }
+            serde_json::to_string(cache.deref()).map_err(|_| anyhow!("save cert state cache failed"))?
+        };
+        tokio::fs::write(self.data_path.join("self_cert_state.json"), state_content)
+            .await
+            .map_err(|_| anyhow!("save cert state cache failed"))?;
+        Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl DnsProvider for AcmeSnProvider {
     async fn call(&self, op: String, domain: String, key_hash: String) -> anyhow::Result<()> {
-        let (token, _) = RPCSessionToken::generate_jwt_token(self.user_name.as_str(), "cyfs_gateway", None, &self.private_key)
-            .map_err(|_| anyhow!("generate jwt token failed"))?;
-        let krpc = kRPC::kRPC::new(self.sn.as_str(), Some(token));
+        let krpc = self.get_krpc()?;
         if op == "add_challenge" {
+            let original = domain.replace("_acme-challenge.", "*.");
+            self.add_cert(original).await?;
             krpc.call("add_dns_record", json!({
                             "device_did": self.did.to_string(),
                             "domain": domain,
@@ -140,6 +285,16 @@ impl DnsProvider for AcmeSnProvider {
                             "record_type": "TXT",
                             "has_cert": has_cert,
                         })).await.map_err(|e| anyhow!("add_dns_record failed.{:?}", e))?;
+
+            let result = krpc.call("query_by_did", json!({
+                    "source_device_id": self.did.to_string()
+                })).await.map_err(|e| anyhow!("query_by_hostname failed.{:?}", e))?;
+            let ood_info = serde_json::from_value::<OODInfo>(result)
+                .map_err(|_| anyhow!("parse query_by_hostname result failed"))?;
+
+            if ood_info.self_cert {
+                self.set_cert_ok().await?;
+            }
         }
         Ok(())
     }

@@ -21,11 +21,12 @@ bytes.workspace = true
 dirs = "*"
 once_cell.workspace = true
 anyhow.workspace = true
-json_value_merge = "2"
 serde_yaml_ng.workspace = true
-sfo-result = "0.2"
+sfo-result = "0.2.16"
 sha2.workspace = true
 chrono.workspace = true
+async-recursion = "*"
+toml.workspace = true
 hex.workspace = true
 jsonwebtoken.workspace = true
 sfo-io = "0.1.12"
@@ -37,6 +38,7 @@ name-lib.workspace = true
 kRPC.workspace = true
 
 cyfs-gateway-lib = { path = "../../components/cyfs-gateway-lib" }
+cyfs-process-chain = { path = "../../components/cyfs-process-chain" }
 cyfs-sn = { path = "../../components/cyfs-sn" }
 cyfs-dns = { path = "../../components/cyfs-dns" }
 cyfs-socks = { path = "../../components/cyfs-socks" }
@@ -44,7 +46,10 @@ cyfs-tun = { path = "../../components/cyfs-tun"}
 http-body-util.workspace = true
 http.workspace = true
 shlex.workspace = true
-sfo-js = "0.1"
+sfo-js = { version = "0.1.8" }
+rand = "0.9.2"
+reqwest.workspace = true
+httpdate = "1.0"
 
 [dev-dependencies]
 tempfile.workspace = true

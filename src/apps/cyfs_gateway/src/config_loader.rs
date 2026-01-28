@@ -406,8 +406,8 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for AcmeHttpCh
 pub struct GatewayConfigParser {
     stack_config_parser: CyfsStackConfigParser<serde_json::Value>,
     server_config_parser: CyfsServerConfigParser<serde_json::Value>,
-
 }
+pub type GatewayConfigParserRef = Arc<GatewayConfigParser>;
 
 impl GatewayConfigParser {
     pub fn new() -> Self {
@@ -431,6 +431,7 @@ impl GatewayConfigParser {
     }
 
     pub fn parse(&self, json_value: serde_json::Value) -> ConfigResult<GatewayConfig> {
+        let raw_config = json_value.clone();
         let mut stacks = vec![];
         if let Some(stacks_value) = json_value.get("stacks") {
             //debug!("stacks_value: {:?}", stacks_value);
@@ -611,6 +612,7 @@ impl GatewayConfigParser {
         }
 
         Ok(GatewayConfig {
+            raw_config,
             limiters_config,
             acme_config,
             tls_ca,
@@ -674,6 +676,7 @@ mod speed_parser {
 
 #[derive(Clone)]
 pub struct GatewayConfig {
+    pub raw_config: serde_json::Value,
     pub limiters_config: Option<Vec<LimiterConfig>>,
     pub acme_config: Option<AcmeConfig>,
     pub tls_ca: Option<TlsCA>,
@@ -686,7 +689,7 @@ pub struct GatewayConfig {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use json_value_merge::Merge;
+    use crate::merge;
 
     #[test]
     fn test_limiter_config_parser() {
@@ -814,12 +817,12 @@ mod tests {
 }
         "#;
         let json2 = serde_json::from_str::<serde_json::Value>(json2_str).unwrap();
-        json1.merge(&json2);
+        merge(&mut json1, &json2);
 
         let json3 = json!({
             "include" : [{"path": "config.json"},{"path": "config2.json"}]
         });
-        json1.merge(&json3);
+        merge(&mut json1, &json3);
         let json1_str = serde_json::to_string_pretty(&json1).unwrap();
         println!("merged: {}", json1_str);
     }

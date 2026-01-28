@@ -9,7 +9,11 @@ use url::Url;
 pub struct SocksServerConfig {
     pub id: String,
 
-    pub auth: SocksProxyAuth,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 
     pub target: Url,
 

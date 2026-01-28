@@ -1,0 +1,3 @@
+name: socks_server
+description: Start a socks server
+main: main.js

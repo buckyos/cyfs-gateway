@@ -38,11 +38,23 @@ stacks:
             block: |
               return "server main_dns";
 
-#  test5:
+  socks_stack:
+    bind: 0.0.0.0:1085
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server proxy;
+
+  #  test5:
 #    bind: 0.0.0.0:2980
 #    protocol: rtcp
-#    key_path: ./rootfs/etc/device.key.pem
-#    device_config_path: ./rootfs/etc/device.doc.json
+  #    key_path: ./device.key.pem
+  #    device_config_path: ./device.doc.json
 #    hook_point:
 #      main:
 #        priority: 1
@@ -61,7 +73,7 @@ stacks:
         blocks:
           default:
             block: |
-              return "forward tls:///${REQ.dest_host}:443";
+              return "forward tcp:///tls://${REQ.dest_host}:443";
 
 #
 #  test8083_quic:
@@ -89,17 +101,19 @@ servers:
   #          default:
 #            block: |
 #              reject;
-#
-  #  proxy:
-  #  type: socks5
-#    hook_point:
-  #      main:
-#        priority: 1
-#        blocks:
-  #          default:
-#            block: |
-#              reject;
-#
+
+  proxy:
+    type: socks
+    target: rtcp://127.0.0.1:2980
+    auth: None
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            block: |
+              return "REJECT";
+
   main_dns:
     type: dns
     hook_point:

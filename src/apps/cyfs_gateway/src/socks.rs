@@ -4,6 +4,7 @@ use cyfs_socks::{
     SocksDataTunnelProvider, SocksDataTunnelProviderRef, SocksError, SocksResult, TargetAddr,
 };
 use std::sync::Arc;
+use log::{error, info};
 use url::Url;
 
 pub struct SocksTunnelBuilder {

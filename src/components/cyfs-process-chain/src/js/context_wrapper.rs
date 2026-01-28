@@ -41,15 +41,17 @@ impl ContextWrapper {
     }
 
     pub fn env(this: &JsValue, _args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
-        let this = this.as_object().and_then(|obj| obj.downcast_ref::<Self>());
-        let wrapper = match &this {
-            Some(this) => this,
-            None => {
-                let msg = format!("Failed to get EnvManagerWrapper from this");
-                error!("{}", msg);
-                return Err(JsNativeError::error().with_message(msg).into());
-            }
-        };
+        let obj = this.as_object().ok_or_else(|| {
+            let msg = "Failed to get ContextWrapper object from this".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
+
+        let wrapper = obj.downcast_ref::<Self>().ok_or_else(|| {
+            let msg = "Failed to downcast this to ContextWrapper".to_string();
+            error!("{}", msg);
+            JsNativeError::error().with_message(msg)
+        })?;
 
         let env = EnvManagerWrapper::new(wrapper.env_manager.clone());
         let obj = EnvManagerWrapper::into_js_object(env, context)?;

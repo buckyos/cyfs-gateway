@@ -46,7 +46,7 @@ function getPath(accessKeySecret, reqParams, commonParams) {
     return '/?' + getQueryString(accessKeySecret, reqParams, commonParams);
 }
 
-export async function add_challenge(provider, domain, challenge_key) {
+async function add_challenge(provider, domain, challenge_key) {
     const accessKeyId = provider["accessKeyId"];
     const accessKeySecret = provider["accessKeySecret"];
     const subDomain = domain;
@@ -120,7 +120,7 @@ export async function add_challenge(provider, domain, challenge_key) {
     return true;
 }
 
-export async function del_challenge(provider, domain, challenge_key) {
+async function del_challenge(provider, domain, challenge_key) {
     const accessKeyId = provider["accessKeyId"];
     const accessKeySecret = provider["accessKeySecret"];
     const subDomain = domain;
@@ -171,3 +171,18 @@ export async function del_challenge(provider, domain, challenge_key) {
     return true;
 }
 
+export async function main(argv) {
+    if (argv.length !== 4) {
+        console.log("params error");
+        return 1;
+    }
+
+    if (argv[0] === "add_challenge") {
+        return await add_challenge(argv[1], argv[2], argv[3]);
+    } else if (argv[0] === "del_challenge") {
+        return await del_challenge(argv[1], argv[2], argv[3]);
+    } else {
+        console.log("params error");
+        return 1;
+    }
+}

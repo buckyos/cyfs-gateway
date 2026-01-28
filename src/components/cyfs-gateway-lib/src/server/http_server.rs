@@ -8,7 +8,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor};
-use crate::{get_server_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerManagerRef, ServerResult, StreamInfo, TunnelManager};
+use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerManagerRef, ServerResult, StreamInfo, TunnelManager};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err,into_server_err};
 use crate::tunnel_connector::TunnelConnector;
@@ -129,7 +129,7 @@ impl ProcessChainHttpServer {
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains,
                                                           builder.global_collection_manager,
-                                                          Some(get_server_external_commands(builder.server_mgr.clone().unwrap()))).await
+                                                          Some(get_external_commands(builder.server_mgr.clone().unwrap()))).await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
         Ok(ProcessChainHttpServer {
             id: builder.id.unwrap(),
@@ -143,7 +143,11 @@ impl ProcessChainHttpServer {
 
     async fn handle_forward_upstream(&self, req: http::Request<BoxBody<Bytes, ServerError>>, target_url: &str) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let org_url = req.uri().to_string();
-        let url = format!("{}{}", target_url, org_url);
+        // Trim URL boundary slashes so we don't end up with "//" when target_url ends with '/'
+        // and org_url starts with '/'.
+        let base = target_url.trim_end_matches('/');
+        let path = org_url.trim_start_matches('/');
+        let url = format!("{}/{}", base, path);
         info!("handle_upstream url: {}", url);
         let upstream_url = Url::parse(target_url);
         if upstream_url.is_err() {

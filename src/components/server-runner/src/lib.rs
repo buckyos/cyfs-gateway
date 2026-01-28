@@ -117,6 +117,12 @@ pub struct Runner {
     router: Router,
 }
 
+#[derive(Clone, Default)]
+pub struct DirHandlerOptions {
+    pub index_file: Option<String>,
+    pub fallback_file: Option<String>,
+}
+
 impl Runner {
     /// Bind to `0.0.0.0:port`.
     pub fn new(port: u16) -> Self {
@@ -144,14 +150,30 @@ impl Runner {
     }
 
     pub async fn add_dir_handler(&self, router_url: String, dir: PathBuf) -> ServerResult<()> {
-        // Create DirServer
-        let dir_server = DirServer::builder()
+        self.add_dir_handler_with_options(router_url, dir, DirHandlerOptions::default())
+            .await
+    }
+
+    pub async fn add_dir_handler_with_options(
+        &self,
+        router_url: String,
+        dir: PathBuf,
+        options: DirHandlerOptions,
+    ) -> ServerResult<()> {
+        let mut builder = DirServer::builder()
             .id(router_url.clone())
             .root_path(dir)
-            .base_url(router_url.clone())
-            .build()
-            .await?;
+            .base_url(router_url.clone());
 
+        if let Some(index_file) = options.index_file {
+            builder = builder.index_file(index_file);
+        }
+
+        if let Some(fallback_file) = options.fallback_file {
+            builder = builder.fallback_file(fallback_file);
+        }
+
+        let dir_server = builder.build().await?;
         self.router.add_route(router_url, Arc::new(dir_server));
         Ok(())
     }

@@ -1,5 +1,5 @@
 use super::config::SocksServerConfig;
-use crate::{Socks5Proxy, SocksHookManager, SocksProxyConfig};
+use crate::{Socks5Proxy, SocksDataTunnelProviderRef, SocksHookManager, SocksProxyAuth, SocksProxyConfig};
 use buckyos_kit::AsyncStream;
 use cyfs_gateway_lib::{server_err, GlobalProcessChainsRef, Server, ServerConfig, ServerErrorCode, ServerFactory, ServerResult, StreamServer, StreamInfo, GlobalCollectionManagerRef};
 use std::sync::Arc;
@@ -39,14 +39,17 @@ impl StreamServer for SocksServer {
 pub struct SocksServerFactory {
     global_process_chains: GlobalProcessChainsRef,
     global_collection_manager: GlobalCollectionManagerRef,
+    tunnel_provider: SocksDataTunnelProviderRef,
 }
 
 impl SocksServerFactory {
     pub fn new(global_process_chains: GlobalProcessChainsRef,
-               global_collection_manager: GlobalCollectionManagerRef,) -> Self {
+               global_collection_manager: GlobalCollectionManagerRef,
+               tunnel_provider: SocksDataTunnelProviderRef,) -> Self {
         Self {
             global_process_chains,
             global_collection_manager,
+            tunnel_provider,
         }
     }
 }
@@ -85,16 +88,22 @@ impl ServerFactory for SocksServerFactory {
             })?;
         let hook_point = Arc::new(hook_point);
 
+        let auth = if config.username.is_some() && config.password.is_some() {
+            SocksProxyAuth::Password(config.username.clone().unwrap(), config.password.clone().unwrap())
+        } else {
+            SocksProxyAuth::None
+        };
         let proxy_config = SocksProxyConfig {
             id: config.id.clone(),
             target: config.target.clone(),
             enable_tunnel: config.enable_tunnel.clone(),
-            auth: config.auth.clone(),
+            auth,
             rule_config: config.rule_config.clone(),
             rule_engine: None,
         };
 
         let socks_server = Socks5Proxy::new(proxy_config, hook_point.clone());
+        socks_server.set_data_tunnel_provider(self.tunnel_provider.clone());
         let server = SocksServer::new(socks_server);
         let server = Server::Stream(Arc::new(server) as Arc<dyn StreamServer>);
 

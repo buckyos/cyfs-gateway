@@ -151,6 +151,12 @@ pub fn get_dest_info_from_url_path(path: &str) -> Result<(Option<String>, u16), 
     }
 }
 
+
+pub fn has_scheme(s: &str) -> bool {
+    let re = regex::Regex::new(r"^[a-zA-Z][a-zA-Z0-9+.-]*://").unwrap();
+    re.is_match(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

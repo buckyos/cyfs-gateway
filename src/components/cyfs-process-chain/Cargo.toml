@@ -1,6 +1,6 @@
 [package]
 name = "cyfs-process-chain"
-version = "0.1.0"
+version = "0.5.1"
 edition = "2024"
 resolver = "3"
 
@@ -13,7 +13,6 @@ async-trait.workspace = true
 regex.workspace = true
 nom = "*"
 shlex.workspace = true
-http-types = "*"
 async-recursion = "*"
 xmltree = "*"
 globset = "*"
@@ -26,9 +25,9 @@ http-body-util.workspace = true
 clap = { workspace = true, features = ["string"] }
 rustyline = "*"
 dirs-next = "*"
-boa_engine = "0.20.0"
-boa_runtime  = "0.20.0"
-boa_gc = "0.20.0"
+boa_engine = "0.21.0"
+boa_runtime  = "0.21.0"
+boa_gc = "0.21.0"
 futures.workspace = true
 buckyos-kit.workspace = true
 pin-project-lite = "*"

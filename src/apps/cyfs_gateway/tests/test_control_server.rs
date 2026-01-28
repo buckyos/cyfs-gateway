@@ -11,6 +11,7 @@ mod tests {
     use serde_json::Value;
     use cyfs_gateway::*;
     use cyfs_gateway_lib::*;
+    use sfo_js::JsPkgManager;
 
     pub struct TempKeyStore {
         private_key: tokio::sync::Mutex<tempfile::NamedTempFile>,
@@ -61,36 +62,13 @@ mod tests {
         }
     }
 
-    pub struct TempExternalCmdStore {
-        test_cmd: tempfile::NamedTempFile,
-    }
-
-    impl TempExternalCmdStore {
-        pub fn new() -> Self {
-            let mut test_cmd = tempfile::NamedTempFile::with_suffix(".js").unwrap();
-            let cmd = r#"
-print("hello python")
-            "#;
-            test_cmd.write_all(cmd.as_bytes()).unwrap();
-            TempExternalCmdStore {
-                test_cmd,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ExternalCmdStore for TempExternalCmdStore {
-        async fn read_external_cmd(&self, cmd: &str) -> ControlResult<String> {
-            Ok(self.test_cmd.path().to_string_lossy().to_string())
-        }
-    }
     #[tokio::test]
     async fn test_cmd_server() {
         init_logging("cyfs_gateway", false);
         let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
 
         // Load config from json
-        let parser = GatewayConfigParser::new();
+        let parser = Arc::new(GatewayConfigParser::new());
         parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
         parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
         parser.register_stack_config_parser("rtcp", Arc::new(RtcpStackConfigParser::new()));
@@ -119,6 +97,7 @@ print("hello python")
         let stat_manager = StatManager::new();
         let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default()).await.unwrap();
         let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
+        let external_cmds = JsPkgManager::new(PathBuf::from("."));
 
         let stack_manager = StackManager::new();
         let factory = GatewayFactory::new(
@@ -132,6 +111,8 @@ print("hello python")
             stat_manager.clone(),
             self_cert_mgr.clone(),
             collection_manager.clone(),
+            external_cmds,
+            parser.clone(),
         );
         factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
             server_manager.clone(),
@@ -195,8 +176,7 @@ print("hello python")
             Some("test".to_string()),
             Some("123456".to_string()),
             store).await.unwrap();
-        let cmd_store = TempExternalCmdStore::new();
-        let handler = GatewayCmdHandler::new(Arc::new(cmd_store), PathBuf::from("config.yaml"), parser);
+        let handler = GatewayCmdHandler::new(Some(PathBuf::from("config.yaml")), parser.clone());
         factory.register_server_factory("control_server", Arc::new(GatewayControlServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
         factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new(
             cert_manager.clone(),
@@ -207,17 +187,17 @@ print("hello python")
         let params = GatewayParams {
             keep_tunnel: vec![],
         };
-        gateway.start(params).await;
+        gateway.start(params).await.unwrap();
         handler.set_gateway(Arc::new(gateway));
 
         let cmd_client = GatewayControlClient::new("http://127.0.0.1:13451".to_string(), None);
-        let ret = cmd_client.get_config(None, None).await;
+        let ret = cmd_client.get_config_by_id(None).await;
         assert!(ret.is_err());
 
         let ret = cmd_client.login("test", "123456").await;
         assert!(ret.is_ok());
 
-        let ret = cmd_client.get_config(None, None).await;
+        let ret = cmd_client.get_config_by_id(None).await;
         assert!(ret.is_ok());
     }
 }
