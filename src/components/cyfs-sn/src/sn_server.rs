@@ -246,9 +246,9 @@ impl SNServer {
         })?;
 
         rpc_session_token.verify_by_key(&user_public_key)?;
-        if rpc_session_token.appid.is_none() || rpc_session_token.appid.as_ref().unwrap() != "active_service"
+        if rpc_session_token.aud.is_none() || rpc_session_token.aud.as_ref().unwrap() != "active_service"
         {
-            return Err(RPCErrors::ParseRequestError(format!("invalid appid {} expect active_service", rpc_session_token.appid.clone().unwrap_or("None".to_string()))));
+            return Err(RPCErrors::ParseRequestError(format!("invalid aud {} expect active_service", rpc_session_token.aud.clone().unwrap_or("None".to_string()))));
         }
 
         let mini_device_config = DeviceMiniConfig::from_jwt(mini_config_jwt, &user_public_key);
@@ -349,9 +349,9 @@ impl SNServer {
         })?;
 
         rpc_session_token.verify_by_key(&user_public_key)?;
-        if rpc_session_token.appid.is_none() || rpc_session_token.appid.unwrap() != "active_service"
+        if rpc_session_token.aud.is_none() || rpc_session_token.aud.unwrap() != "active_service"
         {
-            return Err(RPCErrors::ParseRequestError("invalid appid".to_string()));
+            return Err(RPCErrors::ParseRequestError("invalid aud".to_string()));
         }
 
         // Update zone_config and user_domain in database
@@ -1209,14 +1209,14 @@ impl SNServer {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // Parse token once, use token.userid as device_name (e.g. "ood1") to locate the device.
+        // Parse token once, use token.sub as device_name (e.g. "ood1") to locate the device.
         let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
-        let device_name = rpc_session_token.userid.clone().ok_or_else(|| {
-            RPCErrors::ParseRequestError("Invalid token: userid is none".to_string())
+        let device_name = rpc_session_token.sub.clone().ok_or_else(|| {
+            RPCErrors::ParseRequestError("Invalid token: sub is none".to_string())
         })?;
         if device_name.trim().is_empty() {
             return Err(RPCErrors::ParseRequestError(
-                "Invalid token: userid is empty".to_string(),
+                "Invalid token: sub is empty".to_string(),
             ));
         }
 
