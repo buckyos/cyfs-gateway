@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use as_any::AsAny;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use crate::{stack_err, ProcessChainConfig, StackErrorCode, StackResult};
+use crate::{stack_err, GlobalCollectionManagerRef, LimiterManagerRef, ProcessChainConfig, ServerManagerRef, StackErrorCode, StackResult, StatManagerRef, TunnelManager};
+use crate::global_process_chains::GlobalProcessChainsRef;
 
 #[derive(PartialEq, Eq, Debug, Clone, Hash)]
 pub enum StackProtocol {
@@ -55,13 +56,20 @@ pub trait StackConfig: AsAny + Send + Sync {
     fn remove_process_chain(&self, process_chain_id: &str) -> Arc<dyn StackConfig>;
 }
 
+pub trait StackContext: AsAny + Send + Sync {
+    fn stack_protocol(&self) -> StackProtocol;
+}
+
 #[async_trait::async_trait]
 pub trait Stack: Send + Sync + 'static {
     fn id(&self) -> String;
     fn stack_protocol(&self) -> StackProtocol;
     fn get_bind_addr(&self) -> String;
     async fn start(&self) -> StackResult<()>;
-    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()>;
+    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {Ok(())}
+    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Arc<dyn StackContext>) -> StackResult<()> { Ok(()) }
+    async fn commit_update(&self) {}
+    async fn rollback_update(&self) {}
 }
 
 pub type StackRef = Arc<dyn Stack>;
