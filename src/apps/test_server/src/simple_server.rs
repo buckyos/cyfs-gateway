@@ -24,7 +24,10 @@ impl SimpleHttpServer {
 impl RPCHandler for SimpleHttpServer {
     async fn handle_rpc_call(&self, req: RPCRequest, _client_ip: IpAddr) -> Result<RPCResponse, RPCErrors> {
         info!("|==>recv kRPC req: {:?}", req);
-        Ok(RPCResponse::new(RPCResult::Success(json!({"ok": true})), req.id))
+        Ok(RPCResponse::create_by_req(
+            RPCResult::Success(json!({ "ok": true })),
+            &req,
+        ))
     }
 }
 

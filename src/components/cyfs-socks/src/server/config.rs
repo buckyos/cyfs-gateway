@@ -1,4 +1,3 @@
-use crate::SocksProxyAuth;
 use cyfs_gateway_lib::{ServerConfig, ProcessChainConfig, get_min_priority};
 use cyfs_process_chain::*;
 use serde::{Deserialize, Serialize};

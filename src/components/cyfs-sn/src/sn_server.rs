@@ -91,11 +91,11 @@ impl SNServer {
             error!("Failed to check username: {:?}", e);
             RPCErrors::ReasonError(e.to_string())
         })?;
-        let resp = RPCResponse::new(
+        let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
                 "valid":!ret
             })),
-            req.id,
+            &req,
         );
         return Ok(resp);
     }
@@ -125,11 +125,11 @@ impl SNServer {
             return Err(RPCErrors::ReasonError(ret.err().unwrap().to_string()));
         }
         let valid = ret.unwrap();
-        let resp = RPCResponse::new(
+        let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
                 "valid":valid
             })),
-            req.id,
+            &req,
         );
         return Ok(resp);
     }
@@ -186,11 +186,11 @@ impl SNServer {
             user_name, public_key, active_code
         );
 
-        let resp = RPCResponse::new(
+        let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
                 "code":0
             })),
-            req.id,
+            &req,
         );
         return Ok(resp);
     }
@@ -220,7 +220,7 @@ impl SNServer {
         let device_info = device_info.unwrap().as_str().unwrap();
 
         //check token is valid (verify pub key is user's public key)
-        let session_token = req.token;
+        let session_token = req.token.clone();
         if session_token.is_none() {
             return Err(RPCErrors::ParseRequestError(
                 "Invalid params, session_token is none".to_string(),
@@ -291,11 +291,11 @@ impl SNServer {
 
         info!("device {}_{} registered success", user_name, device_name);
 
-        let resp = RPCResponse::new(
+        let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
                 "code":0
             })),
-            req.id,
+            &req,
         );
         return Ok(resp);
     }
@@ -323,7 +323,7 @@ impl SNServer {
         }
 
         //check token is valid (verify pub key is user's public key)
-        let session_token = req.token;
+        let session_token = req.token.clone();
         if session_token.is_none() {
             return Err(RPCErrors::ParseRequestError(
                 "Invalid params, session_token is none".to_string(),
@@ -372,11 +372,11 @@ impl SNServer {
             user_name
         );
 
-        let resp = RPCResponse::new(
+        let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
                 "code":0
             })),
-            req.id,
+            &req,
         );
         return Ok(resp);
     }
@@ -419,7 +419,7 @@ impl SNServer {
         }
         let (old_device_info, _) = old_device_info.unwrap();
 
-        let session_token = req.token;
+        let session_token = req.token.clone();
         if session_token.is_none() {
             return Err(RPCErrors::ParseRequestError(
                 "Invalid params, session_token is none".to_string(),
@@ -451,11 +451,11 @@ impl SNServer {
             device_info_json.to_string().as_str(),
         ).await.map_err(|e| RPCErrors::ReasonError(format!("{}", e)));
 
-        let resp = RPCResponse::new(
+        let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
                 "code":0
             })),
-            req.id,
+            &req,
         );
         
 
@@ -480,7 +480,7 @@ impl SNServer {
         let pk_preview: String = public_key.chars().take(16).collect();
         info!(
             "get_device_by_public_key start: req_id={}, public_key_len={}, pk_preview={}",
-            req.id,
+            req.seq,
             public_key.len(),
             pk_preview
         );
@@ -509,13 +509,16 @@ impl SNServer {
                 "found": false,
                 "reason": "user not found",
             });
-            return Ok(RPCResponse::new(RPCResult::Success(response_value), req.id));
+            return Ok(RPCResponse::create_by_req(
+                RPCResult::Success(response_value),
+                &req,
+            ));
         }
 
         let (username, zone_config, _) = user_info.unwrap();
         info!(
             "get_device_by_public_key matched username={} for req_id={}",
-            username, req.id
+            username, req.seq
         );
 
         let mut device_info_err: Option<String> = None;
@@ -590,7 +593,10 @@ impl SNServer {
             response_value["device_sn_ip"].is_string()
         );
 
-        Ok(RPCResponse::new(RPCResult::Success(response_value), req.id))
+        Ok(RPCResponse::create_by_req(
+            RPCResult::Success(response_value),
+            &req,
+        ))
     }
 
     //get device info by device_name and owner_name
@@ -622,11 +628,17 @@ impl SNServer {
                 warn!("Failed to parse device info: {:?}", e);
                 RPCErrors::ReasonError(e.to_string())
             })?;
-            return Ok(RPCResponse::new(RPCResult::Success(device_value), req.id));
+            return Ok(RPCResponse::create_by_req(
+                RPCResult::Success(device_value),
+                &req,
+            ));
         } else {
             warn!("device info not found for {}_{}", owner_id, device_id);
             let device_json = serde_json::to_value(device_info.clone()).unwrap();
-            return Ok(RPCResponse::new(RPCResult::Success(device_json), req.id));
+            return Ok(RPCResponse::create_by_req(
+                RPCResult::Success(device_json),
+                &req,
+            ));
         }
     }
 
@@ -908,7 +920,7 @@ impl SNServer {
         &self,
         req: RPCRequest,
     ) -> Result<RPCResponse, RPCErrors> {
-        let session_token = req.token;
+        let session_token = req.token.clone();
         if session_token.is_none() {
             return Err(RPCErrors::ParseRequestError(
                 "Invalid params, session_token is none".to_string(),
@@ -1036,11 +1048,11 @@ impl SNServer {
 
         info!("add dns record {} {} success", user_name, domain);
 
-        let resp = RPCResponse::new(
+        let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
                 "code":0
             })),
-            req.id,
+            &req,
         );
         Ok(resp)
     }
@@ -1049,7 +1061,7 @@ impl SNServer {
         &self,
         req: RPCRequest,
     ) -> Result<RPCResponse, RPCErrors> {
-        let session_token = req.token;
+        let session_token = req.token.clone();
         if session_token.is_none() {
             return Err(RPCErrors::ParseRequestError(
                 "Invalid params, session_token is none".to_string(),
@@ -1166,11 +1178,11 @@ impl SNServer {
 
         info!("remove dns record {} {} success", user_name, domain);
 
-        let resp = RPCResponse::new(
+        let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
                 "code":0
             })),
-            req.id,
+            &req,
         );
         Ok(resp)
     }
@@ -1259,9 +1271,9 @@ impl SNServer {
             device.did.clone(),
             self_cert
         );
-        Ok(RPCResponse::new(
+        Ok(RPCResponse::create_by_req(
             RPCResult::Success(json!({ "code": 0 })),
-            req.id,
+            &req
         ))
     }
 
@@ -1335,7 +1347,10 @@ impl SNServer {
                 if ood_info.is_some() {
                     let ood_info = ood_info.unwrap();
                     let ood_json = serde_json::to_value(ood_info).unwrap();
-                    return Ok(RPCResponse::new(RPCResult::Success(ood_json), req.id));
+                    return Ok(RPCResponse::create_by_req(
+                        RPCResult::Success(ood_json),
+                        &req,
+                    ));
                 } else {
                     return Err(RPCErrors::ParseRequestError(
                         "Invalid params, hostname is none".to_string(),
@@ -1360,7 +1375,10 @@ impl SNServer {
                 if ood_info.is_some() {
                     let ood_info = ood_info.unwrap();
                     let ood_json = serde_json::to_value(ood_info).unwrap();
-                    return Ok(RPCResponse::new(RPCResult::Success(ood_json), req.id));
+                    return Ok(RPCResponse::create_by_req(
+                        RPCResult::Success(ood_json),
+                        &req,
+                    ));
                 } else {
                     return Err(RPCErrors::ParseRequestError(
                         "Invalid params, did is none".to_string(),

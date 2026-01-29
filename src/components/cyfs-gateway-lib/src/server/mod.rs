@@ -122,9 +122,10 @@ pub fn normalize_all_path_value_config(config:&mut serde_json::Value,base_dir:&P
 }
 
 // normalize_all_path_value_config test case
+#[cfg(test)]
 mod test {
-    use std::path::Path;
     use crate::server::normalize_path;
+    use std::path::Path;
 
     #[test]
     fn test_normalize_path() {

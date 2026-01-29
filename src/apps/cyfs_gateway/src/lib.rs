@@ -542,7 +542,7 @@ async fn run_template_local(template_id: &str, args: Vec<String>) -> Result<()> 
 
 
 pub async fn cyfs_gateway_main() {
-    let mut command = Command::new("CYFS Gateway Service")
+    let command = Command::new("CYFS Gateway Service")
         .version(buckyos_kit::get_version())
         .arg(
             Arg::new("config")
