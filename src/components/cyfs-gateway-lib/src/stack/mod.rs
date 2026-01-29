@@ -6,6 +6,7 @@ mod tls_stack;
 mod quic_stack;
 mod limiter;
 mod tls_cert_resolver;
+mod stack_context_factory;
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -18,6 +19,7 @@ pub use stack::*;
 pub use tls_stack::*;
 pub(crate) use tls_cert_resolver::*;
 pub use limiter::*;
+pub use stack_context_factory::*;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum StackErrorCode {

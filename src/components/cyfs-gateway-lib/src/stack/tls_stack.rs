@@ -513,7 +513,7 @@ impl Stack for TlsStack {
         Ok(())
     }
 
-    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Arc<dyn StackContext>) -> StackResult<()> {
+    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Option<Arc<dyn StackContext>>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<TlsStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tls stack config"))?;
         if config.id != self.id {
@@ -523,8 +523,14 @@ impl Stack for TlsStack {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
-        let tls_context = context.as_ref().as_any().downcast_ref::<TlsStackContext>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tls stack context"))?;
+        let env = match context {
+            Some(context) => {
+                let tls_context = context.as_ref().as_any().downcast_ref::<TlsStackContext>()
+                    .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tls stack context"))?;
+                Arc::new(tls_context.clone())
+            }
+            None => self.handler.read().unwrap().env.clone(),
+        };
 
         let certs = build_tls_domain_configs(&config.certs).await?;
         let alpn_protocols = config
@@ -539,7 +545,7 @@ impl Stack for TlsStack {
             config.hook_point.clone(),
             certs,
             alpn_protocols,
-            Arc::new(tls_context.clone()),
+            env,
         )
             .await?;
 

@@ -440,7 +440,7 @@ impl Stack for TcpStack {
         Ok(())
     }
 
-    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Arc<dyn StackContext>) -> StackResult<()> {
+    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Option<Arc<dyn StackContext>>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<TcpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tcp stack config"))?;
 
@@ -456,10 +456,16 @@ impl Stack for TcpStack {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "transparent unmatch"));
         }
 
-        let tcp_context = context.as_ref().as_any().downcast_ref::<TcpStackContext>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tcp stack context"))?;
+        let env = match context {
+            Some(context) => {
+                let tcp_context = context.as_ref().as_any().downcast_ref::<TcpStackContext>()
+                    .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tcp stack context"))?;
+                Arc::new(tcp_context.clone())
+            }
+            None => self.handler.read().unwrap().env.clone(),
+        };
 
-        let new_handler = TcpConnectionHandler::create(config.hook_point.clone(), Arc::new(tcp_context.clone())).await?;
+        let new_handler = TcpConnectionHandler::create(config.hook_point.clone(), env).await?;
 
         *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())

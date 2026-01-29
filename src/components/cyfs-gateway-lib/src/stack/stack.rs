@@ -67,9 +67,9 @@ pub trait Stack: Send + Sync + 'static {
     fn get_bind_addr(&self) -> String;
     async fn start(&self) -> StackResult<()>;
     async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {Ok(())}
-    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Arc<dyn StackContext>) -> StackResult<()> { Ok(()) }
-    async fn commit_update(&self) {}
-    async fn rollback_update(&self) {}
+    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Option<Arc<dyn StackContext>>) -> StackResult<()>;
+    async fn commit_update(&self);
+    async fn rollback_update(&self);
 }
 
 pub type StackRef = Arc<dyn Stack>;

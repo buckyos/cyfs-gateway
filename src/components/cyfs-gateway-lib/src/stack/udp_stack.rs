@@ -1186,7 +1186,7 @@ impl Stack for UdpStack {
         Ok(())
     }
 
-    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Arc<dyn StackContext>) -> StackResult<()> {
+    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Option<Arc<dyn StackContext>>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<UdpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid udp stack config"))?;
 
@@ -1202,11 +1202,18 @@ impl Stack for UdpStack {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "transparent unmatch"));
         }
 
-        let udp_context = context.as_ref().as_any().downcast_ref::<UdpStackContext>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid udp stack context"))?;
+        let env = match context {
+            Some(context) => {
+                let udp_context = context.as_ref().as_any().downcast_ref::<UdpStackContext>()
+                    .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid udp stack context"))?;
+                Arc::new(udp_context.clone())
+            }
+            None => self.inner.handler.read().unwrap().env.clone(),
+        };
+
         let new_handler = UdpDatagramHandler::create(
             config.hook_point.clone(),
-            Arc::new(udp_context.clone()),
+            env,
         ).await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())

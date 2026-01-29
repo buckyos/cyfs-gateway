@@ -614,7 +614,7 @@ impl Stack for RtcpStack {
         Ok(())
     }
 
-    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Arc<dyn StackContext>) -> StackResult<()> {
+    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Option<Arc<dyn StackContext>>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<RtcpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid rtcp stack config"))?;
 
@@ -626,9 +626,15 @@ impl Stack for RtcpStack {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
-        let rtcp_context = context.as_ref().as_any().downcast_ref::<RtcpStackContext>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid rtcp stack context"))?;
-        let handler = RtcpConnectionHandler::create(config.hook_point.clone(), Arc::new(rtcp_context.clone())).await?;
+        let env = match context {
+            Some(context) => {
+                let rtcp_context = context.as_ref().as_any().downcast_ref::<RtcpStackContext>()
+                    .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid rtcp stack context"))?;
+                Arc::new(rtcp_context.clone())
+            }
+            None => self.handler.read().unwrap().env.clone(),
+        };
+        let handler = RtcpConnectionHandler::create(config.hook_point.clone(), env).await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(handler));
         Ok(())
     }

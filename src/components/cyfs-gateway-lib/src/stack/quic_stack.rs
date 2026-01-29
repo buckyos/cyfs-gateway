@@ -1194,7 +1194,7 @@ impl Stack for QuicStack {
         Ok(())
     }
 
-    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Arc<dyn StackContext>) -> StackResult<()> {
+    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Option<Arc<dyn StackContext>>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<QuicStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid quic stack config"))?;
 
@@ -1206,11 +1206,18 @@ impl Stack for QuicStack {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
-        let quic_context = context.as_ref().as_any().downcast_ref::<QuicStackContext>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid quic stack context"))?;
+        let env = match context {
+            Some(context) => {
+                let quic_context = context.as_ref().as_any().downcast_ref::<QuicStackContext>()
+                    .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid quic stack context"))?;
+                Arc::new(quic_context.clone())
+            }
+            None => self.inner.handler.read().unwrap().env.clone(),
+        };
+
         let new_handler = QuicConnectionHandler::create(
             config.hook_point.clone(),
-            Arc::new(quic_context.clone()),
+            env,
             self.inner.connection_manager.clone(),
         ).await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
