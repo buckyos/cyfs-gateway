@@ -1,6 +1,6 @@
 use std::io::Error;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use buckyos_kit::AsyncStream;
 use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,362 @@ use cyfs_gateway_lib::*;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor, StreamRequest};
 
 pub const DEFAULT_MTU: u16 = 1500;
+
+#[derive(Clone)]
+pub struct TunStackContext {
+    pub servers: ServerManagerRef,
+    pub tunnel_manager: TunnelManager,
+    pub limiter_manager: LimiterManagerRef,
+    pub stat_manager: StatManagerRef,
+    pub global_process_chains: Option<GlobalProcessChainsRef>,
+    pub global_collection_manager: Option<GlobalCollectionManagerRef>,
+}
+
+impl TunStackContext {
+    pub fn new(
+        servers: ServerManagerRef,
+        tunnel_manager: TunnelManager,
+        limiter_manager: LimiterManagerRef,
+        stat_manager: StatManagerRef,
+        global_process_chains: Option<GlobalProcessChainsRef>,
+        global_collection_manager: Option<GlobalCollectionManagerRef>,
+    ) -> Self {
+        Self {
+            servers,
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            global_process_chains,
+            global_collection_manager,
+        }
+    }
+}
+
+impl StackContext for TunStackContext {
+    fn stack_protocol(&self) -> StackProtocol {
+        StackProtocol::Extension("tun".to_string())
+    }
+}
+
+struct TunConnectionHandler {
+    env: Arc<TunStackContext>,
+    executor: ProcessChainLibExecutor,
+}
+
+impl TunConnectionHandler {
+    async fn create(hook_point: ProcessChainConfigs, env: Arc<TunStackContext>) -> StackResult<Self> {
+        let (executor, _) = create_process_chain_executor(
+            &hook_point,
+            env.global_process_chains.clone(),
+            env.global_collection_manager.clone(),
+            Some(get_external_commands(env.servers.clone())),
+        )
+            .await
+            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        Ok(Self { env, executor })
+    }
+
+    async fn handle_tcp_stream(
+        &self,
+        mut stream: StatStream<IpStackTcpStream>,
+        stat: MutComposedSpeedStatRef,
+    ) -> StackResult<()> {
+        let executor = self.executor.fork();
+        let servers = self.env.servers.clone();
+        let remote_addr = stream.raw_stream().local_addr();
+        let dest_addr = stream.raw_stream().peer_addr();
+        let mut request = StreamRequest::new(Box::new(stream), dest_addr);
+        request.source_addr = Some(remote_addr);
+        request.dest_port = dest_addr.port();
+        request.app_protocol = Some("tcp".to_string());
+        let chain_env = executor.chain_env().clone();
+        let (ret, stream) = execute_stream_chain(executor, request)
+            .await
+            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        if ret.is_control() {
+            if ret.is_drop() {
+                return Ok(());
+            } else if ret.is_reject() {
+                return Ok(());
+            }
+
+            if let Some(CommandControl::Return(ret)) = ret.as_control() {
+                if let Some(list) = shlex::split(ret.value.as_str()) {
+                    if list.is_empty() {
+                        return Ok(());
+                    }
+
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
+                    let upper = if limiter_id.is_some() {
+                        self.env.limiter_manager.get_limiter(limiter_id.unwrap())
+                    } else {
+                        None
+                    };
+                    let limiter = if down_speed.is_some() && up_speed.is_some() {
+                        Some(Limiter::new(
+                            upper,
+                            Some(1),
+                            down_speed.map(|v| v as u32),
+                            up_speed.map(|v| v as u32),
+                        ))
+                    } else {
+                        upper
+                    };
+
+                    let stat_group_ids = get_stat_info(chain_env).await?;
+                    let speed_groups = self
+                        .env
+                        .stat_manager
+                        .get_speed_stats(stat_group_ids.as_slice());
+                    stat.set_external_stats(speed_groups);
+
+                    let cmd = list[0].as_str();
+                    match cmd {
+                        "forward" => {
+                            if list.len() < 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid forward command"
+                                ));
+                            }
+                            let target = list[1].as_str();
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) =
+                                    limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                stream
+                            };
+                            stream_forward(stream, target, &self.env.tunnel_manager).await?;
+                        }
+                        "server" => {
+                            if list.len() < 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid server command"
+                                ));
+                            }
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) =
+                                    limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                stream
+                            };
+
+                            let server_name = list[1].as_str();
+                            if let Some(server) = servers.get_server(server_name) {
+                                match server {
+                                    Server::Http(server) => {
+                                        hyper_serve_http(
+                                            stream,
+                                            server,
+                                            StreamInfo::new(remote_addr.to_string()),
+                                        )
+                                            .await
+                                            .map_err(into_stack_err!(
+                                                StackErrorCode::ServerError,
+                                                "server {server_name}"
+                                            ))?;
+                                    }
+                                    Server::Stream(server) => {
+                                        server
+                                            .serve_connection(
+                                                stream,
+                                                StreamInfo::new(remote_addr.to_string()),
+                                            )
+                                            .await
+                                            .map_err(into_stack_err!(
+                                                StackErrorCode::ServerError,
+                                                "server {server_name}"
+                                            ))?;
+                                    }
+                                    Server::QA(server) => {
+                                        serve_qa_from_stream(
+                                            Box::new(stream),
+                                            server,
+                                            StreamInfo::new(remote_addr.to_string()),
+                                        )
+                                            .await
+                                            .map_err(into_stack_err!(
+                                                StackErrorCode::ServerError,
+                                                "server {server_name}"
+                                            ))?;
+                                    }
+                                    _ => {
+                                        return Err(stack_err!(
+                                            StackErrorCode::InvalidConfig,
+                                            "unsupported server type {server_name}"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        v => {
+                            log::error!("unknown command: {}", v);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_udp_stream(
+        &self,
+        mut stream: StatStream<IpStackUdpStream>,
+        stat: MutComposedSpeedStatRef,
+    ) -> StackResult<()> {
+        let executor = self.executor.fork();
+        let servers = self.env.servers.clone();
+        let remote_addr = stream.raw_stream().local_addr();
+        let dest_addr = stream.raw_stream().peer_addr();
+
+        let map = MemoryMapCollection::new_ref();
+        map.insert("dest_addr", CollectionValue::String(dest_addr.to_string()))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_port", CollectionValue::String(dest_addr.port().to_string()))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_addr", CollectionValue::String(remote_addr.to_string()))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("app_protocol", CollectionValue::String("udp".to_string()))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+
+        let chain_env = executor.chain_env().clone();
+        let ret = execute_chain(executor, map)
+            .await
+            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+
+        if ret.is_control() {
+            if ret.is_drop() {
+                return Ok(());
+            } else if ret.is_reject() {
+                return Ok(());
+            }
+
+            if let Some(CommandControl::Return(ret)) = ret.as_control() {
+                if let Some(list) = shlex::split(ret.value.as_str()) {
+                    if list.is_empty() {
+                        return Ok(());
+                    }
+
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
+                    let upper = if limiter_id.is_some() {
+                        self.env.limiter_manager.get_limiter(limiter_id.unwrap())
+                    } else {
+                        None
+                    };
+                    let limiter = if down_speed.is_some() && up_speed.is_some() {
+                        Some(Limiter::new(
+                            upper,
+                            Some(1),
+                            down_speed.map(|v| v as u32),
+                            up_speed.map(|v| v as u32),
+                        ))
+                    } else {
+                        upper
+                    };
+
+                    let stat_group_ids = get_stat_info(chain_env).await?;
+                    let speed_groups = self
+                        .env
+                        .stat_manager
+                        .get_speed_stats(stat_group_ids.as_slice());
+                    stat.set_external_stats(speed_groups);
+
+                    let (read, send) = tokio::io::split(Box::new(stream) as Box<dyn AsyncStream>);
+                    let datagram_stream: Box<dyn DatagramClientBox> = if limiter.is_some() {
+                        let (read_limit, write_limit) =
+                            limiter.as_ref().unwrap().new_limit_session();
+                        Box::new(TunDatagramClient::new(
+                            LimitDatagramRecv::new(TunDatagramRecv::new(read), read_limit),
+                            LimitDatagramSend::new(TunDatagramSend::new(send), write_limit),
+                        ))
+                    } else {
+                        Box::new(TunDatagramClient::new(
+                            TunDatagramRecv::new(read),
+                            TunDatagramSend::new(send),
+                        ))
+                    };
+
+                    let cmd = list[0].as_str();
+                    match cmd {
+                        "forward" => {
+                            if list.len() < 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid forward command"
+                                ));
+                            }
+                            let target = list[1].as_str();
+                            datagram_forward(datagram_stream, target, &self.env.tunnel_manager)
+                                .await?;
+                        }
+                        "server" => {
+                            if list.len() < 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid server command"
+                                ));
+                            }
+
+                            let server_name = list[1].as_str();
+                            if let Some(server) = servers.get_server(server_name) {
+                                match server {
+                                    Server::Datagram(server) => {
+                                        let mut buf = vec![0; 4096];
+                                        loop {
+                                            let len = datagram_stream
+                                                .recv_datagram(&mut buf)
+                                                .await
+                                                .map_err(into_stack_err!(
+                                                    StackErrorCode::IoError,
+                                                    "recv datagram error"
+                                                ))?;
+                                            let resp = server
+                                                .serve_datagram(
+                                                    &buf[..len],
+                                                    DatagramInfo::new(Some(dest_addr.to_string())),
+                                                )
+                                                .await
+                                                .map_err(into_stack_err!(
+                                                    StackErrorCode::ServerError,
+                                                    "serve datagram error"
+                                                ))?;
+                                            datagram_stream
+                                                .send_datagram(resp.as_slice())
+                                                .await
+                                                .map_err(into_stack_err!(
+                                                    StackErrorCode::IoError,
+                                                    "send datagram error"
+                                                ))?;
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(stack_err!(
+                                            StackErrorCode::InvalidConfig,
+                                            "Unsupport server type"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        v => {
+                            log::error!("unknown command: {}", v);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 pub struct TunDatagramSend {
     send: WriteHalf<Box<dyn AsyncStream>>,
@@ -133,14 +489,29 @@ impl Stack for TunStack {
     }
 
     async fn start(&self) -> StackResult<()> {
+        {
+            if self.handle.lock().unwrap().is_some() {
+                return Ok(());
+            }
+        }
         let handle = self.inner.start().await?;
         *self.handle.lock().unwrap() = Some(handle);
         Ok(())
     }
 
-    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
-        let config = config.as_ref().as_any().downcast_ref::<TunStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tun stack config"))?;
+    async fn prepare_update(
+        &self,
+        config: Arc<dyn StackConfig>,
+        context: Option<Arc<dyn StackContext>>,
+    ) -> StackResult<()> {
+        let config = config
+            .as_ref()
+            .as_any()
+            .downcast_ref::<TunStackConfig>()
+            .ok_or(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid tun stack config"
+            ))?;
 
         if config.id != self.inner.id {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
@@ -150,13 +521,34 @@ impl Stack for TunStack {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
-        let (executor, _) = create_process_chain_executor(&config.hook_point,
-                                                          self.inner.global_process_chains.clone(),
-                                                          self.inner.global_collection_manager.clone(),
-                                                          Some(get_external_commands(self.inner.servers.clone()))).await
-            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
-        *self.inner.executor.lock().unwrap() = executor;
+        let env = match context {
+            Some(context) => {
+                let tun_context = context
+                    .as_ref()
+                    .as_any()
+                    .downcast_ref::<TunStackContext>()
+                    .ok_or(stack_err!(
+                        StackErrorCode::InvalidConfig,
+                        "invalid tun stack context"
+                    ))?;
+                Arc::new(tun_context.clone())
+            }
+            None => self.inner.handler.read().unwrap().env.clone(),
+        };
+
+        let new_handler = TunConnectionHandler::create(config.hook_point.clone(), env).await?;
+        *self.inner.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())
+    }
+
+    async fn commit_update(&self) {
+        if let Some(handler) = self.inner.prepare_handler.write().unwrap().take() {
+            *self.inner.handler.write().unwrap() = handler;
+        }
+    }
+
+    async fn rollback_update(&self) {
+        self.inner.prepare_handler.write().unwrap().take();
     }
 }
 
@@ -167,14 +559,9 @@ struct TunStackInner {
     mtu: u16,
     tcp_timeout: u64,
     udp_timeout: u64,
-    servers: ServerManagerRef,
-    executor: Arc<Mutex<ProcessChainLibExecutor>>,
+    handler: Arc<RwLock<Arc<TunConnectionHandler>>>,
+    prepare_handler: Arc<RwLock<Option<Arc<TunConnectionHandler>>>>,
     connection_manager: Option<ConnectionManagerRef>,
-    tunnel_manager: TunnelManager,
-    global_process_chains: Option<GlobalProcessChainsRef>,
-    limiter_manager: LimiterManagerRef,
-    stat_manager: StatManagerRef,
-    global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
 
 impl TunStackInner {
@@ -203,24 +590,13 @@ impl TunStackInner {
                 "hook_point is required"
             ));
         }
-        if builder.servers.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "servers is required"));
-        }
-        if builder.tunnel_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "tunnel_manager is required"));
-        }
-        if builder.limiter_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "limiter_manager is required"));
-        }
-        if builder.stat_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "stat_manager is required"));
+        if builder.stack_context.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "stack_context is required"));
         }
 
-        let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
-                                                          builder.global_process_chains.clone(),
-                                                          builder.global_collection_manager.clone(),
-                                                          Some(get_external_commands(builder.servers.clone().unwrap()))).await
-            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        let env = builder.stack_context.unwrap();
+        let handler = TunConnectionHandler::create(builder.hook_point.as_ref().unwrap().clone(), env)
+            .await?;
 
         Ok(Self {
             id: builder.id.unwrap(),
@@ -229,14 +605,9 @@ impl TunStackInner {
             mtu: builder.mtu.unwrap_or(DEFAULT_MTU),
             tcp_timeout: builder.tcp_timeout,
             udp_timeout: builder.udp_timeout,
-            servers: builder.servers.unwrap(),
-            executor: Arc::new(Mutex::new(executor)),
+            handler: Arc::new(RwLock::new(Arc::new(handler))),
+            prepare_handler: Arc::new(Default::default()),
             connection_manager: builder.connection_manager,
-            tunnel_manager: builder.tunnel_manager.unwrap(),
-            limiter_manager: builder.limiter_manager.unwrap(),
-            stat_manager: builder.stat_manager.unwrap(),
-            global_process_chains: builder.global_process_chains,
-            global_collection_manager: builder.global_collection_manager,
         })
     }
 
@@ -299,9 +670,15 @@ impl TunStackInner {
                                 let compose_stat = MutComposedSpeedStat::new();
                                 let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
                                 let speed = stat_stream.get_speed_stat();
-                                let stack = this.clone();
+                                let handler_snapshot = {
+                                    let handler = this.handler.read().unwrap();
+                                    handler.clone()
+                                };
                                 let handle = tokio::spawn(async move {
-                                    if let Err(e) = stack.on_new_tcp_stream(stat_stream, compose_stat).await {
+                                    if let Err(e) = handler_snapshot
+                                        .handle_tcp_stream(stat_stream, compose_stat)
+                                        .await
+                                    {
                                         log::error!("handle tcp stream error: {}", e);
                                     }
                                 });
@@ -320,9 +697,15 @@ impl TunStackInner {
                                 let compose_stat = MutComposedSpeedStat::new();
                                 let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
                                 let speed = stat_stream.get_speed_stat();
-                                let stack = this.clone();
+                                let handler_snapshot = {
+                                    let handler = this.handler.read().unwrap();
+                                    handler.clone()
+                                };
                                 let handle = tokio::spawn(async move {
-                                    if let Err(e) = stack.on_new_udp_stream(stat_stream, compose_stat).await {
+                                    if let Err(e) = handler_snapshot
+                                        .handle_udp_stream(stat_stream, compose_stat)
+                                        .await
+                                    {
                                         log::error!("handle udp stream error: {}", e);
                                     }
                                 });
@@ -356,232 +739,6 @@ impl TunStackInner {
         Ok(handle)
     }
 
-    async fn on_new_tcp_stream(&self, mut stream: StatStream<IpStackTcpStream>, stat: MutComposedSpeedStatRef) -> StackResult<()> {
-        let executor = {
-            self.executor.lock().unwrap().fork()
-        };
-        let servers = self.servers.clone();
-        let remote_addr = stream.raw_stream().local_addr();
-        let dest_addr = stream.raw_stream().peer_addr();
-        let mut request = StreamRequest::new(Box::new(stream), dest_addr);
-        request.source_addr = Some(remote_addr);
-        request.dest_port = dest_addr.port();
-        request.app_protocol = Some("tcp".to_string());
-        let chain_env = executor.chain_env().clone();
-        let (ret, stream) = execute_stream_chain(executor, request)
-            .await
-            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
-        if ret.is_control() {
-            if ret.is_drop() {
-                return Ok(());
-            } else if ret.is_reject() {
-                return Ok(());
-            }
-
-            if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret.value.as_str()) {
-                    if list.len() == 0 {
-                        return Ok(());
-                    }
-
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
-                    let upper = if limiter_id.is_some() {
-                        self.limiter_manager.get_limiter(limiter_id.unwrap())
-                    } else {
-                        None
-                    };
-                    let limiter = if down_speed.is_some() && up_speed.is_some() {
-                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
-                    } else {
-                        upper
-                    };
-
-                    let stat_group_ids = get_stat_info(chain_env).await?;
-                    let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
-                    stat.set_external_stats(speed_groups);
-
-                    let cmd = list[0].as_str();
-                    match cmd {
-                        "forward" => {
-                            if list.len() < 2 {
-                                return Err(stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid forward command"
-                                ));
-                            }
-                            let target = list[1].as_str();
-                            let stream = if limiter.is_some() {
-                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
-                                Box::new(limit_stream)
-                            } else {
-                                stream
-                            };
-                            stream_forward(stream, target, &self.tunnel_manager).await?;
-                        }
-                        "server" => {
-                            if list.len() < 2 {
-                                return Err(stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid server command"
-                                ));
-                            }
-                            let stream = if limiter.is_some() {
-                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
-                                Box::new(limit_stream)
-                            } else {
-                                stream
-                            };
-
-                            let server_name = list[1].as_str();
-                            if let Some(server) = servers.get_server(server_name) {
-                                match server {
-                                    Server::Http(server) => {
-                                        hyper_serve_http(stream, server, StreamInfo::new(remote_addr.to_string())).await
-                                            .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
-                                    }
-                                    Server::Stream(server) => {
-                                        server
-                                            .serve_connection(stream, StreamInfo::new(remote_addr.to_string()))
-                                            .await
-                                            .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
-                                    }
-                                    Server::QA(server) => {
-                                        serve_qa_from_stream(Box::new(stream), server, StreamInfo::new(remote_addr.to_string())).await
-                                            .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
-                                    }
-                                    _  => {
-                                        return Err(stack_err!(
-                                            StackErrorCode::InvalidConfig,
-                                            "unsupported server type {server_name}"
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        v => {
-                            log::error!("unknown command: {}", v);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn on_new_udp_stream(&self, mut stream: StatStream<IpStackUdpStream>, stat: MutComposedSpeedStatRef) -> StackResult<()> {
-        let executor = {
-            self.executor.lock().unwrap().fork()
-        };
-        let servers = self.servers.clone();
-        let remote_addr = stream.raw_stream().local_addr();
-        let dest_addr = stream.raw_stream().peer_addr();
-
-        let map = MemoryMapCollection::new_ref();
-        map.insert("dest_addr", CollectionValue::String(dest_addr.to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_port", CollectionValue::String(dest_addr.port().to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("app_protocol", CollectionValue::String("udp".to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-
-        let chain_env = executor.chain_env().clone();
-        let ret = execute_chain(executor, map).await
-            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
-
-        if ret.is_control() {
-            if ret.is_drop() {
-                return Ok(());
-            } else if ret.is_reject() {
-                return Ok(());
-            }
-
-            if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret.value.as_str()) {
-                    if list.len() == 0 {
-                        return Ok(());
-                    }
-
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
-                    let upper = if limiter_id.is_some() {
-                        self.limiter_manager.get_limiter(limiter_id.unwrap())
-                    } else {
-                        None
-                    };
-                    let limiter = if down_speed.is_some() && up_speed.is_some() {
-                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
-                    } else {
-                        upper
-                    };
-
-                    let stat_group_ids = get_stat_info(chain_env).await?;
-                    let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
-                    stat.set_external_stats(speed_groups);
-
-                    let (read, send) = tokio::io::split(Box::new(stream) as Box<dyn AsyncStream>);
-                    let datagram_stream: Box<dyn DatagramClientBox> = if limiter.is_some() {
-                        let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                        Box::new(TunDatagramClient::new(LimitDatagramRecv::new(TunDatagramRecv::new(read), read_limit),
-                                                        LimitDatagramSend::new(TunDatagramSend::new(send), write_limit), ))
-                    } else {
-                        Box::new(TunDatagramClient::new(TunDatagramRecv::new(read), TunDatagramSend::new(send)))
-                    };
-
-                    let cmd = list[0].as_str();
-                    match cmd {
-                        "forward" => {
-                            if list.len() < 2 {
-                                return Err(stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid forward command"
-                                ));
-                            }
-                            let target = list[1].as_str();
-                            datagram_forward(datagram_stream, target, &self.tunnel_manager).await?;
-                        }
-                        "server" => {
-                            if list.len() < 2 {
-                                return Err(stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid server command"
-                                ));
-                            }
-
-                            let server_name = list[1].as_str();
-                            if let Some(server) = servers.get_server(server_name) {
-                                match server {
-                                    Server::Datagram(server) => {
-                                        let mut buf = vec![0; 4096];
-                                        loop {
-                                            let len = datagram_stream.recv_datagram(&mut buf).await
-                                                .map_err(into_stack_err!(StackErrorCode::IoError, "recv datagram error"))?;
-                                            let resp = server.serve_datagram(&buf[..len], DatagramInfo::new(Some(dest_addr.to_string()))).await
-                                                .map_err(into_stack_err!(StackErrorCode::ServerError, "serve datagram error"))?;
-                                            datagram_stream.send_datagram(resp.as_slice()).await
-                                                .map_err(into_stack_err!(StackErrorCode::IoError, "send datagram error"))?;
-                                        }
-                                    }
-                                    _ => {
-                                        return Err(stack_err!(
-                                            StackErrorCode::InvalidConfig,
-                                            "Unsupport server type"
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        v => {
-                            log::error!("unknown command: {}", v);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 pub struct TunStackBuilder {
@@ -592,13 +749,8 @@ pub struct TunStackBuilder {
     tcp_timeout: u64,
     udp_timeout: u64,
     hook_point: Option<ProcessChainConfigs>,
-    servers: Option<ServerManagerRef>,
-    global_process_chains: Option<GlobalProcessChainsRef>,
     connection_manager: Option<ConnectionManagerRef>,
-    tunnel_manager: Option<TunnelManager>,
-    limiter_manager: Option<LimiterManagerRef>,
-    stat_manager: Option<StatManagerRef>,
-    global_collection_manager: Option<GlobalCollectionManagerRef>,
+    stack_context: Option<Arc<TunStackContext>>,
 }
 
 impl TunStackBuilder {
@@ -611,13 +763,8 @@ impl TunStackBuilder {
             tcp_timeout: 60,
             udp_timeout: 60,
             hook_point: None,
-            servers: None,
-            global_process_chains: None,
             connection_manager: None,
-            tunnel_manager: None,
-            limiter_manager: None,
-            stat_manager: None,
-            global_collection_manager: None,
+            stack_context: None,
         }
     }
 
@@ -656,38 +803,13 @@ impl TunStackBuilder {
         self
     }
 
-    pub fn servers(mut self, servers: ServerManagerRef) -> Self {
-        self.servers = Some(servers);
-        self
-    }
-
-    pub fn global_process_chains(mut self, global_process_chains: GlobalProcessChainsRef) -> Self {
-        self.global_process_chains = Some(global_process_chains);
-        self
-    }
-
     pub fn connection_manager(mut self, connection_manager: ConnectionManagerRef) -> Self {
         self.connection_manager = Some(connection_manager);
         self
     }
 
-    pub fn tunnel_manager(mut self, tunnel_manager: TunnelManager) -> Self {
-        self.tunnel_manager = Some(tunnel_manager);
-        self
-    }
-
-    pub fn limiter_manager(mut self, limiter_manager: LimiterManagerRef) -> Self {
-        self.limiter_manager = Some(limiter_manager);
-        self
-    }
-
-    pub fn stat_manager(mut self, stat_manager: StatManagerRef) -> Self {
-        self.stat_manager = Some(stat_manager);
-        self
-    }
-
-    pub fn global_collection_manager(mut self, collection_manager: GlobalCollectionManagerRef) -> Self {
-        self.global_collection_manager = Some(collection_manager);
+    pub fn stack_context(mut self, stack_context: Arc<TunStackContext>) -> Self {
+        self.stack_context = Some(stack_context);
         self
     }
     
@@ -778,6 +900,15 @@ impl StackFactory for TunStackFactory {
             .downcast_ref::<TunStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tun stack config"))?;
 
+        let stack_context = Arc::new(TunStackContext::new(
+            self.servers.clone(),
+            self.tunnel_manager.clone(),
+            self.limiter_manager.clone(),
+            self.stat_manager.clone(),
+            Some(self.global_process_chains.clone()),
+            Some(self.global_collection_manager.clone()),
+        ));
+
         let stack = TunStack::builder()
             .id(config.id.clone())
             .ip(config.bind)
@@ -786,13 +917,8 @@ impl StackFactory for TunStackFactory {
             .tcp_timeout(config.tcp_timeout.unwrap_or(60))
             .udp_timeout(config.udp_timeout.unwrap_or(60))
             .hook_point(config.hook_point.clone())
-            .servers(self.servers.clone())
-            .global_process_chains(self.global_process_chains.clone())
             .connection_manager(self.connection_manager.clone())
-            .tunnel_manager(self.tunnel_manager.clone())
-            .limiter_manager(self.limiter_manager.clone())
-            .stat_manager(self.stat_manager.clone())
-            .global_collection_manager(self.global_collection_manager.clone())
+            .stack_context(stack_context)
             .build().await?;
         Ok(Arc::new(stack))
     }
