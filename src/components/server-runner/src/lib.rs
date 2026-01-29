@@ -50,7 +50,7 @@ impl HttpServer for Router {
         for (prefix, server) in routes {
             debug!("try match router: {}", prefix);
             if path.starts_with(&prefix) {
-                info!(" {} match router: {}",path, prefix);
+                debug!(" {} match router: {}",path, prefix);
                 // // Calculate new path by stripping prefix
                 // let new_path = if prefix == "/" {
                 //     path.clone()
