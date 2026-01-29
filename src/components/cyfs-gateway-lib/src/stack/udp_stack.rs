@@ -5,7 +5,7 @@ use std::ops::Div;
 use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration};
 use local_ip_address::list_afinet_netifas;
 use serde::{Deserialize, Serialize};
@@ -15,12 +15,433 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, get_min_priority, DatagramInfo, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, get_external_commands, GlobalCollectionManagerRef};
+use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackContext, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, get_min_priority, DatagramInfo, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, get_external_commands, GlobalCollectionManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 #[cfg(target_os = "linux")]
 use crate::stack::{has_root_privileges, recv_from, set_socket_opt};
 use crate::stack::get_limit_info;
+
+#[derive(Clone)]
+pub struct UdpStackContext {
+    pub servers: ServerManagerRef,
+    pub tunnel_manager: TunnelManager,
+    pub limiter_manager: LimiterManagerRef,
+    pub stat_manager: StatManagerRef,
+    pub global_process_chains: Option<GlobalProcessChainsRef>,
+    pub global_collection_manager: Option<GlobalCollectionManagerRef>,
+}
+
+impl UdpStackContext {
+    pub fn new(
+        servers: ServerManagerRef,
+        tunnel_manager: TunnelManager,
+        limiter_manager: LimiterManagerRef,
+        stat_manager: StatManagerRef,
+        global_process_chains: Option<GlobalProcessChainsRef>,
+        global_collection_manager: Option<GlobalCollectionManagerRef>,
+    ) -> Self {
+        Self {
+            servers,
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            global_process_chains,
+            global_collection_manager,
+        }
+    }
+}
+
+impl StackContext for UdpStackContext {
+    fn stack_protocol(&self) -> StackProtocol {
+        StackProtocol::Udp
+    }
+}
+
+struct UdpDatagramHandler {
+    env: Arc<UdpStackContext>,
+    executor: ProcessChainLibExecutor,
+}
+
+impl UdpDatagramHandler {
+    async fn create(
+        hook_point: ProcessChainConfigs,
+        env: Arc<UdpStackContext>,
+    ) -> StackResult<Self> {
+        let (executor, _) = create_process_chain_executor(
+            &hook_point,
+            env.global_process_chains.clone(),
+            env.global_collection_manager.clone(),
+            Some(get_external_commands(env.servers.clone())),
+        )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create process chain executor error: {}", e))?;
+        Ok(Self {
+            env,
+            executor,
+        })
+    }
+
+    async fn handle_datagram(
+        &self,
+        state: &UdpStackInner,
+        udp_socket: Arc<UdpSocket>,
+        src_addr: SocketAddr,
+        dest_addr: SocketAddr,
+        data: Vec<u8>,
+        len: usize,
+    ) -> StackResult<()> {
+        let session_key = SessionKey::new(src_addr, dest_addr);
+        let client_session = {
+            let mut all_sessions = state.all_client_session.lock().unwrap();
+            let client_session = all_sessions.get(&session_key);
+            if client_session.is_none() {
+                let client_session = Arc::new(tokio::sync::Mutex::new(None));
+                all_sessions.insert(session_key, client_session.clone());
+            }
+            let client_session = all_sessions.get(&session_key);
+            let client_session = client_session.unwrap();
+            client_session.clone()
+        };
+
+        let mut session_guard = client_session.lock().await;
+        if session_guard.is_some() {
+            let client_session = session_guard.as_mut().unwrap();
+            match client_session {
+                DatagramSession::Forward(forward_session) => {
+                    if let Err(e) = forward_session.client.send_to(&data[..len]).await {
+                        log::error!("send datagram error: {}", e);
+                        *session_guard = None;
+                    } else {
+                        forward_session.latest_time = chrono::Utc::now().timestamp() as u64;
+                        forward_session.speed_stat.add_read_data_size(len as u64);
+                    }
+                }
+                DatagramSession::Server(server_session) => {
+                    if server_session.send_handle.is_some() {
+                        let is_finished = server_session.send_handle.as_ref().unwrap().is_finished();
+                        if is_finished {
+                            *session_guard = None;
+                        } else {
+                            match server_session.send_datagram.as_mut().unwrap().send_to(&data[..len]).await {
+                                Ok(_) => {
+                                    server_session.latest_time = chrono::Utc::now().timestamp() as u64;
+                                }
+                                Err(e) => {
+                                    log::error!("send datagram error: {}", e);
+                                    *session_guard = None;
+                                }
+                            }
+                        }
+                    } else {
+                        if let Some(server) = self.env.servers.get_server(&server_session.server) {
+                            if let Server::Datagram(server) = server {
+                                match server.serve_datagram(&data[..len], DatagramInfo::new(Some(src_addr.to_string()))).await {
+                                    Ok(resp) => {
+                                        if let Err(e) = udp_socket.send_to(resp.as_slice(), &src_addr).await {
+                                            log::error!("send datagram error: {}", e);
+                                            *session_guard = None;
+                                        } else {
+                                            server_session.latest_time = chrono::Utc::now().timestamp() as u64;
+                                            server_session.speed_stat.add_read_data_size(len as u64);
+                                            server_session.speed_stat.add_write_data_size(resp.len() as u64);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!("send datagram error: {}", e);
+                                        *session_guard = None;
+                                    }
+                                }
+                            } else {
+                                return Err(stack_err!(StackErrorCode::InvalidConfig, "Unsupport server type"));
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        log::info!("new udp session: {} -> {}", src_addr, dest_addr);
+        let executor = self.executor.fork();
+        let global_env = executor.global_env();
+        let map = MemoryMapCollection::new_ref();
+        map.insert("source_addr", CollectionValue::String(src_addr.to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_addr error: {}", e))?;
+
+        map.insert("dest_addr", CollectionValue::String(dest_addr.to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_addr error: {}", e))?;
+
+        global_env.create("REQ", CollectionValue::Map(map)).await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create chain env error: {}", e))?;
+
+        let chain_env = global_env.clone();
+        let ret = executor.execute_lib().await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "execute chain error: {}", e))?;
+        if ret.is_control() {
+            if ret.is_drop() {
+                return Ok(());
+            } else if ret.is_reject() {
+                return Ok(());
+            }
+            if let Some(CommandControl::Return(ret)) = ret.as_control() {
+                if let Some(list) = shlex::split(ret.value.as_str()) {
+                    if list.is_empty() {
+                        return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid forward command"
+                                ));
+                    }
+
+                    let udp_socket = if state.is_local_ip(&dest_addr.ip()) {
+                        udp_socket.clone()
+                    } else {
+                        state.socket_cache.get_socket(dest_addr).await?
+                    };
+
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
+                    let upper = if limiter_id.is_some() {
+                        self.env.limiter_manager.get_limiter(limiter_id.unwrap())
+                    } else {
+                        None
+                    };
+                    let limiter = if down_speed.is_some() && up_speed.is_some() {
+                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
+                    } else {
+                        upper
+                    };
+
+                    let stat_group_ids = get_stat_info(chain_env).await?;
+                    let speed_groups = self.env.stat_manager.get_speed_stats(stat_group_ids.as_slice());
+                    let speed_stat = ComposedSpeedStat::new(speed_groups);
+
+                    let cmd = list[0].as_str();
+                    match cmd {
+                        "forward" => {
+                            if list.len() < 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid server command"
+                                ));
+                            }
+
+                            let target = list[1].as_str();
+                            let url = Url::parse(target).map_err(into_stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid forward url {}",
+                                    target
+                                ))?;
+                            let forward = self.env.tunnel_manager
+                                .create_datagram_client_by_url(&url)
+                                .await.map_err(into_stack_err!(StackErrorCode::TunnelError))?;
+                            forward.send_datagram(&data[..len]).await.map_err(|e| {
+                                println!("send datagram error: {}", e);
+                                stack_err!(StackErrorCode::TunnelError)
+                            })?;
+                            speed_stat.add_read_data_size(len as u64);
+
+                            let forward_recv = forward.clone();
+                            let stat = speed_stat.clone();
+                            let notify = Arc::new(Notify::new());
+                            let is_limit = true;
+                            if is_limit {
+                                let (sender, receive) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+                                let send_datagram = Box::new(ChannelDatagram::new(sender));
+                                let mut receive_datagram: Box<dyn Datagram<Error=StackError>> = if limiter.is_some() {
+                                    let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                    let receive_datagram = LimitDatagram::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive), read_limit, write_limit);
+                                    Box::new(receive_datagram)
+                                } else {
+                                    Box::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive))
+                                };
+                                let stat = speed_stat.clone();
+                                let send_handle = tokio::spawn(async move {
+                                    let mut buffer = vec![0u8; 1024 * 4];
+                                    loop {
+                                        match receive_datagram.recv_from(&mut buffer).await {
+                                            Ok(len) => {
+                                                match forward.send_datagram(&buffer[0..len]).await {
+                                                    Ok(_) => {
+                                                        stat.add_read_data_size(len as u64);
+                                                    }
+                                                    Err(e) => {
+                                                        log::error!("send datagram error: {}", e);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                log::error!("accept error: {}", e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+
+                                let stat = speed_stat.clone();
+                                let mut receive_forward_datagram: Box<dyn Datagram<Error=StackError>> = if limiter.is_some() {
+                                    let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                    let datagram = LimitDatagram::new(UdpSendDatagram::new(udp_socket.clone(), src_addr), read_limit, write_limit);
+                                    Box::new(datagram)
+                                } else {
+                                    Box::new(UdpSendDatagram::new(udp_socket.clone(), src_addr))
+                                };
+                                let handle = tokio::spawn(async move {
+                                    let mut buffer = vec![0u8; 1024 * 4];
+                                    loop {
+                                        let len = match forward_recv
+                                            .recv_datagram(&mut buffer)
+                                            .await
+                                        {
+                                            Ok(pair) => pair,
+                                            Err(err) => {
+                                                log::error!("accept error: {}", err);
+                                                break;
+                                            }
+                                        };
+                                        if let Err(e) = receive_forward_datagram
+                                            .send_to(&buffer[0..len])
+                                            .await
+                                        {
+                                            log::error!("send datagram error: {}", e);
+                                            break;
+                                        }
+                                        stat.add_write_data_size(len as u64);
+                                    }
+                                });
+
+                                *session_guard = Some(DatagramSession::Forward(DatagramForwardSession {
+                                    client: send_datagram,
+                                    latest_time: chrono::Utc::now().timestamp() as u64,
+                                    receive_handle: Some(handle),
+                                    notify: notify.clone(),
+                                    speed_stat: speed_stat.clone(),
+                                    send_handle: Some(send_handle),
+                                }));
+                            } else {
+                                let handle = tokio::spawn(async move {
+                                    let mut buffer = vec![0u8; 1024 * 4];
+                                    loop {
+                                        let len = match forward_recv
+                                            .recv_datagram(&mut buffer)
+                                            .await
+                                        {
+                                            Ok(pair) => pair,
+                                            Err(err) => {
+                                                log::error!("accept error: {}", err);
+                                                break;
+                                            }
+                                        };
+                                        if let Err(e) = udp_socket
+                                            .send_to(&buffer[0..len], src_addr)
+                                            .await
+                                        {
+                                            log::error!("send datagram error: {}", e);
+                                            break;
+                                        }
+                                        stat.add_write_data_size(len as u64);
+                                    }
+                                });
+
+                                *session_guard = Some(DatagramSession::Forward(DatagramForwardSession {
+                                    client: Box::new(ClientDatagram::new(forward)),
+                                    latest_time: chrono::Utc::now().timestamp() as u64,
+                                    receive_handle: Some(handle),
+                                    notify: notify.clone(),
+                                    speed_stat: speed_stat.clone(),
+                                    send_handle: None,
+                                }));
+                            }
+                            if let Some(connection_manager) = state.connection_manager.as_ref() {
+                                let controller = UdpSessionController::new(session_key, state.all_client_session.clone(), notify);
+                                connection_manager.add_connection(ConnectionInfo::new(src_addr.to_string(), target.to_string(), StackProtocol::Udp, speed_stat, controller));
+                            }
+                        }
+                        "server" => {
+                            if list.len() < 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid server command"
+                                ));
+                            }
+                            let server_name = list[1].to_string();
+                            if let Some(server) = self.env.servers.get_server(server_name.as_str()) {
+                                if let Server::Datagram(server) = server {
+                                    let notify = Arc::new(Notify::new());
+                                    let is_limit = true;
+                                    let name = server_name.clone();
+                                    if is_limit {
+                                        let (sender, receive) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+                                        let mut send_datagram = Box::new(ChannelDatagram::new(sender));
+                                        let mut receive_datagram: Box<dyn Datagram<Error=StackError>> = if limiter.is_some() {
+                                            let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                            Box::new(LimitDatagram::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive), read_limit, write_limit))
+                                        } else {
+                                            Box::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive))
+                                        };
+                                        let stat = speed_stat.clone();
+                                        let servers = self.env.servers.clone();
+                                        let handle = tokio::spawn(async move {
+                                            let mut buffer = vec![0u8; 1024 * 4];
+                                            loop {
+                                                match receive_datagram.recv_from(&mut buffer).await {
+                                                    Ok(len) => {
+                                                        if let Some(server) = servers.get_server(name.as_str()) {
+                                                            if let Server::Datagram(server) = server {
+                                                                let buf = match server.serve_datagram(&buffer[0..len],
+                                                                                                      DatagramInfo::new(Some(src_addr.to_string()))).await {
+                                                                    Ok(buf) => buf,
+                                                                    Err(e) => {
+                                                                        log::error!("server error: {}", e);
+                                                                        break;
+                                                                    }
+                                                                };
+                                                                if let Err(e) = udp_socket.send_to(buf.as_slice(), src_addr).await {
+                                                                    log::error!("send datagram error: {}", e);
+                                                                    break;
+                                                                }
+                                                                stat.add_read_data_size(len as u64);
+                                                                stat.add_write_data_size(buf.len() as u64);
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        log::error!("accept error: {}", e);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        send_datagram.send_to(&data[..len]).await?;
+
+                                        *session_guard = Some(DatagramSession::Server(DatagramServerSession {
+                                            server: server_name.clone(),
+                                            latest_time: chrono::Utc::now().timestamp() as u64,
+                                            notify: notify.clone(),
+                                            speed_stat: speed_stat.clone(),
+                                            send_handle: Some(handle),
+                                            send_datagram: Some(send_datagram),
+                                        }));
+                                    }
+                                    if let Some(connection_manager) = state.connection_manager.as_ref() {
+                                        let controller = UdpSessionController::new(session_key, state.all_client_session.clone(), notify);
+                                        connection_manager.add_connection(ConnectionInfo::new(src_addr.to_string(), server_name.to_string(), StackProtocol::Udp, speed_stat, controller));
+                                    }
+                                } else {
+                                    return Err(stack_err!(StackErrorCode::InvalidConfig, "invalid server command"));
+                                }
+                            }
+                        }
+                        v => {
+                            log::error!("invalid command: {}", v);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 pub struct UdpSendDatagram {
     socket: Arc<UdpSocket>,
@@ -363,67 +784,35 @@ struct UdpStackInner {
     bind_addr: String,
     concurrency: u32,
     session_idle_time: Duration,
-    servers: ServerManagerRef,
-    executor: Arc<Mutex<ProcessChainLibExecutor>>,
     all_client_session: DatagramClientSessionMap,
     connection_manager: Option<ConnectionManagerRef>,
-    tunnel_manager: TunnelManager,
-    global_process_chains: Option<GlobalProcessChainsRef>,
-    limiter_manager: LimiterManagerRef,
-    stat_manager: StatManagerRef,
     transparent: bool,
     local_ips: Vec<IpAddr>,
     socket_cache: SocketCache,
-    global_collection_manager: Option<GlobalCollectionManagerRef>,
+    handler: Arc<RwLock<Arc<UdpDatagramHandler>>>,
 }
 
 impl UdpStackInner {
-    async fn create(builder: UdpStackBuilder) -> StackResult<Self> {
+    async fn create(builder: UdpStackBuilder, handler: Arc<RwLock<Arc<UdpDatagramHandler>>>) -> StackResult<Self> {
         if builder.id.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id is required"));
         }
         if builder.bind.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "bind is required"));
         }
-        if builder.servers.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "servers is required"));
-        }
-        if builder.hook_point.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "hook_point is required"));
-        }
-        if builder.tunnel_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "tunnel_manager is required"));
-        }
-        if builder.limiter_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "limiter_manager is required"));
-        }
-        if builder.stat_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "stat_manager is required"));
-        }
 
-        let (executor, _) = create_process_chain_executor(&builder.hook_point.unwrap(),
-                                                          builder.global_process_chains.clone(),
-                                                          builder.global_collection_manager.clone(),
-                                                          Some(get_external_commands(builder.servers.clone().unwrap()))).await
-            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create process chain executor error: {}", e))?;
         let local_ips = Self::local_ips()?;
         Ok(Self {
             id: builder.id.unwrap(),
             bind_addr: builder.bind.unwrap(),
             concurrency: builder.concurrency,
             session_idle_time: builder.session_idle_time,
-            servers: builder.servers.unwrap(),
-            executor: Arc::new(Mutex::new(executor)),
             all_client_session: Arc::new(Mutex::new(BTreeMap::new())),
             connection_manager: builder.connection_manager,
-            tunnel_manager: builder.tunnel_manager.unwrap(),
-            global_process_chains: builder.global_process_chains,
-            limiter_manager: builder.limiter_manager.unwrap(),
-            stat_manager: builder.stat_manager.unwrap(),
             transparent: builder.transparent,
             local_ips,
             socket_cache: SocketCache::new(),
-            global_collection_manager: builder.global_collection_manager,
+            handler,
         })
     }
 
@@ -446,376 +835,13 @@ impl UdpStackInner {
     }
 
     async fn handle_datagram(&self, udp_socket: Arc<UdpSocket>, src_addr: SocketAddr, dest_addr: SocketAddr, data: Vec<u8>, len: usize) -> StackResult<()> {
-        let session_key = SessionKey::new(src_addr, dest_addr);
-        let client_session = {
-            let mut all_sessions = self.all_client_session.lock().unwrap();
-            let client_session = all_sessions.get(&session_key);
-            if client_session.is_none() {
-                let client_session = Arc::new(tokio::sync::Mutex::new(None));
-                all_sessions.insert(session_key, client_session.clone());
-            }
-            let client_session = all_sessions.get(&session_key);
-            let client_session = client_session.unwrap();
-            client_session.clone()
+        let handler_snapshot = {
+            let handler = self.handler.read().unwrap();
+            handler.clone()
         };
-
-        let mut session_guard = client_session.lock().await;
-        if session_guard.is_some() {
-            let client_session = session_guard.as_mut().unwrap();
-            match client_session {
-                DatagramSession::Forward(forward_session) => {
-                    if let Err(e) = forward_session.client.send_to(&data[..len]).await {
-                        log::error!("send datagram error: {}", e);
-                        *session_guard = None;
-                    } else {
-                        forward_session.latest_time = chrono::Utc::now().timestamp() as u64;
-                        forward_session.speed_stat.add_read_data_size(len as u64);
-                    }
-                }
-                DatagramSession::Server(server_session) => {
-                    if server_session.send_handle.is_some() {
-                        let is_finished = server_session.send_handle.as_ref().unwrap().is_finished();
-                        if is_finished {
-                            *session_guard = None;
-                        } else {
-                            match server_session.send_datagram.as_mut().unwrap().send_to(&data[..len]).await {
-                                Ok(_) => {
-                                    server_session.latest_time = chrono::Utc::now().timestamp() as u64;
-                                }
-                                Err(e) => {
-                                    log::error!("send datagram error: {}", e);
-                                    *session_guard = None;
-                                }
-                            }
-                        }
-                    } else {
-                        if let Some(server) = self.servers.get_server(&server_session.server) {
-                            if let Server::Datagram(server) = server {
-                                match server.serve_datagram(&data[..len], DatagramInfo::new(Some(src_addr.to_string()))).await {
-                                    Ok(resp) => {
-                                        if let Err(e) = udp_socket.send_to(resp.as_slice(), &src_addr).await {
-                                            log::error!("send datagram error: {}", e);
-                                            *session_guard = None;
-                                        } else {
-                                            server_session.latest_time = chrono::Utc::now().timestamp() as u64;
-                                            server_session.speed_stat.add_read_data_size(len as u64);
-                                            server_session.speed_stat.add_write_data_size(resp.len() as u64);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!("send datagram error: {}", e);
-                                        *session_guard = None;
-                                    }
-                                }
-                            } else {
-                                return Err(stack_err!(StackErrorCode::InvalidConfig, "Unsupport server type"));
-                            }
-                        }
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        log::info!("new udp session: {} -> {}", src_addr, dest_addr);
-        let executor = { self.executor.lock().unwrap().fork() };
-        let global_env = executor.global_env();
-        let map = MemoryMapCollection::new_ref();
-        map.insert("source_addr", CollectionValue::String(src_addr.to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_addr error: {}", e))?;
-
-        map.insert("dest_addr", CollectionValue::String(dest_addr.to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_addr error: {}", e))?;
-
-        global_env.create("REQ", CollectionValue::Map(map)).await
-            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create chain env error: {}", e))?;
-
-        let chain_env = global_env.clone();
-        let ret = executor.execute_lib().await
-            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "execute chain error: {}", e))?;
-        if ret.is_control() {
-            if ret.is_drop() {
-                return Ok(());
-            } else if ret.is_reject() {
-                return Ok(());
-            }
-            if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret.value.as_str()) {
-                    if list.len() == 0 {
-                        return Err(stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid forward command"
-                                ));
-                    }
-
-                    let udp_socket = if self.is_local_ip(&dest_addr.ip()) {
-                        udp_socket.clone()
-                    } else {
-                        self.socket_cache.get_socket(dest_addr).await?
-                    };
-
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
-                    let upper = if limiter_id.is_some() {
-                        self.limiter_manager.get_limiter(limiter_id.unwrap())
-                    } else {
-                        None
-                    };
-                    let limiter = if down_speed.is_some() && up_speed.is_some() {
-                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
-                    } else {
-                        upper
-                    };
-
-                    let stat_group_ids = get_stat_info(chain_env).await?;
-                    let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
-                    let speed_stat = ComposedSpeedStat::new(speed_groups);
-
-                    let cmd = list[0].as_str();
-                    match cmd {
-                        "forward" => {
-                            if list.len() < 2 {
-                                return Err(stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid server command"
-                                ));
-                            }
-
-                            let target = list[1].as_str();
-                            let url = Url::parse(target).map_err(into_stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid forward url {}",
-                                    target
-                                ))?;
-                            let forward = self.tunnel_manager
-                                .create_datagram_client_by_url(&url)
-                                .await.map_err(into_stack_err!(StackErrorCode::TunnelError))?;
-                            // forward.send_datagram(data).await.map_err(into_stack_err!(StackErrorCode::TunnelError))?;
-                            forward.send_datagram(&data[..len]).await.map_err(|e| {
-                                println!("send datagram error: {}", e);
-                                stack_err!(StackErrorCode::TunnelError)
-                            })?;
-                            speed_stat.add_read_data_size(len as u64);
-
-                            let forward_recv = forward.clone();
-                            let stat = speed_stat.clone();
-                            let notify = Arc::new(Notify::new());
-                            let is_limit = true;
-                            if is_limit {
-                                let (sender, receive) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
-                                let send_datagram = Box::new(ChannelDatagram::new(sender));
-                                let mut receive_datagram: Box<dyn Datagram<Error=StackError>> = if limiter.is_some() {
-                                    let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                    let receive_datagram = LimitDatagram::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive), read_limit, write_limit);
-                                    Box::new(receive_datagram)
-                                } else {
-                                    Box::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive))
-                                };
-                                let stat = speed_stat.clone();
-                                let send_handle = tokio::spawn(async move {
-                                    let mut buffer = vec![0u8; 1024 * 4];
-                                    loop {
-                                        match receive_datagram.recv_from(&mut buffer).await {
-                                            Ok(len) => {
-                                                match forward.send_datagram(&buffer[0..len]).await {
-                                                    Ok(_) => {
-                                                        stat.add_read_data_size(len as u64);
-                                                    }
-                                                    Err(e) => {
-                                                        log::error!("send datagram error: {}", e);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                log::error!("accept error: {}", e);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                });
-
-                                let stat = speed_stat.clone();
-                                let mut receive_forward_datagram: Box<dyn Datagram<Error=StackError>> = if limiter.is_some() {
-                                    let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                    let datagram = LimitDatagram::new(UdpSendDatagram::new(udp_socket.clone(), src_addr), read_limit, write_limit);
-                                    Box::new(datagram)
-                                } else {
-                                    Box::new(UdpSendDatagram::new(udp_socket.clone(), src_addr))
-                                };
-                                let handle = tokio::spawn(async move {
-                                    let mut buffer = vec![0u8; 1024 * 4];
-                                    loop {
-                                        let len = match forward_recv
-                                            .recv_datagram(&mut buffer)
-                                            .await
-                                        {
-                                            Ok(pair) => pair,
-                                            Err(err) => {
-                                                log::error!("accept error: {}", err);
-                                                break;
-                                            }
-                                        };
-                                        if let Err(e) = receive_forward_datagram
-                                            .send_to(&buffer[0..len])
-                                            .await
-                                        {
-                                            log::error!("send datagram error: {}", e);
-                                            break;
-                                        }
-                                        stat.add_write_data_size(len as u64);
-                                    }
-                                });
-
-                                *session_guard = Some(DatagramSession::Forward(DatagramForwardSession {
-                                    client: send_datagram,
-                                    latest_time: chrono::Utc::now().timestamp() as u64,
-                                    receive_handle: Some(handle),
-                                    notify: notify.clone(),
-                                    speed_stat: speed_stat.clone(),
-                                    send_handle: Some(send_handle),
-                                }));
-                            } else {
-                                let handle = tokio::spawn(async move {
-                                    let mut buffer = vec![0u8; 1024 * 4];
-                                    loop {
-                                        let len = match forward_recv
-                                            .recv_datagram(&mut buffer)
-                                            .await
-                                        {
-                                            Ok(pair) => pair,
-                                            Err(err) => {
-                                                log::error!("accept error: {}", err);
-                                                break;
-                                            }
-                                        };
-                                        if let Err(e) = udp_socket
-                                            .send_to(&buffer[0..len], src_addr)
-                                            .await
-                                        {
-                                            log::error!("send datagram error: {}", e);
-                                            break;
-                                        }
-                                        stat.add_write_data_size(len as u64);
-                                    }
-                                });
-
-                                *session_guard = Some(DatagramSession::Forward(DatagramForwardSession {
-                                    client: Box::new(ClientDatagram::new(forward)),
-                                    latest_time: chrono::Utc::now().timestamp() as u64,
-                                    receive_handle: Some(handle),
-                                    notify: notify.clone(),
-                                    speed_stat: speed_stat.clone(),
-                                    send_handle: None,
-                                }));
-                            }
-                            if let Some(connection_manager) = self.connection_manager.as_ref() {
-                                let controller = UdpSessionController::new(session_key, self.all_client_session.clone(), notify);
-                                connection_manager.add_connection(ConnectionInfo::new(src_addr.to_string(), target.to_string(), StackProtocol::Udp, speed_stat, controller));
-                            }
-                        }
-                        "server" => {
-                            if list.len() < 2 {
-                                return Err(stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid server command"
-                                ));
-                            }
-                            let server_name = list[1].to_string();
-                            if let Some(server) = self.servers.get_server(server_name.as_str()) {
-                                if let Server::Datagram(server) = server {
-                                    let notify = Arc::new(Notify::new());
-                                    let is_limit = true;
-                                    let name = server_name.clone();
-                                    if is_limit {
-                                        let (sender, receive) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
-                                        let mut send_datagram = Box::new(ChannelDatagram::new(sender));
-                                        let mut receive_datagram: Box<dyn Datagram<Error=StackError>> = if limiter.is_some() {
-                                            let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                            Box::new(LimitDatagram::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive), read_limit, write_limit))
-                                        } else {
-                                            Box::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive))
-                                        };
-                                        let stat = speed_stat.clone();
-                                        let servers = self.servers.clone();
-                                        let handle = tokio::spawn(async move {
-                                            let mut buffer = vec![0u8; 1024 * 4];
-                                            loop {
-                                                match receive_datagram.recv_from(&mut buffer).await {
-                                                    Ok(len) => {
-                                                        if let Some(server) = servers.get_server(name.as_str()) {
-                                                            if let Server::Datagram(server) = server {
-                                                                let buf = match server.serve_datagram(&buffer[0..len],
-                                                                                                      DatagramInfo::new(Some(src_addr.to_string()))).await {
-                                                                    Ok(buf) => buf,
-                                                                    Err(e) => {
-                                                                        log::error!("server error: {}", e);
-                                                                        break;
-                                                                    }
-                                                                };
-                                                                if let Err(e) = udp_socket.send_to(buf.as_slice(), src_addr).await {
-                                                                    log::error!("send datagram error: {}", e);
-                                                                    break;
-                                                                }
-                                                                stat.add_read_data_size(len as u64);
-                                                                stat.add_write_data_size(buf.len() as u64);
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        log::error!("accept error: {}", e);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        });
-                                        send_datagram.send_to(&data[..len]).await?;
-
-                                        *session_guard = Some(DatagramSession::Server(DatagramServerSession {
-                                            server: server_name.clone(),
-                                            latest_time: chrono::Utc::now().timestamp() as u64,
-                                            notify: notify.clone(),
-                                            speed_stat: speed_stat.clone(),
-                                            send_handle: Some(handle),
-                                            send_datagram: Some(send_datagram),
-                                        }));
-                                    } else {
-                                        let buf = server.serve_datagram(&data[..len],
-                                                                        DatagramInfo::new(Some(src_addr.to_string()))).await
-                                            .map_err(into_stack_err!(StackErrorCode::ServerError, ""))?;
-                                        udp_socket.send_to(buf.as_slice(), src_addr).await.map_err(into_stack_err!(StackErrorCode::IoError, "send error"))?;
-
-                                        speed_stat.add_read_data_size(len as u64);
-                                        speed_stat.add_write_data_size(buf.len() as u64);
-
-                                        *session_guard = Some(DatagramSession::Server(DatagramServerSession {
-                                            server: server_name.clone(),
-                                            latest_time: chrono::Utc::now().timestamp() as u64,
-                                            notify: notify.clone(),
-                                            speed_stat: speed_stat.clone(),
-                                            send_handle: None,
-                                            send_datagram: None,
-                                        }));
-                                    }
-                                    if let Some(connection_manager) = self.connection_manager.as_ref() {
-                                        let controller = UdpSessionController::new(session_key, self.all_client_session.clone(), notify);
-                                        connection_manager.add_connection(ConnectionInfo::new(src_addr.to_string(), server_name.to_string(), StackProtocol::Udp, speed_stat, controller));
-                                    }
-                                } else {
-                                    return Err(stack_err!(
-                                        StackErrorCode::InvalidConfig,
-                                        "invalid server command"
-                                    ));
-                                }
-                            }
-                        }
-                        v => {
-                            log::error!("invalid command: {}", v);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
+        handler_snapshot
+            .handle_datagram(self, udp_socket, src_addr, dest_addr, data, len)
+            .await
     }
 
     pub async fn start(self: &Arc<Self>) -> StackResult<JoinHandle<()>> {
@@ -1044,6 +1070,7 @@ impl UdpStackInner {
 
 pub struct UdpStack {
     inner: Arc<UdpStackInner>,
+    prepare_handler: Arc<RwLock<Option<Arc<UdpDatagramHandler>>>>,
     handle: Mutex<Option<JoinHandle<()>>>,
     clear_handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -1064,10 +1091,25 @@ impl UdpStack {
         UdpStackBuilder::new()
     }
 
-    async fn create(builder: UdpStackBuilder) -> StackResult<Self> {
-        let inner = UdpStackInner::create(builder).await?;
+    async fn create(mut builder: UdpStackBuilder) -> StackResult<Self> {
+        if builder.hook_point.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "hook_point is required"));
+        }
+        if builder.stack_context.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "stack_context is required"));
+        }
+        let stack_context = builder.stack_context.clone().unwrap();;
+
+        let handler = UdpDatagramHandler::create(
+            builder.hook_point.take().unwrap(),
+            stack_context,
+        )
+            .await?;
+        let handler = Arc::new(RwLock::new(Arc::new(handler)));
+        let inner = UdpStackInner::create(builder, handler).await?;
         Ok(Self {
             inner: Arc::new(inner),
+            prepare_handler: Arc::new(Default::default()),
             handle: Mutex::new(None),
             clear_handle: Mutex::new(None),
         })
@@ -1093,6 +1135,11 @@ impl Stack for UdpStack {
     }
 
     async fn start(&self) -> StackResult<()> {
+        {
+            if self.handle.lock().unwrap().is_some() {
+                return Ok(());
+            }
+        }
         let handle = self.inner.start().await?;
         let inner = self.inner.clone();
         *self.clear_handle.lock().unwrap() = Some(tokio::spawn(async move {
@@ -1107,7 +1154,7 @@ impl Stack for UdpStack {
         Ok(())
     }
 
-    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
+    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Arc<dyn StackContext>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<UdpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid udp stack config"))?;
 
@@ -1119,13 +1166,28 @@ impl Stack for UdpStack {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
-        let (executor, _) = create_process_chain_executor(&config.hook_point,
-                                                          self.inner.global_process_chains.clone(),
-                                                          self.inner.global_collection_manager.clone(),
-                                                          Some(get_external_commands(self.inner.servers.clone()))).await
-            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
-        *self.inner.executor.lock().unwrap() = executor;
+        if config.transparent.unwrap_or(false) != self.inner.transparent {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "transparent unmatch"));
+        }
+
+        let udp_context = context.as_ref().as_any().downcast_ref::<UdpStackContext>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid udp stack context"))?;
+        let new_handler = UdpDatagramHandler::create(
+            config.hook_point.clone(),
+            Arc::new(udp_context.clone()),
+        ).await?;
+        *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())
+    }
+
+    async fn commit_update(&self) {
+        if let Some(handler) = self.prepare_handler.write().unwrap().take() {
+            *self.inner.handler.write().unwrap() = handler;
+        }
+    }
+
+    async fn rollback_update(&self) {
+        self.prepare_handler.write().unwrap().take();
     }
 }
 
@@ -1135,14 +1197,9 @@ pub struct UdpStackBuilder {
     concurrency: u32,
     session_idle_time: Duration,
     hook_point: Option<ProcessChainConfigs>,
-    servers: Option<ServerManagerRef>,
-    global_process_chains: Option<GlobalProcessChainsRef>,
     connection_manager: Option<ConnectionManagerRef>,
-    tunnel_manager: Option<TunnelManager>,
-    limiter_manager: Option<LimiterManagerRef>,
-    stat_manager: Option<StatManagerRef>,
-    global_collection_manager: Option<GlobalCollectionManagerRef>,
     transparent: bool,
+    stack_context: Option<Arc<UdpStackContext>>,
 }
 
 impl UdpStackBuilder {
@@ -1153,14 +1210,9 @@ impl UdpStackBuilder {
             concurrency: 200,
             session_idle_time: Duration::from_secs(120),
             hook_point: None,
-            servers: None,
-            global_process_chains: None,
             connection_manager: None,
-            tunnel_manager: None,
-            limiter_manager: None,
-            stat_manager: None,
-            global_collection_manager: None,
             transparent: false,
+            stack_context: None,
         }
     }
 
@@ -1175,16 +1227,6 @@ impl UdpStackBuilder {
     }
     pub fn hook_point(mut self, hook_point: ProcessChainConfigs) -> Self {
         self.hook_point = Some(hook_point);
-        self
-    }
-
-    pub fn servers(mut self, servers: ServerManagerRef) -> Self {
-        self.servers = Some(servers);
-        self
-    }
-
-    pub fn global_process_chains(mut self, global_process_chains: GlobalProcessChainsRef) -> Self {
-        self.global_process_chains = Some(global_process_chains);
         self
     }
 
@@ -1203,28 +1245,13 @@ impl UdpStackBuilder {
         self
     }
 
-    pub fn tunnel_manager(mut self, tunnel_manager: TunnelManager) -> Self {
-        self.tunnel_manager = Some(tunnel_manager);
-        self
-    }
-
     pub fn transparent(mut self, transparent: bool) -> Self {
         self.transparent = transparent;
         self
     }
 
-    pub fn limiter_manager(mut self, limiter_manager: LimiterManagerRef) -> Self {
-        self.limiter_manager = Some(limiter_manager);
-        self
-    }
-
-    pub fn stat_manager(mut self, stat_manager: StatManagerRef) -> Self {
-        self.stat_manager = Some(stat_manager);
-        self
-    }
-
-    pub fn global_collection_manager(mut self, global_collection_manager: GlobalCollectionManagerRef) -> Self {
-        self.global_collection_manager = Some(global_collection_manager);
+    pub fn stack_context(mut self, stack_context: Arc<UdpStackContext>) -> Self {
+        self.stack_context = Some(stack_context);
         self
     }
 
@@ -1313,20 +1340,23 @@ impl StackFactory for UdpStackFactory {
             .as_any()
             .downcast_ref::<UdpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid udp stack config"))?;
+        let stack_context = Arc::new(UdpStackContext::new(
+            self.servers.clone(),
+            self.tunnel_manager.clone(),
+            self.limiter_manager.clone(),
+            self.stat_manager.clone(),
+            Some(self.global_process_chains.clone()),
+            Some(self.global_collection_manager.clone()),
+        ));
         let stack = UdpStack::builder()
             .id(config.id.clone())
             .bind(config.bind.to_string())
-            .tunnel_manager(self.tunnel_manager.clone())
             .connection_manager(self.connection_manager.clone())
-            .global_process_chains(self.global_process_chains.clone())
-            .servers(self.servers.clone())
             .hook_point(config.hook_point.clone())
             .concurrency(config.concurrency.unwrap_or(200))
             .session_idle_time(Duration::from_secs(config.session_idle_time.unwrap_or(120)))
             .transparent(config.transparent.unwrap_or(false))
-            .limiter_manager(self.limiter_manager.clone())
-            .stat_manager(self.stat_manager.clone())
-            .global_collection_manager(self.global_collection_manager.clone())
+            .stack_context(stack_context)
             .build().await?;
         Ok(Arc::new(stack))
     }
@@ -1338,9 +1368,27 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::net::UdpSocket;
-    use crate::{ConnectionManager, DatagramInfo, GlobalCollectionManager, LimiterManager, ProcessChainConfigs, Server, ServerManager, ServerResult, Stack, StackFactory, StackProtocol, StatManager, TunnelManager, UdpStack, UdpStackConfig, UdpStackFactory};
-    use crate::global_process_chains::GlobalProcessChains;
+    use crate::{ConnectionManager, DatagramInfo, GlobalCollectionManager, GlobalCollectionManagerRef, LimiterManager, LimiterManagerRef, ProcessChainConfigs, Server, ServerManager, ServerManagerRef, ServerResult, Stack, StackFactory, StackProtocol, StatManager, StatManagerRef, TunnelManager, UdpStack, UdpStackConfig, UdpStackContext, UdpStackFactory};
+    use crate::global_process_chains::{GlobalProcessChains, GlobalProcessChainsRef};
     use crate::server::{DatagramServer};
+
+    fn build_udp_context(
+        servers: ServerManagerRef,
+        tunnel_manager: TunnelManager,
+        limiter_manager: LimiterManagerRef,
+        stat_manager: StatManagerRef,
+        global_process_chains: Option<GlobalProcessChainsRef>,
+        global_collection_manager: Option<GlobalCollectionManagerRef>,
+    ) -> Arc<UdpStackContext> {
+        Arc::new(UdpStackContext::new(
+            servers,
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            global_process_chains,
+            global_collection_manager,
+        ))
+    }
 
     #[tokio::test]
     async fn test_udp_stack_creation() {
@@ -1358,30 +1406,38 @@ mod tests {
         let result = UdpStack::builder()
             .id("test")
             .bind("0.0.0.0:8930")
-            .servers(Arc::new(ServerManager::new()))
             .build()
             .await;
         assert!(result.is_err());
+        let stack_context = build_udp_context(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            LimiterManager::new(),
+            StatManager::new(),
+            None,
+            None,
+        );
         let result = UdpStack::builder()
             .id("test")
             .bind("0.0.0.0:8930")
             .hook_point(vec![])
-            .servers(Arc::new(ServerManager::new()))
-            .tunnel_manager(TunnelManager::new())
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
+        let stack_context = build_udp_context(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            LimiterManager::new(),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = UdpStack::builder()
             .id("test")
             .bind("0.0.0.0:8930")
             .hook_point(vec![])
-            .servers(Arc::new(ServerManager::new()))
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .tunnel_manager(TunnelManager::new())
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1400,18 +1456,21 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
-        let tunnel_manager = TunnelManager::new();
+        let stack_context = build_udp_context(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            LimiterManager::new(),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = UdpStack::builder()
             .id("test")
             .bind("0.0.0.0:8932")
             .hook_point(chains)
-            .servers(Arc::new(ServerManager::new()))
             .session_idle_time(Duration::from_secs(5))
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .tunnel_manager(tunnel_manager)
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
             .transparent(true)
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1456,17 +1515,20 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
-        let tunnel_manager = TunnelManager::new();
+        let stack_context = build_udp_context(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            LimiterManager::new(),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = UdpStack::builder()
             .id("test")
             .bind("0.0.0.0:8931")
             .hook_point(chains)
             .session_idle_time(Duration::from_secs(5))
-            .servers(Arc::new(ServerManager::new()))
-            .tunnel_manager(tunnel_manager)
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1526,18 +1588,24 @@ mod tests {
 
 
         let tunnel_manager = TunnelManager::new();
+        let limiter_manager = LimiterManager::new();
+        let stat_manager = StatManager::new();
         let datagram_server_manager = Arc::new(ServerManager::new());
         let _ = datagram_server_manager.add_server(Server::Datagram(Arc::new(MockServer::new("mock".to_string())))).unwrap();
+        let stack_context = build_udp_context(
+            datagram_server_manager.clone(),
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = UdpStack::builder()
             .id("test")
             .bind("0.0.0.0:8938")
             .hook_point(chains)
             .session_idle_time(Duration::from_secs(5))
-            .servers(datagram_server_manager)
-            .tunnel_manager(tunnel_manager)
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1573,19 +1641,24 @@ mod tests {
 
 
         let tunnel_manager = TunnelManager::new();
+        let limiter_manager = LimiterManager::new();
         let stat_manager = StatManager::new();
         let datagram_server_manager = Arc::new(ServerManager::new());
         let _ = datagram_server_manager.add_server(Server::Datagram(Arc::new(MockServer::new("mock".to_string())))).unwrap();
+        let stack_context = build_udp_context(
+            datagram_server_manager.clone(),
+            tunnel_manager,
+            limiter_manager,
+            stat_manager.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = UdpStack::builder()
             .id("test")
             .bind("0.0.0.0:8939")
             .hook_point(chains)
             .session_idle_time(Duration::from_secs(5))
-            .servers(datagram_server_manager)
-            .tunnel_manager(tunnel_manager)
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(stat_manager.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1628,19 +1701,24 @@ mod tests {
 
 
         let tunnel_manager = TunnelManager::new();
+        let limiter_manager = LimiterManager::new();
         let stat_manager = StatManager::new();
         let datagram_server_manager = Arc::new(ServerManager::new());
         let _ = datagram_server_manager.add_server(Server::Datagram(Arc::new(MockServer::new("mock".to_string())))).unwrap();
+        let stack_context = build_udp_context(
+            datagram_server_manager.clone(),
+            tunnel_manager,
+            limiter_manager,
+            stat_manager.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = UdpStack::builder()
             .id("test")
             .bind("0.0.0.0:8940")
             .hook_point(chains)
             .session_idle_time(Duration::from_secs(5))
-            .servers(datagram_server_manager)
-            .tunnel_manager(tunnel_manager)
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(stat_manager.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());

@@ -6,7 +6,7 @@ use std::future::poll_fn;
 use std::io;
 use std::io::Read;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use buckyos_kit::AsyncStream;
@@ -30,11 +30,407 @@ use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SelfCertMgrRef, GlobalCollectionManagerRef};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackContext, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_min_priority, get_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SelfCertMgrRef, GlobalCollectionManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 use crate::stack::{get_limit_info, stream_forward, TlsCertResolver};
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
+
+#[derive(Clone)]
+pub struct QuicStackContext {
+    pub servers: ServerManagerRef,
+    pub tunnel_manager: TunnelManager,
+    pub limiter_manager: LimiterManagerRef,
+    pub stat_manager: StatManagerRef,
+    pub acme_manager: AcmeCertManagerRef,
+    pub self_cert_mgr: SelfCertMgrRef,
+    pub global_process_chains: Option<GlobalProcessChainsRef>,
+    pub global_collection_manager: Option<GlobalCollectionManagerRef>,
+}
+
+impl QuicStackContext {
+    pub fn new(
+        servers: ServerManagerRef,
+        tunnel_manager: TunnelManager,
+        limiter_manager: LimiterManagerRef,
+        stat_manager: StatManagerRef,
+        acme_manager: AcmeCertManagerRef,
+        self_cert_mgr: SelfCertMgrRef,
+        global_process_chains: Option<GlobalProcessChainsRef>,
+        global_collection_manager: Option<GlobalCollectionManagerRef>,
+    ) -> Self {
+        Self {
+            servers,
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            acme_manager,
+            self_cert_mgr,
+            global_process_chains,
+            global_collection_manager,
+        }
+    }
+}
+
+impl StackContext for QuicStackContext {
+    fn stack_protocol(&self) -> StackProtocol {
+        StackProtocol::Quic
+    }
+}
+
+struct QuicConnectionHandler {
+    env: Arc<QuicStackContext>,
+    executor: ProcessChainLibExecutor,
+    connection_manager: Option<ConnectionManagerRef>,
+}
+
+impl QuicConnectionHandler {
+    async fn create(
+        hook_point: ProcessChainConfigs,
+        env: Arc<QuicStackContext>,
+        connection_manager: Option<ConnectionManagerRef>,
+    ) -> StackResult<Self> {
+        let (executor, _) = create_process_chain_executor(
+            &hook_point,
+            env.global_process_chains.clone(),
+            env.global_collection_manager.clone(),
+            Some(get_external_commands(env.servers.clone())),
+        )
+            .await
+            .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
+        Ok(Self {
+            env,
+            executor,
+            connection_manager,
+        })
+    }
+
+    fn build_cert_resolver(
+        certs: Vec<TlsDomainConfig>,
+        env: &QuicStackContext,
+    ) -> StackResult<Arc<dyn ResolvesServerCert>> {
+        let crypto_provider = rustls::crypto::ring::default_provider();
+        let external_resolver = Some(env.acme_manager.clone() as Arc<dyn ResolvesServerCert>);
+        let cert_resolver = Arc::new(ResolvesServerCertUsingSni::new(external_resolver));
+        let mut self_cert = false;
+        for cert_config in certs.into_iter() {
+            if cert_config.domain == "*" {
+                self_cert = true;
+                continue;
+            }
+            if let (Some(certs), Some(key)) = (cert_config.certs, cert_config.key) {
+                let cert_key = CertifiedKey::from_der(certs, key, &crypto_provider)
+                    .map_err(into_stack_err!(StackErrorCode::InvalidTlsCert, "parse {} cert failed", cert_config.domain))?;
+                cert_resolver
+                    .add(&cert_config.domain, cert_key)
+                    .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "add {} cert failed.err {}", cert_config.domain, e))?;
+            } else {
+                env.acme_manager
+                    .add_acme_item(AcmeItem::new(
+                        cert_config.domain,
+                        cert_config.acme_type.unwrap_or(ChallengeType::TlsAlpn01),
+                        cert_config.data,
+                    ))
+                    .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
+            }
+        }
+        let cert: Arc<dyn ResolvesServerCert> = if self_cert {
+            Arc::new(TlsCertResolver::new(cert_resolver, Some(env.self_cert_mgr.clone())))
+        } else {
+            cert_resolver
+        };
+        Ok(cert)
+    }
+
+    async fn accept(&self, conn: Incoming, local_addr: SocketAddr) -> StackResult<()> {
+        let connection = conn.await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
+        let server_name = {
+            let handshake_data = connection.handshake_data();
+            if handshake_data.is_none() {
+                return Err(stack_err!(StackErrorCode::QuicError, "handshake data is None"));
+            }
+            let handshake_data = handshake_data.as_ref().unwrap().as_ref().downcast_ref::<HandshakeData>();
+            if handshake_data.is_none() {
+                return Err(stack_err!(StackErrorCode::QuicError, "handshake data is None"));
+            }
+
+            let server_name = handshake_data.unwrap().server_name.as_ref();
+            if server_name.is_none() {
+                return Err(stack_err!(StackErrorCode::QuicError, "server name is None"));
+            }
+            server_name.unwrap().to_string()
+        };
+
+        let remote_addr = connection.remote_address();
+        log::info!("quic accept: {} -> {}", remote_addr, local_addr);
+        let map = MemoryMapCollection::new_ref();
+        map.insert("dest_host", CollectionValue::String(server_name)).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+
+        let executor = self.executor.fork();
+        let global_env = executor.global_env().clone();
+        let ret = execute_chain(executor, map)
+            .await
+            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        if ret.is_control() {
+            if ret.is_drop() {
+                connection.close(0u32.into(), "".as_bytes());
+                return Ok(());
+            } else if ret.is_reject() {
+                connection.close(0u32.into(), "".as_bytes());
+                return Ok(());
+            }
+
+            if let Some(CommandControl::Return(ret)) = ret.as_control() {
+                if let Some(list) = shlex::split(ret.value.as_str()) {
+                    if list.is_empty() {
+                        return Ok(());
+                    }
+
+                    let (limiter_id, down_speed, up_speed) = get_limit_info(global_env.clone()).await?;
+                    let upper = if limiter_id.is_some() {
+                        self.env.limiter_manager.get_limiter(limiter_id.unwrap())
+                    } else {
+                        None
+                    };
+                    let limiter = if down_speed.is_some() && up_speed.is_some() {
+                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
+                    } else {
+                        upper
+                    };
+
+                    let stat_group_ids = get_stat_info(global_env).await?;
+                    let speed_groups = self.env.stat_manager.get_speed_stats(stat_group_ids.as_slice());
+                    let speed_stat = ComposedSpeedStat::new(speed_groups);
+                    let cmd = list[0].as_str();
+                    match cmd {
+                        "forward" => {
+                            if list.len() < 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid forward command"
+                                ));
+                            }
+                            let speed_stat = speed_stat.clone();
+                            loop {
+                                let (send, recv) = connection.accept_bi().await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
+                                log::info!("quic accept bi: {} -> {}", remote_addr, local_addr);
+                                let stream = sfo_split::Splittable::new(recv, send);
+                                let stat_stream = StatStream::new_with_tracker(stream, speed_stat.clone());
+                                let speed = stat_stream.get_speed_stat();
+                                let target = list[1].clone();
+                                let stream: Box<dyn AsyncStream> = if limiter.is_some() {
+                                    let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                    let limit_stream = LimitStream::new(stat_stream, read_limit, write_limit);
+                                    Box::new(limit_stream)
+                                } else {
+                                    Box::new(stat_stream)
+                                };
+                                let tunnel_manager = self.env.tunnel_manager.clone();
+                                let handle = tokio::spawn(async move {
+                                    if let Err(e) = stream_forward(stream, target.as_str(), &tunnel_manager).await {
+                                        log::error!("stream forward error: {}", e);
+                                    }
+                                });
+                                if let Some(connection_manager) = self.connection_manager.as_ref() {
+                                    let controller = HandleConnectionController::new(handle);
+                                    connection_manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), local_addr.to_string(), StackProtocol::Quic, speed, controller));
+                                }
+                            }
+                        }
+                        "server" => {
+                            if list.len() < 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid server command"
+                                ));
+                            }
+                            let server_name = list[1].as_str();
+                            let speed_stat = speed_stat.clone();
+                            if let Some(server) = self.env.servers.get_server(server_name) {
+                                match server {
+                                    Server::Http(server) => {
+                                        let mut h3_conn = match h3::server::Connection::<_, Bytes>::new(
+                                            Http3Connection::new(
+                                                h3_quinn::Connection::new(connection),
+                                                local_addr,
+                                                remote_addr,
+                                                self.connection_manager.clone()))
+                                            .await {
+                                            Ok(h3_conn) => h3_conn,
+                                            Err(e) => {
+                                                return if e.is_h3_no_error() {
+                                                    Ok(())
+                                                } else {
+                                                    Err(stack_err!(StackErrorCode::QuicError, "h3 new error: {e}"))
+                                                }
+                                            }
+                                        };
+                                        loop {
+                                            let resolver = match h3_conn.accept().await {
+                                                Ok(resolver) => resolver,
+                                                Err(e) => {
+                                                    if e.is_h3_no_error() {
+                                                        break;
+                                                    } else {
+                                                        return Err(stack_err!(StackErrorCode::QuicError, "h3 accept error: {e}"))
+                                                    }
+                                                }
+                                            };
+                                            if resolver.is_none() {
+                                                break;
+                                            }
+                                            let speed = speed_stat.clone();
+                                            let limiter = limiter.clone();
+                                            let server = server.clone();
+                                            let speed_stat = speed_stat.clone();
+                                            let handle = tokio::spawn(async move {
+                                                let ret: StackResult<()> = async move {
+                                                    let (req, stream) = resolver.unwrap().resolve_request().await
+                                                        .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 resolve request error"))?;
+                                                    let (parts, _) = req.into_parts();
+                                                    let (mut send, recv) = stream.split();
+                                                    let recv_stream = StatRead::new_with_tracker(Http3Recv::new(recv), speed_stat.clone());
+                                                    let (read_limit, write_limit) = if limiter.is_some() {
+                                                        let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                                        (Some(read_limit), Some(write_limit))
+                                                    } else {
+                                                        (None, None)
+                                                    };
+
+                                                    let body = if read_limit.is_some() {
+                                                        AsyncReadBody::with_capacity(LimitRead::new(recv_stream, read_limit.unwrap()), 4096)
+                                                            .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed()
+                                                    } else {
+                                                        AsyncReadBody::with_capacity(recv_stream, 4096)
+                                                            .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed()
+                                                    };
+                                                    let req = http::Request::from_parts(parts, body);
+                                                    log::info!("recv http request:remote {} method {} host {} path {}",
+                                                        remote_addr,
+                                                        req.method().to_string(),
+                                                        req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
+                                                        req.uri().to_string());
+                                                    let resp = server
+                                                        .serve_request(req, StreamInfo::new(remote_addr.to_string()))
+                                                        .await
+                                                        .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
+                                                    let (parts, mut body) = resp.into_parts();
+
+                                                    send.send_response(http::Response::from_parts(parts, ())).await
+                                                        .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 send response error"))?;
+
+                                                    let send_stream = StatWrite::new_with_tracker(SimpleAsyncWriteHolder::new(Http3Send::new(send)), speed_stat.clone());
+                                                    let mut send: Box<dyn AsyncWrite + Unpin + Send> = if write_limit.is_some() {
+                                                        Box::new(LimitWrite::new(send_stream, write_limit.unwrap()))
+                                                    } else {
+                                                        Box::new(send_stream)
+                                                    };
+                                                    loop {
+                                                        let mut pin_body = Pin::new(&mut body);
+                                                        let data = poll_fn(move |cx| {
+                                                            pin_body.as_mut().poll_frame(cx)
+                                                        }).await;
+                                                        match data {
+                                                            Some(data) => {
+                                                                let data = data.map_err(into_stack_err!(StackErrorCode::QuicError, "h3 map error"))?;
+                                                                send.write_all(data.into_data()
+                                                                    .map_err(|_e| stack_err!(StackErrorCode::QuicError, "h3 data error"))?.as_ref()).await
+                                                                    .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 send data error"))?;
+                                                            }
+                                                            None => {
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    send.shutdown().await
+                                                        .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 finish error"))?;
+                                                    Ok(())
+                                                }.await;
+                                                if let Err(e) = ret {
+                                                    log::error!("server error: {}", e);
+                                                }
+                                            });
+
+                                            if let Some(connection_manager) = self.connection_manager.as_ref() {
+                                                let controller = HandleConnectionController::new(handle);
+                                                connection_manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), local_addr.to_string(), StackProtocol::Quic, speed, controller));
+                                            }
+                                        }
+                                    }
+                                    Server::Stream(server) => {
+                                        loop {
+                                            let (send, recv) = connection.accept_bi().await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
+                                            log::info!("quic accept bi: {} -> {}", remote_addr, local_addr);
+                                            let server = server.clone();
+                                            let stream = sfo_split::Splittable::new(recv, send);
+                                            let stat_stream = StatStream::new_with_tracker(stream, speed_stat.clone());
+                                            let speed = stat_stream.get_speed_stat();
+                                            let stream: Box<dyn AsyncStream> = if limiter.is_some() {
+                                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                                let limit_stream = LimitStream::new(stat_stream, read_limit, write_limit);
+                                                Box::new(limit_stream)
+                                            } else {
+                                                Box::new(stat_stream)
+                                            };
+                                            let handle = tokio::spawn(async move {
+                                                if let Err(e) = server.serve_connection(stream, StreamInfo::new(remote_addr.to_string())).await {
+                                                    log::error!("server error: {}", e);
+                                                }
+                                            });
+                                            if let Some(connection_manager) = self.connection_manager.as_ref() {
+                                                let controller = HandleConnectionController::new(handle);
+                                                connection_manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), local_addr.to_string(), StackProtocol::Quic, speed, controller));
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(stack_err!(
+                                            StackErrorCode::InvalidConfig,
+                                            "Unsupport server type"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        v => {
+                            log::error!("unknown command: {}", v);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn build_tls_domain_configs(
+    certs: &[StackCertConfig],
+) -> StackResult<Vec<TlsDomainConfig>> {
+    let mut cert_list = Vec::with_capacity(certs.len());
+    for cert_config in certs.iter() {
+        if cert_config.cert_path.is_some() && cert_config.key_path.is_some() {
+            let certs = load_certs(cert_config.cert_path.as_deref().unwrap()).await?;
+            let key = load_key(cert_config.key_path.as_deref().unwrap()).await?;
+            cert_list.push(TlsDomainConfig {
+                domain: cert_config.domain.clone(),
+                acme_type: None,
+                certs: Some(certs),
+                key: Some(key),
+                data: None,
+            });
+        } else {
+            cert_list.push(TlsDomainConfig {
+                domain: cert_config.domain.clone(),
+                acme_type: cert_config.acme_type.clone(),
+                certs: None,
+                key: None,
+                data: cert_config.data.clone(),
+            });
+        }
+    }
+    Ok(cert_list)
+}
 
 pub struct Http3Body<S, B> {
     stream: RequestStream<S, B>,
@@ -649,14 +1045,8 @@ struct QuicStackInner {
     concurrency: u32,
     certs: Arc<dyn ResolvesServerCert>,
     alpn_protocols: Vec<Vec<u8>>,
-    servers: ServerManagerRef,
-    executor: Arc<Mutex<ProcessChainLibExecutor>>,
     connection_manager: Option<ConnectionManagerRef>,
-    global_process_chains: Option<GlobalProcessChainsRef>,
-    tunnel_manager: TunnelManager,
-    limiter_manager: LimiterManagerRef,
-    stat_manager: StatManagerRef,
-    global_collection_manager: Option<GlobalCollectionManagerRef>,
+    handler: Arc<RwLock<Arc<QuicConnectionHandler>>>,
 }
 
 impl QuicStackInner {
@@ -709,273 +1099,19 @@ impl QuicStackInner {
     }
 
     async fn accept(self: &Arc<Self>, conn: Incoming) -> StackResult<()> {
-        let connection = conn.await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
-        let server_name = {
-            let handshake_data = connection.handshake_data();
-            if handshake_data.is_none() {
-                return Err(stack_err!(StackErrorCode::QuicError, "handshake data is None"));
-            }
-            let handshake_data = handshake_data.as_ref().unwrap().as_ref().downcast_ref::<HandshakeData>();
-            if handshake_data.is_none() {
-                return Err(stack_err!(StackErrorCode::QuicError, "handshake data is None"));
-            }
-
-            let server_name = handshake_data.unwrap().server_name.as_ref();
-            if server_name.is_none() {
-                return Err(stack_err!(StackErrorCode::QuicError, "server name is None"));
-            }
-            server_name.unwrap().to_string()
+        let local_addr: SocketAddr = self.bind_addr.parse()
+            .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
+        let handler_snapshot = {
+            let handler = self.handler.read().unwrap();
+            handler.clone()
         };
-
-        let local_addr: SocketAddr = self.bind_addr.parse().unwrap();
-        let remote_addr = connection.remote_address();
-        log::info!("quic accept: {} -> {}", remote_addr, local_addr);
-        let map = MemoryMapCollection::new_ref();
-        map.insert("dest_host", CollectionValue::String(server_name)).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-
-        let executor = {
-            self.executor.lock().unwrap().fork()
-        };
-        let global_env = executor.global_env().clone();
-        let ret = execute_chain(executor, map)
-            .await
-            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
-        if ret.is_control() {
-            if ret.is_drop() {
-                connection.close(0u32.into(), "".as_bytes());
-                return Ok(());
-            } else if ret.is_reject() {
-                connection.close(0u32.into(), "".as_bytes());
-                return Ok(());
-            }
-
-            if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret.value.as_str()) {
-                    if list.len() == 0 {
-                        return Ok(());
-                    }
-
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(global_env.clone()).await?;
-                    let upper = if limiter_id.is_some() {
-                        self.limiter_manager.get_limiter(limiter_id.unwrap())
-                    } else {
-                        None
-                    };
-                    let limiter = if down_speed.is_some() && up_speed.is_some() {
-                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
-                    } else {
-                        upper
-                    };
-
-                    let stat_group_ids = get_stat_info(global_env).await?;
-                    let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
-                    let speed_stat = ComposedSpeedStat::new(speed_groups);
-                    let cmd = list[0].as_str();
-                    match cmd {
-                        "forward" => {
-                            if list.len() < 2 {
-                                return Err(stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid forward command"
-                                ));
-                            }
-                            let speed_stat = speed_stat.clone();
-                            loop {
-                                let (send, recv) = connection.accept_bi().await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
-                                log::info!("quic accept bi: {} -> {}", remote_addr, local_addr);
-                                let stream = sfo_split::Splittable::new(recv, send);
-                                let stat_stream = StatStream::new_with_tracker(stream, speed_stat.clone());
-                                let speed = stat_stream.get_speed_stat();
-                                let target = list[1].clone();
-                                let stream: Box<dyn AsyncStream> = if limiter.is_some() {
-                                    let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                    let limit_stream = LimitStream::new(stat_stream, read_limit, write_limit);
-                                    Box::new(limit_stream)
-                                } else {
-                                    Box::new(stat_stream)
-                                };
-                                let tunnel_manager = self.tunnel_manager.clone();
-                                let handle = tokio::spawn(async move {
-                                    if let Err(e) = stream_forward(stream, target.as_str(), &tunnel_manager).await {
-                                        log::error!("stream forward error: {}", e);
-                                    }
-                                });
-                                if let Some(connection_manager) = self.connection_manager.as_ref() {
-                                    let controller = HandleConnectionController::new(handle);
-                                    connection_manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), local_addr.to_string(), StackProtocol::Quic, speed, controller));
-                                }
-                            }
-                        }
-                        "server" => {
-                            if list.len() < 2 {
-                                return Err(stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid server command"
-                                ));
-                            }
-                            let server_name = list[1].as_str();
-                            let speed_stat = speed_stat.clone();
-                            if let Some(server) = self.servers.get_server(server_name) {
-                                match server {
-                                    Server::Http(server) => {
-                                        let mut h3_conn = match h3::server::Connection::<_, Bytes>::new(
-                                            Http3Connection::new(
-                                                h3_quinn::Connection::new(connection),
-                                                local_addr,
-                                                remote_addr,
-                                                self.connection_manager.clone()))
-                                            .await {
-                                            Ok(h3_conn) => h3_conn,
-                                            Err(e) => {
-                                                return if e.is_h3_no_error() {
-                                                    Ok(())
-                                                } else {
-                                                    Err(stack_err!(StackErrorCode::QuicError, "h3 new error: {e}"))
-                                                }
-                                            }
-                                        };
-                                        loop {
-                                            let resolver = match h3_conn.accept().await {
-                                                Ok(resolver) => resolver,
-                                                Err(e) => {
-                                                    if e.is_h3_no_error() {
-                                                        break;
-                                                    } else {
-                                                        return Err(stack_err!(StackErrorCode::QuicError, "h3 accept error: {e}"))
-                                                    }
-                                                }
-                                            };
-                                            if resolver.is_none() {
-                                                break;
-                                            }
-                                            let speed = speed_stat.clone();
-                                            let limiter = limiter.clone();
-                                            let server = server.clone();
-                                            let speed_stat = speed_stat.clone();
-                                            let handle = tokio::spawn(async move {
-                                                let ret: StackResult<()> = async move {
-                                                    let (req, stream) = resolver.unwrap().resolve_request().await
-                                                        .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 resolve request error"))?;
-                                                    let (parts, _) = req.into_parts();
-                                                    // let stat_stream = StatStream::new(stream);
-                                                    let (mut send, recv) = stream.split();
-                                                    let recv_stream = StatRead::new_with_tracker(Http3Recv::new(recv), speed_stat.clone());
-                                                    let (read_limit, write_limit) = if limiter.is_some() {
-                                                        let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                                        (Some(read_limit), Some(write_limit))
-                                                    } else {
-                                                        (None, None)
-                                                    };
-
-                                                    let body = if read_limit.is_some() {
-                                                        AsyncReadBody::with_capacity(LimitRead::new(recv_stream, read_limit.unwrap()), 4096)
-                                                            .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed()
-                                                    } else {
-                                                        AsyncReadBody::with_capacity(recv_stream, 4096)
-                                                            .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed()
-                                                    };
-                                                    let req = http::Request::from_parts(parts, body);
-                                                    log::info!("recv http request:remote {} method {} host {} path {}",
-                                                        remote_addr,
-                                                        req.method().to_string(),
-                                                        req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
-                                                        req.uri().to_string());
-                                                    let resp = server
-                                                        .serve_request(req, StreamInfo::new(remote_addr.to_string()))
-                                                        .await
-                                                        .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
-                                                    let (parts, mut body) = resp.into_parts();
-
-                                                    send.send_response(http::Response::from_parts(parts, ())).await
-                                                        .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 send response error"))?;
-
-                                                    let send_stream = StatWrite::new_with_tracker(SimpleAsyncWriteHolder::new(Http3Send::new(send)), speed_stat.clone());
-                                                    let mut send: Box<dyn AsyncWrite + Unpin + Send> = if write_limit.is_some() {
-                                                        Box::new(LimitWrite::new(send_stream, write_limit.unwrap()))
-                                                    } else {
-                                                        Box::new(send_stream)
-                                                    };
-                                                    loop {
-                                                        let mut pin_body = Pin::new(&mut body);
-                                                        let data = poll_fn(move |cx| {
-                                                            pin_body.as_mut().poll_frame(cx)
-                                                        }).await;
-                                                        match data {
-                                                            Some(data) => {
-                                                                let data = data.map_err(into_stack_err!(StackErrorCode::QuicError, "h3 map error"))?;
-                                                                send.write_all(data.into_data()
-                                                                    .map_err(|_e| stack_err!(StackErrorCode::QuicError, "h3 data error"))?.as_ref()).await
-                                                                    .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 send data error"))?;
-                                                            }
-                                                            None => {
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                    send.shutdown().await
-                                                        .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 finish error"))?;
-                                                    Ok(())
-                                                }.await;
-                                                if let Err(e) = ret {
-                                                    log::error!("server error: {}", e);
-                                                }
-                                            });
-
-                                            if let Some(connection_manager) = self.connection_manager.as_ref() {
-                                                let controller = HandleConnectionController::new(handle);
-                                                connection_manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), local_addr.to_string(), StackProtocol::Quic, speed, controller));
-                                            }
-                                        }
-                                    }
-                                    Server::Stream(server) => {
-                                        loop {
-                                            let (send, recv) = connection.accept_bi().await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
-                                            log::info!("quic accept bi: {} -> {}", remote_addr, local_addr);
-                                            let server = server.clone();
-                                            let stream = sfo_split::Splittable::new(recv, send);
-                                            let stat_stream = StatStream::new_with_tracker(stream, speed_stat.clone());
-                                            let speed = stat_stream.get_speed_stat();
-                                            let stream: Box<dyn AsyncStream> = if limiter.is_some() {
-                                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                                let limit_stream = LimitStream::new(stat_stream, read_limit, write_limit);
-                                                Box::new(limit_stream)
-                                            } else {
-                                                Box::new(stat_stream)
-                                            };
-                                            let handle = tokio::spawn(async move {
-                                                if let Err(e) = server.serve_connection(stream, StreamInfo::new(remote_addr.to_string())).await {
-                                                    log::error!("server error: {}", e);
-                                                }
-                                            });
-                                            if let Some(connection_manager) = self.connection_manager.as_ref() {
-                                                let controller = HandleConnectionController::new(handle);
-                                                connection_manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), local_addr.to_string(), StackProtocol::Quic, speed, controller));
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        return Err(stack_err!(
-                                            StackErrorCode::InvalidConfig,
-                                            "Unsupport server type"
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        v => {
-                            log::error!("unknown command: {}", v);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
+        handler_snapshot.accept(conn, local_addr).await
     }
 }
 
 pub struct QuicStack {
     inner: Arc<QuicStackInner>,
+    prepare_handler: Arc<RwLock<Option<Arc<QuicConnectionHandler>>>>,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -992,7 +1128,7 @@ impl QuicStack {
         QuicStackBuilder::new()
     }
 
-    async fn create(builder: QuicStackBuilder) -> StackResult<Self> {
+    async fn create(mut builder: QuicStackBuilder) -> StackResult<Self> {
         if builder.id.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id is required"));
         }
@@ -1002,77 +1138,32 @@ impl QuicStack {
         if builder.hook_point.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "hook_point is required"));
         }
-        if builder.servers.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "servers is required"));
-        }
-        if builder.tunnel_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "tunnel_manager is required"));
-        }
-        if builder.limiter_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "limit_manager is required"));
-        }
-        if builder.stat_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "stat_manager is required"));
-        }
-        if builder.acme_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "acme_manager is required"));
-        }
-        if builder.self_cert_mgr.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "self_cert_mgr is required"));
+        if builder.stack_context.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "stack_context is required"));
         }
 
-        let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
-                                                          builder.global_process_chains.clone(),
-                                                          builder.global_collection_manager.clone(),
-                                                          Some(get_external_commands(builder.servers.clone().unwrap()))).await
-            .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
+        let stack_context = builder.stack_context.unwrap();
 
-        let crypto_provider = rustls::crypto::ring::default_provider();
-        let external_resolver = builder.acme_manager.clone().map(|v| v.clone() as Arc<dyn ResolvesServerCert>);
-        let cert_resolver = Arc::new(ResolvesServerCertUsingSni::new(external_resolver));
-        let mut self_cert = false;
-        for cert_config in builder.certs.into_iter() {
-            if cert_config.domain == "*" {
-                self_cert = true;
-            } else {
-                if cert_config.certs.is_some() && cert_config.key.is_some() {
-                    let cert_key = CertifiedKey::from_der(cert_config.certs.unwrap(), cert_config.key.unwrap(), &crypto_provider)
-                        .map_err(into_stack_err!(StackErrorCode::InvalidTlsCert, "parse {} cert failed", cert_config.domain))?;
-                    cert_resolver.add(&cert_config.domain, cert_key)
-                        .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "add {} cert failed.err {}", cert_config.domain, e))?;
-                } else {
-                    if builder.acme_manager.is_some() {
-                        builder.acme_manager.as_ref().unwrap()
-                            .add_acme_item(AcmeItem::new(cert_config.domain,
-                                                         cert_config.acme_type.unwrap_or(ChallengeType::TlsAlpn01),
-                                                         cert_config.data))
-                            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
-                    }
-                }
-            }
-        }
-        let cert: Arc<dyn ResolvesServerCert> = if self_cert {
-            Arc::new(TlsCertResolver::new(cert_resolver, builder.self_cert_mgr))
-        } else {
-            cert_resolver
-        };
+        let handler = QuicConnectionHandler::create(
+            builder.hook_point.take().unwrap(),
+            stack_context.clone(),
+            builder.connection_manager.clone(),
+        )
+            .await?;
+        let handler = Arc::new(RwLock::new(Arc::new(handler)));
+        let certs = QuicConnectionHandler::build_cert_resolver(builder.certs, stack_context.as_ref())?;
 
         Ok(QuicStack {
             inner: Arc::new(QuicStackInner {
-                id: builder.id.unwrap(),
-                bind_addr: builder.bind.unwrap(),
+                id: builder.id.take().unwrap(),
+                bind_addr: builder.bind.take().unwrap(),
                 concurrency: builder.concurrency,
-                certs: cert,
+                certs,
                 alpn_protocols: builder.alpn_protocols,
-                servers: builder.servers.unwrap(),
-                executor: Arc::new(Mutex::new(executor)),
-                connection_manager: builder.connection_manager,
-                global_process_chains: builder.global_process_chains,
-                tunnel_manager: builder.tunnel_manager.unwrap(),
-                limiter_manager: builder.limiter_manager.unwrap(),
-                stat_manager: builder.stat_manager.unwrap(),
-                global_collection_manager: builder.global_collection_manager
+                connection_manager: builder.connection_manager.clone(),
+                handler,
             }),
+            prepare_handler: Arc::new(Default::default()),
             handle: Mutex::new(None),
         })
     }
@@ -1093,12 +1184,17 @@ impl Stack for QuicStack {
     }
 
     async fn start(&self) -> StackResult<()> {
+        {
+            if self.handle.lock().unwrap().is_some() {
+                return Ok(());
+            }
+        }
         let handle = self.inner.start().await?;
         *self.handle.lock().unwrap() = Some(handle);
         Ok(())
     }
 
-    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
+    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Arc<dyn StackContext>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<QuicStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid quic stack config"))?;
 
@@ -1110,14 +1206,25 @@ impl Stack for QuicStack {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
-        let (executor, _) = create_process_chain_executor(
-            &config.hook_point,
-            self.inner.global_process_chains.clone(),
-            self.inner.global_collection_manager.clone(),
-            Some(get_external_commands(self.inner.servers.clone())),
-        ).await.map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
-        *self.inner.executor.lock().unwrap() = executor;
+        let quic_context = context.as_ref().as_any().downcast_ref::<QuicStackContext>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid quic stack context"))?;
+        let new_handler = QuicConnectionHandler::create(
+            config.hook_point.clone(),
+            Arc::new(quic_context.clone()),
+            self.inner.connection_manager.clone(),
+        ).await?;
+        *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())
+    }
+
+    async fn commit_update(&self) {
+        if let Some(handler) = self.prepare_handler.write().unwrap().take() {
+            *self.inner.handler.write().unwrap() = handler;
+        }
+    }
+
+    async fn rollback_update(&self) {
+        self.prepare_handler.write().unwrap().take();
     }
 }
 
@@ -1125,18 +1232,11 @@ pub struct QuicStackBuilder {
     id: Option<String>,
     bind: Option<String>,
     hook_point: Option<ProcessChainConfigs>,
-    servers: Option<ServerManagerRef>,
-    global_process_chains: Option<GlobalProcessChainsRef>,
     certs: Vec<TlsDomainConfig>,
     alpn_protocols: Vec<Vec<u8>>,
     concurrency: u32,
     connection_manager: Option<ConnectionManagerRef>,
-    tunnel_manager: Option<TunnelManager>,
-    acme_manager: Option<AcmeCertManagerRef>,
-    limiter_manager: Option<LimiterManagerRef>,
-    stat_manager: Option<StatManagerRef>,
-    self_cert_mgr: Option<SelfCertMgrRef>,
-    global_collection_manager: Option<GlobalCollectionManagerRef>,
+    stack_context: Option<Arc<QuicStackContext>>,
 }
 
 impl QuicStackBuilder {
@@ -1145,18 +1245,11 @@ impl QuicStackBuilder {
             id: None,
             bind: None,
             hook_point: None,
-            servers: None,
-            global_process_chains: None,
             certs: vec![],
             concurrency: 1024,
             alpn_protocols: vec![],
             connection_manager: None,
-            tunnel_manager: None,
-            acme_manager: None,
-            limiter_manager: None,
-            stat_manager: None,
-            self_cert_mgr: None,
-            global_collection_manager: None,
+            stack_context: None,
         }
     }
 
@@ -1171,16 +1264,6 @@ impl QuicStackBuilder {
 
     pub fn hook_point(mut self, hook_point: ProcessChainConfigs) -> Self {
         self.hook_point = Some(hook_point);
-        self
-    }
-
-    pub fn servers(mut self, servers: ServerManagerRef) -> Self {
-        self.servers = Some(servers);
-        self
-    }
-
-    pub fn global_process_chains(mut self, global_process_chains: GlobalProcessChainsRef) -> Self {
-        self.global_process_chains = Some(global_process_chains);
         self
     }
 
@@ -1203,38 +1286,13 @@ impl QuicStackBuilder {
         self
     }
 
-    pub fn acme_manager(mut self, acme_manager: AcmeCertManagerRef) -> Self {
-        self.acme_manager = Some(acme_manager);
-        self
-    }
-
     pub fn connection_manager(mut self, connection_manager: ConnectionManagerRef) -> Self {
         self.connection_manager = Some(connection_manager);
         self
     }
 
-    pub fn tunnel_manager(mut self, tunnel_manager: TunnelManager) -> Self {
-        self.tunnel_manager = Some(tunnel_manager);
-        self
-    }
-
-    pub fn limiter_manager(mut self, limiter_manager: LimiterManagerRef) -> Self {
-        self.limiter_manager = Some(limiter_manager);
-        self
-    }
-
-    pub fn stat_manager(mut self, stat_manager: StatManagerRef) -> Self {
-        self.stat_manager = Some(stat_manager);
-        self
-    }
-
-    pub fn self_cert_mgr(mut self, self_cert_mgr: SelfCertMgrRef) -> Self {
-        self.self_cert_mgr = Some(self_cert_mgr);
-        self
-    }
-
-    pub fn global_collection_manager(mut self, global_collection_manager: GlobalCollectionManagerRef) -> Self {
-        self.global_collection_manager = Some(global_collection_manager);
+    pub fn stack_context(mut self, stack_context: Arc<QuicStackContext>) -> Self {
+        self.stack_context = Some(stack_context);
         self
     }
 
@@ -1327,42 +1385,25 @@ impl StackFactory for QuicStackFactory {
             .as_any()
             .downcast_ref::<QuicStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid quic stack config"))?;
-        let mut cert_list = vec![];
-        for cert_config in config.certs.iter() {
-            if cert_config.cert_path.is_some() && cert_config.key_path.is_some() {
-                let certs = load_certs(cert_config.cert_path.as_ref().unwrap().as_str()).await?;
-                let key = load_key(cert_config.key_path.as_ref().unwrap().as_str()).await?;
-                cert_list.push(TlsDomainConfig {
-                    domain: cert_config.domain.clone(),
-                    acme_type: None,
-                    certs: Some(certs),
-                    key: Some(key),
-                    data: None,
-                });
-            } else {
-                cert_list.push(TlsDomainConfig {
-                    domain: cert_config.domain.clone(),
-                    acme_type: cert_config.acme_type.clone(),
-                    certs: None,
-                    key: None,
-                    data: cert_config.data.clone(),
-                });
-            }
-        }
+        let cert_list = build_tls_domain_configs(&config.certs).await?;
+        let stack_context = Arc::new(QuicStackContext::new(
+            self.servers.clone(),
+            self.tunnel_manager.clone(),
+            self.limiter_manager.clone(),
+            self.stat_manager.clone(),
+            self.acme_manager.clone(),
+            self.self_cert_mgr.clone(),
+            Some(self.global_process_chains.clone()),
+            Some(self.global_collection_manager.clone()),
+        ));
         let stack = QuicStack::builder()
             .bind(config.bind.to_string().as_str())
-            .tunnel_manager(self.tunnel_manager.clone())
             .connection_manager(self.connection_manager.clone())
-            .global_process_chains(self.global_process_chains.clone())
-            .servers(self.servers.clone())
             .hook_point(config.hook_point.clone())
             .add_certs(cert_list)
             .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec![]).iter().map(|s| s.as_bytes().to_vec()).collect())
             .concurrency(config.concurrency.unwrap_or(1024))
-            .acme_manager(self.acme_manager.clone())
-            .limiter_manager(self.limiter_manager.clone())
-            .stat_manager(self.stat_manager.clone())
-            .self_cert_mgr(self.self_cert_mgr.clone())
+            .stack_context(stack_context)
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -1383,8 +1424,30 @@ mod tests {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use crate::{ProcessChainConfigs, QuicStack, ServerResult, StreamServer, ServerManager, TlsDomainConfig, TunnelManager, Server, ProcessChainHttpServer, Stack, QuicStackFactory, ConnectionManager, StackProtocol, QuicStackConfig, StackFactory, StreamInfo, CertManagerConfig, AcmeCertManager, LimiterManager, StatManager, SelfCertMgr, SelfCertConfig, GlobalCollectionManager};
-    use crate::global_process_chains::GlobalProcessChains;
+    use crate::{AcmeCertManager, AcmeCertManagerRef, ConnectionManager, GlobalCollectionManager, GlobalCollectionManagerRef, LimiterManager, LimiterManagerRef, ProcessChainConfigs, ProcessChainHttpServer, QuicStack, QuicStackConfig, QuicStackContext, QuicStackFactory, SelfCertMgr, SelfCertMgrRef, SelfCertConfig, Server, ServerManager, ServerManagerRef, ServerResult, Stack, StackFactory, StackProtocol, StatManager, StatManagerRef, StreamInfo, StreamServer, TlsDomainConfig, TunnelManager, CertManagerConfig};
+    use crate::global_process_chains::{GlobalProcessChains, GlobalProcessChainsRef};
+
+    fn build_quic_context(
+        servers: ServerManagerRef,
+        tunnel_manager: TunnelManager,
+        limiter_manager: LimiterManagerRef,
+        stat_manager: StatManagerRef,
+        acme_manager: AcmeCertManagerRef,
+        self_cert_mgr: SelfCertMgrRef,
+        global_process_chains: Option<GlobalProcessChainsRef>,
+        global_collection_manager: Option<GlobalCollectionManagerRef>,
+    ) -> Arc<QuicStackContext> {
+        Arc::new(QuicStackContext::new(
+            servers,
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            acme_manager,
+            self_cert_mgr,
+            global_process_chains,
+            global_collection_manager,
+        ))
+    }
 
     #[tokio::test]
     async fn test_quic_stack_creation() {
@@ -1397,36 +1460,53 @@ mod tests {
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9080")
-            .servers(Arc::new(ServerManager::new()))
             .build()
             .await;
         assert!(result.is_err());
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9080")
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
             .build()
             .await;
         assert!(result.is_err());
+        let servers = Arc::new(ServerManager::new());
         let tunnel_manager = TunnelManager::new();
+        let limiter_manager = LimiterManager::new();
+        let stat_manager = StatManager::new();
+        let acme_manager = AcmeCertManager::create(CertManagerConfig::default()).await.unwrap();
+        let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default()).await.unwrap();
+        let stack_context = build_quic_context(
+            servers.clone(),
+            tunnel_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
+            acme_manager.clone(),
+            self_cert_mgr.clone(),
+            None,
+            None,
+        );
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9080")
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
-            .tunnel_manager(tunnel_manager.clone())
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
-            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
-            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
+        let stack_context = build_quic_context(
+            servers.clone(),
+            tunnel_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
+            acme_manager.clone(),
+            self_cert_mgr.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9080")
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
@@ -1437,12 +1517,7 @@ mod tests {
                 )),
                 data: None,
             }])
-            .tunnel_manager(tunnel_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
-            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
-            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1463,12 +1538,20 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let stack_context = build_quic_context(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            LimiterManager::new(),
+            StatManager::new(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9180")
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(TunnelManager::new())
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
@@ -1478,11 +1561,7 @@ mod tests {
                 )),
                 data: None,
             }])
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
-            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
-            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1527,12 +1606,20 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let stack_context = build_quic_context(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            LimiterManager::new(),
+            StatManager::new(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9181")
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(TunnelManager::new())
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
@@ -1542,11 +1629,7 @@ mod tests {
                 )),
                 data: None,
             }])
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
-            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
-            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1594,12 +1677,20 @@ mod tests {
         let mut self_cert_config = SelfCertConfig::default();
         self_cert_config.store_path = tls_self_certs_path.clone();
 
+        let stack_context = build_quic_context(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            LimiterManager::new(),
+            StatManager::new(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(self_cert_config).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9193")
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(TunnelManager::new())
             .add_certs(vec![TlsDomainConfig {
                 domain: "*".to_string(),
                 acme_type: None,
@@ -1607,11 +1698,7 @@ mod tests {
                 key: None,
                 data: None,
             }])
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
-            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
-            .self_cert_mgr(SelfCertMgr::create(self_cert_config).await.unwrap())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1740,12 +1827,20 @@ mod tests {
 
         let server_manager = Arc::new(ServerManager::new());
         let _ = server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))));
+        let stack_context = build_quic_context(
+            server_manager.clone(),
+            tunnel_manager,
+            LimiterManager::new(),
+            StatManager::new(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9185")
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
@@ -1755,11 +1850,7 @@ mod tests {
                 )),
                 data: None,
             }])
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
-            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
-            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1843,12 +1934,20 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let tunnel_manager = TunnelManager::new();
+        let stack_context = build_quic_context(
+            server_manager.clone(),
+            tunnel_manager,
+            LimiterManager::new(),
+            StatManager::new(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9186")
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
@@ -1859,11 +1958,7 @@ mod tests {
                 data: None,
             }])
             .alpn_protocols(vec![b"h2".to_vec(), b"h3".to_vec()])
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
-            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
-            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1952,12 +2047,20 @@ mod tests {
         let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
         let server_manager = Arc::new(ServerManager::new());
         let tunnel_manager = TunnelManager::new();
+        let stack_context = build_quic_context(
+            server_manager.clone(),
+            tunnel_manager,
+            LimiterManager::new(),
+            StatManager::new(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9188")
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
@@ -1967,11 +2070,7 @@ mod tests {
                 )),
                 data: None,
             }])
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
-            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
-            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2034,12 +2133,20 @@ mod tests {
         let stat_manager = StatManager::new();
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let stack_context = build_quic_context(
+            server_manager.clone(),
+            tunnel_manager,
+            LimiterManager::new(),
+            stat_manager.clone(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9189")
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
@@ -2049,11 +2156,7 @@ mod tests {
                 )),
                 data: None,
             }])
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(stat_manager.clone())
-            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
-            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2126,12 +2229,20 @@ mod tests {
         let stat_manager = StatManager::new();
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let stack_context = build_quic_context(
+            server_manager.clone(),
+            tunnel_manager,
+            LimiterManager::new(),
+            stat_manager.clone(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9190")
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
@@ -2141,11 +2252,7 @@ mod tests {
                 )),
                 data: None,
             }])
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(stat_manager.clone())
-            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
-            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2226,12 +2333,20 @@ mod tests {
         let _ = limiter_manager.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let stack_context = build_quic_context(
+            server_manager.clone(),
+            tunnel_manager,
+            limiter_manager,
+            stat_manager.clone(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9191")
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
@@ -2241,11 +2356,7 @@ mod tests {
                 )),
                 data: None,
             }])
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(limiter_manager)
-            .stat_manager(stat_manager.clone())
-            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
-            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2326,12 +2437,20 @@ mod tests {
         let _ = limiter_manager.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let stack_context = build_quic_context(
+            server_manager.clone(),
+            tunnel_manager,
+            limiter_manager,
+            stat_manager.clone(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
         let result = QuicStack::builder()
             .id("test")
             .bind("127.0.0.1:9192")
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager)
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
@@ -2341,11 +2460,7 @@ mod tests {
                 )),
                 data: None,
             }])
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(limiter_manager)
-            .stat_manager(stat_manager.clone())
-            .acme_manager(AcmeCertManager::create(CertManagerConfig::default()).await.unwrap())
-            .self_cert_mgr(SelfCertMgr::create(SelfCertConfig::default()).await.unwrap())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());

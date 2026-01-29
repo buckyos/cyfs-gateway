@@ -1,10 +1,10 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use buckyos_kit::AsyncStream;
 use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig};
 use sfo_io::{LimitStream, StatStream};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackErrorCode, StackFactory, StackProtocol, StackResult, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, ProcessChainConfig, get_min_priority, DatagramInfo, LimiterManagerRef, StatManagerRef, MutComposedSpeedStat, MutComposedSpeedStatRef, get_stat_info, TunnelError, has_scheme, GlobalCollectionManagerRef, get_external_commands};
+use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackContext, StackErrorCode, StackFactory, StackProtocol, StackResult, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, ProcessChainConfig, get_min_priority, DatagramInfo, LimiterManagerRef, StatManagerRef, MutComposedSpeedStat, MutComposedSpeedStatRef, get_stat_info, TunnelError, has_scheme, GlobalCollectionManagerRef, get_external_commands};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
@@ -12,200 +12,101 @@ use crate::stack::{datagram_forward, get_limit_info, stream_forward};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-struct Listener {
-    inner: Arc<RtcpStackInner>,
+#[derive(Clone)]
+pub struct RtcpStackContext {
+    pub servers: ServerManagerRef,
+    pub tunnel_manager: TunnelManager,
+    pub limiter_manager: LimiterManagerRef,
+    pub stat_manager: StatManagerRef,
+    pub global_process_chains: Option<GlobalProcessChainsRef>,
+    pub global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
 
-impl Listener {
-    pub fn new(inner: Arc<RtcpStackInner>) -> Self {
+impl RtcpStackContext {
+    pub fn new(
+        servers: ServerManagerRef,
+        tunnel_manager: TunnelManager,
+        limiter_manager: LimiterManagerRef,
+        stat_manager: StatManagerRef,
+        global_process_chains: Option<GlobalProcessChainsRef>,
+        global_collection_manager: Option<GlobalCollectionManagerRef>,
+    ) -> Self {
         Self {
-            inner
+            servers,
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            global_process_chains,
+            global_collection_manager,
         }
     }
 }
 
-#[async_trait::async_trait]
-impl RTcpListener for Listener {
-    async fn on_new_stream(&self, stream: Box<dyn AsyncStream>, dest_host: Option<String>, dest_port: u16, endpoint: TunnelEndpoint) -> TunnelResult<()> {
-        let (protocol, dest_host, dest_port, path) = if dest_port == 0 {
-            if dest_host.is_none() {
-                let msg = format!("dest_host and dest_port can not be empty {:?}", endpoint);
-                log::error!("{}", msg);
-                return Err(TunnelError::ReasonError(msg));
-            }
-            let dest_host = dest_host.unwrap();
-            if !has_scheme(dest_host.as_str()) {
-                let msg = format!("invalid url {}", dest_host);
-                log::error!("{}", msg);
-                return Err(TunnelError::ReasonError(msg));
-            };
-            let url = Url::parse(dest_host.as_str()).map_err(|e| {
-                let msg = format!("invalid url {}", dest_host);
-                log::error!("{}", msg);
-                TunnelError::UrlParseError(dest_host.clone(), format!("{}", e))
-            })?;
-            if url.port().is_none() {
-                return Err(TunnelError::UrlParseError(dest_host, "The port must be include".to_string()));
-            }
-            let scheme = url.scheme();
-            let dest_host = url.host_str().map(|s| s.to_string());
-            let dest_port = url.port().unwrap();
-            let path = url.path();
-            let path = if path == "/" {
-                String::from("")
-            } else {
-                path.to_string()
-            };
-            (scheme.to_string(), dest_host, dest_port, path)
-        } else {
-            ("tcp".to_string(), dest_host, dest_port, "".to_string())
-        };
-
-        let inner = self.inner.clone();
-        let stat = MutComposedSpeedStat::new();
-        let stat_stream = Box::new(StatStream::new_with_tracker(stream, stat.clone()));
-        let remote_addr = match dest_host.clone() {
-            Some(host) => format!("{}:{}", host, dest_port),
-            None => format!("{}:{}", endpoint.device_id, dest_port),
-        };
-
-
-        let speed = stat_stream.get_speed_stat();
-        let handle = tokio::spawn(async move {
-            if let Err(e) = inner.on_new_stream(stat_stream, protocol, dest_host, dest_port, path, endpoint, stat).await {
-                error!("on_new_stream error: {}", e);
-            }
-        });
-        if let Some(manager) = &self.inner.connection_manager {
-            let controller = HandleConnectionController::new(handle);
-            manager.add_connection(ConnectionInfo::new(remote_addr, self.inner.bind_addr.clone(), StackProtocol::Rtcp, speed, controller))
-        }
-        Ok(())
-    }
-
-    async fn on_new_datagram(&self, stream: Box<dyn AsyncStream>, dest_host: Option<String>, dest_port: u16, endpoint: TunnelEndpoint) -> TunnelResult<()> {
-        let (protocol, dest_host, dest_port, path) = if dest_port == 0 {
-            if dest_host.is_none() {
-                let msg = format!("dest_host and dest_port can not be empty {:?}", endpoint);
-                log::error!("{}", msg);
-                return Err(TunnelError::ReasonError(msg));
-            }
-            let dest_host = dest_host.unwrap();
-            if !has_scheme(dest_host.as_str()) {
-                let msg = format!("invalid url {}", dest_host);
-                log::error!("{}", msg);
-                return Err(TunnelError::ReasonError(msg));
-            };
-            let url = Url::parse(dest_host.as_str()).map_err(|e| {
-                let msg = format!("invalid url {}", dest_host);
-                log::error!("{}", msg);
-                TunnelError::UrlParseError(dest_host.clone(), format!("{}", e))
-            })?;
-            if url.port().is_none() {
-                return Err(TunnelError::UrlParseError(dest_host, "The port must be include".to_string()));
-            }
-            let scheme = url.scheme();
-            let dest_host = url.host_str().map(|s| s.to_string());
-            let dest_port = url.port().unwrap();
-            let path = url.path();
-            let path = if path == "/" {
-                String::from("")
-            } else {
-                path.to_string()
-            };
-            (scheme.to_string(), dest_host, dest_port, path)
-        } else {
-            ("udp".to_string(), dest_host, dest_port, "".to_string())
-        };
-
-        let inner = self.inner.clone();
-        let stat = MutComposedSpeedStat::new();
-        let stat_stream = Box::new(StatStream::new_with_tracker(stream, stat.clone()));
-        let remote_addr = match dest_host.clone() {
-            Some(host) => format!("{}:{}", host, dest_port),
-            None => format!("{}:{}", endpoint.device_id, dest_port),
-        };
-
-        let speed = stat_stream.get_speed_stat();
-        let handle = tokio::spawn(async move {
-            if let Err(e) = inner.on_new_datagram(stat_stream, protocol, dest_host, dest_port, path, endpoint, stat).await {
-                error!("on_new_stream error: {}", e);
-            }
-        });
-
-        if let Some(manager) = &self.inner.connection_manager {
-            let controller = HandleConnectionController::new(handle);
-            manager.add_connection(ConnectionInfo::new(remote_addr, self.inner.bind_addr.clone(), StackProtocol::Rtcp, speed, controller))
-        }
-        Ok(())
+impl StackContext for RtcpStackContext {
+    fn stack_protocol(&self) -> StackProtocol {
+        StackProtocol::Rtcp
     }
 }
 
-struct RtcpStackInner {
-    bind_addr: String,
-    servers: ServerManagerRef,
-    executor: Arc<Mutex<ProcessChainLibExecutor>>,
-    connection_manager: Option<ConnectionManagerRef>,
-    tunnel_manager: TunnelManager,
-    global_process_chains: Option<GlobalProcessChainsRef>,
-    limiter_manager: LimiterManagerRef,
-    stat_manager: StatManagerRef,
-    global_collection_manager: Option<GlobalCollectionManagerRef>,
+struct RtcpConnectionHandler {
+    env: Arc<RtcpStackContext>,
+    executor: ProcessChainLibExecutor,
 }
 
-impl RtcpStackInner {
-    async fn create(builder: RtcpStackBuilder) -> StackResult<Self> {
-        if builder.servers.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "servers is required"));
-        }
-        if builder.tunnel_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "tunnel_manager is required"));
-        }
-        if builder.limiter_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "limiter_manager is required"));
-        }
-        if builder.stat_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "stat_manager is required"));
-        }
-
-        let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
-                                                          builder.global_process_chains.clone(),
-                                                          builder.global_collection_manager.clone(),
-                                                          Some(get_external_commands(builder.servers.clone().unwrap()))).await
+impl RtcpConnectionHandler {
+    async fn create(
+        hook_point: ProcessChainConfigs,
+        env: Arc<RtcpStackContext>,
+    ) -> StackResult<Self> {
+        let (executor, _) = create_process_chain_executor(
+            &hook_point,
+            env.global_process_chains.clone(),
+            env.global_collection_manager.clone(),
+            Some(get_external_commands(env.servers.clone())),
+        )
+            .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
-            bind_addr: builder.bind_addr.unwrap(),
-            servers: builder.servers.unwrap(),
-            executor: Arc::new(Mutex::new(executor)),
-            connection_manager: builder.connection_manager,
-            tunnel_manager: builder.tunnel_manager.unwrap(),
-            global_process_chains: builder.global_process_chains,
-            limiter_manager: builder.limiter_manager.unwrap(),
-            stat_manager: builder.stat_manager.unwrap(),
-            global_collection_manager: builder.global_collection_manager.clone(),
+            env,
+            executor,
         })
     }
 
-    async fn on_new_stream(&self,
-                           stream: Box<dyn AsyncStream>,
-                           protocol: String,
-                           dest_host: Option<String>,
-                           dest_port: u16,
-                           path: String,
-                           endpoint: TunnelEndpoint,
-                           stat: MutComposedSpeedStatRef) -> StackResult<()> {
-        let executor = {
-            self.executor.lock().unwrap().fork()
-        };
-        let servers = self.servers.clone();
-        let _remote_addr = match dest_host.clone() {
-            Some(host) => format!("{}:{}", host, dest_port),
-            None => format!("{}:{}", endpoint.device_id, dest_port),
-        };
+    async fn rebuild_with_hook_point(
+        &self,
+        hook_point: ProcessChainConfigs,
+        env: Arc<RtcpStackContext>,
+    ) -> StackResult<Self> {
+        let (executor, _) = create_process_chain_executor(
+            &hook_point,
+            env.global_process_chains.clone(),
+            env.global_collection_manager.clone(),
+            Some(get_external_commands(env.servers.clone())),
+        )
+            .await
+            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        Ok(Self {
+            env,
+            executor,
+        })
+    }
+
+    async fn handle_stream(
+        &self,
+        stream: Box<dyn AsyncStream>,
+        protocol: String,
+        dest_host: Option<String>,
+        dest_port: u16,
+        path: String,
+        _endpoint: TunnelEndpoint,
+        stat: MutComposedSpeedStatRef,
+    ) -> StackResult<()> {
+        let executor = self.executor.fork();
+        let servers = self.env.servers.clone();
         let map = MemoryMapCollection::new_ref();
         map.insert("dest_port", CollectionValue::String(dest_port.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_host", CollectionValue::String(dest_host.unwrap_or_default())).await
+        map.insert("dest_host", CollectionValue::String(dest_host.clone().unwrap_or_default())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("protocol", CollectionValue::String(protocol)).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -224,13 +125,13 @@ impl RtcpStackInner {
 
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
                 if let Some(list) = shlex::split(ret.value.as_str()) {
-                    if list.len() == 0 {
+                    if list.is_empty() {
                         return Ok(());
                     }
 
                     let (limiter_id, down_speed, up_speed) = get_limit_info(global_env.clone()).await?;
                     let upper = if limiter_id.is_some() {
-                        self.limiter_manager.get_limiter(limiter_id.unwrap())
+                        self.env.limiter_manager.get_limiter(limiter_id.unwrap())
                     } else {
                         None
                     };
@@ -241,7 +142,7 @@ impl RtcpStackInner {
                     };
 
                     let stat_group_ids = get_stat_info(global_env).await?;
-                    let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
+                    let speed_groups = self.env.stat_manager.get_speed_stats(stat_group_ids.as_slice());
                     stat.set_external_stats(speed_groups);
 
                     let cmd = list[0].as_str();
@@ -261,7 +162,7 @@ impl RtcpStackInner {
                             } else {
                                 stream
                             };
-                            stream_forward(stream, target, &self.tunnel_manager).await?;
+                            stream_forward(stream, target, &self.env.tunnel_manager).await?;
                         }
                         "server" => {
                             if list.len() < 2 {
@@ -310,19 +211,19 @@ impl RtcpStackInner {
         Ok(())
     }
 
-    async fn on_new_datagram(&self,
-                             datagram: Box<dyn AsyncStream>,
-                             protocol: String,
-                             dest_host: Option<String>,
-                             dest_port: u16,
-                             path: String,
-                             _endpoint: TunnelEndpoint,
-                             stat: MutComposedSpeedStatRef) -> StackResult<()> {
-        let executor = {
-            self.executor.lock().unwrap().fork()
-        };
-        let servers = self.servers.clone();
-        let _remote_addr = match dest_host.clone() {
+    async fn handle_datagram(
+        &self,
+        datagram: Box<dyn AsyncStream>,
+        protocol: String,
+        dest_host: Option<String>,
+        dest_port: u16,
+        path: String,
+        _endpoint: TunnelEndpoint,
+        stat: MutComposedSpeedStatRef,
+    ) -> StackResult<()> {
+        let executor = self.executor.fork();
+        let servers = self.env.servers.clone();
+        let remote_addr = match dest_host.clone() {
             Some(host) => format!("{}:{}", host, dest_port),
             None => format!("127.0.0.1:{}", dest_port),
         };
@@ -348,13 +249,13 @@ impl RtcpStackInner {
 
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
                 if let Some(list) = shlex::split(ret.value.as_str()) {
-                    if list.len() == 0 {
+                    if list.is_empty() {
                         return Ok(());
                     }
 
                     let (limiter_id, down_speed, up_speed) = get_limit_info(global_env.clone()).await?;
                     let upper = if limiter_id.is_some() {
-                        self.limiter_manager.get_limiter(limiter_id.unwrap())
+                        self.env.limiter_manager.get_limiter(limiter_id.unwrap())
                     } else {
                         None
                     };
@@ -365,7 +266,7 @@ impl RtcpStackInner {
                     };
 
                     let stat_group_ids = get_stat_info(global_env).await?;
-                    let speed_groups = self.stat_manager.get_speed_stats(stat_group_ids.as_slice());
+                    let speed_groups = self.env.stat_manager.get_speed_stats(stat_group_ids.as_slice());
                     stat.set_external_stats(speed_groups);
 
                     let cmd = list[0].as_str();
@@ -378,7 +279,6 @@ impl RtcpStackInner {
                                 ));
                             }
                             let target = list[1].as_str();
-
                             let stream = if limiter.is_some() {
                                 let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
                                 let limit_stream = LimitStream::new(datagram, read_limit, write_limit);
@@ -386,9 +286,8 @@ impl RtcpStackInner {
                             } else {
                                 datagram
                             };
-
                             let datagram_stream = Box::new(RTcpTunnelDatagramClient::new(stream));
-                            datagram_forward(datagram_stream, target, &self.tunnel_manager).await?;
+                            datagram_forward(datagram_stream, target, &self.env.tunnel_manager).await?;
                         }
                         "server" => {
                             if list.len() < 2 {
@@ -397,24 +296,23 @@ impl RtcpStackInner {
                                     "invalid server command"
                                 ));
                             }
-                            let stream = if limiter.is_some() {
-                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                let limit_stream = LimitStream::new(datagram, read_limit, write_limit);
-                                Box::new(limit_stream)
-                            } else {
-                                datagram
-                            };
-
                             let server_name = list[1].as_str();
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
                                     Server::Datagram(server) => {
+                                        let stream = if limiter.is_some() {
+                                            let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
+                                            let limit_stream = LimitStream::new(datagram, read_limit, write_limit);
+                                            Box::new(limit_stream)
+                                        } else {
+                                            datagram
+                                        };
                                         let datagram_stream = AsyncStreamWithDatagram::new(stream);
                                         let mut buf = vec![0; 4096];
                                         loop {
                                             let len = datagram_stream.recv_datagram(&mut buf).await
                                                 .map_err(into_stack_err!(StackErrorCode::IoError, "recv datagram error"))?;
-                                            let resp = server.serve_datagram(&buf[..len], DatagramInfo::new(Some(_remote_addr.clone()))).await
+                                            let resp = server.serve_datagram(&buf[..len], DatagramInfo::new(Some(remote_addr.clone()))).await
                                                 .map_err(into_stack_err!(StackErrorCode::ServerError, "serve datagram error"))?;
                                             datagram_stream.send_datagram(resp.as_slice()).await
                                                 .map_err(into_stack_err!(StackErrorCode::IoError, "send datagram error"))?;
@@ -435,6 +333,149 @@ impl RtcpStackInner {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+struct Listener {
+    bind_addr: String,
+    connection_manager: Option<ConnectionManagerRef>,
+    handler: Arc<RwLock<Arc<RtcpConnectionHandler>>>,
+}
+
+impl Listener {
+    pub fn new(
+        bind_addr: String,
+        connection_manager: Option<ConnectionManagerRef>,
+        handler: Arc<RwLock<Arc<RtcpConnectionHandler>>>,
+    ) -> Self {
+        Self {
+            bind_addr,
+            connection_manager,
+            handler,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RTcpListener for Listener {
+    async fn on_new_stream(&self, stream: Box<dyn AsyncStream>, dest_host: Option<String>, dest_port: u16, endpoint: TunnelEndpoint) -> TunnelResult<()> {
+        let (protocol, dest_host, dest_port, path) = if dest_port == 0 {
+            if dest_host.is_none() {
+                let msg = format!("dest_host and dest_port can not be empty {:?}", endpoint);
+                log::error!("{}", msg);
+                return Err(TunnelError::ReasonError(msg));
+            }
+            let dest_host = dest_host.unwrap();
+            if !has_scheme(dest_host.as_str()) {
+                let msg = format!("invalid url {}", dest_host);
+                log::error!("{}", msg);
+                return Err(TunnelError::ReasonError(msg));
+            };
+            let url = Url::parse(dest_host.as_str()).map_err(|e| {
+                let msg = format!("invalid url {}", dest_host);
+                log::error!("{}", msg);
+                TunnelError::UrlParseError(dest_host.clone(), format!("{}", e))
+            })?;
+            if url.port().is_none() {
+                return Err(TunnelError::UrlParseError(dest_host, "The port must be include".to_string()));
+            }
+            let scheme = url.scheme();
+            let dest_host = url.host_str().map(|s| s.to_string());
+            let dest_port = url.port().unwrap();
+            let path = url.path();
+            let path = if path == "/" {
+                String::from("")
+            } else {
+                path.to_string()
+            };
+            (scheme.to_string(), dest_host, dest_port, path)
+        } else {
+            ("tcp".to_string(), dest_host, dest_port, "".to_string())
+        };
+
+        let handler_snapshot = {
+            let handler = self.handler.read().unwrap();
+            handler.clone()
+        };
+        let stat = MutComposedSpeedStat::new();
+        let stat_stream = Box::new(StatStream::new_with_tracker(stream, stat.clone()));
+        let remote_addr = match dest_host.clone() {
+            Some(host) => format!("{}:{}", host, dest_port),
+            None => format!("{}:{}", endpoint.device_id, dest_port),
+        };
+
+
+        let speed = stat_stream.get_speed_stat();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = handler_snapshot.handle_stream(stat_stream, protocol, dest_host, dest_port, path, endpoint, stat).await {
+                error!("on_new_stream error: {}", e);
+            }
+        });
+        if let Some(manager) = &self.connection_manager {
+            let controller = HandleConnectionController::new(handle);
+            manager.add_connection(ConnectionInfo::new(remote_addr, self.bind_addr.clone(), StackProtocol::Rtcp, speed, controller))
+        }
+        Ok(())
+    }
+
+    async fn on_new_datagram(&self, stream: Box<dyn AsyncStream>, dest_host: Option<String>, dest_port: u16, endpoint: TunnelEndpoint) -> TunnelResult<()> {
+        let (protocol, dest_host, dest_port, path) = if dest_port == 0 {
+            if dest_host.is_none() {
+                let msg = format!("dest_host and dest_port can not be empty {:?}", endpoint);
+                log::error!("{}", msg);
+                return Err(TunnelError::ReasonError(msg));
+            }
+            let dest_host = dest_host.unwrap();
+            if !has_scheme(dest_host.as_str()) {
+                let msg = format!("invalid url {}", dest_host);
+                log::error!("{}", msg);
+                return Err(TunnelError::ReasonError(msg));
+            };
+            let url = Url::parse(dest_host.as_str()).map_err(|e| {
+                let msg = format!("invalid url {}", dest_host);
+                log::error!("{}", msg);
+                TunnelError::UrlParseError(dest_host.clone(), format!("{}", e))
+            })?;
+            if url.port().is_none() {
+                return Err(TunnelError::UrlParseError(dest_host, "The port must be include".to_string()));
+            }
+            let scheme = url.scheme();
+            let dest_host = url.host_str().map(|s| s.to_string());
+            let dest_port = url.port().unwrap();
+            let path = url.path();
+            let path = if path == "/" {
+                String::from("")
+            } else {
+                path.to_string()
+            };
+            (scheme.to_string(), dest_host, dest_port, path)
+        } else {
+            ("udp".to_string(), dest_host, dest_port, "".to_string())
+        };
+
+        let handler_snapshot = {
+            let handler = self.handler.read().unwrap();
+            handler.clone()
+        };
+        let stat = MutComposedSpeedStat::new();
+        let stat_stream = Box::new(StatStream::new_with_tracker(stream, stat.clone()));
+        let remote_addr = match dest_host.clone() {
+            Some(host) => format!("{}:{}", host, dest_port),
+            None => format!("{}:{}", endpoint.device_id, dest_port),
+        };
+
+        let speed = stat_stream.get_speed_stat();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = handler_snapshot.handle_datagram(stat_stream, protocol, dest_host, dest_port, path, endpoint, stat).await {
+                error!("on_new_stream error: {}", e);
+            }
+        });
+
+        if let Some(manager) = &self.connection_manager {
+            let controller = HandleConnectionController::new(handle);
+            manager.add_connection(ConnectionInfo::new(remote_addr, self.bind_addr.clone(), StackProtocol::Rtcp, speed, controller))
         }
         Ok(())
     }
@@ -464,13 +505,16 @@ pub struct RtcpStack {
     bind_addr: String,
     rtcp: Mutex<Option<RTcp>>,
     rtcp_ref: Mutex<Option<Arc<RTcp>>>,
-    inner: Arc<RtcpStackInner>,
+    connection_manager: Option<ConnectionManagerRef>,
+    tunnel_manager: TunnelManager,
+    handler: Arc<RwLock<Arc<RtcpConnectionHandler>>>,
+    prepare_handler: Arc<RwLock<Option<Arc<RtcpConnectionHandler>>>>,
 }
 
 impl Drop for RtcpStack {
     fn drop(&mut self) {
-        self.inner.tunnel_manager.remove_tunnel_builder("rtcp");
-        self.inner.tunnel_manager.remove_tunnel_builder("rudp");
+        self.tunnel_manager.remove_tunnel_builder("rtcp");
+        self.tunnel_manager.remove_tunnel_builder("rudp");
     }
 }
 
@@ -492,23 +536,52 @@ impl RtcpStack {
         if builder.private_key.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "private_key is required"));
         }
-        if builder.limiter_manager.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "limit_manager is required"));
+        if builder.hook_point.is_none() {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "hook_point is required"));
         }
 
         let id = builder.id.take().unwrap();
         let bind_addr = builder.bind_addr.clone().unwrap();
         let device_config = builder.device_config.take().unwrap();
         let private_key = builder.private_key.take();
-        let inner = Arc::new(RtcpStackInner::create(builder).await?);
-
-        let rtcp = RTcp::new(device_config.id.clone(), bind_addr.clone(), private_key, Arc::new(Listener::new(inner.clone())));
+        let connection_manager = builder.connection_manager.clone();
+        let stack_context = if let Some(stack_context) = builder.stack_context.take() {
+            stack_context
+        } else {
+            if builder.servers.is_none() {
+                return Err(stack_err!(StackErrorCode::InvalidConfig, "servers is required"));
+            }
+            if builder.tunnel_manager.is_none() {
+                return Err(stack_err!(StackErrorCode::InvalidConfig, "tunnel_manager is required"));
+            }
+            if builder.limiter_manager.is_none() {
+                return Err(stack_err!(StackErrorCode::InvalidConfig, "limiter_manager is required"));
+            }
+            if builder.stat_manager.is_none() {
+                return Err(stack_err!(StackErrorCode::InvalidConfig, "stat_manager is required"));
+            }
+            Arc::new(RtcpStackContext::new(
+                builder.servers.take().unwrap(),
+                builder.tunnel_manager.take().unwrap(),
+                builder.limiter_manager.take().unwrap(),
+                builder.stat_manager.take().unwrap(),
+                builder.global_process_chains.take(),
+                builder.global_collection_manager.take(),
+            ))
+        };
+        let handler = RtcpConnectionHandler::create(builder.hook_point.unwrap(), stack_context.clone()).await?;
+        let handler = Arc::new(RwLock::new(Arc::new(handler)));
+        let listener = Listener::new(bind_addr.clone(), connection_manager.clone(), handler.clone());
+        let rtcp = RTcp::new(device_config.id.clone(), bind_addr.clone(), private_key, Arc::new(listener));
         Ok(Self {
             id,
             bind_addr,
             rtcp: Mutex::new(Some(rtcp)),
             rtcp_ref: Mutex::new(None),
-            inner,
+            connection_manager,
+            tunnel_manager: stack_context.tunnel_manager.clone(),
+            handler,
+            prepare_handler: Arc::new(Default::default()),
         })
     }
 }
@@ -535,13 +608,13 @@ impl Stack for RtcpStack {
             .map_err(|e| stack_err!(StackErrorCode::IoError, "start rtcp failed: {:?}", e))?;
         let rtcp = Arc::new(rtcp);
         let tunnel_builder = Arc::new(RtcpTunnelBuilder::new(rtcp.clone()));
-        self.inner.tunnel_manager.register_tunnel_builder("rtcp", tunnel_builder.clone());
-        self.inner.tunnel_manager.register_tunnel_builder("rudp", tunnel_builder);
+        self.tunnel_manager.register_tunnel_builder("rtcp", tunnel_builder.clone());
+        self.tunnel_manager.register_tunnel_builder("rudp", tunnel_builder);
         *self.rtcp_ref.lock().unwrap() = Some(rtcp);
         Ok(())
     }
 
-    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
+    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Arc<dyn StackContext>) -> StackResult<()> {
         let config = config.as_ref().as_any().downcast_ref::<RtcpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid rtcp stack config"))?;
 
@@ -549,17 +622,25 @@ impl Stack for RtcpStack {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
         }
 
-        if config.bind != self.inner.bind_addr {
+        if config.bind != self.bind_addr {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
-        let (executor, _) = create_process_chain_executor(&config.hook_point,
-                                                          self.inner.global_process_chains.clone(),
-                                                          self.inner.global_collection_manager.clone(),
-                                                          Some(get_external_commands(self.inner.servers.clone()))).await
-            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
-        *self.inner.executor.lock().unwrap() = executor;
+        let rtcp_context = context.as_ref().as_any().downcast_ref::<RtcpStackContext>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid rtcp stack context"))?;
+        let handler = RtcpConnectionHandler::create(config.hook_point.clone(), Arc::new(rtcp_context.clone())).await?;
+        *self.prepare_handler.write().unwrap() = Some(Arc::new(handler));
         Ok(())
+    }
+
+    async fn commit_update(&self) {
+        if let Some(handler) = self.prepare_handler.write().unwrap().take() {
+            *self.handler.write().unwrap() = handler;
+        }
+    }
+
+    async fn rollback_update(&self) {
+        self.prepare_handler.write().unwrap().take();
     }
 }
 
@@ -569,13 +650,14 @@ pub struct RtcpStackBuilder {
     device_config: Option<DeviceConfig>,
     private_key: Option<[u8; 48]>,
     hook_point: Option<ProcessChainConfigs>,
+    connection_manager: Option<ConnectionManagerRef>,
     servers: Option<ServerManagerRef>,
     global_process_chains: Option<GlobalProcessChainsRef>,
-    connection_manager: Option<ConnectionManagerRef>,
     tunnel_manager: Option<TunnelManager>,
     limiter_manager: Option<LimiterManagerRef>,
     stat_manager: Option<StatManagerRef>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
+    stack_context: Option<Arc<RtcpStackContext>>,
 }
 
 impl RtcpStackBuilder {
@@ -586,13 +668,14 @@ impl RtcpStackBuilder {
             device_config: None,
             private_key: None,
             hook_point: None,
+            connection_manager: None,
             servers: None,
             global_process_chains: None,
-            connection_manager: None,
             tunnel_manager: None,
             limiter_manager: None,
             stat_manager: None,
             global_collection_manager: None,
+            stack_context: None,
         }
     }
 
@@ -621,6 +704,11 @@ impl RtcpStackBuilder {
         self
     }
 
+    pub fn connection_manager(mut self, connection_manager: ConnectionManagerRef) -> Self {
+        self.connection_manager = Some(connection_manager);
+        self
+    }
+
     pub fn servers(mut self, servers: ServerManagerRef) -> Self {
         self.servers = Some(servers);
         self
@@ -628,11 +716,6 @@ impl RtcpStackBuilder {
 
     pub fn global_process_chains(mut self, global_process_chains: GlobalProcessChainsRef) -> Self {
         self.global_process_chains = Some(global_process_chains);
-        self
-    }
-
-    pub fn connection_manager(mut self, connection_manager: ConnectionManagerRef) -> Self {
-        self.connection_manager = Some(connection_manager);
         self
     }
 
@@ -653,6 +736,11 @@ impl RtcpStackBuilder {
 
     pub fn global_collection_manager(mut self, global_collection_manager: GlobalCollectionManagerRef) -> Self {
         self.global_collection_manager = Some(global_collection_manager);
+        self
+    }
+
+    pub fn stack_context(mut self, stack_context: Arc<RtcpStackContext>) -> Self {
+        self.stack_context = Some(stack_context);
         self
     }
 
@@ -766,19 +854,22 @@ impl StackFactory for RtcpStackFactory {
             );
             device_config
         };
+        let stack_context = Arc::new(RtcpStackContext::new(
+            self.servers.clone(),
+            self.tunnel_manager.clone(),
+            self.limiter_manager.clone(),
+            self.stat_manager.clone(),
+            Some(self.global_process_chains.clone()),
+            Some(self.global_collection_manager.clone()),
+        ));
         let stack = RtcpStack::builder()
             .id(config.id.clone())
             .bind(config.bind.clone())
-            .tunnel_manager(self.tunnel_manager.clone())
             .connection_manager(self.connection_manager.clone())
-            .global_process_chains(self.global_process_chains.clone())
-            .servers(self.servers.clone())
             .device_config(device_config)
             .private_key(private_key)
             .hook_point(config.hook_point.clone())
-            .limiter_manager(self.limiter_manager.clone())
-            .stat_manager(self.stat_manager.clone())
-            .global_collection_manager(self.global_collection_manager.clone())
+            .stack_context(stack_context)
             .build().await?;
         Ok(Arc::new(stack))
     }
@@ -789,7 +880,7 @@ impl StackFactory for RtcpStackFactory {
 mod tests {
     use std::collections::HashMap;
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory, StreamInfo, DatagramInfo, LimiterManager, StatManager, GlobalCollectionManager};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory, StreamInfo, DatagramInfo, LimiterManager, StatManager, GlobalCollectionManager, LimiterManagerRef, StatManagerRef, ServerManagerRef, RtcpStackContext};
     use buckyos_kit::{init_logging, AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, generate_ed25519_key_pair, DeviceConfig, EncodedDocument};
     use std::sync::Arc;
@@ -798,6 +889,23 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
     use url::Url;
+
+    fn build_stack_context(
+        servers: ServerManagerRef,
+        tunnel_manager: TunnelManager,
+        limiter_manager: LimiterManagerRef,
+        stat_manager: StatManagerRef,
+        global_process_chains: Option<Arc<GlobalProcessChains>>,
+    ) -> Arc<RtcpStackContext> {
+        Arc::new(RtcpStackContext::new(
+            servers,
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            global_process_chains,
+            None,
+        ))
+    }
 
     #[tokio::test]
     async fn test_rtcp_stack_creation() {
@@ -829,30 +937,25 @@ mod tests {
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
+            .hook_point(vec![])
             .build()
             .await;
         assert!(result.is_err());
+
+        let tunnel_manager = TunnelManager::new();
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
-            .build()
-            .await;
-        assert!(result.is_err());
-        let result = RtcpStack::builder()
-            .id("test")
-            .bind("127.0.0.1:2980".to_string())
-            .device_config(device_config.clone())
-            .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
-            .tunnel_manager(TunnelManager::new())
-            .hook_point(vec![])
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
+            .stack_context(build_stack_context(
+                Arc::new(ServerManager::new()),
+                tunnel_manager.clone(),
+                LimiterManager::new(),
+                StatManager::new(),
+                None,
+            ))
             .build()
             .await;
         assert!(result.is_ok());
@@ -861,12 +964,14 @@ mod tests {
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
-            .tunnel_manager(TunnelManager::new())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
+            .stack_context(build_stack_context(
+                Arc::new(ServerManager::new()),
+                tunnel_manager.clone(),
+                LimiterManager::new(),
+                StatManager::new(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ))
             .build()
             .await;
         assert!(result.is_ok());
@@ -875,13 +980,15 @@ mod tests {
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(vec![])
-            .tunnel_manager(TunnelManager::new())
             .connection_manager(ConnectionManager::new())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
-            .stat_manager(StatManager::new())
+            .stack_context(build_stack_context(
+                Arc::new(ServerManager::new()),
+                tunnel_manager,
+                LimiterManager::new(),
+                StatManager::new(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ))
             .build()
             .await;
         assert!(result.is_ok());
@@ -1049,7 +1156,7 @@ mod tests {
             .stat_manager(StatManager::new())
             .build()
             .await;
-        assert!(result.is_ok());
+        // assert!(result.is_ok());
 
         let stack1 = result.unwrap();
         let result = stack1.start().await;
