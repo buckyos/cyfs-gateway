@@ -8,7 +8,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor};
-use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerManagerRef, ServerResult, StreamInfo, TunnelManager};
+use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerRef, ServerResult, StreamInfo, TunnelManager};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err,into_server_err};
 use crate::tunnel_connector::TunnelConnector;
@@ -363,40 +363,74 @@ impl ServerConfig for ProcessChainHttpServerConfig {
     }
 }
 
-pub struct ProcessChainHttpServerFactory {
-    server_mgr: ServerManagerRef,
-    global_process_chains: GlobalProcessChainsRef,
-    tunnel_mgr: TunnelManager,
-    global_collection_manager: GlobalCollectionManagerRef,
+#[derive(Clone)]
+pub struct HttpServerContext {
+    pub server_mgr: ServerManagerRef,
+    pub global_process_chains: GlobalProcessChainsRef,
+    pub tunnel_manager: TunnelManager,
+    pub global_collection_manager: GlobalCollectionManagerRef,
 }
 
-impl ProcessChainHttpServerFactory {
-    pub fn new(server_mgr: ServerManagerRef,
-               global_process_chains: GlobalProcessChainsRef,
-               tunnel_mgr: TunnelManager,
-               global_collection_manager: GlobalCollectionManagerRef, ) -> Self {
+impl HttpServerContext {
+    pub fn new(
+        server_mgr: ServerManagerRef,
+        global_process_chains: GlobalProcessChainsRef,
+        tunnel_manager: TunnelManager,
+        global_collection_manager: GlobalCollectionManagerRef,
+    ) -> Self {
         Self {
             server_mgr,
             global_process_chains,
-            tunnel_mgr,
+            tunnel_manager,
             global_collection_manager,
         }
     }
 }
 
+impl ServerContext for HttpServerContext {
+    fn get_server_type(&self) -> String {
+        "http".to_string()
+    }
+}
+
+pub struct ProcessChainHttpServerFactory;
+
+impl ProcessChainHttpServerFactory {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 #[async_trait::async_trait]
 impl ServerFactory for ProcessChainHttpServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
+    async fn create(
+        &self,
+        config: Arc<dyn ServerConfig>,
+        context: Option<ServerContextRef>,
+    ) -> ServerResult<Vec<Server>> {
         let config = config.as_any().downcast_ref::<ProcessChainHttpServerConfig>()
             .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid process chain http server config"))?;
+
+        let context = context.ok_or(server_err!(
+            ServerErrorCode::InvalidConfig,
+            "http server context is required"
+        ))?;
+        let context = context
+            .as_ref()
+            .as_any()
+            .downcast_ref::<HttpServerContext>()
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid http server context"
+            ))?;
 
         let mut builder = ProcessChainHttpServer::builder()
             .hook_point(config.hook_point.clone())
             .id(config.id.clone())
-            .server_mgr(self.server_mgr.clone())
-            .tunnel_manager(self.tunnel_mgr.clone())
-            .global_process_chains(self.global_process_chains.clone())
-            .global_collection_manager(self.global_collection_manager.clone());
+            .server_mgr(context.server_mgr.clone())
+            .tunnel_manager(context.tunnel_manager.clone())
+            .global_process_chains(context.global_process_chains.clone())
+            .global_collection_manager(context.global_collection_manager.clone());
         if config.h3_port.is_some() {
             builder = builder.h3_port(config.h3_port.clone().unwrap());
         }
@@ -900,13 +934,14 @@ mod tests {
             h3_port: None,
             hook_point: ProcessChainConfigs::default(),
         };
-        let factory = ProcessChainHttpServerFactory::new(
+        let context = HttpServerContext::new(
             Arc::new(ServerManager::new()),
             Arc::new(GlobalProcessChains::new()),
             TunnelManager::new(),
-            GlobalCollectionManager::create(vec![]).await.unwrap()
+            GlobalCollectionManager::create(vec![]).await.unwrap(),
         );
-        let result = factory.create(Arc::new(config)).await;
+        let factory = ProcessChainHttpServerFactory::new();
+        let result = factory.create(Arc::new(config), Some(Arc::new(context))).await;
         assert!(result.is_ok());
     }
 }

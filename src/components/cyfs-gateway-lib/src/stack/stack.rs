@@ -66,7 +66,11 @@ pub trait Stack: Send + Sync + 'static {
     fn stack_protocol(&self) -> StackProtocol;
     fn get_bind_addr(&self) -> String;
     async fn start(&self) -> StackResult<()>;
-    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {Ok(())}
+    async fn update_config(&self, config: Arc<dyn StackConfig>) -> StackResult<()> {
+        self.prepare_update(config, None).await?;
+        self.commit_update().await;
+        Ok(())
+    }
     async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Option<Arc<dyn StackContext>>) -> StackResult<()>;
     async fn commit_update(&self);
     async fn rollback_update(&self);
@@ -133,7 +137,11 @@ impl StackManager {
 
 #[async_trait::async_trait]
 pub trait StackFactory: Send + Sync {
-    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackRef>;
+    async fn create(
+        &self,
+        config: Arc<dyn StackConfig>,
+        context: Arc<dyn StackContext>,
+    ) -> StackResult<StackRef>;
 }
 
 pub struct CyfsStackFactory {
@@ -161,7 +169,11 @@ impl CyfsStackFactory {
 
 #[async_trait::async_trait]
 impl StackFactory for CyfsStackFactory {
-    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackRef> {
+    async fn create(
+        &self,
+        config: Arc<dyn StackConfig>,
+        context: Arc<dyn StackContext>,
+    ) -> StackResult<StackRef> {
         let protocol = config.stack_protocol();
         let factory = {
             self.stack_factory.lock().unwrap().get(&protocol).cloned()
@@ -169,6 +181,6 @@ impl StackFactory for CyfsStackFactory {
         if factory.is_none() {
             return Err(stack_err!(StackErrorCode::UnsupportedStackProtocol, "unsupported stack protocol {:?}", protocol));
         }
-        factory.unwrap().create(config).await
+        factory.unwrap().create(config, context).await
     }
 }

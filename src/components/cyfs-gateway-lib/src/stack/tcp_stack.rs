@@ -567,33 +567,15 @@ impl StackConfig for TcpStackConfig {
 }
 
 pub struct TcpStackFactory {
-    servers: ServerManagerRef,
-    global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
-    tunnel_manager: TunnelManager,
-    limiter_manager: LimiterManagerRef,
-    stat_manager: StatManagerRef,
-    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl TcpStackFactory {
     pub fn new(
-        servers: ServerManagerRef,
-        global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
-        tunnel_manager: TunnelManager,
-        limiter_manager: LimiterManagerRef,
-        stat_manager: StatManagerRef,
-        global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         Self {
-            servers,
-            global_process_chains,
             connection_manager,
-            tunnel_manager,
-            limiter_manager,
-            stat_manager,
-            global_collection_manager,
         }
     }
 }
@@ -603,17 +585,16 @@ impl StackFactory for TcpStackFactory {
     async fn create(
         &self,
         config: Arc<dyn StackConfig>,
+        context: Arc<dyn StackContext>,
     ) -> StackResult<StackRef> {
         let config = config.as_ref().as_any().downcast_ref::<TcpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tcp stack config"))?;
-        let handler_env = Arc::new(TcpStackContext::new(
-            self.servers.clone(),
-            self.tunnel_manager.clone(),
-            self.limiter_manager.clone(),
-            self.stat_manager.clone(),
-            Some(self.global_process_chains.clone()),
-            Some(self.global_collection_manager.clone()),
-        ));
+        let handler_env = context
+            .as_ref()
+            .as_any()
+            .downcast_ref::<TcpStackContext>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tcp stack context"))?;
+        let handler_env = Arc::new(handler_env.clone());
         let stack = TcpStack::builder()
             .id(config.id.clone())
             .bind(config.bind.to_string())
@@ -630,7 +611,7 @@ impl StackFactory for TcpStackFactory {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, StreamInfo, LimiterManager, StatManager, GlobalCollectionManager, TcpStackContext, ServerManagerRef, LimiterManagerRef, StatManagerRef};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, StreamInfo, DefaultLimiterManager, StatManager, GlobalCollectionManager, TcpStackContext, ServerManagerRef, LimiterManagerRef, StatManagerRef};
     use buckyos_kit::{AsyncStream};
     use std::sync::Arc;
     use std::time::Instant;
@@ -658,7 +639,7 @@ mod tests {
         build_handler_env(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             StatManager::new(),
             None,
         )
@@ -668,7 +649,7 @@ mod tests {
         build_handler_env(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         )
@@ -737,7 +718,7 @@ mod tests {
         let handler_env = build_handler_env(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -783,7 +764,7 @@ mod tests {
         let handler_env = build_handler_env(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -825,7 +806,7 @@ mod tests {
         let handler_env = build_handler_env(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -889,7 +870,7 @@ mod tests {
         let handler_env = build_handler_env(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -960,7 +941,7 @@ mod tests {
         let handler_env = build_handler_env(
             server_manager,
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -1008,7 +989,7 @@ mod tests {
         let handler_env = build_handler_env(
             server_manager,
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             stat_manager.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -1062,7 +1043,7 @@ mod tests {
         let handler_env = build_handler_env(
             server_manager,
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             stat_manager.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -1114,7 +1095,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let stat_manager = StatManager::new();
-        let limiter_manager = LimiterManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
         let _ = limiter_manager.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
@@ -1173,7 +1154,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let stat_manager = StatManager::new();
-        let limiter_manager = LimiterManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
         let _ = limiter_manager.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
@@ -1218,13 +1199,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_factory() {
-        let tcp_factory = TcpStackFactory::new(Arc::new(ServerManager::new()),
-                                               Arc::new(GlobalProcessChains::new()),
-                                               ConnectionManager::new(),
-                                               TunnelManager::new(),
-                                               LimiterManager::new(),
-                                               StatManager::new(),
-                                               GlobalCollectionManager::create(vec![]).await.unwrap());
+        let server_manager = Arc::new(ServerManager::new());
+        let global_process_chains = Arc::new(GlobalProcessChains::new());
+        let tunnel_manager = TunnelManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
+        let stat_manager = StatManager::new();
+        let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
+        let tcp_factory = TcpStackFactory::new(ConnectionManager::new());
         let config = TcpStackConfig {
             id: "test".to_string(),
             protocol: StackProtocol::Tcp,
@@ -1233,7 +1214,15 @@ mod tests {
             hook_point: vec![],
         };
 
-        let ret = tcp_factory.create(Arc::new(config)).await;
+        let stack_context = Arc::new(TcpStackContext::new(
+            server_manager,
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            Some(global_process_chains),
+            Some(collection_manager),
+        ));
+        let ret = tcp_factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());
     }
 }

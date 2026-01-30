@@ -632,46 +632,26 @@ impl crate::StackConfig for TlsStackConfig {
 }
 
 pub struct TlsStackFactory {
-    servers: ServerManagerRef,
-    global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
-    tunnel_manager: TunnelManager,
-    acme_manager: AcmeCertManagerRef,
-    limiter_manager: LimiterManagerRef,
-    stat_manager: StatManagerRef,
-    self_cert_mgr: SelfCertMgrRef,
-    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl TlsStackFactory {
     pub fn new(
-        servers: ServerManagerRef,
-        global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
-        tunnel_manager: TunnelManager,
-        acme_manager: AcmeCertManagerRef,
-        limiter_manager: LimiterManagerRef,
-        stat_manager: StatManagerRef,
-        self_cert_mgr: SelfCertMgrRef,
-        global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         Self {
-            servers,
-            global_process_chains,
             connection_manager,
-            tunnel_manager,
-            acme_manager,
-            limiter_manager,
-            stat_manager,
-            self_cert_mgr,
-            global_collection_manager,
         }
     }
 }
 
 #[async_trait::async_trait]
 impl crate::StackFactory for TlsStackFactory {
-    async fn create(&self, config: Arc<dyn crate::StackConfig>) -> crate::StackResult<crate::StackRef> {
+    async fn create(
+        &self,
+        config: Arc<dyn crate::StackConfig>,
+        context: Arc<dyn crate::StackContext>,
+    ) -> crate::StackResult<crate::StackRef> {
         let config = config
             .as_any()
             .downcast_ref::<TlsStackConfig>()
@@ -679,16 +659,12 @@ impl crate::StackFactory for TlsStackFactory {
 
         let cert_list = build_tls_domain_configs(&config.certs).await?;
 
-        let stack_context = Arc::new(TlsStackContext::new(
-            self.servers.clone(),
-            self.tunnel_manager.clone(),
-            self.limiter_manager.clone(),
-            self.stat_manager.clone(),
-            self.acme_manager.clone(),
-            self.self_cert_mgr.clone(),
-            Some(self.global_process_chains.clone()),
-            Some(self.global_collection_manager.clone()),
-        ));
+        let stack_context = context
+            .as_ref()
+            .as_any()
+            .downcast_ref::<TlsStackContext>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tls stack context"))?;
+        let stack_context = Arc::new(stack_context.clone());
 
         let stack = TlsStack::builder()
             .id(config.id.clone())
@@ -785,8 +761,8 @@ impl TlsStackBuilder {
 mod tests {
     use super::{load_certs, load_key};
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, StreamInfo, LimiterManager, StatManager, GlobalCollectionManager};
-    use crate::{LimiterManagerRef, ServerManagerRef, StatManagerRef, TlsDomainConfig, TlsStack, TlsStackContext};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, StreamInfo, DefaultLimiterManager, StatManager, GlobalCollectionManager};
+    use crate::{LimiterManagerRef, ServerManagerRef, StackContext, StatManagerRef, TlsDomainConfig, TlsStack, TlsStackContext};
     use buckyos_kit::{init_logging, AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
     use rcgen::{generate_simple_self_signed, BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
@@ -843,7 +819,7 @@ mod tests {
             .stack_context(build_stack_context(
                 Arc::new(ServerManager::new()),
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
@@ -859,7 +835,7 @@ mod tests {
             .stack_context(build_stack_context(
                 Arc::new(ServerManager::new()),
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
@@ -884,7 +860,7 @@ mod tests {
             .stack_context(build_stack_context(
                 Arc::new(ServerManager::new()),
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
@@ -927,7 +903,7 @@ mod tests {
             .stack_context(build_stack_context(
                 Arc::new(ServerManager::new()),
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
@@ -992,7 +968,7 @@ mod tests {
             .stack_context(build_stack_context(
                 Arc::new(ServerManager::new()),
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
@@ -1059,7 +1035,7 @@ mod tests {
             .stack_context(build_stack_context(
                 Arc::new(ServerManager::new()),
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
@@ -1147,7 +1123,7 @@ mod tests {
             .stack_context(build_stack_context(
                 Arc::new(ServerManager::new()),
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
@@ -1218,7 +1194,7 @@ mod tests {
             .stack_context(build_stack_context(
                 Arc::new(ServerManager::new()),
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(self_cert_config).await.unwrap(),
@@ -1385,7 +1361,7 @@ mod tests {
             .stack_context(build_stack_context(
                 server_manager,
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
@@ -1477,7 +1453,7 @@ mod tests {
             .stack_context(build_stack_context(
                 server_manager,
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
@@ -1585,7 +1561,7 @@ mod tests {
             .stack_context(build_stack_context(
                 server_manager,
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
@@ -1643,17 +1619,13 @@ mod tests {
         cert_config.keystore_path = data_dir.path().to_string_lossy().to_string();
         let cert_manager = AcmeCertManager::create(cert_config).await.unwrap();
         let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default()).await.unwrap();
-        let factory = TlsStackFactory::new(
-            Arc::new(ServerManager::new()),
-            Arc::new(GlobalProcessChains::new()),
-            ConnectionManager::new(),
-            TunnelManager::new(),
-            cert_manager,
-            LimiterManager::new(),
-            StatManager::new(),
-            self_cert_mgr,
-            GlobalCollectionManager::create(vec![]).await.unwrap(),
-        );
+        let server_manager = Arc::new(ServerManager::new());
+        let global_process_chains = Arc::new(GlobalProcessChains::new());
+        let tunnel_manager = TunnelManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
+        let stat_manager = StatManager::new();
+        let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
+        let factory = TlsStackFactory::new(ConnectionManager::new());
 
         let config = TlsStackConfig {
             id: "test".to_string(),
@@ -1664,7 +1636,17 @@ mod tests {
             concurrency: None,
             alpn_protocols: None,
         };
-        let ret = factory.create(Arc::new(config)).await;
+        let stack_context: Arc<dyn StackContext> = Arc::new(TlsStackContext::new(
+            server_manager,
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            cert_manager,
+            self_cert_mgr,
+            Some(global_process_chains),
+            Some(collection_manager),
+        ));
+        let ret = factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());
     }
 
@@ -1704,7 +1686,7 @@ mod tests {
             .stack_context(build_stack_context(
                 server_manager,
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 stat_manager.clone(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
@@ -1782,7 +1764,7 @@ mod tests {
             .stack_context(build_stack_context(
                 server_manager,
                 TunnelManager::new(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 stat_manager.clone(),
                 AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
                 SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
@@ -1844,7 +1826,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let stat_manager = StatManager::new();
-        let limiter_manager = LimiterManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
         let _ = limiter_manager.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
@@ -1927,7 +1909,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let stat_manager = StatManager::new();
-        let limiter_manager = LimiterManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
         let _ = limiter_manager.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();

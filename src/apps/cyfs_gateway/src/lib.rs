@@ -44,7 +44,7 @@ use tokio::task;
 use url::Url;
 use cyfs_sn::{SnServerFactory, SqliteDBFactory};
 use cyfs_socks::SocksServerFactory;
-use cyfs_tun::TunStackFactory;
+use cyfs_tun::{TunStackFactory};
 
 
 #[derive(Deserialize)]
@@ -115,15 +115,6 @@ async fn run_gateway_with_config(
         None
     };
 
-    let user_name: Option<String> = match config_json.get("user_name") {
-        Some(user_name) => user_name.as_str().map(|value| value.to_string()),
-        None => None,
-    };
-    let password: Option<String> = match config_json.get("password") {
-        Some(password) => password.as_str().map(|value| value.to_string()),
-        None => None,
-    };
-
     let parser = Arc::new(GatewayConfigParser::new());
     parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
     parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
@@ -150,223 +141,63 @@ async fn run_gateway_with_config(
     info!("Parse cyfs-gatway config success");
 
     let connect_manager = ConnectionManager::new();
-    let tunnel_manager = TunnelManager::new();
-    let stack_manager = StackManager::new();
-    let server_manager = Arc::new(ServerManager::new());
-    let global_process_chains = Arc::new(GlobalProcessChains::new());
-    let limiter_manager = LimiterManager::new();
-    let stat_manager = StatManager::new();
-    if let Some(limiters_config) = gateway_config.limiters_config.clone() {
-        for limiter_config in limiters_config.iter() {
-            if limiter_manager.get_limiter(limiter_config.id.as_str()).is_some() {
-                log::error!("Create limiter {} error: limiter already exists", limiter_config.id);
-                continue;
-            }
-            if let Some(upper_limiter) = limiter_config.upper_limiter.clone() {
-                if limiter_manager.get_limiter(upper_limiter.as_str()).is_none() {
-                    log::error!("Create limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
-                }
-            }
-            let _ = limiter_manager.new_limiter(
-                limiter_config.id.clone(),
-                limiter_config.upper_limiter.clone(),
-                limiter_config.concurrent.map(|v| v as u32),
-                limiter_config.download_speed.map(|v| v as u32),
-                limiter_config.upload_speed.map(|v| v as u32),
-            );
-        }
-    }
 
-    let sn_acme_data = get_buckyos_service_data_dir("cyfs_gateway").join("sn_dns");
-    if !sn_acme_data.exists() {
-        std::fs::create_dir_all(&sn_acme_data).unwrap();
-    }
-    let sn_provider_factory = AcmeSnProviderFactory::new(sn_acme_data);
-    AcmeCertManager::register_dns_provider_factory("sn-dns", sn_provider_factory.clone());
-    let mut cert_config = CertManagerConfig::default();
-    let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
-    let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
-    cert_config.keystore_path = data_dir.to_string_lossy().to_string();
-    if let Some(acme_config) = gateway_config.acme_config.clone() {
-        cert_config.account = acme_config.account;
-        if acme_config.issuer.is_some() {
-            cert_config.acme_server = acme_config.issuer.unwrap();
-        }
-        cert_config.dns_providers = acme_config.dns_providers;
-        if acme_config.check_interval.is_some() {
-            if let Some(check_interval) = chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0) {
-                cert_config.check_interval = check_interval;
-            }
-        }
-
-        if acme_config.renew_before_expiry.is_some() {
-            if let Some(renew_before_expiry) = chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0) {
-                cert_config.renew_before_expiry = renew_before_expiry;
-            }
-        }
-    }
-    cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
-
-    let cert_manager = AcmeCertManager::create(cert_config).await?;
-    sn_provider_factory.set_acme_mgr(cert_manager.clone());
-    let inner_dns_record_manager = InnerDnsRecordManager::new();
-    let record_manager = inner_dns_record_manager.clone();
-    cert_manager.register_dns_provider("local", move |op: String, domain: String, key_hash: String| {
-        let record_manager = record_manager.clone();
-        async move {
-            if op == "add_challenge" {
-                record_manager.add_record(domain, "TXT", key_hash).map_err(|e| anyhow!(e.to_string()))
-            } else if op == "del_challenge" {
-                record_manager.remove_record(domain, "TXT");
-                Ok(())
-            } else {
-                Err(anyhow!("Unsupported op: {}", op))
-            }
-        }
-    });
-
-    let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
-    let mut self_cert_config = SelfCertConfig::default();
-    if let Some(config) = gateway_config.tls_ca.clone() {
-        self_cert_config.ca_path = Some(config.cert_path);
-        self_cert_config.key_path = Some(config.key_path);
-    }
-    self_cert_config.store_path = data_dir.to_string_lossy().to_string();
-    let self_cert_manager = SelfCertMgr::create(self_cert_config).await?;
-
-    let global_collections = GlobalCollectionManager::create(gateway_config.collections.clone()).await?;
-
-    let chain_cmds = get_buckyos_system_etc_dir().join("cyfs_gateway").join("server_templates");
-    let external_cmds = JsPkgManager::new(chain_cmds);
     let factory = GatewayFactory::new(
-        stack_manager.clone(),
-        server_manager.clone(),
-        global_process_chains.clone(),
         connect_manager.clone(),
-        tunnel_manager.clone(),
-        cert_manager.clone(),
-        limiter_manager.clone(),
-        stat_manager.clone(),
-        self_cert_manager.clone(),
-        global_collections.clone(),
-        external_cmds,
         parser.clone(),
     );
     factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
-        server_manager.clone(),
-        global_process_chains.clone(),
         connect_manager.clone(),
-        tunnel_manager.clone(),
-        limiter_manager.clone(),
-        stat_manager.clone(),
-        global_collections.clone(),
     )));
     debug!("Register tcp stack factory");
     factory.register_stack_factory(StackProtocol::Udp, Arc::new(UdpStackFactory::new(
-        server_manager.clone(),
-        global_process_chains.clone(),
         connect_manager.clone(),
-        tunnel_manager.clone(),
-        limiter_manager.clone(),
-        stat_manager.clone(),
-        global_collections.clone(),
     )));
     debug!("Register udp stack factory");
     factory.register_stack_factory(StackProtocol::Tls, Arc::new(TlsStackFactory::new(
-        server_manager.clone(),
-        global_process_chains.clone(),
         connect_manager.clone(),
-        tunnel_manager.clone(),
-        cert_manager.clone(),
-        limiter_manager.clone(),
-        stat_manager.clone(),
-        self_cert_manager.clone(),
-        global_collections.clone(),
     )));
     debug!("Register tls stack factory");
     factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
-        server_manager.clone(),
-        global_process_chains.clone(),
         connect_manager.clone(),
-        tunnel_manager.clone(),
-        cert_manager.clone(),
-        limiter_manager.clone(),
-        stat_manager.clone(),
-        self_cert_manager.clone(),
-        global_collections.clone(),
     )));
     factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
-        server_manager.clone(),
-        global_process_chains.clone(),
         connect_manager.clone(),
-        tunnel_manager.clone(),
-        limiter_manager.clone(),
-        stat_manager.clone(),
-        global_collections.clone(),
     )));
     debug!("Register rtcp stack factory");
     factory.register_stack_factory(StackProtocol::Extension("tun".to_string()), Arc::new(TunStackFactory::new(
-        server_manager.clone(),
-        global_process_chains.clone(),
         connect_manager.clone(),
-        tunnel_manager.clone(),
-        limiter_manager.clone(),
-        stat_manager.clone(),
-        global_collections.clone(),
     )));
-    debug!("Register tun stack factory");
-    factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
-        server_manager.clone(),
-        global_process_chains.clone(),
-        tunnel_manager.clone(),
-        global_collections.clone(),
-    )));
+    debug!("Register tun stack context factory");
+    factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new()));
     debug!("Register http server factory");
     factory.register_server_factory("dir", Arc::new(DirServerFactory::new()));
-    factory.register_server_factory("socks", Arc::new(SocksServerFactory::new(
-        global_process_chains.clone(),
-        global_collections.clone(),
-        socks::SocksTunnelBuilder::new_ref(tunnel_manager.clone())
-    )));
+    factory.register_server_factory("socks", Arc::new(SocksServerFactory::new()));
     debug!("Register dir server factory");
-    factory.register_server_factory("dns", Arc::new(ProcessChainDnsServerFactory::new(
-        server_manager.clone(),
-        global_process_chains.clone(),
-        global_collections.clone(),
-        inner_dns_record_manager,
-    )));
+    factory.register_server_factory("dns", Arc::new(ProcessChainDnsServerFactory::new()));
     debug!("Register dns server factory");
-    factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new(cert_manager.clone())));
+    factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new()));
     debug!("Register acme response server factory");
-    let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
-    if !data_dir.exists() {
-        create_dir_all(data_dir.clone()).await?;
-    }
-
-    let store = LocalTokenKeyStore::new(data_dir);
-    let token_manager = LocalTokenManager::new(user_name, password, store).await?;
-    let handler = GatewayCmdHandler::new(config_file.map(|v| v.to_path_buf()), parser.clone());
     factory.register_server_factory(
         "control_server",
-        Arc::new(GatewayControlServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())),
+        Arc::new(GatewayControlServerFactory::new()),
     );
     info!("Register control server factory");
     factory.register_server_factory(
         "local_dns",
-        Arc::new(LocalDnsFactory::new(config_dir.map(|v| v.to_string_lossy().to_string()))),
+        Arc::new(LocalDnsFactory::new()),
     );
     info!("Register local dns server factory");
     let mut sn_factory = SnServerFactory::new();
     sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
     factory.register_server_factory("sn", Arc::new(sn_factory));
     info!("Register sn server factory");
-    let gateway = factory.create_gateway(gateway_config).await.map_err(|e| {
+    let gateway = factory.create_gateway(config_file, gateway_config).await.map_err(|e| {
         let msg = format!("create gateway failed: {}", e);
         error!("{}", msg);
         anyhow::anyhow!(msg)
     })?;
     gateway.start(params).await?;
-    handler.set_gateway(Arc::new(gateway));
 
     let _ = tokio::signal::ctrl_c().await;
 

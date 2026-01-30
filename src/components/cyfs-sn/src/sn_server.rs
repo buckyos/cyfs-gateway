@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use cyfs_gateway_lib::{into_server_err, server_err};
 use cyfs_gateway_lib::{
     qa_json_to_rpc_request, HttpServer, NameServer, ProcessChainConfig, QAServer, Server,
-    ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo,
+    ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo,
 };
 use http::{Method, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -2636,7 +2636,11 @@ impl SnServerFactory {
 
 #[async_trait::async_trait]
 impl ServerFactory for SnServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
+    async fn create(
+        &self,
+        config: Arc<dyn ServerConfig>,
+        _context: Option<ServerContextRef>,
+    ) -> ServerResult<Vec<Server>> {
         let config = config
             .as_any()
             .downcast_ref::<SNServerConfig>()
@@ -2789,7 +2793,7 @@ mod tests {
             "db_path": db.path().to_str().unwrap(),
         });
         let config: SNServerConfig = serde_json::from_value(config).unwrap();
-        let servers = sn_factory.create(Arc::new(config)).await.unwrap();
+        let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
         let mut http_server = None;
         for server in servers.iter() {
             if let Server::Http(server) = server {

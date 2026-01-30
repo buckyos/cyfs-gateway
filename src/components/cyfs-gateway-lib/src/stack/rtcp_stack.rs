@@ -794,40 +794,26 @@ impl crate::StackConfig for RtcpStackConfig {
 }
 
 pub struct RtcpStackFactory {
-    servers: ServerManagerRef,
-    global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
-    tunnel_manager: TunnelManager,
-    limiter_manager: LimiterManagerRef,
-    stat_manager: StatManagerRef,
-    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl RtcpStackFactory {
     pub fn new(
-        servers: ServerManagerRef,
-        global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
-        tunnel_manager: TunnelManager,
-        limiter_manager: LimiterManagerRef,
-        stat_manager: StatManagerRef,
-        global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         Self {
-            servers,
-            global_process_chains,
             connection_manager,
-            tunnel_manager,
-            limiter_manager,
-            stat_manager,
-            global_collection_manager,
         }
     }
 }
 
 #[async_trait::async_trait]
 impl StackFactory for RtcpStackFactory {
-    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackRef> {
+    async fn create(
+        &self,
+        config: Arc<dyn StackConfig>,
+        context: Arc<dyn StackContext>,
+    ) -> StackResult<StackRef> {
         let config = config
             .as_any()
             .downcast_ref::<RtcpStackConfig>()
@@ -860,14 +846,12 @@ impl StackFactory for RtcpStackFactory {
             );
             device_config
         };
-        let stack_context = Arc::new(RtcpStackContext::new(
-            self.servers.clone(),
-            self.tunnel_manager.clone(),
-            self.limiter_manager.clone(),
-            self.stat_manager.clone(),
-            Some(self.global_process_chains.clone()),
-            Some(self.global_collection_manager.clone()),
-        ));
+        let stack_context = context
+            .as_ref()
+            .as_any()
+            .downcast_ref::<RtcpStackContext>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid rtcp stack context"))?;
+        let stack_context = Arc::new(stack_context.clone());
         let stack = RtcpStack::builder()
             .id(config.id.clone())
             .bind(config.bind.clone())
@@ -886,7 +870,7 @@ impl StackFactory for RtcpStackFactory {
 mod tests {
     use std::collections::HashMap;
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackProtocol, StackFactory, StreamInfo, DatagramInfo, LimiterManager, StatManager, GlobalCollectionManager, LimiterManagerRef, StatManagerRef, ServerManagerRef, RtcpStackContext};
+    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackContext, StackProtocol, StackFactory, StreamInfo, DatagramInfo, DefaultLimiterManager, StatManager, GlobalCollectionManager, LimiterManagerRef, StatManagerRef, ServerManagerRef, RtcpStackContext};
     use buckyos_kit::{init_logging, AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, generate_ed25519_key_pair, DeviceConfig, EncodedDocument};
     use std::sync::Arc;
@@ -958,7 +942,7 @@ mod tests {
             .stack_context(build_stack_context(
                 Arc::new(ServerManager::new()),
                 tunnel_manager.clone(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 None,
             ))
@@ -974,7 +958,7 @@ mod tests {
             .stack_context(build_stack_context(
                 Arc::new(ServerManager::new()),
                 tunnel_manager.clone(),
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
@@ -991,7 +975,7 @@ mod tests {
             .stack_context(build_stack_context(
                 Arc::new(ServerManager::new()),
                 tunnel_manager,
-                LimiterManager::new(),
+                DefaultLimiterManager::new(),
                 StatManager::new(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
@@ -1043,7 +1027,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1091,7 +1075,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1158,7 +1142,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1204,7 +1188,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1271,7 +1255,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1317,7 +1301,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1400,7 +1384,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1446,7 +1430,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1543,7 +1527,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1591,7 +1575,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1657,7 +1641,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1703,7 +1687,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1770,7 +1754,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1816,7 +1800,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1883,7 +1867,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -1929,7 +1913,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -2010,7 +1994,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -2056,7 +2040,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -2116,7 +2100,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let tunnel_manager1 = TunnelManager::new();
-        let limiter_manager1 = LimiterManager::new();
+        let limiter_manager1 = DefaultLimiterManager::new();
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
@@ -2177,7 +2161,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -2240,7 +2224,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let tunnel_manager1 = TunnelManager::new();
-        let limiter_manager1 = LimiterManager::new();
+        let limiter_manager1 = DefaultLimiterManager::new();
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
@@ -2301,7 +2285,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -2367,7 +2351,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let tunnel_manager1 = TunnelManager::new();
-        let limiter_manager1 = LimiterManager::new();
+        let limiter_manager1 = DefaultLimiterManager::new();
         let _ = limiter_manager1.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
@@ -2429,7 +2413,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -2495,7 +2479,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let tunnel_manager1 = TunnelManager::new();
-        let limiter_manager1 = LimiterManager::new();
+        let limiter_manager1 = DefaultLimiterManager::new();
         let _ = limiter_manager1.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
@@ -2557,7 +2541,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -2656,7 +2640,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -2704,7 +2688,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(StatManager::new())
             .build()
             .await;
@@ -2773,7 +2757,7 @@ mod tests {
             .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(stat1.clone())
             .build()
             .await;
@@ -2823,7 +2807,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(stat2.clone())
             .build()
             .await;
@@ -2900,7 +2884,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let _ = server_manager.add_server(Server::Datagram(Arc::new(MockDatagramServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager1 = TunnelManager::new();
-        let limiter_manager1 = LimiterManager::new();
+        let limiter_manager1 = DefaultLimiterManager::new();
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
         let result = RtcpStack::builder()
@@ -2963,7 +2947,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(stat2.clone())
             .build()
             .await;
@@ -3030,7 +3014,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let _ = server_manager.add_server(Server::Datagram(Arc::new(MockDatagramServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager1 = TunnelManager::new();
-        let limiter_manager1 = LimiterManager::new();
+        let limiter_manager1 = DefaultLimiterManager::new();
         let _ = limiter_manager1.new_limiter("test", None::<String>, Some(1), Some(4), Some(4));
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
@@ -3094,7 +3078,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(stat2.clone())
             .build()
             .await;
@@ -3161,7 +3145,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let _ = server_manager.add_server(Server::Datagram(Arc::new(MockDatagramServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager1 = TunnelManager::new();
-        let limiter_manager1 = LimiterManager::new();
+        let limiter_manager1 = DefaultLimiterManager::new();
         let _ = limiter_manager1.new_limiter("test", None::<String>, Some(1), Some(4), Some(4));
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
@@ -3225,7 +3209,7 @@ mod tests {
             .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(LimiterManager::new())
+            .limiter_manager(DefaultLimiterManager::new())
             .stat_manager(stat2.clone())
             .build()
             .await;
@@ -3261,15 +3245,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_factory() {
-        let factory = RtcpStackFactory::new(
-            Arc::new(ServerManager::new()),
-            Arc::new(GlobalProcessChains::new()),
-            ConnectionManager::new(),
-            TunnelManager::new(),
-            LimiterManager::new(),
-            StatManager::new(),
-            GlobalCollectionManager::create(vec![]).await.unwrap(),
-        );
+        let server_manager = Arc::new(ServerManager::new());
+        let global_process_chains = Arc::new(GlobalProcessChains::new());
+        let tunnel_manager = TunnelManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
+        let stat_manager = StatManager::new();
+        let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
+        let factory = RtcpStackFactory::new(ConnectionManager::new());
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key_pair();
 
@@ -3291,7 +3273,15 @@ mod tests {
             name: Some("test".to_string()),
         };
 
-        let ret = factory.create(Arc::new(config)).await;
+        let stack_context: Arc<dyn StackContext> = Arc::new(RtcpStackContext::new(
+            server_manager,
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            Some(global_process_chains),
+            Some(collection_manager),
+        ));
+        let ret = factory.create(Arc::new(config), stack_context.clone()).await;
         assert!(ret.is_ok());
 
         let config = RtcpStackConfig {
@@ -3304,7 +3294,7 @@ mod tests {
             name: Some("test".to_string()),
         };
 
-        let ret = factory.create(Arc::new(config)).await;
+        let ret = factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());
     }
 }

@@ -1,7 +1,7 @@
 use http::{Request, Response, Version, StatusCode};
 use http_body_util::combinators::BoxBody;
 use hyper::body::Bytes;
-use crate::{server_err, AcmeCertManagerRef, HttpServer, ProcessChainConfig, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
+use crate::{server_err, AcmeCertManagerRef, HttpServer, ProcessChainConfig, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
 use std::sync::Arc;
 use http_body_util::{BodyExt, Full};
 use serde::{Deserialize, Serialize};
@@ -109,22 +109,53 @@ impl ServerConfig for AcmeHttpChallengeServerConfig {
     }
 }
 
-pub struct AcmeHttpChallengeServerFactory {
-    acme_mgr: AcmeCertManagerRef,
+#[derive(Clone)]
+pub struct AcmeHttpChallengeServerContext {
+    pub acme_mgr: AcmeCertManagerRef,
 }
 
-impl AcmeHttpChallengeServerFactory {
+impl AcmeHttpChallengeServerContext {
     pub fn new(acme_mgr: AcmeCertManagerRef) -> Self {
-        AcmeHttpChallengeServerFactory { acme_mgr }
+        Self { acme_mgr }
+    }
+}
+
+impl ServerContext for AcmeHttpChallengeServerContext {
+    fn get_server_type(&self) -> String {
+        "acme_response".to_string()
+    }
+}
+
+pub struct AcmeHttpChallengeServerFactory;
+
+impl AcmeHttpChallengeServerFactory {
+    pub fn new() -> Self {
+        Self
     }
 }
 
 #[async_trait::async_trait]
 impl ServerFactory for AcmeHttpChallengeServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
+    async fn create(
+        &self,
+        config: Arc<dyn ServerConfig>,
+        context: Option<ServerContextRef>,
+    ) -> ServerResult<Vec<Server>> {
         let config = config.as_any().downcast_ref::<AcmeHttpChallengeServerConfig>()
             .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid acme http challenge server config"))?;
-        let server = AcmeHttpChallengeServer::new(config.id.clone(), self.acme_mgr.clone());
+        let context = context.ok_or(server_err!(
+            ServerErrorCode::InvalidConfig,
+            "acme response server context is required"
+        ))?;
+        let context = context
+            .as_ref()
+            .as_any()
+            .downcast_ref::<AcmeHttpChallengeServerContext>()
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid acme response server context"
+            ))?;
+        let server = AcmeHttpChallengeServer::new(config.id.clone(), context.acme_mgr.clone());
         Ok(vec![Server::Http(Arc::new(server))])
     }
 }

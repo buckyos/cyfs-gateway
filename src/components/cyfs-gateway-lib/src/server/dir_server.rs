@@ -4,7 +4,7 @@ use http_body_util::combinators::{BoxBody};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
 use serde::{Deserialize, Serialize};
-use crate::{HttpServer, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
+use crate::{HttpServer, Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
 use super::server_err;
 use futures_util::TryStreamExt;
 use tokio::io::AsyncReadExt;
@@ -399,7 +399,11 @@ impl DirServerFactory {
 
 #[async_trait::async_trait]
 impl ServerFactory for DirServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
+    async fn create(
+        &self,
+        config: Arc<dyn ServerConfig>,
+        _context: Option<ServerContextRef>,
+    ) -> ServerResult<Vec<Server>> {
         let config = config
             .as_any()
             .downcast_ref::<DirServerConfig>()
@@ -590,7 +594,7 @@ mod tests {
         };
         
         let factory = DirServerFactory::new();
-        let result = factory.create(Arc::new(config)).await;
+        let result = factory.create(Arc::new(config), None).await;
         assert!(result.is_ok());
     }
 }

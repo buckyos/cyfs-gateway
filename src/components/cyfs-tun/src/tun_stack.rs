@@ -861,53 +861,37 @@ impl StackConfig for TunStackConfig {
 }
 
 pub struct TunStackFactory {
-    servers: ServerManagerRef,
-    global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
-    tunnel_manager: TunnelManager,
-    limiter_manager: LimiterManagerRef,
-    stat_manager: StatManagerRef,
-    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl TunStackFactory {
     pub fn new(
-        servers: ServerManagerRef,
-        global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
-        tunnel_manager: TunnelManager,
-        limiter_manager: LimiterManagerRef,
-        stat_manager: StatManagerRef,
-        global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         TunStackFactory {
-            servers,
-            global_process_chains,
             connection_manager,
-            tunnel_manager,
-            limiter_manager,
-            stat_manager,
-            global_collection_manager,
         }
     }
 }
 
 #[async_trait::async_trait]
 impl StackFactory for TunStackFactory {
-    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackRef> {
+    async fn create(
+        &self,
+        config: Arc<dyn StackConfig>,
+        context: Arc<dyn StackContext>,
+    ) -> StackResult<StackRef> {
         let config = config
             .as_any()
             .downcast_ref::<TunStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tun stack config"))?;
 
-        let stack_context = Arc::new(TunStackContext::new(
-            self.servers.clone(),
-            self.tunnel_manager.clone(),
-            self.limiter_manager.clone(),
-            self.stat_manager.clone(),
-            Some(self.global_process_chains.clone()),
-            Some(self.global_collection_manager.clone()),
-        ));
+        let stack_context = context
+            .as_ref()
+            .as_any()
+            .downcast_ref::<TunStackContext>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tun stack context"))?;
+        let stack_context = Arc::new(stack_context.clone());
 
         let stack = TunStack::builder()
             .id(config.id.clone())

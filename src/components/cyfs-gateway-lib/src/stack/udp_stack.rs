@@ -1341,52 +1341,36 @@ impl StackConfig for UdpStackConfig {
 }
 
 pub struct UdpStackFactory {
-    servers: ServerManagerRef,
-    global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
-    tunnel_manager: TunnelManager,
-    limiter_manager: LimiterManagerRef,
-    stat_manager: StatManagerRef,
-    global_collection_manager: GlobalCollectionManagerRef,
 }
 
 impl UdpStackFactory {
     pub fn new(
-        servers: ServerManagerRef,
-        global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
-        tunnel_manager: TunnelManager,
-        limiter_manager: LimiterManagerRef,
-        stat_manager: StatManagerRef,
-        global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         Self {
-            servers,
-            global_process_chains,
             connection_manager,
-            tunnel_manager,
-            limiter_manager,
-            stat_manager,
-            global_collection_manager,
         }
     }
 }
 
 #[async_trait::async_trait]
 impl StackFactory for UdpStackFactory {
-    async fn create(&self, config: Arc<dyn StackConfig>) -> StackResult<StackRef> {
+    async fn create(
+        &self,
+        config: Arc<dyn StackConfig>,
+        context: Arc<dyn StackContext>,
+    ) -> StackResult<StackRef> {
         let config = config
             .as_any()
             .downcast_ref::<UdpStackConfig>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid udp stack config"))?;
-        let stack_context = Arc::new(UdpStackContext::new(
-            self.servers.clone(),
-            self.tunnel_manager.clone(),
-            self.limiter_manager.clone(),
-            self.stat_manager.clone(),
-            Some(self.global_process_chains.clone()),
-            Some(self.global_collection_manager.clone()),
-        ));
+        let stack_context = context
+            .as_ref()
+            .as_any()
+            .downcast_ref::<UdpStackContext>()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid udp stack context"))?;
+        let stack_context = Arc::new(stack_context.clone());
         let stack = UdpStack::builder()
             .id(config.id.clone())
             .bind(config.bind.to_string())
@@ -1407,7 +1391,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::net::UdpSocket;
-    use crate::{ConnectionManager, DatagramInfo, GlobalCollectionManager, GlobalCollectionManagerRef, LimiterManager, LimiterManagerRef, ProcessChainConfigs, Server, ServerManager, ServerManagerRef, ServerResult, Stack, StackFactory, StackProtocol, StatManager, StatManagerRef, TunnelManager, UdpStack, UdpStackConfig, UdpStackContext, UdpStackFactory};
+    use crate::{ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager, GlobalCollectionManagerRef, LimiterManagerRef, ProcessChainConfigs, Server, ServerManager, ServerManagerRef, ServerResult, Stack, StackFactory, StackProtocol, StatManager, StatManagerRef, TunnelManager, UdpStack, UdpStackConfig, UdpStackContext, UdpStackFactory};
     use crate::global_process_chains::{GlobalProcessChains, GlobalProcessChainsRef};
     use crate::server::{DatagramServer};
 
@@ -1451,7 +1435,7 @@ mod tests {
         let stack_context = build_udp_context(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             StatManager::new(),
             None,
             None,
@@ -1467,7 +1451,7 @@ mod tests {
         let stack_context = build_udp_context(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
             None,
@@ -1498,7 +1482,7 @@ mod tests {
         let stack_context = build_udp_context(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
             None,
@@ -1557,7 +1541,7 @@ mod tests {
         let stack_context = build_udp_context(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            LimiterManager::new(),
+            DefaultLimiterManager::new(),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
             None,
@@ -1627,7 +1611,7 @@ mod tests {
 
 
         let tunnel_manager = TunnelManager::new();
-        let limiter_manager = LimiterManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
         let stat_manager = StatManager::new();
         let datagram_server_manager = Arc::new(ServerManager::new());
         let _ = datagram_server_manager.add_server(Server::Datagram(Arc::new(MockServer::new("mock".to_string())))).unwrap();
@@ -1680,7 +1664,7 @@ mod tests {
 
 
         let tunnel_manager = TunnelManager::new();
-        let limiter_manager = LimiterManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
         let stat_manager = StatManager::new();
         let datagram_server_manager = Arc::new(ServerManager::new());
         let _ = datagram_server_manager.add_server(Server::Datagram(Arc::new(MockServer::new("mock".to_string())))).unwrap();
@@ -1740,7 +1724,7 @@ mod tests {
 
 
         let tunnel_manager = TunnelManager::new();
-        let limiter_manager = LimiterManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
         let stat_manager = StatManager::new();
         let datagram_server_manager = Arc::new(ServerManager::new());
         let _ = datagram_server_manager.add_server(Server::Datagram(Arc::new(MockServer::new("mock".to_string())))).unwrap();
@@ -1797,14 +1781,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_udp_factory() {
-        let udp_factory = UdpStackFactory::new(Arc::new(ServerManager::new()),
-                                               Arc::new(GlobalProcessChains::new()),
-                                               ConnectionManager::new(),
-                                               TunnelManager::new(),
-                                               LimiterManager::new(),
-                                               StatManager::new(),
-                                               GlobalCollectionManager::create(vec![]).await.unwrap()
-        );
+        let server_manager = Arc::new(ServerManager::new());
+        let global_process_chains = Arc::new(GlobalProcessChains::new());
+        let tunnel_manager = TunnelManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
+        let stat_manager = StatManager::new();
+        let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
+        let udp_factory = UdpStackFactory::new(ConnectionManager::new());
 
         let config = UdpStackConfig {
             id: "test".to_string(),
@@ -1815,7 +1798,15 @@ mod tests {
             hook_point: vec![],
             transparent: None,
         };
-        let ret = udp_factory.create(Arc::new(config)).await;
+        let stack_context = Arc::new(UdpStackContext::new(
+            server_manager,
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            Some(global_process_chains),
+            Some(collection_manager),
+        ));
+        let ret = udp_factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());
     }
 }

@@ -93,102 +93,50 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let global_process_chains = Arc::new(GlobalProcessChains::new());
         let cert_manager = AcmeCertManager::create(CertManagerConfig::default()).await.unwrap();
-        let limiter_manager = LimiterManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
         let stat_manager = StatManager::new();
         let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default()).await.unwrap();
         let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
         let external_cmds = JsPkgManager::new(PathBuf::from("."));
-
-        let stack_manager = StackManager::new();
-        let factory = GatewayFactory::new(
-            stack_manager.clone(),
-            server_manager.clone(),
-            global_process_chains.clone(),
-            connect_manager.clone(),
-            tunnel_manager.clone(),
-            cert_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            self_cert_mgr.clone(),
-            collection_manager.clone(),
-            external_cmds,
-            parser.clone(),
-        );
-        factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
-            server_manager.clone(),
-            global_process_chains.clone(),
-            connect_manager.clone(),
-            tunnel_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            collection_manager.clone(),
-        )));
-        factory.register_stack_factory(StackProtocol::Udp, Arc::new(UdpStackFactory::new(
-            server_manager.clone(),
-            global_process_chains.clone(),
-            connect_manager.clone(),
-            tunnel_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            collection_manager.clone(),
-        )));
-        factory.register_stack_factory(StackProtocol::Tls, Arc::new(TlsStackFactory::new(
-            server_manager.clone(),
-            global_process_chains.clone(),
-            connect_manager.clone(),
-            tunnel_manager.clone(),
-            cert_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            self_cert_mgr.clone(),
-            collection_manager.clone(),
-        )));
-        factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
-            server_manager.clone(),
-            global_process_chains.clone(),
-            connect_manager.clone(),
-            tunnel_manager.clone(),
-            cert_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            self_cert_mgr.clone(),
-            collection_manager.clone(),
-        )));
-        factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
-            server_manager.clone(),
-            global_process_chains.clone(),
-            connect_manager.clone(),
-            tunnel_manager.clone(),
-            limiter_manager.clone(),
-            stat_manager.clone(),
-            collection_manager.clone(),
-        )));
-
-        factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new(
-            server_manager.clone(),
-            global_process_chains.clone(),
-            tunnel_manager.clone(),
-            collection_manager.clone(),
-        )));
 
         let store = TempKeyStore::new();
         let token_manager = LocalTokenManager::new(
             Some("test".to_string()),
             Some("123456".to_string()),
             store).await.unwrap();
-        let handler = GatewayCmdHandler::new(Some(PathBuf::from("config.yaml")), parser.clone());
-        factory.register_server_factory("control_server", Arc::new(GatewayControlServerFactory::new(handler.clone(), token_manager.clone(), token_manager.clone())));
-        factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new(
-            cert_manager.clone(),
+        let inner_dns_record_manager = cyfs_dns::InnerDnsRecordManager::new();
+        let stack_manager = StackManager::new();
+        let factory = GatewayFactory::new(
+            connect_manager.clone(),
+            parser.clone(),
+        );
+        factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
+            connect_manager.clone(),
         )));
-        let gateway = factory.create_gateway(config_loader).await;
+        factory.register_stack_factory(StackProtocol::Udp, Arc::new(UdpStackFactory::new(
+            connect_manager.clone(),
+        )));
+        factory.register_stack_factory(StackProtocol::Tls, Arc::new(TlsStackFactory::new(
+            connect_manager.clone(),
+        )));
+        factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
+            connect_manager.clone(),
+        )));
+        factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
+            connect_manager.clone(),
+        )));
+
+        factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new()));
+
+        factory.register_server_factory("control_server", Arc::new(GatewayControlServerFactory::new()));
+        factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new()));
+        let gateway = factory.create_gateway(None, config_loader).await;
         assert!(gateway.is_ok());
         let gateway = gateway.unwrap();
         let params = GatewayParams {
             keep_tunnel: vec![],
         };
         gateway.start(params).await.unwrap();
-        handler.set_gateway(Arc::new(gateway));
 
         let cmd_client = GatewayControlClient::new("http://127.0.0.1:13451".to_string(), None);
         let ret = cmd_client.get_config_by_id(None).await;

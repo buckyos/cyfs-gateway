@@ -26,10 +26,15 @@ pub trait ServerConfig: AsAny + Send + Sync {
     fn remove_post_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig>;
 }
 
+pub trait ServerContext: AsAny + Send + Sync {
+    fn get_server_type(&self) -> String;
+}
+pub type ServerContextRef = Arc<dyn ServerContext>;
+
 #[async_trait::async_trait]
 #[callback_trait::callback_trait]
 pub trait ServerFactory: Send + Sync {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>>;
+    async fn create(&self, config: Arc<dyn ServerConfig>, context: Option<ServerContextRef>) -> ServerResult<Vec<Server>>;
 }
 
 pub struct CyfsServerFactory {
@@ -56,12 +61,16 @@ impl CyfsServerFactory {
 
 #[async_trait::async_trait]
 impl ServerFactory for CyfsServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
+    async fn create(
+        &self,
+        config: Arc<dyn ServerConfig>,
+        context: Option<ServerContextRef>,
+    ) -> ServerResult<Vec<Server>> {
         let factory = {
             self.server_factory.lock().unwrap().get(config.server_type().as_str()).cloned()
         };
         match factory {
-            Some(factory) => factory.create(config).await,
+            Some(factory) => factory.create(config, context).await,
             None => Err(server_err!(ServerErrorCode::UnknownServerType, "unknown server type {}", config.server_type())),
         }
     }
@@ -657,6 +666,16 @@ impl ServerManager {
         }
     }
 
+    pub fn clone_manager(&self) -> ServerManager {
+        let new = ServerManager {
+            servers: Mutex::new(HashMap::new()),
+        };
+        
+        for (key, server) in self.servers.lock().unwrap().iter() {
+            new.servers.lock().unwrap().insert(key.clone(), server.clone());
+        }
+        new
+    }
     /// 添加 server，使用 full_key 作为存储键
     /// 同一个 id 的 server 可以注册多个不同的 trait 类型
     pub fn add_server(&self, server: Server) -> ServerResult<()> {

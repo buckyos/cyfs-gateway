@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CollectionValue, EnvRef, MapCollectionRef, MemoryMapCollection, MemorySetCollection, SetCollectionRef};
 use crate::{config_err, ConfigErrorCode, ConfigResult, JsonMap, JsonSet, SqliteMap, SqliteSet, TextSet};
@@ -34,16 +34,16 @@ pub struct CollectionConfig {
 }
 
 pub struct GlobalCollectionManager {
-    sets: RwLock<HashMap<String, SetCollectionRef>>,
-    maps: RwLock<HashMap<String, MapCollectionRef>>,
+    sets: HashMap<String, SetCollectionRef>,
+    maps: HashMap<String, MapCollectionRef>,
 }
 pub type GlobalCollectionManagerRef = Arc<GlobalCollectionManager>;
 
 impl GlobalCollectionManager {
     pub fn new() -> Arc<Self> {
         Arc::new(GlobalCollectionManager {
-            sets: RwLock::new(HashMap::new()),
-            maps: RwLock::new(HashMap::new()),
+            sets: HashMap::new(),
+            maps: HashMap::new(),
         })
     }
 
@@ -145,12 +145,12 @@ impl GlobalCollectionManager {
         }
 
         Ok(Arc::new(GlobalCollectionManager {
-            sets: RwLock::new(sets),
-            maps: RwLock::new(maps),
+            sets,
+            maps,
         }))
     }
 
-    pub async fn update(&self, configs: Vec<CollectionConfig>) -> ConfigResult<()> {
+    pub async fn update(&mut self, configs: Vec<CollectionConfig>) -> ConfigResult<()> {
         let mut collection_names = HashSet::new();
         for config in configs {
             if collection_names.contains(&config.name) {
@@ -259,43 +259,35 @@ impl GlobalCollectionManager {
         Ok(())
     }
 
-    fn add_set(&self, name: String, set: SetCollectionRef) {
-        let mut sets = self.sets.write().unwrap();
-        sets.insert(name, set);
+    fn add_set(&mut self, name: String, set: SetCollectionRef) {
+        self.sets.insert(name, set);
     }
 
     fn set_exists(&self, name: &str) -> bool {
-        let sets = self.sets.read().unwrap();
-        sets.contains_key(name)
+        self.sets.contains_key(name)
     }
 
-    fn retain_sets(&self, predicate: impl Fn(&String, &SetCollectionRef) -> bool) {
-        let mut sets = self.sets.write().unwrap();
-        sets.retain(|k, v| predicate(k, v));
+    fn retain_sets(&mut self, predicate: impl Fn(&String, &SetCollectionRef) -> bool) {
+        self.sets.retain(|k, v| predicate(k, v));
     }
 
-    fn retain_maps(&self, predicate: impl Fn(&String, &MapCollectionRef) -> bool) {
-        let mut maps = self.maps.write().unwrap();
-        maps.retain(|k, v| predicate(k, v));
+    fn retain_maps(&mut self, predicate: impl Fn(&String, &MapCollectionRef) -> bool) {
+        self.maps.retain(|k, v| predicate(k, v));
     }
-    fn add_map(&self, name: String, map: MapCollectionRef) {
-        let mut maps = self.maps.write().unwrap();
-        maps.insert(name, map);
+    fn add_map(&mut self, name: String, map: MapCollectionRef) {
+        self.maps.insert(name, map);
     }
 
     fn map_exists(&self, name: &str) -> bool {
-        let maps = self.maps.read().unwrap();
-        maps.contains_key(name)
+        self.maps.contains_key(name)
     }
 
     fn get_sets(&self) -> HashMap<String, SetCollectionRef> {
-        let sets = self.sets.read().unwrap();
-        sets.clone()
+        self.sets.clone()
     }
 
     fn get_maps(&self) -> HashMap<String, MapCollectionRef> {
-        let maps = self.maps.read().unwrap();
-        maps.clone()
+        self.maps.clone()
     }
 
     pub async fn register_collection(&self, env: &EnvRef) -> ConfigResult<()> {

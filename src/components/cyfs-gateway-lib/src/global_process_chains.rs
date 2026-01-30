@@ -6,19 +6,20 @@ use tokio::sync::RwLock;
 use cyfs_process_chain::*;
 use crate::{config_err, ConfigErrorCode, ConfigResult, GlobalCollectionManagerRef, ProcessChainConfig};
 
+#[derive(Clone)]
 pub struct GlobalProcessChains {
-    process_chains: Mutex<Vec<ProcessChainLibRef>>,
+    process_chains: Vec<ProcessChainLibRef>,
 }
 pub type GlobalProcessChainsRef = Arc<GlobalProcessChains>;
 
 impl GlobalProcessChains {
     pub fn new() -> Self {
         Self {
-            process_chains: Mutex::new(vec![]),
+            process_chains: vec![],
         }
     }
 
-    pub fn add_process_chain(&self, process_chain: ProcessChainRef) -> ConfigResult<()> {
+    pub fn add_process_chain(&mut self, process_chain: ProcessChainRef) -> ConfigResult<()> {
         if self.get_process_chain(process_chain.id()).is_some() {
             return Err(config_err!(
                 ConfigErrorCode::AlreadyExists,
@@ -27,23 +28,22 @@ impl GlobalProcessChains {
             ));
         }
         let process_chain_lib = ProcessChainListLib::new(process_chain.id().to_string().as_str(), 0, vec![process_chain]);
-        self.process_chains.lock().unwrap().push(process_chain_lib.into_process_chain_lib());
+        self.process_chains.push(process_chain_lib.into_process_chain_lib());
         Ok(())
     }
 
-    pub fn replace_process_chains(&self, process_chains: Vec<ProcessChainLibRef>) {
-        self.clear_process_chains();
-        *self.process_chains.lock().unwrap() = process_chains;
+    pub fn replace_process_chains(&mut self, process_chains: Vec<ProcessChainLibRef>) {
+        self.process_chains = process_chains;
     }
 
-    pub fn clear_process_chains(&self) {
-        self.process_chains.lock().unwrap().clear();
+    pub fn clear_process_chains(&mut self) {
+        self.process_chains.clear();
     }
 
-    pub fn update_process_chain(&self, process_chain: ProcessChainRef) {
+    pub fn update_process_chain(&mut self, process_chain: ProcessChainRef) {
         let id = process_chain.id().to_string();
         let new_chain_lib = ProcessChainListLib::new(id.as_str(), 0, vec![process_chain]);
-        for process_chain_lib in self.process_chains.lock().unwrap().iter_mut() {
+        for process_chain_lib in self.process_chains.iter_mut() {
             if process_chain_lib.get_id() == id {
                 *process_chain_lib = new_chain_lib.into_process_chain_lib();
                 break;
@@ -52,7 +52,7 @@ impl GlobalProcessChains {
     }
 
     pub fn get_process_chain(&self, id: &str) -> Option<ProcessChainLibRef> {
-        for process_chain_lib in self.process_chains.lock().unwrap().iter() {
+        for process_chain_lib in self.process_chains.iter() {
             if process_chain_lib.get_id() == id {
                 return Some(process_chain_lib.clone());
             }
@@ -61,12 +61,11 @@ impl GlobalProcessChains {
     }
 
     pub fn get_process_chains(&self) -> Vec<ProcessChainLibRef> {
-        self.process_chains.lock().unwrap().clone()
+        self.process_chains.clone()
     }
 
     pub fn register_global_process_chain(&self, hook_point: &HookPoint) -> ConfigResult<()> {
-        let process_chains = self.process_chains.lock().unwrap();
-        for process_chain_lib in process_chains.iter() {
+        for process_chain_lib in self.process_chains.iter() {
             hook_point.add_process_chain_lib(process_chain_lib.clone())
                 .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{}", e))?;
         }

@@ -84,20 +84,21 @@ impl Limiter {
     }
 }
 
-pub struct LimiterManager {
+pub trait LimiterManager: Send + Sync {
+    fn get_limiter(&self, id: String) -> Option<Limiter>;
+    fn clone_manager(&self) -> Arc<dyn LimiterManager>;
+}
+pub type LimiterManagerRef = Arc<dyn LimiterManager>;
+
+pub struct DefaultLimiterManager {
     limiters: RwLock<HashMap<String, Limiter>>,
 }
-pub type LimiterManagerRef = Arc<LimiterManager>;
 
-impl LimiterManager {
+impl DefaultLimiterManager {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             limiters: RwLock::new(HashMap::new()),
         })
-    }
-
-    pub fn get_limiter(&self, id: impl Into<String>) -> Option<Limiter> {
-        self.limiters.read().unwrap().get(&id.into()).cloned()
     }
 
     pub fn new_limiter(&self,
@@ -107,7 +108,7 @@ impl LimiterManager {
                        read_speed: Option<u32>,
                        write_speed: Option<u32>) -> Limiter {
         let upper = match upper {
-            Some(id) => self.get_limiter(id),
+            Some(id) => self.get_limiter(id.into()),
             None => None,
         };
 
@@ -124,6 +125,18 @@ impl LimiterManager {
     {
         let mut limiters = self.limiters.write().unwrap();
         limiters.retain(f);
+    }
+}
+
+impl LimiterManager for DefaultLimiterManager {
+    fn get_limiter(&self, id: String) -> Option<Limiter> {
+        self.limiters.read().unwrap().get(&id).cloned()
+    }
+
+    fn clone_manager(&self) -> Arc<dyn LimiterManager> {
+        let new = DefaultLimiterManager::new();
+        new.limiters.write().unwrap().extend(self.limiters.read().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())));
+        new
     }
 }
 

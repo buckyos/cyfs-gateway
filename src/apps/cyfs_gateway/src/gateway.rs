@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use super::config_loader::GatewayConfig;
 use cyfs_gateway_lib::*;
 
@@ -17,7 +17,7 @@ use jsonwebtoken::jwk::Jwk;
 use kRPC::RPCSessionToken;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sfo_js::{JsEngine, JsPkg, JsPkgManagerRef, JsString, JsValue, NativeFunction};
+use sfo_js::{JsEngine, JsPkg, JsPkgManager, JsPkgManagerRef, JsString, JsValue, NativeFunction};
 use sfo_js::object::builtins::JsArray;
 use sha2::Digest;
 use rand::{Rng};
@@ -28,9 +28,14 @@ use crate::gateway_control_client::{cmd_err, into_cmd_err};
 use crate::gateway_control_server::{ControlErrorCode, ControlResult, GatewayControlCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
 use crate::config_loader::GatewayConfigParserRef;
 use crate::gateway_control_server::{
-    GatewayControlServerConfigParser, GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY,
+    GatewayControlServerConfigParser, GatewayControlServerContext, GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY,
 };
+use cyfs_dns::{DnsServerContext, InnerDnsRecordManager, InnerDnsRecordManagerRef, LocalDnsServerContext};
+use cyfs_socks::SocksServerContext;
+use cyfs_tun::TunStackContext;
+use crate::acme_sn_provider::AcmeSnProviderFactory;
 use crate::merge;
+use crate::socks::SocksTunnelBuilder;
 
 fn get_default_saved_gateway_config_path() -> PathBuf {
     get_buckyos_service_data_dir("cyfs_gateway").join("cyfs_gateway_saved.json")
@@ -59,6 +64,127 @@ fn strip_includes_field(mut config: Value) -> Value {
     config
 }
 
+fn build_server_context(
+    server_type: &str,
+    server_manager: ServerManagerRef,
+    global_process_chains: GlobalProcessChainsRef,
+    tunnel_manager: TunnelManager,
+    global_collection_manager: GlobalCollectionManagerRef,
+    acme_mgr: AcmeCertManagerRef,
+    inner_dns_record_manager: InnerDnsRecordManagerRef,
+    control_handler: Weak<dyn GatewayControlCmdHandler>,
+    control_token_verifier: Arc<dyn CyfsTokenVerifier>,
+    control_token_factory: Arc<dyn CyfsTokenFactory>,
+) -> Option<ServerContextRef> {
+    match server_type {
+        "http" => Some(Arc::new(HttpServerContext::new(
+            server_manager,
+            global_process_chains,
+            tunnel_manager,
+            global_collection_manager,
+        ))),
+        "dns" => Some(Arc::new(DnsServerContext::new(
+            server_manager,
+            global_process_chains,
+            global_collection_manager,
+            inner_dns_record_manager,
+        ))),
+        "socks" => Some(Arc::new(SocksServerContext::new(
+            global_process_chains,
+            global_collection_manager,
+            SocksTunnelBuilder::new_ref(tunnel_manager),
+        ))),
+        "acme_response" => Some(Arc::new(AcmeHttpChallengeServerContext::new(acme_mgr))),
+        "local_dns" => Some(Arc::new(LocalDnsServerContext::new(None))),
+        "control_server" => Some(Arc::new(GatewayControlServerContext::new(
+            control_handler,
+            control_token_verifier,
+            control_token_factory,
+        ))),
+        _ => {
+            None
+        }
+    }
+}
+
+fn build_stack_context(
+    protocol: StackProtocol,
+    servers: ServerManagerRef,
+    tunnel_manager: TunnelManager,
+    limiter_manager: LimiterManagerRef,
+    stat_manager: StatManagerRef,
+    global_process_chains: Option<GlobalProcessChainsRef>,
+    global_collection_manager: Option<GlobalCollectionManagerRef>,
+    acme_manager: AcmeCertManagerRef,
+    self_cert_mgr: SelfCertMgrRef, ) -> StackResult<Arc<dyn StackContext>> {
+    match protocol {
+        StackProtocol::Tcp => Ok(Arc::new(TcpStackContext::new(
+            servers.clone(),
+            tunnel_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
+            global_process_chains.clone(),
+            global_collection_manager.clone(),
+        ))),
+        StackProtocol::Udp => Ok(Arc::new(UdpStackContext::new(
+            servers.clone(),
+            tunnel_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
+            global_process_chains.clone(),
+            global_collection_manager.clone(),
+        ))),
+        StackProtocol::Rtcp => Ok(Arc::new(RtcpStackContext::new(
+            servers.clone(),
+            tunnel_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
+            global_process_chains.clone(),
+            global_collection_manager.clone(),
+        ))),
+        StackProtocol::Tls => {
+            Ok(Arc::new(TlsStackContext::new(
+                servers.clone(),
+                tunnel_manager.clone(),
+                limiter_manager.clone(),
+                stat_manager.clone(),
+                acme_manager.clone(),
+                self_cert_mgr.clone(),
+                global_process_chains.clone(),
+                global_collection_manager.clone(),
+            )))
+        }
+        StackProtocol::Quic => {
+            Ok(Arc::new(QuicStackContext::new(
+                servers.clone(),
+                tunnel_manager.clone(),
+                limiter_manager.clone(),
+                stat_manager.clone(),
+                acme_manager,
+                self_cert_mgr,
+                global_process_chains.clone(),
+                global_collection_manager.clone(),
+            )))
+        }
+        StackProtocol::Extension(name) => {
+            match name.as_str() {
+                "tun" => {
+                    Ok(Arc::new(TunStackContext::new(
+                        servers.clone(),
+                        tunnel_manager.clone(),
+                        limiter_manager.clone(),
+                        stat_manager.clone(),
+                        global_process_chains.clone(),
+                        global_collection_manager.clone(),
+                    )))
+                },
+                _ => {
+                    Err(server_err!(StackErrorCode::InvalidConfig, "invalid protocol: {}", name))
+                }
+            }
+        }
+    }
+}
 fn read_config_value(path: &Path) -> Result<Value> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow!("read config {} failed: {}", path.to_string_lossy(), e))?;
@@ -219,55 +345,22 @@ pub struct GatewayParams {
 }
 
 pub struct GatewayFactory {
-    stacks: StackManagerRef,
-    global_process_chains: GlobalProcessChainsRef,
     server_factory: CyfsServerFactoryRef,
-    servers: ServerManagerRef,
 
     stack_factory: CyfsStackFactoryRef,
     parser: GatewayConfigParserRef,
 
     connection_manager: ConnectionManagerRef,
-    tunnel_manager: TunnelManager,
-
-    //inner_service_factory: CyfsInnerServiceFactoryRef,
-    //inner_service_manager: InnerServiceManagerRef,
-    acme_mgr: AcmeCertManagerRef,
-    limiter_manager: LimiterManagerRef,
-    stat_manager: StatManagerRef,
-    self_cert_mgr: SelfCertMgrRef,
-    global_collection_manager: GlobalCollectionManagerRef,
-    external_cmds: JsPkgManagerRef,
 }
 
 impl GatewayFactory {
     pub fn new(
-        stacks: StackManagerRef,
-        servers: ServerManagerRef,
-        global_process_chains: GlobalProcessChainsRef,
         connection_manager: ConnectionManagerRef,
-        tunnel_manager: TunnelManager,
-        acme_mgr: AcmeCertManagerRef,
-        limiter_manager: LimiterManagerRef,
-        stat_manager: StatManagerRef,
-        self_cert_mgr: SelfCertMgrRef,
-        global_collection_manager: GlobalCollectionManagerRef,
-        external_cmds: JsPkgManagerRef,
         parser: GatewayConfigParserRef, ) -> Self {
         Self {
-            stacks,
-            servers,
-            global_process_chains,
             connection_manager,
-            tunnel_manager,
             stack_factory: Arc::new(CyfsStackFactory::new()),
             server_factory: Arc::new(CyfsServerFactory::new()),
-            acme_mgr,
-            limiter_manager,
-            stat_manager,
-            self_cert_mgr,
-            global_collection_manager,
-            external_cmds,
             parser,
         }
     }
@@ -280,47 +373,185 @@ impl GatewayFactory {
         self.server_factory.register(server_type.into(), factory);
     }
 
-
     pub async fn create_gateway(
         &self,
+        config_file: Option<&Path>,
         config: GatewayConfig,
-    ) -> Result<Gateway> {
-        for process_chain_config in config.global_process_chains.iter() {
-            let process_chain = process_chain_config.create_process_chain()?;
-            self.global_process_chains.add_process_chain(Arc::new(process_chain))?;
-        }
+    ) -> Result<Arc<Gateway>> {
+        let user_name: Option<String> = match config.raw_config.get("user_name") {
+            Some(user_name) => user_name.as_str().map(|value| value.to_string()),
+            None => None,
+        };
+        let password: Option<String> = match config.raw_config.get("password") {
+            Some(password) => password.as_str().map(|value| value.to_string()),
+            None => None,
+        };
 
-        let stack_manager = self.stacks.clone();
-        for stack_config in config.stacks.iter() {
-            let stack = self.stack_factory.create(stack_config.clone()).await?;
-            stack_manager.add_stack(stack)?;
-        }
 
-        for server_config in config.servers.iter() {
-            let servers = self.server_factory.create(server_config.clone()).await?;
-            for server in servers.into_iter() {
-                self.servers.add_server(server)?;
+        let limiter_manager = DefaultLimiterManager::new();
+        let stat_manager = StatManager::new();
+        if let Some(limiters_config) = config.limiters_config.clone() {
+            for limiter_config in limiters_config.iter() {
+                if limiter_manager.get_limiter(limiter_config.id.clone()).is_some() {
+                    log::error!("Create limiter {} error: limiter already exists", limiter_config.id);
+                    continue;
+                }
+                if let Some(upper_limiter) = limiter_config.upper_limiter.clone() {
+                    if limiter_manager.get_limiter(upper_limiter.clone()).is_none() {
+                        log::error!("Create limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
+                    }
+                }
+                let _ = limiter_manager.new_limiter(
+                    limiter_config.id.clone(),
+                    limiter_config.upper_limiter.clone(),
+                    limiter_config.concurrent.map(|v| v as u32),
+                    limiter_config.download_speed.map(|v| v as u32),
+                    limiter_config.upload_speed.map(|v| v as u32),
+                );
             }
         }
 
-        Ok(Gateway {
+        let sn_acme_data = get_buckyos_service_data_dir("cyfs_gateway").join("sn_dns");
+        if !sn_acme_data.exists() {
+            std::fs::create_dir_all(&sn_acme_data).unwrap();
+        }
+        let sn_provider_factory = AcmeSnProviderFactory::new(sn_acme_data);
+        AcmeCertManager::register_dns_provider_factory("sn-dns", sn_provider_factory.clone());
+        let mut cert_config = CertManagerConfig::default();
+        let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+        let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
+        cert_config.keystore_path = data_dir.to_string_lossy().to_string();
+        if let Some(acme_config) = config.acme_config.clone() {
+            cert_config.account = acme_config.account;
+            if acme_config.issuer.is_some() {
+                cert_config.acme_server = acme_config.issuer.unwrap();
+            }
+            cert_config.dns_providers = acme_config.dns_providers;
+            if acme_config.check_interval.is_some() {
+                if let Some(check_interval) = chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0) {
+                    cert_config.check_interval = check_interval;
+                }
+            }
+
+            if acme_config.renew_before_expiry.is_some() {
+                if let Some(renew_before_expiry) = chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0) {
+                    cert_config.renew_before_expiry = renew_before_expiry;
+                }
+            }
+        }
+        cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
+
+        let cert_manager = AcmeCertManager::create(cert_config).await?;
+        sn_provider_factory.set_acme_mgr(cert_manager.clone());
+        let inner_dns_record_manager = InnerDnsRecordManager::new();
+        let record_manager = inner_dns_record_manager.clone();
+        cert_manager.register_dns_provider("local", move |op: String, domain: String, key_hash: String| {
+            let record_manager = record_manager.clone();
+            async move {
+                if op == "add_challenge" {
+                    record_manager.add_record(domain, "TXT", key_hash).map_err(|e| anyhow!(e.to_string()))
+                } else if op == "del_challenge" {
+                    record_manager.remove_record(domain, "TXT");
+                    Ok(())
+                } else {
+                    Err(anyhow!("Unsupported op: {}", op))
+                }
+            }
+        });
+
+        let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
+        let mut self_cert_config = SelfCertConfig::default();
+        if let Some(config) = config.tls_ca.clone() {
+            self_cert_config.ca_path = Some(config.cert_path);
+            self_cert_config.key_path = Some(config.key_path);
+        }
+        self_cert_config.store_path = data_dir.to_string_lossy().to_string();
+        let self_cert_manager = SelfCertMgr::create(self_cert_config).await?;
+
+        let global_collections = GlobalCollectionManager::create(config.collections.clone()).await?;
+
+        let chain_cmds = get_buckyos_system_etc_dir().join("cyfs_gateway").join("server_templates");
+        let external_cmds = JsPkgManager::new(chain_cmds);
+        let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
+        if !data_dir.exists() {
+            create_dir_all(data_dir.clone()).await?;
+        }
+
+        let store = LocalTokenKeyStore::new(data_dir);
+        let token_manager = LocalTokenManager::new(user_name, password, store).await?;
+        let handler = GatewayCmdHandler::new(config_file.map(|v| v.to_path_buf()), self.parser.clone());
+
+        let mut global_process_chains = GlobalProcessChains::new();
+        for process_chain_config in config.global_process_chains.iter() {
+            let process_chain = process_chain_config.create_process_chain()?;
+            global_process_chains.add_process_chain(Arc::new(process_chain))?;
+        }
+        let global_process_chains = Arc::new(global_process_chains);
+
+        let tunnel_manager = TunnelManager::new();
+        let server_manager = Arc::new(ServerManager::new());
+        let control_handler: Arc<dyn GatewayControlCmdHandler> = handler.clone();
+        for server_config in config.servers.iter() {
+            let context = build_server_context(
+                server_config.server_type().as_str(),
+                server_manager.clone(),
+                global_process_chains.clone(),
+                tunnel_manager.clone(),
+                global_collections.clone(),
+                cert_manager.clone(),
+                inner_dns_record_manager.clone(),
+                Arc::downgrade(&control_handler),
+                token_manager.clone(),
+                token_manager.clone(),
+            );
+            let servers = self.server_factory.create(server_config.clone(), context).await?;
+            for server in servers.into_iter() {
+                server_manager.add_server(server)?;
+            }
+        }
+
+        let stack_manager = StackManager::new();
+        for stack_config in config.stacks.iter() {
+            let stack_context = build_stack_context(
+                stack_config.stack_protocol(),
+                server_manager.clone(),
+                tunnel_manager.clone(),
+                limiter_manager.clone(),
+                stat_manager.clone(),
+                Some(global_process_chains.clone()),
+                Some(global_collections.clone()),
+                cert_manager.clone(),
+                self_cert_manager.clone(),
+            )?;
+            let stack = self.stack_factory.create(stack_config.clone(), stack_context).await?;
+            stack_manager.add_stack(stack)?;
+        }
+
+        let control_handler: Arc<dyn GatewayControlCmdHandler> = handler.clone();
+        let gateway = Arc::new(Gateway {
             init_config: Mutex::new(config.clone()),
             config: Arc::new(Mutex::new(config)),
             stack_manager,
-            tunnel_manager: self.tunnel_manager.clone(),
-            server_manager: self.servers.clone(),
+            tunnel_manager,
+            server_manager,
             parser: self.parser.clone(),
-            global_process_chains: self.global_process_chains.clone(),
+            global_process_chains,
             connection_manager: self.connection_manager.clone(),
-            acme_mgr: self.acme_mgr.clone(),
+            acme_mgr: cert_manager,
             stack_factory: self.stack_factory.clone(),
             server_factory: self.server_factory.clone(),
-            limiter_manager: self.limiter_manager.clone(),
-            stat_manager: self.stat_manager.clone(),
-            self_cert_mgr: self.self_cert_mgr.clone(),
-            global_collection_manager: self.global_collection_manager.clone(),
-            external_cmds: self.external_cmds.clone(),
-        })
+            limiter_manager,
+            stat_manager,
+            self_cert_mgr: self_cert_manager,
+            global_collection_manager: global_collections,
+            external_cmds,
+            inner_dns_record_manager,
+            control_handler,
+            control_token_verifier: token_manager.clone(),
+            control_token_factory: token_manager,
+        });
+        handler.set_gateway(gateway.clone());
+        Ok(gateway)
     }
 }
 
@@ -341,6 +572,10 @@ pub struct Gateway {
     self_cert_mgr: SelfCertMgrRef,
     global_collection_manager: GlobalCollectionManagerRef,
     external_cmds: JsPkgManagerRef,
+    inner_dns_record_manager: InnerDnsRecordManagerRef,
+    control_handler: Arc<dyn GatewayControlCmdHandler>,
+    control_token_verifier: Arc<dyn CyfsTokenVerifier>,
+    control_token_factory: Arc<dyn CyfsTokenFactory>,
 }
 
 impl Drop for Gateway {
@@ -1827,6 +2062,9 @@ impl Gateway {
         Ok(raw_config)
     }
 
+    fn create_server_context(&self, server_type: &str) -> Result<Option<ServerContextRef>> {
+        unreachable!()
+    }
     pub async fn add_rule(&self, id: &str, rule: &str) -> Result<()> {
         let id_list = id.split(':').collect::<Vec<&str>>();
         if id_list.len() < 2 {
@@ -1869,7 +2107,8 @@ impl Gateway {
                     .cloned()
                     .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
 
-                let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+                let context = self.create_server_context(new_server_config.server_type().as_str())?;
+                let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
                 for server in new_servers.into_iter() {
                     self.server_manager.replace_server(server);
                 }
@@ -1929,7 +2168,8 @@ impl Gateway {
                     .cloned()
                     .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
 
-                let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+                let context = self.create_server_context(new_server_config.server_type().as_str())?;
+                let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
                 for server in new_servers.into_iter() {
                     self.server_manager.replace_server(server);
                 }
@@ -1989,7 +2229,8 @@ impl Gateway {
                     .cloned()
                     .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
 
-                let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+                let context = self.create_server_context(new_server_config.server_type().as_str())?;
+                let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
                 for server in new_servers.into_iter() {
                     self.server_manager.replace_server(server);
                 }
@@ -2050,7 +2291,8 @@ impl Gateway {
                     .cloned()
                     .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
 
-                let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+                let context = self.create_server_context(new_server_config.server_type().as_str())?;
+                let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
                 for server in new_servers.into_iter() {
                     self.server_manager.replace_server(server);
                 }
@@ -2077,18 +2319,7 @@ impl Gateway {
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
 
-        let new_stack_config = gateway_config
-            .stacks
-            .iter()
-            .find(|s| s.id() == stack_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("stack config not found after parse: {}", stack_id))?;
-        let new_stack = self.stack_factory.create(new_stack_config.clone()).await?;
-        self.stack_manager.add_stack(new_stack.clone())?;
-        new_stack.start().await?;
-
-        let mut guard = self.config.lock().unwrap();
-        *guard = gateway_config;
+        self.reload(gateway_config).await?;
         Ok(())
     }
 
@@ -2109,7 +2340,8 @@ impl Gateway {
                 .cloned()
                 .ok_or_else(|| anyhow!("server config not found after parse: {}", server_id))?;
 
-            let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+            let context = self.create_server_context(new_server_config.server_type().as_str())?;
+            let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
             for server in new_servers.into_iter() {
                 self.server_manager.replace_server(server);
             }
@@ -2122,7 +2354,8 @@ impl Gateway {
             .cloned()
             .ok_or_else(|| anyhow!("server config not found after parse: {}", server_id))?;
 
-        let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+        let context = self.create_server_context(new_server_config.server_type().as_str())?;
+        let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
         for server in new_servers.into_iter() {
             self.server_manager.replace_server(server);
         }
@@ -2152,7 +2385,8 @@ impl Gateway {
                 .find(|s| s.id() == removed_server_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("server config not found after parse"))?;
-            let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+            let context = self.create_server_context(new_server_config.server_type().as_str())?;
+            let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
             for server in new_servers.into_iter() {
                 self.server_manager.replace_server(server);
             }
@@ -2224,7 +2458,8 @@ impl Gateway {
                     .cloned()
                     .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
 
-                let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+                let context = self.create_server_context(new_server_config.server_type().as_str())?;
+                let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
                 for server in new_servers.into_iter() {
                     self.server_manager.replace_server(server);
                 }
@@ -2434,7 +2669,8 @@ impl Gateway {
                     .cloned()
                     .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
 
-                let new_servers = self.server_factory.create(new_server_config.clone()).await?;
+                let context = self.create_server_context(new_server_config.server_type().as_str())?;
+                let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
                 for server in new_servers.into_iter() {
                     self.server_manager.replace_server(server);
                 }
@@ -2453,207 +2689,222 @@ impl Gateway {
     }
 
     pub async fn reload(&self, mut config: GatewayConfig) -> Result<()> {
-        let old_config = {
-            self.config.lock().unwrap().clone()
-        };
-        let mut new_process_chains = HashMap::new();
-        for process_chain_config in config.global_process_chains.iter() {
-            let process_chain = Arc::new(process_chain_config.create_process_chain()?);
-            if new_process_chains.contains_key(process_chain.id()) {
-                Err(cmd_err!(
-                    ConfigErrorCode::AlreadyExists,
-                    "Duplicated process chain: {}", process_chain.id(),
-                ))?;
-            }
-            new_process_chains.insert(process_chain.id().to_string(), process_chain);
-        }
-
-
-
-        self.global_process_chains.clear_process_chains();
-        for process_chain in new_process_chains.values() {
-            self.global_process_chains.add_process_chain(process_chain.clone())?;
-        }
-
-        let mut new_servers = HashMap::new();
-        for server_config in config.servers.iter() {
-            let new_server = self.server_factory.create(server_config.clone()).await?;
-            for server in new_server.into_iter() {
-                if new_servers.contains_key(server.full_key().as_str()) {
-                    Err(cmd_err!(
-                    ConfigErrorCode::AlreadyExists,
-                    "Duplicated server: {}", server.full_key(),
-                ))?;
-                }
-                new_servers.insert(server.full_key(), server);
-            }
-        }
-
-
-
-        for server in new_servers.values() {
-            self.server_manager.replace_server(server.clone());
-        }
-
-        let mut success_stacks = Vec::new();
-        for stack_config in config.stacks.iter() {
-            if let Some(stack) = self.stack_manager.get_stack(stack_config.id().as_str()) {
-                if let Err(e) = stack.update_config(stack_config.clone()).await {
-                    if e.code() == StackErrorCode::BindUnmatched {
-                        self.stack_manager.remove(stack_config.id().as_str());
-                        let new_stack = match self.stack_factory.create(stack_config.clone()).await {
-                            Ok(stack) => stack,
-                            Err(e) => {
-                                log::error!("Failed to create stack {}: {}", stack_config.id(), e);
-                                continue;
-                            }
-                        };
-                        if let Err(e) = self.stack_manager.add_stack(new_stack.clone()) {
-                            log::error!("Failed to add stack {}: {}", stack_config.id(), e);
-                        }
-                        if let Err(e) = new_stack.start().await {
-                            self.stack_manager.remove(stack_config.id().as_str());
-                            log::error!("Failed to start stack {}: {}", stack_config.id(), e);
-                        }
-                        success_stacks.push(stack_config.clone());
-                    } else {
-                        log::error!("Failed to update stack {}: {}", stack_config.id(), e);
-                        let config = self.config.lock().unwrap();
-                        for old_config in config.stacks.iter() {
-                            if old_config.id() == stack_config.id() {
-                                success_stacks.push(old_config.clone());
-                            }
-                        }
-                    }
-                } else {
-                    success_stacks.push(stack_config.clone());
-                }
-            } else {
-                let new_stack = match self.stack_factory.create(stack_config.clone()).await {
-                    Ok(stack) => stack,
-                    Err(e) => {
-                        log::error!("Failed to create stack {}: {}", stack_config.id(), e);
-                        continue;
-                    }
-                };
-                if let Err(e) = self.stack_manager.add_stack(new_stack.clone()) {
-                    log::error!("Failed to add stack {}: {}", stack_config.id(), e);
-                    continue;
-                }
-                if let Err(e) = new_stack.start().await {
-                    self.stack_manager.remove(stack_config.id().as_str());
-                    log::error!("Failed to start stack {}: {}", stack_config.id(), e);
-                    continue;
-                }
-                success_stacks.push(stack_config.clone());
-            }
-        }
-
-        config.stacks = success_stacks;
-        self.stack_manager.retain(|id| {
-            config.stacks.iter().any(|stack| stack.id() == id)
-        });
-        self.server_manager.retain(|id| {
-            new_servers.contains_key(id)
-        });
-
-        if config.acme_config != old_config.acme_config {
-            if config.acme_config.is_some() {
-                let acme_config = config.acme_config.clone().unwrap();
-                let mut cert_config = CertManagerConfig::default();
-                let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
-                let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
-                cert_config.keystore_path = data_dir.to_string_lossy().to_string();
-                cert_config.account = acme_config.account;
-                if acme_config.issuer.is_some() {
-                    cert_config.acme_server = acme_config.issuer.unwrap();
-                }
-                cert_config.dns_providers = acme_config.dns_providers;
-                if acme_config.check_interval.is_some() {
-                    if let Some(check_interval) = chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0) {
-                        cert_config.check_interval = check_interval;
-                    }
-                }
-
-                if acme_config.renew_before_expiry.is_some() {
-                    if let Some(renew_before_expiry) = chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0) {
-                        cert_config.renew_before_expiry = renew_before_expiry;
-                    }
-                }
-                cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
-                if let Err(e) = self.acme_mgr.update(cert_config).await {
-                    log::error!("Failed to update acme manager: {}", e);
-                }
-            } else {
-                let mut cert_config = CertManagerConfig::default();
-                let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
-                let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
-                cert_config.keystore_path = data_dir.to_string_lossy().to_string();
-                cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
-                if let Err(e) = self.acme_mgr.update(cert_config).await {
-                    log::error!("Failed to update acme manager: {}", e);
-                }
-            }
-        }
-
-        if config.limiters_config != old_config.limiters_config {
-            if config.limiters_config.is_some() {
-                let limiters_config = config.limiters_config.clone().unwrap();
-                let mut limiter_set = HashSet::new();
-                for limiter_config in limiters_config.iter() {
-                    limiter_set.insert(limiter_config.id.clone());
-                    if let Some(limiter) = self.limiter_manager.get_limiter(limiter_config.id.as_str()) {
-                        if limiter.get_upper_limiter().map(|limiter| limiter.get_id().map(|v| v.to_string())) == Some(limiter_config.upper_limiter.clone()) {
-                            limiter.set_speed(limiter_config.concurrent.map(|v| v as u32),
-                                              limiter_config.download_speed.map(|v| v as u32),
-                                              limiter_config.upload_speed.map(|v| v as u32));
-                            continue;
-                        }
-                    }
-                    if let Some(upper_limiter) = limiter_config.upper_limiter.clone() {
-                        if self.limiter_manager.get_limiter(upper_limiter.as_str()).is_none() {
-                            log::error!("Update limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
-                        }
-                    }
-                    let _ = self.limiter_manager.new_limiter(limiter_config.id.clone(),
-                                                             limiter_config.upper_limiter.clone(),
-                                                             limiter_config.concurrent.map(|v| v as u32),
-                                                             limiter_config.download_speed.map(|v| v as u32),
-                                                             limiter_config.upload_speed.map(|v| v as u32));
-                }
-
-                self.limiter_manager.retain(|id, _| {
-                    limiter_set.contains(id)
-                });
-            } else {
-                self.limiter_manager.retain(|_, _| {
-                    false
-                });
-            }
-        }
-
-        if config.tls_ca != old_config.tls_ca {
-            if config.tls_ca.is_some() {
-                let tls_ca = config.tls_ca.clone().unwrap();
-                let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
-                let mut self_cert_config = SelfCertConfig::default();
-                self_cert_config.ca_path = Some(tls_ca.cert_path);
-                self_cert_config.key_path = Some(tls_ca.key_path);
-                self_cert_config.store_path = data_dir.to_string_lossy().to_string();
-                if let Err(e) = self.self_cert_mgr.update(self_cert_config).await {
-                    log::error!("Failed to update self cert manager: {}", e);
-                }
-            } else {
-                let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
-                let mut self_cert_config = SelfCertConfig::default();
-                self_cert_config.store_path = data_dir.to_string_lossy().to_string();
-                if let Err(e) = self.self_cert_mgr.update(self_cert_config).await {
-                    log::error!("Failed to update self cert manager: {}", e);
-                }
-            }
-        }
-
-        *self.config.lock().unwrap() = config;
+        // let old_config = {
+        //     self.config.lock().unwrap().clone()
+        // };
+        // let mut new_process_chains = HashMap::new();
+        // for process_chain_config in config.global_process_chains.iter() {
+        //     let process_chain = Arc::new(process_chain_config.create_process_chain()?);
+        //     if new_process_chains.contains_key(process_chain.id()) {
+        //         Err(cmd_err!(
+        //             ConfigErrorCode::AlreadyExists,
+        //             "Duplicated process chain: {}", process_chain.id(),
+        //         ))?;
+        //     }
+        //     new_process_chains.insert(process_chain.id().to_string(), process_chain);
+        // }
+        //
+        //
+        //
+        // self.global_process_chains.clear_process_chains();
+        // for process_chain in new_process_chains.values() {
+        //     self.global_process_chains.add_process_chain(process_chain.clone())?;
+        // }
+        //
+        // let mut new_servers = HashMap::new();
+        // for server_config in config.servers.iter() {
+        //     let context = self.create_server_context(server_config.server_type().as_str())?;
+        //     let new_server = self.server_factory.create(server_config.clone(), context).await?;
+        //     for server in new_server.into_iter() {
+        //         if new_servers.contains_key(server.full_key().as_str()) {
+        //             Err(cmd_err!(
+        //             ConfigErrorCode::AlreadyExists,
+        //             "Duplicated server: {}", server.full_key(),
+        //         ))?;
+        //         }
+        //         new_servers.insert(server.full_key(), server);
+        //     }
+        // }
+        //
+        //
+        //
+        // for server in new_servers.values() {
+        //     self.server_manager.replace_server(server.clone());
+        // }
+        //
+        // let mut success_stacks = Vec::new();
+        // for stack_config in config.stacks.iter() {
+        //     if let Some(stack) = self.stack_manager.get_stack(stack_config.id().as_str()) {
+        //         if let Err(e) = stack.update_config(stack_config.clone()).await {
+        //             if e.code() == StackErrorCode::BindUnmatched {
+        //                 self.stack_manager.remove(stack_config.id().as_str());
+        //                 let stack_context = match self.create_stack_context(&stack_config.stack_protocol()) {
+        //                     Ok(context) => context,
+        //                     Err(e) => {
+        //                         log::error!("Failed to create stack context {}: {}", stack_config.id(), e);
+        //                         continue;
+        //                     }
+        //                 };
+        //                 let new_stack = match self.stack_factory.create(stack_config.clone(), stack_context).await {
+        //                     Ok(stack) => stack,
+        //                     Err(e) => {
+        //                         log::error!("Failed to create stack {}: {}", stack_config.id(), e);
+        //                         continue;
+        //                     }
+        //                 };
+        //                 if let Err(e) = self.stack_manager.add_stack(new_stack.clone()) {
+        //                     log::error!("Failed to add stack {}: {}", stack_config.id(), e);
+        //                 }
+        //                 if let Err(e) = new_stack.start().await {
+        //                     self.stack_manager.remove(stack_config.id().as_str());
+        //                     log::error!("Failed to start stack {}: {}", stack_config.id(), e);
+        //                 }
+        //                 success_stacks.push(stack_config.clone());
+        //             } else {
+        //                 log::error!("Failed to update stack {}: {}", stack_config.id(), e);
+        //                 let config = self.config.lock().unwrap();
+        //                 for old_config in config.stacks.iter() {
+        //                     if old_config.id() == stack_config.id() {
+        //                         success_stacks.push(old_config.clone());
+        //                     }
+        //                 }
+        //             }
+        //         } else {
+        //             success_stacks.push(stack_config.clone());
+        //         }
+        //     } else {
+        //         let stack_context = match self.create_stack_context(&stack_config.stack_protocol()) {
+        //             Ok(context) => context,
+        //             Err(e) => {
+        //                 log::error!("Failed to create stack context {}: {}", stack_config.id(), e);
+        //                 continue;
+        //             }
+        //         };
+        //         let new_stack = match self.stack_factory.create(stack_config.clone(), stack_context).await {
+        //             Ok(stack) => stack,
+        //             Err(e) => {
+        //                 log::error!("Failed to create stack {}: {}", stack_config.id(), e);
+        //                 continue;
+        //             }
+        //         };
+        //         if let Err(e) = self.stack_manager.add_stack(new_stack.clone()) {
+        //             log::error!("Failed to add stack {}: {}", stack_config.id(), e);
+        //             continue;
+        //         }
+        //         if let Err(e) = new_stack.start().await {
+        //             self.stack_manager.remove(stack_config.id().as_str());
+        //             log::error!("Failed to start stack {}: {}", stack_config.id(), e);
+        //             continue;
+        //         }
+        //         success_stacks.push(stack_config.clone());
+        //     }
+        // }
+        //
+        // config.stacks = success_stacks;
+        // self.stack_manager.retain(|id| {
+        //     config.stacks.iter().any(|stack| stack.id() == id)
+        // });
+        // self.server_manager.retain(|id| {
+        //     new_servers.contains_key(id)
+        // });
+        //
+        // if config.acme_config != old_config.acme_config {
+        //     if config.acme_config.is_some() {
+        //         let acme_config = config.acme_config.clone().unwrap();
+        //         let mut cert_config = CertManagerConfig::default();
+        //         let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+        //         let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
+        //         cert_config.keystore_path = data_dir.to_string_lossy().to_string();
+        //         cert_config.account = acme_config.account;
+        //         if acme_config.issuer.is_some() {
+        //             cert_config.acme_server = acme_config.issuer.unwrap();
+        //         }
+        //         cert_config.dns_providers = acme_config.dns_providers;
+        //         if acme_config.check_interval.is_some() {
+        //             if let Some(check_interval) = chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0) {
+        //                 cert_config.check_interval = check_interval;
+        //             }
+        //         }
+        //
+        //         if acme_config.renew_before_expiry.is_some() {
+        //             if let Some(renew_before_expiry) = chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0) {
+        //                 cert_config.renew_before_expiry = renew_before_expiry;
+        //             }
+        //         }
+        //         cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
+        //         if let Err(e) = self.acme_mgr.update(cert_config).await {
+        //             log::error!("Failed to update acme manager: {}", e);
+        //         }
+        //     } else {
+        //         let mut cert_config = CertManagerConfig::default();
+        //         let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+        //         let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
+        //         cert_config.keystore_path = data_dir.to_string_lossy().to_string();
+        //         cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
+        //         if let Err(e) = self.acme_mgr.update(cert_config).await {
+        //             log::error!("Failed to update acme manager: {}", e);
+        //         }
+        //     }
+        // }
+        //
+        // if config.limiters_config != old_config.limiters_config {
+        //     if config.limiters_config.is_some() {
+        //         let limiters_config = config.limiters_config.clone().unwrap();
+        //         let mut limiter_set = HashSet::new();
+        //         for limiter_config in limiters_config.iter() {
+        //             limiter_set.insert(limiter_config.id.clone());
+        //             if let Some(limiter) = self.limiter_manager.get_limiter(limiter_config.id.as_str()) {
+        //                 if limiter.get_upper_limiter().map(|limiter| limiter.get_id().map(|v| v.to_string())) == Some(limiter_config.upper_limiter.clone()) {
+        //                     limiter.set_speed(limiter_config.concurrent.map(|v| v as u32),
+        //                                       limiter_config.download_speed.map(|v| v as u32),
+        //                                       limiter_config.upload_speed.map(|v| v as u32));
+        //                     continue;
+        //                 }
+        //             }
+        //             if let Some(upper_limiter) = limiter_config.upper_limiter.clone() {
+        //                 if self.limiter_manager.get_limiter(upper_limiter.as_str()).is_none() {
+        //                     log::error!("Update limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
+        //                 }
+        //             }
+        //             let _ = self.limiter_manager.new_limiter(limiter_config.id.clone(),
+        //                                                      limiter_config.upper_limiter.clone(),
+        //                                                      limiter_config.concurrent.map(|v| v as u32),
+        //                                                      limiter_config.download_speed.map(|v| v as u32),
+        //                                                      limiter_config.upload_speed.map(|v| v as u32));
+        //         }
+        //
+        //         self.limiter_manager.retain(|id, _| {
+        //             limiter_set.contains(id)
+        //         });
+        //     } else {
+        //         self.limiter_manager.retain(|_, _| {
+        //             false
+        //         });
+        //     }
+        // }
+        //
+        // if config.tls_ca != old_config.tls_ca {
+        //     if config.tls_ca.is_some() {
+        //         let tls_ca = config.tls_ca.clone().unwrap();
+        //         let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
+        //         let mut self_cert_config = SelfCertConfig::default();
+        //         self_cert_config.ca_path = Some(tls_ca.cert_path);
+        //         self_cert_config.key_path = Some(tls_ca.key_path);
+        //         self_cert_config.store_path = data_dir.to_string_lossy().to_string();
+        //         if let Err(e) = self.self_cert_mgr.update(self_cert_config).await {
+        //             log::error!("Failed to update self cert manager: {}", e);
+        //         }
+        //     } else {
+        //         let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
+        //         let mut self_cert_config = SelfCertConfig::default();
+        //         self_cert_config.store_path = data_dir.to_string_lossy().to_string();
+        //         if let Err(e) = self.self_cert_mgr.update(self_cert_config).await {
+        //             log::error!("Failed to update self cert manager: {}", e);
+        //         }
+        //     }
+        // }
+        //
+        // *self.config.lock().unwrap() = config;
         Ok(())
     }
 }
@@ -2671,7 +2922,7 @@ struct StartTemplateParams {
 }
 
 pub struct GatewayCmdHandler {
-    gateway: Mutex<Option<Arc<Gateway>>>,
+    gateway: Mutex<Option<Weak<Gateway>>>,
     config_file: Option<PathBuf>,
     parser: GatewayConfigParserRef,
 }
@@ -2687,101 +2938,110 @@ impl GatewayCmdHandler {
     }
 
     pub fn set_gateway(&self, gateway: Arc<Gateway>) {
-        self.gateway.lock().unwrap().replace(gateway);
+        self.gateway.lock().unwrap().replace(Arc::downgrade(&gateway));
     }
 
     fn get_gateway(&self) -> Option<Arc<Gateway>> {
-        self.gateway.lock().unwrap().clone()
+        if let Some(gateway) = self.gateway.lock().unwrap().clone() {
+            gateway.upgrade()
+        } else {
+            None
+        }
     }
 
     async fn start_template(&self, template_id: &str, args: Vec<String>) -> ControlResult<Value> {
-        let gateway = self.get_gateway().ok_or_else(|| cmd_err!(ControlErrorCode::NoGateway, "gateway not init"))?;
-        let current_config = {
-            gateway.config.lock().unwrap().clone()
-        };
-        let pkg = gateway.external_cmds.get_pkg(template_id)
-            .await
-            .map_err(into_cmd_err!(ControlErrorCode::Failed, "get pkg failed"))?;
-        let output = run_server_tempalte_pkg(pkg, args).await?;
-        let template_config: Value = serde_json::from_str(output.as_str())
-            .map_err(into_cmd_err!(ControlErrorCode::InvalidParams, "invalid template config"))?;
-        let mut raw_config = current_config.raw_config.clone();
-        merge(&mut raw_config, &template_config);
-        let gateway_config = self.parser
-            .parse(raw_config)
-            .map_err(into_cmd_err!(ControlErrorCode::Failed, "parse config failed"))?;
-        let existing_stack_ids: HashSet<String> = current_config.stacks.iter()
-            .map(|stack| stack.id().to_string())
-            .collect();
-        let existing_server_ids: HashSet<String> = current_config.servers.iter()
-            .map(|server| server.id().to_string())
-            .collect();
-        let existing_chain_ids: HashSet<String> = current_config.global_process_chains.iter()
-            .map(|chain| chain.id.clone())
-            .collect();
-
-        let mut added_chains = Vec::new();
-        for chain_config in gateway_config.global_process_chains.iter() {
-            if existing_chain_ids.contains(chain_config.id.as_str()) {
-                continue;
-            }
-            let process_chain = Arc::new(chain_config.create_process_chain()
-                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create process chain {} failed: {}", chain_config.id, e))?);
-            gateway.global_process_chains.add_process_chain(process_chain)
-                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "add process chain {} failed: {}", chain_config.id, e))?;
-            added_chains.push(chain_config.clone());
-        }
-
-        let mut added_stacks = Vec::new();
-        for stack_config in gateway_config.stacks.iter() {
-            if existing_stack_ids.contains(stack_config.id().as_str()) {
-                continue;
-            }
-            let new_stack = gateway.stack_factory.create(stack_config.clone()).await
-                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create stack {} failed: {}", stack_config.id(), e))?;
-            gateway.stack_manager.add_stack(new_stack.clone())
-                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "add stack {} failed: {}", stack_config.id(), e))?;
-            if let Err(e) = new_stack.start().await {
-                gateway.stack_manager.remove(stack_config.id().as_str());
-                return Err(cmd_err!(ControlErrorCode::Failed, "start stack {} failed: {}", stack_config.id(), e));
-            }
-            added_stacks.push(stack_config.clone());
-        }
-
-        let mut added_servers = Vec::new();
-        for server_config in gateway_config.servers.iter() {
-            if existing_server_ids.contains(server_config.id().as_str()) {
-                continue;
-            }
-            let new_servers = gateway.server_factory.create(server_config.clone()).await
-                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create server {} failed: {}", server_config.id(), e))?;
-            let mut added_any = false;
-            for server in new_servers.into_iter() {
-                if gateway.server_manager.get_server_by_key(server.full_key().as_str()).is_some() {
-                    continue;
-                }
-                gateway.server_manager.add_server(server)
-                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "add server failed: {}", e))?;
-                added_any = true;
-            }
-            if added_any {
-                added_servers.push(server_config.clone());
-            }
-        }
-
-        let mut updated_config = current_config.clone();
-        updated_config.raw_config = gateway_config.raw_config.clone();
-        if !added_chains.is_empty() {
-            updated_config.global_process_chains.extend(added_chains);
-        }
-        if !added_stacks.is_empty() {
-            updated_config.stacks.extend(added_stacks);
-        }
-        if !added_servers.is_empty() {
-            updated_config.servers.extend(added_servers);
-        }
-        *gateway.config.lock().unwrap() = updated_config;
-        Ok(template_config)
+        unreachable!();
+        // let gateway = self.get_gateway().ok_or_else(|| cmd_err!(ControlErrorCode::NoGateway, "gateway not init"))?;
+        // let current_config = {
+        //     gateway.config.lock().unwrap().clone()
+        // };
+        // let pkg = gateway.external_cmds.get_pkg(template_id)
+        //     .await
+        //     .map_err(into_cmd_err!(ControlErrorCode::Failed, "get pkg failed"))?;
+        // let output = run_server_tempalte_pkg(pkg, args).await?;
+        // let template_config: Value = serde_json::from_str(output.as_str())
+        //     .map_err(into_cmd_err!(ControlErrorCode::InvalidParams, "invalid template config"))?;
+        // let mut raw_config = current_config.raw_config.clone();
+        // merge(&mut raw_config, &template_config);
+        // let gateway_config = self.parser
+        //     .parse(raw_config)
+        //     .map_err(into_cmd_err!(ControlErrorCode::Failed, "parse config failed"))?;
+        // let existing_stack_ids: HashSet<String> = current_config.stacks.iter()
+        //     .map(|stack| stack.id().to_string())
+        //     .collect();
+        // let existing_server_ids: HashSet<String> = current_config.servers.iter()
+        //     .map(|server| server.id().to_string())
+        //     .collect();
+        // let existing_chain_ids: HashSet<String> = current_config.global_process_chains.iter()
+        //     .map(|chain| chain.id.clone())
+        //     .collect();
+        //
+        // let mut added_chains = Vec::new();
+        // for chain_config in gateway_config.global_process_chains.iter() {
+        //     if existing_chain_ids.contains(chain_config.id.as_str()) {
+        //         continue;
+        //     }
+        //     let process_chain = Arc::new(chain_config.create_process_chain()
+        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create process chain {} failed: {}", chain_config.id, e))?);
+        //     gateway.global_process_chains.add_process_chain(process_chain)
+        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "add process chain {} failed: {}", chain_config.id, e))?;
+        //     added_chains.push(chain_config.clone());
+        // }
+        //
+        // let mut added_servers = Vec::new();
+        // for server_config in gateway_config.servers.iter() {
+        //     if existing_server_ids.contains(server_config.id().as_str()) {
+        //         continue;
+        //     }
+        //     let context = gateway.create_server_context(server_config.server_type().as_str())
+        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create server context {} failed: {}", server_config.id(), e))?;
+        //     let new_servers = gateway.server_factory.create(server_config.clone(), context).await
+        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create server {} failed: {}", server_config.id(), e))?;
+        //     let mut added_any = false;
+        //     for server in new_servers.into_iter() {
+        //         if gateway.server_manager.get_server_by_key(server.full_key().as_str()).is_some() {
+        //             continue;
+        //         }
+        //         gateway.server_manager.add_server(server)
+        //             .map_err(|e| cmd_err!(ControlErrorCode::Failed, "add server failed: {}", e))?;
+        //         added_any = true;
+        //     }
+        //     if added_any {
+        //         added_servers.push(server_config.clone());
+        //     }
+        // }
+        //
+        // let mut added_stacks = Vec::new();
+        // for stack_config in gateway_config.stacks.iter() {
+        //     if existing_stack_ids.contains(stack_config.id().as_str()) {
+        //         continue;
+        //     }
+        //     let stack_context = gateway.create_stack_context(&stack_config.stack_protocol())
+        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create stack context {} failed: {}", stack_config.id(), e))?;
+        //     let new_stack = gateway.stack_factory.create(stack_config.clone(), stack_context).await
+        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create stack {} failed: {}", stack_config.id(), e))?;
+        //     gateway.stack_manager.add_stack(new_stack.clone())
+        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "add stack {} failed: {}", stack_config.id(), e))?;
+        //     if let Err(e) = new_stack.start().await {
+        //         gateway.stack_manager.remove(stack_config.id().as_str());
+        //         return Err(cmd_err!(ControlErrorCode::Failed, "start stack {} failed: {}", stack_config.id(), e));
+        //     }
+        //     added_stacks.push(stack_config.clone());
+        // }
+        //
+        // let mut updated_config = current_config.clone();
+        // updated_config.raw_config = gateway_config.raw_config.clone();
+        // if !added_chains.is_empty() {
+        //     updated_config.global_process_chains.extend(added_chains);
+        // }
+        // if !added_stacks.is_empty() {
+        //     updated_config.stacks.extend(added_stacks);
+        // }
+        // if !added_servers.is_empty() {
+        //     updated_config.servers.extend(added_servers);
+        // }
+        // *gateway.config.lock().unwrap() = updated_config;
+        // Ok(template_config)
     }
 
     async fn get_external_cmds(&self) -> ControlResult<Vec<ExternalCmd>> {

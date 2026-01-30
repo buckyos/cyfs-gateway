@@ -6,7 +6,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, ProcessChainConfig, Server, ServerConfig, StreamInfo, config_err, ServerError};
-use cyfs_gateway_lib::{ServerFactory, HttpServer};
+use cyfs_gateway_lib::{ServerContext, ServerContextRef, ServerFactory, HttpServer};
 use crate::config_loader::{ServerConfigParser};
 use crate::gateway_control_client::cmd_err;
 use cyfs_gateway_lib::{server_err, ServerErrorCode, ServerResult};
@@ -76,33 +76,66 @@ impl ServerConfig for GatewayControlServerConfig {
 }
 
 
-pub struct GatewayControlServerFactory {
-    handler: Weak<dyn GatewayControlCmdHandler>,
-    token_factory: Arc<dyn CyfsTokenFactory>,
-    token_verifier: Arc<dyn CyfsTokenVerifier>,
+#[derive(Clone)]
+pub struct GatewayControlServerContext {
+    pub handler: Weak<dyn GatewayControlCmdHandler>,
+    pub token_factory: Arc<dyn CyfsTokenFactory>,
+    pub token_verifier: Arc<dyn CyfsTokenVerifier>,
 }
 
-impl GatewayControlServerFactory {
-    pub fn new(handler: Arc<dyn GatewayControlCmdHandler>,
-               token_verifier: Arc<dyn CyfsTokenVerifier>,
-               token_factory: Arc<dyn CyfsTokenFactory>, ) -> Self {
-        GatewayControlServerFactory {
-            handler: Arc::downgrade(&handler),
+impl GatewayControlServerContext {
+    pub fn new(
+        handler: Weak<dyn GatewayControlCmdHandler>,
+        token_verifier: Arc<dyn CyfsTokenVerifier>,
+        token_factory: Arc<dyn CyfsTokenFactory>,
+    ) -> Self {
+        Self {
+            handler,
             token_factory,
             token_verifier,
         }
     }
 }
 
+impl ServerContext for GatewayControlServerContext {
+    fn get_server_type(&self) -> String {
+        "control_server".to_string()
+    }
+}
+
+pub struct GatewayControlServerFactory;
+
+impl GatewayControlServerFactory {
+    pub fn new() -> Self {
+        GatewayControlServerFactory
+    }
+}
+
 #[async_trait::async_trait]
 impl ServerFactory for GatewayControlServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
+    async fn create(
+        &self,
+        config: Arc<dyn ServerConfig>,
+        context: Option<ServerContextRef>,
+    ) -> ServerResult<Vec<Server>> {
         let config = config.as_any().downcast_ref::<GatewayControlServerConfig>()
             .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid CyfsCmdServer config {}", config.server_type()))?;
+        let context = context.ok_or(server_err!(
+            ServerErrorCode::InvalidConfig,
+            "control server context is required"
+        ))?;
+        let context = context
+            .as_ref()
+            .as_any()
+            .downcast_ref::<GatewayControlServerContext>()
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid control server context"
+            ))?;
         Ok(vec![Server::Http(Arc::new(GatewayControlServer::new(config.clone(),
-                                                           self.handler.clone(),
-                                                           self.token_factory.clone(),
-                                                                self.token_verifier.clone())))])
+                                                           context.handler.clone(),
+                                                           context.token_factory.clone(),
+                                                                context.token_verifier.clone())))])
     }
 }
 

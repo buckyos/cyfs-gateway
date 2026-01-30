@@ -9,7 +9,7 @@ use serde_json::Value;
 use futures_util::TryStreamExt;
 use buckyos_kit::get_by_json_path;
 use ndn_lib::*;
-use crate::{HttpServer, Server, ServerConfig, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo, NamedDataMgrRouteConfig};
+use crate::{HttpServer, Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo, NamedDataMgrRouteConfig};
 use super::server_err;
 
 /// Wrapper for ChunkReader to make it Sync
@@ -801,7 +801,11 @@ pub struct NdnServerFactory;
 
 #[async_trait::async_trait]
 impl ServerFactory for NdnServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
+    async fn create(
+        &self,
+        config: Arc<dyn ServerConfig>,
+        _context: Option<ServerContextRef>,
+    ) -> ServerResult<Vec<Server>> {
         let config_json = config.get_config_json();
         let ndn_config: NdnServerConfig = serde_json::from_str(&config_json).map_err(|e| {
             server_err!(ServerErrorCode::InvalidConfig, "Failed to parse NdnServerConfig: {}", e)
@@ -1183,8 +1187,7 @@ mod tests {
         };
 
         let factory = NdnServerFactory {};
-        let result = factory.create(Arc::new(config)).await;
+        let result = factory.create(Arc::new(config), None).await;
         assert!(result.is_ok());
     }
 }
-

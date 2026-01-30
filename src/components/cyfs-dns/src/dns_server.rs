@@ -473,14 +473,17 @@ impl cyfs_gateway_lib::server::DatagramServer for ProcessChainDnsServer {
     }
 }
 
-pub struct ProcessChainDnsServerFactory {
-    server_mgr: ServerManagerRef,
-    global_process_chains: GlobalProcessChainsRef,
-    global_collection_manager: GlobalCollectionManagerRef,
-    inner_record_manager: InnerDnsRecordManagerRef,
+pub struct ProcessChainDnsServerFactory;
+
+#[derive(Clone)]
+pub struct DnsServerContext {
+    pub server_mgr: ServerManagerRef,
+    pub global_process_chains: GlobalProcessChainsRef,
+    pub global_collection_manager: GlobalCollectionManagerRef,
+    pub inner_record_manager: InnerDnsRecordManagerRef,
 }
 
-impl ProcessChainDnsServerFactory {
+impl DnsServerContext {
     pub fn new(
         server_mgr: ServerManagerRef,
         global_process_chains: GlobalProcessChainsRef,
@@ -496,19 +499,48 @@ impl ProcessChainDnsServerFactory {
     }
 }
 
+impl ServerContext for DnsServerContext {
+    fn get_server_type(&self) -> String {
+        "dns".to_string()
+    }
+}
+
+impl ProcessChainDnsServerFactory {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 #[async_trait::async_trait]
 impl ServerFactory for ProcessChainDnsServerFactory {
-    async fn create(&self, config: Arc<dyn ServerConfig>) -> ServerResult<Vec<Server>> {
+    async fn create(
+        &self,
+        config: Arc<dyn ServerConfig>,
+        context: Option<ServerContextRef>,
+    ) -> ServerResult<Vec<Server>> {
         let config = config.as_any().downcast_ref::<DnsServerConfig>()
             .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid dns server config"))?;
 
+        let context = context.ok_or(server_err!(
+            ServerErrorCode::InvalidConfig,
+            "dns server context is required"
+        ))?;
+        let context = context
+            .as_ref()
+            .as_any()
+            .downcast_ref::<DnsServerContext>()
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid dns server context"
+            ))?;
+
         let server = ProcessChainDnsServer::create_server(
             config.id.clone(),
-            self.server_mgr.clone(),
-            Some(self.global_process_chains.clone()),
-            Some(self.global_collection_manager.clone()),
+            context.server_mgr.clone(),
+            Some(context.global_process_chains.clone()),
+            Some(context.global_collection_manager.clone()),
             config.hook_point.clone(),
-            self.inner_record_manager.clone(),
+            context.inner_record_manager.clone(),
         ).await?;
         Ok(vec![Server::Datagram(Arc::new(server))])
     }
@@ -568,7 +600,7 @@ mod tests {
     use hickory_proto::op::{Message, Query};
     use hickory_proto::rr::RecordType;
     use hickory_server::proto::rr::{Name, RData};
-    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, GlobalCollectionManager, GlobalProcessChains, LimiterManager, Server, ServerFactory, ServerManager, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackFactory};
+    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager, GlobalProcessChains, Server, ServerFactory, ServerManager, StackContext, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackContext, UdpStackFactory};
     use cyfs_gateway_lib::server::DatagramServer;
     use crate::{DnsServerConfig, InnerDnsRecordManager, LocalDns, ProcessChainDnsServer, ProcessChainDnsServerFactory};
 
@@ -587,13 +619,14 @@ hook_point:
         "#;
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
         let config = Arc::new(config);
-        let factory = ProcessChainDnsServerFactory::new(
+        let context = DnsServerContext::new(
             Arc::new(ServerManager::new()),
             Arc::new(GlobalProcessChains::new()),
             GlobalCollectionManager::create(vec![]).await.unwrap(),
             InnerDnsRecordManager::new(),
         );
-        let ret = factory.create(config).await;
+        let factory = ProcessChainDnsServerFactory::new();
+        let ret = factory.create(config, Some(Arc::new(context))).await;
         assert!(ret.is_ok());
     }
 
@@ -825,12 +858,14 @@ hook_point:
         "#;
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
         let global_process_chains = Arc::new(GlobalProcessChains::new());
-        let server_factory = ProcessChainDnsServerFactory::new(
+        let context = DnsServerContext::new(
             server_mgr.clone(),
             global_process_chains.clone(),
             GlobalCollectionManager::create(vec![]).await.unwrap(),
-            InnerDnsRecordManager::new(), );
-        let ret = server_factory.create(Arc::new(config)).await;
+            InnerDnsRecordManager::new(),
+        );
+        let server_factory = ProcessChainDnsServerFactory::new();
+        let ret = server_factory.create(Arc::new(config), Some(Arc::new(context))).await;
         assert!(ret.is_ok());
         let servers = ret.unwrap();
 
@@ -852,14 +887,20 @@ hook_point:
         "#;
 
         let stack_config: UdpStackConfig = serde_yaml_ng::from_str(stack_config).unwrap();
-        let stack = UdpStackFactory::new(server_manager.clone(),
-                                         global_process_chains.clone(),
-                                         ConnectionManager::new(),
-                                         TunnelManager::new(),
-                                         LimiterManager::new(),
-                                         StatManager::new(),
-                                         GlobalCollectionManager::create(vec![]).await.unwrap());
-        let ret = stack.create(Arc::new(stack_config)).await;
+        let tunnel_manager = TunnelManager::new();
+        let limiter_manager = DefaultLimiterManager::new();
+        let stat_manager = StatManager::new();
+        let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
+        let stack = UdpStackFactory::new(ConnectionManager::new());
+        let stack_context: Arc<dyn StackContext> = Arc::new(UdpStackContext::new(
+            server_manager.clone(),
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            Some(global_process_chains.clone()),
+            Some(collection_manager),
+        ));
+        let ret = stack.create(Arc::new(stack_config), stack_context).await;
         assert!(ret.is_ok());
         let stack = ret.unwrap();
         stack.start().await;
