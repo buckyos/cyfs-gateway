@@ -230,6 +230,7 @@ impl HttpServer for ProcessChainHttpServer {
         req_map.register_visitors(&global_env).await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
         let ret = executor.execute_lib().await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+
         if ret.is_control() {
             if ret.is_drop() {
                 debug!("Request dropped by the process chain");
@@ -287,6 +288,14 @@ impl HttpServer for ProcessChainHttpServer {
                     }
                 }
             }
+        } else {
+            // Log only the non-control (normal) outcome.
+            // A normal value like "false" often means no routing rule matched.
+            debug!(
+                "process_chain_decision hook_point={} final_result_kind=normal final_value={:?}",
+                self.id,
+                ret.value(),
+            );
         }
         let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
