@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use super::config_loader::GatewayConfig;
 use cyfs_gateway_lib::*;
 
@@ -34,7 +34,7 @@ use cyfs_dns::{DnsServerContext, InnerDnsRecordManager, InnerDnsRecordManagerRef
 use cyfs_socks::SocksServerContext;
 use cyfs_tun::TunStackContext;
 use crate::acme_sn_provider::AcmeSnProviderFactory;
-use crate::merge;
+use crate::{merge, AcmeConfig, TlsCA};
 use crate::socks::SocksTunnelBuilder;
 
 fn get_default_saved_gateway_config_path() -> PathBuf {
@@ -339,6 +339,57 @@ pub(crate) async fn run_server_tempalte_pkg(mut pkg: JsPkg, args: Vec<String>) -
     Ok(output)
 }
 
+async fn build_acme_mgr_from_config(acme_config: &Option<AcmeConfig>) -> Result<AcmeCertManagerRef> {
+    let mut cert_config = CertManagerConfig::default();
+    let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+    let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
+    cert_config.keystore_path = data_dir.to_string_lossy().to_string();
+    if let Some(acme_config) = acme_config.clone() {
+        cert_config.account = acme_config.account;
+        if acme_config.issuer.is_some() {
+            cert_config.acme_server = acme_config.issuer.unwrap();
+        }
+        cert_config.dns_providers = acme_config.dns_providers;
+        if acme_config.check_interval.is_some() {
+            if let Some(check_interval) = chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0) {
+                cert_config.check_interval = check_interval;
+            }
+        }
+
+        if acme_config.renew_before_expiry.is_some() {
+            if let Some(renew_before_expiry) = chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0) {
+                cert_config.renew_before_expiry = renew_before_expiry;
+            }
+        }
+    }
+    cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
+
+    let cert_manager = AcmeCertManager::create(cert_config).await?;
+    Ok(cert_manager)
+}
+
+async fn build_self_cert_mgr_from_config(tls_ca: &Option<TlsCA>) -> Result<SelfCertMgrRef> {
+    let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
+    let mut self_cert_config = SelfCertConfig::default();
+    if let Some(config) = tls_ca.clone() {
+        self_cert_config.ca_path = Some(config.cert_path);
+        self_cert_config.key_path = Some(config.key_path);
+    }
+    self_cert_config.store_path = data_dir.to_string_lossy().to_string();
+    let self_cert_manager = SelfCertMgr::create(self_cert_config).await?;
+    Ok(self_cert_manager)
+}
+
+async fn build_global_process_chains_from_config(global_process_configs: &ProcessChainConfigs) -> Result<GlobalProcessChainsRef> {
+    let mut global_process_chains = GlobalProcessChains::new();
+    for process_chain_config in global_process_configs.iter() {
+        let process_chain = process_chain_config.create_process_chain()?;
+        global_process_chains.add_process_chain(Arc::new(process_chain))?;
+    }
+    let global_process_chains = Arc::new(global_process_chains);
+    Ok(global_process_chains)
+}
+
 //use buckyos_api::{*};
 pub struct GatewayParams {
     pub keep_tunnel: Vec<String>,
@@ -388,7 +439,7 @@ impl GatewayFactory {
         };
 
 
-        let limiter_manager = DefaultLimiterManager::new();
+        let mut limiter_manager = DefaultLimiterManager::new();
         let stat_manager = StatManager::new();
         if let Some(limiters_config) = config.limiters_config.clone() {
             for limiter_config in limiters_config.iter() {
@@ -410,39 +461,15 @@ impl GatewayFactory {
                 );
             }
         }
+        let limiter_manager: Arc<Box<dyn LimiterManager>> = Arc::new(limiter_manager);
 
         let sn_acme_data = get_buckyos_service_data_dir("cyfs_gateway").join("sn_dns");
         if !sn_acme_data.exists() {
             std::fs::create_dir_all(&sn_acme_data).unwrap();
         }
-        let sn_provider_factory = AcmeSnProviderFactory::new(sn_acme_data);
-        AcmeCertManager::register_dns_provider_factory("sn-dns", sn_provider_factory.clone());
-        let mut cert_config = CertManagerConfig::default();
-        let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
-        let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
-        cert_config.keystore_path = data_dir.to_string_lossy().to_string();
-        if let Some(acme_config) = config.acme_config.clone() {
-            cert_config.account = acme_config.account;
-            if acme_config.issuer.is_some() {
-                cert_config.acme_server = acme_config.issuer.unwrap();
-            }
-            cert_config.dns_providers = acme_config.dns_providers;
-            if acme_config.check_interval.is_some() {
-                if let Some(check_interval) = chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0) {
-                    cert_config.check_interval = check_interval;
-                }
-            }
+        AcmeCertManager::register_dns_provider_factory("sn-dns", AcmeSnProviderFactory::new(sn_acme_data));
 
-            if acme_config.renew_before_expiry.is_some() {
-                if let Some(renew_before_expiry) = chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0) {
-                    cert_config.renew_before_expiry = renew_before_expiry;
-                }
-            }
-        }
-        cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
-
-        let cert_manager = AcmeCertManager::create(cert_config).await?;
-        sn_provider_factory.set_acme_mgr(cert_manager.clone());
+        let cert_manager = build_acme_mgr_from_config(&config.acme_config).await?;
         let inner_dns_record_manager = InnerDnsRecordManager::new();
         let record_manager = inner_dns_record_manager.clone();
         cert_manager.register_dns_provider("local", move |op: String, domain: String, key_hash: String| {
@@ -459,14 +486,7 @@ impl GatewayFactory {
             }
         });
 
-        let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
-        let mut self_cert_config = SelfCertConfig::default();
-        if let Some(config) = config.tls_ca.clone() {
-            self_cert_config.ca_path = Some(config.cert_path);
-            self_cert_config.key_path = Some(config.key_path);
-        }
-        self_cert_config.store_path = data_dir.to_string_lossy().to_string();
-        let self_cert_manager = SelfCertMgr::create(self_cert_config).await?;
+        let self_cert_manager = build_self_cert_mgr_from_config(&config.tls_ca).await?;
 
         let global_collections = GlobalCollectionManager::create(config.collections.clone()).await?;
 
@@ -481,12 +501,7 @@ impl GatewayFactory {
         let token_manager = LocalTokenManager::new(user_name, password, store).await?;
         let handler = GatewayCmdHandler::new(config_file.map(|v| v.to_path_buf()), self.parser.clone());
 
-        let mut global_process_chains = GlobalProcessChains::new();
-        for process_chain_config in config.global_process_chains.iter() {
-            let process_chain = process_chain_config.create_process_chain()?;
-            global_process_chains.add_process_chain(Arc::new(process_chain))?;
-        }
-        let global_process_chains = Arc::new(global_process_chains);
+        let global_process_chains = build_global_process_chains_from_config(&config.global_process_chains).await?;
 
         let tunnel_manager = TunnelManager::new();
         let server_manager = Arc::new(ServerManager::new());
@@ -533,22 +548,15 @@ impl GatewayFactory {
             config: Arc::new(Mutex::new(config)),
             stack_manager,
             tunnel_manager,
-            server_manager,
             parser: self.parser.clone(),
-            global_process_chains,
             connection_manager: self.connection_manager.clone(),
-            acme_mgr: cert_manager,
             stack_factory: self.stack_factory.clone(),
             server_factory: self.server_factory.clone(),
-            limiter_manager,
+            limiter_manager: Mutex::new(limiter_manager),
             stat_manager,
-            self_cert_mgr: self_cert_manager,
-            global_collection_manager: global_collections,
             external_cmds,
-            inner_dns_record_manager,
             control_handler,
-            control_token_verifier: token_manager.clone(),
-            control_token_factory: token_manager,
+            control_token_manager: token_manager,
         });
         handler.set_gateway(gateway.clone());
         Ok(gateway)
@@ -560,22 +568,15 @@ pub struct Gateway {
     config: Arc<Mutex<GatewayConfig>>,
     stack_manager: StackManagerRef,
     tunnel_manager: TunnelManager,
-    server_manager: ServerManagerRef,
     parser: GatewayConfigParserRef,
-    global_process_chains: GlobalProcessChainsRef,
     connection_manager: ConnectionManagerRef,
-    acme_mgr: AcmeCertManagerRef,
     stack_factory: CyfsStackFactoryRef,
     server_factory: CyfsServerFactoryRef,
-    limiter_manager: LimiterManagerRef,
+    limiter_manager: Mutex<LimiterManagerRef>,
     stat_manager: StatManagerRef,
-    self_cert_mgr: SelfCertMgrRef,
-    global_collection_manager: GlobalCollectionManagerRef,
     external_cmds: JsPkgManagerRef,
-    inner_dns_record_manager: InnerDnsRecordManagerRef,
     control_handler: Arc<dyn GatewayControlCmdHandler>,
-    control_token_verifier: Arc<dyn CyfsTokenVerifier>,
-    control_token_factory: Arc<dyn CyfsTokenFactory>,
+    control_token_manager: Arc<LocalTokenManager<LocalTokenKeyStore>>,
 }
 
 impl Drop for Gateway {
@@ -2062,15 +2063,11 @@ impl Gateway {
         Ok(raw_config)
     }
 
-    fn create_server_context(&self, server_type: &str) -> Result<Option<ServerContextRef>> {
-        unreachable!()
-    }
     pub async fn add_rule(&self, id: &str, rule: &str) -> Result<()> {
         let id_list = id.split(':').collect::<Vec<&str>>();
         if id_list.len() < 2 {
             return Err(anyhow!("Invalid config id: {}", id));
         }
-        let config_type = id_list[0];
         let config_id = id_list[1];
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
@@ -2086,43 +2083,8 @@ impl Gateway {
         let gateway_config = self.parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
-        match config_type {
-            "stack" => {
-                let new_stack_config = gateway_config
-                    .stacks
-                    .iter()
-                    .find(|s| s.id() == config_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("stack config not found after parse: {}", config_id))?;
+        self.reload(gateway_config).await?;
 
-                if let Some(stack) = self.stack_manager.get_stack(config_id) {
-                    stack.update_config(new_stack_config.clone()).await?;
-                }
-            }
-            "server" => {
-                let new_server_config = gateway_config
-                    .servers
-                    .iter()
-                    .find(|s| s.id() == config_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
-
-                let context = self.create_server_context(new_server_config.server_type().as_str())?;
-                let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
-                for server in new_servers.into_iter() {
-                    self.server_manager.replace_server(server);
-                }
-            }
-            _ => {
-                return Err(anyhow!(cmd_err!(
-                    ControlErrorCode::InvalidConfigType,
-                    "Invalid config type: {}", config_type,
-                )));
-            }
-        }
-
-        let mut guard = self.config.lock().unwrap();
-        *guard = gateway_config;
         Ok(())
     }
 
@@ -2131,7 +2093,6 @@ impl Gateway {
         if id_list.len() < 2 {
             return Err(anyhow!("Invalid config id: {}", id));
         }
-        let config_type = id_list[0];
         let config_id = id_list[1];
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
@@ -2147,43 +2108,8 @@ impl Gateway {
         let gateway_config = self.parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
-        match config_type {
-            "stack" => {
-                let new_stack_config = gateway_config
-                    .stacks
-                    .iter()
-                    .find(|s| s.id() == config_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("stack config not found after parse: {}", config_id))?;
 
-                if let Some(stack) = self.stack_manager.get_stack(config_id) {
-                    stack.update_config(new_stack_config.clone()).await?;
-                }
-            }
-            "server" => {
-                let new_server_config = gateway_config
-                    .servers
-                    .iter()
-                    .find(|s| s.id() == config_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
-
-                let context = self.create_server_context(new_server_config.server_type().as_str())?;
-                let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
-                for server in new_servers.into_iter() {
-                    self.server_manager.replace_server(server);
-                }
-            }
-            _ => {
-                return Err(anyhow!(cmd_err!(
-                    ControlErrorCode::InvalidConfigType,
-                    "Invalid config type: {}", config_type,
-                )));
-            }
-        }
-
-        let mut guard = self.config.lock().unwrap();
-        *guard = gateway_config;
+        self.reload(gateway_config).await?;
         Ok(())
     }
 
@@ -2192,7 +2118,6 @@ impl Gateway {
         if id_list.len() < 2 {
             return Err(anyhow!("Invalid config id: {}", id));
         }
-        let config_type = id_list[0];
         let config_id = id_list[1];
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
@@ -2208,43 +2133,8 @@ impl Gateway {
         let gateway_config = self.parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
-        match config_type {
-            "stack" => {
-                let new_stack_config = gateway_config
-                    .stacks
-                    .iter()
-                    .find(|s| s.id() == config_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("stack config not found after parse: {}", config_id))?;
 
-                if let Some(stack) = self.stack_manager.get_stack(config_id) {
-                    stack.update_config(new_stack_config.clone()).await?;
-                }
-            }
-            "server" => {
-                let new_server_config = gateway_config
-                    .servers
-                    .iter()
-                    .find(|s| s.id() == config_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
-
-                let context = self.create_server_context(new_server_config.server_type().as_str())?;
-                let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
-                for server in new_servers.into_iter() {
-                    self.server_manager.replace_server(server);
-                }
-            }
-            _ => {
-                return Err(anyhow!(cmd_err!(
-                    ControlErrorCode::InvalidConfigType,
-                    "Invalid config type: {}", config_type,
-                )));
-            }
-        }
-
-        let mut guard = self.config.lock().unwrap();
-        *guard = gateway_config;
+        self.reload(gateway_config).await?;
         Ok(())
     }
 
@@ -2253,7 +2143,6 @@ impl Gateway {
         if id_list.len() < 3 {
             return Err(anyhow!("Invalid rule id: {}", id));
         }
-        let config_type = id_list[0];
         let config_id = id_list[1];
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
@@ -2270,43 +2159,7 @@ impl Gateway {
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
 
-        match config_type {
-            "stack" => {
-                let new_stack_config = gateway_config
-                    .stacks
-                    .iter()
-                    .find(|s| s.id() == config_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("stack config not found after parse: {}", config_id))?;
-
-                if let Some(stack) = self.stack_manager.get_stack(config_id) {
-                    stack.update_config(new_stack_config.clone()).await?;
-                }
-            }
-            "server" => {
-                let new_server_config = gateway_config
-                    .servers
-                    .iter()
-                    .find(|s| s.id() == config_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
-
-                let context = self.create_server_context(new_server_config.server_type().as_str())?;
-                let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
-                for server in new_servers.into_iter() {
-                    self.server_manager.replace_server(server);
-                }
-            }
-            _ => {
-                return Err(anyhow!(cmd_err!(
-                    ControlErrorCode::InvalidConfigType,
-                    "Invalid config type: {}", config_type,
-                )));
-            }
-        }
-
-        let mut guard = self.config.lock().unwrap();
-        *guard = gateway_config;
+        self.reload(gateway_config).await?;
         Ok(())
     }
 
@@ -2314,7 +2167,7 @@ impl Gateway {
         let raw_config = {
             self.config.lock().unwrap().raw_config.clone()
         };
-        let (raw_config, stack_id) = Self::add_dispatch_to_config(raw_config, local, target, protocol)?;
+        let (raw_config, _) = Self::add_dispatch_to_config(raw_config, local, target, protocol)?;
         let gateway_config = self.parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
@@ -2327,41 +2180,13 @@ impl Gateway {
         let raw_config = {
             self.config.lock().unwrap().raw_config.clone()
         };
-        let (raw_config, server_id, dir_server) = Self::add_router_to_config(raw_config, server_id, uri, target)?;
+        let (raw_config, server_id, _) = Self::add_router_to_config(raw_config, server_id, uri, target)?;
         let gateway_config = self.parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
 
-        if let Some(dir_server) = dir_server {
-            let new_server_config = gateway_config
-                .servers
-                .iter()
-                .find(|s| s.id() == dir_server)
-                .cloned()
-                .ok_or_else(|| anyhow!("server config not found after parse: {}", server_id))?;
+        self.reload(gateway_config).await?;
 
-            let context = self.create_server_context(new_server_config.server_type().as_str())?;
-            let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
-            for server in new_servers.into_iter() {
-                self.server_manager.replace_server(server);
-            }
-        }
-
-        let new_server_config = gateway_config
-            .servers
-            .iter()
-            .find(|s| s.id() == server_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("server config not found after parse: {}", server_id))?;
-
-        let context = self.create_server_context(new_server_config.server_type().as_str())?;
-        let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
-        for server in new_servers.into_iter() {
-            self.server_manager.replace_server(server);
-        }
-
-        let mut guard = self.config.lock().unwrap();
-        *guard = gateway_config;
         Ok(server_id)
     }
 
@@ -2369,33 +2194,12 @@ impl Gateway {
         let raw_config = {
             self.config.lock().unwrap().raw_config.clone()
         };
-        let (raw_config, removed_server_id) = Self::remove_router_from_config(raw_config, server_id, uri, target)?;
+        let (raw_config, _) = Self::remove_router_from_config(raw_config, server_id, uri, target)?;
         let gateway_config = self.parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
 
-        if gateway_config
-            .servers
-            .iter()
-            .any(|s| s.id() == removed_server_id)
-        {
-            let new_server_config = gateway_config
-                .servers
-                .iter()
-                .find(|s| s.id() == removed_server_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("server config not found after parse"))?;
-            let context = self.create_server_context(new_server_config.server_type().as_str())?;
-            let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
-            for server in new_servers.into_iter() {
-                self.server_manager.replace_server(server);
-            }
-        } else {
-            self.server_manager.remove_server(&removed_server_id);
-        }
-
-        let mut guard = self.config.lock().unwrap();
-        *guard = gateway_config;
+        self.reload(gateway_config).await?;
         Ok(())
     }
 
@@ -2420,7 +2224,6 @@ impl Gateway {
         if id_list.len() < 3 {
             return Err(anyhow!("Invalid rule id: {}", id));
         }
-        let config_type = id_list[0];
         let config_id = id_list[1];
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
@@ -2436,44 +2239,7 @@ impl Gateway {
         let gateway_config = self.parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
-
-        match config_type {
-            "stack" => {
-                let new_stack_config = gateway_config
-                    .stacks
-                    .iter()
-                    .find(|s| s.id() == config_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("stack config not found after parse: {}", config_id))?;
-
-                if let Some(stack) = self.stack_manager.get_stack(config_id) {
-                    stack.update_config(new_stack_config.clone()).await?;
-                }
-            }
-            "server" => {
-                let new_server_config = gateway_config
-                    .servers
-                    .iter()
-                    .find(|s| s.id() == config_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
-
-                let context = self.create_server_context(new_server_config.server_type().as_str())?;
-                let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
-                for server in new_servers.into_iter() {
-                    self.server_manager.replace_server(server);
-                }
-            }
-            _ => {
-                return Err(anyhow!(cmd_err!(
-                    ControlErrorCode::InvalidConfigType,
-                    "Invalid config type: {}", config_type,
-                )));
-            }
-        }
-
-        let mut guard = self.config.lock().unwrap();
-        *guard = gateway_config;
+        self.reload(gateway_config).await?;
         Ok(())
     }
 
@@ -2631,7 +2397,6 @@ impl Gateway {
         if id_list.len() < 3 {
             return Err(anyhow!("Invalid rule id: {}", id));
         }
-        let config_type = id_list[0];
         let config_id = id_list[1];
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
@@ -2647,264 +2412,167 @@ impl Gateway {
         let gateway_config = self.parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
-
-        match config_type {
-            "stack" => {
-                let new_stack_config = gateway_config
-                    .stacks
-                    .iter()
-                    .find(|s| s.id() == config_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("stack config not found after parse: {}", config_id))?;
-
-                if let Some(stack) = self.stack_manager.get_stack(config_id) {
-                    stack.update_config(new_stack_config.clone()).await?;
-                }
-            }
-            "server" => {
-                let new_server_config = gateway_config
-                    .servers
-                    .iter()
-                    .find(|s| s.id() == config_id)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("server config not found after parse: {}", config_id))?;
-
-                let context = self.create_server_context(new_server_config.server_type().as_str())?;
-                let new_servers = self.server_factory.create(new_server_config.clone(), context).await?;
-                for server in new_servers.into_iter() {
-                    self.server_manager.replace_server(server);
-                }
-            }
-            _ => {
-                return Err(anyhow!(cmd_err!(
-                    ControlErrorCode::InvalidConfigType,
-                    "Invalid config type: {}", config_type,
-                )));
-            }
-        }
-
-        let mut guard = self.config.lock().unwrap();
-        *guard = gateway_config;
+        self.reload(gateway_config).await?;
         Ok(())
     }
 
     pub async fn reload(&self, mut config: GatewayConfig) -> Result<()> {
-        // let old_config = {
-        //     self.config.lock().unwrap().clone()
-        // };
-        // let mut new_process_chains = HashMap::new();
-        // for process_chain_config in config.global_process_chains.iter() {
-        //     let process_chain = Arc::new(process_chain_config.create_process_chain()?);
-        //     if new_process_chains.contains_key(process_chain.id()) {
-        //         Err(cmd_err!(
-        //             ConfigErrorCode::AlreadyExists,
-        //             "Duplicated process chain: {}", process_chain.id(),
-        //         ))?;
-        //     }
-        //     new_process_chains.insert(process_chain.id().to_string(), process_chain);
-        // }
-        //
-        //
-        //
-        // self.global_process_chains.clear_process_chains();
-        // for process_chain in new_process_chains.values() {
-        //     self.global_process_chains.add_process_chain(process_chain.clone())?;
-        // }
-        //
-        // let mut new_servers = HashMap::new();
-        // for server_config in config.servers.iter() {
-        //     let context = self.create_server_context(server_config.server_type().as_str())?;
-        //     let new_server = self.server_factory.create(server_config.clone(), context).await?;
-        //     for server in new_server.into_iter() {
-        //         if new_servers.contains_key(server.full_key().as_str()) {
-        //             Err(cmd_err!(
-        //             ConfigErrorCode::AlreadyExists,
-        //             "Duplicated server: {}", server.full_key(),
-        //         ))?;
-        //         }
-        //         new_servers.insert(server.full_key(), server);
-        //     }
-        // }
-        //
-        //
-        //
-        // for server in new_servers.values() {
-        //     self.server_manager.replace_server(server.clone());
-        // }
-        //
-        // let mut success_stacks = Vec::new();
-        // for stack_config in config.stacks.iter() {
-        //     if let Some(stack) = self.stack_manager.get_stack(stack_config.id().as_str()) {
-        //         if let Err(e) = stack.update_config(stack_config.clone()).await {
-        //             if e.code() == StackErrorCode::BindUnmatched {
-        //                 self.stack_manager.remove(stack_config.id().as_str());
-        //                 let stack_context = match self.create_stack_context(&stack_config.stack_protocol()) {
-        //                     Ok(context) => context,
-        //                     Err(e) => {
-        //                         log::error!("Failed to create stack context {}: {}", stack_config.id(), e);
-        //                         continue;
-        //                     }
-        //                 };
-        //                 let new_stack = match self.stack_factory.create(stack_config.clone(), stack_context).await {
-        //                     Ok(stack) => stack,
-        //                     Err(e) => {
-        //                         log::error!("Failed to create stack {}: {}", stack_config.id(), e);
-        //                         continue;
-        //                     }
-        //                 };
-        //                 if let Err(e) = self.stack_manager.add_stack(new_stack.clone()) {
-        //                     log::error!("Failed to add stack {}: {}", stack_config.id(), e);
-        //                 }
-        //                 if let Err(e) = new_stack.start().await {
-        //                     self.stack_manager.remove(stack_config.id().as_str());
-        //                     log::error!("Failed to start stack {}: {}", stack_config.id(), e);
-        //                 }
-        //                 success_stacks.push(stack_config.clone());
-        //             } else {
-        //                 log::error!("Failed to update stack {}: {}", stack_config.id(), e);
-        //                 let config = self.config.lock().unwrap();
-        //                 for old_config in config.stacks.iter() {
-        //                     if old_config.id() == stack_config.id() {
-        //                         success_stacks.push(old_config.clone());
-        //                     }
-        //                 }
-        //             }
-        //         } else {
-        //             success_stacks.push(stack_config.clone());
-        //         }
-        //     } else {
-        //         let stack_context = match self.create_stack_context(&stack_config.stack_protocol()) {
-        //             Ok(context) => context,
-        //             Err(e) => {
-        //                 log::error!("Failed to create stack context {}: {}", stack_config.id(), e);
-        //                 continue;
-        //             }
-        //         };
-        //         let new_stack = match self.stack_factory.create(stack_config.clone(), stack_context).await {
-        //             Ok(stack) => stack,
-        //             Err(e) => {
-        //                 log::error!("Failed to create stack {}: {}", stack_config.id(), e);
-        //                 continue;
-        //             }
-        //         };
-        //         if let Err(e) = self.stack_manager.add_stack(new_stack.clone()) {
-        //             log::error!("Failed to add stack {}: {}", stack_config.id(), e);
-        //             continue;
-        //         }
-        //         if let Err(e) = new_stack.start().await {
-        //             self.stack_manager.remove(stack_config.id().as_str());
-        //             log::error!("Failed to start stack {}: {}", stack_config.id(), e);
-        //             continue;
-        //         }
-        //         success_stacks.push(stack_config.clone());
-        //     }
-        // }
-        //
-        // config.stacks = success_stacks;
-        // self.stack_manager.retain(|id| {
-        //     config.stacks.iter().any(|stack| stack.id() == id)
-        // });
-        // self.server_manager.retain(|id| {
-        //     new_servers.contains_key(id)
-        // });
-        //
-        // if config.acme_config != old_config.acme_config {
-        //     if config.acme_config.is_some() {
-        //         let acme_config = config.acme_config.clone().unwrap();
-        //         let mut cert_config = CertManagerConfig::default();
-        //         let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
-        //         let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
-        //         cert_config.keystore_path = data_dir.to_string_lossy().to_string();
-        //         cert_config.account = acme_config.account;
-        //         if acme_config.issuer.is_some() {
-        //             cert_config.acme_server = acme_config.issuer.unwrap();
-        //         }
-        //         cert_config.dns_providers = acme_config.dns_providers;
-        //         if acme_config.check_interval.is_some() {
-        //             if let Some(check_interval) = chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0) {
-        //                 cert_config.check_interval = check_interval;
-        //             }
-        //         }
-        //
-        //         if acme_config.renew_before_expiry.is_some() {
-        //             if let Some(renew_before_expiry) = chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0) {
-        //                 cert_config.renew_before_expiry = renew_before_expiry;
-        //             }
-        //         }
-        //         cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
-        //         if let Err(e) = self.acme_mgr.update(cert_config).await {
-        //             log::error!("Failed to update acme manager: {}", e);
-        //         }
-        //     } else {
-        //         let mut cert_config = CertManagerConfig::default();
-        //         let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
-        //         let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
-        //         cert_config.keystore_path = data_dir.to_string_lossy().to_string();
-        //         cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
-        //         if let Err(e) = self.acme_mgr.update(cert_config).await {
-        //             log::error!("Failed to update acme manager: {}", e);
-        //         }
-        //     }
-        // }
-        //
-        // if config.limiters_config != old_config.limiters_config {
-        //     if config.limiters_config.is_some() {
-        //         let limiters_config = config.limiters_config.clone().unwrap();
-        //         let mut limiter_set = HashSet::new();
-        //         for limiter_config in limiters_config.iter() {
-        //             limiter_set.insert(limiter_config.id.clone());
-        //             if let Some(limiter) = self.limiter_manager.get_limiter(limiter_config.id.as_str()) {
-        //                 if limiter.get_upper_limiter().map(|limiter| limiter.get_id().map(|v| v.to_string())) == Some(limiter_config.upper_limiter.clone()) {
-        //                     limiter.set_speed(limiter_config.concurrent.map(|v| v as u32),
-        //                                       limiter_config.download_speed.map(|v| v as u32),
-        //                                       limiter_config.upload_speed.map(|v| v as u32));
-        //                     continue;
-        //                 }
-        //             }
-        //             if let Some(upper_limiter) = limiter_config.upper_limiter.clone() {
-        //                 if self.limiter_manager.get_limiter(upper_limiter.as_str()).is_none() {
-        //                     log::error!("Update limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
-        //                 }
-        //             }
-        //             let _ = self.limiter_manager.new_limiter(limiter_config.id.clone(),
-        //                                                      limiter_config.upper_limiter.clone(),
-        //                                                      limiter_config.concurrent.map(|v| v as u32),
-        //                                                      limiter_config.download_speed.map(|v| v as u32),
-        //                                                      limiter_config.upload_speed.map(|v| v as u32));
-        //         }
-        //
-        //         self.limiter_manager.retain(|id, _| {
-        //             limiter_set.contains(id)
-        //         });
-        //     } else {
-        //         self.limiter_manager.retain(|_, _| {
-        //             false
-        //         });
-        //     }
-        // }
-        //
-        // if config.tls_ca != old_config.tls_ca {
-        //     if config.tls_ca.is_some() {
-        //         let tls_ca = config.tls_ca.clone().unwrap();
-        //         let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
-        //         let mut self_cert_config = SelfCertConfig::default();
-        //         self_cert_config.ca_path = Some(tls_ca.cert_path);
-        //         self_cert_config.key_path = Some(tls_ca.key_path);
-        //         self_cert_config.store_path = data_dir.to_string_lossy().to_string();
-        //         if let Err(e) = self.self_cert_mgr.update(self_cert_config).await {
-        //             log::error!("Failed to update self cert manager: {}", e);
-        //         }
-        //     } else {
-        //         let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("self_certs");
-        //         let mut self_cert_config = SelfCertConfig::default();
-        //         self_cert_config.store_path = data_dir.to_string_lossy().to_string();
-        //         if let Err(e) = self.self_cert_mgr.update(self_cert_config).await {
-        //             log::error!("Failed to update self cert manager: {}", e);
-        //         }
-        //     }
-        // }
-        //
-        // *self.config.lock().unwrap() = config;
+        let user_name: Option<String> = match config.raw_config.get("user_name") {
+            Some(user_name) => user_name.as_str().map(|value| value.to_string()),
+            None => None,
+        };
+        let password: Option<String> = match config.raw_config.get("password") {
+            Some(password) => password.as_str().map(|value| value.to_string()),
+            None => None,
+        };
+
+        let mut limiter_manager = {
+            self.limiter_manager.lock().unwrap().clone_manager()
+        };
+        let mut exist_limters = HashSet::new();
+        if let Some(limiters_config) = config.limiters_config.clone() {
+            for limiter_config in limiters_config.iter() {
+                exist_limters.insert(limiter_config.id.clone());
+                let old_limiter = limiter_manager.get_limiter(limiter_config.id.clone());
+                if let Some(old_limiter) = old_limiter {
+                    if old_limiter.get_id().map(|v| v.to_string()) == limiter_config.upper_limiter {
+                        continue;
+                    }
+                    limiter_manager.remove_limiter(limiter_config.id.clone());
+                }
+                if let Some(upper_limiter) = limiter_config.upper_limiter.clone() {
+                    let upper = limiter_manager.get_limiter(upper_limiter.clone());
+                    if upper.is_none() {
+                        let msg = format!("Create limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
+                        log::error!("{}", msg);
+                        return Err(anyhow!(msg))
+                    }
+                }
+                let _ = limiter_manager.new_limiter(
+                    limiter_config.id.clone(),
+                    limiter_config.upper_limiter.clone(),
+                    limiter_config.concurrent.map(|v| v as u32),
+                    limiter_config.download_speed.map(|v| v as u32),
+                    limiter_config.upload_speed.map(|v| v as u32),
+                );
+            }
+        }
+        limiter_manager.retain(Box::new(move |id, _| {
+            exist_limters.contains(id)
+        }));
+        let limiter_manager = Arc::new(limiter_manager);
+
+        let cert_manager = build_acme_mgr_from_config(&config.acme_config).await?;
+        let inner_dns_record_manager = InnerDnsRecordManager::new();
+        let record_manager = inner_dns_record_manager.clone();
+        cert_manager.register_dns_provider("local", move |op: String, domain: String, key_hash: String| {
+            let record_manager = record_manager.clone();
+            async move {
+                if op == "add_challenge" {
+                    record_manager.add_record(domain, "TXT", key_hash).map_err(|e| anyhow!(e.to_string()))
+                } else if op == "del_challenge" {
+                    record_manager.remove_record(domain, "TXT");
+                    Ok(())
+                } else {
+                    Err(anyhow!("Unsupported op: {}", op))
+                }
+            }
+        });
+
+        let self_cert_manager = build_self_cert_mgr_from_config(&config.tls_ca).await?;
+
+        let global_collections = GlobalCollectionManager::create(config.collections.clone()).await?;
+
+        let global_process_chains = build_global_process_chains_from_config(&config.global_process_chains).await?;
+
+        let server_manager = Arc::new(ServerManager::new());
+        let control_handler: Arc<dyn GatewayControlCmdHandler> = self.control_handler.clone();
+        for server_config in config.servers.iter() {
+            let context = build_server_context(
+                server_config.server_type().as_str(),
+                server_manager.clone(),
+                global_process_chains.clone(),
+                self.tunnel_manager.clone(),
+                global_collections.clone(),
+                cert_manager.clone(),
+                inner_dns_record_manager.clone(),
+                Arc::downgrade(&control_handler),
+                self.control_token_manager.clone(),
+                self.control_token_manager.clone(),
+            );
+            let servers = self.server_factory.create(server_config.clone(), context).await?;
+            for server in servers.into_iter() {
+                server_manager.add_server(server)?;
+            }
+        }
+
+
+        let mut exist_stacks = HashSet::new();
+        let mut new_stacks = Vec::new();
+        let mut changed_stacks = Vec::new();
+        for stack_config in config.stacks.iter() {
+            let stack_context = build_stack_context(
+                stack_config.stack_protocol(),
+                server_manager.clone(),
+                self.tunnel_manager.clone(),
+                limiter_manager.clone(),
+                self.stat_manager.clone(),
+                Some(global_process_chains.clone()),
+                Some(global_collections.clone()),
+                cert_manager.clone(),
+                self_cert_manager.clone(),
+            )?;
+            exist_stacks.insert(stack_config.id().clone());
+            if let Some(stack) = self.stack_manager.get_stack(stack_config.id().as_str()) {
+                stack.prepare_update(stack_config.clone(), Some(stack_context)).await.map_err(|e| {
+                    let msg = format!("Failed to prepare update stack {}: {}", stack_config.id(), e);
+                    log::error!("{}", msg);
+                    anyhow!(msg)
+                })?;
+                changed_stacks.push(stack);
+            } else {
+                let new_stack = match self.stack_factory.create(stack_config.clone(), stack_context).await {
+                    Ok(stack) => stack,
+                    Err(e) => {
+                        log::error!("Failed to create stack {}: {}", stack_config.id(), e);
+                        continue;
+                    }
+                };
+                new_stack.start().await.map_err(|e| {
+                    let msg = format!("Failed to start stack {}: {}", stack_config.id(), e);
+                    log::error!("{}", msg);
+                    anyhow!(msg)
+                })?;
+                new_stacks.push(new_stack);
+            }
+        }
+
+        self.stack_manager.retain(|id| {
+            exist_stacks.contains(id)
+        });
+
+        for changed_stack in changed_stacks.into_iter() {
+            changed_stack.commit_update().await;
+        }
+
+        for new_stack in new_stacks.into_iter() {
+            let _ = self.stack_manager.add_stack(new_stack);
+        }
+
+        self.control_token_manager.update_credentials(user_name, password);
+
+        if let Some(limiters_config) = config.limiters_config.clone() {
+            for limiter_config in limiters_config.iter() {
+                if let Some(limiter) = limiter_manager.get_limiter(limiter_config.id.clone()) {
+                    limiter.set_speed(limiter_config.concurrent.map(|v| v as u32),
+                                      limiter_config.download_speed.map(|v| v as u32),
+                                      limiter_config.upload_speed.map(|v| v as u32));
+                }
+            }
+        }
+
+        *self.config.lock().unwrap() = config;
+        *self.limiter_manager.lock().unwrap() = limiter_manager;
         Ok(())
     }
 }
@@ -2950,98 +2618,23 @@ impl GatewayCmdHandler {
     }
 
     async fn start_template(&self, template_id: &str, args: Vec<String>) -> ControlResult<Value> {
-        unreachable!();
-        // let gateway = self.get_gateway().ok_or_else(|| cmd_err!(ControlErrorCode::NoGateway, "gateway not init"))?;
-        // let current_config = {
-        //     gateway.config.lock().unwrap().clone()
-        // };
-        // let pkg = gateway.external_cmds.get_pkg(template_id)
-        //     .await
-        //     .map_err(into_cmd_err!(ControlErrorCode::Failed, "get pkg failed"))?;
-        // let output = run_server_tempalte_pkg(pkg, args).await?;
-        // let template_config: Value = serde_json::from_str(output.as_str())
-        //     .map_err(into_cmd_err!(ControlErrorCode::InvalidParams, "invalid template config"))?;
-        // let mut raw_config = current_config.raw_config.clone();
-        // merge(&mut raw_config, &template_config);
-        // let gateway_config = self.parser
-        //     .parse(raw_config)
-        //     .map_err(into_cmd_err!(ControlErrorCode::Failed, "parse config failed"))?;
-        // let existing_stack_ids: HashSet<String> = current_config.stacks.iter()
-        //     .map(|stack| stack.id().to_string())
-        //     .collect();
-        // let existing_server_ids: HashSet<String> = current_config.servers.iter()
-        //     .map(|server| server.id().to_string())
-        //     .collect();
-        // let existing_chain_ids: HashSet<String> = current_config.global_process_chains.iter()
-        //     .map(|chain| chain.id.clone())
-        //     .collect();
-        //
-        // let mut added_chains = Vec::new();
-        // for chain_config in gateway_config.global_process_chains.iter() {
-        //     if existing_chain_ids.contains(chain_config.id.as_str()) {
-        //         continue;
-        //     }
-        //     let process_chain = Arc::new(chain_config.create_process_chain()
-        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create process chain {} failed: {}", chain_config.id, e))?);
-        //     gateway.global_process_chains.add_process_chain(process_chain)
-        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "add process chain {} failed: {}", chain_config.id, e))?;
-        //     added_chains.push(chain_config.clone());
-        // }
-        //
-        // let mut added_servers = Vec::new();
-        // for server_config in gateway_config.servers.iter() {
-        //     if existing_server_ids.contains(server_config.id().as_str()) {
-        //         continue;
-        //     }
-        //     let context = gateway.create_server_context(server_config.server_type().as_str())
-        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create server context {} failed: {}", server_config.id(), e))?;
-        //     let new_servers = gateway.server_factory.create(server_config.clone(), context).await
-        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create server {} failed: {}", server_config.id(), e))?;
-        //     let mut added_any = false;
-        //     for server in new_servers.into_iter() {
-        //         if gateway.server_manager.get_server_by_key(server.full_key().as_str()).is_some() {
-        //             continue;
-        //         }
-        //         gateway.server_manager.add_server(server)
-        //             .map_err(|e| cmd_err!(ControlErrorCode::Failed, "add server failed: {}", e))?;
-        //         added_any = true;
-        //     }
-        //     if added_any {
-        //         added_servers.push(server_config.clone());
-        //     }
-        // }
-        //
-        // let mut added_stacks = Vec::new();
-        // for stack_config in gateway_config.stacks.iter() {
-        //     if existing_stack_ids.contains(stack_config.id().as_str()) {
-        //         continue;
-        //     }
-        //     let stack_context = gateway.create_stack_context(&stack_config.stack_protocol())
-        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create stack context {} failed: {}", stack_config.id(), e))?;
-        //     let new_stack = gateway.stack_factory.create(stack_config.clone(), stack_context).await
-        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "create stack {} failed: {}", stack_config.id(), e))?;
-        //     gateway.stack_manager.add_stack(new_stack.clone())
-        //         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "add stack {} failed: {}", stack_config.id(), e))?;
-        //     if let Err(e) = new_stack.start().await {
-        //         gateway.stack_manager.remove(stack_config.id().as_str());
-        //         return Err(cmd_err!(ControlErrorCode::Failed, "start stack {} failed: {}", stack_config.id(), e));
-        //     }
-        //     added_stacks.push(stack_config.clone());
-        // }
-        //
-        // let mut updated_config = current_config.clone();
-        // updated_config.raw_config = gateway_config.raw_config.clone();
-        // if !added_chains.is_empty() {
-        //     updated_config.global_process_chains.extend(added_chains);
-        // }
-        // if !added_stacks.is_empty() {
-        //     updated_config.stacks.extend(added_stacks);
-        // }
-        // if !added_servers.is_empty() {
-        //     updated_config.servers.extend(added_servers);
-        // }
-        // *gateway.config.lock().unwrap() = updated_config;
-        // Ok(template_config)
+        let gateway = self.get_gateway().ok_or_else(|| cmd_err!(ControlErrorCode::NoGateway, "gateway not init"))?;
+        let current_config = {
+            gateway.config.lock().unwrap().clone()
+        };
+        let pkg = gateway.external_cmds.get_pkg(template_id)
+            .await
+            .map_err(into_cmd_err!(ControlErrorCode::Failed, "get pkg failed"))?;
+        let output = run_server_tempalte_pkg(pkg, args).await?;
+        let template_config: Value = serde_json::from_str(output.as_str())
+            .map_err(into_cmd_err!(ControlErrorCode::InvalidParams, "invalid template config"))?;
+        let mut raw_config = current_config.raw_config.clone();
+        merge(&mut raw_config, &template_config);
+        let gateway_config = self.parser
+            .parse(raw_config)
+            .map_err(into_cmd_err!(ControlErrorCode::Failed, "parse config failed"))?;
+        gateway.reload(gateway_config).await.map_err(|e| cmd_err!(ControlErrorCode::Failed, "reload gateway failed. {:?}", e))?;
+        Ok(template_config)
     }
 
     async fn get_external_cmds(&self) -> ControlResult<Vec<ExternalCmd>> {
@@ -3424,9 +3017,13 @@ impl TokenKeyStore for LocalTokenKeyStore {
     }
 }
 
+struct LocalTokenCredentials {
+    user_name: Option<String>,
+    password: Option<String>,
+}
+
 pub struct LocalTokenManager<S: TokenKeyStore> {
-    pub user_name: Option<String>,
-    pub password: Option<String>,
+    credentials: RwLock<LocalTokenCredentials>,
     pub token_encode_key: EncodingKey,
     pub token_decode_key: DecodingKey,
     _p: PhantomData<S>,
@@ -3450,12 +3047,20 @@ impl<S: TokenKeyStore> LocalTokenManager<S> {
             }
         };
         Ok(Arc::new(LocalTokenManager {
-            user_name,
-            password,
+            credentials: RwLock::new(LocalTokenCredentials {
+                user_name,
+                password,
+            }),
             token_encode_key: encode_key,
             token_decode_key: decode_key,
             _p: Default::default(),
         }))
+    }
+
+    pub fn update_credentials(&self, user_name: Option<String>, password: Option<String>) {
+        let mut credentials = self.credentials.write().unwrap();
+        credentials.user_name = user_name;
+        credentials.password = password;
     }
 
     fn load(private_key: &Path, public_key: &Path) -> ControlResult<(EncodingKey, DecodingKey)> {
@@ -3478,19 +3083,20 @@ impl<S: TokenKeyStore> LocalTokenManager<S> {
 #[async_trait::async_trait]
 impl<S: TokenKeyStore> CyfsTokenFactory for LocalTokenManager<S> {
     async fn create(&self, user_name: &str, password: &str, timestamp: u64) -> ControlResult<String> {
-        if self.user_name.is_none() || self.password.is_none() {
+        let credentials = self.credentials.read().unwrap();
+        if credentials.user_name.is_none() || credentials.password.is_none() {
             return Err(cmd_err!(ControlErrorCode::NotSupportLogin, "not support login"));
         }
         if (Utc::now().timestamp() - timestamp as i64).abs() > 120 {
             return Err(cmd_err!(ControlErrorCode::Expired, "login session expired"));
         }
 
-        if user_name != self.user_name.as_ref().unwrap() {
+        if user_name != credentials.user_name.as_ref().unwrap() {
             return Err(cmd_err!(ControlErrorCode::InvalidUserName, "invalid user name"));
         }
 
         let mut sha256 = sha2::Sha256::new();
-        sha256.update(format!("{}_{}_{}", user_name, self.password.as_ref().unwrap(), timestamp));
+        sha256.update(format!("{}_{}_{}", user_name, credentials.password.as_ref().unwrap(), timestamp));
         if hex::encode(sha256.finalize()).to_lowercase() != password.to_lowercase() {
             return Err(cmd_err!(ControlErrorCode::InvalidPassword, "invalid password"));
         }
@@ -3525,8 +3131,10 @@ impl<S: TokenKeyStore> CyfsTokenVerifier for LocalTokenManager<S> {
                 return Err(cmd_err!(ControlErrorCode::Expired));
             }
 
+            let credentials = self.credentials.read().unwrap();
+            let user_name = credentials.user_name.as_deref().unwrap_or("root");
             match RPCSessionToken::generate_jwt_token(
-                self.user_name.as_ref().unwrap_or(&("root".to_string())),
+                user_name,
                 "cyfs-gateway",
                 None,
                 &self.token_encode_key) {

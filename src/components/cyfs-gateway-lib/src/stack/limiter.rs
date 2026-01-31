@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc};
 use sfo_io::{SpeedLimitSession, SpeedLimiter, SpeedLimiterRef};
 use cyfs_process_chain::*;
 use crate::{stack_err, StackErrorCode, StackResult};
@@ -85,58 +85,67 @@ impl Limiter {
 }
 
 pub trait LimiterManager: Send + Sync {
+    fn new_limiter(&mut self,
+                   id: String,
+                   upper: Option<String>,
+                   concurrent: Option<u32>,
+                   read_speed: Option<u32>,
+                   write_speed: Option<u32>) -> Limiter;
     fn get_limiter(&self, id: String) -> Option<Limiter>;
-    fn clone_manager(&self) -> Arc<dyn LimiterManager>;
+    fn clone_manager(&self) -> Box<dyn LimiterManager>;
+    fn retain(&mut self, f: Box<dyn FnMut(&String, &mut Limiter) -> bool>);
+    fn remove_limiter(&mut self, id: String);
+
 }
-pub type LimiterManagerRef = Arc<dyn LimiterManager>;
+pub type LimiterManagerRef = Arc<Box<dyn LimiterManager>>;
 
 pub struct DefaultLimiterManager {
-    limiters: RwLock<HashMap<String, Limiter>>,
+    limiters: HashMap<String, Limiter>,
 }
 
 impl DefaultLimiterManager {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            limiters: RwLock::new(HashMap::new()),
+    pub fn new() -> Box<dyn LimiterManager> {
+        Box::new(Self {
+            limiters: HashMap::new(),
         })
-    }
-
-    pub fn new_limiter(&self,
-                       id: impl Into<String>,
-                       upper: Option<impl Into<String>>,
-                       concurrent: Option<u32>,
-                       read_speed: Option<u32>,
-                       write_speed: Option<u32>) -> Limiter {
-        let upper = match upper {
-            Some(id) => self.get_limiter(id.into()),
-            None => None,
-        };
-
-        let id = id.into();
-        let limiter = Limiter::new_named(id.clone(), upper, concurrent, read_speed, write_speed);
-        let mut limiters = self.limiters.write().unwrap();
-        limiters.insert(id, limiter.clone());
-        limiter
-    }
-
-    pub fn retain<F>(&self, f: F)
-    where
-        F: FnMut(&String, &mut Limiter) -> bool,
-    {
-        let mut limiters = self.limiters.write().unwrap();
-        limiters.retain(f);
     }
 }
 
 impl LimiterManager for DefaultLimiterManager {
-    fn get_limiter(&self, id: String) -> Option<Limiter> {
-        self.limiters.read().unwrap().get(&id).cloned()
+    fn new_limiter(&mut self,
+                   id: String,
+                   upper: Option<String>,
+                   concurrent: Option<u32>,
+                   read_speed: Option<u32>,
+                   write_speed: Option<u32>) -> Limiter {
+        let upper = match upper {
+            Some(id) => self.get_limiter(id.clone()),
+            None => None,
+        };
+
+        let limiter = Limiter::new_named(id.clone(), upper, concurrent, read_speed, write_speed);
+        self.limiters.insert(id, limiter.clone());
+        limiter
     }
 
-    fn clone_manager(&self) -> Arc<dyn LimiterManager> {
-        let new = DefaultLimiterManager::new();
-        new.limiters.write().unwrap().extend(self.limiters.read().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())));
+    fn get_limiter(&self, id: String) -> Option<Limiter> {
+        self.limiters.get(&id).cloned()
+    }
+    fn clone_manager(&self) -> Box<dyn LimiterManager> {
+        let mut new =
+            Box::new(Self {
+                limiters: HashMap::new(),
+            });
+        new.limiters.extend(self.limiters.iter().map(|(k, v)| (k.clone(), v.clone())));
         new
+    }
+
+    fn retain(&mut self, f: Box<dyn FnMut(&String, &mut Limiter) -> bool>) {
+        self.limiters.retain(f);
+    }
+
+    fn remove_limiter(&mut self, id: String) {
+        self.limiters.remove(&id);
     }
 }
 

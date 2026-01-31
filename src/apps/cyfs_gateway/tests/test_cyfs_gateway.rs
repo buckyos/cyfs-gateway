@@ -422,8 +422,8 @@ mod tests {
             assert_eq!(response.status(), hyper::StatusCode::OK);
         }
 
+        let router_dir = tempfile::TempDir::new().unwrap();
         {
-            let router_dir = tempfile::TempDir::new().unwrap();
             let router_target = format!("{}/", router_dir.path().to_string_lossy());
             std::fs::write(router_dir.path().join("index.html"), "router").unwrap();
 
@@ -477,6 +477,7 @@ mod tests {
         {
             let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client.add_router(Some("server:www.buckyos.com"), "/reverse/", "http://127.0.0.1:18081/").await;
+            ret.as_ref().unwrap();
             assert!(ret.is_ok());
 
             let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();

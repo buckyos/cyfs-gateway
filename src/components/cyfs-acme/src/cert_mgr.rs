@@ -6,7 +6,7 @@ use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 use rustls::server::{ResolvesServerCert, ClientHello};
 use rustls::sign::CertifiedKey;
-use std::sync::{Arc};
+use std::sync::{Arc, Weak};
 use std::sync::RwLock;
 use tokio::task;
 use log::*;
@@ -391,7 +391,7 @@ impl DnsProvider for ExternalDnsProvider {
 
 #[async_trait::async_trait]
 pub trait DnsProviderFactory: Send + Sync + 'static {
-    async fn create(&self, params: serde_json::Value) -> Result<DnsProviderRef>;
+    async fn create(&self, acme_mgr: Weak<AcmeCertManager>, params: serde_json::Value) -> Result<DnsProviderRef>;
 }
 pub type DnsProviderFactoryRef = Arc<dyn DnsProviderFactory>;
 
@@ -415,71 +415,7 @@ pub struct AcmeCertManager {
     dns_providers: RwLock<HashMap<String, DnsProviderRef>>,
 }
 
-pub struct AcmeCertManagerHolder {
-    provider_cache: Mutex<HashMap<String, DnsProviderRef>>,
-    inner: RwLock<Arc<AcmeCertManager>>,
-}
-
-impl Debug for AcmeCertManagerHolder {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AcmeCertManagerRef")
-    }
-}
-
-impl AcmeCertManagerHolder {
-    fn new(cert_manager: AcmeCertManager) -> Self {
-        Self {
-            provider_cache: Mutex::new(HashMap::new()),
-            inner: RwLock::new(Arc::new(cert_manager))
-        }
-    }
-
-    pub async fn update(&self, config: CertManagerConfig) -> Result<()> {
-        let new_manager = AcmeCertManager::create(config).await?;
-        {
-            for (name, provider) in self.provider_cache.lock().unwrap().iter() {
-                new_manager.get_manager().register_dns_provider(name.clone(), provider.clone());
-            }
-        }
-        *self.inner.write().unwrap() = new_manager.get_manager();
-        Ok(())
-    }
-
-    fn get_manager(&self) -> Arc<AcmeCertManager> {
-        self.inner.read().unwrap().clone()
-    }
-
-    pub fn get_cert_by_host(&self, host: &str) -> Option<CertStub> {
-        self.get_manager().get_cert_by_host(host)
-    }
-
-    pub fn add_acme_item(&self, item: AcmeItem) -> Result<()> {
-        self.get_manager().add_acme_item(item)
-    }
-
-    pub fn get_auth_of_token(&self, token: &str) -> Option<String> {
-        self.get_manager().get_auth_of_token(token)
-    }
-
-    pub fn register_dns_provider(&self, name: impl Into<String>, provider: impl DnsProvider) {
-        let name = name.into();
-        let provider = Arc::new(provider);
-        {
-            self.provider_cache.lock().unwrap().insert(name.clone(), provider.clone());
-        }
-        self.get_manager().register_dns_provider(name, provider);
-    }
-
-    pub fn register_dns_provider_factory(&self, name: impl Into<String>, factory: impl DnsProviderFactory) {}
-}
-
-impl ResolvesServerCert for AcmeCertManagerHolder {
-    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.get_manager().resolve(client_hello)
-    }
-}
-
-pub type AcmeCertManagerRef = Arc<AcmeCertManagerHolder>;
+pub type AcmeCertManagerRef = Arc<AcmeCertManager>;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct CertManagerConfig {
@@ -597,6 +533,17 @@ impl AcmeCertManager {
         let acme_client = AcmeClient::new(account, config.acme_server.clone()).await?;
 
         let mut dns_providers = HashMap::<String, DnsProviderRef>::new();
+        let manager = AcmeCertManagerRef::new(Self {
+            config: config.clone(),
+            acme_client,
+            certs: RwLock::new(HashMap::new()),
+            check_handler: Mutex::new(None),
+            responder: Mutex::new(None),
+            challenge_certs: Mutex::new(Default::default()),
+            http_challenges: Mutex::new(Default::default()),
+            dns_providers: RwLock::new(dns_providers.clone()),
+        });
+
         if let Some(dns_providers_config) = &config.dns_providers {
             let provider_manager = if config.dns_provider_path.is_some() {
                 let dns_provider_path = Path::new(config.dns_provider_path.as_ref().unwrap()).to_path_buf();
@@ -610,7 +557,7 @@ impl AcmeCertManager {
                     DNS_PROVIDER_FACTORYS.read().unwrap().get(name).cloned()
                 };
                 if let Some(factory) = factory {
-                    let provider = factory.create(provider_config.clone()).await?;
+                    let provider = factory.create(Arc::downgrade(&manager), provider_config.clone()).await?;
                     dns_providers.insert(name.clone(), provider);
                 } else {
                     if provider_manager.is_some() {
@@ -623,26 +570,18 @@ impl AcmeCertManager {
                 }
             }
         }
+        {
+            manager.dns_providers.write().unwrap().extend(dns_providers);
+        }
 
-        let manager = AcmeCertManagerRef::new(AcmeCertManagerHolder::new(Self {
-            config: config.clone(),
-            acme_client,
-            certs: RwLock::new(HashMap::new()),
-            check_handler: Mutex::new(None),
-            responder: Mutex::new(None),
-            challenge_certs: Mutex::new(Default::default()),
-            http_challenges: Mutex::new(Default::default()),
-            dns_providers: RwLock::new(dns_providers),
-        }));
 
         {
-            let manager_tmp = manager.get_manager();
-            let mut responder = manager_tmp.responder.lock().unwrap();
-            *responder = Some(Arc::new(DefaultChallengeResponder::new(manager.get_manager())));
+            let mut responder = manager.responder.lock().unwrap();
+            *responder = Some(Arc::new(DefaultChallengeResponder::new(manager.clone())));
         }
         // 启动定期检查任务
         {
-            let weak_manager = Arc::downgrade(&manager.get_manager());
+            let weak_manager = Arc::downgrade(&manager);
             let handle: JoinHandle<()> = tokio::spawn(async move {
                 let check_interval = tokio::time::Duration::from_secs(
                     config.check_interval.num_seconds() as u64
@@ -657,14 +596,14 @@ impl AcmeCertManager {
                     }
                 }
             });
-            *manager.get_manager().check_handler.lock().unwrap() = Some(handle);
+            *manager.check_handler.lock().unwrap() = Some(handle);
         }
 
         Ok(manager)
     }
 
-    pub fn register_dns_provider(&self, name: impl Into<String>, provider: DnsProviderRef) {
-        self.dns_providers.write().unwrap().insert(name.into(), provider);
+    pub fn register_dns_provider(&self, name: impl Into<String>, provider: impl DnsProvider) {
+        self.dns_providers.write().unwrap().insert(name.into(), Arc::new(provider));
     }
 
     pub fn add_acme_item(&self, item: AcmeItem) -> Result<()> {

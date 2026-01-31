@@ -15,7 +15,6 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::sync::{Arc, Mutex, RwLock};
-use as_any::AsAny;
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
 use tokio::net::TcpStream;
@@ -639,7 +638,7 @@ mod tests {
         build_handler_env(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            DefaultLimiterManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
             None,
         )
@@ -649,7 +648,7 @@ mod tests {
         build_handler_env(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            DefaultLimiterManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         )
@@ -718,7 +717,7 @@ mod tests {
         let handler_env = build_handler_env(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            DefaultLimiterManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -764,7 +763,7 @@ mod tests {
         let handler_env = build_handler_env(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            DefaultLimiterManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -806,7 +805,7 @@ mod tests {
         let handler_env = build_handler_env(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            DefaultLimiterManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -870,7 +869,7 @@ mod tests {
         let handler_env = build_handler_env(
             Arc::new(ServerManager::new()),
             TunnelManager::new(),
-            DefaultLimiterManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -941,7 +940,7 @@ mod tests {
         let handler_env = build_handler_env(
             server_manager,
             TunnelManager::new(),
-            DefaultLimiterManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -989,7 +988,7 @@ mod tests {
         let handler_env = build_handler_env(
             server_manager,
             TunnelManager::new(),
-            DefaultLimiterManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
             stat_manager.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -1043,7 +1042,7 @@ mod tests {
         let handler_env = build_handler_env(
             server_manager,
             TunnelManager::new(),
-            DefaultLimiterManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
             stat_manager.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
@@ -1095,8 +1094,9 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let stat_manager = StatManager::new();
-        let limiter_manager = DefaultLimiterManager::new();
-        let _ = limiter_manager.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
+        let mut limiter_manager = DefaultLimiterManager::new();
+        let _ = limiter_manager.new_limiter("test".to_string(), None::<String>, Some(1), Some(2), Some(2));
+        let limiter_manager = Arc::new(limiter_manager);
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let handler_env = build_handler_env(
@@ -1154,8 +1154,9 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let stat_manager = StatManager::new();
-        let limiter_manager = DefaultLimiterManager::new();
-        let _ = limiter_manager.new_limiter("test", None::<String>, Some(1), Some(2), Some(2));
+        let mut limiter_manager = DefaultLimiterManager::new();
+        let _ = limiter_manager.new_limiter("test".to_string(), None::<String>, Some(1), Some(2), Some(2));
+        let limiter_manager = Arc::new(limiter_manager);
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let handler_env = build_handler_env(
@@ -1202,7 +1203,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let global_process_chains = Arc::new(GlobalProcessChains::new());
         let tunnel_manager = TunnelManager::new();
-        let limiter_manager = DefaultLimiterManager::new();
+        let limiter_manager = Arc::new(DefaultLimiterManager::new());
         let stat_manager = StatManager::new();
         let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
         let tcp_factory = TcpStackFactory::new(ConnectionManager::new());

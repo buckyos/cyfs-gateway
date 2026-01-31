@@ -7,24 +7,18 @@ use kRPC::RPCSessionToken;
 use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig, DID};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use cyfs_gateway_lib::{AcmeCertManagerHolder, AcmeCertManagerRef, DnsProvider, DnsProviderFactory, DnsProviderRef, RtcpStackConfig, StackProtocol};
+use cyfs_gateway_lib::{AcmeCertManager, AcmeCertManagerRef, DnsProvider, DnsProviderFactory, DnsProviderRef, RtcpStackConfig, StackProtocol};
 use cyfs_sn::OODInfo;
 
 pub struct AcmeSnProviderFactory {
     data_path: PathBuf,
-    weak_acme_mgr: Arc<Mutex<Option<Weak<AcmeCertManagerHolder>>>>,
 }
 
 impl AcmeSnProviderFactory {
     pub fn new(data_path: PathBuf) -> Arc<AcmeSnProviderFactory> {
         Arc::new(AcmeSnProviderFactory {
             data_path,
-            weak_acme_mgr: Arc::new(Mutex::new(None))
         })
-    }
-
-    pub fn set_acme_mgr(&self, acme_mgr: AcmeCertManagerRef) {
-        *self.weak_acme_mgr.lock().unwrap() = Some(Arc::downgrade(&acme_mgr));
     }
 }
 
@@ -37,7 +31,7 @@ pub struct AcmdSnProviderConfig {
 
 #[async_trait::async_trait]
 impl DnsProviderFactory for AcmeSnProviderFactory {
-    async fn create(&self, params: serde_json::Value) -> anyhow::Result<DnsProviderRef> {
+    async fn create(&self, acme_mgr: Weak<AcmeCertManager>, params: serde_json::Value) -> anyhow::Result<DnsProviderRef> {
         let config: AcmdSnProviderConfig = serde_json::from_value(params.clone())
             .map_err(|_| anyhow!("invalid acme sn provider config.{}", params.to_string()))?;
 
@@ -73,7 +67,7 @@ impl DnsProviderFactory for AcmeSnProviderFactory {
         };
         let private_key = jsonwebtoken::EncodingKey::from_ed_der(private_key.as_slice());
 
-        Ok(AcmeSnProvider::new(self.data_path.clone(), self.weak_acme_mgr.clone(), config.sn, private_key, device_config.id, device_config.name))
+        Ok(AcmeSnProvider::new(self.data_path.clone(), acme_mgr, config.sn, private_key, device_config.id, device_config.name))
     }
 }
 
@@ -86,7 +80,7 @@ struct CertStateItem {
 
 struct AcmeSnProvider {
     data_path: PathBuf,
-    weak_acme_mgr: Arc<Mutex<Option<Weak<AcmeCertManagerHolder>>>>,
+    weak_acme_mgr: Weak<AcmeCertManager>,
     sn: String,
     private_key: jsonwebtoken::EncodingKey,
     did: DID,
@@ -106,7 +100,7 @@ impl Drop for AcmeSnProvider {
 impl AcmeSnProvider {
     pub fn new(
         data_path: PathBuf,
-        weak_acme_mgr: Arc<Mutex<Option<Weak<AcmeCertManagerHolder>>>>,
+        weak_acme_mgr: Weak<AcmeCertManager>,
         sn: String,
         private_key: jsonwebtoken::EncodingKey,
         did: DID,
@@ -182,15 +176,10 @@ impl AcmeSnProvider {
             }
 
             let mut has_cert = false;
-            let weak_acme_mgr = {
-                self.weak_acme_mgr.lock().unwrap().clone()
-            };
-            if let Some(weak_acme_mgr) = weak_acme_mgr {
-                if let Some(acme_mgr) = weak_acme_mgr.upgrade() {
-                    if let Some(cert) = acme_mgr.get_cert_by_host(item.domain.as_str()) {
-                        if let Some(_) = cert.get_cert() {
-                            has_cert = true;
-                        }
+            if let Some(acme_mgr) = self.weak_acme_mgr.upgrade() {
+                if let Some(cert) = acme_mgr.get_cert_by_host(item.domain.as_str()) {
+                    if let Some(_) = cert.get_cert() {
+                        has_cert = true;
                     }
                 }
             }
@@ -258,23 +247,18 @@ impl DnsProvider for AcmeSnProvider {
                         })).await.map_err(|e| anyhow!("add_dns_record failed.{:?}", e))?;
         } else if op == "del_challenge" {
             let mut has_cert = false;
-            let weak_acme_mgr = {
-                self.weak_acme_mgr.lock().unwrap().clone()
-            };
-            if let Some(weak_acme_mgr) = weak_acme_mgr {
-                if let Some(acme_mgr) = weak_acme_mgr.upgrade() {
-                    let original = domain.replace("_acme-challenge.", "*.");
+            if let Some(acme_mgr) = self.weak_acme_mgr.upgrade() {
+                let original = domain.replace("_acme-challenge.", "*.");
+                if let Some(cert) = acme_mgr.get_cert_by_host(original.as_str()) {
+                    if let Some(_) = cert.get_cert() {
+                        has_cert = true;
+                    }
+                }
+                if !has_cert {
+                    let original = domain.replace("_acme-challenge.", "");
                     if let Some(cert) = acme_mgr.get_cert_by_host(original.as_str()) {
                         if let Some(_) = cert.get_cert() {
                             has_cert = true;
-                        }
-                    }
-                    if !has_cert {
-                        let original = domain.replace("_acme-challenge.", "");
-                        if let Some(cert) = acme_mgr.get_cert_by_host(original.as_str()) {
-                            if let Some(_) = cert.get_cert() {
-                                has_cert = true;
-                            }
                         }
                     }
                 }
