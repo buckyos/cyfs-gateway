@@ -1269,12 +1269,14 @@ pub async fn cyfs_gateway_main() {
     let log_dir = get_buckyos_log_dir("cyfs_gateway", true);
     std::fs::create_dir_all(&log_dir).unwrap();
 
+    //let log_level = env::var("BUCKY_LOG").unwrap_or("info".to_string());
+
     sfo_log::Logger::new("cyfs_gateway")
         .set_log_level(log_params.level.unwrap_or("info".to_string()).as_str())
         .set_log_path(log_params.path.unwrap_or(log_dir.to_string_lossy().to_string()).as_str())
         .set_log_to_file(true)
         .set_log_file_count(log_params.file_count.unwrap_or(10))
-        .set_log_file_size(parse_size_bytes(log_params.file_size.unwrap_or("20MB".to_string()).as_str()).unwrap_or(20 * 1024 * 1024))
+        .set_log_file_size(parse_size_bytes(log_params.file_size.unwrap_or("100MB".to_string()).as_str()).unwrap_or(20 * 1024 * 1024))
         .start().unwrap();
     // init log
     // init_logging("cyfs_gateway",true);
