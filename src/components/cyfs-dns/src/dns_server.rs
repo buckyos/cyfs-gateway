@@ -602,7 +602,7 @@ mod tests {
     use hickory_server::proto::rr::{Name, RData};
     use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager, GlobalProcessChains, Server, ServerFactory, ServerManager, StackContext, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackContext, UdpStackFactory};
     use cyfs_gateway_lib::server::DatagramServer;
-    use crate::{DnsServerConfig, InnerDnsRecordManager, LocalDns, ProcessChainDnsServer, ProcessChainDnsServerFactory};
+    use crate::{DnsServerConfig, DnsServerContext, InnerDnsRecordManager, LocalDns, ProcessChainDnsServer, ProcessChainDnsServerFactory};
 
     #[tokio::test]
     async fn test_process_chain_dns_server_factory() {
@@ -621,7 +621,7 @@ hook_point:
         let config = Arc::new(config);
         let server_mgr = Arc::new(ServerManager::new());
         let context = DnsServerContext::new(
-            server_mgr.clone(),
+            Arc::downgrade(&server_mgr),
             Arc::new(GlobalProcessChains::new()),
             GlobalCollectionManager::create(vec![]).await.unwrap(),
             InnerDnsRecordManager::new(),
@@ -681,7 +681,7 @@ hook_point:
         let inner_record_manager = InnerDnsRecordManager::new();
         let server = ProcessChainDnsServer::create_server(
             config.id,
-            server_mgr.clone(),
+            Arc::downgrade(&server_mgr),
             Some(Arc::new(GlobalProcessChains::new())),
             Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
@@ -730,7 +730,7 @@ hook_point:
         let inner_record_manager = InnerDnsRecordManager::new();
         let server = ProcessChainDnsServer::create_server(
             config.id,
-            server_mgr.clone(),
+            Arc::downgrade(&server_mgr),
             Some(Arc::new(GlobalProcessChains::new())),
             Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
@@ -860,7 +860,7 @@ hook_point:
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
         let global_process_chains = Arc::new(GlobalProcessChains::new());
         let context = DnsServerContext::new(
-            server_mgr.clone(),
+            Arc::downgrade(&server_mgr),
             global_process_chains.clone(),
             GlobalCollectionManager::create(vec![]).await.unwrap(),
             InnerDnsRecordManager::new(),
@@ -889,7 +889,7 @@ hook_point:
 
         let stack_config: UdpStackConfig = serde_yaml_ng::from_str(stack_config).unwrap();
         let tunnel_manager = TunnelManager::new();
-        let limiter_manager = DefaultLimiterManager::new();
+        let limiter_manager = Arc::new(DefaultLimiterManager::new());
         let stat_manager = StatManager::new();
         let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
         let stack = UdpStackFactory::new(ConnectionManager::new());
@@ -921,7 +921,7 @@ hook_point:
         let inner_record_manager = InnerDnsRecordManager::new();
         let server = ProcessChainDnsServer::create_server(
             config.id,
-            server_mgr.clone(),
+            Arc::downgrade(&server_mgr),
             Some(Arc::new(GlobalProcessChains::new())),
             Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
