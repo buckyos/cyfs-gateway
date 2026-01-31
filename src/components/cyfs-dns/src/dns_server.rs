@@ -230,7 +230,7 @@ impl InnerDnsRecordManager {
 
 pub struct ProcessChainDnsServer {
     id: String,
-    server_mgr: ServerManagerRef,
+    server_mgr: ServerManagerWeakRef,
     global_process_chains: Option<GlobalProcessChainsRef>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
@@ -240,7 +240,7 @@ pub struct ProcessChainDnsServer {
 impl ProcessChainDnsServer {
     pub async fn create_server(
         id: String,
-        server_mgr: ServerManagerRef,
+        server_mgr: ServerManagerWeakRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
         hook_point: ProcessChainConfigs,
@@ -477,7 +477,7 @@ pub struct ProcessChainDnsServerFactory;
 
 #[derive(Clone)]
 pub struct DnsServerContext {
-    pub server_mgr: ServerManagerRef,
+    pub server_mgr: ServerManagerWeakRef,
     pub global_process_chains: GlobalProcessChainsRef,
     pub global_collection_manager: GlobalCollectionManagerRef,
     pub inner_record_manager: InnerDnsRecordManagerRef,
@@ -485,7 +485,7 @@ pub struct DnsServerContext {
 
 impl DnsServerContext {
     pub fn new(
-        server_mgr: ServerManagerRef,
+        server_mgr: ServerManagerWeakRef,
         global_process_chains: GlobalProcessChainsRef,
         global_collection_manager: GlobalCollectionManagerRef,
         inner_record_manager: InnerDnsRecordManagerRef,
@@ -619,8 +619,9 @@ hook_point:
         "#;
         let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
         let config = Arc::new(config);
+        let server_mgr = Arc::new(ServerManager::new());
         let context = DnsServerContext::new(
-            Arc::new(ServerManager::new()),
+            server_mgr.clone(),
             Arc::new(GlobalProcessChains::new()),
             GlobalCollectionManager::create(vec![]).await.unwrap(),
             InnerDnsRecordManager::new(),

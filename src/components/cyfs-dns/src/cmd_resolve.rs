@@ -4,7 +4,7 @@ use hickory_proto::xfer::Protocol;
 use log::{error, warn};
 use name_client::{DnsProvider, NameInfo, NsProvider, RecordType};
 use name_lib::{EncodedDocument, DID};
-use cyfs_gateway_lib::{server_err, Server, ServerManagerRef, ServerResult};
+use cyfs_gateway_lib::ServerManagerWeakRef;
 use cyfs_process_chain::{command_help, CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel, ExternalCommand};
 use crate::nameinfo_to_map_collection;
 
@@ -13,11 +13,11 @@ use crate::nameinfo_to_map_collection;
 pub struct CmdResolve {
     name: String,
     cmd: Command,
-    server_mgr: ServerManagerRef,
+    server_mgr: ServerManagerWeakRef,
 }
 
 impl CmdResolve {
-    pub fn new(server_mgr: ServerManagerRef) -> Self {
+    pub fn new(server_mgr: ServerManagerWeakRef) -> Self {
         let cmd = Command::new("resolve")
             .about("resolve a domain name")
             .after_help(
@@ -149,7 +149,15 @@ impl ExternalCommand for CmdResolve {
                     }
                 }
             } else {
-                if let Some(dns_service) = self.server_mgr.get_name_server(server_address) {
+                let server_mgr = match self.server_mgr.upgrade() {
+                    Some(server_mgr) => server_mgr,
+                    None => {
+                        let msg = "Resolve command failed: server manager is unavailable".to_string();
+                        error!("{}", msg);
+                        return Ok(CommandResult::Error(msg));
+                    }
+                };
+                if let Some(dns_service) = server_mgr.get_name_server(server_address) {
                     match dns_service.query(domain, Some(record_type), None).await
                         .map_err(|e| {
                             let msg = format!(

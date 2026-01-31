@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::AtomicU32;
 use ::kRPC::{RPCHandler, RPCRequest, RPCResponse};
 use as_any::AsAny;
@@ -659,6 +659,12 @@ pub struct ServerManager {
     servers: Mutex<HashMap<String, Server>>
 }
 
+impl Drop for ServerManager {
+    fn drop(&mut self) {
+        log::debug!("ServerManager dropped");
+    }
+}
+
 impl ServerManager {
     pub fn new() -> Self {
         ServerManager {
@@ -836,6 +842,7 @@ impl ServerManager {
 }
 
 pub type ServerManagerRef = Arc<ServerManager>;
+pub type ServerManagerWeakRef = Weak<ServerManager>;
 
 pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn HttpServer>, info: StreamInfo) -> ServerResult<()> {
     if server.http_version() <= http::Version::HTTP_11 {

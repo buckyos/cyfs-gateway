@@ -62,7 +62,7 @@ impl RtcpConnectionHandler {
             &hook_point,
             env.global_process_chains.clone(),
             env.global_collection_manager.clone(),
-            Some(get_external_commands(env.servers.clone())),
+            Some(get_external_commands(Arc::downgrade(&env.servers))),
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -81,7 +81,7 @@ impl RtcpConnectionHandler {
             &hook_point,
             env.global_process_chains.clone(),
             env.global_collection_manager.clone(),
-            Some(get_external_commands(env.servers.clone())),
+            Some(get_external_commands(Arc::downgrade(&env.servers))),
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;

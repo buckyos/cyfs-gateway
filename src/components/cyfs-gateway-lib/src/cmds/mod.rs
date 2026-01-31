@@ -9,10 +9,10 @@ pub use forward::*;
 pub use set_limit::*;
 pub use set_stat::*;
 pub use server::*;
-use crate::{CmdQa, ServerManagerRef};
+use crate::{CmdQa, ServerManagerWeakRef};
 
 
-pub fn get_external_commands(server_manager: ServerManagerRef) -> Vec<(String, ExternalCommandRef)> {
+pub fn get_external_commands(server_manager: ServerManagerWeakRef) -> Vec<(String, ExternalCommandRef)> {
     let mut cmds = vec![];
 
     let https_sni_probe_command = HttpsSniProbeCommand::new();
@@ -39,7 +39,7 @@ pub fn get_external_commands(server_manager: ServerManagerRef) -> Vec<(String, E
     let name = server_command.name().to_owned();
     cmds.push((name, Arc::new(Box::new(server_command) as Box<dyn ExternalCommand>)));
 
-    let qa_command = CmdQa::new(server_manager.clone());
+    let qa_command = CmdQa::new(server_manager);
     let name = qa_command.name().to_owned();
     cmds.push((name, Arc::new(Box::new(qa_command) as Box<dyn ExternalCommand>)));
 

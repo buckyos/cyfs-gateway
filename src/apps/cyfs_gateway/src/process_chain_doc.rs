@@ -1,10 +1,10 @@
 use buckyos_kit::get_buckyos_service_data_dir;
+use cyfs_dns::CmdResolve;
 use cyfs_gateway_lib::{get_external_commands, ServerManager};
 use cyfs_process_chain::{CommandHelpType, HookPointEnv, COMMAND_PARSER_FACTORY};
 use log::*;
 use std::collections::HashSet;
 use std::sync::Arc;
-use cyfs_dns::CmdResolve;
 
 pub struct GatewayProcessChainDoc {
     env: HookPointEnv,
@@ -29,7 +29,10 @@ impl GatewayProcessChainDoc {
 
     pub fn render_command_list(&self) -> String {
         let mut output = String::new();
-        let mut groups: Vec<_> = COMMAND_PARSER_FACTORY.get_group_list().into_iter().collect();
+        let mut groups: Vec<_> = COMMAND_PARSER_FACTORY
+            .get_group_list()
+            .into_iter()
+            .collect();
         groups.sort_by_key(|(group, _)| group.as_str());
 
         output.push_str("Available process_chain commands:\n\n");
@@ -64,7 +67,10 @@ impl GatewayProcessChainDoc {
 
     pub fn render_all_docs(&self) -> String {
         let mut doc = String::new();
-        let mut groups: Vec<_> = COMMAND_PARSER_FACTORY.get_group_list().into_iter().collect();
+        let mut groups: Vec<_> = COMMAND_PARSER_FACTORY
+            .get_group_list()
+            .into_iter()
+            .collect();
         groups.sort_by_key(|(group, _)| group.as_str());
 
         doc.push_str("# Command reference documentation\n\n");
@@ -105,13 +111,13 @@ impl GatewayProcessChainDoc {
     fn register_gateway_external_commands(env: &HookPointEnv) -> Result<(), String> {
         let server_manager = Arc::new(ServerManager::new());
         let mut registered = HashSet::new();
-        for (name, cmd) in get_external_commands(server_manager.clone()) {
+        for (name, cmd) in get_external_commands(Arc::downgrade(&server_manager)) {
             if !registered.insert(name.clone()) {
                 continue;
             }
             env.register_external_command(&name, cmd)?;
         }
-        let resolve_cmd = CmdResolve::new(server_manager.clone());
+        let resolve_cmd = CmdResolve::new(Arc::downgrade(&server_manager));
         let resolve_name = resolve_cmd.name().to_string();
         env.register_external_command(resolve_name.as_str(), Arc::new(Box::new(resolve_cmd)))?;
 

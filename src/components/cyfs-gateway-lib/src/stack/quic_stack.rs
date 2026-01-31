@@ -94,7 +94,7 @@ impl QuicConnectionHandler {
             &hook_point,
             env.global_process_chains.clone(),
             env.global_collection_manager.clone(),
-            Some(get_external_commands(env.servers.clone())),
+            Some(get_external_commands(Arc::downgrade(&env.servers))),
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
@@ -1893,13 +1893,14 @@ mod tests {
         "#;
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let server_mgr = Arc::new(ServerManager::new());
         let http_server = ProcessChainHttpServer::builder()
             .id("www.buckyos.com")
             .version("HTTP/3")
             .h3_port(9186)
             .hook_point(chains)
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .server_mgr(Arc::new(ServerManager::new()))
+            .server_mgr(Arc::downgrade(&server_mgr))
             .tunnel_manager(TunnelManager::new())
             .build().await.unwrap();
 

@@ -54,7 +54,7 @@ pub fn get_default_config_path() -> PathBuf {
     if !default_config.exists() {
         default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
     }
-    default_config
+    default_config.canonicalize().unwrap()
 }
 
 fn strip_includes_field(mut config: Value) -> Value {
@@ -66,7 +66,7 @@ fn strip_includes_field(mut config: Value) -> Value {
 
 fn build_server_context(
     server_type: &str,
-    server_manager: ServerManagerRef,
+    server_manager: ServerManagerWeakRef,
     global_process_chains: GlobalProcessChainsRef,
     tunnel_manager: TunnelManager,
     global_collection_manager: GlobalCollectionManagerRef,
@@ -509,7 +509,7 @@ impl GatewayFactory {
         for server_config in config.servers.iter() {
             let context = build_server_context(
                 server_config.server_type().as_str(),
-                server_manager.clone(),
+                Arc::downgrade(&server_manager),
                 global_process_chains.clone(),
                 tunnel_manager.clone(),
                 global_collections.clone(),
@@ -2416,7 +2416,7 @@ impl Gateway {
         Ok(())
     }
 
-    pub async fn reload(&self, mut config: GatewayConfig) -> Result<()> {
+    pub async fn reload(&self, config: GatewayConfig) -> Result<()> {
         let user_name: Option<String> = match config.raw_config.get("user_name") {
             Some(user_name) => user_name.as_str().map(|value| value.to_string()),
             None => None,
@@ -2490,7 +2490,7 @@ impl Gateway {
         for server_config in config.servers.iter() {
             let context = build_server_context(
                 server_config.server_type().as_str(),
-                server_manager.clone(),
+                Arc::downgrade(&server_manager),
                 global_process_chains.clone(),
                 self.tunnel_manager.clone(),
                 global_collections.clone(),

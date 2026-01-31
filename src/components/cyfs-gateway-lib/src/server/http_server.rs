@@ -8,7 +8,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor};
-use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerRef, ServerResult, StreamInfo, TunnelManager};
+use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err,into_server_err};
 use crate::tunnel_connector::TunnelConnector;
@@ -20,7 +20,7 @@ pub struct ProcessChainHttpServerBuilder {
     h3_port: Option<u16>,
     hook_point: Option<ProcessChainConfigs>,
     global_process_chains: Option<GlobalProcessChainsRef>,
-    server_mgr: Option<ServerManagerRef>,
+    server_mgr: Option<ServerManagerWeakRef>,
     tunnel_manager: Option<TunnelManager>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
 }
@@ -47,7 +47,7 @@ impl ProcessChainHttpServerBuilder {
         self
     }
 
-    pub fn server_mgr(mut self, server_mgr: ServerManagerRef) -> Self {
+    pub fn server_mgr(mut self, server_mgr: ServerManagerWeakRef) -> Self {
         self.server_mgr = Some(server_mgr);
         self
     }
@@ -76,9 +76,15 @@ pub struct ProcessChainHttpServer {
     id: String,
     version: http::Version,
     h3_port: Option<u16>,
-    server_mgr: ServerManagerRef,
+    server_mgr: ServerManagerWeakRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     tunnel_manager: TunnelManager,
+}
+
+impl Drop for ProcessChainHttpServer {
+    fn drop(&mut self) {
+        debug!("ProcessChainHttpServer {} drop", self.id);
+    }
 }
 
 impl ProcessChainHttpServer {
@@ -104,9 +110,12 @@ impl ProcessChainHttpServer {
             return Err(server_err!(ServerErrorCode::InvalidConfig, "hook_point is none"));
         }
 
-        if builder.server_mgr.is_none() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "server_mgr is none"));
-        }
+        let server_mgr = builder
+            .server_mgr
+            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "server_mgr is none"))?;
+        let server_mgr_ref = server_mgr
+            .upgrade()
+            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "server_mgr is unavailable"))?;
 
         if builder.tunnel_manager.is_none() {
             return Err(server_err!(ServerErrorCode::InvalidConfig, "tunnel_manager is none"));
@@ -129,13 +138,13 @@ impl ProcessChainHttpServer {
         let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
                                                           builder.global_process_chains,
                                                           builder.global_collection_manager,
-                                                          Some(get_external_commands(builder.server_mgr.clone().unwrap()))).await
+                                                          Some(get_external_commands(Arc::downgrade(&server_mgr_ref)))).await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
         Ok(ProcessChainHttpServer {
             id: builder.id.unwrap(),
             version,
             h3_port: builder.h3_port,
-            server_mgr: builder.server_mgr.unwrap(),
+            server_mgr,
             executor: Arc::new(Mutex::new(executor)),
             tunnel_manager: builder.tunnel_manager.unwrap(),
         })
@@ -264,9 +273,13 @@ impl HttpServer for ProcessChainHttpServer {
                             let post_req= req_map.into_request()
                                 .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
-                            if let Some(service) = self.server_mgr.get_http_server(server_id) {
-                                let resp = service.serve_request(post_req, info).await;
-                                return resp;
+                            if let Some(server_mgr) = self.server_mgr.upgrade() {
+                                if let Some(service) = server_mgr.get_http_server(server_id) {
+                                    let resp = service.serve_request(post_req, info).await;
+                                    return resp;
+                                }
+                            } else {
+                                log::error!("server manager is unavailable");
                             }
                         },
                         "forward" => {
@@ -365,7 +378,7 @@ impl ServerConfig for ProcessChainHttpServerConfig {
 
 #[derive(Clone)]
 pub struct HttpServerContext {
-    pub server_mgr: ServerManagerRef,
+    pub server_mgr: ServerManagerWeakRef,
     pub global_process_chains: GlobalProcessChainsRef,
     pub tunnel_manager: TunnelManager,
     pub global_collection_manager: GlobalCollectionManagerRef,
@@ -373,7 +386,7 @@ pub struct HttpServerContext {
 
 impl HttpServerContext {
     pub fn new(
-        server_mgr: ServerManagerRef,
+        server_mgr: ServerManagerWeakRef,
         global_process_chains: GlobalProcessChainsRef,
         tunnel_manager: TunnelManager,
         global_collection_manager: GlobalCollectionManagerRef,
@@ -423,7 +436,6 @@ impl ServerFactory for ProcessChainHttpServerFactory {
                 ServerErrorCode::InvalidConfig,
                 "invalid http server context"
             ))?;
-
         let mut builder = ProcessChainHttpServer::builder()
             .hook_point(config.hook_point.clone())
             .id(config.id.clone())
@@ -464,7 +476,7 @@ mod tests {
         let mock_server_mgr = Arc::new(ServerManager::new());
 
         let result = ProcessChainHttpServer::builder()
-            .server_mgr(mock_server_mgr).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
         if let Err(e) = result {
             assert_eq!(e.code(), ServerErrorCode::InvalidConfig);
         }
@@ -488,7 +500,7 @@ mod tests {
         let result = ProcessChainHttpServer::builder()
             .version("HTTP/1.2".to_string())
             .hook_point(vec![])
-            .server_mgr(mock_server_mgr).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
 
         assert!(result.is_err());
         if let Err(e) = result {
@@ -505,7 +517,7 @@ mod tests {
             .version("HTTP/1.1".to_string())
             .hook_point(vec![])
             .tunnel_manager(TunnelManager::new())
-            .server_mgr(mock_server_mgr).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
 
         assert!(result.is_ok());
     }
@@ -519,7 +531,7 @@ mod tests {
             .version("HTTP/2".to_string())
             .hook_point(vec![])
             .tunnel_manager(TunnelManager::new())
-            .server_mgr(mock_server_mgr).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
         assert!(result.is_ok());
     }
 
@@ -543,7 +555,7 @@ mod tests {
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
             .tunnel_manager(TunnelManager::new())
-            .server_mgr(mock_server_mgr).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
 
         assert!(result.is_ok());
         let http_server = Arc::new(result.unwrap());
@@ -588,7 +600,7 @@ mod tests {
             .version("HTTP/2".to_string())
             .hook_point(chains)
             .tunnel_manager(TunnelManager::new())
-            .server_mgr(mock_server_mgr).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
 
         assert!(result.is_ok());
         let http_server = Arc::new(result.unwrap());
@@ -633,7 +645,7 @@ mod tests {
             .version("HTTP/2".to_string())
             .hook_point(chains)
             .tunnel_manager(TunnelManager::new())
-            .server_mgr(mock_server_mgr).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
 
         assert!(result.is_ok());
         let http_server = Arc::new(result.unwrap());
@@ -679,7 +691,7 @@ mod tests {
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
             .tunnel_manager(TunnelManager::new())
-            .server_mgr(mock_server_mgr).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
 
         assert!(result.is_ok());
         let http_server = Arc::new(result.unwrap());
@@ -754,7 +766,7 @@ mod tests {
             .id("test_forward")
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
-            .server_mgr(mock_server_mgr)
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
             .tunnel_manager(TunnelManager::new())
             .build()
             .await;
@@ -836,7 +848,7 @@ mod tests {
             .id("test_forward")
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
-            .server_mgr(mock_server_mgr)
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
             .tunnel_manager(TunnelManager::new())
             .build()
             .await;
@@ -891,7 +903,7 @@ mod tests {
             .id("test_forward_err")
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
-            .server_mgr(mock_server_mgr)
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
             .tunnel_manager(TunnelManager::new())
             .build()
             .await;
@@ -934,8 +946,9 @@ mod tests {
             h3_port: None,
             hook_point: ProcessChainConfigs::default(),
         };
+        let server_mgr = Arc::new(ServerManager::new());
         let context = HttpServerContext::new(
-            Arc::new(ServerManager::new()),
+            Arc::downgrade(&server_mgr),
             Arc::new(GlobalProcessChains::new()),
             TunnelManager::new(),
             GlobalCollectionManager::create(vec![]).await.unwrap(),

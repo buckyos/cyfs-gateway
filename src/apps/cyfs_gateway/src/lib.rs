@@ -105,16 +105,6 @@ async fn run_gateway_with_config(
     config_file: Option<&Path>,
     params: GatewayParams,
 ) -> Result<()> {
-    let config_dir = if let Some(config_file) = config_file {
-        Some(config_file.parent().ok_or_else(|| {
-            let msg = format!("cannot get config dir: {:?}", config_file);
-            error!("{}", msg);
-            anyhow!(msg)
-        })?)
-    } else {
-        None
-    };
-
     let parser = Arc::new(GatewayConfigParser::new());
     parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
     parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
@@ -213,6 +203,7 @@ fn get_config_file_path(matches: &clap::ArgMatches) -> PathBuf {
     } else {
         real_config_file = PathBuf::from(config_file.unwrap());
     }
+    let real_config_file = real_config_file.canonicalize().unwrap();
     set_gateway_main_config_dir(&real_config_file);
     real_config_file
 }

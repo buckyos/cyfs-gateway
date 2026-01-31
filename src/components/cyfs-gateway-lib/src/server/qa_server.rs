@@ -134,11 +134,11 @@ pub fn qa_json_to_rpc_request(json_req: &serde_json::Value) -> ServerResult<RPCR
 const CMD_QA_NAME: &str = "qa";
 pub struct CmdQa {
     cmd: Command,
-    server_manager: ServerManagerRef,
+    server_manager: ServerManagerWeakRef,
 }
 
 impl CmdQa {
-    pub fn new(server_manager: ServerManagerRef) -> Self {
+    pub fn new(server_manager: ServerManagerWeakRef) -> Self {
         let cmd = Command::new(CMD_QA_NAME)
             .about("Call QA Server to answer questions")
             .after_help(
@@ -235,7 +235,10 @@ impl ExternalCommand for CmdQa {
         info!("will execute qa command: server_id={}, map_id={}", server_id, map_id);
 
         // Get the QA server
-        let server = self.server_manager.get_qa_server(server_id);
+        let server_manager = self.server_manager
+            .upgrade()
+            .ok_or_else(|| "qa command failed: server manager is unavailable".to_string())?;
+        let server = server_manager.get_qa_server(server_id);
         if server.is_none() {
             return Err(format!("QA server '{}' not found", server_id));
         }
