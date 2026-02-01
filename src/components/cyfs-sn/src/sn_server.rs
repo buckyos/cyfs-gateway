@@ -246,9 +246,8 @@ impl SNServer {
         })?;
 
         rpc_session_token.verify_by_key(&user_public_key)?;
-        if rpc_session_token.aud.is_none() || rpc_session_token.aud.as_ref().unwrap() != "active_service"
-        {
-            return Err(RPCErrors::ParseRequestError(format!("invalid aud {} expect active_service", rpc_session_token.aud.clone().unwrap_or("None".to_string()))));
+        if rpc_session_token.aud != Some("sn".to_string()) {
+            return Err(RPCErrors::ParseRequestError(format!("invalid aud {} expect sn", rpc_session_token.aud.clone().unwrap_or("None".to_string()))));
         }
 
         let mini_device_config = DeviceMiniConfig::from_jwt(mini_config_jwt, &user_public_key);
@@ -349,10 +348,6 @@ impl SNServer {
         })?;
 
         rpc_session_token.verify_by_key(&user_public_key)?;
-        if rpc_session_token.aud.is_none() || rpc_session_token.aud.unwrap() != "active_service"
-        {
-            return Err(RPCErrors::ParseRequestError("invalid aud".to_string()));
-        }
 
         // Update zone_config and user_domain in database
         self.db.update_user_zone_config(user_name, zone_config_jwt).await.map_err(|e| {
@@ -969,7 +964,7 @@ impl SNServer {
                 RPCErrors::ParseRequestError(e.to_string())
             })?;
         rpc_session_token.verify_by_key(&verify_public_key)?;
-
+        
         let domain = req.params.get("domain");
         if domain.is_none() {
             return Err(RPCErrors::ParseRequestError(
