@@ -548,26 +548,7 @@ impl RtcpStack {
         let stack_context = if let Some(stack_context) = builder.stack_context.take() {
             stack_context
         } else {
-            if builder.servers.is_none() {
-                return Err(stack_err!(StackErrorCode::InvalidConfig, "servers is required"));
-            }
-            if builder.tunnel_manager.is_none() {
-                return Err(stack_err!(StackErrorCode::InvalidConfig, "tunnel_manager is required"));
-            }
-            if builder.limiter_manager.is_none() {
-                return Err(stack_err!(StackErrorCode::InvalidConfig, "limiter_manager is required"));
-            }
-            if builder.stat_manager.is_none() {
-                return Err(stack_err!(StackErrorCode::InvalidConfig, "stat_manager is required"));
-            }
-            Arc::new(RtcpStackContext::new(
-                builder.servers.take().unwrap(),
-                builder.tunnel_manager.take().unwrap(),
-                builder.limiter_manager.take().unwrap(),
-                builder.stat_manager.take().unwrap(),
-                builder.global_process_chains.take(),
-                builder.global_collection_manager.take(),
-            ))
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "stack_context is required"));
         };
         let handler = RtcpConnectionHandler::create(builder.hook_point.unwrap(), stack_context.clone()).await?;
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
@@ -657,12 +638,6 @@ pub struct RtcpStackBuilder {
     private_key: Option<[u8; 48]>,
     hook_point: Option<ProcessChainConfigs>,
     connection_manager: Option<ConnectionManagerRef>,
-    servers: Option<ServerManagerRef>,
-    global_process_chains: Option<GlobalProcessChainsRef>,
-    tunnel_manager: Option<TunnelManager>,
-    limiter_manager: Option<LimiterManagerRef>,
-    stat_manager: Option<StatManagerRef>,
-    global_collection_manager: Option<GlobalCollectionManagerRef>,
     stack_context: Option<Arc<RtcpStackContext>>,
 }
 
@@ -675,12 +650,6 @@ impl RtcpStackBuilder {
             private_key: None,
             hook_point: None,
             connection_manager: None,
-            servers: None,
-            global_process_chains: None,
-            tunnel_manager: None,
-            limiter_manager: None,
-            stat_manager: None,
-            global_collection_manager: None,
             stack_context: None,
         }
     }
@@ -712,36 +681,6 @@ impl RtcpStackBuilder {
 
     pub fn connection_manager(mut self, connection_manager: ConnectionManagerRef) -> Self {
         self.connection_manager = Some(connection_manager);
-        self
-    }
-
-    pub fn servers(mut self, servers: ServerManagerRef) -> Self {
-        self.servers = Some(servers);
-        self
-    }
-
-    pub fn global_process_chains(mut self, global_process_chains: GlobalProcessChainsRef) -> Self {
-        self.global_process_chains = Some(global_process_chains);
-        self
-    }
-
-    pub fn tunnel_manager(mut self, tunnel_manager: TunnelManager) -> Self {
-        self.tunnel_manager = Some(tunnel_manager);
-        self
-    }
-
-    pub fn limiter_manager(mut self, limiter_manager: LimiterManagerRef) -> Self {
-        self.limiter_manager = Some(limiter_manager);
-        self
-    }
-
-    pub fn stat_manager(mut self, stat_manager: StatManagerRef) -> Self {
-        self.stat_manager = Some(stat_manager);
-        self
-    }
-
-    pub fn global_collection_manager(mut self, global_collection_manager: GlobalCollectionManagerRef) -> Self {
-        self.global_collection_manager = Some(global_collection_manager);
         self
     }
 
@@ -1016,18 +955,21 @@ mod tests {
 
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            Arc::new(ServerManager::new()),
+            tunnel_manager1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2981".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1064,18 +1006,21 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            Arc::new(ServerManager::new()),
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2982".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1131,18 +1076,21 @@ mod tests {
 
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            Arc::new(ServerManager::new()),
+            tunnel_manager1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2983".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         // assert!(result.is_ok());
@@ -1177,18 +1125,21 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            Arc::new(ServerManager::new()),
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2984".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1244,18 +1195,21 @@ mod tests {
 
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            Arc::new(ServerManager::new()),
+            tunnel_manager1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2985".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1290,18 +1244,21 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            Arc::new(ServerManager::new()),
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2986".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1373,18 +1330,21 @@ mod tests {
 
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            Arc::new(ServerManager::new()),
+            tunnel_manager1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2988".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1419,18 +1379,21 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            Arc::new(ServerManager::new()),
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2989".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1516,18 +1479,21 @@ mod tests {
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2990".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1564,18 +1530,21 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2991".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1629,20 +1598,24 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let server_manager = Arc::new(ServerManager::new());
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2995".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1676,19 +1649,23 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let server_manager = Arc::new(ServerManager::new());
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2996".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1742,20 +1719,24 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let server_manager = Arc::new(ServerManager::new());
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2997".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1789,19 +1770,23 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let server_manager = Arc::new(ServerManager::new());
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2313".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1855,20 +1840,24 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let server_manager = Arc::new(ServerManager::new());
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2998".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1902,19 +1891,23 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let server_manager = Arc::new(ServerManager::new());
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2999".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -1982,20 +1975,24 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let server_manager = Arc::new(ServerManager::new());
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2301".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2029,19 +2026,23 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
+        let server_manager = Arc::new(ServerManager::new());
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2302".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(Arc::new(ServerManager::new()))
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2103,18 +2104,21 @@ mod tests {
         let limiter_manager1 = Arc::new(DefaultLimiterManager::new());
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            limiter_manager1.clone(),
+            stat1.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2322".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(limiter_manager1.clone())
-            .stat_manager(stat1.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2151,18 +2155,21 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2323".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2227,18 +2234,21 @@ mod tests {
         let limiter_manager1 = Arc::new(DefaultLimiterManager::new());
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            limiter_manager1.clone(),
+            stat1.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2324".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(limiter_manager1.clone())
-            .stat_manager(stat1.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2275,18 +2285,21 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2325".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2355,18 +2368,21 @@ mod tests {
         let _ = limiter_manager1.new_limiter("test".to_string(), None::<String>, Some(1), Some(2), Some(2));
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            Arc::new(limiter_manager1),
+            stat1.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2326".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(limiter_manager1))
-            .stat_manager(stat1.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2403,18 +2419,21 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2327".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2483,18 +2502,21 @@ mod tests {
         let _ = limiter_manager1.new_limiter("test".to_string(), None::<String>, Some(1), Some(2), Some(2));
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            Arc::new(limiter_manager1),
+            stat1.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2328".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(limiter_manager1))
-            .stat_manager(stat1.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2531,18 +2553,21 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2329".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2630,18 +2655,21 @@ mod tests {
         let _ = server_manager.add_server(Server::Datagram(Arc::new(MockDatagramServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager1 = TunnelManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2310".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2678,18 +2706,21 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let _ = server_manager.add_server(Server::Datagram(Arc::new(MockDatagramServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager2 = TunnelManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2311".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(StatManager::new())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2747,18 +2778,21 @@ mod tests {
         let tunnel_manager1 = TunnelManager::new();
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            stat1.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2332".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(stat1.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2797,18 +2831,21 @@ mod tests {
         let _ = server_manager.add_server(Server::Datagram(Arc::new(MockDatagramServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager2 = TunnelManager::new();
         let stat2 = StatManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            stat2.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2333".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(stat2.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2887,18 +2924,21 @@ mod tests {
         let limiter_manager1 = DefaultLimiterManager::new();
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            Arc::new(limiter_manager1),
+            stat1.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2314".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(limiter_manager1))
-            .stat_manager(stat1.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -2937,18 +2977,21 @@ mod tests {
         let _ = server_manager.add_server(Server::Datagram(Arc::new(MockDatagramServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager2 = TunnelManager::new();
         let stat2 = StatManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            stat2.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2315".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(stat2.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -3018,18 +3061,21 @@ mod tests {
         let _ = limiter_manager1.new_limiter("test".to_string(), None::<String>, Some(1), Some(4), Some(4));
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            Arc::new(limiter_manager1),
+            stat1.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2316".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(limiter_manager1))
-            .stat_manager(stat1.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -3068,18 +3114,21 @@ mod tests {
         let _ = server_manager.add_server(Server::Datagram(Arc::new(MockDatagramServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager2 = TunnelManager::new();
         let stat2 = StatManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            stat2.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2317".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(stat2.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -3149,18 +3198,21 @@ mod tests {
         let _ = limiter_manager1.new_limiter("test".to_string(), None::<String>, Some(1), Some(4), Some(4));
         let stat1 = StatManager::new();
         let connection_manager = ConnectionManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager1.clone(),
+            Arc::new(limiter_manager1),
+            stat1.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test")
             .bind("127.0.0.1:2318".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager1.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(limiter_manager1))
-            .stat_manager(stat1.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
@@ -3199,18 +3251,21 @@ mod tests {
         let _ = server_manager.add_server(Server::Datagram(Arc::new(MockDatagramServer::new("www.buckyos.com".to_string()))));
         let tunnel_manager2 = TunnelManager::new();
         let stat2 = StatManager::new();
+        let stack_context = build_stack_context(
+            server_manager,
+            tunnel_manager2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            stat2.clone(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let result = RtcpStack::builder()
             .id("test2")
             .bind("127.0.0.1:2319".to_string())
             .device_config(device_config.clone())
             .private_key(pkcs8_bytes)
-            .servers(server_manager)
             .hook_point(chains)
-            .tunnel_manager(tunnel_manager2.clone())
             .connection_manager(connection_manager.clone())
-            .global_process_chains(Arc::new(GlobalProcessChains::new()))
-            .limiter_manager(Arc::new(DefaultLimiterManager::new()))
-            .stat_manager(stat2.clone())
+            .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());

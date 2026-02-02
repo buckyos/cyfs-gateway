@@ -161,7 +161,7 @@ mod test {
         if cfg!(windows) {
             assert_eq!(normalized_str, "windows\\style\\path");
         } else {
-            assert_eq!(normalized_str, "./windows\\style\\path");
+            assert_eq!(normalized_str, ".\\windows\\style\\path");
         }
 
         // Test Windows-style path
@@ -169,14 +169,22 @@ mod test {
         let normalized = normalize_path(path);
         // Should remove the current directory reference
         let normalized_str = normalized.to_string_lossy().to_string();
-        assert_eq!(normalized_str, "C:\\windows\\style\\path");
+        if cfg!(windows) {
+            assert_eq!(normalized_str, "C:\\windows\\style\\path");
+        } else {
+            assert_eq!(normalized_str, "C:\\windows\\.\\style\\path");
+        }
 
         // Test Windows-style path
         let path = Path::new("C:\\windows\\..\\style\\path");
         let normalized = normalize_path(path);
         // Should remove the current directory reference
         let normalized_str = normalized.to_string_lossy().to_string();
-        assert_eq!(normalized_str, "C:\\style\\path");
+        if cfg!(windows) {
+            assert_eq!(normalized_str, "C:\\style\\path");
+        } else {
+            assert_eq!(normalized_str, "C:\\windows\\..\\style\\path");
+        }
 
         // Test path with parent directory at the beginning
         let path = Path::new("../a/b/c");
