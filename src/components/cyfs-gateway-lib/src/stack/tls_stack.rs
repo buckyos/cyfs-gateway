@@ -2,9 +2,9 @@ use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
 use crate::{
-    get_external_commands, get_min_priority, get_stat_info, hyper_serve_http, into_stack_err, stack_err,
+    get_external_commands, get_stat_info, hyper_serve_http, into_stack_err, stack_err,
     ConnectionInfo, ConnectionManagerRef, HandleConnectionController, LimiterManagerRef, StatManagerRef,
-    MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfig, ProcessChainConfigs,
+    MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs,
     Server, ServerManagerRef, Stack, StackCertConfig, StackConfig, StackContext, StackErrorCode,
     StackProtocol, StackResult, StreamInfo, TunnelManager, GlobalCollectionManagerRef,
 };
@@ -615,19 +615,6 @@ impl crate::StackConfig for TlsStackConfig {
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
-    }
-
-    fn add_process_chain(&self, mut process_chain: ProcessChainConfig) -> Arc<dyn StackConfig> {
-        let mut config = self.clone();
-        process_chain.priority = get_min_priority(&config.hook_point) - 1;
-        config.hook_point.push(process_chain);
-        Arc::new(config)
-    }
-
-    fn remove_process_chain(&self, process_chain_id: &str) -> Arc<dyn StackConfig> {
-        let mut config = self.clone();
-        config.hook_point.retain(|chain| chain.id != process_chain_id);
-        Arc::new(config)
     }
 }
 
