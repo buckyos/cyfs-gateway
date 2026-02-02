@@ -8,7 +8,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor};
-use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpServer, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager};
+use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpResponseHeaderMap, HttpServer, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err,into_server_err};
 use crate::tunnel_connector::TunnelConnector;
@@ -19,6 +19,7 @@ pub struct ProcessChainHttpServerBuilder {
     version: Option<String>,
     h3_port: Option<u16>,
     hook_point: Option<ProcessChainConfigs>,
+    post_hook_point: Option<ProcessChainConfigs>,
     global_process_chains: Option<GlobalProcessChainsRef>,
     server_mgr: Option<ServerManagerWeakRef>,
     tunnel_manager: Option<TunnelManager>,
@@ -39,6 +40,11 @@ impl ProcessChainHttpServerBuilder {
 
     pub fn hook_point(mut self, hook_point: ProcessChainConfigs) -> Self {
         self.hook_point = Some(hook_point);
+        self
+    }
+
+    pub fn post_hook_point(mut self, post_hook_point: ProcessChainConfigs) -> Self {
+        self.post_hook_point = Some(post_hook_point);
         self
     }
 
@@ -78,6 +84,7 @@ pub struct ProcessChainHttpServer {
     h3_port: Option<u16>,
     server_mgr: ServerManagerWeakRef,
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
+    post_executor: Option<Arc<Mutex<ProcessChainLibExecutor>>>,
     tunnel_manager: TunnelManager,
 }
 
@@ -94,6 +101,7 @@ impl ProcessChainHttpServer {
             version: None,
             h3_port: None,
             hook_point: None,
+            post_hook_point: None,
             global_process_chains: None,
             server_mgr: None,
             tunnel_manager: None,
@@ -135,17 +143,37 @@ impl ProcessChainHttpServer {
             None => http::Version::HTTP_11,
         };
 
-        let (executor, _) = create_process_chain_executor(builder.hook_point.as_ref().unwrap(),
-                                                          builder.global_process_chains,
-                                                          builder.global_collection_manager,
-                                                          Some(get_external_commands(Arc::downgrade(&server_mgr_ref)))).await
+        let global_process_chains = builder.global_process_chains.clone();
+        let global_collection_manager = builder.global_collection_manager.clone();
+        let external_commands = Some(get_external_commands(Arc::downgrade(&server_mgr_ref)));
+        let (executor, _) = create_process_chain_executor(
+            builder.hook_point.as_ref().unwrap(),
+            global_process_chains.clone(),
+            global_collection_manager.clone(),
+            external_commands.clone(),
+        )
+        .await
+        .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
+        let post_executor = if let Some(post_hook_point) = builder.post_hook_point.as_ref() {
+            let (post_executor, _) = create_process_chain_executor(
+                post_hook_point,
+                global_process_chains,
+                global_collection_manager,
+                external_commands,
+            )
+            .await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
+            Some(Arc::new(Mutex::new(post_executor)))
+        } else {
+            None
+        };
         Ok(ProcessChainHttpServer {
             id: builder.id.unwrap(),
             version,
             h3_port: builder.h3_port,
             server_mgr,
             executor: Arc::new(Mutex::new(executor)),
+            post_executor,
             tunnel_manager: builder.tunnel_manager.unwrap(),
         })
     }
@@ -225,6 +253,54 @@ impl ProcessChainHttpServer {
             }
         }
     }
+
+    // Post-hook rules:
+    // - post_hook_point is optional; when absent, response is returned as-is.
+    // - RESP is a header-only map (no status/version keys).
+    // - Post chain control results are ignored; only header mutations are applied.
+    async fn apply_post_chain(
+        &self,
+        resp: http::Response<BoxBody<Bytes, ServerError>>,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let post_executor = match &self.post_executor {
+            Some(executor) => executor.lock().unwrap().fork(),
+            None => return Ok(resp),
+        };
+
+        let resp_map = HttpResponseHeaderMap::new(resp);
+        let global_env = post_executor.global_env();
+        resp_map
+            .register_visitors(&global_env)
+            .await
+            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+
+        let ret = post_executor
+            .execute_lib()
+            .await
+            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+        if ret.is_control() {
+            debug!(
+                "post_hook_point control result ignored hook_point={} final_value={:?}",
+                self.id,
+                ret.value(),
+            );
+        }
+
+        let resp = resp_map
+            .into_response()
+            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+        Ok(resp)
+    }
+
+    async fn apply_post_chain_result(
+        &self,
+        resp: ServerResult<http::Response<BoxBody<Bytes, ServerError>>>,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        match resp {
+            Ok(resp) => self.apply_post_chain(resp).await,
+            Err(err) => Err(err),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -243,12 +319,17 @@ impl HttpServer for ProcessChainHttpServer {
         if ret.is_control() {
             if ret.is_drop() {
                 debug!("Request dropped by the process chain");
-                return Ok(http::Response::new(Full::new(Bytes::from("Request dropped")).map_err(|e| match e {}).boxed()));
+                let response = http::Response::new(
+                    Full::new(Bytes::from("Request dropped"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                );
+                return self.apply_post_chain(response).await;
             } else if ret.is_reject() {
                 debug!("Request rejected by the process chain");
                 let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                 *response.status_mut() = StatusCode::FORBIDDEN;
-                return Ok(response);
+                return self.apply_post_chain(response).await;
             }
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
                 if let Some(list) = shlex::split(ret.value.as_str()) {
@@ -256,7 +337,7 @@ impl HttpServer for ProcessChainHttpServer {
                         log::error!("process chain return is empty");
                         let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                        return Ok(response);
+                        return self.apply_post_chain(response).await;
                     }
 
                     let cmd = list[0].as_str();
@@ -276,7 +357,7 @@ impl HttpServer for ProcessChainHttpServer {
                             if let Some(server_mgr) = self.server_mgr.upgrade() {
                                 if let Some(service) = server_mgr.get_http_server(server_id) {
                                     let resp = service.serve_request(post_req, info).await;
-                                    return resp;
+                                    return self.apply_post_chain_result(resp).await;
                                 }
                             } else {
                                 log::error!("server manager is unavailable");
@@ -293,7 +374,7 @@ impl HttpServer for ProcessChainHttpServer {
                             let post_req= req_map.into_request()
                                 .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
                             let resp = self.handle_forward_upstream(post_req, target_url).await;
-                            return resp;
+                            return self.apply_post_chain_result(resp).await;
                         },
                         _ => {
                             log::error!("unknown command: {}", cmd);
@@ -312,7 +393,7 @@ impl HttpServer for ProcessChainHttpServer {
         }
         let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        Ok(response)
+        self.apply_post_chain(response).await
     }
 
     fn id(&self) -> String {
@@ -338,6 +419,8 @@ pub struct ProcessChainHttpServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub h3_port: Option<u16>,
     pub hook_point: ProcessChainConfigs,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_hook_point: Option<ProcessChainConfigs>,
 }
 
 impl ServerConfig for ProcessChainHttpServerConfig {
@@ -427,6 +510,9 @@ impl ServerFactory for ProcessChainHttpServerFactory {
         if config.version.is_some() {
             builder = builder.version(config.version.clone().unwrap());
         }
+        if let Some(post_hook_point) = config.post_hook_point.as_ref() {
+            builder = builder.post_hook_point(post_hook_point.clone());
+        }
         let server = builder.build().await?;
         Ok(vec![Server::Http(Arc::new(server))])
     }
@@ -445,6 +531,7 @@ mod tests {
         let builder = ProcessChainHttpServer::builder();
         assert!(builder.version.is_none());
         assert!(builder.hook_point.is_none());
+        assert!(builder.post_hook_point.is_none());
         assert!(builder.global_process_chains.is_none());
         assert!(builder.server_mgr.is_none());
     }
@@ -557,6 +644,63 @@ mod tests {
         let resp = sender.send_request(request).await.unwrap();
         assert_eq!(resp.version(), Version::HTTP_11);
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_post_hook_point_adds_header() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        reject;
+        "#;
+        let post_chains = r#"
+- id: post
+  priority: 1
+  blocks:
+    - id: post
+      block: |
+        map-add RESP x-test "1";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+        let post_chains: ProcessChainConfigs = serde_yaml_ng::from_str(post_chains).unwrap();
+
+        let result = ProcessChainHttpServer::builder()
+            .id("1")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .post_hook_point(post_chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+        let http_server = Arc::new(result.unwrap());
+
+        let (client, server) = tokio::io::duplex(128);
+
+        tokio::spawn(async move {
+            hyper_serve_http1(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new().handshake(TokioIo::new(client)).await.unwrap();
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.headers().get("x-test").unwrap(), "1");
     }
 
     #[tokio::test]
@@ -923,6 +1067,7 @@ mod tests {
             version: None,
             h3_port: None,
             hook_point: ProcessChainConfigs::default(),
+            post_hook_point: None,
         };
         let server_mgr = Arc::new(ServerManager::new());
         let context = HttpServerContext::new(

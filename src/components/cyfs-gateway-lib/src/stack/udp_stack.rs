@@ -1481,14 +1481,14 @@ mod tests {
             .bind("0.0.0.0:8932")
             .hook_point(chains)
             .session_idle_time(Duration::from_secs(5))
-            .transparent(true)
+            .transparent(false)
             .stack_context(stack_context)
             .build()
             .await;
         assert!(result.is_ok());
         let stack = result.unwrap();
         let result = stack.start().await;
-        result.unwrap();
+        assert!(result.is_ok());
 
         tokio::spawn(async move {
             let udp_socket = UdpSocket::bind("127.0.0.1:8933").await.unwrap();

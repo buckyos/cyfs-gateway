@@ -459,6 +459,203 @@ impl MapCollection for HttpRequestHeaderMap {
     }
 }
 
+#[derive(Clone)]
+pub struct HttpResponseHeaderMap {
+    response: Arc<RwLock<http::Response<BoxBody<Bytes, ServerError>>>>,
+    transverse_counter: Arc<AtomicU32>,
+}
+
+impl HttpResponseHeaderMap {
+    pub fn new(response: http::Response<BoxBody<Bytes, ServerError>>) -> Self {
+        Self {
+            response: Arc::new(RwLock::new(response)),
+            transverse_counter: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn is_during_traversal(&self) -> bool {
+        self.transverse_counter
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+    }
+
+    pub fn into_response(self) -> Result<http::Response<BoxBody<Bytes, ServerError>>, String> {
+        let resp = Arc::try_unwrap(self.response)
+            .map_err(|_| {
+                let msg = "Failed to unwrap HttpResponseHeaderMap".to_string();
+                error!("{}", msg);
+                msg
+            })?
+            .into_inner();
+
+        Ok(resp)
+    }
+
+    pub async fn register_visitors(&self, env: &EnvRef) -> Result<(), String> {
+        let coll = Arc::new(Box::new(self.clone()) as Box<dyn MapCollection>);
+        env.create("RESP", CollectionValue::Map(coll)).await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl MapCollection for HttpResponseHeaderMap {
+    async fn len(&self) -> Result<usize, String> {
+        let response = self.response.read().await;
+        Ok(response.headers().len())
+    }
+
+    async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot insert new header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let mut response = self.response.write().await;
+        let header = value.try_as_str()?.parse().map_err(|e| {
+            let msg = format!("Invalid header value '{}': {}", value, e);
+            warn!("{}", msg);
+            msg
+        })?;
+
+        let name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
+            let msg = format!("Invalid header name '{}': {}", key, e);
+            warn!("{}", msg);
+            msg.to_string()
+        })?;
+
+        if response.headers().contains_key(&name) {
+            let msg = format!("Header '{}' already exists", key);
+            warn!("{}", msg);
+            return Ok(false);
+        }
+
+        response.headers_mut().insert(name, header);
+        Ok(true)
+    }
+
+    async fn insert(
+        &self,
+        key: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot insert header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let mut response = self.response.write().await;
+        let header = value.try_as_str()?.parse().map_err(|e| {
+            let msg = format!("Invalid header value '{}': {}", value, e);
+            warn!("{}", msg);
+            msg
+        })?;
+
+        let name = HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
+            let msg = format!("Invalid header name '{}': {}", key, e);
+            warn!("{}", msg);
+            msg.to_string()
+        })?;
+
+        let prev = response.headers_mut().insert(name, header);
+        if let Some(prev_value) = prev {
+            let prev = match prev_value.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    let msg = format!("Header value for '{}' is not valid UTF-8", key);
+                    warn!("{}", msg);
+                    "".to_string()
+                }
+            };
+            Ok(Some(CollectionValue::String(prev)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        let response = self.response.read().await;
+        let ret = response.headers().get(key);
+        if let Some(value) = ret {
+            if let Ok(value_str) = value.to_str() {
+                Ok(Some(CollectionValue::String(value_str.to_string())))
+            } else {
+                warn!("Header value for '{}' is not valid UTF-8", key);
+                Ok(Some(CollectionValue::String("".to_string())))
+            }
+        } else {
+            warn!("Header '{}' not found", key);
+            Ok(None)
+        }
+    }
+
+    async fn contains_key(&self, key: &str) -> Result<bool, String> {
+        let response = self.response.read().await;
+        Ok(response.headers().get(key).is_some())
+    }
+
+    async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot remove header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let mut response = self.response.write().await;
+        let prev = response.headers_mut().remove(key);
+        if let Some(prev_value) = prev {
+            let prev = match prev_value.to_str() {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    let msg = format!("Header value for '{}' is not valid UTF-8", key);
+                    warn!("{}", msg);
+                    "".to_string()
+                }
+            };
+            Ok(Some(CollectionValue::String(prev)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String> {
+        let _guard = TraverseGuard::new(&self.transverse_counter);
+
+        let response = self.response.read().await;
+        for (key, value) in response.headers().iter() {
+            if let Ok(value_str) = value.to_str() {
+                if !callback
+                    .call(key.as_str(), &CollectionValue::String(value_str.to_owned()))
+                    .await?
+                {
+                    break;
+                }
+            } else {
+                warn!("Header value for '{}' is not valid UTF-8", key);
+            }
+        }
+        Ok(())
+    }
+
+    async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
+        let response = self.response.read().await;
+        let mut result = Vec::new();
+        for (key, value) in response.headers().iter() {
+            if let Ok(value_str) = value.to_str() {
+                result.push((
+                    key.as_str().to_string(),
+                    CollectionValue::String(value_str.to_string()),
+                ));
+            } else {
+                warn!("Header value for '{}' is not valid UTF-8", key);
+            }
+        }
+        Ok(result)
+    }
+}
+
 // Url visitor for HTTP requests
 #[derive(Clone)]
 pub struct HttpRequestUrlVisitor {

@@ -82,6 +82,7 @@ mod tests {
             assert_eq!(response.status(), hyper::StatusCode::OK);
             assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
             assert_eq!(response.headers().get("content-length").unwrap(), format!("{}", "web3.buckyos.com".len()).as_str());
+            assert_eq!(response.headers().get("x-test").unwrap(), "1");
             let body = response.into_body();
             let data = body.collect().await.unwrap();
             assert_eq!(data.to_bytes().as_ref(), b"web3.buckyos.com");
@@ -94,6 +95,7 @@ mod tests {
             let response = sender.send_request(request).await.unwrap();
             assert_eq!(response.status(), hyper::StatusCode::OK);
             assert_eq!(response.headers().get("content-length").unwrap(), format!("{}", "test".len()).as_str());
+            assert_eq!(response.headers().get("x-test").unwrap(), "1");
             let body = response.into_body();
             let data = body.collect().await.unwrap();
             assert_eq!(data.to_bytes().as_ref(), b"test");

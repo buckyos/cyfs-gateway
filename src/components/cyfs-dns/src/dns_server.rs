@@ -358,7 +358,7 @@ impl ProcessChainDnsServer {
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
                 if let Some(list) = shlex::split(ret.value.as_str()) {
                     if list.is_empty() {
-                        let resp = chain_env.get("RESP").await.map_err(
+                        let resp = chain_env.get("RESOLVE_RESP").await.map_err(
                             |e| server_err!(ServerErrorCode::ProcessChainError, "{e}")
                         )?;
                         if let Some(resp) = resp {

@@ -102,6 +102,14 @@ servers:
             priority: 2
             block: |
               call-server web3_dir;
+    post_hook_point:
+      main:
+        priority: 0
+        blocks:
+          default:
+            priority: 1
+            block: |
+              map-add RESP x-test "1";
 
   www.buckyos.com:
     type: http
