@@ -158,7 +158,11 @@ mod test {
         let normalized = normalize_path(path);
         // Should remove the current directory reference
         let normalized_str = normalized.to_string_lossy().to_string();
-        assert_eq!(normalized_str, "windows\\style\\path");
+        if cfg!(windows) {
+            assert_eq!(normalized_str, "windows\\style\\path");
+        } else {
+            assert_eq!(normalized_str, "./windows\\style\\path");
+        }
 
         // Test Windows-style path
         let path = Path::new("C:\\windows\\.\\style\\path");

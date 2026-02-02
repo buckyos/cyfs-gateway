@@ -197,14 +197,24 @@ async fn run_gateway_with_config(
 fn get_config_file_path(matches: &clap::ArgMatches) -> PathBuf {
     let default_config = get_default_config_path();
     let config_file = matches.get_one::<String>("config_file");
-    let real_config_file;
-    if config_file.is_none() {
-        real_config_file = default_config;
+    let requested_path = if config_file.is_none() {
+        default_config
     } else {
-        real_config_file = PathBuf::from(config_file.unwrap());
-    }
-    let real_config_file = real_config_file.canonicalize().unwrap();
-    set_gateway_main_config_dir(&real_config_file);
+        PathBuf::from(config_file.unwrap())
+    };
+    let base_dir = std::env::current_dir().unwrap_or(PathBuf::new());
+    let resolved_path = if requested_path.is_relative() {
+        base_dir.join(requested_path)
+    } else {
+        requested_path
+    };
+    let real_config_file = resolved_path.canonicalize().unwrap_or(resolved_path);
+    let config_dir = if real_config_file.is_dir() {
+        real_config_file.clone()
+    } else {
+        real_config_file.parent().unwrap_or(base_dir.as_path()).to_path_buf()
+    };
+    set_gateway_main_config_dir(&config_dir);
     real_config_file
 }
 

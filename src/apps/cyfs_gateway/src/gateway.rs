@@ -54,7 +54,7 @@ pub fn get_default_config_path() -> PathBuf {
     if !default_config.exists() {
         default_config = get_buckyos_system_etc_dir().join("cyfs_gateway.json");
     }
-    default_config.canonicalize().unwrap()
+    default_config.canonicalize().unwrap_or(default_config)
 }
 
 fn strip_includes_field(mut config: Value) -> Value {
