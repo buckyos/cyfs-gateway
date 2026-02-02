@@ -369,23 +369,6 @@ impl ServerConfig for DirServerConfig {
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
     }
-
-    fn add_pre_hook_point_process_chain(&self, _process_chain: crate::ProcessChainConfig) -> Arc<dyn ServerConfig> {
-        // DirServer doesn't support process chains
-        Arc::new(self.clone())
-    }
-
-    fn remove_pre_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
-    }
-
-    fn add_post_hook_point_process_chain(&self, _process_chain: crate::ProcessChainConfig) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
-    }
-
-    fn remove_post_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
-    }
 }
 
 /// Factory for creating DirServer instances

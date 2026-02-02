@@ -8,7 +8,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor};
-use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpServer, ProcessChainConfig, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager};
+use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpServer, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err,into_server_err};
 use crate::tunnel_connector::TunnelConnector;
@@ -351,28 +351,6 @@ impl ServerConfig for ProcessChainHttpServerConfig {
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
-    }
-
-    fn add_pre_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
-        let mut config = self.clone();
-        config.hook_point.push(process_chain);
-        Arc::new(config)
-    }
-
-    fn remove_pre_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig> {
-        let mut config = self.clone();
-        config.hook_point.retain(|chain| chain.id != process_chain_id);
-        Arc::new(config)
-    }
-
-    fn add_post_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
-        let config = self.clone();
-        Arc::new(config)
-    }
-
-    fn remove_post_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
-        let config = self.clone();
-        Arc::new(config)
     }
 }
 

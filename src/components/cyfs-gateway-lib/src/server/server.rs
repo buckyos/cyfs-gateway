@@ -14,16 +14,12 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::RwLock;
 use cyfs_process_chain::{CollectionValue, EnvRef, MapCollection, MapCollectionTraverseCallBackRef, TraverseGuard, VariableVisitor, VariableVisitorWrapperForMapCollection, HTTP_REQUEST_HEADER_VARS};
 use crate::server::dns_server::NameServer;
-use crate::{server_err, ProcessChainConfig, ServerError, ServerErrorCode, ServerResult, QAServer};
+use crate::{server_err, ServerError, ServerErrorCode, ServerResult, QAServer};
 
 pub trait ServerConfig: AsAny + Send + Sync {
     fn id(&self) -> String;
     fn server_type(&self) -> String;
     fn get_config_json(&self) -> String;
-    fn add_pre_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig>;
-    fn remove_pre_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig>;
-    fn add_post_hook_point_process_chain(&self, process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig>;
-    fn remove_post_hook_point_process_chain(&self, process_chain_id: &str) -> Arc<dyn ServerConfig>;
 }
 
 pub trait ServerContext: AsAny + Send + Sync {

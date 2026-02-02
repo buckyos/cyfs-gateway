@@ -1,7 +1,7 @@
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
-use cyfs_gateway_lib::{NameServer, ProcessChainConfig, Server, ServerConfig, ServerContext, ServerContextRef, ServerFactory};
+use cyfs_gateway_lib::{NameServer, Server, ServerConfig, ServerContext, ServerContextRef, ServerFactory};
 use name_client::{LocalConfigDnsProvider, NameInfo, NsProvider, RecordType};
 use name_lib::{EncodedDocument, DID};
 use serde::{Deserialize, Serialize};
@@ -58,22 +58,6 @@ impl ServerConfig for LocalDnsConfig {
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
-    }
-
-    fn add_pre_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
-    }
-
-    fn remove_pre_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
-    }
-    
-    fn add_post_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
-    }
-
-    fn remove_post_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
     }
 }
 

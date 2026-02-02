@@ -1,7 +1,7 @@
 use http::{Request, Response, Version, StatusCode};
 use http_body_util::combinators::BoxBody;
 use hyper::body::Bytes;
-use crate::{server_err, AcmeCertManagerRef, HttpServer, ProcessChainConfig, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
+use crate::{server_err, AcmeCertManagerRef, HttpServer, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
 use std::sync::Arc;
 use http_body_util::{BodyExt, Full};
 use serde::{Deserialize, Serialize};
@@ -90,22 +90,6 @@ impl ServerConfig for AcmeHttpChallengeServerConfig {
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
-    }
-
-    fn add_pre_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
-    }
-
-    fn remove_pre_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
-    }
-
-    fn add_post_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
-    }
-
-    fn remove_post_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
     }
 }
 

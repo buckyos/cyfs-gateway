@@ -4,7 +4,7 @@ use ::kRPC::*;
 use async_trait::async_trait;
 use cyfs_gateway_lib::{into_server_err, server_err};
 use cyfs_gateway_lib::{
-    qa_json_to_rpc_request, HttpServer, NameServer, ProcessChainConfig, QAServer, Server,
+    qa_json_to_rpc_request, HttpServer, NameServer, QAServer, Server,
     ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo,
 };
 use http::{Method, Response, StatusCode};
@@ -2732,34 +2732,6 @@ impl ServerConfig for SNServerConfig {
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
-    }
-
-    fn add_pre_hook_point_process_chain(
-        &self,
-        _process_chain: ProcessChainConfig,
-    ) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
-    }
-
-    fn remove_pre_hook_point_process_chain(
-        &self,
-        _process_chain_id: &str,
-    ) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
-    }
-
-    fn add_post_hook_point_process_chain(
-        &self,
-        _process_chain: ProcessChainConfig,
-    ) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
-    }
-
-    fn remove_post_hook_point_process_chain(
-        &self,
-        _process_chain_id: &str,
-    ) -> Arc<dyn ServerConfig> {
-        Arc::new(self.clone())
     }
 }
 

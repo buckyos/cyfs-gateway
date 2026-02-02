@@ -1390,6 +1390,7 @@ impl StackFactory for UdpStackFactory {
 mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use buckyos_kit::init_logging;
     use tokio::net::UdpSocket;
     use crate::{ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager, GlobalCollectionManagerRef, LimiterManagerRef, ProcessChainConfigs, Server, ServerManager, ServerManagerRef, ServerResult, Stack, StackFactory, StackProtocol, StatManager, StatManagerRef, TunnelManager, UdpStack, UdpStackConfig, UdpStackContext, UdpStackFactory};
     use crate::global_process_chains::{GlobalProcessChains, GlobalProcessChainsRef};
@@ -1468,6 +1469,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_udp_stack_forward() {
+        init_logging("test", false);
         let chains = r#"
 - id: main
   priority: 1
@@ -1499,8 +1501,7 @@ mod tests {
         assert!(result.is_ok());
         let stack = result.unwrap();
         let result = stack.start().await;
-        assert!(result.is_ok());
-
+        result.unwrap();
 
         tokio::spawn(async move {
             let udp_socket = UdpSocket::bind("127.0.0.1:8933").await.unwrap();

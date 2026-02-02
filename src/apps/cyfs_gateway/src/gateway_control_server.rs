@@ -5,7 +5,7 @@ use std::sync::{Arc, Weak};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, ProcessChainConfig, Server, ServerConfig, StreamInfo, config_err, ServerError};
+use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, Server, ServerConfig, StreamInfo, config_err, ServerError};
 use cyfs_gateway_lib::{ServerContext, ServerContextRef, ServerFactory, HttpServer};
 use crate::config_loader::{ServerConfigParser};
 use crate::gateway_control_client::cmd_err;
@@ -56,22 +56,6 @@ impl ServerConfig for GatewayControlServerConfig {
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
-    }
-
-    fn add_pre_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
-        unimplemented!();
-    }
-
-    fn remove_pre_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
-        unimplemented!();
-    }
-
-    fn add_post_hook_point_process_chain(&self, _process_chain: ProcessChainConfig) -> Arc<dyn ServerConfig> {
-        unimplemented!();
-    }
-
-    fn remove_post_hook_point_process_chain(&self, _process_chain_id: &str) -> Arc<dyn ServerConfig> {
-        unimplemented!();
     }
 }
 
