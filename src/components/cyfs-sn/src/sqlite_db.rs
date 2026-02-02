@@ -44,6 +44,10 @@ impl SqliteSnDB {
             .map_err(into_sn_err!(SnErrorCode::DBError, "create unique index on user_dns_records failed"))?;
         conn.execute_sql(sql_query("CREATE INDEX IF NOT EXISTS user_dns_records_domain_index ON user_dns_records (domain, id)")).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create user_dns_records_domain_index failed"))?;
+        conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS did_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, obj_id TEXT, owner_user TEXT, obj_name TEXT, did_document TEXT, doc_type TEXT, update_time INTEGER)")).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "create did_documents table failed"))?;
+        conn.execute_sql(sql_query("CREATE INDEX IF NOT EXISTS idx_did_documents_owner_obj ON did_documents (owner_user, obj_name, update_time)")).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "create did_documents index failed"))?;
         Ok(())
     }
 }
@@ -572,6 +576,65 @@ impl SnDB for SqliteSnDB {
             .bind(username)).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "query user dns records failed"))?;
         Ok(rows.into_iter().map(|row| (row.get(0), row.get(1), row.get(2), row.get::<i64, _>(3) as u32)).collect())
+    }
+
+    async fn insert_user_did_document(
+        &self,
+        obj_id: &str,
+        owner_user: &str,
+        obj_name: &str,
+        did_document: &str,
+        doc_type: Option<&str>,
+    ) -> SnResult<()> {
+        let mut conn = self.pool.get_conn().await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        conn.execute_sql(sql_query("INSERT INTO did_documents (obj_id, owner_user, obj_name, did_document, doc_type, update_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+            .bind(obj_id)
+            .bind(owner_user)
+            .bind(obj_name)
+            .bind(did_document)
+            .bind(doc_type)
+            .bind(now as i64)).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "insert did document failed"))?;
+        Ok(())
+    }
+
+    async fn query_user_did_document(
+        &self,
+        owner_user: &str,
+        obj_name: &str,
+        doc_type: Option<&str>,
+    ) -> SnResult<Option<(String, String, Option<String>)>> {
+        let mut conn = self.pool.get_conn().await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        let rows = if let Some(doc_type) = doc_type {
+            conn.query_all(sql_query("SELECT obj_id, did_document, doc_type FROM did_documents WHERE owner_user = ?1 AND obj_name = ?2 AND doc_type = ?3 ORDER BY update_time DESC LIMIT 1")
+                .bind(owner_user)
+                .bind(obj_name)
+                .bind(doc_type)).await
+        } else {
+            conn.query_all(sql_query("SELECT obj_id, did_document, doc_type FROM did_documents WHERE owner_user = ?1 AND obj_name = ?2 ORDER BY update_time DESC LIMIT 1")
+                .bind(owner_user)
+                .bind(obj_name)).await
+        };
+
+        match rows {
+            Ok(mut rows) => {
+                if let Some(row) = rows.pop() {
+                    Ok(Some((row.get(0), row.get(1), row.get(2))))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(_) => Ok(None),
+        }
     }
 }
 

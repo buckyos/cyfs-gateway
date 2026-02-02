@@ -16,6 +16,7 @@ use lazy_static::lazy_static;
 use log::*;
 use name_client::*;
 use name_lib::*;
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -1272,6 +1273,118 @@ impl SNServer {
         ))
     }
 
+    async fn set_user_did_document(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
+        // set_user_did_document(owner_user:String,obj_name:String,did_document:JSON,doc_type:String)
+        let session_token = req.token.clone().ok_or_else(|| {
+            RPCErrors::ParseRequestError("Invalid params, session_token is none".to_string())
+        })?;
+        let mut rpc_session_token = RPCSessionToken::from_string(session_token.as_str())?;
+
+        let owner_user = req
+            .params
+            .get("owner_user")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                RPCErrors::ParseRequestError("Invalid params, owner_user is none".to_string())
+            })?;
+        if owner_user.trim().is_empty() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, owner_user is empty".to_string(),
+            ));
+        }
+
+        let obj_name = req
+            .params
+            .get("obj_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                RPCErrors::ParseRequestError("Invalid params, obj_name is none".to_string())
+            })?;
+        if obj_name.trim().is_empty() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, obj_name is empty".to_string(),
+            ));
+        }
+
+        let doc_type = req
+            .params
+            .get("doc_type")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        // Allow empty document; stringify to keep stored JSON text.
+        let did_document_str = req
+            .params
+            .get("did_document")
+            .map(|v| v.to_string())
+            .unwrap_or_else(String::new);
+
+        let user_public_key = self
+            .get_user_public_key(owner_user)
+            .await
+            .ok_or_else(|| RPCErrors::ParseRequestError("user not found".to_string()))?;
+        let user_public_key: jsonwebtoken::jwk::Jwk =
+            serde_json::from_str(user_public_key.as_str()).map_err(|e| {
+                error!("Failed to parse user public key: {:?}", e);
+                RPCErrors::ParseRequestError(e.to_string())
+            })?;
+
+        let verify_public_key = DecodingKey::from_jwk(&user_public_key).map_err(|e| {
+            error!("Failed to decode user public key: {:?}", e);
+            RPCErrors::ParseRequestError(e.to_string())
+        })?;
+
+        rpc_session_token.verify_by_key(&verify_public_key)?;
+        match rpc_session_token.sub.as_deref() {
+            Some(sub) if sub == owner_user => {}
+            Some(_) => {
+                return Err(RPCErrors::ParseRequestError(
+                    "token user mismatch".to_string(),
+                ))
+            }
+            None => {
+                return Err(RPCErrors::ParseRequestError(
+                    "Invalid token: sub is none".to_string(),
+                ))
+            }
+        }
+        
+        let mut hasher = Sha256::new();
+        hasher.update(did_document_str.as_bytes());
+        let obj_id = hex::encode(hasher.finalize());
+
+        let ret = self
+            .db
+            .insert_user_did_document(
+                obj_id.as_str(),
+                owner_user,
+                obj_name,
+                did_document_str.as_str(),
+                doc_type.as_deref(),
+            )
+            .await;
+        if let Err(e) = ret {
+            let err_str = e.to_string();
+            warn!(
+                "Failed to insert did document owner={}, obj_name={}, err={}",
+                owner_user, obj_name, err_str
+            );
+            return Err(RPCErrors::ReasonError(err_str));
+        }
+
+        info!(
+            "set_user_did_document success: owner={}, obj_name={}, obj_id={}, doc_type={:?}",
+            owner_user, obj_name, obj_id, doc_type
+        );
+
+        Ok(RPCResponse::create_by_req(
+            RPCResult::Success(json!({ "code": 0, "obj_id": obj_id })),
+            &req,
+        ))
+    }
+
     async fn handle_rpc_call(
         &self,
         req: RPCRequest,
@@ -1302,10 +1415,12 @@ impl SNServer {
                 return self.set_user_self_cert(req).await;
             }
             "set_user_did_document" => {
-                //update user did document : did:bns.$name.$user_name + doc_type,后续可以在query_did_document中查询到
-                // set_user_did_document(name:String,document:String,doc_type:String) ,如果document为空，则删除对应的document
+                //set_user_did_document(owner_user:String,obj_name:String,did_document:JSON,doc_type:String)
+                // 保存在数据库中记录为  obj_id(did_document计算得到),owner_user,obj_name,did_document,doc_type(可以为空),update_time
+                // 设置成功可以在query_did_document中查询到（查询update_time最新的一条记录）,did是 did:bns:obj_name.user_name
+                // 如果document为空，则插入一条did_document为空的记录。数据库不删除记录，保存所有曾经设置过的did_document,给用户提供一定的回滚能力
                 // 需要有用户的签名才可以更新用户的did document
-                unimplemented!();
+                return self.set_user_did_document(req).await;
             }
             "register" => {
                 //register device
@@ -2203,7 +2318,7 @@ impl NameServer for SNServer {
             "bns" => {
                 let id = did.id.as_str();
 
-                if let Some((device_name, tail)) = id.split_once('.') {
+                if let Some((obj_name, tail)) = id.split_once('.') {
                     let username = if tail.contains('.') {
                         let user_info = self.resolve_user_by_domain(tail).await?;
                         user_info.username.clone().ok_or(server_err!(
@@ -2216,29 +2331,70 @@ impl NameServer for SNServer {
                     };
 
                     // did:bns:$device_name.$username
-                    let device = self.resolve_device_by_name(username.as_str(), device_name).await?;
-                    match doc_type.unwrap_or("doc") {
-                        "doc" => {
-                            let user = self.resolve_user_by_username(username.as_str()).await?;
-                            let v = Self::device_config_from_mini_jwt(
-                                device.mini_config_jwt.as_str(),
-                                user.public_key.as_str(),
-                                username.as_str(),
-                            )
-                            .map_err(|msg| server_err!(ServerErrorCode::InvalidParam, "{}", msg))?;
-                            Ok(EncodedDocument::JsonLd(v))
+                    match self.resolve_device_by_name(username.as_str(), obj_name).await {
+                        Ok(device) => match doc_type.unwrap_or("doc") {
+                            "doc" => {
+                                let user = self.resolve_user_by_username(username.as_str()).await?;
+                                let v = Self::device_config_from_mini_jwt(
+                                    device.mini_config_jwt.as_str(),
+                                    user.public_key.as_str(),
+                                    username.as_str(),
+                                )
+                                .map_err(|msg| server_err!(ServerErrorCode::InvalidParam, "{}", msg))?;
+                                Ok(EncodedDocument::JsonLd(v))
+                            }
+                            "info" => {
+                                let v = Self::build_device_info_json(&device);
+                                Ok(EncodedDocument::JsonLd(v))
+                            }
+                            other => Err(server_err!(
+                                ServerErrorCode::InvalidParam,
+                                "unsupported doc_type {} for did:bns:{}.{}",
+                                other,
+                                obj_name,
+                                username
+                            )),
+                        },
+                        Err(e) if e.code() == ServerErrorCode::NotFound => {
+                            // Not a device: fallback to user-defined did_document stored in DB.
+                            let latest_doc = self
+                                .db
+                                .query_user_did_document(username.as_str(), obj_name, doc_type)
+                                .await
+                                .map_err(|err| {
+                                    server_err!(
+                                        ServerErrorCode::ProcessChainError,
+                                        "query did document failed: {}",
+                                        err
+                                    )
+                                })?;
+
+                            if let Some((_obj_id, did_doc_str, _stored_type)) = latest_doc {
+                                // Empty string is allowed and should return JSON null.
+                                let v = if did_doc_str.trim().is_empty() {
+                                    Value::Null
+                                } else {
+                                    serde_json::from_str::<Value>(did_doc_str.as_str()).map_err(
+                                        |e| {
+                                            server_err!(
+                                                ServerErrorCode::InvalidParam,
+                                                "invalid did_document json: {}",
+                                                e
+                                            )
+                                        },
+                                    )?
+                                };
+                                Ok(EncodedDocument::JsonLd(v))
+                            } else {
+                                Err(server_err!(
+                                    ServerErrorCode::NotFound,
+                                    "did document not found for did:bns:{}.{}",
+                                    obj_name,
+                                    username
+                                ))
+                            }
                         }
-                        "info" => {
-                            let v = Self::build_device_info_json(&device);
-                            Ok(EncodedDocument::JsonLd(v))
-                        }
-                        other => Err(server_err!(
-                            ServerErrorCode::InvalidParam,
-                            "unsupported doc_type {} for did:bns:{}.{}",
-                            other,
-                            device_name,
-                            username
-                        )),
+                        Err(e) => Err(e),
                     }
                 } else {
                     // did:bns:$username

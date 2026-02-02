@@ -142,5 +142,19 @@ pub trait SnDB: Send + Sync + 'static {
     async fn query_domain_record(&self, domain: &str, record_type: &str) -> SnResult<Option<(String, u32)>>;
     async fn query_domain_records(&self, domain: &str) -> SnResult<Vec<(String, String, u32)>>;
     async fn query_user_domain_records(&self, username: &str) -> SnResult<Vec<(String, String, String, u32)>>;
+    async fn insert_user_did_document(
+        &self,
+        obj_id: &str,
+        owner_user: &str,
+        obj_name: &str,
+        did_document: &str,
+        doc_type: Option<&str>,
+    ) -> SnResult<()>;
+    async fn query_user_did_document(
+        &self,
+        owner_user: &str,
+        obj_name: &str,
+        doc_type: Option<&str>,
+    ) -> SnResult<Option<(String, String, Option<String>)>>;
 }
 pub type SnDBRef = std::sync::Arc<dyn SnDB>;

@@ -21,6 +21,8 @@ http.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 buckyos-kit.workspace = true
 kRPC.workspace = true
