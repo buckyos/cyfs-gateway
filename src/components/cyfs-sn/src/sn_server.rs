@@ -2895,8 +2895,9 @@ mod tests {
         let zone_boot_config: ZoneBootConfig = serde_json::from_value(zone_boot_config).unwrap();
         let zone_jwt = zone_boot_config.encode(Some(&user_encoding_key)).unwrap().to_string();
 
-        let (user_token, user_session) = RPCSessionToken::generate_jwt_token("test", "active_service", None, &user_encoding_key).unwrap();
-
+        let (user_token, mut user_session) = RPCSessionToken::generate_jwt_token("test", "active_service", None, &user_encoding_key).unwrap();
+        user_session.aud = Some("sn".to_string());
+        let user_token = user_session.generate_jwt(None, &user_encoding_key).unwrap().to_string();
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
@@ -2906,9 +2907,11 @@ mod tests {
 
         let encoding_key = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes.as_slice());
         // device signed token: userid is device_name (e.g. "ood1")
-        let (token, session) =
+        let (token, mut session) =
             RPCSessionToken::generate_jwt_token("ood1", "cyfs_gateway", None, &encoding_key)
                 .unwrap();
+        session.aud = Some("sn".to_string());
+        let token = session.generate_jwt(None, &encoding_key).unwrap().to_string();
 
         // token and user_token are used by different flows below:
         // - token: used for cyfs_gateway (should NOT be allowed to register device)
@@ -2919,8 +2922,9 @@ mod tests {
         let device_config2 = DeviceConfig::new_by_jwk("ood2", serde_json::from_value(jwk2).unwrap());
 
         let encoding_key2 = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes2.as_slice());
-        let (token2, session2) = RPCSessionToken::generate_jwt_token("test", "cyfs_gateway", None, &encoding_key2).unwrap();
-
+        let (token2, mut session2) = RPCSessionToken::generate_jwt_token("test", "cyfs_gateway", None, &encoding_key2).unwrap();
+        session2.aud = Some("sn".to_string());
+        let token2 = session2.generate_jwt(None, &encoding_key2).unwrap().to_string();
 
 
         let mut sn_factory = SnServerFactory::new();
