@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use http::{Version};
 use http_body_util::combinators::{BoxBody};
@@ -7,7 +8,7 @@ use hyper::{http, StatusCode, Request};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
-use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor};
+use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
 use regex::Regex;
 use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpResponseHeaderMap, HttpServer, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
@@ -369,6 +370,24 @@ impl HttpServer for ProcessChainHttpServer {
 
         let req_map = HttpRequestHeaderMap::new(req);
         let global_env = executor.global_env();
+        if let Some(src_addr) = info.src_addr.as_ref() {
+            if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
+                global_env
+                    .create(
+                        "REQ_remote_ip",
+                        CollectionValue::String(socket_addr.ip().to_string()),
+                    )
+                    .await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                global_env
+                    .create(
+                        "REQ_remote_port",
+                        CollectionValue::String(socket_addr.port().to_string()),
+                    )
+                    .await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+            }
+        }
         req_map.register_visitors(&global_env).await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
         let ret = executor.execute_lib().await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
@@ -1740,6 +1759,10 @@ mod tests {
                 let (stream, _) = listener.accept().await.unwrap();
                 let service = hyper::service::service_fn(|req: http::Request<hyper::body::Incoming>| async move {
                     println!("{:?}", req.headers());
+                    assert!(req.headers().get("X-Real-IP").is_some());
+                    assert_eq!(req.headers().get("X-Real-IP").map(|v| v.to_str().unwrap()), Some("127.0.0.1"));
+                    assert!(req.headers().get("X-Real-Port").is_some());
+                    assert_eq!(req.headers().get("X-Real-Port").map(|v| v.to_str().unwrap()), Some("344"));
                     let _ = req.collect().await; // 消费请求体
                     Ok::<_, ServerError>(http::Response::builder()
                         .status(StatusCode::OK)
@@ -1765,7 +1788,7 @@ mod tests {
   blocks:
     - id: main
       block: |
-        forward http://127.0.0.1:18090;
+        map-add REQ X-Real-IP $REQ_remote_ip && map-add REQ X-Real-Port $REQ_remote_port && forward http://127.0.0.1:18090;
         "#;
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
@@ -1785,7 +1808,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo {
+                src_addr: Some("127.0.0.1:344".to_string()),
+            }).await.unwrap();
         });
 
         let request = http::Request::builder()
