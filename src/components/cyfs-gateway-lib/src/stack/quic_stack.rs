@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, IntoRawFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use std::future::poll_fn;
@@ -1045,6 +1049,7 @@ struct QuicStackInner {
     concurrency: u32,
     certs: Arc<dyn ResolvesServerCert>,
     alpn_protocols: Vec<Vec<u8>>,
+    reuse_address: bool,
     connection_manager: Option<ConnectionManagerRef>,
     handler: Arc<RwLock<Arc<QuicConnectionHandler>>>,
 }
@@ -1064,13 +1069,42 @@ impl QuicStackInner {
             Arc::new(QuicServerConfig::try_from(server_config)
 
                 .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?));
-        let endpoint = quinn::Endpoint::server(server_config,
-                                               self.bind_addr.parse()
-                                                   .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?)
-            .map_err(|e| {
-                println!("{}", e);
-                into_stack_err!(StackErrorCode::InvalidConfig)(e)
-            })?;
+        let addr: SocketAddr = self.bind_addr.parse()
+            .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
+        let sockaddr: socket2::SockAddr = addr.into();
+        let domain = match addr {
+            std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
+            std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+            .map_err(into_stack_err!(StackErrorCode::IoError, "create socket error"))?;
+        socket.set_nonblocking(true)
+            .map_err(into_stack_err!(StackErrorCode::IoError, "set nonblocking error"))?;
+        #[cfg(target_os = "linux")]
+        {
+            if self.reuse_address {
+                socket.set_reuse_address(true)
+                    .map_err(into_stack_err!(StackErrorCode::IoError, "set reuse address error"))?;
+            }
+        }
+        socket.bind(&sockaddr)
+            .map_err(into_stack_err!(StackErrorCode::BindFailed, "bind {} error", self.bind_addr))?;
+        #[cfg(unix)]
+        let socket = unsafe {
+            std::net::UdpSocket::from_raw_fd(socket.into_raw_fd())
+        };
+        #[cfg(windows)]
+        let socket = unsafe {
+            std::net::UdpSocket::from_raw_socket(socket.into_raw_socket())
+        };
+        let runtime = quinn::default_runtime()
+            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "no async runtime found"))?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        ).map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
 
         let this = self.clone();
         let handle = tokio::spawn(async move {
@@ -1160,6 +1194,7 @@ impl QuicStack {
                 concurrency: builder.concurrency,
                 certs,
                 alpn_protocols: builder.alpn_protocols,
+                reuse_address: builder.reuse_address,
                 connection_manager: builder.connection_manager.clone(),
                 handler,
             }),
@@ -1206,6 +1241,10 @@ impl Stack for QuicStack {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
+        if config.reuse_address.unwrap_or(false) != self.inner.reuse_address {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "reuse_address unmatch"));
+        }
+
         let env = match context {
             Some(context) => {
                 let quic_context = context.as_ref().as_any().downcast_ref::<QuicStackContext>()
@@ -1242,6 +1281,7 @@ pub struct QuicStackBuilder {
     certs: Vec<TlsDomainConfig>,
     alpn_protocols: Vec<Vec<u8>>,
     concurrency: u32,
+    reuse_address: bool,
     connection_manager: Option<ConnectionManagerRef>,
     stack_context: Option<Arc<QuicStackContext>>,
 }
@@ -1255,6 +1295,7 @@ impl QuicStackBuilder {
             certs: vec![],
             concurrency: 1024,
             alpn_protocols: vec![],
+            reuse_address: false,
             connection_manager: None,
             stack_context: None,
         }
@@ -1298,6 +1339,11 @@ impl QuicStackBuilder {
         self
     }
 
+    pub fn reuse_address(mut self, reuse_address: bool) -> Self {
+        self.reuse_address = reuse_address;
+        self
+    }
+
     pub fn stack_context(mut self, stack_context: Arc<QuicStackContext>) -> Self {
         self.stack_context = Some(stack_context);
         self
@@ -1318,6 +1364,8 @@ pub struct QuicStackConfig {
     pub certs: Vec<StackCertConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alpn_protocols: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reuse_address: Option<bool>,
 }
 
 impl StackConfig for QuicStackConfig {
@@ -1374,6 +1422,7 @@ impl StackFactory for QuicStackFactory {
             .add_certs(cert_list)
             .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec![]).iter().map(|s| s.as_bytes().to_vec()).collect())
             .concurrency(config.concurrency.unwrap_or(1024))
+            .reuse_address(config.reuse_address.unwrap_or(false))
             .stack_context(stack_context)
             .build()
             .await?;
@@ -2515,6 +2564,7 @@ mod tests {
             hook_point: vec![],
             certs: vec![],
             alpn_protocols: None,
+            reuse_address: None,
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(QuicStackContext::new(
             server_manager,

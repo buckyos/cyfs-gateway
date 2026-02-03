@@ -724,6 +724,7 @@ struct UdpStackInner {
     all_client_session: DatagramClientSessionMap,
     connection_manager: Option<ConnectionManagerRef>,
     transparent: bool,
+    reuse_address: bool,
     local_ips: Vec<IpAddr>,
     socket_cache: SocketCache,
     handler: Arc<RwLock<Arc<UdpDatagramHandler>>>,
@@ -747,6 +748,7 @@ impl UdpStackInner {
             all_client_session: Arc::new(Mutex::new(BTreeMap::new())),
             connection_manager: builder.connection_manager,
             transparent: builder.transparent,
+            reuse_address: builder.reuse_address,
             local_ips,
             socket_cache: SocketCache::new(),
             handler,
@@ -894,6 +896,10 @@ impl UdpStackInner {
         socket.set_nonblocking(true).map_err(into_stack_err!(StackErrorCode::IoError, "set nonblocking error"))?;
         #[cfg(target_os = "linux")]
         {
+            if self.reuse_address || self.transparent {
+                socket.set_reuse_address(true)
+                    .map_err(into_stack_err!(StackErrorCode::IoError, "set reuse address error"))?;
+            }
             if self.transparent {
                 if !has_root_privileges() {
                     return Err(stack_err!(
@@ -901,8 +907,6 @@ impl UdpStackInner {
                         "transparent mode requires root privileges"
                     ));
                 }
-                socket.set_reuse_address(true)
-                    .map_err(into_stack_err!(StackErrorCode::IoError, "set reuse address error"))?;
                 socket.set_ip_transparent_v4(true)
                     .map_err(into_stack_err!(StackErrorCode::IoError, "set ip transparent error"))?;
 
@@ -1202,6 +1206,10 @@ impl Stack for UdpStack {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "transparent unmatch"));
         }
 
+        if config.reuse_address.unwrap_or(false) != self.inner.reuse_address {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "reuse_address unmatch"));
+        }
+
         let env = match context {
             Some(context) => {
                 let udp_context = context.as_ref().as_any().downcast_ref::<UdpStackContext>()
@@ -1238,6 +1246,7 @@ pub struct UdpStackBuilder {
     hook_point: Option<ProcessChainConfigs>,
     connection_manager: Option<ConnectionManagerRef>,
     transparent: bool,
+    reuse_address: bool,
     stack_context: Option<Arc<UdpStackContext>>,
 }
 
@@ -1251,6 +1260,7 @@ impl UdpStackBuilder {
             hook_point: None,
             connection_manager: None,
             transparent: false,
+            reuse_address: false,
             stack_context: None,
         }
     }
@@ -1289,6 +1299,11 @@ impl UdpStackBuilder {
         self
     }
 
+    pub fn reuse_address(mut self, reuse_address: bool) -> Self {
+        self.reuse_address = reuse_address;
+        self
+    }
+
     pub fn stack_context(mut self, stack_context: Arc<UdpStackContext>) -> Self {
         self.stack_context = Some(stack_context);
         self
@@ -1311,6 +1326,8 @@ pub struct UdpStackConfig {
     pub hook_point: Vec<ProcessChainConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transparent: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reuse_address: Option<bool>,
 }
 
 impl StackConfig for UdpStackConfig {
@@ -1366,6 +1383,7 @@ impl StackFactory for UdpStackFactory {
             .concurrency(config.concurrency.unwrap_or(200))
             .session_idle_time(Duration::from_secs(config.session_idle_time.unwrap_or(120)))
             .transparent(config.transparent.unwrap_or(false))
+            .reuse_address(config.reuse_address.unwrap_or(false))
             .stack_context(stack_context)
             .build().await?;
         Ok(Arc::new(stack))
@@ -1785,6 +1803,7 @@ mod tests {
             session_idle_time: None,
             hook_point: vec![],
             transparent: None,
+            reuse_address: None,
         };
         let stack_context = Arc::new(UdpStackContext::new(
             server_manager,
