@@ -12,6 +12,10 @@ use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest}
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, IntoRawFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::sync::{Arc, Mutex, RwLock};
 use rustls::pki_types::pem::PemObject;
 use rustls::server::ResolvesServerCert;
@@ -374,6 +378,7 @@ pub struct TlsStack {
     connection_manager: Option<ConnectionManagerRef>,
     handler: Arc<RwLock<Arc<TlsConnectionHandler>>>,
     prepare_handler: Arc<RwLock<Option<Arc<TlsConnectionHandler>>>>,
+    reuse_address: bool,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -433,15 +438,46 @@ impl TlsStack {
             connection_manager: config.connection_manager,
             handler: Arc::new(RwLock::new(Arc::new(handler))),
             prepare_handler: Arc::new(Default::default()),
+            reuse_address: config.reuse_address,
             handle: Mutex::new(None),
         })
     }
 
     async fn start_listener(&self) -> StackResult<JoinHandle<()>> {
-        let bind_addr = self.bind_addr.clone();
-        let listener = tokio::net::TcpListener::bind(bind_addr.as_str())
-            .await
-            .map_err(into_stack_err!(StackErrorCode::BindFailed, "bind address:{}", bind_addr))?;
+        let addr: SocketAddr = self.bind_addr.parse()
+            .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "invalid bind address {}", self.bind_addr))?;
+        let sockaddr: socket2::SockAddr = addr.into();
+        let domain = match addr {
+            std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
+            std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+            .map_err(into_stack_err!(StackErrorCode::IoError, "create socket error"))?;
+
+        socket.set_nonblocking(true)
+            .map_err(into_stack_err!(StackErrorCode::IoError, "set nonblocking error"))?;
+        #[cfg(target_os = "linux")]
+        {
+            if self.reuse_address {
+                socket.set_reuse_address(true)
+                    .map_err(into_stack_err!(StackErrorCode::IoError, "set reuse address error"))?;
+            }
+        }
+        socket.bind(&sockaddr)
+            .map_err(into_stack_err!(StackErrorCode::BindFailed, "bind {} error", self.bind_addr))?;
+        socket.listen(1024)
+            .map_err(into_stack_err!(StackErrorCode::ListenFailed, "listen error"))?;
+        #[cfg(unix)]
+        let std_listener = unsafe {
+            std::net::TcpListener::from_raw_fd(socket.into_raw_fd())
+        };
+        #[cfg(windows)]
+        let std_listener = unsafe {
+            std::net::TcpListener::from_raw_socket(socket.into_raw_socket())
+        };
+
+        let listener = tokio::net::TcpListener::from_std(std_listener)
+            .map_err(into_stack_err!(StackErrorCode::BindFailed))?;
         let handler = self.handler.clone();
         let connection_manager = self.connection_manager.clone();
         let handle = tokio::spawn(async move {
@@ -523,6 +559,10 @@ impl Stack for TlsStack {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
+        if config.reuse_address.unwrap_or(false) != self.reuse_address {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "reuse_address unmatch"));
+        }
+
         let env = match context {
             Some(context) => {
                 let tls_context = context.as_ref().as_any().downcast_ref::<TlsStackContext>()
@@ -602,6 +642,8 @@ pub struct TlsStackConfig {
     pub concurrency: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alpn_protocols: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reuse_address: Option<bool>,
 }
 
 impl crate::StackConfig for TlsStackConfig {
@@ -661,6 +703,7 @@ impl crate::StackFactory for TlsStackFactory {
             .add_certs(cert_list)
             .concurrency(config.concurrency.unwrap_or(0))
             .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec!["http/1.1".to_string()]).iter().map(|s| s.as_bytes().to_vec()).collect())
+            .reuse_address(config.reuse_address.unwrap_or(false))
             .stack_context(stack_context)
             .build()
             .await?;
@@ -677,6 +720,7 @@ pub struct TlsStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     alpn_protocols: Vec<Vec<u8>>,
     stack_context: Option<Arc<TlsStackContext>>,
+    reuse_address: bool,
 }
 
 impl TlsStackBuilder {
@@ -690,6 +734,7 @@ impl TlsStackBuilder {
             connection_manager: None,
             alpn_protocols: vec![],
             stack_context: None,
+            reuse_address: false,
         }
     }
 
@@ -734,6 +779,11 @@ impl TlsStackBuilder {
 
     pub fn alpn_protocols(mut self, alpn_protocols: Vec<Vec<u8>>) -> Self {
         self.alpn_protocols = alpn_protocols;
+        self
+    }
+
+    pub fn reuse_address(mut self, reuse_address: bool) -> Self {
+        self.reuse_address = reuse_address;
         self
     }
 
@@ -1624,6 +1674,7 @@ mod tests {
             certs: vec![],
             concurrency: None,
             alpn_protocols: None,
+            reuse_address: None,
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(TlsStackContext::new(
             server_manager,

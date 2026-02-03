@@ -248,6 +248,7 @@ pub struct TcpStack {
     handler: Arc<RwLock<Arc<TcpConnectionHandler>>>,
     prepare_handler: Arc<RwLock<Option<Arc<TcpConnectionHandler>>>>,
     transparent: bool,
+    reuse_address: bool,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -260,6 +261,7 @@ impl TcpStack {
             connection_manager: None,
             stack_context: None,
             transparent: false,
+            reuse_address: false,
         }
     }
 
@@ -305,6 +307,7 @@ impl TcpStack {
             handler: Arc::new(RwLock::new(Arc::new(handler))),
             prepare_handler: Arc::new(Default::default()),
             transparent: config.transparent,
+            reuse_address: config.reuse_address,
             handle: Mutex::new(None),
         })
     }
@@ -324,6 +327,10 @@ impl TcpStack {
         socket.set_nonblocking(true).map_err(into_stack_err!(StackErrorCode::IoError, "set nonblocking error"))?;
         #[cfg(target_os = "linux")]
         {
+            if self.reuse_address || self.transparent {
+                socket.set_reuse_address(true)
+                    .map_err(into_stack_err!(StackErrorCode::IoError, "set reuse address error"))?;
+            }
             if self.transparent {
                 if !has_root_privileges() {
                     return Err(stack_err!(
@@ -331,8 +338,6 @@ impl TcpStack {
                         "transparent mode requires root privileges"
                     ));
                 }
-                socket.set_reuse_address(true)
-                    .map_err(into_stack_err!(StackErrorCode::IoError, "set reuse address error"))?;
                 socket.set_ip_transparent_v4(true)
                     .map_err(into_stack_err!(StackErrorCode::IoError, "set ip transparent error"))?;
 
@@ -455,6 +460,10 @@ impl Stack for TcpStack {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "transparent unmatch"));
         }
 
+        if config.reuse_address.unwrap_or(false) != self.reuse_address {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "reuse_address unmatch"));
+        }
+
         let env = match context {
             Some(context) => {
                 let tcp_context = context.as_ref().as_any().downcast_ref::<TcpStackContext>()
@@ -489,6 +498,7 @@ pub struct TcpStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     stack_context: Option<Arc<TcpStackContext>>,
     transparent: bool,
+    reuse_address: bool,
 }
 
 impl TcpStackBuilder {
@@ -517,6 +527,11 @@ impl TcpStackBuilder {
         self
     }
 
+    pub fn reuse_address(mut self, reuse_address: bool) -> Self {
+        self.reuse_address = reuse_address;
+        self
+    }
+
     pub fn stack_context(mut self, handler_env: Arc<TcpStackContext>) -> Self {
         self.stack_context = Some(handler_env);
         self
@@ -535,6 +550,8 @@ pub struct TcpStackConfig {
     pub bind: SocketAddr,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transparent: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reuse_address: Option<bool>,
     pub hook_point: Vec<ProcessChainConfig>,
 }
 
@@ -586,6 +603,7 @@ impl StackFactory for TcpStackFactory {
             .bind(config.bind.to_string())
             .connection_manager(self.connection_manager.clone())
             .transparent(config.transparent.unwrap_or(false))
+            .reuse_address(config.reuse_address.unwrap_or(false))
             .hook_point(config.hook_point.clone())
             .stack_context(handler_env)
             .build().await?;
@@ -1199,6 +1217,7 @@ mod tests {
             protocol: StackProtocol::Tcp,
             bind: "127.0.0.1:3345".parse().unwrap(),
             transparent: None,
+            reuse_address: None,
             hook_point: vec![],
         };
 
