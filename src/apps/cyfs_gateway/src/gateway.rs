@@ -525,6 +525,8 @@ impl GatewayFactory {
             }
         }
 
+        server_manager.add_server(Server::Http(Arc::new(WelcomeServer::new())))?;
+
         let stack_manager = StackManager::new();
         for stack_config in config.stacks.iter() {
             let stack_context = build_stack_context(

@@ -6,6 +6,7 @@ mod qa_server;
 mod dir_server;
 mod ndn_server;
 mod acme_http_challenge_server;
+mod welcome_server;
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -18,6 +19,7 @@ pub use dns_server::*;
 pub use dir_server::*;
 pub use ndn_server::*;
 pub use acme_http_challenge_server::*;
+pub use welcome_server::*;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ServerErrorCode {
