@@ -8,9 +8,11 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor};
+use regex::Regex;
 use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpResponseHeaderMap, HttpServer, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err,into_server_err};
+use super::http_compression::{apply_request_decompression, apply_response_compression, CompressionRequestInfo, HttpCompressionSettings};
 use crate::tunnel_connector::TunnelConnector;
 use url::Url;
 
@@ -24,6 +26,7 @@ pub struct ProcessChainHttpServerBuilder {
     server_mgr: Option<ServerManagerWeakRef>,
     tunnel_manager: Option<TunnelManager>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
+    compression: HttpCompressionSettings,
 }
 
 // Add setter methods for HttpServerBuilder
@@ -73,8 +76,40 @@ impl ProcessChainHttpServerBuilder {
         self
     }
 
+    pub fn compression(mut self, compression: HttpCompressionSettings) -> Self {
+        self.compression = compression;
+        self
+    }
+
     pub async fn build(self) -> ServerResult<ProcessChainHttpServer> {
         ProcessChainHttpServer::create_server(self).await
+    }
+
+    fn build_compression_settings(
+        config: &ProcessChainHttpServerConfig,
+    ) -> ServerResult<HttpCompressionSettings> {
+        let gzip_http_version = parse_gzip_http_version(&config.gzip_http_version)?;
+        let gzip_disable = match config.gzip_disable.as_ref() {
+            Some(expr) => Some(Regex::new(expr).map_err(|e| {
+                server_err!(ServerErrorCode::InvalidConfig, "invalid gzip_disable regex: {}", e)
+            })?),
+            None => None,
+        };
+
+        Ok(HttpCompressionSettings {
+            gzip: config.gzip,
+            gzip_request: config.gzip_request,
+            gzip_types: normalize_content_types(&config.gzip_types),
+            gzip_min_length: config.gzip_min_length,
+            gzip_comp_level: clamp_gzip_comp_level(config.gzip_comp_level),
+            gzip_http_version,
+            gzip_vary: config.gzip_vary,
+            gzip_disable,
+            brotli: config.brotli,
+            brotli_types: normalize_content_types(&config.brotli_types),
+            brotli_min_length: config.brotli_min_length,
+            brotli_comp_level: clamp_brotli_comp_level(config.brotli_comp_level),
+        })
     }
 }
 
@@ -86,6 +121,7 @@ pub struct ProcessChainHttpServer {
     executor: Arc<Mutex<ProcessChainLibExecutor>>,
     post_executor: Option<Arc<Mutex<ProcessChainLibExecutor>>>,
     tunnel_manager: TunnelManager,
+    compression: HttpCompressionSettings,
 }
 
 impl Drop for ProcessChainHttpServer {
@@ -106,6 +142,7 @@ impl ProcessChainHttpServer {
             server_mgr: None,
             tunnel_manager: None,
             global_collection_manager: None,
+            compression: HttpCompressionSettings::default(),
         }
     }
 
@@ -175,6 +212,7 @@ impl ProcessChainHttpServer {
             executor: Arc::new(Mutex::new(executor)),
             post_executor,
             tunnel_manager: builder.tunnel_manager.unwrap(),
+            compression: builder.compression,
         })
     }
 
@@ -295,9 +333,13 @@ impl ProcessChainHttpServer {
     async fn apply_post_chain_result(
         &self,
         resp: ServerResult<http::Response<BoxBody<Bytes, ServerError>>>,
+        req_info: &CompressionRequestInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         match resp {
-            Ok(resp) => self.apply_post_chain(resp).await,
+            Ok(resp) => {
+                let resp = self.apply_post_chain(resp).await?;
+                apply_response_compression(resp, req_info, &self.compression)
+            }
             Err(err) => Err(err),
         }
     }
@@ -306,6 +348,21 @@ impl ProcessChainHttpServer {
 #[async_trait::async_trait]
 impl HttpServer for ProcessChainHttpServer {
     async fn serve_request(&self, req: http::Request<BoxBody<Bytes, ServerError>>, info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let req_info = CompressionRequestInfo::from_request(&req);
+        let req = match apply_request_decompression(req, &self.compression) {
+            Ok(req) => req,
+            Err(err) => {
+                let mut response = http::Response::new(
+                    Full::new(Bytes::from(err.msg().to_string()))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                );
+                *response.status_mut() = StatusCode::BAD_REQUEST;
+                return self
+                    .apply_post_chain_result(Ok(response), &req_info)
+                    .await;
+            }
+        };
         let executor = {
             self.executor.lock().unwrap().fork()
         };
@@ -324,12 +381,16 @@ impl HttpServer for ProcessChainHttpServer {
                         .map_err(|e| match e {})
                         .boxed(),
                 );
-                return self.apply_post_chain(response).await;
+                return self
+                    .apply_post_chain_result(Ok(response), &req_info)
+                    .await;
             } else if ret.is_reject() {
                 debug!("Request rejected by the process chain");
                 let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                 *response.status_mut() = StatusCode::FORBIDDEN;
-                return self.apply_post_chain(response).await;
+                return self
+                    .apply_post_chain_result(Ok(response), &req_info)
+                    .await;
             }
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
                 if let Some(list) = shlex::split(ret.value.as_str()) {
@@ -337,7 +398,9 @@ impl HttpServer for ProcessChainHttpServer {
                         log::error!("process chain return is empty");
                         let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                        return self.apply_post_chain(response).await;
+                        return self
+                            .apply_post_chain_result(Ok(response), &req_info)
+                            .await;
                     }
 
                     let cmd = list[0].as_str();
@@ -357,7 +420,7 @@ impl HttpServer for ProcessChainHttpServer {
                             if let Some(server_mgr) = self.server_mgr.upgrade() {
                                 if let Some(service) = server_mgr.get_http_server(server_id) {
                                     let resp = service.serve_request(post_req, info).await;
-                                    return self.apply_post_chain_result(resp).await;
+                                    return self.apply_post_chain_result(resp, &req_info).await;
                                 }
                             } else {
                                 log::error!("server manager is unavailable");
@@ -374,7 +437,7 @@ impl HttpServer for ProcessChainHttpServer {
                             let post_req= req_map.into_request()
                                 .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
                             let resp = self.handle_forward_upstream(post_req, target_url).await;
-                            return self.apply_post_chain_result(resp).await;
+                            return self.apply_post_chain_result(resp, &req_info).await;
                         },
                         _ => {
                             log::error!("unknown command: {}", cmd);
@@ -393,7 +456,7 @@ impl HttpServer for ProcessChainHttpServer {
         }
         let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        self.apply_post_chain(response).await
+        self.apply_post_chain_result(Ok(response), &req_info).await
     }
 
     fn id(&self) -> String {
@@ -409,6 +472,56 @@ impl HttpServer for ProcessChainHttpServer {
     }
 }
 
+fn default_gzip_min_length() -> u64 {
+    20
+}
+
+fn default_gzip_comp_level() -> u32 {
+    1
+}
+
+fn default_gzip_http_version() -> String {
+    "1.1".to_string()
+}
+
+fn default_brotli_min_length() -> u64 {
+    20
+}
+
+fn default_brotli_comp_level() -> u32 {
+    4
+}
+
+fn clamp_gzip_comp_level(level: u32) -> u32 {
+    level.clamp(1, 9)
+}
+
+fn clamp_brotli_comp_level(level: u32) -> u32 {
+    level.clamp(0, 11)
+}
+
+fn normalize_content_types(types: &[String]) -> Vec<String> {
+    types
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn parse_gzip_http_version(value: &str) -> ServerResult<Version> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "1.0" | "HTTP/1.0" => Ok(Version::HTTP_10),
+        "1.1" | "HTTP/1.1" => Ok(Version::HTTP_11),
+        "2" | "2.0" | "HTTP/2" => Ok(Version::HTTP_2),
+        "3" | "3.0" | "HTTP/3" => Ok(Version::HTTP_3),
+        _ => Err(server_err!(
+            ServerErrorCode::InvalidConfig,
+            "invalid gzip_http_version: {}",
+            value
+        )),
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ProcessChainHttpServerConfig {
     pub id: String,
@@ -421,6 +534,30 @@ pub struct ProcessChainHttpServerConfig {
     pub hook_point: ProcessChainConfigs,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_hook_point: Option<ProcessChainConfigs>,
+    #[serde(default)]
+    pub gzip: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gzip_types: Vec<String>,
+    #[serde(default = "default_gzip_min_length")]
+    pub gzip_min_length: u64,
+    #[serde(default = "default_gzip_comp_level")]
+    pub gzip_comp_level: u32,
+    #[serde(default = "default_gzip_http_version")]
+    pub gzip_http_version: String,
+    #[serde(default)]
+    pub gzip_vary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gzip_disable: Option<String>,
+    #[serde(default)]
+    pub gzip_request: bool,
+    #[serde(default)]
+    pub brotli: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub brotli_types: Vec<String>,
+    #[serde(default = "default_brotli_min_length")]
+    pub brotli_min_length: u64,
+    #[serde(default = "default_brotli_comp_level")]
+    pub brotli_comp_level: u32,
 }
 
 impl ServerConfig for ProcessChainHttpServerConfig {
@@ -504,6 +641,8 @@ impl ServerFactory for ProcessChainHttpServerFactory {
             .tunnel_manager(context.tunnel_manager.clone())
             .global_process_chains(context.global_process_chains.clone())
             .global_collection_manager(context.global_collection_manager.clone());
+        let compression = ProcessChainHttpServerBuilder::build_compression_settings(config)?;
+        builder = builder.compression(compression);
         if config.h3_port.is_some() {
             builder = builder.h3_port(config.h3_port.clone().unwrap());
         }
@@ -521,10 +660,122 @@ impl ServerFactory for ProcessChainHttpServerFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, GzipEncoder};
+    use std::io::Cursor;
     use std::sync::Arc;
     use buckyos_kit::init_logging;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use crate::{GlobalProcessChains, ServerManager, StreamInfo, hyper_serve_http, hyper_serve_http1, GlobalCollectionManager};
+    use tokio::io::AsyncReadExt;
+
+    struct FixedResponseServer {
+        id: String,
+        body: Bytes,
+        content_type: &'static str,
+        status: StatusCode,
+        content_encoding: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpServer for FixedResponseServer {
+        async fn serve_request(
+            &self,
+            _req: http::Request<BoxBody<Bytes, ServerError>>,
+            _info: StreamInfo,
+        ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+            let body = self.body.clone();
+            let len = body.len();
+            let mut builder = http::Response::builder()
+                .status(self.status)
+                .header("Content-Type", self.content_type)
+                .header("Content-Length", len);
+            if let Some(encoding) = self.content_encoding {
+                builder = builder.header("Content-Encoding", encoding);
+            }
+            let response = builder
+                .body(Full::new(body).map_err(|e| match e {}).boxed())
+                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?;
+            Ok(response)
+        }
+
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+
+        fn http_version(&self) -> Version {
+            Version::HTTP_11
+        }
+
+        fn http3_port(&self) -> Option<u16> {
+            None
+        }
+    }
+
+    struct EchoBodyServer {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpServer for EchoBodyServer {
+        async fn serve_request(
+            &self,
+            req: http::Request<BoxBody<Bytes, ServerError>>,
+            _info: StreamInfo,
+        ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+            let body_bytes = req
+                .collect()
+                .await
+                .map_err(|e| server_err!(ServerErrorCode::StreamError, "Stream error: {}", e))?
+                .to_bytes();
+            let len = body_bytes.len();
+            let response = http::Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Length", len)
+                .body(Full::new(body_bytes).map_err(|e| match e {}).boxed())
+                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?;
+            Ok(response)
+        }
+
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+
+        fn http_version(&self) -> Version {
+            Version::HTTP_11
+        }
+
+        fn http3_port(&self) -> Option<u16> {
+            None
+        }
+    }
+
+    async fn gzip_bytes(data: &[u8]) -> Bytes {
+        let cursor = Cursor::new(data.to_vec());
+        let reader = tokio::io::BufReader::new(cursor);
+        let mut encoder = GzipEncoder::new(reader);
+        let mut output = Vec::new();
+        encoder.read_to_end(&mut output).await.unwrap();
+        Bytes::from(output)
+    }
+
+    async fn gunzip_bytes(data: Bytes) -> Bytes {
+        let cursor = Cursor::new(data.to_vec());
+        let reader = tokio::io::BufReader::new(cursor);
+        let mut decoder = GzipDecoder::new(reader);
+        let mut output = Vec::new();
+        decoder.read_to_end(&mut output).await.unwrap();
+        Bytes::from(output)
+    }
+
+    async fn brotli_decode_bytes(data: Bytes) -> Bytes {
+        let cursor = Cursor::new(data.to_vec());
+        let reader = tokio::io::BufReader::new(cursor);
+        let mut decoder = BrotliDecoder::new(reader);
+        let mut output = Vec::new();
+        decoder.read_to_end(&mut output).await.unwrap();
+        Bytes::from(output)
+    }
 
     #[tokio::test]
     async fn test_http_server_builder_creation() {
@@ -534,6 +785,641 @@ mod tests {
         assert!(builder.post_hook_point.is_none());
         assert!(builder.global_process_chains.is_none());
         assert!(builder.server_mgr.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gzip_min_length_no_compress() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let server = FixedResponseServer {
+            id: "test".to_string(),
+            body: Bytes::from_static(b"small-body"),
+            content_type: "text/plain",
+            status: StatusCode::OK,
+            content_encoding: None,
+        };
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(server)))
+            .unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server test";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let mut compression = HttpCompressionSettings::default();
+        compression.gzip = true;
+        compression.gzip_vary = true;
+        compression.gzip_min_length = 1024;
+        compression.gzip_types = vec!["text/plain".to_string()];
+
+        let result = ProcessChainHttpServer::builder()
+            .id("test_gzip_min")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .compression(compression)
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+        let http_server = result.unwrap();
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/")
+            .header("Accept-Encoding", "gzip")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let resp = http_server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .unwrap();
+
+        assert!(resp.headers().get("content-encoding").is_none());
+        let vary = resp
+            .headers()
+            .get("vary")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(vary.to_ascii_lowercase().contains("accept-encoding"));
+
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(b"small-body"));
+    }
+
+    #[tokio::test]
+    async fn test_gzip_response_compress() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let raw_body = Bytes::from_static(b"compress-body-contents");
+        let server = FixedResponseServer {
+            id: "compress".to_string(),
+            body: raw_body.clone(),
+            content_type: "text/plain",
+            status: StatusCode::OK,
+            content_encoding: None,
+        };
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(server)))
+            .unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server compress";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let mut compression = HttpCompressionSettings::default();
+        compression.gzip = true;
+        compression.gzip_vary = true;
+        compression.gzip_min_length = 1;
+        compression.gzip_types = vec!["text/plain".to_string()];
+
+        let http_server = ProcessChainHttpServer::builder()
+            .id("test_gzip_compress")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .compression(compression)
+            .build()
+            .await
+            .unwrap();
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/")
+            .header("Accept-Encoding", "gzip")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let resp = http_server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.headers()
+                .get("content-encoding")
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
+        assert!(resp.headers().get("content-length").is_none());
+        let vary = resp
+            .headers()
+            .get("vary")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(vary.to_ascii_lowercase().contains("accept-encoding"));
+
+        let body = resp.collect().await.unwrap().to_bytes();
+        let decoded = gunzip_bytes(body).await;
+        assert_eq!(decoded, raw_body);
+    }
+
+    #[tokio::test]
+    async fn test_gzip_request_decompression() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let server = EchoBodyServer {
+            id: "echo".to_string(),
+        };
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(server)))
+            .unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server echo";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let mut compression = HttpCompressionSettings::default();
+        compression.gzip_request = true;
+
+        let http_server = ProcessChainHttpServer::builder()
+            .id("test_gzip_request")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .compression(compression)
+            .build()
+            .await
+            .unwrap();
+
+        let original = Bytes::from_static(b"request-body");
+        let compressed = gzip_bytes(original.as_ref()).await;
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/")
+            .header("Content-Encoding", "gzip")
+            .body(Full::new(compressed).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let resp = http_server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .unwrap();
+
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, original);
+    }
+
+    #[tokio::test]
+    async fn test_gzip_response_skip_when_already_encoded() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let raw_body = Bytes::from_static(b"already-encoded");
+        let server = FixedResponseServer {
+            id: "encoded".to_string(),
+            body: raw_body.clone(),
+            content_type: "text/plain",
+            status: StatusCode::OK,
+            content_encoding: Some("gzip"),
+        };
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(server)))
+            .unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server encoded";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let mut compression = HttpCompressionSettings::default();
+        compression.gzip = true;
+        compression.gzip_vary = true;
+        compression.gzip_min_length = 1;
+        compression.gzip_types = vec!["text/plain".to_string()];
+
+        let http_server = ProcessChainHttpServer::builder()
+            .id("test_gzip_encoded")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .compression(compression)
+            .build()
+            .await
+            .unwrap();
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/")
+            .header("Accept-Encoding", "gzip")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let resp = http_server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.headers()
+                .get("content-encoding")
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, raw_body);
+    }
+
+    #[tokio::test]
+    async fn test_gzip_response_skip_for_head() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let raw_body = Bytes::from_static(b"head-body-content");
+        let server = FixedResponseServer {
+            id: "head".to_string(),
+            body: raw_body.clone(),
+            content_type: "text/plain",
+            status: StatusCode::OK,
+            content_encoding: None,
+        };
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(server)))
+            .unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server head";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let mut compression = HttpCompressionSettings::default();
+        compression.gzip = true;
+        compression.gzip_vary = true;
+        compression.gzip_min_length = 1;
+        compression.gzip_types = vec!["text/plain".to_string()];
+
+        let http_server = ProcessChainHttpServer::builder()
+            .id("test_gzip_head")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .compression(compression)
+            .build()
+            .await
+            .unwrap();
+
+        let request = http::Request::builder()
+            .method("HEAD")
+            .uri("http://localhost/")
+            .header("Accept-Encoding", "gzip")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let resp = http_server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .unwrap();
+
+        assert!(resp.headers().get("content-encoding").is_none());
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, raw_body);
+    }
+
+    #[tokio::test]
+    async fn test_gzip_response_skip_for_status() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let server = FixedResponseServer {
+            id: "no_content".to_string(),
+            body: Bytes::new(),
+            content_type: "text/plain",
+            status: StatusCode::NO_CONTENT,
+            content_encoding: None,
+        };
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(server)))
+            .unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server no_content";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let mut compression = HttpCompressionSettings::default();
+        compression.gzip = true;
+        compression.gzip_vary = true;
+        compression.gzip_min_length = 1;
+        compression.gzip_types = vec!["text/plain".to_string()];
+
+        let http_server = ProcessChainHttpServer::builder()
+            .id("test_gzip_no_content")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .compression(compression)
+            .build()
+            .await
+            .unwrap();
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/")
+            .header("Accept-Encoding", "gzip")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let resp = http_server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .unwrap();
+
+        assert!(resp.headers().get("content-encoding").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gzip_response_skip_for_not_modified() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let server = FixedResponseServer {
+            id: "not_modified".to_string(),
+            body: Bytes::new(),
+            content_type: "text/plain",
+            status: StatusCode::NOT_MODIFIED,
+            content_encoding: None,
+        };
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(server)))
+            .unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server not_modified";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let mut compression = HttpCompressionSettings::default();
+        compression.gzip = true;
+        compression.gzip_vary = true;
+        compression.gzip_min_length = 1;
+        compression.gzip_types = vec!["text/plain".to_string()];
+
+        let http_server = ProcessChainHttpServer::builder()
+            .id("test_gzip_not_modified")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .compression(compression)
+            .build()
+            .await
+            .unwrap();
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/")
+            .header("Accept-Encoding", "gzip")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let resp = http_server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .unwrap();
+
+        assert!(resp.headers().get("content-encoding").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_brotli_response_compress() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let raw_body = Bytes::from_static(b"brotli-contents");
+        let server = FixedResponseServer {
+            id: "brotli".to_string(),
+            body: raw_body.clone(),
+            content_type: "text/plain",
+            status: StatusCode::OK,
+            content_encoding: None,
+        };
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(server)))
+            .unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server brotli";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let mut compression = HttpCompressionSettings::default();
+        compression.brotli = true;
+        compression.gzip_vary = true;
+        compression.brotli_min_length = 1;
+        compression.brotli_types = vec!["text/plain".to_string()];
+
+        let http_server = ProcessChainHttpServer::builder()
+            .id("test_brotli_compress")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .compression(compression)
+            .build()
+            .await
+            .unwrap();
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/")
+            .header("Accept-Encoding", "br")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let resp = http_server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.headers()
+                .get("content-encoding")
+                .and_then(|value| value.to_str().ok()),
+            Some("br")
+        );
+        assert!(resp.headers().get("content-length").is_none());
+        let vary = resp
+            .headers()
+            .get("vary")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(vary.to_ascii_lowercase().contains("accept-encoding"));
+
+        let body = resp.collect().await.unwrap().to_bytes();
+        let decoded = brotli_decode_bytes(body).await;
+        assert_eq!(decoded, raw_body);
+    }
+
+    #[tokio::test]
+    async fn test_gzip_http_version_gate() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let raw_body = Bytes::from_static(b"version-gate");
+        let server = FixedResponseServer {
+            id: "version".to_string(),
+            body: raw_body.clone(),
+            content_type: "text/plain",
+            status: StatusCode::OK,
+            content_encoding: None,
+        };
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(server)))
+            .unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server version";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let mut compression = HttpCompressionSettings::default();
+        compression.gzip = true;
+        compression.gzip_vary = true;
+        compression.gzip_min_length = 1;
+        compression.gzip_types = vec!["text/plain".to_string()];
+        compression.gzip_http_version = Version::HTTP_2;
+
+        let http_server = ProcessChainHttpServer::builder()
+            .id("test_version_gate")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .compression(compression)
+            .build()
+            .await
+            .unwrap();
+
+        let request = http::Request::builder()
+            .version(Version::HTTP_11)
+            .method("GET")
+            .uri("http://localhost/")
+            .header("Accept-Encoding", "gzip")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let resp = http_server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .unwrap();
+
+        assert!(resp.headers().get("content-encoding").is_none());
+        let vary = resp
+            .headers()
+            .get("vary")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(vary.to_ascii_lowercase().contains("accept-encoding"));
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, raw_body);
+    }
+
+    #[tokio::test]
+    async fn test_gzip_disable_user_agent() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let raw_body = Bytes::from_static(b"ua-disable");
+        let server = FixedResponseServer {
+            id: "ua".to_string(),
+            body: raw_body.clone(),
+            content_type: "text/plain",
+            status: StatusCode::OK,
+            content_encoding: None,
+        };
+        mock_server_mgr
+            .add_server(Server::Http(Arc::new(server)))
+            .unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server ua";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let mut compression = HttpCompressionSettings::default();
+        compression.gzip = true;
+        compression.gzip_vary = true;
+        compression.gzip_min_length = 1;
+        compression.gzip_types = vec!["text/plain".to_string()];
+        compression.gzip_disable = Some(Regex::new("TestAgent").unwrap());
+
+        let http_server = ProcessChainHttpServer::builder()
+            .id("test_gzip_disable")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .compression(compression)
+            .build()
+            .await
+            .unwrap();
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/")
+            .header("Accept-Encoding", "gzip")
+            .header("User-Agent", "TestAgent/1.0")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let resp = http_server
+            .serve_request(request, StreamInfo::default())
+            .await
+            .unwrap();
+
+        assert!(resp.headers().get("content-encoding").is_none());
+        let vary = resp
+            .headers()
+            .get("vary")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(vary.to_ascii_lowercase().contains("accept-encoding"));
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, raw_body);
     }
 
     #[tokio::test]
@@ -1068,6 +1954,18 @@ mod tests {
             h3_port: None,
             hook_point: ProcessChainConfigs::default(),
             post_hook_point: None,
+            gzip: false,
+            gzip_types: Vec::new(),
+            gzip_min_length: default_gzip_min_length(),
+            gzip_comp_level: default_gzip_comp_level(),
+            gzip_http_version: default_gzip_http_version(),
+            gzip_vary: false,
+            gzip_disable: None,
+            gzip_request: false,
+            brotli: false,
+            brotli_types: Vec::new(),
+            brotli_min_length: default_brotli_min_length(),
+            brotli_comp_level: default_brotli_comp_level(),
         };
         let server_mgr = Arc::new(ServerManager::new());
         let context = HttpServerContext::new(

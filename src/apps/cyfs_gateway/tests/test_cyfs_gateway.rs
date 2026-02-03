@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::net::{IpAddr, SocketAddr};
     use std::str::FromStr;
+    use async_compression::tokio::bufread::GzipDecoder;
     use buckyos_kit::init_logging;
     use bytes::Bytes;
     use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
@@ -10,7 +12,17 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use http_body_util::BodyExt;
     use serde_json::json;
+    use tokio::io::AsyncReadExt;
     use cyfs_gateway::{gateway_service_main, read_login_token, GatewayControlClient, GatewayParams, CONTROL_SERVER};
+
+    async fn gunzip_bytes(data: Bytes) -> Bytes {
+        let cursor = Cursor::new(data.to_vec());
+        let reader = tokio::io::BufReader::new(cursor);
+        let mut decoder = GzipDecoder::new(reader);
+        let mut output = Vec::new();
+        decoder.read_to_end(&mut output).await.unwrap();
+        Bytes::from(output)
+    }
 
     #[tokio::test]
     async fn test_cyfs_gateway() {
@@ -51,6 +63,10 @@ mod tests {
         let config = config.replace("{{www_dir}}", local_dir.path().to_str().unwrap());
         let path = local_dir.path().join("index.html");
         std::fs::write(path, "www.buckyos.com").unwrap();
+
+        let path = local_dir.path().join("index2.html");
+        let raw_compress_body = "www.buckyos.comwww.buckyos.comwww.buckyos.comwww.buckyos.comwww.buckyos.comwww.buckyos.comwww.buckyos.comwww.buckyos.com";
+        std::fs::write(path, raw_compress_body).unwrap();
 
         std::fs::write(config_file.path(), config).unwrap();
 
@@ -124,6 +140,59 @@ mod tests {
             let body = response.into_body();
             let data = body.collect().await.unwrap();
             assert_eq!(data.to_bytes().as_ref(), b"www.buckyos.com");
+        }
+
+        {
+            //用tokio库创建一个tcpstream
+            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
+
+            // 用hyper构造一个http请求
+            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream)).await.unwrap();
+            let request = hyper::Request::get("/index2.html")
+                .header("Host", "www.buckyos.com")
+                .header("Accept-Encoding", "gzip")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::new())).unwrap();
+
+            tokio::spawn(async move {
+                conn.await.unwrap();
+            });
+
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
+            assert!(response.headers().get("content-encoding").is_some());
+            assert_eq!(response.headers().get("content-encoding").map(|v| v.to_str().unwrap()), Some("gzip"));
+            let body = response.into_body();
+            let data = body.collect().await.unwrap();
+            let decoded = gunzip_bytes(data.to_bytes()).await;
+            assert_eq!(decoded.as_ref(), raw_compress_body.as_bytes());
+        }
+
+        {
+            //用tokio库创建一个tcpstream
+            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
+
+            // 用hyper构造一个http请求
+            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream)).await.unwrap();
+            let request = hyper::Request::get("/index2.html")
+                .header("Host", "www.buckyos.com")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::new())).unwrap();
+
+            tokio::spawn(async move {
+                conn.await.unwrap();
+            });
+
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
+            assert!(response.headers().get("content-encoding").is_none());
+            let body = response.into_body();
+            let data = body.collect().await.unwrap();
+            assert_eq!(data.to_bytes().as_ref(), raw_compress_body.as_bytes());
         }
 
         {

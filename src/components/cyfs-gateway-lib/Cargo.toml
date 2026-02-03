@@ -55,6 +55,7 @@ http.workspace = true
 serde_qs.workspace = true
 serde_urlencoded.workspace = true
 tokio-util = { version = "0.7", features = ["full"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "brotli"] }
 rustls-platform-verifier.workspace = true
 as-any = "0.3.2"
 libc = "0.2"
