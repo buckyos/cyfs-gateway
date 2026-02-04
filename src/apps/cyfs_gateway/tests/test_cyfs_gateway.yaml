@@ -96,6 +96,7 @@ servers:
           default:
             priority: 1
             block: |
+              starts-with ${REQ.path} "/test_return" && rewrite ${REQ.path} "/test_return*" "*" && map-add REQ host www.buckyos.com && return "forward http://127.0.0.1:18081";
               starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;
 
           default1:
