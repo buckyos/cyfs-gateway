@@ -1,41 +1,41 @@
-# cyfs_gateway 配置字段说明（可直接运行）
-# - 本文件包含所有配置字段的说明，并提供最小可运行的 HTTP 服务
-# - 默认启动 0.0.0.0:80
+# cyfs_gateway configuration field reference (ready to run)
+# - This file explains all config fields and provides a minimal runnable HTTP service
+# - Default binds to 0.0.0.0:80
 
-# includes:            # 额外配置文件或目录（按顺序合并），相对路径基于当前文件目录
+# includes:            # extra config files or directories (merged in order), paths are relative to this file
 #   - path: extra.yaml
 #   - path: configs/
 
-# user_name: "root"    # 控制台登录用户名，可选
-# password: "123456"   # 控制台登录密码，可选（明文，会在登录时做哈希）
+# user_name: "root"    # console login username, optional
+# password: "123456"   # console login password, optional (plain text, hashed on login)
 
-# acme:               # ACME 证书配置（可选）
-#   account: "admin@example.com"  # ACME 账户
-#   issuer: "https://acme-v02.api.letsencrypt.org/directory"  # ACME 服务地址
-#   dns_providers:     # DNS 校验配置
-#     aliyun: // 阿里云
+# acme:               # ACME certificate config (optional)
+#   account: "admin@example.com"  # ACME account
+#   issuer: "https://acme-v02.api.letsencrypt.org/directory"  # ACME directory URL
+#   dns_providers:     # DNS challenge config
+#     aliyun: // Alibaba Cloud
 #       accessKeyId: "***"
 #       accessKeySecret: "***"
 #    sn-dns: // buckyos sn
 #      sn: https://sn.buckyos.ai
 #      key_path: ***
 #      device_config_path: ***
-#   check_interval: 43200          # 证书检查周期（秒），默认 12h
-#   renew_before_expiry: 2592000   # 提前续期时间（秒），默认 30d
+#   check_interval: 43200          # certificate check interval (seconds), default 12h
+#   renew_before_expiry: 2592000   # renew ahead of expiry (seconds), default 30d
 
-# tls_ca:             # 自签名/CA 证书配置（可选）
+# tls_ca:             # self-signed/CA certificate config (optional)
 #   cert_path: ./ca.crt
 #   key_path: ./ca.key
 
-# 限流器配置（可选，空对象表示不启用）
+# limiter config (optional; empty object disables)
 # limiters:
-#   global:            # limiter id（由 map key 提供）
-#     upper_limiter: ***          # 上级 limiter id（可选）
-#     download_speed: "1GB/s"      # 下行带宽（支持 KB/s、MB/s、GB/s）
-#     upload_speed: "1GB/s"        # 上行带宽
-#     concurrent: 2048             # 并发数
+#   global:            # limiter id (from map key)
+#     upper_limiter: ***          # upper limiter id (optional)
+#     download_speed: "1GB/s"      # download bandwidth (supports KB/s, MB/s, GB/s)
+#     upload_speed: "1GB/s"        # upload bandwidth
+#     concurrent: 2048             # concurrency
 
-# 全局集合配置（可选，空对象表示不启用）
+# global collection config (optional; empty object disables)
 # collections:
 #   memory_set_example:
 #     type: memory_set
@@ -64,7 +64,7 @@
 #       key_name: k
 #       value_name: v
 
-# 全局处理链配置（可选，空对象表示不启用）
+# global process chain config (optional; empty object disables)
 # global_process_chains:
 #   global_chain:
 #     priority: 1
@@ -76,11 +76,12 @@
 
 stacks:
   http_tcp:
-    # id 由 map key 提供（此处为 http_tcp）
+    # id comes from map key (here: http_tcp)
     protocol: tcp                 # tcp | udp | tls | quic | rtcp | tun
-    bind: 0.0.0.0:80            # 监听地址
-    # transparent: false          # 透明代理模式（tcp/udp 可选，默认 false）
-    hook_point: # 处理链（map 形式，会被转换为数组）
+    bind: 0.0.0.0:80            # bind address
+    # transparent: false          # transparent proxy mode (tcp/udp optional, default false)
+    # reuse_address: false      # set EADDRINUSE on socket, default false, linux only
+    hook_point: # process chains (map form, converted to array)
       main:
         priority: 1000
         blocks:
@@ -92,37 +93,37 @@ stacks:
     # udp_example:
     #   protocol: udp
     #   bind: 0.0.0.0:53
-    #   concurrency: 200            # 默认 200
-    #   session_idle_time: 120      # 会话超时（秒），默认 120
+    #   concurrency: 200            # default 200
+    #   session_idle_time: 120      # session timeout (seconds), default 120
     #   transparent: false
     #   hook_point: { }
 
     # tls_example:
     #   protocol: tls
     #   bind: 0.0.0.0:443
-    #   concurrency: 0              # 默认 0（不限制）
-    #   alpn_protocols: ["http/1.1"] # 默认为http/1.1,支持 h2、h3
+    #   concurrency: 0              # default 0 (unlimited)
+    #   alpn_protocols: ["http/1.1"] # default http/1.1, supports h2/h3
     #   certs:
-    #     - domain: example.com #配置本地证书
+    #     - domain: example.com # local certificate
     #       cert_path: ./cert.pem
     #       key_path: ./key.pem
-    #     - domain: example.org #配置 acme证书
-    #       acme_type: 可缺省，默认使用tls-alpn-01，支持dns-01 | http-01 | tls-alpn-01
-    #     - domain: * #本地缺省证书，所有通过该stack的连接都会使用本地根证书生成对应的证书，根证书可以通过tls_ca字段配置
+    #     - domain: example.org # ACME certificate
+    #       acme_type: optional, default tls-alpn-01, supports dns-01 | http-01 | tls-alpn-01
+    #     - domain: * # local default certificate; all connections through this stack use certs generated from the local root, configured via tls_ca
     #   hook_point: { }
 
     # quic_example:
     #   protocol: quic
     #   bind: 0.0.0.0:4433
-    #   concurrency: 1024           # 默认 1024
-    #   alpn_protocols: ["h3"] # 支持h2、h3
+    #   concurrency: 1024           # default 1024
+    #   alpn_protocols: ["h3"] # supports h2/h3
     #   certs:
-    #     - domain: example.com #配置本地证书
+    #     - domain: example.com # local certificate
     #       cert_path: ./cert.pem
     #       key_path: ./key.pem
-    #     - domain: example.org #配置 acme证书
-    #       acme_type: 可缺省，默认使用tls-alpn-01，支持dns-01 | http-01 | tls-alpn-01
-    #     - domain: * #本地缺省证书，所有通过该stack的连接都会使用本地根证书生成对应的证书，根证书可以通过tls_ca字段配置
+    #     - domain: example.org # ACME certificate
+    #       acme_type: optional, default tls-alpn-01, supports dns-01 | http-01 | tls-alpn-01
+    #     - domain: * # local default certificate; all connections through this stack use certs generated from the local root, configured via tls_ca
     #   hook_point: { }
 
     # rtcp_example:
@@ -136,18 +137,18 @@ stacks:
     # tun_example:
     #   protocol: tun
     #   bind: 10.0.0.1
-    #   mask: 255.255.255.0         # 默认 255.255.255.0
-    #   mtu: 1500                   # 默认 1500
-    #   tcp_timeout: 60             # 默认 60
-    #   udp_timeout: 60             # 默认 60
+    #   mask: 255.255.255.0         # default 255.255.255.0
+    #   mtu: 1500                   # default 1500
+    #   tcp_timeout: 60             # default 60
+    #   udp_timeout: 60             # default 60
     #   hook_point: { }
 
     #servers:
     #  http_main:
-    #     id 由 map key 提供（此处为 http_main）
+    #     id comes from map key (here: http_main)
     #     type: http
-    #     version: "HTTP/1.1"         # 可选：HTTP/1.1、HTTP/2、HTTP/3，默认 HTTP/1.1
-    #     h3_port: 443                # 可选：HTTP/3 端口
+    #     version: "HTTP/1.1"         # optional: HTTP/1.1, HTTP/2, HTTP/3; default HTTP/1.1
+    #     h3_port: 443                # optional: HTTP/3 port
     #    hook_point:
     #      main:
     #        priority: 1
@@ -159,8 +160,8 @@ stacks:
     #
     #  http_dir:
     #    type: dir
-    #    root_path: ./www              # 静态目录
-    # version: "HTTP/1.1"         # 可选：HTTP/1.1、HTTP/2，默认 HTTP/1.1
+    #    root_path: ./www              # static directory
+    # version: "HTTP/1.1"         # optional: HTTP/1.1, HTTP/2; default HTTP/1.1
     # index_file: index.html
     # fallback_file: 404.html
 
@@ -187,15 +188,15 @@ stacks:
   #   owner_pkx: "<pkx>"
   #   device_jwt:
   #     - "<jwt>"
-  #   aliases: []                 # 可选
-  #   db_type: sqlite             # 可选
+  #   aliases: []                 # optional
+  #   db_type: sqlite             # optional
   #   db_params:
   #     db_path: ./sn.db
 
   # socks_example:
   #   type: socks
   #   target: "http://127.0.0.1:1080"
-  #   username: ""  # 没有username和password字段则表示不设置密码
+  #   username: ""  # if username/password are absent, no password is set
   #   password: ""
   #   hook_point:
   #     main:
@@ -205,4 +206,3 @@ stacks:
   #           priority: 1
   #           block: |
   #             reject;
-
