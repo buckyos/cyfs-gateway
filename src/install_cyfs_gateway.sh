@@ -34,6 +34,78 @@ require_cmd python3
 require_cmd uname
 require_cmd mktemp
 
+get_gateway_pids() {
+	if command -v pgrep >/dev/null 2>&1; then
+		pgrep -x "$SERVICE_NAME" || true
+		return
+	fi
+	if command -v pidof >/dev/null 2>&1; then
+		pidof "$SERVICE_NAME" 2>/dev/null | tr ' ' '\n' || true
+	fi
+}
+
+stop_gateway() {
+	local pids=("$@")
+	local remaining=()
+	if [[ "${#pids[@]}" -eq 0 ]]; then
+		return
+	fi
+
+	log "Stopping ${SERVICE_NAME}..."
+	kill -TERM "${pids[@]}" 2>/dev/null || true
+
+	for _ in {1..10}; do
+		sleep 0.5
+		remaining=()
+		while IFS= read -r line; do
+			remaining+=("$line")
+		done < <(get_gateway_pids)
+		if [[ "${#remaining[@]}" -eq 0 ]]; then
+			log "Stopped ${SERVICE_NAME}."
+			return
+		fi
+	done
+
+	warn "${SERVICE_NAME} still running; sending SIGKILL."
+	kill -KILL "${remaining[@]}" 2>/dev/null || true
+	sleep 0.5
+	remaining=()
+	while IFS= read -r line; do
+		remaining+=("$line")
+	done < <(get_gateway_pids)
+	if [[ "${#remaining[@]}" -eq 0 ]]; then
+		log "Stopped ${SERVICE_NAME}."
+		return
+	fi
+
+	err "Failed to stop ${SERVICE_NAME}."
+	exit 1
+}
+
+check_running() {
+	local pids=()
+	local answer=""
+	while IFS= read -r line; do
+		pids+=("$line")
+	done < <(get_gateway_pids)
+	if [[ "${#pids[@]}" -eq 0 ]]; then
+		return
+	fi
+
+	warn "Detected running ${SERVICE_NAME} process(es): ${pids[*]}"
+	log "Continue installation and stop them? [y/N]"
+	read -r answer || true
+	case "${answer}" in
+		y | Y | yes | YES)
+			stop_gateway "${pids[@]}"
+			;;
+		*)
+			log "Installation aborted."
+			exit 1
+			;;
+	esac
+}
+
 os_name="$(uname -s)"
 os_slug=""
 needs_systemd=0
@@ -85,20 +157,25 @@ cleanup() {
 trap cleanup EXIT
 
 release_json_path="${tmp_dir}/release.json"
-headers=()
-if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-	headers+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
-	headers+=(-H "X-GitHub-Api-Version: 2022-11-28")
-fi
 
 log "Fetching latest release metadata from ${REPO}..."
-http_status="$(curl -sS -w '%{http_code}' -o "$release_json_path" "${headers[@]}" "$API_URL" || true)"
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+	http_status="$(curl -sS -w '%{http_code}' -o "$release_json_path" \
+		-H "Authorization: Bearer ${GITHUB_TOKEN}" \
+		-H "X-GitHub-Api-Version: 2022-11-28" \
+		"$API_URL" || true)"
+else
+	http_status="$(curl -sS -w '%{http_code}' -o "$release_json_path" "$API_URL" || true)"
+fi
 if [[ "$http_status" != "200" ]]; then
 	err "GitHub API request failed (HTTP ${http_status})."
 	exit 1
 fi
 
-mapfile -t release_info < <(
+release_info=()
+while IFS= read -r line; do
+	release_info+=("$line")
+done < <(
 	python3 - "$release_json_path" "$asset_name" <<'PY'
 import json
 import sys
@@ -134,11 +211,13 @@ fi
 log "Downloading asset: ${asset_name}"
 
 archive_path="${tmp_dir}/${asset_name}"
-download_headers=()
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-	download_headers+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+	curl -fSL -H "Authorization: Bearer ${GITHUB_TOKEN}" -o "$archive_path" "$asset_url"
+else
+	curl -fSL -o "$archive_path" "$asset_url"
 fi
-curl -fSL "${download_headers[@]}" -o "$archive_path" "$asset_url"
+
+check_running
 
 extract_dir="${tmp_dir}/extract"
 mkdir -p "$extract_dir"
@@ -229,12 +308,13 @@ if [[ "$needs_launchd" -eq 1 ]]; then
   <key>WorkingDirectory</key>
   <string>${INSTALL_DIR}</string>
   <key>RunAtLoad</key>
-  <false/>
+  <true/>
   <key>KeepAlive</key>
-  <false/>
+  <true/>
 </dict>
 </plist>
 EOF
+	chown root:wheel "$LAUNCHD_PLIST_PATH"
 	chmod 644 "$LAUNCHD_PLIST_PATH"
 	log "launchd plist installed (not loaded)."
 fi
