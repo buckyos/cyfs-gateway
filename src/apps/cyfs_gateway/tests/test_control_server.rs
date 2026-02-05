@@ -8,7 +8,7 @@ mod tests {
     use jsonwebtoken::jwk::Jwk;
     use log::error;
     use name_lib::generate_ed25519_key_pair;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use cyfs_gateway::*;
     use cyfs_gateway_lib::*;
     use sfo_js::JsPkgManager;
@@ -64,6 +64,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cmd_server() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("BUCKYOS_ROOT", temp_dir.path().to_string_lossy().to_string());
         init_logging("cyfs_gateway", false);
         let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
 
@@ -86,7 +88,7 @@ mod tests {
             error!("{}", msg);
             std::process::exit(1);
         }
-        let config_loader = load_result.unwrap();
+        let mut config_loader = load_result.unwrap();
 
         let connect_manager = ConnectionManager::new();
         let tunnel_manager = TunnelManager::new();
@@ -130,6 +132,12 @@ mod tests {
 
         factory.register_server_factory("control_server", Arc::new(GatewayControlServerFactory::new()));
         factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new()));
+
+        let login = json!({
+            "user_name": "test",
+            "password": "123456"
+        });
+        merge(&mut config_loader.raw_config, &login);
         let gateway = factory.create_gateway(None, config_loader).await;
         assert!(gateway.is_ok());
         let gateway = gateway.unwrap();
@@ -146,6 +154,7 @@ mod tests {
         assert!(ret.is_ok());
 
         let ret = cmd_client.get_config_by_id(None).await;
+        ret.as_ref().unwrap();
         assert!(ret.is_ok());
     }
 }
