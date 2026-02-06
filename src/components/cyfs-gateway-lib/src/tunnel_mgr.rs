@@ -95,15 +95,11 @@ impl TunnelManager {
                 error!("Get tunnel builder by protocol failed: {:?}", e);
                 e
             })?;
-        let tunnel_stack_id = if target_url.scheme() == "socks" {
             let auth = target_url.authority();
-            if auth.is_empty() {
+        let tunnel_stack_id = if auth.is_empty() {
                 None
             } else {
                 Some(auth)
-            }
-        } else {
-            target_url.host_str()
         };
         let tunnel = builder.create_tunnel(tunnel_stack_id)
             .await.map_err(|e| {
@@ -286,6 +282,6 @@ mod tests {
         assert!(ret.is_ok());
 
         let value = captured.lock().unwrap().clone();
-        assert_eq!(value.as_deref(), Some("127.0.0.1"));
+        assert_eq!(value.as_deref(), Some("127.0.0.1:18080"));
     }
 }
