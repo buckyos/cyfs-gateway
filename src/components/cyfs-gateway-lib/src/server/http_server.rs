@@ -306,6 +306,22 @@ impl ProcessChainHttpServer {
 #[async_trait::async_trait]
 impl HttpServer for ProcessChainHttpServer {
     async fn serve_request(&self, req: http::Request<BoxBody<Bytes, ServerError>>, info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        // Capture request meta early so we can log it even if the process chain
+        // decides to drop/reject without forwarding the request.
+        let req_method = req.method().to_string();
+        let req_host = req
+            .headers()
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("none")
+            .to_string();
+        let req_uri = req.uri().to_string();
+        let req_remote = info
+            .src_addr
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_string();
+
         let executor = {
             self.executor.lock().unwrap().fork()
         };
@@ -326,7 +342,14 @@ impl HttpServer for ProcessChainHttpServer {
                 );
                 return self.apply_post_chain(response).await;
             } else if ret.is_reject() {
-                debug!("Request rejected by the process chain");
+                debug!(
+                    "process_chain_reject server={} remote={} method={} host={} uri={}",
+                    self.id,
+                    req_remote,
+                    req_method,
+                    req_host,
+                    req_uri,
+                );
                 let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 return self.apply_post_chain(response).await;

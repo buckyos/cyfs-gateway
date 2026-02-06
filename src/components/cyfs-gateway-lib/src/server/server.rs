@@ -1047,13 +1047,48 @@ pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn Http
                     let (parts, body) = req.into_parts();
                     let req = Request::new(BoxBody::new(body)).map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                     let req = Request::from_parts(parts, req);
-                    log::info!("recv http request:remote {} method {} host {} path {}",
-            info.src_addr.as_ref().unwrap_or(&"new req".to_string()),
-            req.method().to_string(),
-            req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
-            req.uri().to_string());
+                    let remote = info.src_addr.clone().unwrap_or_else(|| "unknown".to_string());
+                    let method_is_options = req.method() == Method::OPTIONS;
+                    let method = req.method().to_string();
+                    let host = req
+                        .headers()
+                        .get("host")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("none")
+                        .to_string();
+                    let uri = req.uri().to_string();
+                    log::info!(
+                        "recv http request:remote {} method {} host {} path {}",
+                        remote,
+                        method,
+                        host,
+                        uri,
+                    );
                     match server.serve_request(req, info).await {
-                        Ok(resp) => Ok(resp),
+                        Ok(resp) => {
+                            if resp.status() == StatusCode::FORBIDDEN {
+                                if method_is_options {
+                                    log::warn!(
+                                        "http_forbidden server={} remote={} method={} host={} uri={}",
+                                        server.id(),
+                                        remote,
+                                        method,
+                                        host,
+                                        uri,
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "http_forbidden server={} remote={} method={} host={} uri={}",
+                                        server.id(),
+                                        remote,
+                                        method,
+                                        host,
+                                        uri,
+                                    );
+                                }
+                            }
+                            Ok(resp)
+                        }
                         Err(e) => {
                             log::error!("http error {}", e);
                             Response::builder()
@@ -1076,17 +1111,50 @@ pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn Http
                         .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                     let req = Request::from_parts(parts, req);
                     let http3_port = server.http3_port().unwrap();
-                    log::info!("recv http request:remote {} method {} host {} path {}",
-            info.src_addr.as_ref().unwrap_or(&"new req".to_string()),
-            req.method().to_string(),
-            req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
-            req.uri().to_string());
+                    let remote = info.src_addr.clone().unwrap_or_else(|| "unknown".to_string());
+                    let method_is_options = req.method() == Method::OPTIONS;
+                    let method = req.method().to_string();
+                    let host = req
+                        .headers()
+                        .get("host")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("none")
+                        .to_string();
+                    let uri = req.uri().to_string();
+                    log::info!(
+                        "recv http request:remote {} method {} host {} path {}",
+                        remote,
+                        method,
+                        host,
+                        uri,
+                    );
                     match server.serve_request(req, info).await {
                         Ok(mut res) => {
                             res.headers_mut().insert(
                                 http::header::ALT_SVC,
                                 http::HeaderValue::from_str(format!("h3=\":{http3_port}\"; ma=86400").as_str()).unwrap(),
                             );
+                            if res.status() == StatusCode::FORBIDDEN {
+                                if method_is_options {
+                                    log::warn!(
+                                        "http_forbidden server={} remote={} method={} host={} uri={}",
+                                        server.id(),
+                                        remote,
+                                        method,
+                                        host,
+                                        uri,
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "http_forbidden server={} remote={} method={} host={} uri={}",
+                                        server.id(),
+                                        remote,
+                                        method,
+                                        host,
+                                        uri,
+                                    );
+                                }
+                            }
                             Ok(res)
                         },
                         Err(e) => {
@@ -1110,13 +1178,48 @@ pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn Http
                     let req = Request::new(BoxBody::new(body))
                         .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                     let req = Request::from_parts(parts, req);
-                    log::info!("recv http request:remote {} method {} host {} path {}",
-            info.src_addr.as_ref().unwrap_or(&"new req".to_string()),
-            req.method().to_string(),
-            req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
-            req.uri().to_string());
+                    let remote = info.src_addr.clone().unwrap_or_else(|| "unknown".to_string());
+                    let method_is_options = req.method() == Method::OPTIONS;
+                    let method = req.method().to_string();
+                    let host = req
+                        .headers()
+                        .get("host")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("none")
+                        .to_string();
+                    let uri = req.uri().to_string();
+                    log::info!(
+                        "recv http request:remote {} method {} host {} path {}",
+                        remote,
+                        method,
+                        host,
+                        uri,
+                    );
                     match server.serve_request(req, info).await {
-                        Ok(resp) => Ok(resp),
+                        Ok(resp) => {
+                            if resp.status() == StatusCode::FORBIDDEN {
+                                if method_is_options {
+                                    log::warn!(
+                                        "http_forbidden server={} remote={} method={} host={} uri={}",
+                                        server.id(),
+                                        remote,
+                                        method,
+                                        host,
+                                        uri,
+                                    );
+                                } else {
+                                    log::debug!(
+                                        "http_forbidden server={} remote={} method={} host={} uri={}",
+                                        server.id(),
+                                        remote,
+                                        method,
+                                        host,
+                                        uri,
+                                    );
+                                }
+                            }
+                            Ok(resp)
+                        }
                         Err(e) => {
                             log::error!("http error {}", e);
                             Response::builder()
@@ -1143,13 +1246,48 @@ pub async fn hyper_serve_http1(stream: Box<dyn AsyncStream>, server: Arc<dyn Htt
                 let req = Request::new(BoxBody::new(body))
                     .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
                 let req = Request::from_parts(parts, req);
-                log::info!("recv http request:remote {} method {} host {} path {}",
-            info.src_addr.as_ref().unwrap_or(&"new req".to_string()),
-            req.method().to_string(),
-            req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
-            req.uri().to_string());
+                let remote = info.src_addr.clone().unwrap_or_else(|| "unknown".to_string());
+                let method_is_options = req.method() == Method::OPTIONS;
+                let method = req.method().to_string();
+                let host = req
+                    .headers()
+                    .get("host")
+                    .and_then(|h| h.to_str().ok())
+                    .unwrap_or("none")
+                    .to_string();
+                let uri = req.uri().to_string();
+                log::info!(
+                    "recv http request:remote {} method {} host {} path {}",
+                    remote,
+                    method,
+                    host,
+                    uri,
+                );
                 match server.serve_request(req, info).await {
-                    Ok(resp) => Ok(resp),
+                    Ok(resp) => {
+                        if resp.status() == StatusCode::FORBIDDEN {
+                            if method_is_options {
+                                log::warn!(
+                                    "http_forbidden server={} remote={} method={} host={} uri={}",
+                                    server.id(),
+                                    remote,
+                                    method,
+                                    host,
+                                    uri,
+                                );
+                            } else {
+                                log::debug!(
+                                    "http_forbidden server={} remote={} method={} host={} uri={}",
+                                    server.id(),
+                                    remote,
+                                    method,
+                                    host,
+                                    uri,
+                                );
+                            }
+                        }
+                        Ok(resp)
+                    }
                     Err(e) => {
                         log::error!("http error {}", e);
                         Response::builder()
