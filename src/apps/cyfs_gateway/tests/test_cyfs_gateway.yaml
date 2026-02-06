@@ -66,6 +66,30 @@ stacks:
               http-probe && call-server ${REQ.dest_host};
               reject;
 
+  socks_stack:
+    bind: 127.0.0.1:{{socks_stack_port}}
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server socks_proxy;
+
+  upstream_socks_stack:
+    bind: 127.0.0.1:{{upstream_socks_stack_port}}
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server upstream_socks;
+
   test3:
     bind: 0.0.0.0:9545
     protocol: udp
@@ -152,6 +176,37 @@ servers:
     device_jwt: ["eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA"]
     db_type: sqlite
     db_path: {{sn_db}}
+
+  socks_proxy:
+    type: socks
+    username: {{socks_user}}
+    password: {{socks_pass}}
+    target: socks://{{upstream_socks_user}}:{{upstream_socks_pass}}@127.0.0.1:{{upstream_socks_stack_port}}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              eq ${REQ.target.port} "{{echo_direct_port}}" && return "DIRECT";
+              eq ${REQ.target.port} "{{echo_proxy_port}}" && return "PROXY";
+              reject;
+
+  upstream_socks:
+    type: socks
+    username: {{upstream_socks_user}}
+    password: {{upstream_socks_pass}}
+    target: http://127.0.0.1:0
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              eq ${REQ.target.port} "{{echo_proxy_port}}" && set-add test_json_set upstream_socks_hit && return "DIRECT";
+              reject;
 
 
   local_dns:
