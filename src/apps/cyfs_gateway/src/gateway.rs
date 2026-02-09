@@ -597,6 +597,7 @@ impl GatewayFactory {
         }
 
         let control_handler: Arc<dyn GatewayControlCmdHandler> = handler.clone();
+        let timer_manager = TimerManager::new();
         let gateway = Arc::new(Gateway {
             config_file: config_file.map(|v| v.to_path_buf()),
             init_config: Mutex::new(config.clone()),
@@ -612,7 +613,30 @@ impl GatewayFactory {
             external_cmds,
             control_handler,
             control_token_manager: token_manager,
+            timer_manager,
         });
+        let timers = gateway
+            .config
+            .lock()
+            .unwrap()
+            .timers
+            .iter()
+            .map(|timer| TimerTaskConfig {
+                id: timer.id.clone(),
+                timeout: timer.timeout,
+                process_chains: timer.to_process_chains(),
+            })
+            .collect::<Vec<_>>();
+        gateway
+            .timer_manager
+            .reload(
+                &timers,
+                Arc::downgrade(&server_manager),
+                global_process_chains,
+                global_collections,
+                js_externals,
+            )
+            .await?;
         handler.set_gateway(gateway.clone());
         Ok(gateway)
     }
@@ -633,10 +657,12 @@ pub struct Gateway {
     external_cmds: JsPkgManagerRef,
     control_handler: Arc<dyn GatewayControlCmdHandler>,
     control_token_manager: Arc<LocalTokenManager<LocalTokenKeyStore>>,
+    timer_manager: TimerManager,
 }
 
 impl Drop for Gateway {
     fn drop(&mut self) {
+        self.timer_manager.stop_all();
         info!("Gateway is dropped!");
     }
 }
@@ -2641,6 +2667,26 @@ impl Gateway {
                 }
             }
         }
+
+        let timer_tasks = config
+            .timers
+            .iter()
+            .map(|timer| TimerTaskConfig {
+                id: timer.id.clone(),
+                timeout: timer.timeout,
+                process_chains: timer.to_process_chains(),
+            })
+            .collect::<Vec<_>>();
+
+        self.timer_manager
+            .reload(
+                &timer_tasks,
+                Arc::downgrade(&server_manager),
+                global_process_chains,
+                global_collections,
+                js_externals,
+            )
+            .await?;
 
         *self.config.lock().unwrap() = config;
         *self.limiter_manager.lock().unwrap() = limiter_manager;

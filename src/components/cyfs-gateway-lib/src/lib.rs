@@ -22,6 +22,7 @@ mod self_cert_mgr;
 mod tls_tunnel;
 mod collections;
 mod global_collection_manager;
+mod timer_manager;
 
 pub use aes_stream::*;
 pub use config::*;
@@ -42,6 +43,7 @@ pub use cmds::*;
 pub use self_cert_mgr::*;
 pub use collections::*;
 pub use global_collection_manager::*;
+pub use timer_manager::*;
 
 use thiserror::Error;
 use std::sync::Arc;
@@ -81,5 +83,4 @@ pub struct GatewayDevice {
 }
 
 pub type GatewayDeviceRef = Arc<GatewayDevice>;
-
 

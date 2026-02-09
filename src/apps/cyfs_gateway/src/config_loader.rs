@@ -1,8 +1,9 @@
 use cyfs_dns::{DnsServerConfig, LocalDnsConfig};
 use cyfs_gateway_lib::{
-    config_err, AcmeHttpChallengeServerConfig, CollectionConfig, ConfigErrorCode, ConfigResult,
-    DirServerConfig, ProcessChainConfig, ProcessChainConfigs, ProcessChainHttpServerConfig,
-    QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig,
+    config_err, AcmeHttpChallengeServerConfig, BlockConfig, CollectionConfig, ConfigErrorCode,
+    ConfigResult, DirServerConfig, ProcessChainConfig, ProcessChainConfigs,
+    ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig,
+    TcpStackConfig, UdpStackConfig,
 };
 use cyfs_sn::*;
 use cyfs_socks::SocksServerConfig;
@@ -551,6 +552,28 @@ pub struct GatewayConfigParser {
 }
 pub type GatewayConfigParserRef = Arc<GatewayConfigParser>;
 
+#[derive(Deserialize, Clone)]
+pub struct TimerConfig {
+    pub id: String,
+    pub timeout: u64,
+    #[serde(rename = "process-chain", alias = "process_chain")]
+    pub process_chain: String,
+}
+
+impl TimerConfig {
+    pub fn to_process_chains(&self) -> ProcessChainConfigs {
+        vec![ProcessChainConfig {
+            id: "main".to_string(),
+            priority: 1,
+            blocks: vec![BlockConfig {
+                id: "default".to_string(),
+                priority: 1,
+                block: self.process_chain.clone(),
+            }],
+        }]
+    }
+}
+
 impl GatewayConfigParser {
     pub fn new() -> Self {
         let cyfs_stack_parser = CyfsStackConfigParser::new();
@@ -784,6 +807,33 @@ impl GatewayConfigParser {
             }
         }
 
+        let mut timers = Vec::new();
+        if let Some(timers_value) = json_value.get("timers") {
+            if let Some(timers_value) = timers_value.as_object() {
+                for (id, timer_value) in timers_value.iter() {
+                    let mut timer_with_id = timer_value.clone();
+                    timer_with_id["id"] = serde_json::Value::String(id.clone());
+                    let timer =
+                        serde_json::from_value::<TimerConfig>(timer_with_id).map_err(|e| {
+                            config_err!(
+                                ConfigErrorCode::InvalidConfig,
+                                "invalid timer config: {:?}\n{}",
+                                e,
+                                serde_json::to_string_pretty(timer_value).unwrap()
+                            )
+                        })?;
+                    if timer.timeout == 0 {
+                        return Err(config_err!(
+                            ConfigErrorCode::InvalidConfig,
+                            "invalid timer config {}: timeout must be greater than 0",
+                            timer.id
+                        ));
+                    }
+                    timers.push(timer);
+                }
+            }
+        }
+
         Ok(GatewayConfig {
             raw_config,
             limiters_config,
@@ -793,6 +843,7 @@ impl GatewayConfigParser {
             servers,
             global_process_chains,
             collections,
+            timers,
         })
     }
 }
@@ -855,6 +906,7 @@ pub struct GatewayConfig {
     pub servers: Vec<Arc<dyn ServerConfig>>,
     pub global_process_chains: ProcessChainConfigs,
     pub collections: Vec<CollectionConfig>,
+    pub timers: Vec<TimerConfig>,
 }
 
 #[cfg(test)]
@@ -920,6 +972,43 @@ mod tests {
         assert_eq!(config.download_speed, Some(100 * 1024));
         assert_eq!(config.upload_speed, Some(100 * 1024));
         assert_eq!(config.concurrent, None);
+    }
+
+    #[test]
+    fn test_timer_config_parser() {
+        let parser = super::GatewayConfigParser::new();
+        let json = json!({
+            "timer": {
+                "t1": {
+                    "timeout": 120,
+                    "process-chain": "echo \"test\";"
+                },
+                "t2": {
+                    "timeout": 60,
+                    "process_chain": "echo \"test2\";"
+                }
+            }
+        });
+        let config = parser.parse(json).unwrap();
+        assert_eq!(config.timers.len(), 2);
+        let t1 = config.timers.iter().find(|timer| timer.id == "t1").unwrap();
+        let t2 = config.timers.iter().find(|timer| timer.id == "t2").unwrap();
+        assert_eq!(t1.timeout, 120);
+        assert_eq!(t2.timeout, 60);
+    }
+
+    #[test]
+    fn test_timer_config_timeout_zero() {
+        let parser = super::GatewayConfigParser::new();
+        let json = json!({
+            "timer": {
+                "t1": {
+                    "timeout": 0,
+                    "process-chain": "echo \"test\";"
+                }
+            }
+        });
+        assert!(parser.parse(json).is_err());
     }
 
     #[test]

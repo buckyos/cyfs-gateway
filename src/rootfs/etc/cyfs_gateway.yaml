@@ -18,3 +18,9 @@ includes:
   - path: boot_gateway.yaml
   - path: node_gateway.json
   - path: post_gateway.json
+
+timers:
+  test_timer:
+    timeout: 120
+    process-chain: |
+      echo "test"
