@@ -3,12 +3,27 @@ use http::{Version, StatusCode};
 use http_body_util::combinators::{BoxBody};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Local};
 use crate::{HttpServer, Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
 use super::server_err;
 use futures_util::TryStreamExt;
 use tokio::io::AsyncReadExt;
 use std::sync::Arc;
+
+const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/');
 
 /// DirServer Builder for fluent configuration
 pub struct DirServerBuilder {
@@ -18,6 +33,7 @@ pub struct DirServerBuilder {
     index_file: Option<String>,
     fallback_file: Option<String>,
     base_url: Option<String>,
+    autoindex: bool,
 }
 
 impl DirServerBuilder {
@@ -51,6 +67,11 @@ impl DirServerBuilder {
         self
     }
 
+    pub fn autoindex(mut self, autoindex: bool) -> Self {
+        self.autoindex = autoindex;
+        self
+    }
+
     pub async fn build(self) -> ServerResult<DirServer> {
         DirServer::create_server(self).await
     }
@@ -64,6 +85,7 @@ pub struct DirServer {
     index_file: String,
     fallback_file: Option<String>,
     base_url: String,
+    autoindex: bool,
 }
 
 impl DirServer {
@@ -75,6 +97,7 @@ impl DirServer {
             index_file: None,
             fallback_file: None,
             base_url: None,
+            autoindex: false,
         }
     }
 
@@ -143,6 +166,7 @@ impl DirServer {
             index_file,
             fallback_file,
             base_url: builder.base_url.unwrap_or_else(|| "/".to_string()),
+            autoindex: builder.autoindex,
         })
     }
 
@@ -247,20 +271,188 @@ impl DirServer {
             })?)
     }
 
-    /// Normalize the request path and resolve to local file path
-    fn resolve_path(&self, req_path: &str) -> PathBuf {
-        // Remove leading slash
-        let sub_path = req_path.trim_start_matches(&self.base_url);
-        
-        // Resolve the full path
-        let mut file_path = self.root_dir.join(sub_path);
+    fn resolve_path(&self, req_path: &str) -> ServerResult<PathBuf> {
+        let stripped = req_path.strip_prefix(&self.base_url).unwrap_or(req_path);
+        let sub_path = stripped.trim_start_matches('/');
+        let mut path = self.root_dir.clone();
 
-        // If it's a directory, append index file
-        if file_path.is_dir() {
-            file_path = file_path.join(&self.index_file);
+        for component in Path::new(sub_path).components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(part) => path.push(part),
+                Component::ParentDir => {
+                    return Err(server_err!(
+                        ServerErrorCode::InvalidParam,
+                        "path traversal is not allowed"
+                    ));
+                }
+                Component::RootDir | Component::Prefix(_) => {}
+            }
         }
 
-        file_path
+        Ok(path)
+    }
+
+    fn build_text_response(
+        &self,
+        status: StatusCode,
+        body: impl Into<Bytes>,
+    ) -> http::Response<BoxBody<Bytes, ServerError>> {
+        http::Response::builder()
+            .status(status)
+            .body(Full::new(body.into()).map_err(|e| match e {}).boxed())
+            .unwrap()
+    }
+
+    fn build_html_response(
+        &self,
+        status: StatusCode,
+        body: String,
+    ) -> http::Response<BoxBody<Bytes, ServerError>> {
+        http::Response::builder()
+            .status(status)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
+            .unwrap()
+    }
+
+    fn ensure_path_in_root(&self, path: &Path) -> ServerResult<PathBuf> {
+        let canonical_path = path.canonicalize().map_err(|e| {
+            server_err!(ServerErrorCode::IOError, "Failed to canonicalize path: {}", e)
+        })?;
+        if !canonical_path.starts_with(&self.root_dir) {
+            return Err(server_err!(
+                ServerErrorCode::InvalidParam,
+                "path out of root directory"
+            ));
+        }
+        Ok(canonical_path)
+    }
+
+    fn escape_html(input: &str) -> String {
+        let mut escaped = String::with_capacity(input.len());
+        for ch in input.chars() {
+            match ch {
+                '&' => escaped.push_str("&amp;"),
+                '<' => escaped.push_str("&lt;"),
+                '>' => escaped.push_str("&gt;"),
+                '"' => escaped.push_str("&quot;"),
+                '\'' => escaped.push_str("&#39;"),
+                _ => escaped.push(ch),
+            }
+        }
+        escaped
+    }
+
+    fn format_modified_time(st: std::time::SystemTime) -> String {
+        let dt: DateTime<Local> = st.into();
+        dt.format("%d-%b-%Y %H:%M").to_string()
+    }
+
+    async fn serve_directory_listing(
+        &self,
+        req_path: &str,
+        dir_path: &Path,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        struct Entry {
+            name: String,
+            href: String,
+            is_dir: bool,
+            modified: String,
+            size: String,
+        }
+
+        let mut entries = Vec::new();
+        let mut read_dir = tokio::fs::read_dir(dir_path).await.map_err(|e| {
+            server_err!(ServerErrorCode::IOError, "Failed to read directory: {}", e)
+        })?;
+
+        let req_base = if req_path.ends_with('/') {
+            req_path.to_string()
+        } else {
+            format!("{}/", req_path)
+        };
+
+        while let Some(entry) = read_dir.next_entry().await.map_err(|e| {
+            server_err!(ServerErrorCode::IOError, "Failed to read directory entry: {}", e)
+        })? {
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+
+            let metadata = entry.metadata().await.map_err(|e| {
+                server_err!(ServerErrorCode::IOError, "Failed to read metadata: {}", e)
+            })?;
+            let is_dir = metadata.is_dir();
+            let encoded_name = utf8_percent_encode(&name, PATH_SEGMENT_ENCODE_SET).to_string();
+            let mut href = format!("{}{}", req_base, encoded_name);
+            if is_dir {
+                href.push('/');
+            }
+
+            let modified = metadata
+                .modified()
+                .ok()
+                .map(Self::format_modified_time)
+                .unwrap_or_else(|| "-".to_string());
+            let size = if is_dir {
+                "-".to_string()
+            } else {
+                metadata.len().to_string()
+            };
+
+            entries.push(Entry {
+                name,
+                href,
+                is_dir,
+                modified,
+                size,
+            });
+        }
+
+        entries.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.as_bytes().cmp(b.name.as_bytes()))
+        });
+
+        let escaped_path = Self::escape_html(req_path);
+        let mut html = String::new();
+        html.push_str("<!doctype html>\r\n<html lang=\"en\">\r\n<head>\r\n<meta charset=\"utf-8\">\r\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\r\n<title>Index of ");
+        html.push_str(&escaped_path);
+        html.push_str("</title>\r\n<style>\r\n:root {\r\n  color-scheme: light;\r\n  --bg: #f3f6fb;\r\n  --panel: #ffffff;\r\n  --text: #1f2937;\r\n  --muted: #64748b;\r\n  --line: #d8e1ec;\r\n  --link: #0f62d6;\r\n  --link-hover: #0b4fb0;\r\n}\r\n* { box-sizing: border-box; }\r\nbody {\r\n  margin: 0;\r\n  font-family: \"Segoe UI\", \"PingFang SC\", \"Microsoft YaHei\", sans-serif;\r\n  color: var(--text);\r\n  background: radial-gradient(circle at top right, #e8f0ff 0%, var(--bg) 45%, #edf2f9 100%);\r\n}\r\nmain {\r\n  max-width: 980px;\r\n  margin: 24px auto;\r\n  padding: 0 16px;\r\n}\r\nsection {\r\n  background: var(--panel);\r\n  border: 1px solid var(--line);\r\n  border-radius: 12px;\r\n  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);\r\n  overflow: hidden;\r\n}\r\nh1 {\r\n  margin: 0;\r\n  padding: 18px 20px;\r\n  font-size: 20px;\r\n  font-weight: 600;\r\n  letter-spacing: 0.01em;\r\n}\r\nhr {\r\n  margin: 0;\r\n  border: 0;\r\n  border-top: 1px solid var(--line);\r\n}\r\npre {\r\n  margin: 0;\r\n  padding: 14px 20px 20px;\r\n  overflow-x: auto;\r\n  font-family: Consolas, \"Courier New\", monospace;\r\n  font-size: 14px;\r\n  line-height: 1.55;\r\n}\r\na {\r\n  color: var(--link);\r\n  text-decoration: none;\r\n}\r\na:hover {\r\n  color: var(--link-hover);\r\n  text-decoration: underline;\r\n}\r\n@media (max-width: 640px) {\r\n  main {\r\n    margin: 14px auto;\r\n    padding: 0 10px;\r\n  }\r\n  h1 {\r\n    padding: 14px 14px;\r\n    font-size: 18px;\r\n  }\r\n  pre {\r\n    padding: 10px 14px 14px;\r\n    font-size: 13px;\r\n  }\r\n}\r\n</style>\r\n</head>\r\n<body>\r\n<main><section>\r\n<h1>Index of ");
+        html.push_str(&escaped_path);
+        html.push_str("</h1><hr><pre><a href=\"../\">../</a>\r\n");
+
+        for entry in entries {
+            let mut display_name = entry.name;
+            if entry.is_dir {
+                display_name.push('/');
+            }
+
+            let mut short_name: String = display_name.chars().take(50).collect();
+            if display_name.chars().count() > 50 {
+                short_name = format!("{}..>", display_name.chars().take(47).collect::<String>());
+            }
+
+            let escaped_name = Self::escape_html(&short_name);
+            let escaped_href = Self::escape_html(&entry.href);
+            let pad = 50usize.saturating_sub(short_name.chars().count());
+            let spaces = " ".repeat(pad);
+            html.push_str(&format!(
+                "<a href=\"{}\">{}</a>{} {} {:>19}\r\n",
+                escaped_href,
+                escaped_name,
+                spaces,
+                entry.modified,
+                entry.size
+            ));
+        }
+
+        html.push_str("</pre><hr></section></main></body>\r\n</html>\r\n");
+        Ok(self.build_html_response(StatusCode::OK, html))
     }
 }
 
@@ -279,21 +471,45 @@ impl HttpServer for DirServer {
         // Only support GET and HEAD methods
         if req_method != hyper::Method::GET && req_method != hyper::Method::HEAD {
             warn!("Method not allowed: {}", req_method);
-            return Ok(http::Response::builder()
-                .status(StatusCode::METHOD_NOT_ALLOWED)
-                .body(Full::new(Bytes::from("Method not allowed")).map_err(|e| match e {}).boxed())
-                .unwrap());
+            return Ok(self.build_text_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed"));
         }
 
-        let file_path = self.resolve_path(req_path);
+        let mut file_path = match self.resolve_path(req_path) {
+            Ok(path) => path,
+            Err(_) => {
+                warn!("Path traversal attempt: {}", req_path);
+                return Ok(self.build_text_response(StatusCode::FORBIDDEN, "Forbidden"));
+            }
+        };
 
-        // Security check: prevent path traversal
-        if !file_path.starts_with(&self.root_dir) {
-            warn!("Path traversal attempt: {:?}", file_path);
-            return Ok(http::Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Full::new(Bytes::from("Forbidden")).map_err(|e| match e {}).boxed())
-                .unwrap());
+        if file_path.exists() {
+            file_path = match self.ensure_path_in_root(&file_path) {
+                Ok(path) => path,
+                Err(_) => {
+                    warn!("Path traversal attempt: {:?}", file_path);
+                    return Ok(self.build_text_response(StatusCode::FORBIDDEN, "Forbidden"));
+                }
+            };
+        }
+
+        if file_path.is_dir() {
+            let index_path = file_path.join(&self.index_file);
+            if index_path.exists() && index_path.is_file() {
+                let index_path = match self.ensure_path_in_root(&index_path) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        warn!("Path traversal attempt: {:?}", index_path);
+                        return Ok(self.build_text_response(StatusCode::FORBIDDEN, "Forbidden"));
+                    }
+                };
+                info!("Serving index file: {:?}", index_path);
+                return self.serve_file(&index_path, &req).await;
+            }
+
+            if self.autoindex {
+                info!("Serving directory listing: {:?}", file_path);
+                return self.serve_directory_listing(req_path, &file_path).await;
+            }
         }
 
         // Check if file exists
@@ -301,12 +517,9 @@ impl HttpServer for DirServer {
             warn!("File not found: {:?}", file_path);
             if let Some(fallback_file) = &self.fallback_file {
                 let fallback_path = self.root_dir.join(fallback_file);
-                match fallback_path.canonicalize() {
+                match self.ensure_path_in_root(&fallback_path) {
                     Ok(fallback_path) => {
-                        if fallback_path.starts_with(&self.root_dir)
-                            && fallback_path.exists()
-                            && fallback_path.is_file()
-                        {
+                        if fallback_path.exists() && fallback_path.is_file() {
                             info!("Fallback to file: {:?}", fallback_path);
                             return self.serve_file(&fallback_path, &req).await;
                         }
@@ -317,10 +530,7 @@ impl HttpServer for DirServer {
                     }
                 }
             }
-            return Ok(http::Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from("Not found")).map_err(|e| match e {}).boxed())
-                .unwrap());
+            return Ok(self.build_text_response(StatusCode::NOT_FOUND, "Not found"));
         }
 
         info!("Serving file: {:?}", file_path);
@@ -355,6 +565,8 @@ pub struct DirServerConfig {
     pub index_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_file: Option<String>,
+    #[serde(default)]
+    pub autoindex: bool,
 }
 
 impl ServerConfig for DirServerConfig {
@@ -407,6 +619,8 @@ impl ServerFactory for DirServerFactory {
         if let Some(fallback_file) = &config.fallback_file {
             builder = builder.fallback_file(fallback_file.clone());
         }
+
+        builder = builder.autoindex(config.autoindex);
 
         let server = builder.build().await?;
         Ok(vec![Server::Http(Arc::new(server))])
@@ -574,10 +788,118 @@ mod tests {
             root_path: temp_dir.path().to_string_lossy().to_string(),
             index_file: None,
             fallback_file: None,
+            autoindex: false,
         };
         
         let factory = DirServerFactory::new();
         let result = factory.create(Arc::new(config), None).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dir_prefers_index_file_before_autoindex_listing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(temp_dir.path().join("index.html"), b"index-body")
+            .await
+            .unwrap();
+        tokio::fs::write(temp_dir.path().join("another.txt"), b"another")
+            .await
+            .unwrap();
+
+        let server = Arc::new(
+            DirServer::builder()
+                .id("test")
+                .root_path(temp_dir.path().to_path_buf())
+                .autoindex(true)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let (client, server_stream) = tokio::io::duplex(1024);
+
+        tokio::spawn(async move {
+            hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body_bytes.as_ref(), b"index-body");
+    }
+
+    #[tokio::test]
+    async fn test_dir_returns_listing_when_index_missing_and_autoindex_enabled() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(temp_dir.path().join("visible.txt"), b"visible")
+            .await
+            .unwrap();
+        tokio::fs::write(temp_dir.path().join(".hidden.txt"), b"hidden")
+            .await
+            .unwrap();
+
+        let server = Arc::new(
+            DirServer::builder()
+                .id("test")
+                .root_path(temp_dir.path().to_path_buf())
+                .autoindex(true)
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let (client, server_stream) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(content_type, "text/html; charset=utf-8");
+
+        let body = String::from_utf8(resp.collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(body.contains("visible.txt"));
+        assert!(!body.contains(".hidden.txt"));
+        assert!(body.contains("Index of /"));
     }
 }

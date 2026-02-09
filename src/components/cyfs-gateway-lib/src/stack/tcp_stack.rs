@@ -623,6 +623,7 @@ mod tests {
             stat_manager,
             global_process_chains,
             None,
+            None,
         ))
     }
 
@@ -1214,6 +1215,7 @@ mod tests {
             stat_manager,
             Some(global_process_chains),
             Some(collection_manager),
+            None,
         ));
         let ret = tcp_factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());

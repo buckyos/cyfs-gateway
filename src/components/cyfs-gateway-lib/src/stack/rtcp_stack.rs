@@ -825,6 +825,7 @@ mod tests {
             stat_manager,
             global_process_chains,
             None,
+            None,
         ))
     }
 
@@ -3327,6 +3328,7 @@ mod tests {
             stat_manager,
             Some(global_process_chains),
             Some(collection_manager),
+            None,
         ));
         let ret = factory.create(Arc::new(config), stack_context.clone()).await;
         assert!(ret.is_ok());

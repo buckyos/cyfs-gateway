@@ -697,7 +697,7 @@ mod tests {
     use std::sync::Arc;
     use buckyos_kit::init_logging;
     use hyper_util::rt::{TokioExecutor, TokioIo};
-    use crate::{GlobalProcessChains, ServerManager, StreamInfo, hyper_serve_http, hyper_serve_http1, GlobalCollectionManager};
+    use crate::{GlobalCollectionManager, GlobalProcessChains, JsExternalsManager, ServerManager, StreamInfo, hyper_serve_http, hyper_serve_http1};
     use tokio::io::AsyncReadExt;
 
     struct FixedResponseServer {
@@ -2009,6 +2009,7 @@ mod tests {
         let context = HttpServerContext::new(
             Arc::downgrade(&server_mgr),
             Arc::new(GlobalProcessChains::new()),
+            Arc::new(JsExternalsManager::new()),
             TunnelManager::new(),
             GlobalCollectionManager::create(vec![]).await.unwrap(),
         );

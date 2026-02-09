@@ -1421,6 +1421,7 @@ mod tests {
             self_cert_mgr,
             global_process_chains,
             global_collection_manager,
+            None,
         ))
     }
 
@@ -2529,6 +2530,7 @@ mod tests {
             self_cert_mgr,
             Some(global_process_chains),
             Some(collection_manager),
+            None,
         ));
         let ret = factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());
