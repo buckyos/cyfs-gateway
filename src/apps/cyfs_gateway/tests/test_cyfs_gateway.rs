@@ -49,6 +49,16 @@ mod tests {
         let text_set = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
         let config = config.replace("{{test_text_set}}", text_set.path().to_str().unwrap());
 
+        let js_hook_file = tempfile::NamedTempFile::with_suffix(".js").unwrap();
+        let js_hook = r#"
+function test_js_hook(context, host) {
+    console.log(`Checking host: ${host}`);
+    return true;
+}
+"#;
+        std::fs::write(js_hook_file.path(), js_hook).unwrap();
+        let config = config.replace("{{test_js_hook_file}}", js_hook_file.path().to_str().unwrap());
+
         let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
         let config = config.replace("{{sn_db}}", db.path().to_str().unwrap());
 

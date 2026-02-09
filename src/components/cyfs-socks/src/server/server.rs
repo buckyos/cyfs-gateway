@@ -1,7 +1,7 @@
 use super::config::SocksServerConfig;
 use crate::{Socks5Proxy, SocksDataTunnelProviderRef, SocksHookManager, SocksProxyAuth, SocksProxyConfig};
 use buckyos_kit::AsyncStream;
-use cyfs_gateway_lib::{server_err, GlobalProcessChainsRef, Server, ServerConfig, ServerContext, ServerContextRef, ServerErrorCode, ServerFactory, ServerResult, StreamServer, StreamInfo, GlobalCollectionManagerRef};
+use cyfs_gateway_lib::{server_err, GlobalProcessChainsRef, JsExternalsManagerRef, Server, ServerConfig, ServerContext, ServerContextRef, ServerErrorCode, ServerFactory, ServerResult, StreamServer, StreamInfo, GlobalCollectionManagerRef};
 use std::sync::Arc;
 
 pub struct SocksServer {
@@ -39,6 +39,7 @@ impl StreamServer for SocksServer {
 #[derive(Clone)]
 pub struct SocksServerContext {
     pub global_process_chains: GlobalProcessChainsRef,
+    pub js_externals: JsExternalsManagerRef,
     pub global_collection_manager: GlobalCollectionManagerRef,
     pub tunnel_provider: SocksDataTunnelProviderRef,
 }
@@ -46,11 +47,13 @@ pub struct SocksServerContext {
 impl SocksServerContext {
     pub fn new(
         global_process_chains: GlobalProcessChainsRef,
+        js_externals: JsExternalsManagerRef,
         global_collection_manager: GlobalCollectionManagerRef,
         tunnel_provider: SocksDataTunnelProviderRef,
     ) -> Self {
         Self {
             global_process_chains,
+            js_externals,
             global_collection_manager,
             tunnel_provider,
         }

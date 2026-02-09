@@ -15,7 +15,7 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackContext, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, DatagramInfo, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SpeedStatRef, get_external_commands, GlobalCollectionManagerRef};
+use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackContext, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, DatagramInfo, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SpeedStatRef, get_external_commands, GlobalCollectionManagerRef, JsExternalsManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 #[cfg(target_os = "linux")]
@@ -30,6 +30,7 @@ pub struct UdpStackContext {
     pub stat_manager: StatManagerRef,
     pub global_process_chains: Option<GlobalProcessChainsRef>,
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
+    pub js_externals: Option<JsExternalsManagerRef>,
 }
 
 impl UdpStackContext {
@@ -40,6 +41,7 @@ impl UdpStackContext {
         stat_manager: StatManagerRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
+        js_externals: Option<JsExternalsManagerRef>,
     ) -> Self {
         Self {
             servers,
@@ -48,6 +50,7 @@ impl UdpStackContext {
             stat_manager,
             global_process_chains,
             global_collection_manager,
+            js_externals,
         }
     }
 }
@@ -73,6 +76,7 @@ impl UdpDatagramHandler {
             env.global_process_chains.clone(),
             env.global_collection_manager.clone(),
             Some(get_external_commands(Arc::downgrade(&env.servers))),
+            env.js_externals.clone(),
         )
             .await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create process chain executor error: {}", e))?;

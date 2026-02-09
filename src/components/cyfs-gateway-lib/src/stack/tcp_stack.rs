@@ -7,7 +7,7 @@ use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, MutComposedSpeedStat, MutComposedSpeedStatRef, GlobalCollectionManagerRef, StackContext};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, MutComposedSpeedStat, MutComposedSpeedStatRef, GlobalCollectionManagerRef, JsExternalsManagerRef, StackContext};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -29,6 +29,7 @@ pub struct TcpStackContext {
     pub stat_manager: StatManagerRef,
     pub global_process_chains: Option<GlobalProcessChainsRef>,
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
+    pub js_externals: Option<JsExternalsManagerRef>,
 }
 
 impl TcpStackContext {
@@ -39,6 +40,7 @@ impl TcpStackContext {
         stat_manager: StatManagerRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
+        js_externals: Option<JsExternalsManagerRef>,
     ) -> Self {
         Self {
             servers,
@@ -47,6 +49,7 @@ impl TcpStackContext {
             stat_manager,
             global_process_chains,
             global_collection_manager,
+            js_externals,
         }
     }
 }
@@ -72,6 +75,7 @@ impl TcpConnectionHandler {
             env.global_process_chains.clone(),
             env.global_collection_manager.clone(),
             Some(get_external_commands(Arc::downgrade(&env.servers))),
+            env.js_externals.clone(),
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -90,6 +94,7 @@ impl TcpConnectionHandler {
             self.env.global_process_chains.clone(),
             self.env.global_collection_manager.clone(),
             Some(get_external_commands(Arc::downgrade(&self.env.servers))),
+            self.env.js_externals.clone(),
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;

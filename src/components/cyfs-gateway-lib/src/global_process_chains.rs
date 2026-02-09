@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicU32;
 use buckyos_kit::AsyncStream;
 use tokio::sync::RwLock;
 use cyfs_process_chain::*;
-use crate::{config_err, ConfigErrorCode, ConfigResult, GlobalCollectionManagerRef, ProcessChainConfig};
+use crate::{config_err, ConfigErrorCode, ConfigResult, GlobalCollectionManagerRef, JsExternalsManagerRef, ProcessChainConfig};
 
 #[derive(Clone)]
 pub struct GlobalProcessChains {
@@ -530,6 +530,7 @@ pub async fn create_process_chain_executor(
     global_process_chains: Option<GlobalProcessChainsRef>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
     external_commands: Option<Vec<(String, ExternalCommandRef)>>,
+    js_externals: Option<JsExternalsManagerRef>,
 ) -> ConfigResult<(ProcessChainLibExecutor, HookPointEnv)> {
     let hook_point = HookPoint::new("cyfs_server_hook_point");
     let process_chain_lib = ProcessChainListLib::new_empty("main", 0);
@@ -550,6 +551,21 @@ pub async fn create_process_chain_executor(
         for (name, cmd) in external_commands {
             hook_point_env.register_external_command(name.as_str(), cmd.clone())
                 .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
+        }
+    }
+
+    if let Some(js_externals) = js_externals {
+        for (name, cmd) in js_externals.get_external_commands() {
+            hook_point_env
+                .register_external_command(name.as_str(), cmd)
+                .map_err(|e| {
+                    config_err!(
+                        ConfigErrorCode::ProcessChainError,
+                        "register js external command '{}' failed: {}",
+                        name,
+                        e
+                    )
+                })?;
         }
     }
     

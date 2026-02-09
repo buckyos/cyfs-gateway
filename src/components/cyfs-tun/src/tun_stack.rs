@@ -20,6 +20,7 @@ pub struct TunStackContext {
     pub stat_manager: StatManagerRef,
     pub global_process_chains: Option<GlobalProcessChainsRef>,
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
+    pub js_externals: Option<JsExternalsManagerRef>,
 }
 
 impl TunStackContext {
@@ -30,6 +31,7 @@ impl TunStackContext {
         stat_manager: StatManagerRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
+        js_externals: Option<JsExternalsManagerRef>,
     ) -> Self {
         Self {
             servers,
@@ -38,6 +40,7 @@ impl TunStackContext {
             stat_manager,
             global_process_chains,
             global_collection_manager,
+            js_externals,
         }
     }
 }
@@ -60,6 +63,7 @@ impl TunConnectionHandler {
             env.global_process_chains.clone(),
             env.global_collection_manager.clone(),
             Some(get_external_commands(Arc::downgrade(&env.servers))),
+            env.js_externals.clone(),
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;

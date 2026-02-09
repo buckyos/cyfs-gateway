@@ -4,7 +4,7 @@ use buckyos_kit::AsyncStream;
 use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig};
 use sfo_io::{LimitStream, StatStream};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackContext, StackErrorCode, StackFactory, StackProtocol, StackResult, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, DatagramInfo, LimiterManagerRef, StatManagerRef, MutComposedSpeedStat, MutComposedSpeedStatRef, get_stat_info, TunnelError, has_scheme, GlobalCollectionManagerRef, get_external_commands};
+use crate::{hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, HandleConnectionController, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackContext, StackErrorCode, StackFactory, StackProtocol, StackResult, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, DatagramInfo, LimiterManagerRef, StatManagerRef, MutComposedSpeedStat, MutComposedSpeedStatRef, get_stat_info, TunnelError, has_scheme, GlobalCollectionManagerRef, get_external_commands, JsExternalsManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
@@ -20,6 +20,7 @@ pub struct RtcpStackContext {
     pub stat_manager: StatManagerRef,
     pub global_process_chains: Option<GlobalProcessChainsRef>,
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
+    pub js_externals: Option<JsExternalsManagerRef>,
 }
 
 impl RtcpStackContext {
@@ -30,6 +31,7 @@ impl RtcpStackContext {
         stat_manager: StatManagerRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
+        js_externals: Option<JsExternalsManagerRef>,
     ) -> Self {
         Self {
             servers,
@@ -38,6 +40,7 @@ impl RtcpStackContext {
             stat_manager,
             global_process_chains,
             global_collection_manager,
+            js_externals,
         }
     }
 }
@@ -63,6 +66,7 @@ impl RtcpConnectionHandler {
             env.global_process_chains.clone(),
             env.global_collection_manager.clone(),
             Some(get_external_commands(Arc::downgrade(&env.servers))),
+            env.js_externals.clone(),
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -82,6 +86,7 @@ impl RtcpConnectionHandler {
             env.global_process_chains.clone(),
             env.global_collection_manager.clone(),
             Some(get_external_commands(Arc::downgrade(&env.servers))),
+            env.js_externals.clone(),
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;

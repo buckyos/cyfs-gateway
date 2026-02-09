@@ -68,6 +68,7 @@ fn build_server_context(
     server_type: &str,
     server_manager: ServerManagerWeakRef,
     global_process_chains: GlobalProcessChainsRef,
+    js_externals: JsExternalsManagerRef,
     tunnel_manager: TunnelManager,
     global_collection_manager: GlobalCollectionManagerRef,
     acme_mgr: AcmeCertManagerRef,
@@ -80,17 +81,20 @@ fn build_server_context(
         "http" => Some(Arc::new(HttpServerContext::new(
             server_manager,
             global_process_chains,
+            js_externals,
             tunnel_manager,
             global_collection_manager,
         ))),
         "dns" => Some(Arc::new(DnsServerContext::new(
             server_manager,
             global_process_chains,
+            js_externals,
             global_collection_manager,
             inner_dns_record_manager,
         ))),
         "socks" => Some(Arc::new(SocksServerContext::new(
             global_process_chains,
+            js_externals,
             global_collection_manager,
             SocksTunnelBuilder::new_ref(tunnel_manager),
         ))),
@@ -115,6 +119,7 @@ fn build_stack_context(
     stat_manager: StatManagerRef,
     global_process_chains: Option<GlobalProcessChainsRef>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
+    js_externals: Option<JsExternalsManagerRef>,
     acme_manager: AcmeCertManagerRef,
     self_cert_mgr: SelfCertMgrRef, ) -> StackResult<Arc<dyn StackContext>> {
     match protocol {
@@ -125,6 +130,7 @@ fn build_stack_context(
             stat_manager.clone(),
             global_process_chains.clone(),
             global_collection_manager.clone(),
+            js_externals.clone(),
         ))),
         StackProtocol::Udp => Ok(Arc::new(UdpStackContext::new(
             servers.clone(),
@@ -133,6 +139,7 @@ fn build_stack_context(
             stat_manager.clone(),
             global_process_chains.clone(),
             global_collection_manager.clone(),
+            js_externals.clone(),
         ))),
         StackProtocol::Rtcp => Ok(Arc::new(RtcpStackContext::new(
             servers.clone(),
@@ -141,6 +148,7 @@ fn build_stack_context(
             stat_manager.clone(),
             global_process_chains.clone(),
             global_collection_manager.clone(),
+            js_externals.clone(),
         ))),
         StackProtocol::Tls => {
             Ok(Arc::new(TlsStackContext::new(
@@ -152,6 +160,7 @@ fn build_stack_context(
                 self_cert_mgr.clone(),
                 global_process_chains.clone(),
                 global_collection_manager.clone(),
+                js_externals.clone(),
             )))
         }
         StackProtocol::Quic => {
@@ -164,6 +173,7 @@ fn build_stack_context(
                 self_cert_mgr,
                 global_process_chains.clone(),
                 global_collection_manager.clone(),
+                js_externals.clone(),
             )))
         }
         StackProtocol::Extension(name) => {
@@ -176,6 +186,7 @@ fn build_stack_context(
                         stat_manager.clone(),
                         global_process_chains.clone(),
                         global_collection_manager.clone(),
+                        js_externals.clone(),
                     )))
                 },
                 _ => {
@@ -380,6 +391,34 @@ async fn build_self_cert_mgr_from_config(tls_ca: &Option<TlsCA>) -> Result<SelfC
     Ok(self_cert_manager)
 }
 
+async fn build_js_externals_from_raw_config(base_dir: &Path, raw_config: &Value) -> Result<JsExternalsManagerRef> {
+    let manager = Arc::new(JsExternalsManager::new());
+    let js_externals = raw_config
+        .get("js_externals")
+        .and_then(|value| value.as_object());
+
+    let Some(js_externals) = js_externals else {
+        return Ok(manager);
+    };
+
+    for (name, source_path) in js_externals {
+        let source_path = source_path.as_str().ok_or_else(|| {
+            anyhow!("js_externals.{} must be a string file path", name)
+        })?;
+
+        let source_path = normalize_config_file_path(PathBuf::from(source_path), base_dir);
+        let source = std::fs::read_to_string(source_path.as_path())
+            .map_err(|e| anyhow!("read js external {} from {} failed: {}", name, source_path.to_string_lossy(), e))?;
+
+        manager
+            .add_js_external(name, source)
+            .await
+            .map_err(|e| anyhow!("register js external {} failed: {}", name, e))?;
+    }
+
+    Ok(manager)
+}
+
 async fn build_global_process_chains_from_config(global_process_configs: &ProcessChainConfigs) -> Result<GlobalProcessChainsRef> {
     let mut global_process_chains = GlobalProcessChains::new();
     for process_chain_config in global_process_configs.iter() {
@@ -490,6 +529,19 @@ impl GatewayFactory {
 
         let global_collections = GlobalCollectionManager::create(config.collections.clone()).await?;
 
+        let base_dir = if let Some(config_file) = config_file.clone() {
+            let config_dir = config_file.parent().ok_or_else(|| {
+                let msg = format!("cannot get config dir: {:?}", config_file);
+                error!("{}", msg);
+                anyhow::anyhow!(msg)
+            })?;
+            config_dir.to_path_buf()
+        } else {
+            get_gateway_main_config_dir()
+        };
+
+        let js_externals = build_js_externals_from_raw_config(base_dir.as_path(), &config.raw_config).await?;
+
         let chain_cmds = get_buckyos_system_etc_dir().join("cyfs_gateway").join("server_templates");
         let external_cmds = JsPkgManager::new(chain_cmds);
         let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
@@ -511,6 +563,7 @@ impl GatewayFactory {
                 server_config.server_type().as_str(),
                 Arc::downgrade(&server_manager),
                 global_process_chains.clone(),
+                js_externals.clone(),
                 tunnel_manager.clone(),
                 global_collections.clone(),
                 cert_manager.clone(),
@@ -535,6 +588,7 @@ impl GatewayFactory {
                 stat_manager.clone(),
                 Some(global_process_chains.clone()),
                 Some(global_collections.clone()),
+                Some(js_externals.clone()),
                 cert_manager.clone(),
                 self_cert_manager.clone(),
             )?;
@@ -544,6 +598,7 @@ impl GatewayFactory {
 
         let control_handler: Arc<dyn GatewayControlCmdHandler> = handler.clone();
         let gateway = Arc::new(Gateway {
+            config_file: config_file.map(|v| v.to_path_buf()),
             init_config: Mutex::new(config.clone()),
             config: Arc::new(Mutex::new(config)),
             stack_manager,
@@ -564,6 +619,7 @@ impl GatewayFactory {
 }
 
 pub struct Gateway {
+    config_file: Option<PathBuf>,
     init_config: Mutex<GatewayConfig>,
     config: Arc<Mutex<GatewayConfig>>,
     stack_manager: StackManagerRef,
@@ -2483,6 +2539,19 @@ impl Gateway {
 
         let global_collections = GlobalCollectionManager::create(config.collections.clone()).await?;
 
+        let base_dir = if let Some(config_file) = self.config_file.clone() {
+            let config_dir = config_file.parent().ok_or_else(|| {
+                let msg = format!("cannot get config dir: {:?}", config_file);
+                error!("{}", msg);
+                anyhow::anyhow!(msg)
+            })?;
+            config_dir.to_path_buf()
+        } else {
+            get_gateway_main_config_dir()
+        };
+
+        let js_externals = build_js_externals_from_raw_config(base_dir.as_path(), &config.raw_config).await?;
+
         let global_process_chains = build_global_process_chains_from_config(&config.global_process_chains).await?;
 
         let server_manager = Arc::new(ServerManager::new());
@@ -2492,6 +2561,7 @@ impl Gateway {
                 server_config.server_type().as_str(),
                 Arc::downgrade(&server_manager),
                 global_process_chains.clone(),
+                js_externals.clone(),
                 self.tunnel_manager.clone(),
                 global_collections.clone(),
                 cert_manager.clone(),
@@ -2519,6 +2589,7 @@ impl Gateway {
                 self.stat_manager.clone(),
                 Some(global_process_chains.clone()),
                 Some(global_collections.clone()),
+                Some(js_externals.clone()),
                 cert_manager.clone(),
                 self_cert_manager.clone(),
             )?;

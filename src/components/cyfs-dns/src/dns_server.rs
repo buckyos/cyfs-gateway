@@ -245,6 +245,7 @@ impl ProcessChainDnsServer {
         global_collection_manager: Option<GlobalCollectionManagerRef>,
         hook_point: ProcessChainConfigs,
         inner_record_manager: InnerDnsRecordManagerRef,
+        js_externals: Option<JsExternalsManagerRef>,
     ) -> ServerResult<Self> {
         let resolve_cmd = CmdResolve::new(server_mgr.clone());
         let mut commands = get_external_commands(server_mgr.clone());
@@ -253,7 +254,9 @@ impl ProcessChainDnsServer {
             &hook_point,
             global_process_chains.clone(),
             global_collection_manager.clone(),
-            Some(commands)).await
+            Some(commands),
+            js_externals,
+        ).await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
 
         Ok(Self {
@@ -479,6 +482,7 @@ pub struct ProcessChainDnsServerFactory;
 pub struct DnsServerContext {
     pub server_mgr: ServerManagerWeakRef,
     pub global_process_chains: GlobalProcessChainsRef,
+    pub js_externals: JsExternalsManagerRef,
     pub global_collection_manager: GlobalCollectionManagerRef,
     pub inner_record_manager: InnerDnsRecordManagerRef,
 }
@@ -487,12 +491,14 @@ impl DnsServerContext {
     pub fn new(
         server_mgr: ServerManagerWeakRef,
         global_process_chains: GlobalProcessChainsRef,
+        js_externals: JsExternalsManagerRef,
         global_collection_manager: GlobalCollectionManagerRef,
         inner_record_manager: InnerDnsRecordManagerRef,
     ) -> Self {
         Self {
             server_mgr,
             global_process_chains,
+            js_externals,
             global_collection_manager,
             inner_record_manager,
         }
@@ -541,6 +547,7 @@ impl ServerFactory for ProcessChainDnsServerFactory {
             Some(context.global_collection_manager.clone()),
             config.hook_point.clone(),
             context.inner_record_manager.clone(),
+            Some(context.js_externals.clone()),
         ).await?;
         Ok(vec![Server::Datagram(Arc::new(server))])
     }
@@ -601,6 +608,7 @@ hook_point:
         let context = DnsServerContext::new(
             Arc::downgrade(&server_mgr),
             Arc::new(GlobalProcessChains::new()),
+            Arc::new(JsExternalsManager::new()),
             GlobalCollectionManager::create(vec![]).await.unwrap(),
             InnerDnsRecordManager::new(),
         );
@@ -664,6 +672,7 @@ hook_point:
             Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
             inner_record_manager,
+            Some(Arc::new(JsExternalsManager::new())),
         ).await;
         assert!(server.is_ok());
         let server = server.unwrap();
@@ -713,6 +722,7 @@ hook_point:
             Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
             inner_record_manager,
+            Some(Arc::new(JsExternalsManager::new())),
         ).await;
         assert!(server.is_ok());
         let server = server.unwrap();
@@ -840,6 +850,7 @@ hook_point:
         let context = DnsServerContext::new(
             Arc::downgrade(&server_mgr),
             global_process_chains.clone(),
+            Arc::new(JsExternalsManager::new()),
             GlobalCollectionManager::create(vec![]).await.unwrap(),
             InnerDnsRecordManager::new(),
         );
@@ -878,6 +889,7 @@ hook_point:
             stat_manager,
             Some(global_process_chains.clone()),
             Some(collection_manager),
+            Some(Arc::new(JsExternalsManager::new())),
         ));
         let ret = stack.create(Arc::new(stack_config), stack_context).await;
         assert!(ret.is_ok());
@@ -904,6 +916,7 @@ hook_point:
             Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
             inner_record_manager,
+            Some(Arc::new(JsExternalsManager::new())),
         ).await;
         assert!(server.is_ok());
         let server = server.unwrap();

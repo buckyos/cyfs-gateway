@@ -30,7 +30,7 @@ use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackContext, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SelfCertMgrRef, GlobalCollectionManagerRef};
+use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackContext, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SelfCertMgrRef, GlobalCollectionManagerRef, JsExternalsManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 use crate::stack::{get_limit_info, stream_forward, TlsCertResolver};
@@ -46,6 +46,7 @@ pub struct QuicStackContext {
     pub self_cert_mgr: SelfCertMgrRef,
     pub global_process_chains: Option<GlobalProcessChainsRef>,
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
+    pub js_externals: Option<JsExternalsManagerRef>,
 }
 
 impl QuicStackContext {
@@ -58,6 +59,7 @@ impl QuicStackContext {
         self_cert_mgr: SelfCertMgrRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
+        js_externals: Option<JsExternalsManagerRef>,
     ) -> Self {
         Self {
             servers,
@@ -68,6 +70,7 @@ impl QuicStackContext {
             self_cert_mgr,
             global_process_chains,
             global_collection_manager,
+            js_externals,
         }
     }
 }
@@ -95,6 +98,7 @@ impl QuicConnectionHandler {
             env.global_process_chains.clone(),
             env.global_collection_manager.clone(),
             Some(get_external_commands(Arc::downgrade(&env.servers))),
+            env.js_externals.clone(),
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;

@@ -7,6 +7,7 @@ use crate::{
     MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs,
     Server, ServerManagerRef, Stack, StackCertConfig, StackConfig, StackContext, StackErrorCode,
     StackProtocol, StackResult, StreamInfo, TunnelManager, GlobalCollectionManagerRef,
+    JsExternalsManagerRef,
 };
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -100,6 +101,7 @@ pub struct TlsStackContext {
     pub self_cert_mgr: SelfCertMgrRef,
     pub global_process_chains: Option<GlobalProcessChainsRef>,
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
+    pub js_externals: Option<JsExternalsManagerRef>,
 }
 
 impl TlsStackContext {
@@ -112,6 +114,7 @@ impl TlsStackContext {
         self_cert_mgr: SelfCertMgrRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
+        js_externals: Option<JsExternalsManagerRef>,
     ) -> Self {
         Self {
             servers,
@@ -122,6 +125,7 @@ impl TlsStackContext {
             self_cert_mgr,
             global_process_chains,
             global_collection_manager,
+            js_externals,
         }
     }
 }
@@ -151,6 +155,7 @@ impl TlsConnectionHandler {
             env.global_process_chains.clone(),
             env.global_collection_manager.clone(),
             Some(get_external_commands(Arc::downgrade(&env.servers))),
+            env.js_externals.clone(),
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -172,6 +177,7 @@ impl TlsConnectionHandler {
             self.env.global_process_chains.clone(),
             self.env.global_collection_manager.clone(),
             Some(get_external_commands(Arc::downgrade(&self.env.servers))),
+            self.env.js_externals.clone(),
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;

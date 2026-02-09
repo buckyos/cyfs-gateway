@@ -10,7 +10,7 @@ use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
 use regex::Regex;
-use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpResponseHeaderMap, HttpServer, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager};
+use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use super::{server_err,into_server_err};
 use super::http_compression::{apply_request_decompression, apply_response_compression, CompressionRequestInfo, HttpCompressionSettings};
@@ -24,6 +24,7 @@ pub struct ProcessChainHttpServerBuilder {
     hook_point: Option<ProcessChainConfigs>,
     post_hook_point: Option<ProcessChainConfigs>,
     global_process_chains: Option<GlobalProcessChainsRef>,
+    js_externals: Option<JsExternalsManagerRef>,
     server_mgr: Option<ServerManagerWeakRef>,
     tunnel_manager: Option<TunnelManager>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
@@ -54,6 +55,11 @@ impl ProcessChainHttpServerBuilder {
 
     pub fn global_process_chains(mut self, global_process_chains: GlobalProcessChainsRef) -> Self {
         self.global_process_chains = Some(global_process_chains);
+        self
+    }
+
+    pub fn js_externals(mut self, js_externals: JsExternalsManagerRef) -> Self {
+        self.js_externals = Some(js_externals);
         self
     }
 
@@ -140,6 +146,7 @@ impl ProcessChainHttpServer {
             hook_point: None,
             post_hook_point: None,
             global_process_chains: None,
+            js_externals: None,
             server_mgr: None,
             tunnel_manager: None,
             global_collection_manager: None,
@@ -189,6 +196,7 @@ impl ProcessChainHttpServer {
             global_process_chains.clone(),
             global_collection_manager.clone(),
             external_commands.clone(),
+            builder.js_externals.clone(),
         )
         .await
         .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
@@ -198,6 +206,7 @@ impl ProcessChainHttpServer {
                 global_process_chains,
                 global_collection_manager,
                 external_commands,
+                builder.js_externals,
             )
             .await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
@@ -597,6 +606,7 @@ impl ServerConfig for ProcessChainHttpServerConfig {
 pub struct HttpServerContext {
     pub server_mgr: ServerManagerWeakRef,
     pub global_process_chains: GlobalProcessChainsRef,
+    pub js_externals: JsExternalsManagerRef,
     pub tunnel_manager: TunnelManager,
     pub global_collection_manager: GlobalCollectionManagerRef,
 }
@@ -605,12 +615,14 @@ impl HttpServerContext {
     pub fn new(
         server_mgr: ServerManagerWeakRef,
         global_process_chains: GlobalProcessChainsRef,
+        js_externals: JsExternalsManagerRef,
         tunnel_manager: TunnelManager,
         global_collection_manager: GlobalCollectionManagerRef,
     ) -> Self {
         Self {
             server_mgr,
             global_process_chains,
+            js_externals,
             tunnel_manager,
             global_collection_manager,
         }
@@ -659,6 +671,7 @@ impl ServerFactory for ProcessChainHttpServerFactory {
             .server_mgr(context.server_mgr.clone())
             .tunnel_manager(context.tunnel_manager.clone())
             .global_process_chains(context.global_process_chains.clone())
+            .js_externals(context.js_externals.clone())
             .global_collection_manager(context.global_collection_manager.clone());
         let compression = ProcessChainHttpServerBuilder::build_compression_settings(config)?;
         builder = builder.compression(compression);

@@ -19,6 +19,9 @@ collections:
     type: text_set
     file_path: {{test_text_set}}
 
+js_externals:
+  test_js_hook: {{test_js_hook_file}}
+
 limiters:
   test:
     upper_limiter: global
@@ -49,7 +52,7 @@ stacks:
               map-add test_map ${REQ.dest_host} 1;
               map-add test_json_map ${REQ.dest_host} 1;
               map-add test_sqlite_map ${REQ.dest_host} 1;
-              http-probe && call-server ${REQ.dest_host};
+              test_js_hook ${REQ.dest_host} && http-probe && call-server ${REQ.dest_host};
               reject;
 
   test2:

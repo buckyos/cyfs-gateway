@@ -14,6 +14,7 @@ pub mod server;
 //mod inner_service;
 mod stack;
 mod global_process_chains;
+mod js_externals;
 mod connection_manager;
 mod quic_tunnel;
 mod cmds;
@@ -35,6 +36,7 @@ pub use server::*;
 pub use stack::*;
 pub use connection_manager::*;
 pub use global_process_chains::*;
+pub use js_externals::*;
 pub use cyfs_acme::*;
 pub use cmds::*;
 pub use self_cert_mgr::*;
@@ -79,6 +81,5 @@ pub struct GatewayDevice {
 }
 
 pub type GatewayDeviceRef = Arc<GatewayDevice>;
-
 
 
