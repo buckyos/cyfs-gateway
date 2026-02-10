@@ -58,7 +58,11 @@ pub async fn get_source_addr_from_req_env(global_env: &cyfs_process_chain::EnvRe
         None => return None,
     };
 
-    let source = match req.get("source_addr").await {
+    let ext = match req.get("ext").await {
+        Ok(Some(CollectionValue::Map(ext))) => ext,
+        _ => return None,
+    };
+    let source = match ext.get("proxy_source_addr").await {
         Ok(Some(source)) => source,
         _ => return None,
     };

@@ -311,11 +311,6 @@ impl ExternalCommand for ProxyProtocolProbeCommand {
                 CollectionValue::String(source_addr.to_string()),
             )
             .await?;
-            req.insert(
-                "source_addr",
-                CollectionValue::String(source_addr.to_string()),
-            )
-            .await?;
         }
 
         if let Some(dest_addr) = probe_result.dest_addr {
