@@ -9,6 +9,7 @@ mod config_merger;
 mod acme_sn_provider;
 mod process_chain_doc;
 mod socks;
+mod debug;
 
 pub use gateway::*;
 pub use gateway_control_client::*;
@@ -16,10 +17,11 @@ pub use gateway_control_server::*;
 pub use config_loader::*;
 pub use config_merger::*;
 use acme_sn_provider::*;
+use crate::debug::run_debug_command;
 
 
 use std::collections::HashSet;
-use clap::{Arg, ArgAction, ArgMatches, Command};
+use clap::{Arg, ArgAction, Command};
 use console_subscriber::{self, Server};
 use cyfs_dns::{InnerDnsRecordManager, LocalDnsFactory, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
@@ -36,7 +38,7 @@ use anyhow::Result;
 use buckyos_kit::{get_buckyos_log_dir, get_buckyos_service_data_dir, get_buckyos_system_etc_dir};
 use kRPC::RPCSessionToken;
 use serde::{Deserialize};
-use serde_json::{Value};
+use serde_json::Value;
 use sfo_js::{JsEngine, JsPkgManager, JsString, JsValue};
 use sfo_js::object::builtins::JsArray;
 use tokio::fs::create_dir_all;
@@ -372,7 +374,6 @@ async fn run_template_local(template_id: &str, args: Vec<String>) -> Result<()> 
     run_gateway_with_config(config_json, None, GatewayParams { keep_tunnel: vec![] }).await
 }
 
-
 pub async fn cyfs_gateway_main() {
     let command = Command::new("CYFS Gateway Service")
         .version(buckyos_kit::get_version())
@@ -689,6 +690,20 @@ pub async fn cyfs_gateway_main() {
                 .short('f')
                 .help("write output to file")
                 .value_name("PATH")
+                .required(false)))
+        .subcommand(Command::new("debug")
+            .about("Debug process chain rule with request file")
+            .arg(Arg::new("config_file")
+                .long("config_file")
+                .help("config file path, optional; uses default config if omitted")
+                .required(false))
+            .arg(Arg::new("req_file")
+                .long("req_file")
+                .help("request file path in JSON format")
+                .required(true))
+            .arg(Arg::new("id")
+                .long("id")
+                .help("rule id to debug; if omitted, use id field from req_file")
                 .required(false)))
         .subcommand(Command::new("reload")
             .about("reload config")
@@ -1103,6 +1118,24 @@ pub async fn cyfs_gateway_main() {
                 println!("{}", output);
             }
             std::process::exit(0);
+        }
+        Some(("debug", sub_matches)) => {
+            let req_file = sub_matches
+                .get_one::<String>("req_file")
+                .expect("req_file is required");
+            let config_file = sub_matches
+                .get_one::<String>("config_file")
+                .map(|s| s.as_str());
+            let id = sub_matches.get_one::<String>("id").map(|s| s.as_str());
+            match run_debug_command(req_file.as_str(), config_file, id).await {
+                Ok(_) => {
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("debug error: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         Some(("reload", sub_matches)) => {
             let server = sub_matches.get_one::<String>("server").unwrap();
