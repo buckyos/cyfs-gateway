@@ -108,19 +108,26 @@ enum DebugTarget {
     ScopeHookPoint {
         kind: DebugScopeKind,
         scope_id: String,
+        mount_point: String,
     },
     ScopeChain {
         kind: DebugScopeKind,
         scope_id: String,
+        mount_point: String,
         chain_id: String,
     },
     ScopeBlock {
         kind: DebugScopeKind,
         scope_id: String,
+        mount_point: String,
         chain_id: String,
         block_id: String,
         line_spec: Option<String>,
     },
+}
+
+fn is_mount_point_segment(segment: &str) -> bool {
+    segment == "hook_point" || segment.ends_with("_hook_point")
 }
 
 fn parse_debug_target(id: &str) -> Result<DebugTarget> {
@@ -156,7 +163,9 @@ fn parse_debug_target(id: &str) -> Result<DebugTarget> {
     }
 
     let mut index = 2;
-    if parts.len() > index && parts[index] == "hook_point" {
+    let mut mount_point = "hook_point";
+    if parts.len() > index && is_mount_point_segment(parts[index]) {
+        mount_point = parts[index];
         index += 1;
     }
 
@@ -164,6 +173,7 @@ fn parse_debug_target(id: &str) -> Result<DebugTarget> {
         return Ok(DebugTarget::ScopeHookPoint {
             kind,
             scope_id: scope_id.to_string(),
+            mount_point: mount_point.to_string(),
         });
     }
 
@@ -177,6 +187,7 @@ fn parse_debug_target(id: &str) -> Result<DebugTarget> {
         return Ok(DebugTarget::ScopeChain {
             kind,
             scope_id: scope_id.to_string(),
+            mount_point: mount_point.to_string(),
             chain_id: chain_id.to_string(),
         });
     }
@@ -203,6 +214,7 @@ fn parse_debug_target(id: &str) -> Result<DebugTarget> {
     Ok(DebugTarget::ScopeBlock {
         kind,
         scope_id: scope_id.to_string(),
+        mount_point: mount_point.to_string(),
         chain_id: chain_id.to_string(),
         block_id: block_id.to_string(),
         line_spec,
@@ -299,6 +311,7 @@ fn get_scope_hook_point<'a>(
     config: &'a Value,
     kind: &DebugScopeKind,
     scope_id: &str,
+    mount_point: &str,
 ) -> Result<&'a Map<String, Value>> {
     let scope_root = get_scope_root(config, kind)?;
     let scope_value = scope_root
@@ -308,9 +321,9 @@ fn get_scope_hook_point<'a>(
         .as_object()
         .ok_or_else(|| anyhow!("invalid scope config: {}", scope_id))?;
     scope_obj
-        .get("hook_point")
+        .get(mount_point)
         .and_then(|value| value.as_object())
-        .ok_or_else(|| anyhow!("hook_point not found in scope {}", scope_id))
+        .ok_or_else(|| anyhow!("{} not found in scope {}", mount_point, scope_id))
 }
 
 fn build_debug_chain_configs(config: &Value, target: &DebugTarget) -> Result<ProcessChainConfigs> {
@@ -326,8 +339,13 @@ fn build_debug_chain_configs(config: &Value, target: &DebugTarget) -> Result<Pro
             let chain = parse_chain_config(chain_id.as_str(), chain_value)?;
             Ok(vec![chain])
         }
-        DebugTarget::ScopeHookPoint { kind, scope_id } => {
-            let hook_point = get_scope_hook_point(config, kind, scope_id.as_str())?;
+        DebugTarget::ScopeHookPoint {
+            kind,
+            scope_id,
+            mount_point,
+        } => {
+            let hook_point =
+                get_scope_hook_point(config, kind, scope_id.as_str(), mount_point.as_str())?;
             let mut chain_list = Vec::with_capacity(hook_point.len());
             for (chain_id, chain_value) in hook_point {
                 chain_list.push(parse_chain_config(chain_id.as_str(), chain_value)?);
@@ -337,9 +355,11 @@ fn build_debug_chain_configs(config: &Value, target: &DebugTarget) -> Result<Pro
         DebugTarget::ScopeChain {
             kind,
             scope_id,
+            mount_point,
             chain_id,
         } => {
-            let hook_point = get_scope_hook_point(config, kind, scope_id.as_str())?;
+            let hook_point =
+                get_scope_hook_point(config, kind, scope_id.as_str(), mount_point.as_str())?;
             let chain_value = hook_point
                 .get(chain_id)
                 .ok_or_else(|| anyhow!("chain not found: {}", chain_id))?;
@@ -349,11 +369,13 @@ fn build_debug_chain_configs(config: &Value, target: &DebugTarget) -> Result<Pro
         DebugTarget::ScopeBlock {
             kind,
             scope_id,
+            mount_point,
             chain_id,
             block_id,
             line_spec,
         } => {
-            let hook_point = get_scope_hook_point(config, kind, scope_id.as_str())?;
+            let hook_point =
+                get_scope_hook_point(config, kind, scope_id.as_str(), mount_point.as_str())?;
             let chain_value = hook_point
                 .get(chain_id)
                 .ok_or_else(|| anyhow!("chain not found: {}", chain_id))?;
@@ -701,6 +723,17 @@ mod tests {
                                 }
                             }
                         }
+                    },
+                    "post_hook_point": {
+                        "main": {
+                            "priority": 1,
+                            "blocks": {
+                                "b1": {
+                                    "priority": 1,
+                                    "block": "echo \"p-line-1\";\necho \"p-line-2\";"
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -745,6 +778,8 @@ mod tests {
             "server:http1:main",
             "server:http1:main:blocks:b1",
             "server:http1:main:blocks:b1:2",
+            "server:http1:post_hook_point:main",
+            "server:http1:post_hook_point:main:blocks:b1",
         ];
 
         for id in success_ids {

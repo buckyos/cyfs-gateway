@@ -667,6 +667,15 @@ impl Drop for Gateway {
     }
 }
 
+struct ParsedRuleId<'a> {
+    config_type: &'a str,
+    config_id: &'a str,
+    mount_point: &'a str,
+    chain_id: Option<&'a str>,
+    block_id: Option<&'a str>,
+    line_spec: Option<String>,
+}
+
 impl Gateway {
     pub fn tunnel_manager(&self) -> &TunnelManager {
         &self.tunnel_manager
@@ -818,15 +827,21 @@ impl Gateway {
         )))
     }
 
-    pub fn get_config_by_id(&self, id: &str) -> Result<Value> {
+    fn is_mount_point_segment(segment: &str) -> bool {
+        segment == "hook_point" || segment.ends_with("_hook_point")
+    }
+
+    fn parse_rule_id(id: &str) -> Result<ParsedRuleId<'_>> {
         let id_list = id.split(':').collect::<Vec<&str>>();
         if id_list.len() < 2 {
             return Err(anyhow!("Invalid config id: {}", id));
         }
+
         let config_type = id_list[0];
         if config_type != "stack" && config_type != "server" {
             return Err(anyhow!("Invalid config type: {}", config_type));
         }
+
         let config_id = id_list[1];
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
@@ -836,28 +851,63 @@ impl Gateway {
         }
 
         let mut index = 2;
-        if id_list.len() > index && id_list[index] == "hook_point" {
+        let mut mount_point = "hook_point";
+        if id_list.len() > index && Self::is_mount_point_segment(id_list[index]) {
+            mount_point = id_list[index];
             index += 1;
         }
-        let chain_id = if id_list.len() > index { Some(id_list[index]) } else { None };
-        index += 1;
+
+        let chain_id = if id_list.len() > index {
+            Some(id_list[index])
+        } else {
+            None
+        };
+
+        if chain_id.is_some() {
+            index += 1;
+        }
+
         if id_list.len() > index && id_list[index] == "blocks" {
             index += 1;
         }
-        let block_id = if id_list.len() > index { Some(id_list[index]) } else { None };
-        if id_list.len() > index + 1 {
+
+        let block_id = if id_list.len() > index {
+            Some(id_list[index])
+        } else {
+            None
+        };
+
+        let line_spec = if id_list.len() > index + 1 {
+            Some(id_list[index + 1..].join(":"))
+        } else {
+            None
+        };
+
+        Ok(ParsedRuleId {
+            config_type,
+            config_id,
+            mount_point,
+            chain_id,
+            block_id,
+            line_spec,
+        })
+    }
+
+    pub fn get_config_by_id(&self, id: &str) -> Result<Value> {
+        let parsed = Self::parse_rule_id(id)?;
+        if parsed.line_spec.is_some() {
             return Err(anyhow!("Invalid config id: {}", id));
         }
 
-        let config_value = self.get_config(config_type, config_id)?;
-        if chain_id.is_none() {
+        let config_value = self.get_config(parsed.config_type, parsed.config_id)?;
+        if parsed.chain_id.is_none() {
             return Ok(config_value);
         }
 
         let target_config = config_value
             .as_object()
-            .ok_or_else(|| anyhow!("Invalid {} config: {}", config_type, config_id))?;
-        if config_type == "server" {
+            .ok_or_else(|| anyhow!("Invalid {} config: {}", parsed.config_type, parsed.config_id))?;
+        if parsed.config_type == "server" {
             let server_type = target_config
                 .get("type")
                 .and_then(|value| value.as_str())
@@ -868,15 +918,15 @@ impl Gateway {
         }
 
         let hook_point = target_config
-            .get("hook_point")
-            .ok_or_else(|| anyhow!("hook_point not found"))?
+            .get(parsed.mount_point)
+            .ok_or_else(|| anyhow!("{} not found", parsed.mount_point))?
             .as_object()
-            .ok_or_else(|| anyhow!("hook_point must be an object"))?;
-        let chain_id = chain_id.unwrap();
+            .ok_or_else(|| anyhow!("{} must be an object", parsed.mount_point))?;
+        let chain_id = parsed.chain_id.unwrap();
         let chain_value = hook_point
             .get(chain_id)
             .ok_or_else(|| anyhow!("chain not found: {}", chain_id))?;
-        if block_id.is_none() {
+        if parsed.block_id.is_none() {
             return Ok(chain_value.clone());
         }
 
@@ -888,7 +938,7 @@ impl Gateway {
             .ok_or_else(|| anyhow!("blocks not found in chain {}", chain_id))?
             .as_object()
             .ok_or_else(|| anyhow!("blocks must be an object"))?;
-        let block_id = block_id.unwrap();
+        let block_id = parsed.block_id.unwrap();
         let block_value = blocks
             .get(block_id)
             .ok_or_else(|| anyhow!("block not found: {}", block_id))?;
@@ -896,33 +946,11 @@ impl Gateway {
     }
 
     fn add_rule_to_config(mut raw_config: Value, id: &str, rule: &str) -> Result<Value> {
-        let id_list = id.split(':').collect::<Vec<&str>>();
-        if id_list.len() < 2 {
-            return Err(anyhow!("Invalid config id: {}", id));
-        }
-        let config_type = id_list[0];
-        if config_type != "stack" && config_type != "server" {
-            return Err(anyhow!("Invalid config type: {}", config_type));
-        }
-        let config_id = id_list[1];
-        if config_id == GATEWAY_CONTROL_SERVER_KEY {
-            return Err(anyhow!(cmd_err!(
-                ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
-            )));
-        }
-
-        let mut index = 2;
-        if id_list.len() > index && id_list[index] == "hook_point" {
-            index += 1;
-        }
-
-        let chain_id = if id_list.len() > index { Some(id_list[index]) } else { None };
-        index += 1;
-        if id_list.len() > index && id_list[index] == "blocks" {
-            index += 1;
-        }
-        let block_id = if id_list.len() > index { Some(id_list[index]) } else { None };
+        let parsed = Self::parse_rule_id(id)?;
+        let config_type = parsed.config_type;
+        let config_id = parsed.config_id;
+        let chain_id = parsed.chain_id;
+        let block_id = parsed.block_id;
 
         let root_key = if config_type == "stack" {
             "stacks"
@@ -951,11 +979,11 @@ impl Gateway {
         }
 
         let hook_point_value = target_config
-            .entry("hook_point")
+            .entry(parsed.mount_point)
             .or_insert_with(|| Value::Object(Map::new()));
         let hook_point = hook_point_value
             .as_object_mut()
-            .ok_or_else(|| anyhow!("hook_point must be an object"))?;
+            .ok_or_else(|| anyhow!("{} must be an object", parsed.mount_point))?;
 
         let chain_id = if let Some(chain_id) = chain_id {
             chain_id.to_string()
@@ -1071,32 +1099,11 @@ impl Gateway {
     }
 
     fn insert_rule_to_config(mut raw_config: Value, id: &str, pos: i32, rule: &str) -> Result<Value> {
-        let id_list = id.split(':').collect::<Vec<&str>>();
-        if id_list.len() < 2 {
-            return Err(anyhow!("Invalid config id: {}", id));
-        }
-        let config_type = id_list[0];
-        if config_type != "stack" && config_type != "server" {
-            return Err(anyhow!("Invalid config type: {}", config_type));
-        }
-        let config_id = id_list[1];
-        if config_id == GATEWAY_CONTROL_SERVER_KEY {
-            return Err(anyhow!(cmd_err!(
-                ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
-            )));
-        }
-
-        let mut index = 2;
-        if id_list.len() > index && id_list[index] == "hook_point" {
-            index += 1;
-        }
-        let chain_id = if id_list.len() > index { Some(id_list[index]) } else { None };
-        index += 1;
-        if id_list.len() > index && id_list[index] == "blocks" {
-            index += 1;
-        }
-        let block_id = if id_list.len() > index { Some(id_list[index]) } else { None };
+        let parsed = Self::parse_rule_id(id)?;
+        let config_type = parsed.config_type;
+        let config_id = parsed.config_id;
+        let chain_id = parsed.chain_id;
+        let block_id = parsed.block_id;
 
         let root_key = if config_type == "stack" {
             "stacks"
@@ -1126,11 +1133,11 @@ impl Gateway {
         }
 
         let hook_point_value = target_config
-            .entry("hook_point")
+            .entry(parsed.mount_point)
             .or_insert_with(|| Value::Object(Map::new()));
         let hook_point = hook_point_value
             .as_object_mut()
-            .ok_or_else(|| anyhow!("hook_point must be an object"))?;
+            .ok_or_else(|| anyhow!("{} must be an object", parsed.mount_point))?;
 
         let chain_id = if let Some(chain_id) = chain_id {
             chain_id.to_string()
@@ -1190,37 +1197,15 @@ impl Gateway {
     }
 
     fn move_rule_in_config(mut raw_config: Value, id: &str, new_pos: i32) -> Result<Value> {
-        let id_list = id.split(':').collect::<Vec<&str>>();
-        if id_list.len() < 3 {
+        let parsed = Self::parse_rule_id(id)?;
+        if parsed.chain_id.is_none() {
             return Err(anyhow!("Invalid id: {}", id));
         }
-        let config_type = id_list[0];
-        if config_type != "stack" && config_type != "server" {
-            return Err(anyhow!("Invalid config type: {}", config_type));
-        }
-        let config_id = id_list[1];
-        if config_id == GATEWAY_CONTROL_SERVER_KEY {
-            return Err(anyhow!(cmd_err!(
-                ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
-            )));
-        }
-
-        let mut index = 2;
-        if id_list.len() > index && id_list[index] == "hook_point" {
-            index += 1;
-        }
-        let chain_id = id_list.get(index).ok_or_else(|| anyhow!("Missing chain id in {}", id))?;
-        index += 1;
-        if id_list.len() > index && id_list[index] == "blocks" {
-            index += 1;
-        }
-        let block_id = id_list.get(index).copied();
-        let line_spec = if id_list.len() > index + 1 {
-            Some(id_list[index + 1..].join(":"))
-        } else {
-            None
-        };
+        let config_type = parsed.config_type;
+        let config_id = parsed.config_id;
+        let chain_id = parsed.chain_id.unwrap();
+        let block_id = parsed.block_id;
+        let line_spec = parsed.line_spec;
         if line_spec.is_some() && block_id.is_none() {
             return Err(anyhow!("line position can only be used when block id is specified"));
         }
@@ -1253,14 +1238,14 @@ impl Gateway {
         }
 
         let hook_point_value = target_config
-            .get_mut("hook_point")
-            .ok_or_else(|| anyhow!("hook_point not found"))?;
+            .get_mut(parsed.mount_point)
+            .ok_or_else(|| anyhow!("{} not found", parsed.mount_point))?;
         let hook_point = hook_point_value
             .as_object_mut()
-            .ok_or_else(|| anyhow!("hook_point must be an object"))?;
+            .ok_or_else(|| anyhow!("{} must be an object", parsed.mount_point))?;
 
         let chain_value = hook_point
-            .get_mut(*chain_id)
+            .get_mut(chain_id)
             .ok_or_else(|| anyhow!("chain not found: {}", chain_id))?;
         let chain_obj = chain_value
             .as_object_mut()
@@ -1870,37 +1855,15 @@ impl Gateway {
     }
 
     fn set_rule_in_config(mut raw_config: Value, id: &str, rule: &str) -> Result<Value> {
-        let id_list = id.split(':').collect::<Vec<&str>>();
-        if id_list.len() < 3 {
+        let parsed = Self::parse_rule_id(id)?;
+        if parsed.chain_id.is_none() {
             return Err(anyhow!("Invalid id: {}", id));
         }
-        let config_type = id_list[0];
-        if config_type != "stack" && config_type != "server" {
-            return Err(anyhow!("Invalid config type: {}", config_type));
-        }
-        let config_id = id_list[1];
-        if config_id == GATEWAY_CONTROL_SERVER_KEY {
-            return Err(anyhow!(cmd_err!(
-                ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
-            )));
-        }
-
-        let mut index = 2;
-        if id_list.len() > index && id_list[index] == "hook_point" {
-            index += 1;
-        }
-        let chain_id = id_list.get(index).ok_or_else(|| anyhow!("Missing chain id in {}", id))?;
-        index += 1;
-        if id_list.len() > index && id_list[index] == "blocks" {
-            index += 1;
-        }
-        let block_id = id_list.get(index).copied();
-        let line_spec = if id_list.len() > index + 1 {
-            Some(id_list[index + 1..].join(":"))
-        } else {
-            None
-        };
+        let config_type = parsed.config_type;
+        let config_id = parsed.config_id;
+        let chain_id = parsed.chain_id.unwrap();
+        let block_id = parsed.block_id;
+        let line_spec = parsed.line_spec;
         if line_spec.is_some() && block_id.is_none() {
             return Err(anyhow!("line position can only be used when block id is specified"));
         }
@@ -1934,14 +1897,14 @@ impl Gateway {
         }
 
         let hook_point_value = target_config
-            .get_mut("hook_point")
-            .ok_or_else(|| anyhow!("hook_point not found"))?;
+            .get_mut(parsed.mount_point)
+            .ok_or_else(|| anyhow!("{} not found", parsed.mount_point))?;
         let hook_point = hook_point_value
             .as_object_mut()
-            .ok_or_else(|| anyhow!("hook_point must be an object"))?;
+            .ok_or_else(|| anyhow!("{} must be an object", parsed.mount_point))?;
 
         let chain_value = hook_point
-            .get_mut(*chain_id)
+            .get_mut(chain_id)
             .ok_or_else(|| anyhow!("chain not found: {}", chain_id))?;
         let chain_obj = chain_value
             .as_object_mut()
@@ -2025,32 +1988,11 @@ impl Gateway {
     }
 
     fn append_rule_to_config(mut raw_config: Value, id: &str, rule: &str) -> Result<Value> {
-        let id_list = id.split(':').collect::<Vec<&str>>();
-        if id_list.len() < 2 {
-            return Err(anyhow!("Invalid config id: {}", id));
-        }
-        let config_type = id_list[0];
-        if config_type != "stack" && config_type != "server" {
-            return Err(anyhow!("Invalid config type: {}", config_type));
-        }
-        let config_id = id_list[1];
-        if config_id == GATEWAY_CONTROL_SERVER_KEY {
-            return Err(anyhow!(cmd_err!(
-                ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
-            )));
-        }
-
-        let mut index = 2;
-        if id_list.len() > index && id_list[index] == "hook_point" {
-            index += 1;
-        }
-        let chain_id = if id_list.len() > index { Some(id_list[index]) } else { None };
-        index += 1;
-        if id_list.len() > index && id_list[index] == "blocks" {
-            index += 1;
-        }
-        let block_id = if id_list.len() > index { Some(id_list[index]) } else { None };
+        let parsed = Self::parse_rule_id(id)?;
+        let config_type = parsed.config_type;
+        let config_id = parsed.config_id;
+        let chain_id = parsed.chain_id;
+        let block_id = parsed.block_id;
 
         let root_key = if config_type == "stack" {
             "stacks"
@@ -2080,11 +2022,11 @@ impl Gateway {
         }
 
         let hook_point_value = target_config
-            .entry("hook_point")
+            .entry(parsed.mount_point)
             .or_insert_with(|| Value::Object(Map::new()));
         let hook_point = hook_point_value
             .as_object_mut()
-            .ok_or_else(|| anyhow!("hook_point must be an object"))?;
+            .ok_or_else(|| anyhow!("{} must be an object", parsed.mount_point))?;
 
         let chain_id = if let Some(chain_id) = chain_id {
             chain_id.to_string()
@@ -2326,32 +2268,14 @@ impl Gateway {
     }
 
     fn remove_rule_from_config(mut raw_config: Value, id: &str) -> Result<Value> {
-        let id_list = id.split(':').collect::<Vec<&str>>();
-        if id_list.len() < 3 {
+        let parsed = Self::parse_rule_id(id)?;
+        if parsed.chain_id.is_none() {
             return Err(anyhow!("Invalid rule id: {}", id));
         }
-        let config_type = id_list[0];
-        if config_type != "stack" && config_type != "server" {
-            return Err(anyhow!("Invalid config type: {}", config_type));
-        }
-        let config_id = id_list[1];
-        if config_id == GATEWAY_CONTROL_SERVER_KEY {
-            return Err(anyhow!(cmd_err!(
-                ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
-            )));
-        }
-
-        let mut index = 2;
-        if id_list.len() > index && id_list[index] == "hook_point" {
-            index += 1;
-        }
-        let chain_id = id_list.get(index).ok_or_else(|| anyhow!("Missing chain id in {}", id))?;
-        index += 1;
-        if id_list.len() > index && id_list[index] == "blocks" {
-            index += 1;
-        }
-        let block_id = id_list.get(index).copied();
+        let config_type = parsed.config_type;
+        let config_id = parsed.config_id;
+        let chain_id = parsed.chain_id.unwrap();
+        let block_id = parsed.block_id;
 
         let root_key = if config_type == "stack" {
             "stacks"
@@ -2381,20 +2305,20 @@ impl Gateway {
         }
 
         let hook_point_value = target_config
-            .get_mut("hook_point")
-            .ok_or_else(|| anyhow!("hook_point not found"))?;
+            .get_mut(parsed.mount_point)
+            .ok_or_else(|| anyhow!("{} not found", parsed.mount_point))?;
         let hook_point = hook_point_value
             .as_object_mut()
-            .ok_or_else(|| anyhow!("hook_point must be an object"))?;
+            .ok_or_else(|| anyhow!("{} must be an object", parsed.mount_point))?;
 
         let only_chain = hook_point.len() == 1;
-        let line_spec = if id_list.len() > index + 1 { Some(id_list[index + 1..].join(":")) } else { None };
+        let line_spec = parsed.line_spec;
         if line_spec.is_some() && block_id.is_none() {
             return Err(anyhow!("line range can only be used when block id is specified"));
         }
 
         let chain_value = hook_point
-            .get_mut(*chain_id)
+            .get_mut(chain_id)
             .ok_or_else(|| anyhow!("chain not found: {}", chain_id))?;
         let chain_obj = chain_value
             .as_object_mut()
@@ -2464,12 +2388,12 @@ impl Gateway {
             if only_chain && only_block {
                 return Err(anyhow!("cannot delete the last block of the last chain"));
             }
-            hook_point.remove(*chain_id);
+            hook_point.remove(chain_id);
             return Ok(raw_config);
         }
 
         if blocks.is_empty() {
-            hook_point.remove(*chain_id);
+            hook_point.remove(chain_id);
         }
         Ok(raw_config)
     }
@@ -3405,6 +3329,72 @@ mod tests {
         let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].clone();
         let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
         let blocks = updated["stacks"]["s1"]["hook_point"].clone();
+    }
+
+    #[tokio::test]
+    async fn test_rule_ops_support_custom_mount_point() {
+        let raw_config = json!({
+            "servers": {
+                "s1": {
+                    "type": "http",
+                    "hook_point": {
+                        "main": {
+                            "priority": 1,
+                            "blocks": {
+                                "default": {
+                                    "priority": 1,
+                                    "block": "hook;"
+                                }
+                            }
+                        }
+                    },
+                    "post_hook_point": {
+                        "main": {
+                            "priority": 1,
+                            "blocks": {
+                                "b1": {
+                                    "priority": 1,
+                                    "block": "a\nb"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let updated = Gateway::add_rule_to_config(raw_config, "server:s1:post_hook_point:main:b2", "new;").unwrap();
+        let content = updated["servers"]["s1"]["post_hook_point"]["main"]["blocks"]["b2"]["block"]
+            .as_str()
+            .unwrap();
+        assert_eq!(content, "new;");
+
+        let updated = Gateway::append_rule_to_config(updated, "server:s1:post_hook_point:main:b2", "tail;").unwrap();
+        let content = updated["servers"]["s1"]["post_hook_point"]["main"]["blocks"]["b2"]["block"]
+            .as_str()
+            .unwrap();
+        assert_eq!(content, "new;\ntail;");
+
+        let updated = Gateway::insert_rule_to_config(updated, "server:s1:post_hook_point:main:b2", 1, "head;").unwrap();
+        let content = updated["servers"]["s1"]["post_hook_point"]["main"]["blocks"]["b2"]["block"]
+            .as_str()
+            .unwrap();
+        assert_eq!(content, "head;\nnew;\ntail;");
+
+        let updated = Gateway::set_rule_in_config(updated, "server:s1:post_hook_point:main:b2", "replaced;").unwrap();
+        let content = updated["servers"]["s1"]["post_hook_point"]["main"]["blocks"]["b2"]["block"]
+            .as_str()
+            .unwrap();
+        assert_eq!(content, "replaced;");
+
+        let updated = Gateway::move_rule_in_config(updated, "server:s1:post_hook_point:main", 9).unwrap();
+        let priority = updated["servers"]["s1"]["post_hook_point"]["main"]["priority"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(priority, 9);
+
+        let updated = Gateway::remove_rule_from_config(updated, "server:s1:post_hook_point:main:b2").unwrap();
+        assert!(updated["servers"]["s1"]["post_hook_point"]["main"]["blocks"]["b2"].is_null());
     }
 
     #[tokio::test]

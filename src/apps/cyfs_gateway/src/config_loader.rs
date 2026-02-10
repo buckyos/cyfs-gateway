@@ -978,7 +978,7 @@ mod tests {
     fn test_timer_config_parser() {
         let parser = super::GatewayConfigParser::new();
         let json = json!({
-            "timer": {
+            "timers": {
                 "t1": {
                     "timeout": 120,
                     "process-chain": "echo \"test\";"
@@ -1001,7 +1001,7 @@ mod tests {
     fn test_timer_config_timeout_zero() {
         let parser = super::GatewayConfigParser::new();
         let json = json!({
-            "timer": {
+            "timers": {
                 "t1": {
                     "timeout": 0,
                     "process-chain": "echo \"test\";"
