@@ -309,6 +309,7 @@ impl ProcessChainHttpServer {
     async fn apply_post_chain(
         &self,
         resp: http::Response<BoxBody<Bytes, ServerError>>,
+        info: Option<&StreamInfo>,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let post_executor = match &self.post_executor {
             Some(executor) => executor.lock().unwrap().fork(),
@@ -317,6 +318,62 @@ impl ProcessChainHttpServer {
 
         let resp_map = HttpResponseHeaderMap::new(resp);
         let global_env = post_executor.global_env();
+        if let Some(info) = info {
+            if let Some(src_addr) = info.src_addr.as_ref() {
+                if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
+                    global_env
+                        .create(
+                            "REQ_remote_ip",
+                            CollectionValue::String(socket_addr.ip().to_string()),
+                        )
+                        .await
+                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                    global_env
+                        .create(
+                            "REQ_remote_port",
+                            CollectionValue::String(socket_addr.port().to_string()),
+                        )
+                        .await
+                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                }
+            }
+            if let Some(src_addr) = info.conn_src_addr.as_ref() {
+                if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
+                    global_env
+                        .create(
+                            "REQ_conn_remote_ip",
+                            CollectionValue::String(socket_addr.ip().to_string()),
+                        )
+                        .await
+                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                    global_env
+                        .create(
+                            "REQ_conn_remote_port",
+                            CollectionValue::String(socket_addr.port().to_string()),
+                        )
+                        .await
+                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                }
+            }
+            if let Some(src_addr) = info.real_src_addr.as_ref() {
+                if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
+                    global_env
+                        .create(
+                            "REQ_real_remote_ip",
+                            CollectionValue::String(socket_addr.ip().to_string()),
+                        )
+                        .await
+                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                    global_env
+                        .create(
+                            "REQ_real_remote_port",
+                            CollectionValue::String(socket_addr.port().to_string()),
+                        )
+                        .await
+                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                }
+            }
+        }
         resp_map
             .register_visitors(&global_env)
             .await
@@ -344,10 +401,11 @@ impl ProcessChainHttpServer {
         &self,
         resp: ServerResult<http::Response<BoxBody<Bytes, ServerError>>>,
         req_info: &CompressionRequestInfo,
+        info: Option<&StreamInfo>,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         match resp {
             Ok(resp) => {
-                let resp = self.apply_post_chain(resp).await?;
+                let resp = self.apply_post_chain(resp, info).await?;
                 apply_response_compression(resp, req_info, &self.compression)
             }
             Err(err) => Err(err),
@@ -369,7 +427,7 @@ impl HttpServer for ProcessChainHttpServer {
                 );
                 *response.status_mut() = StatusCode::BAD_REQUEST;
                 return self
-                    .apply_post_chain_result(Ok(response), &req_info)
+                    .apply_post_chain_result(Ok(response), &req_info, Some(&info))
                     .await;
             }
         };
@@ -397,6 +455,42 @@ impl HttpServer for ProcessChainHttpServer {
                     .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
             }
         }
+        if let Some(src_addr) = info.conn_src_addr.as_ref() {
+            if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
+                global_env
+                    .create(
+                        "REQ_conn_remote_ip",
+                        CollectionValue::String(socket_addr.ip().to_string()),
+                    )
+                    .await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                global_env
+                    .create(
+                        "REQ_conn_remote_port",
+                        CollectionValue::String(socket_addr.port().to_string()),
+                    )
+                    .await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+            }
+        }
+        if let Some(src_addr) = info.real_src_addr.as_ref() {
+            if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
+                global_env
+                    .create(
+                        "REQ_real_remote_ip",
+                        CollectionValue::String(socket_addr.ip().to_string()),
+                    )
+                    .await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                global_env
+                    .create(
+                        "REQ_real_remote_port",
+                        CollectionValue::String(socket_addr.port().to_string()),
+                    )
+                    .await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+            }
+        }
         req_map.register_visitors(&global_env).await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
         let ret = executor.execute_lib().await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
@@ -410,14 +504,14 @@ impl HttpServer for ProcessChainHttpServer {
                         .boxed(),
                 );
                 return self
-                    .apply_post_chain_result(Ok(response), &req_info)
+                    .apply_post_chain_result(Ok(response), &req_info, Some(&info))
                     .await;
             } else if ret.is_reject() {
                 debug!("Request rejected by the process chain");
                 let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 return self
-                    .apply_post_chain_result(Ok(response), &req_info)
+                    .apply_post_chain_result(Ok(response), &req_info, Some(&info))
                     .await;
             }
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
@@ -427,7 +521,7 @@ impl HttpServer for ProcessChainHttpServer {
                         let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                         return self
-                            .apply_post_chain_result(Ok(response), &req_info)
+                            .apply_post_chain_result(Ok(response), &req_info, Some(&info))
                             .await;
                     }
 
@@ -447,8 +541,8 @@ impl HttpServer for ProcessChainHttpServer {
 
                             if let Some(server_mgr) = self.server_mgr.upgrade() {
                                 if let Some(service) = server_mgr.get_http_server(server_id) {
-                                    let resp = service.serve_request(post_req, info).await;
-                                    return self.apply_post_chain_result(resp, &req_info).await;
+                                    let resp = service.serve_request(post_req, info.clone()).await;
+                                    return self.apply_post_chain_result(resp, &req_info, Some(&info)).await;
                                 }
                             } else {
                                 log::error!("server manager is unavailable");
@@ -465,7 +559,7 @@ impl HttpServer for ProcessChainHttpServer {
                             let post_req= req_map.into_request()
                                 .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
                             let resp = self.handle_forward_upstream(post_req, target_url).await;
-                            return self.apply_post_chain_result(resp, &req_info).await;
+                            return self.apply_post_chain_result(resp, &req_info, Some(&info)).await;
                         },
                         _ => {
                             log::error!("unknown command: {}", cmd);
@@ -484,7 +578,7 @@ impl HttpServer for ProcessChainHttpServer {
         }
         let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        self.apply_post_chain_result(Ok(response), &req_info).await
+        self.apply_post_chain_result(Ok(response), &req_info, Some(&info)).await
     }
 
     fn id(&self) -> String {
@@ -1823,6 +1917,8 @@ mod tests {
         tokio::spawn(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo {
                 src_addr: Some("127.0.0.1:344".to_string()),
+                conn_src_addr: Some("127.0.0.1:344".to_string()),
+                real_src_addr: None,
             }).await.unwrap();
         });
 

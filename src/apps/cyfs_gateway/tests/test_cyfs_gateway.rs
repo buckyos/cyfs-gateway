@@ -256,6 +256,72 @@ function test_js_hook(context, host) {
         }
 
         {
+            let stream = tokio::net::TcpStream::connect("127.0.0.1:18084").await.unwrap();
+
+            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream)).await.unwrap();
+            let request = hyper::Request::get("/")
+                .header("Host", "ptcp-direct.buckyos.com")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::new())).unwrap();
+
+            tokio::spawn(async move {
+                conn.await.unwrap();
+            });
+
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            let body = response.into_body();
+            let data = body.collect().await.unwrap();
+            assert_eq!(data.to_bytes().as_ref(), b"www.buckyos.com");
+        }
+
+        {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind(SocketAddr::from_str("127.0.0.1:18123").unwrap()).unwrap();
+            let stream = socket.connect(SocketAddr::from_str("127.0.0.1:18082").unwrap()).await.unwrap();
+            let expected_port = 18123;
+
+            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream)).await.unwrap();
+            let request = hyper::Request::get("/")
+                .header("Host", "ptcp-probe.buckyos.com")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::new())).unwrap();
+
+            tokio::spawn(async move {
+                conn.await.unwrap();
+            });
+
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+
+            let remote_port = response.headers()
+                .get("x-remote-port")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap();
+            let conn_remote_port = response.headers()
+                .get("x-conn-remote-port")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap();
+            let real_remote_port = response.headers()
+                .get("x-real-remote-port")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap();
+
+            assert_eq!(remote_port, expected_port);
+            assert_eq!(real_remote_port, expected_port);
+            assert_ne!(conn_remote_port, expected_port);
+
+            let body = response.into_body();
+            let data = body.collect().await.unwrap();
+            assert_eq!(data.to_bytes().as_ref(), b"www.buckyos.com");
+        }
+
+        {
             let name_server_configs = vec![NameServerConfig::new(
                 SocketAddr::from_str("127.0.0.1:9545").unwrap(),
                 Protocol::Udp,

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use crate::ip::IPTunnelBuilder;
+use crate::ip::{IPTunnelBuilder, ProxyTcpTunnelBuilder};
 use crate::DatagramClientBox;
 use crate::{
     TunnelBox, TunnelBuilder, TunnelError, TunnelResult,
@@ -23,6 +23,7 @@ pub fn get_protocol_category(str_protocol: &str) -> TunnelResult<ProtocolCategor
     let str_protocol = str_protocol.to_lowercase();
     match str_protocol.as_str() {
         "tcp" => Ok(ProtocolCategory::Stream),
+        "ptcp" => Ok(ProtocolCategory::Stream),
         "rtcp" => Ok(ProtocolCategory::Stream),
         "udp" => Ok(ProtocolCategory::Datagram),
         "rudp" => Ok(ProtocolCategory::Datagram),
@@ -53,6 +54,7 @@ impl TunnelManager {
             tunnel_builder_manager: Arc::new(Mutex::new(Default::default())),
         };
         this.register_tunnel_builder("tcp", Arc::new(IPTunnelBuilder::new()));
+        this.register_tunnel_builder("ptcp", Arc::new(ProxyTcpTunnelBuilder::new()));
         this.register_tunnel_builder("udp", Arc::new(IPTunnelBuilder::new()));
         this.register_tunnel_builder("quic", Arc::new(QuicTunnelBuilder::new()));
         this.register_tunnel_builder("tls", Arc::new(TlsTunnelBuilder::new()));

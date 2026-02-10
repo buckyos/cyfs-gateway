@@ -1,4 +1,4 @@
-use super::{get_limit_info, stream_forward, Stack};
+use super::{get_limit_info, get_source_addr_from_req_env, stream_forward, Stack};
 
 #[cfg(target_os = "linux")]
 use super::{has_root_privileges, set_socket_opt};
@@ -119,6 +119,11 @@ impl TcpConnectionHandler {
         let (ret, stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        let conn_src_addr = Some(remote_addr.to_string());
+        let real_src_addr = get_source_addr_from_req_env(&global_env)
+            .await
+            .and_then(|addr| addr.parse::<SocketAddr>().ok().map(|_| addr));
+        let stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr);
         if ret.is_control() {
             if ret.is_drop() {
                 return Ok(());
@@ -187,12 +192,12 @@ impl TcpConnectionHandler {
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
                                     Server::Http(server) => {
-                                        hyper_serve_http(stream, server, StreamInfo::new(remote_addr.to_string())).await
+                                        hyper_serve_http(stream, server, stream_info.clone()).await
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
                                     }
                                     Server::Stream(server) => {
                                         server
-                                            .serve_connection(stream, StreamInfo::new(remote_addr.to_string()))
+                                            .serve_connection(stream, stream_info.clone())
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
                                     }

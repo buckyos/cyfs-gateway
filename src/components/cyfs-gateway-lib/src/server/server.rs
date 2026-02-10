@@ -121,12 +121,25 @@ impl Server {
 #[derive(Default, Debug, Clone)]
 pub struct StreamInfo {
     pub src_addr: Option<String>,
+    pub conn_src_addr: Option<String>,
+    pub real_src_addr: Option<String>,
 }
 
 impl StreamInfo {
     pub fn new(src_addr: String) -> Self {
         Self {
-            src_addr: Some(src_addr),
+            src_addr: Some(src_addr.clone()),
+            conn_src_addr: Some(src_addr),
+            real_src_addr: None,
+        }
+    }
+
+    pub fn with_addrs(conn_src_addr: Option<String>, real_src_addr: Option<String>) -> Self {
+        let src_addr = real_src_addr.clone().or_else(|| conn_src_addr.clone());
+        Self {
+            src_addr,
+            conn_src_addr,
+            real_src_addr,
         }
     }
 }

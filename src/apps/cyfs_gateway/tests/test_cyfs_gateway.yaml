@@ -82,6 +82,33 @@ stacks:
             block: |
               call-server main_dns;
 
+  test_ptcp_entry:
+    bind: 0.0.0.0:18082
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              http-probe && forward "ptcp://${REQ.source_addr}/127.0.0.1:18084";
+              reject;
+
+  test_ptcp_mix:
+    bind: 0.0.0.0:18084
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call proxy-protocol-probe;
+              http-probe && call-server ${REQ.dest_host};
+              reject;
+
 servers:
   web3.buckyos.com:
     type: http
@@ -132,6 +159,38 @@ servers:
             priority: 1
             block: |
               call-server www_dir;
+
+  ptcp-direct.buckyos.com:
+    type: http
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server www_dir;
+
+  ptcp-probe.buckyos.com:
+    type: http
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server www_dir;
+    post_hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              map-add RESP x-remote-port ${REQ_remote_port};
+              map-add RESP x-conn-remote-port ${REQ_conn_remote_port};
+              map-add RESP x-real-remote-port ${REQ_real_remote_port};
 
   web3_dir:
     type: dir

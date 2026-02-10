@@ -1,4 +1,5 @@
 mod forward;
+mod proxy_protocol_probe;
 mod set_limit;
 mod set_stat;
 mod server;
@@ -6,6 +7,7 @@ mod server;
 use std::sync::Arc;
 use cyfs_process_chain::{ExternalCommand, ExternalCommandRef, HttpProbeCommand, HttpsSniProbeCommand};
 pub use forward::*;
+pub use proxy_protocol_probe::*;
 pub use set_limit::*;
 pub use set_stat::*;
 pub use server::*;
@@ -22,6 +24,10 @@ pub fn get_external_commands(server_manager: ServerManagerWeakRef) -> Vec<(Strin
     let http_probe_command = HttpProbeCommand::new();
     let name = http_probe_command.name().to_owned();
     cmds.push((name, Arc::new(Box::new(http_probe_command) as Box<dyn ExternalCommand>)));
+
+    let proxy_protocol_probe = ProxyProtocolProbeCommand::new();
+    let name = proxy_protocol_probe.name().to_owned();
+    cmds.push((name, Arc::new(Box::new(proxy_protocol_probe) as Box<dyn ExternalCommand>)));
 
     let set_limit_command = SetLimit::new();
     let name = set_limit_command.name().to_owned();

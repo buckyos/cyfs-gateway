@@ -10,6 +10,7 @@ mod tls_cert_resolver;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use buckyos_kit::AsyncStream;
+use cyfs_process_chain::CollectionValue;
 pub use tcp_stack::*;
 pub use rtcp_stack::*;
 pub use udp_stack::*;
@@ -45,6 +46,28 @@ pub use sfo_result::into_err as into_stack_err;
 pub use sfo_result::err as stack_err;
 use url::Url;
 use crate::{DatagramClientBox, TunnelManager};
+
+pub async fn get_source_addr_from_req_env(global_env: &cyfs_process_chain::EnvRef) -> Option<String> {
+    let req = match global_env.get("REQ").await {
+        Ok(Some(req)) => req,
+        _ => return None,
+    };
+
+    let req = match req.into_map() {
+        Some(req) => req,
+        None => return None,
+    };
+
+    let source = match req.get("source_addr").await {
+        Ok(Some(source)) => source,
+        _ => return None,
+    };
+
+    match source {
+        CollectionValue::String(addr) => Some(addr),
+        _ => None,
+    }
+}
 
 pub async fn stream_forward(mut stream: Box<dyn AsyncStream>, target: &str, tunnel_manager: &TunnelManager) -> StackResult<()> {
     let url = Url::parse(target).map_err(into_stack_err!(

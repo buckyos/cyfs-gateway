@@ -21,7 +21,7 @@ use sfo_io::{LimitStream, StatStream};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
-use crate::stack::{get_limit_info, stream_forward, TlsCertResolver};
+use crate::stack::{get_limit_info, get_source_addr_from_req_env, stream_forward, TlsCertResolver};
 use serde::{Deserialize, Serialize};
 use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType, ACME_TLS_ALPN_NAME};
 use crate::self_cert_mgr::SelfCertMgrRef;
@@ -277,6 +277,11 @@ impl TlsConnectionHandler {
         let (ret, stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        let conn_src_addr = Some(remote_addr.to_string());
+        let real_src_addr = get_source_addr_from_req_env(&global_env)
+            .await
+            .and_then(|addr| addr.parse::<SocketAddr>().ok().map(|_| addr));
+        let stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr);
         if ret.is_control() {
             if ret.is_drop() {
                 return Ok(());
@@ -347,13 +352,13 @@ impl TlsConnectionHandler {
                                     Server::Http(http_server) => {
                                         if let Err(e) = hyper_serve_http(stream,
                                                                          http_server,
-                                                                         StreamInfo::new(remote_addr.to_string())).await {
+                                                                         stream_info.clone()).await {
                                             log::error!("hyper serve http failed: {}", e);
                                         }
                                     }
                                     Server::Stream(server) => {
                                         server
-                                            .serve_connection(stream, StreamInfo::new(remote_addr.to_string()))
+                                            .serve_connection(stream, stream_info.clone())
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
                                     }
