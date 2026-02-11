@@ -33,6 +33,20 @@ pub struct CollectionConfig {
     pub data: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionKind {
+    Set,
+    Map,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CollectionEntry {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: CollectionKind,
+}
+
 pub struct GlobalCollectionManager {
     sets: HashMap<String, SetCollectionRef>,
     maps: HashMap<String, MapCollectionRef>,
@@ -280,6 +294,32 @@ impl GlobalCollectionManager {
 
     fn map_exists(&self, name: &str) -> bool {
         self.maps.contains_key(name)
+    }
+
+    pub fn get_set(&self, name: &str) -> Option<SetCollectionRef> {
+        self.sets.get(name).cloned()
+    }
+
+    pub fn get_map(&self, name: &str) -> Option<MapCollectionRef> {
+        self.maps.get(name).cloned()
+    }
+
+    pub fn list(&self) -> Vec<CollectionEntry> {
+        let mut collections = Vec::with_capacity(self.sets.len() + self.maps.len());
+        for name in self.sets.keys() {
+            collections.push(CollectionEntry {
+                name: name.clone(),
+                kind: CollectionKind::Set,
+            });
+        }
+        for name in self.maps.keys() {
+            collections.push(CollectionEntry {
+                name: name.clone(),
+                kind: CollectionKind::Map,
+            });
+        }
+        collections.sort_by(|a, b| a.name.cmp(&b.name));
+        collections
     }
 
     fn get_sets(&self) -> HashMap<String, SetCollectionRef> {

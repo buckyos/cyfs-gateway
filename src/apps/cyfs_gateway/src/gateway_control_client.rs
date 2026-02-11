@@ -176,6 +176,60 @@ impl GatewayControlClient {
         Ok(result)
     }
 
+    pub async fn collection_list(&self) -> ControlResult<Value> {
+        let result = self.krpc.call("collection_list", Value::Null).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+        Ok(result)
+    }
+
+    pub async fn collection_get(&self, name: &str, key: Option<&str>) -> ControlResult<Value> {
+        let mut params = HashMap::new();
+        params.insert("name", name);
+        if let Some(key) = key {
+            params.insert("key", key);
+        }
+        let result = self.krpc.call("collection_get", serde_json::to_value(&params).unwrap()).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+        Ok(result)
+    }
+
+    pub async fn collection_set_add(&self, name: &str, value: &str) -> ControlResult<Value> {
+        let mut params = HashMap::new();
+        params.insert("name", name);
+        params.insert("value", value);
+        let result = self.krpc.call("collection_set_add", serde_json::to_value(&params).unwrap()).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+        Ok(result)
+    }
+
+    pub async fn collection_set_del(&self, name: &str, value: &str) -> ControlResult<Value> {
+        let mut params = HashMap::new();
+        params.insert("name", name);
+        params.insert("value", value);
+        let result = self.krpc.call("collection_set_del", serde_json::to_value(&params).unwrap()).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+        Ok(result)
+    }
+
+    pub async fn collection_map_put(&self, name: &str, key: &str, value: &str) -> ControlResult<Value> {
+        let mut params = HashMap::new();
+        params.insert("name", name);
+        params.insert("key", key);
+        params.insert("value", value);
+        let result = self.krpc.call("collection_map_put", serde_json::to_value(&params).unwrap()).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+        Ok(result)
+    }
+
+    pub async fn collection_map_del(&self, name: &str, key: &str) -> ControlResult<Value> {
+        let mut params = HashMap::new();
+        params.insert("name", name);
+        params.insert("key", key);
+        let result = self.krpc.call("collection_map_del", serde_json::to_value(&params).unwrap()).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+        Ok(result)
+    }
+
     pub async fn reload(&self) -> ControlResult<Value> {
         let result = self.krpc.call("reload", Value::Null).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;

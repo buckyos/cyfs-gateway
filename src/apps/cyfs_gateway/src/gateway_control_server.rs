@@ -306,16 +306,27 @@ impl HttpServer for GatewayControlServer {
             };
 
             if let Some(handler) = self.handler.upgrade() {
-                let result = handler.handle(req.method.as_str(), req.params).await?;
+                let result = handler.handle(req.method.as_str(), req.params).await;
                 let sys = if new_token.is_some() {
                     vec![seq, Value::String(new_token.unwrap())]
                 } else {
                     vec![seq]
                 };
-                let resp = CmdResp::<Value> {
-                    sys,
-                    result: Some(result),
-                    error: None,
+                let resp = match result {
+                    Ok(result) => {
+                        CmdResp::<Value> {
+                            sys,
+                            result: Some(result),
+                            error: None,
+                        }
+                    }
+                    Err(e) => {
+                        CmdResp::<Value> {
+                            sys,
+                            result: None,
+                            error: Some(e.msg().to_string()),
+                        }
+                    }
                 };
                 let data = serde_json::to_vec(&resp)
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;

@@ -691,6 +691,93 @@ pub async fn cyfs_gateway_main() {
                 .help("write output to file")
                 .value_name("PATH")
                 .required(false)))
+        .subcommand(Command::new("collection")
+            .about("Operate global collections")
+            .subcommand(Command::new("list")
+                .about("List global collections")
+                .arg(Arg::new("server")
+                    .long("server")
+                    .short('s')
+                    .help("server url")
+                    .required(false)
+                    .default_value(CONTROL_SERVER)))
+            .subcommand(Command::new("get")
+                .about("Get collection items")
+                .arg(Arg::new("name")
+                    .help("collection name")
+                    .required(true))
+                .arg(Arg::new("key")
+                    .help("map key, optional")
+                    .required(false))
+                .arg(Arg::new("server")
+                    .long("server")
+                    .short('s')
+                    .help("server url")
+                    .required(false)
+                    .default_value(CONTROL_SERVER)))
+            .subcommand(Command::new("set-add")
+                .about("Add an item to a set collection")
+                .arg(Arg::new("name")
+                    .help("set collection name")
+                    .required(true))
+                .arg(Arg::new("value")
+                    .help("value to add")
+                    .required(true))
+                .arg(Arg::new("server")
+                    .long("server")
+                    .short('s')
+                    .help("server url")
+                    .required(false)
+                    .default_value(CONTROL_SERVER)))
+            .subcommand(Command::new("set-del")
+                .about("Delete an item from a set collection")
+                .arg(Arg::new("name")
+                    .help("set collection name")
+                    .required(true))
+                .arg(Arg::new("value")
+                    .help("value to delete")
+                    .required(true))
+                .arg(Arg::new("server")
+                    .long("server")
+                    .short('s')
+                    .help("server url")
+                    .required(false)
+                    .default_value(CONTROL_SERVER)))
+            .subcommand(Command::new("map-put")
+                .about("Put a key-value in a map collection")
+                .arg(Arg::new("name")
+                    .help("map collection name")
+                    .required(true))
+                .arg(Arg::new("key")
+                    .help("map key")
+                    .required(true))
+                .arg(Arg::new("value")
+                    .help("value to put")
+                    .required(true))
+                .arg(Arg::new("json")
+                    .long("json")
+                    .help("parse value as JSON before storing")
+                    .action(ArgAction::SetTrue))
+                .arg(Arg::new("server")
+                    .long("server")
+                    .short('s')
+                    .help("server url")
+                    .required(false)
+                    .default_value(CONTROL_SERVER)))
+            .subcommand(Command::new("map-del")
+                .about("Delete a key from a map collection")
+                .arg(Arg::new("name")
+                    .help("map collection name")
+                    .required(true))
+                .arg(Arg::new("key")
+                    .help("map key")
+                    .required(true))
+                .arg(Arg::new("server")
+                    .long("server")
+                    .short('s')
+                    .help("server url")
+                    .required(false)
+                    .default_value(CONTROL_SERVER))))
         .subcommand(Command::new("debug")
             .about("Debug process chain rule with request file")
             .arg(Arg::new("config_file")
@@ -1086,6 +1173,156 @@ pub async fn cyfs_gateway_main() {
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(("collection", sub_matches)) => {
+            match sub_matches.subcommand() {
+                Some(("list", list_matches)) => {
+                    let server = list_matches.get_one::<String>("server").expect("server is required");
+                    let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+                    match cyfs_cmd_client.collection_list().await {
+                        Ok(result) => {
+                            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                                save_login_token(server.as_str(), token.as_str());
+                            }
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            println!("collection list error: {}", e);
+                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                                save_login_token(server.as_str(), token.as_str());
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Some(("get", get_matches)) => {
+                    let name = get_matches.get_one::<String>("name").expect("name is required");
+                    let key = get_matches.get_one::<String>("key").map(|s| s.as_str());
+                    let server = get_matches.get_one::<String>("server").expect("server is required");
+                    let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+                    match cyfs_cmd_client.collection_get(name, key).await {
+                        Ok(result) => {
+                            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                                save_login_token(server.as_str(), token.as_str());
+                            }
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            println!("collection get error: {}", e);
+                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                                save_login_token(server.as_str(), token.as_str());
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Some(("set-add", set_add_matches)) => {
+                    let name = set_add_matches.get_one::<String>("name").expect("name is required");
+                    let value = set_add_matches.get_one::<String>("value").expect("value is required");
+                    let server = set_add_matches.get_one::<String>("server").expect("server is required");
+                    let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+                    match cyfs_cmd_client.collection_set_add(name, value).await {
+                        Ok(result) => {
+                            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                                save_login_token(server.as_str(), token.as_str());
+                            }
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            println!("collection set-add error: {}", e);
+                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                                save_login_token(server.as_str(), token.as_str());
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Some(("set-del", set_del_matches)) => {
+                    let name = set_del_matches.get_one::<String>("name").expect("name is required");
+                    let value = set_del_matches.get_one::<String>("value").expect("value is required");
+                    let server = set_del_matches.get_one::<String>("server").expect("server is required");
+                    let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+                    match cyfs_cmd_client.collection_set_del(name, value).await {
+                        Ok(result) => {
+                            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                                save_login_token(server.as_str(), token.as_str());
+                            }
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            println!("collection set-del error: {}", e);
+                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                                save_login_token(server.as_str(), token.as_str());
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Some(("map-put", map_put_matches)) => {
+                    let name = map_put_matches.get_one::<String>("name").expect("name is required");
+                    let key = map_put_matches.get_one::<String>("key").expect("key is required");
+                    let raw_value = map_put_matches.get_one::<String>("value").expect("value is required");
+                    let value = if map_put_matches.get_flag("json") {
+                        match serde_json::from_str::<Value>(raw_value.as_str()) {
+                            Ok(v) => v.to_string(),
+                            Err(e) => {
+                                println!("collection map-put error: invalid --json value: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        raw_value.clone()
+                    };
+                    let server = map_put_matches.get_one::<String>("server").expect("server is required");
+                    let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+                    match cyfs_cmd_client.collection_map_put(name, key, value.as_str()).await {
+                        Ok(result) => {
+                            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                                save_login_token(server.as_str(), token.as_str());
+                            }
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            println!("collection map-put error: {}", e);
+                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                                save_login_token(server.as_str(), token.as_str());
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Some(("map-del", map_del_matches)) => {
+                    let name = map_del_matches.get_one::<String>("name").expect("name is required");
+                    let key = map_del_matches.get_one::<String>("key").expect("key is required");
+                    let server = map_del_matches.get_one::<String>("server").expect("server is required");
+                    let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+                    match cyfs_cmd_client.collection_map_del(name, key).await {
+                        Ok(result) => {
+                            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                                save_login_token(server.as_str(), token.as_str());
+                            }
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            println!("collection map-del error: {}", e);
+                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                                save_login_token(server.as_str(), token.as_str());
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                _ => {
+                    println!("collection subcommand is required");
                     std::process::exit(1);
                 }
             }

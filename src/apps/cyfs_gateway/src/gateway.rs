@@ -33,6 +33,7 @@ use crate::gateway_control_server::{
 use cyfs_dns::{DnsServerContext, InnerDnsRecordManager, InnerDnsRecordManagerRef, LocalDnsServerContext};
 use cyfs_socks::SocksServerContext;
 use cyfs_tun::TunStackContext;
+use cyfs_process_chain::CollectionValue;
 use crate::acme_sn_provider::AcmeSnProviderFactory;
 use crate::{merge, AcmeConfig, TlsCA};
 use crate::socks::SocksTunnelBuilder;
@@ -614,6 +615,7 @@ impl GatewayFactory {
             control_handler,
             control_token_manager: token_manager,
             timer_manager,
+            global_collection_manager: RwLock::new(global_collections.clone()),
         });
         let timers = gateway
             .config
@@ -658,6 +660,7 @@ pub struct Gateway {
     control_handler: Arc<dyn GatewayControlCmdHandler>,
     control_token_manager: Arc<LocalTokenManager<LocalTokenKeyStore>>,
     timer_manager: TimerManager,
+    global_collection_manager: RwLock<GlobalCollectionManagerRef>,
 }
 
 impl Drop for Gateway {
@@ -679,6 +682,10 @@ struct ParsedRuleId<'a> {
 impl Gateway {
     pub fn tunnel_manager(&self) -> &TunnelManager {
         &self.tunnel_manager
+    }
+
+    pub fn global_collection_manager(&self) -> GlobalCollectionManagerRef {
+        self.global_collection_manager.read().unwrap().clone()
     }
 
     pub async fn start(&self, params: GatewayParams) -> Result<()> {
@@ -2607,11 +2614,12 @@ impl Gateway {
                 &timer_tasks,
                 Arc::downgrade(&server_manager),
                 global_process_chains,
-                global_collections,
+                global_collections.clone(),
                 js_externals,
             )
             .await?;
 
+        *self.global_collection_manager.write().unwrap() = global_collections;
         *self.config.lock().unwrap() = config;
         *self.limiter_manager.lock().unwrap() = limiter_manager;
         Ok(())
@@ -2773,6 +2781,230 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 gateway.get_init_config()
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))
             },
+            "collection_list" => {
+                let collections = gateway.global_collection_manager().list();
+                Ok(serde_json::to_value(collections).map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
+            }
+            "collection_get" => {
+                let params = serde_json::from_value::<HashMap<String, String>>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let name = params.get("name");
+                if name.is_none() {
+                    Err(cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "Invalid params: name is None",
+                    ))?;
+                }
+                let name = name.unwrap();
+                let key = params.get("key");
+                let manager = gateway.global_collection_manager();
+                if let Some(set) = manager.get_set(name.as_str()) {
+                    let items = set.get_all().await
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                    return Ok(json!({
+                        "name": name,
+                        "type": "set",
+                        "items": items,
+                    }));
+                }
+                if let Some(map) = manager.get_map(name.as_str()) {
+                    if let Some(key) = key {
+                        let value = map.get(key.as_str()).await
+                            .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                        let value = value
+                            .as_ref()
+                            .map(collection_value_to_json_value)
+                            .unwrap_or(Value::Null);
+                        return Ok(json!({
+                            "name": name,
+                            "type": "map",
+                            "key": key,
+                            "value": value,
+                        }));
+                    }
+                    let entries = map.dump().await
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                    let mut items = Map::new();
+                    for (k, v) in entries {
+                        items.insert(k, collection_value_to_json_value(&v));
+                    }
+                    return Ok(json!({
+                        "name": name,
+                        "type": "map",
+                        "items": items,
+                    }));
+                }
+                Err(cmd_err!(
+                    ControlErrorCode::ConfigNotFound,
+                    "collection not found: {}",
+                    name
+                ))
+            }
+            "collection_set_add" => {
+                let params = serde_json::from_value::<HashMap<String, String>>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let name = params.get("name");
+                let value = params.get("value");
+                if name.is_none() || value.is_none() {
+                    Err(cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "Invalid params: name or value is None",
+                    ))?;
+                }
+                let name = name.unwrap();
+                let value = value.unwrap();
+                let manager = gateway.global_collection_manager();
+                if let Some(set) = manager.get_set(name.as_str()) {
+                    let inserted = set.insert(value.as_str()).await
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                    return Ok(json!({
+                        "name": name,
+                        "type": "set",
+                        "value": value,
+                        "inserted": inserted,
+                    }));
+                }
+                if manager.get_map(name.as_str()).is_some() {
+                    return Err(cmd_err!(
+                        ControlErrorCode::InvalidConfigType,
+                        "collection {} is a map, expected set",
+                        name
+                    ));
+                }
+                Err(cmd_err!(
+                    ControlErrorCode::ConfigNotFound,
+                    "collection not found: {}",
+                    name
+                ))
+            }
+            "collection_set_del" => {
+                let params = serde_json::from_value::<HashMap<String, String>>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let name = params.get("name");
+                let value = params.get("value");
+                if name.is_none() || value.is_none() {
+                    Err(cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "Invalid params: name or value is None",
+                    ))?;
+                }
+                let name = name.unwrap();
+                let value = value.unwrap();
+                let manager = gateway.global_collection_manager();
+                if let Some(set) = manager.get_set(name.as_str()) {
+                    let removed = set.remove(value.as_str()).await
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                    return Ok(json!({
+                        "name": name,
+                        "type": "set",
+                        "value": value,
+                        "removed": removed,
+                    }));
+                }
+                if manager.get_map(name.as_str()).is_some() {
+                    return Err(cmd_err!(
+                        ControlErrorCode::InvalidConfigType,
+                        "collection {} is a map, expected set",
+                        name
+                    ));
+                }
+                Err(cmd_err!(
+                    ControlErrorCode::ConfigNotFound,
+                    "collection not found: {}",
+                    name
+                ))
+            }
+            "collection_map_put" => {
+                let params = serde_json::from_value::<HashMap<String, String>>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let name = params.get("name");
+                let key = params.get("key");
+                let value = params.get("value");
+                if name.is_none() || key.is_none() || value.is_none() {
+                    Err(cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "Invalid params: name or key or value is None",
+                    ))?;
+                }
+                let name = name.unwrap();
+                let key = key.unwrap();
+                let value = value.unwrap();
+                let manager = gateway.global_collection_manager();
+                if let Some(map) = manager.get_map(name.as_str()) {
+                    let old = map
+                        .insert(key.as_str(), CollectionValue::String(value.clone()))
+                        .await
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                    let old = old
+                        .as_ref()
+                        .map(collection_value_to_json_value)
+                        .unwrap_or(Value::Null);
+                    return Ok(json!({
+                        "name": name,
+                        "type": "map",
+                        "key": key,
+                        "value": value,
+                        "replaced": !old.is_null(),
+                        "old": old,
+                    }));
+                }
+                if manager.get_set(name.as_str()).is_some() {
+                    return Err(cmd_err!(
+                        ControlErrorCode::InvalidConfigType,
+                        "collection {} is a set, expected map",
+                        name
+                    ));
+                }
+                Err(cmd_err!(
+                    ControlErrorCode::ConfigNotFound,
+                    "collection not found: {}",
+                    name
+                ))
+            }
+            "collection_map_del" => {
+                let params = serde_json::from_value::<HashMap<String, String>>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let name = params.get("name");
+                let key = params.get("key");
+                if name.is_none() || key.is_none() {
+                    Err(cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "Invalid params: name or key is None",
+                    ))?;
+                }
+                let name = name.unwrap();
+                let key = key.unwrap();
+                let manager = gateway.global_collection_manager();
+                if let Some(map) = manager.get_map(name.as_str()) {
+                    let old = map
+                        .remove(key.as_str())
+                        .await
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                    let old = old
+                        .as_ref()
+                        .map(collection_value_to_json_value)
+                        .unwrap_or(Value::Null);
+                    return Ok(json!({
+                        "name": name,
+                        "type": "map",
+                        "key": key,
+                        "removed": !old.is_null(),
+                        "old": old,
+                    }));
+                }
+                if manager.get_set(name.as_str()).is_some() {
+                    return Err(cmd_err!(
+                        ControlErrorCode::InvalidConfigType,
+                        "collection {} is a set, expected map",
+                        name
+                    ));
+                }
+                Err(cmd_err!(
+                    ControlErrorCode::ConfigNotFound,
+                    "collection not found: {}",
+                    name
+                ))
+            }
             "save_config" => {
                 let requested_path = if params.is_null() {
                     None
