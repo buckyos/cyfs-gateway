@@ -348,6 +348,52 @@ impl ProcessChainHttpServer {
         Ok(response)
     }
 
+    fn parse_error_status_code(status: &str) -> ServerResult<StatusCode> {
+        let code = status.parse::<u16>().map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid error status code: {}, {}",
+                status,
+                e
+            )
+        })?;
+        if !(400..=599).contains(&code) {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid error status code: {}, supported range is 400..=599",
+                code
+            ));
+        }
+        StatusCode::from_u16(code).map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid error status code: {}, {}",
+                code,
+                e
+            )
+        })
+    }
+
+    fn build_error_response(
+        &self,
+        status: StatusCode,
+        message: Option<&str>,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let body = message.unwrap_or("");
+        let response = http::Response::builder()
+            .status(status)
+            .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Full::new(Bytes::from(body.to_string())).map_err(|e| match e {}).boxed())
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::BadRequest,
+                    "Failed to build error response: {}",
+                    e
+                )
+            })?;
+        Ok(response)
+    }
+
     // Post-hook rules:
     // - post_hook_point is optional; when absent, response is returned as-is.
     // - RESP is a header-only map (no status/version keys).
@@ -626,6 +672,20 @@ impl HttpServer for ProcessChainHttpServer {
                                 list.get(2).map(|v| v.as_str()),
                             )?;
                             let resp = self.build_redirect_response(location, status)?;
+                            return self
+                                .apply_post_chain_result(Ok(resp), &req_info, Some(&info))
+                                .await;
+                        },
+                        "error" => {
+                            if list.len() < 2 || list.len() > 3 {
+                                return Err(server_err!(
+                                    ServerErrorCode::InvalidConfig,
+                                    "invalid error command"
+                                ));
+                            }
+                            let status = Self::parse_error_status_code(list[1].as_str())?;
+                            let message = list.get(2).map(|v| v.as_str());
+                            let resp = self.build_error_response(status, message)?;
                             return self
                                 .apply_post_chain_result(Ok(resp), &req_info, Some(&info))
                                 .await;
@@ -2274,6 +2334,161 @@ mod tests {
 
         let result = ProcessChainHttpServer::builder()
             .id("test_redirect_invalid")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .tunnel_manager(TunnelManager::new())
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+        let http_server = Arc::new(result.unwrap());
+
+        let (client, server) = tokio::io::duplex(128);
+
+        tokio::spawn(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/test")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_http_server_error_status() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "error 404";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let result = ProcessChainHttpServer::builder()
+            .id("test_error_status")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .tunnel_manager(TunnelManager::new())
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+        let http_server = Arc::new(result.unwrap());
+
+        let (client, server) = tokio::io::duplex(128);
+
+        tokio::spawn(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/test")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_http_server_error_with_message() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "error 503 \"upstream unavailable\"";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let result = ProcessChainHttpServer::builder()
+            .id("test_error_message")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .tunnel_manager(TunnelManager::new())
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+        let http_server = Arc::new(result.unwrap());
+
+        let (client, server) = tokio::io::duplex(128);
+
+        tokio::spawn(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/test")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from("upstream unavailable"));
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_http_server_error_invalid_status() {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "error 200 should fail";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let result = ProcessChainHttpServer::builder()
+            .id("test_error_invalid")
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
             .server_mgr(Arc::downgrade(&mock_server_mgr))
