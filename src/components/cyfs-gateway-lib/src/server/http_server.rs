@@ -1,13 +1,18 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use http::{Version};
+use http::Version;
 use http_body_util::combinators::{BoxBody};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes};
 use hyper::{http, StatusCode, Request};
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
 use regex::Regex;
 use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager};
@@ -131,6 +136,58 @@ pub struct ProcessChainHttpServer {
     compression: HttpCompressionSettings,
 }
 
+#[derive(Debug)]
+struct NoCertificateVerifier;
+
+impl ServerCertVerifier for NoCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer,
+        _intermediates: &[CertificateDer],
+        _server_name: &ServerName,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA1,
+            SignatureScheme::ECDSA_SHA1_Legacy,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
+    }
+}
+
 impl Drop for ProcessChainHttpServer {
     fn drop(&mut self) {
         debug!("ProcessChainHttpServer {} drop", self.id);
@@ -232,37 +289,170 @@ impl ProcessChainHttpServer {
         // and org_url starts with '/'.
         let base = target_url.trim_end_matches('/');
         let path = org_url.trim_start_matches('/');
-        let url = format!("{}/{}", base, path);
-        info!("handle_upstream url: {}", url);
-        let upstream_url = Url::parse(target_url);
-        if upstream_url.is_err() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "Failed to parse upstream url: {}", target_url));
-        }
-        //TODO:support url rewrite
-        let upstream_url = upstream_url.unwrap();
-        let scheme = upstream_url.scheme();
+        let raw_url = format!("{}/{}", base, path);
+        let request_url = Url::parse(&raw_url).map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "Failed to parse request upstream url {}: {}",
+                raw_url,
+                e
+            )
+        })?;
+        info!("handle_upstream url: {}", request_url);
+        let scheme = request_url.scheme();
         match scheme {
-            "http" | "https" => {
-                let client: Client<_, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>> = Client::builder(TokioExecutor::new()).build_http();
+            "http" => {
+                let client: Client<_, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>> =
+                    Client::builder(TokioExecutor::new()).build_http();
                 let header = req.headers().clone();
                 let method = req.method().clone();
                 let body = req.into_body().map_err(|e| {
                     Box::new(e) as Box<dyn std::error::Error + Send + Sync>
                 }).boxed();
                 let mut upstream_req = Request::builder()
-                .method(method)
-                .uri(&url)
-                .body(body).map_err(|e| {
+                    .method(method)
+                    .uri(request_url.as_str())
+                    .body(body).map_err(|e| {
                     server_err!(ServerErrorCode::InvalidConfig, "Failed to build request: {}", e)
                 })?;
 
                 *upstream_req.headers_mut() = header;
 
                 let resp = client.request(upstream_req).await.map_err(|e| {
-                    server_err!(ServerErrorCode::InvalidConfig, "Failed to request upstream {}: {}", upstream_url, e)
+                    server_err!(ServerErrorCode::InvalidConfig, "Failed to request upstream {}: {}", request_url, e)
                 })?;
                 let resp = resp.map(|body| body.map_err(|e| ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))).boxed());
-                return Ok(resp)
+                Ok(resp)
+            },
+            "https" => {
+                let header = req.headers().clone();
+                let method = req.method().clone();
+                let upstream_http_version = match req.version() {
+                    http::Version::HTTP_10 => http::Version::HTTP_10,
+                    http::Version::HTTP_11 => http::Version::HTTP_11,
+                    _ => http::Version::HTTP_11,
+                };
+
+                let connect_host = request_url.host_str().ok_or_else(|| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Missing upstream host in url: {}",
+                        request_url
+                    )
+                })?;
+                let connect_port = request_url.port_or_known_default().ok_or_else(|| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Missing upstream port in url: {}",
+                        request_url
+                    )
+                })?;
+
+                let sni_host = {
+                    let host = header.get("host").and_then(|h| h.to_str().ok()).map(|h| h.trim());
+                    let parsed = host.and_then(|h| {
+                        if h.is_empty() {
+                            return None;
+                        }
+                        if let Some(stripped) = h.strip_prefix('[') {
+                            let end = stripped.find(']')?;
+                            return Some(stripped[..end].to_string());
+                        }
+                        Some(h.split(':').next().unwrap_or(h).to_string())
+                    });
+                    parsed.or_else(|| request_url.host_str().map(|h| h.to_string()))
+                }.ok_or_else(|| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Missing SNI host for upstream: {}",
+                        request_url
+                    )
+                })?;
+
+                let tcp_stream = TcpStream::connect(format!("{}:{}", connect_host, connect_port))
+                    .await
+                    .map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "Failed to connect upstream {}:{}: {}",
+                            connect_host,
+                            connect_port,
+                            e
+                        )
+                    })?;
+
+                let tls_config = ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                    .with_safe_default_protocol_versions()
+                    .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "Invalid tls config: {}", e))?
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoCertificateVerifier))
+                    .with_no_client_auth();
+                let tls_connector = TlsConnector::from(Arc::new(tls_config));
+                let server_name = ServerName::try_from(sni_host.clone()).map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Invalid upstream host for tls {}: {}",
+                        sni_host,
+                        e
+                    )
+                })?;
+                let tls_stream = tls_connector.connect(server_name, tcp_stream).await.map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Failed tls handshake with upstream {} via {}:{}: {}",
+                        sni_host,
+                        connect_host,
+                        connect_port,
+                        e
+                    )
+                })?;
+
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
+                    .await
+                    .map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::StreamError,
+                            "Failed to build https client connection: {}",
+                            e
+                        )
+                    })?;
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        debug!("https upstream connection closed with error: {}", e);
+                    }
+                });
+
+                let body = req.into_body().map_err(|e| {
+                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                }).boxed();
+                let mut upstream_req = Request::builder()
+                    .method(method)
+                    .uri(org_url)
+                    .version(upstream_http_version)
+                    .body(body)
+                    .map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::BadRequest,
+                            "Failed to build https upstream request: {}",
+                            e
+                        )
+                    })?;
+                *upstream_req.headers_mut() = header;
+
+                let resp = sender.send_request(upstream_req).await.map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Failed to request https upstream {} via {}:{}: {}",
+                        sni_host,
+                        connect_host,
+                        connect_port,
+                        e
+                    )
+                })?;
+                let resp = resp.map(|body| body.map_err(|e| ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))).boxed());
+                Ok(resp)
             },
             _ => {
                 let tunnel_connector = TunnelConnector {
