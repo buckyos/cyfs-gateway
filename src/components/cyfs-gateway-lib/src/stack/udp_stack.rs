@@ -15,7 +15,7 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use url::Url;
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, DatagramClientBox, ServerManagerRef, ProcessChainConfigs, Stack, StackContext, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, DatagramInfo, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SpeedStatRef, get_external_commands, GlobalCollectionManagerRef, JsExternalsManagerRef};
+use crate::{create_io_dump_stack_config, dump_single_datagram, into_stack_err, stack_err, DatagramClientBox, IoDumpStackConfig, ServerManagerRef, ProcessChainConfigs, Stack, StackContext, StackErrorCode, StackProtocol, StackResult, Server, ConnectionManagerRef, ConnectionController, ConnectionInfo, StackError, StackConfig, ProcessChainConfig, TunnelManager, StackFactory, StackRef, DatagramInfo, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SpeedStatRef, get_external_commands, GlobalCollectionManagerRef, JsExternalsManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 #[cfg(target_os = "linux")]
@@ -64,12 +64,14 @@ impl StackContext for UdpStackContext {
 struct UdpDatagramHandler {
     env: Arc<UdpStackContext>,
     executor: ProcessChainLibExecutor,
+    io_dump: Option<IoDumpStackConfig>,
 }
 
 impl UdpDatagramHandler {
     async fn create(
         hook_point: ProcessChainConfigs,
         env: Arc<UdpStackContext>,
+        io_dump: Option<IoDumpStackConfig>,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -83,6 +85,7 @@ impl UdpDatagramHandler {
         Ok(Self {
             env,
             executor,
+            io_dump,
         })
     }
 
@@ -214,6 +217,9 @@ impl UdpDatagramHandler {
                                 });
 
                                 let stat = speed_stat.clone();
+                                let io_dump = self.io_dump.clone();
+                                let src_addr_copy = src_addr;
+                                let dest_addr_copy = dest_addr;
                                 let mut receive_forward_datagram: Box<dyn Datagram<Error=StackError>> = if limiter.is_some() {
                                     let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
                                     let datagram = LimitDatagram::new(UdpSendDatagram::new(udp_socket.clone(), src_addr), read_limit, write_limit);
@@ -241,6 +247,15 @@ impl UdpDatagramHandler {
                                             log::error!("send datagram error: {}", e);
                                             break;
                                         }
+                                        if let Some(io_dump) = io_dump.as_ref() {
+                                            dump_single_datagram(
+                                                io_dump,
+                                                src_addr_copy.to_string(),
+                                                dest_addr_copy.to_string(),
+                                                Vec::new(),
+                                                buffer[0..len].to_vec(),
+                                            );
+                                        }
                                         stat.add_write_data_size(len as u64);
                                     }
                                 });
@@ -258,6 +273,9 @@ impl UdpDatagramHandler {
                                     speed_stat: speed_stat_ref.clone(),
                                 });
                             } else {
+                                let io_dump = self.io_dump.clone();
+                                let src_addr_copy = src_addr;
+                                let dest_addr_copy = dest_addr;
                                 let handle = tokio::spawn(async move {
                                     let mut buffer = vec![0u8; 1024 * 4];
                                     loop {
@@ -277,6 +295,15 @@ impl UdpDatagramHandler {
                                         {
                                             log::error!("send datagram error: {}", e);
                                             break;
+                                        }
+                                        if let Some(io_dump) = io_dump.as_ref() {
+                                            dump_single_datagram(
+                                                io_dump,
+                                                src_addr_copy.to_string(),
+                                                dest_addr_copy.to_string(),
+                                                Vec::new(),
+                                                buffer[0..len].to_vec(),
+                                            );
                                         }
                                         stat.add_write_data_size(len as u64);
                                     }
@@ -319,6 +346,9 @@ impl UdpDatagramHandler {
                                             Box::new(UdpDatagram::new(udp_socket.clone(), src_addr, receive))
                                         };
                                         let stat = speed_stat.clone();
+                                        let io_dump = self.io_dump.clone();
+                                        let src_addr_copy = src_addr;
+                                        let dest_addr_copy = dest_addr;
                                         let datagram_server = datagram_server.clone();
                                         let handle = tokio::spawn(async move {
                                             let mut buffer = vec![0u8; 1024 * 4];
@@ -336,6 +366,15 @@ impl UdpDatagramHandler {
                                                         if let Err(e) = udp_socket.send_to(buf.as_slice(), src_addr).await {
                                                             log::error!("send datagram error: {}", e);
                                                             break;
+                                                        }
+                                                        if let Some(io_dump) = io_dump.as_ref() {
+                                                            dump_single_datagram(
+                                                                io_dump,
+                                                                src_addr_copy.to_string(),
+                                                                dest_addr_copy.to_string(),
+                                                                Vec::new(),
+                                                                buf.clone(),
+                                                            );
                                                         }
                                                         stat.add_read_data_size(len as u64);
                                                         stat.add_write_data_size(buf.len() as u64);
@@ -731,6 +770,7 @@ struct UdpStackInner {
     local_ips: Vec<IpAddr>,
     socket_cache: SocketCache,
     handler: Arc<RwLock<Arc<UdpDatagramHandler>>>,
+    io_dump: Arc<RwLock<Option<IoDumpStackConfig>>>,
 }
 
 impl UdpStackInner {
@@ -743,6 +783,7 @@ impl UdpStackInner {
         }
 
         let local_ips = Self::local_ips()?;
+        let io_dump = handler.read().unwrap().io_dump.clone();
         Ok(Self {
             id: builder.id.unwrap(),
             bind_addr: builder.bind.unwrap(),
@@ -753,6 +794,7 @@ impl UdpStackInner {
             transparent: builder.transparent,
             local_ips,
             socket_cache: SocketCache::new(),
+            io_dump: Arc::new(RwLock::new(io_dump)),
             handler,
         })
     }
@@ -776,6 +818,15 @@ impl UdpStackInner {
     }
 
     async fn handle_datagram(&self, udp_socket: Arc<UdpSocket>, src_addr: SocketAddr, dest_addr: SocketAddr, data: Vec<u8>, len: usize) -> StackResult<()> {
+        if let Some(io_dump) = self.io_dump.read().unwrap().clone() {
+            dump_single_datagram(
+                &io_dump,
+                src_addr.to_string(),
+                dest_addr.to_string(),
+                data[..len].to_vec(),
+                Vec::new(),
+            );
+        }
         let session_key = SessionKey::new(src_addr, dest_addr);
         let client_session = {
             let mut all_sessions = self.all_client_session.lock().unwrap();
@@ -827,6 +878,15 @@ impl UdpStackInner {
                                             log::error!("send datagram error: {}", e);
                                             *session_guard = None;
                                         } else {
+                                            if let Some(io_dump) = self.io_dump.read().unwrap().clone() {
+                                                dump_single_datagram(
+                                                    &io_dump,
+                                                    src_addr.to_string(),
+                                                    dest_addr.to_string(),
+                                                    Vec::new(),
+                                                    resp.clone(),
+                                                );
+                                            }
                                             server_session.latest_time = chrono::Utc::now().timestamp() as u64;
                                             server_session.speed_stat.add_read_data_size(len as u64);
                                             server_session.speed_stat.add_write_data_size(resp.len() as u64);
@@ -1139,6 +1199,7 @@ impl UdpStack {
         let handler = UdpDatagramHandler::create(
             builder.hook_point.take().unwrap(),
             stack_context,
+            builder.io_dump.clone(),
         )
             .await?;
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
@@ -1218,6 +1279,16 @@ impl Stack for UdpStack {
         let new_handler = UdpDatagramHandler::create(
             config.hook_point.clone(),
             env,
+            create_io_dump_stack_config(
+                &config.id,
+                config.io_dump_file.as_deref(),
+                config.io_dump_rotate_size.as_deref(),
+                config.io_dump_rotate_max_files,
+                config.io_dump_max_upload_bytes_per_conn.as_deref(),
+                config.io_dump_max_download_bytes_per_conn.as_deref(),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
         ).await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())
@@ -1225,6 +1296,7 @@ impl Stack for UdpStack {
 
     async fn commit_update(&self) {
         if let Some(handler) = self.prepare_handler.write().unwrap().take() {
+            *self.inner.io_dump.write().unwrap() = handler.io_dump.clone();
             *self.inner.handler.write().unwrap() = handler;
         }
     }
@@ -1243,6 +1315,7 @@ pub struct UdpStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     transparent: bool,
     stack_context: Option<Arc<UdpStackContext>>,
+    io_dump: Option<IoDumpStackConfig>,
 }
 
 impl UdpStackBuilder {
@@ -1256,6 +1329,7 @@ impl UdpStackBuilder {
             connection_manager: None,
             transparent: false,
             stack_context: None,
+            io_dump: None,
         }
     }
 
@@ -1298,6 +1372,11 @@ impl UdpStackBuilder {
         self
     }
 
+    pub fn io_dump(mut self, io_dump: Option<IoDumpStackConfig>) -> Self {
+        self.io_dump = io_dump;
+        self
+    }
+
     pub async fn build(self) -> StackResult<UdpStack> {
         UdpStack::create(self).await
     }
@@ -1315,6 +1394,16 @@ pub struct UdpStackConfig {
     pub hook_point: Vec<ProcessChainConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transparent: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_rotate_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_rotate_max_files: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_max_upload_bytes_per_conn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_max_download_bytes_per_conn: Option<String>,
 }
 
 impl StackConfig for UdpStackConfig {
@@ -1362,6 +1451,16 @@ impl StackFactory for UdpStackFactory {
             .downcast_ref::<UdpStackContext>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid udp stack context"))?;
         let stack_context = Arc::new(stack_context.clone());
+        let io_dump = create_io_dump_stack_config(
+            &config.id,
+            config.io_dump_file.as_deref(),
+            config.io_dump_rotate_size.as_deref(),
+            config.io_dump_rotate_max_files,
+            config.io_dump_max_upload_bytes_per_conn.as_deref(),
+            config.io_dump_max_download_bytes_per_conn.as_deref(),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
         let stack = UdpStack::builder()
             .id(config.id.clone())
             .bind(config.bind.to_string())
@@ -1370,7 +1469,8 @@ impl StackFactory for UdpStackFactory {
             .concurrency(config.concurrency.unwrap_or(200))
             .session_idle_time(Duration::from_secs(config.session_idle_time.unwrap_or(120)))
             .transparent(config.transparent.unwrap_or(false))
-            .stack_context(stack_context)
+            .stack_context(stack_context.clone())
+            .io_dump(io_dump)
             .build().await?;
         Ok(Arc::new(stack))
     }
@@ -1379,11 +1479,12 @@ impl StackFactory for UdpStackFactory {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use buckyos_kit::init_logging;
     use tokio::net::UdpSocket;
-    use crate::{ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager, GlobalCollectionManagerRef, LimiterManagerRef, ProcessChainConfigs, Server, ServerManager, ServerManagerRef, ServerResult, Stack, StackFactory, StackProtocol, StatManager, StatManagerRef, TunnelManager, UdpStack, UdpStackConfig, UdpStackContext, UdpStackFactory};
+    use crate::{create_io_dump_stack_config, decode_io_dump_frames, ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager, GlobalCollectionManagerRef, LimiterManagerRef, ProcessChainConfigs, Server, ServerManager, ServerManagerRef, ServerResult, Stack, StackFactory, StackProtocol, StatManager, StatManagerRef, TunnelManager, UdpStack, UdpStackConfig, UdpStackContext, UdpStackFactory};
     use crate::global_process_chains::{GlobalProcessChains, GlobalProcessChainsRef};
     use crate::server::{DatagramServer};
 
@@ -1404,6 +1505,20 @@ mod tests {
             global_collection_manager,
             None,
         ))
+    }
+
+    async fn wait_dump_frames(file: &Path, min_frames: usize) -> Vec<crate::DecodedIoDumpFrame> {
+        for _ in 0..50 {
+            if let Ok(data) = std::fs::read(file)
+                && !data.is_empty()
+                && let Ok(frames) = decode_io_dump_frames(&data)
+                && frames.len() >= min_frames
+            {
+                return frames;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("dump frames not ready");
     }
 
     #[tokio::test]
@@ -1517,6 +1632,73 @@ mod tests {
         assert!(stack.get_session_count() > 0);
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         assert_eq!(stack.get_session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_udp_io_dump_forward_single_roundtrip() {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "forward udp:///127.0.0.1:8942";
+        "#;
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+        let stack_context = build_udp_context(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("udp_forward.dump");
+        let io_dump = create_io_dump_stack_config(
+            "udp_forward",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stack = UdpStack::builder()
+            .id("udp-dump-forward")
+            .bind("0.0.0.0:8941")
+            .hook_point(chains)
+            .session_idle_time(Duration::from_secs(5))
+            .stack_context(stack_context)
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+
+        tokio::spawn(async move {
+            let udp_socket = UdpSocket::bind("127.0.0.1:8942").await.unwrap();
+            let mut buf = [0; 1024];
+            let (n, addr) = udp_socket.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"test");
+            let _ = udp_socket.send_to(b"recv", addr).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_client.send_to(b"test", "127.0.0.1:8941").await.unwrap();
+        let mut buf = [0; 1024];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(10), udp_client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"recv");
+
+        let frames = wait_dump_frames(&dump, 2).await;
+        assert!(frames.iter().any(|f| f.upload == b"test" && f.download.is_empty()));
+        assert!(frames.iter().any(|f| f.upload.is_empty() && f.download == b"recv"));
     }
     #[tokio::test]
     async fn test_udp_stack_forward_err() {
@@ -1640,6 +1822,71 @@ mod tests {
         assert!(stack.get_session_count() > 0);
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         assert_eq!(stack.get_session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_udp_io_dump_server_single_roundtrip() {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server mock";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let tunnel_manager = TunnelManager::new();
+        let limiter_manager = Arc::new(DefaultLimiterManager::new());
+        let stat_manager = StatManager::new();
+        let datagram_server_manager = Arc::new(ServerManager::new());
+        datagram_server_manager
+            .add_server(Server::Datagram(Arc::new(MockServer::new("mock".to_string()))))
+            .unwrap();
+        let stack_context = build_udp_context(
+            datagram_server_manager,
+            tunnel_manager,
+            limiter_manager,
+            stat_manager,
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("udp_server.dump");
+        let io_dump = create_io_dump_stack_config(
+            "udp_server",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let stack = UdpStack::builder()
+            .id("udp-dump-server")
+            .bind("0.0.0.0:8943")
+            .hook_point(chains)
+            .session_idle_time(Duration::from_secs(5))
+            .stack_context(stack_context)
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+
+        let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp_client.send_to(b"test_server", "127.0.0.1:8943").await.unwrap();
+        let mut buf = [0; 1024];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(10), udp_client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"datagram");
+
+        let frames = wait_dump_frames(&dump, 2).await;
+        assert!(frames.iter().any(|f| f.upload == b"test_server" && f.download.is_empty()));
+        assert!(frames.iter().any(|f| f.upload.is_empty() && f.download == b"datagram"));
     }
 
     #[tokio::test]
@@ -1790,6 +2037,11 @@ mod tests {
             session_idle_time: None,
             hook_point: vec![],
             transparent: None,
+            io_dump_file: None,
+            io_dump_rotate_size: None,
+            io_dump_rotate_max_files: None,
+            io_dump_max_upload_bytes_per_conn: None,
+            io_dump_max_download_bytes_per_conn: None,
         };
         let stack_context = Arc::new(UdpStackContext::new(
             server_manager,

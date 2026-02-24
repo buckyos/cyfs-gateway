@@ -7,7 +7,7 @@ use super::StackResult;
 use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, MutComposedSpeedStat, MutComposedSpeedStatRef, GlobalCollectionManagerRef, JsExternalsManagerRef, StackContext};
+use crate::{create_io_dump_stack_config, into_stack_err, stack_err, DumpStream, IoDumpStackConfig, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, MutComposedSpeedStat, MutComposedSpeedStatRef, GlobalCollectionManagerRef, JsExternalsManagerRef, StackContext};
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -63,12 +63,14 @@ impl StackContext for TcpStackContext {
 struct TcpConnectionHandler {
     env: Arc<TcpStackContext>,
     executor: ProcessChainLibExecutor,
+    io_dump: Option<IoDumpStackConfig>,
 }
 
 impl TcpConnectionHandler {
     async fn create(
         hook_point: ProcessChainConfigs,
         env: Arc<TcpStackContext>,
+        io_dump: Option<IoDumpStackConfig>,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -82,12 +84,14 @@ impl TcpConnectionHandler {
         Ok(Self {
             env,
             executor,
+            io_dump,
         })
     }
 
     async fn rebuild_with_hook_point(
         &self,
         hook_point: ProcessChainConfigs,
+        io_dump: Option<IoDumpStackConfig>,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -101,6 +105,7 @@ impl TcpConnectionHandler {
         Ok(Self {
             env: self.env.clone(),
             executor,
+            io_dump,
         })
     }
 
@@ -113,7 +118,17 @@ impl TcpConnectionHandler {
         let executor = self.executor.fork();
         let servers = self.env.servers.clone();
         let remote_addr = stream.raw_stream().peer_addr().map_err(into_stack_err!(StackErrorCode::ServerError, "read remote addr failed"))?;
-        let mut request = StreamRequest::new(Box::new(stream), dest_addr);
+        let req_stream: Box<dyn buckyos_kit::AsyncStream> = if let Some(io_dump) = self.io_dump.clone() {
+            Box::new(DumpStream::new(
+                stream,
+                io_dump,
+                remote_addr.to_string(),
+                dest_addr.to_string(),
+            ))
+        } else {
+            Box::new(stream)
+        };
+        let mut request = StreamRequest::new(req_stream, dest_addr);
         request.source_addr = Some(remote_addr);
         let global_env = executor.global_env().clone();
         let (ret, stream) = execute_stream_chain(executor, request)
@@ -270,6 +285,7 @@ impl TcpStack {
             connection_manager: None,
             stack_context: None,
             transparent: false,
+            io_dump: None,
         }
     }
 
@@ -305,6 +321,7 @@ impl TcpStack {
         let handler = TcpConnectionHandler::create(
             config.hook_point.unwrap(),
             env,
+            config.io_dump,
         )
             .await?;
 
@@ -474,7 +491,17 @@ impl Stack for TcpStack {
             None => self.handler.read().unwrap().env.clone(),
         };
 
-        let new_handler = TcpConnectionHandler::create(config.hook_point.clone(), env).await?;
+        let io_dump = create_io_dump_stack_config(
+            &config.id,
+            config.io_dump_file.as_deref(),
+            config.io_dump_rotate_size.as_deref(),
+            config.io_dump_rotate_max_files,
+            config.io_dump_max_upload_bytes_per_conn.as_deref(),
+            config.io_dump_max_download_bytes_per_conn.as_deref(),
+        )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
+        let new_handler = TcpConnectionHandler::create(config.hook_point.clone(), env, io_dump).await?;
 
         *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())
@@ -499,6 +526,7 @@ pub struct TcpStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     stack_context: Option<Arc<TcpStackContext>>,
     transparent: bool,
+    io_dump: Option<IoDumpStackConfig>,
 }
 
 impl TcpStackBuilder {
@@ -532,6 +560,11 @@ impl TcpStackBuilder {
         self
     }
 
+    pub fn io_dump(mut self, io_dump: Option<IoDumpStackConfig>) -> Self {
+        self.io_dump = io_dump;
+        self
+    }
+
     pub async fn build(self) -> StackResult<TcpStack> {
         let stack = TcpStack::create(self).await?;
         Ok(stack)
@@ -545,6 +578,16 @@ pub struct TcpStackConfig {
     pub bind: SocketAddr,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transparent: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_rotate_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_rotate_max_files: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_max_upload_bytes_per_conn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_max_download_bytes_per_conn: Option<String>,
     pub hook_point: Vec<ProcessChainConfig>,
 }
 
@@ -591,6 +634,16 @@ impl StackFactory for TcpStackFactory {
             .downcast_ref::<TcpStackContext>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tcp stack context"))?;
         let handler_env = Arc::new(handler_env.clone());
+        let io_dump = create_io_dump_stack_config(
+            &config.id,
+            config.io_dump_file.as_deref(),
+            config.io_dump_rotate_size.as_deref(),
+            config.io_dump_rotate_max_files,
+            config.io_dump_max_upload_bytes_per_conn.as_deref(),
+            config.io_dump_max_download_bytes_per_conn.as_deref(),
+        )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
         let stack = TcpStack::builder()
             .id(config.id.clone())
             .bind(config.bind.to_string())
@@ -598,6 +651,7 @@ impl StackFactory for TcpStackFactory {
             .transparent(config.transparent.unwrap_or(false))
             .hook_point(config.hook_point.clone())
             .stack_context(handler_env)
+            .io_dump(io_dump)
             .build().await?;
         Ok(Arc::new(stack))
     }
@@ -607,8 +661,9 @@ impl StackFactory for TcpStackFactory {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, StreamInfo, DefaultLimiterManager, StatManager, GlobalCollectionManager, TcpStackContext, ServerManagerRef, LimiterManagerRef, StatManagerRef};
+    use crate::{decode_io_dump_frames, create_io_dump_stack_config, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TcpStack, TunnelManager, Server, ConnectionManager, Stack, TcpStackFactory, TcpStackConfig, StackProtocol, StackFactory, StreamInfo, DefaultLimiterManager, StatManager, GlobalCollectionManager, TcpStackContext, ServerManagerRef, LimiterManagerRef, StatManagerRef};
     use buckyos_kit::{AsyncStream};
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -650,6 +705,20 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         )
+    }
+
+    async fn wait_dump_frames(file: &Path, min_frames: usize) -> Vec<crate::DecodedIoDumpFrame> {
+        for _ in 0..50 {
+            if let Ok(data) = std::fs::read(file)
+                && !data.is_empty()
+                && let Ok(frames) = decode_io_dump_frames(&data)
+                && frames.len() >= min_frames
+            {
+                return frames;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("dump frames not ready");
     }
 
     #[tokio::test]
@@ -1197,6 +1266,272 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tcp_io_dump_raw_single_roundtrip() {
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
+        )
+            .unwrap();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))))
+            .unwrap();
+        let env = build_handler_env(
+            server_manager,
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("tcp_raw.dump");
+        let io_dump = create_io_dump_stack_config(
+            "tcp_raw",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            None,
+            None,
+        )
+            .await
+            .unwrap();
+        let stack = TcpStack::builder()
+            .id("tcp-raw")
+            .bind("127.0.0.1:8091")
+            .hook_point(chains)
+            .stack_context(env)
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let mut stream = TcpStream::connect("127.0.0.1:8091").await.unwrap();
+        stream.write_all(b"test").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"recv");
+        drop(stream);
+
+        let frames = wait_dump_frames(&dump, 1).await;
+        assert!(frames.iter().any(|f| f.upload == b"test" && f.download == b"recv"));
+    }
+
+    #[tokio::test]
+    async fn test_tcp_io_dump_raw_flush_on_upload_limit() {
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
+        )
+        .unwrap();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))))
+            .unwrap();
+        let env = build_handler_env(
+            server_manager,
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("tcp_raw_limit.dump");
+        let io_dump = create_io_dump_stack_config(
+            "tcp_raw_limit",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            Some("2B"),
+            None,
+        )
+        .await
+        .unwrap();
+        let stack = TcpStack::builder()
+            .id("tcp-raw-limit")
+            .bind("127.0.0.1:8093")
+            .hook_point(chains)
+            .stack_context(env)
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut stream = TcpStream::connect("127.0.0.1:8093").await.unwrap();
+        stream.write_all(b"test").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"recv");
+
+        let frames = wait_dump_frames(&dump, 1).await;
+        assert!(frames.iter().any(|f| f.upload == b"te" && f.download.is_empty()));
+    }
+
+    struct MockHttpKeepAliveServer {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamServer for MockHttpKeepAliveServer {
+        async fn serve_connection(&self, mut stream: Box<dyn AsyncStream>, _info: StreamInfo) -> ServerResult<()> {
+            for _ in 0..2 {
+                let mut req = Vec::new();
+                let mut b = [0u8; 1];
+                loop {
+                    stream.read_exact(&mut b).await.unwrap();
+                    req.push(b[0]);
+                    if req.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = if req.windows(2).any(|w| w == b"/a") {
+                    b"A"
+                } else {
+                    b"B"
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+            Ok(())
+        }
+
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tcp_io_dump_http1_multi_requests_same_connection() {
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
+        )
+            .unwrap();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockHttpKeepAliveServer {
+                id: "www.buckyos.com".to_string(),
+            })))
+            .unwrap();
+        let env = build_handler_env(
+            server_manager,
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("tcp_http.dump");
+        let io_dump = create_io_dump_stack_config(
+            "tcp_http",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            None,
+            None,
+        )
+            .await
+            .unwrap();
+        let stack = TcpStack::builder()
+            .id("tcp-http")
+            .bind("127.0.0.1:8092")
+            .hook_point(chains)
+            .stack_context(env)
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut stream = TcpStream::connect("127.0.0.1:8092").await.unwrap();
+        stream
+            .write_all(b"GET /a HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp_a = vec![0u8; 64];
+        let n = stream.read(&mut resp_a).await.unwrap();
+        assert!(n > 0);
+
+        stream
+            .write_all(b"GET /b HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp_b = vec![0u8; 64];
+        let n = stream.read(&mut resp_b).await.unwrap();
+        assert!(n > 0);
+
+        let frames = wait_dump_frames(&dump, 2).await;
+        assert!(frames.iter().any(|f| {
+            println!("{}", String::from_utf8_lossy(f.upload.as_slice()));
+            println!("{}", String::from_utf8_lossy(f.download.as_slice()));
+            f.upload.starts_with(b"GET /a HTTP/1.1") && f.download.starts_with(b"HTTP/1.1 200 OK")
+        }));
+        assert!(frames.iter().any(|f| {
+            f.upload.starts_with(b"GET /b HTTP/1.1") && f.download.starts_with(b"HTTP/1.1 200 OK")
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_tcp_io_dump_http_flush_on_upload_limit() {
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
+        )
+        .unwrap();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockHttpKeepAliveServer {
+                id: "www.buckyos.com".to_string(),
+            })))
+            .unwrap();
+        let env = build_handler_env(
+            server_manager,
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("tcp_http_limit.dump");
+        let io_dump = create_io_dump_stack_config(
+            "tcp_http_limit",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            Some("4B"),
+            None,
+        )
+        .await
+        .unwrap();
+        let stack = TcpStack::builder()
+            .id("tcp-http-limit")
+            .bind("127.0.0.1:8094")
+            .hook_point(chains)
+            .stack_context(env)
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut stream = TcpStream::connect("127.0.0.1:8094").await.unwrap();
+        stream
+            .write_all(b"GET /a HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = vec![0u8; 64];
+        let n = stream.read(&mut resp).await.unwrap();
+        assert!(n > 0);
+
+        let frames = wait_dump_frames(&dump, 1).await;
+        assert!(frames.iter().any(|f| f.upload == b"GET " && f.download.is_empty()));
+    }
+
+    #[tokio::test]
     async fn test_factory() {
         let server_manager = Arc::new(ServerManager::new());
         let global_process_chains = Arc::new(GlobalProcessChains::new());
@@ -1210,6 +1545,11 @@ mod tests {
             protocol: StackProtocol::Tcp,
             bind: "127.0.0.1:3345".parse().unwrap(),
             transparent: None,
+            io_dump_file: None,
+            io_dump_rotate_size: None,
+            io_dump_rotate_max_files: None,
+            io_dump_max_upload_bytes_per_conn: None,
+            io_dump_max_download_bytes_per_conn: None,
             hook_point: vec![],
         };
 

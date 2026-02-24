@@ -54,10 +54,15 @@ impl StackContext for TunStackContext {
 struct TunConnectionHandler {
     env: Arc<TunStackContext>,
     executor: ProcessChainLibExecutor,
+    io_dump: Option<IoDumpStackConfig>,
 }
 
 impl TunConnectionHandler {
-    async fn create(hook_point: ProcessChainConfigs, env: Arc<TunStackContext>) -> StackResult<Self> {
+    async fn create(
+        hook_point: ProcessChainConfigs,
+        env: Arc<TunStackContext>,
+        io_dump: Option<IoDumpStackConfig>,
+    ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
             env.global_process_chains.clone(),
@@ -67,7 +72,11 @@ impl TunConnectionHandler {
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
-        Ok(Self { env, executor })
+        Ok(Self {
+            env,
+            executor,
+            io_dump,
+        })
     }
 
     async fn handle_tcp_stream(
@@ -79,7 +88,17 @@ impl TunConnectionHandler {
         let servers = self.env.servers.clone();
         let remote_addr = stream.raw_stream().local_addr();
         let dest_addr = stream.raw_stream().peer_addr();
-        let mut request = StreamRequest::new(Box::new(stream), dest_addr);
+        let req_stream: Box<dyn AsyncStream> = if let Some(io_dump) = self.io_dump.clone() {
+            Box::new(DumpStream::new(
+                stream,
+                io_dump,
+                remote_addr.to_string(),
+                dest_addr.to_string(),
+            ))
+        } else {
+            Box::new(stream)
+        };
+        let mut request = StreamRequest::new(req_stream, dest_addr);
         request.source_addr = Some(remote_addr);
         request.dest_port = dest_addr.port();
         request.app_protocol = Some("tcp".to_string());
@@ -284,7 +303,17 @@ impl TunConnectionHandler {
                         .get_speed_stats(stat_group_ids.as_slice());
                     stat.set_external_stats(speed_groups);
 
-                    let (read, send) = tokio::io::split(Box::new(stream) as Box<dyn AsyncStream>);
+                    let stream: Box<dyn AsyncStream> = if let Some(io_dump) = self.io_dump.clone() {
+                        Box::new(DumpStream::new(
+                            stream,
+                            io_dump,
+                            remote_addr.to_string(),
+                            dest_addr.to_string(),
+                        ))
+                    } else {
+                        Box::new(stream)
+                    };
+                    let (read, send) = tokio::io::split(stream);
                     let datagram_stream: Box<dyn DatagramClientBox> = if limiter.is_some() {
                         let (read_limit, write_limit) =
                             limiter.as_ref().unwrap().new_limit_session();
@@ -540,7 +569,17 @@ impl Stack for TunStack {
             None => self.inner.handler.read().unwrap().env.clone(),
         };
 
-        let new_handler = TunConnectionHandler::create(config.hook_point.clone(), env).await?;
+        let io_dump = create_io_dump_stack_config(
+            &config.id,
+            config.io_dump_file.as_deref(),
+            config.io_dump_rotate_size.as_deref(),
+            config.io_dump_rotate_max_files,
+            config.io_dump_max_upload_bytes_per_conn.as_deref(),
+            config.io_dump_max_download_bytes_per_conn.as_deref(),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
+        let new_handler = TunConnectionHandler::create(config.hook_point.clone(), env, io_dump).await?;
         *self.inner.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())
     }
@@ -599,7 +638,11 @@ impl TunStackInner {
         }
 
         let env = builder.stack_context.unwrap();
-        let handler = TunConnectionHandler::create(builder.hook_point.as_ref().unwrap().clone(), env)
+        let handler = TunConnectionHandler::create(
+            builder.hook_point.as_ref().unwrap().clone(),
+            env,
+            builder.io_dump,
+        )
             .await?;
 
         Ok(Self {
@@ -755,6 +798,7 @@ pub struct TunStackBuilder {
     hook_point: Option<ProcessChainConfigs>,
     connection_manager: Option<ConnectionManagerRef>,
     stack_context: Option<Arc<TunStackContext>>,
+    io_dump: Option<IoDumpStackConfig>,
 }
 
 impl TunStackBuilder {
@@ -769,6 +813,7 @@ impl TunStackBuilder {
             hook_point: None,
             connection_manager: None,
             stack_context: None,
+            io_dump: None,
         }
     }
 
@@ -816,6 +861,11 @@ impl TunStackBuilder {
         self.stack_context = Some(stack_context);
         self
     }
+
+    pub fn io_dump(mut self, io_dump: Option<IoDumpStackConfig>) -> Self {
+        self.io_dump = io_dump;
+        self
+    }
     
     pub async fn build(self) -> StackResult<TunStack> {
         TunStack::create(self).await
@@ -834,6 +884,16 @@ pub struct TunStackConfig {
     pub tcp_timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub udp_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_rotate_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_rotate_max_files: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_max_upload_bytes_per_conn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_max_download_bytes_per_conn: Option<String>,
     pub hook_point: Vec<ProcessChainConfig>,
 }
 
@@ -883,6 +943,16 @@ impl StackFactory for TunStackFactory {
             .downcast_ref::<TunStackContext>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tun stack context"))?;
         let stack_context = Arc::new(stack_context.clone());
+        let io_dump = create_io_dump_stack_config(
+            &config.id,
+            config.io_dump_file.as_deref(),
+            config.io_dump_rotate_size.as_deref(),
+            config.io_dump_rotate_max_files,
+            config.io_dump_max_upload_bytes_per_conn.as_deref(),
+            config.io_dump_max_download_bytes_per_conn.as_deref(),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
 
         let stack = TunStack::builder()
             .id(config.id.clone())
@@ -893,7 +963,8 @@ impl StackFactory for TunStackFactory {
             .udp_timeout(config.udp_timeout.unwrap_or(60))
             .hook_point(config.hook_point.clone())
             .connection_manager(self.connection_manager.clone())
-            .stack_context(stack_context)
+            .stack_context(stack_context.clone())
+            .io_dump(io_dump)
             .build().await?;
         Ok(Arc::new(stack))
     }

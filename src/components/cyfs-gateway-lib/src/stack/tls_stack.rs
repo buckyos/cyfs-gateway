@@ -2,7 +2,9 @@ use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
 use crate::{
+    create_io_dump_stack_config,
     get_external_commands, get_stat_info, hyper_serve_http, into_stack_err, stack_err,
+    DumpStream, IoDumpStackConfig,
     ConnectionInfo, ConnectionManagerRef, HandleConnectionController, LimiterManagerRef, StatManagerRef,
     MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs,
     Server, ServerManagerRef, Stack, StackCertConfig, StackConfig, StackContext, StackErrorCode,
@@ -141,6 +143,7 @@ struct TlsConnectionHandler {
     executor: ProcessChainLibExecutor,
     certs: Arc<dyn ResolvesServerCert>,
     alpn_protocols: Vec<Vec<u8>>,
+    io_dump: Option<IoDumpStackConfig>,
 }
 
 impl TlsConnectionHandler {
@@ -149,6 +152,7 @@ impl TlsConnectionHandler {
         certs: Vec<TlsDomainConfig>,
         alpn_protocols: Vec<Vec<u8>>,
         env: Arc<TlsStackContext>,
+        io_dump: Option<IoDumpStackConfig>,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -165,6 +169,7 @@ impl TlsConnectionHandler {
             executor,
             certs,
             alpn_protocols,
+            io_dump,
         })
     }
 
@@ -186,6 +191,7 @@ impl TlsConnectionHandler {
             executor,
             certs: self.certs.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
+            io_dump: self.io_dump.clone(),
         })
     }
 
@@ -270,7 +276,17 @@ impl TlsConnectionHandler {
             return Ok(());
         }
         log::info!("accept tls stream from {} to {} name {}", remote_addr, local_addr, server_name.as_ref().unwrap_or(&"".to_string()));
-        let mut request = StreamRequest::new(Box::new(tls_stream), local_addr);
+        let request_stream: Box<dyn buckyos_kit::AsyncStream> = if let Some(io_dump) = self.io_dump.clone() {
+            Box::new(DumpStream::new(
+                tls_stream,
+                io_dump,
+                remote_addr.to_string(),
+                local_addr.to_string(),
+            ))
+        } else {
+            Box::new(tls_stream)
+        };
+        let mut request = StreamRequest::new(request_stream, local_addr);
         request.source_addr = Some(remote_addr);
         request.dest_host = server_name;
         let global_env = executor.global_env().clone();
@@ -435,6 +451,7 @@ impl TlsStack {
             config.certs,
             config.alpn_protocols,
             env,
+            config.io_dump,
         )
             .await?;
 
@@ -557,6 +574,16 @@ impl Stack for TlsStack {
             certs,
             alpn_protocols,
             env,
+            create_io_dump_stack_config(
+                &config.id,
+                config.io_dump_file.as_deref(),
+                config.io_dump_rotate_size.as_deref(),
+                config.io_dump_rotate_max_files,
+                config.io_dump_max_upload_bytes_per_conn.as_deref(),
+                config.io_dump_max_download_bytes_per_conn.as_deref(),
+            )
+                .await
+                .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
         )
             .await?;
 
@@ -613,6 +640,16 @@ pub struct TlsStackConfig {
     pub concurrency: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alpn_protocols: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_rotate_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_rotate_max_files: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_max_upload_bytes_per_conn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_max_download_bytes_per_conn: Option<String>,
 }
 
 impl crate::StackConfig for TlsStackConfig {
@@ -663,6 +700,16 @@ impl crate::StackFactory for TlsStackFactory {
             .downcast_ref::<TlsStackContext>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tls stack context"))?;
         let stack_context = Arc::new(stack_context.clone());
+        let io_dump = create_io_dump_stack_config(
+            &config.id,
+            config.io_dump_file.as_deref(),
+            config.io_dump_rotate_size.as_deref(),
+            config.io_dump_rotate_max_files,
+            config.io_dump_max_upload_bytes_per_conn.as_deref(),
+            config.io_dump_max_download_bytes_per_conn.as_deref(),
+        )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
 
         let stack = TlsStack::builder()
             .id(config.id.clone())
@@ -673,6 +720,7 @@ impl crate::StackFactory for TlsStackFactory {
             .concurrency(config.concurrency.unwrap_or(0))
             .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec!["http/1.1".to_string()]).iter().map(|s| s.as_bytes().to_vec()).collect())
             .stack_context(stack_context)
+            .io_dump(io_dump)
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -688,6 +736,7 @@ pub struct TlsStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     alpn_protocols: Vec<Vec<u8>>,
     stack_context: Option<Arc<TlsStackContext>>,
+    io_dump: Option<IoDumpStackConfig>,
 }
 
 impl TlsStackBuilder {
@@ -701,6 +750,7 @@ impl TlsStackBuilder {
             connection_manager: None,
             alpn_protocols: vec![],
             stack_context: None,
+            io_dump: None,
         }
     }
 
@@ -748,6 +798,11 @@ impl TlsStackBuilder {
         self
     }
 
+    pub fn io_dump(mut self, io_dump: Option<IoDumpStackConfig>) -> Self {
+        self.io_dump = io_dump;
+        self
+    }
+
     pub async fn build(self) -> StackResult<TlsStack> {
         let stack = TlsStack::create(self).await?;
         Ok(stack)
@@ -759,7 +814,7 @@ impl TlsStackBuilder {
 mod tests {
     use super::{load_certs, load_key};
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, StreamInfo, DefaultLimiterManager, StatManager, GlobalCollectionManager};
+    use crate::{create_io_dump_stack_config, decode_io_dump_frames, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, StreamInfo, DefaultLimiterManager, StatManager, GlobalCollectionManager};
     use crate::{LimiterManagerRef, ServerManagerRef, StackContext, StatManagerRef, TlsDomainConfig, TlsStack, TlsStackContext};
     use buckyos_kit::{init_logging, AsyncStream};
     use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
@@ -781,6 +836,20 @@ mod tests {
     use tokio_rustls::{TlsAcceptor, TlsConnector};
     use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, CertManagerConfig};
     use crate::self_cert_mgr::{SelfCertConfig, SelfCertMgr, SelfCertMgrRef};
+
+    async fn wait_dump_frames(file: &std::path::Path, min_frames: usize) -> Vec<crate::DecodedIoDumpFrame> {
+        for _ in 0..50 {
+            if let Ok(data) = std::fs::read(file)
+                && !data.is_empty()
+                && let Ok(frames) = decode_io_dump_frames(&data)
+                && frames.len() >= min_frames
+            {
+                return frames;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("dump frames not ready");
+    }
 
     fn build_stack_context(
         servers: ServerManagerRef,
@@ -1614,6 +1683,380 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tls_io_dump_raw_single_roundtrip() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
+        )
+            .unwrap();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))))
+            .unwrap();
+        let dir = tempdir().unwrap();
+        let dump = dir.path().join("tls_raw.dump");
+        let io_dump = create_io_dump_stack_config(
+            "tls_raw",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            None,
+            None,
+        )
+            .await
+            .unwrap();
+
+        let stack = TlsStack::builder()
+            .id("tls-raw")
+            .bind("127.0.0.1:9093")
+            .hook_point(chains)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                acme_type: None,
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    cert_key.signing_key.serialize_der(),
+                ))),
+                data: None,
+            }])
+            .stack_context(build_stack_context(
+                server_manager,
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ))
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+
+        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        let stream = TcpStream::connect("127.0.0.1:9093").await.unwrap();
+        let connector = TlsConnector::from(Arc::new(config));
+        let mut stream = connector
+            .connect(ServerName::try_from("www.buckyos.com").unwrap(), stream)
+            .await
+            .unwrap();
+        stream.write_all(b"test").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"recv");
+        drop(stream);
+
+        let frames = wait_dump_frames(&dump, 1).await;
+        assert!(frames.iter().any(|f| f.upload == b"test" && f.download == b"recv"));
+    }
+
+    #[tokio::test]
+    async fn test_tls_io_dump_raw_flush_on_upload_limit() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
+        )
+            .unwrap();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))))
+            .unwrap();
+        let dir = tempdir().unwrap();
+        let dump = dir.path().join("tls_raw_limit.dump");
+        let io_dump = create_io_dump_stack_config(
+            "tls_raw_limit",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            Some("2B"),
+            None,
+        )
+            .await
+            .unwrap();
+
+        let stack = TlsStack::builder()
+            .id("tls-raw-limit")
+            .bind("127.0.0.1:9095")
+            .hook_point(chains)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                acme_type: None,
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    cert_key.signing_key.serialize_der(),
+                ))),
+                data: None,
+            }])
+            .stack_context(build_stack_context(
+                server_manager,
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ))
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+
+        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        let stream = TcpStream::connect("127.0.0.1:9095").await.unwrap();
+        let connector = TlsConnector::from(Arc::new(config));
+        let mut stream = connector
+            .connect(ServerName::try_from("www.buckyos.com").unwrap(), stream)
+            .await
+            .unwrap();
+        stream.write_all(b"test").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"recv");
+
+        let frames = wait_dump_frames(&dump, 1).await;
+        assert!(frames.iter().any(|f| f.upload == b"te" && f.download.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn test_tls_io_dump_http1_multi_requests_same_connection() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        reject;
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let server_mgr = Arc::new(ServerManager::new());
+        let http_server = ProcessChainHttpServer::builder()
+            .id("www.buckyos.com")
+            .version("HTTP/3")
+            .h3_port(9196)
+            .hook_point(chains)
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .server_mgr(Arc::downgrade(&server_mgr))
+            .tunnel_manager(TunnelManager::new())
+            .build().await.unwrap();
+
+        let server_manager = Arc::new(ServerManager::new());
+        let _ = server_manager.add_server(Server::Http(Arc::new(http_server)));
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
+        )
+            .unwrap();
+        let dir = tempdir().unwrap();
+        let dump = dir.path().join("tls_http.dump");
+        let io_dump = create_io_dump_stack_config(
+            "tls_http",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            None,
+            None,
+        )
+            .await
+            .unwrap();
+        let stack = TlsStack::builder()
+            .id("tls-http")
+            .bind("127.0.0.1:9094")
+            .hook_point(chains)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                acme_type: None,
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    cert_key.signing_key.serialize_der(),
+                ))),
+                data: None,
+            }])
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .stack_context(build_stack_context(
+                server_manager,
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ))
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+
+        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        let stream = TcpStream::connect("127.0.0.1:9094").await.unwrap();
+        let connector = TlsConnector::from(Arc::new(config));
+        let stream = connector
+            .connect(ServerName::try_from("www.buckyos.com").unwrap(), stream)
+            .await
+            .unwrap();
+        let (mut send, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        for path in ["/a", "/b"] {
+            let req = http::Request::builder()
+                .version(http::Version::HTTP_11)
+                .method("GET")
+                .uri(format!("https://www.buckyos.com{path}"))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let resp = send.send_request(req).await.unwrap();
+            assert_eq!(resp.version(), http::Version::HTTP_11);
+        }
+
+        let frames = wait_dump_frames(&dump, 2).await;
+        assert!(frames.iter().any(|f| {
+            f.upload.starts_with(b"GET ")
+                && f.upload.windows(2).any(|w| w == b"/a")
+                && f.download.starts_with(b"HTTP/1.1")
+        }));
+        assert!(frames.iter().any(|f| {
+            f.upload.starts_with(b"GET ")
+                && f.upload.windows(2).any(|w| w == b"/b")
+                && f.download.starts_with(b"HTTP/1.1")
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_tls_io_dump_http_flush_on_upload_limit() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        reject;
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let server_mgr = Arc::new(ServerManager::new());
+        let http_server = ProcessChainHttpServer::builder()
+            .id("www.buckyos.com")
+            .version("HTTP/3")
+            .h3_port(9196)
+            .hook_point(chains)
+            .global_process_chains(Arc::new(GlobalProcessChains::new()))
+            .server_mgr(Arc::downgrade(&server_mgr))
+            .tunnel_manager(TunnelManager::new())
+            .build().await.unwrap();
+
+        let server_manager = Arc::new(ServerManager::new());
+        let _ = server_manager.add_server(Server::Http(Arc::new(http_server)));
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
+        )
+            .unwrap();
+        let dir = tempdir().unwrap();
+        let dump = dir.path().join("tls_http_limit.dump");
+        let io_dump = create_io_dump_stack_config(
+            "tls_http_limit",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            Some("4B"),
+            None,
+        )
+            .await
+            .unwrap();
+        let stack = TlsStack::builder()
+            .id("tls-http-limit")
+            .bind("127.0.0.1:9096")
+            .hook_point(chains)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                acme_type: None,
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    cert_key.signing_key.serialize_der(),
+                ))),
+                data: None,
+            }])
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .stack_context(build_stack_context(
+                server_manager,
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ))
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+
+        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        let stream = TcpStream::connect("127.0.0.1:9096").await.unwrap();
+        let connector = TlsConnector::from(Arc::new(config));
+        let stream = connector
+            .connect(ServerName::try_from("www.buckyos.com").unwrap(), stream)
+            .await
+            .unwrap();
+        let (mut send, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = http::Request::builder()
+            .version(http::Version::HTTP_11)
+            .method("GET")
+            .uri("https://www.buckyos.com/a")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = send.send_request(req).await.unwrap();
+        assert_eq!(resp.version(), http::Version::HTTP_11);
+
+        let frames = wait_dump_frames(&dump, 1).await;
+        assert!(frames.iter().any(|f| f.upload == b"GET " && f.download.is_empty()));
+    }
+
+    #[tokio::test]
     async fn test_factory() {
         let mut cert_config = CertManagerConfig::default();
         let data_dir = tempfile::tempdir().unwrap();
@@ -1636,6 +2079,11 @@ mod tests {
             certs: vec![],
             concurrency: None,
             alpn_protocols: None,
+            io_dump_file: None,
+            io_dump_rotate_size: None,
+            io_dump_rotate_max_files: None,
+            io_dump_max_upload_bytes_per_conn: None,
+            io_dump_max_download_bytes_per_conn: None,
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(TlsStackContext::new(
             server_manager,
