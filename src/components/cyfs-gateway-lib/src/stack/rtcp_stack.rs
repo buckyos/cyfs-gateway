@@ -145,7 +145,7 @@ impl RtcpConnectionHandler {
                     .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
             }
             if let Some(host_name) = device_info.hostname() {
-                map.insert("source_host_name", CollectionValue::String(host_name.to_string())).await
+                map.insert("source_hostname", CollectionValue::String(host_name.to_string())).await
                     .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
             }
         }
@@ -294,7 +294,7 @@ impl RtcpConnectionHandler {
                     .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
             }
             if let Some(host_name) = device_info.hostname() {
-                map.insert("source_host_name", CollectionValue::String(host_name.to_string())).await
+                map.insert("source_hostname", CollectionValue::String(host_name.to_string())).await
                     .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
             }
         }

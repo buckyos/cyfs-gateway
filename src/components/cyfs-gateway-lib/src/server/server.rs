@@ -124,7 +124,7 @@ pub struct StreamInfo {
     pub conn_src_addr: Option<String>,
     pub real_src_addr: Option<String>,
     pub source_mac: Option<String>,
-    pub source_host_name: Option<String>,
+    pub source_hostname: Option<String>,
 }
 
 impl StreamInfo {
@@ -134,7 +134,7 @@ impl StreamInfo {
             conn_src_addr: Some(src_addr),
             real_src_addr: None,
             source_mac: None,
-            source_host_name: None,
+            source_hostname: None,
         }
     }
 
@@ -145,13 +145,13 @@ impl StreamInfo {
             conn_src_addr,
             real_src_addr,
             source_mac: None,
-            source_host_name: None,
+            source_hostname: None,
         }
     }
 
-    pub fn with_device_info(mut self, source_mac: Option<String>, source_host_name: Option<String>) -> Self {
+    pub fn with_device_info(mut self, source_mac: Option<String>, source_hostname: Option<String>) -> Self {
         self.source_mac = source_mac;
-        self.source_host_name = source_host_name;
+        self.source_hostname = source_hostname;
         self
     }
 }
@@ -857,7 +857,7 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
 pub struct DatagramInfo {
     pub src_addr: Option<String>,
     pub source_mac: Option<String>,
-    pub source_host_name: Option<String>,
+    pub source_hostname: Option<String>,
 }
 
 impl DatagramInfo {
@@ -865,13 +865,13 @@ impl DatagramInfo {
         DatagramInfo {
             src_addr,
             source_mac: None,
-            source_host_name: None,
+            source_hostname: None,
         }
     }
 
-    pub fn with_device_info(mut self, source_mac: Option<String>, source_host_name: Option<String>) -> Self {
+    pub fn with_device_info(mut self, source_mac: Option<String>, source_hostname: Option<String>) -> Self {
         self.source_mac = source_mac;
-        self.source_host_name = source_host_name;
+        self.source_hostname = source_hostname;
         self
     }
 }

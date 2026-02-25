@@ -668,11 +668,11 @@ impl ProcessChainHttpServer {
                     .await
                     .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
             }
-            if let Some(source_host_name) = info.source_host_name.as_ref() {
+            if let Some(source_hostname) = info.source_hostname.as_ref() {
                 global_env
                     .create(
-                        "REQ_source_host_name",
-                        CollectionValue::String(source_host_name.to_string()),
+                        "REQ_source_hostname",
+                        CollectionValue::String(source_hostname.to_string()),
                     )
                     .await
                     .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
@@ -804,11 +804,11 @@ impl HttpServer for ProcessChainHttpServer {
                 .await
                 .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
         }
-        if let Some(source_host_name) = info.source_host_name.as_ref() {
+        if let Some(source_hostname) = info.source_hostname.as_ref() {
             global_env
                 .create(
-                    "REQ_source_host_name",
-                    CollectionValue::String(source_host_name.to_string()),
+                    "REQ_source_hostname",
+                    CollectionValue::String(source_hostname.to_string()),
                 )
                 .await
                 .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
@@ -2279,7 +2279,7 @@ mod tests {
                 conn_src_addr: Some("127.0.0.1:344".to_string()),
                 real_src_addr: None,
                 source_mac: None,
-                source_host_name: None,
+                source_hostname: None,
             }).await.unwrap();
         });
 

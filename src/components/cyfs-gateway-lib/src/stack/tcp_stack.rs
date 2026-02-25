@@ -140,7 +140,7 @@ impl TcpConnectionHandler {
             .and_then(|manager| manager.get_device_info_by_source(remote_addr.ip()))
         {
             request.source_mac = device_info.mac().map(|v| v.to_string());
-            request.source_host_name = device_info.hostname().map(|v| v.to_string());
+            request.source_hostname = device_info.hostname().map(|v| v.to_string());
         }
         let global_env = executor.global_env().clone();
         let (ret, stream) = execute_stream_chain(executor, request)
