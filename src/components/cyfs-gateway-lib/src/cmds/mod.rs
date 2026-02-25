@@ -1,5 +1,6 @@
 mod error;
 mod forward;
+mod in_time_range;
 mod proxy_protocol_probe;
 mod redirect;
 mod set_limit;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use cyfs_process_chain::{ExternalCommand, ExternalCommandRef, HttpProbeCommand, HttpsSniProbeCommand};
 pub use error::*;
 pub use forward::*;
+pub use in_time_range::*;
 pub use proxy_protocol_probe::*;
 pub use redirect::*;
 pub use set_limit::*;
@@ -52,6 +54,10 @@ pub fn get_external_commands(server_manager: ServerManagerWeakRef) -> Vec<(Strin
     let redirect_command = Redirect::new();
     let name = redirect_command.name().to_owned();
     cmds.push((name, Arc::new(Box::new(redirect_command) as Box<dyn ExternalCommand>)));
+
+    let in_time_range_command = InTimeRange::new();
+    let name = in_time_range_command.name().to_owned();
+    cmds.push((name, Arc::new(Box::new(in_time_range_command) as Box<dyn ExternalCommand>)));
 
     let server_command = CallServer::new();
     let name = server_command.name().to_owned();
