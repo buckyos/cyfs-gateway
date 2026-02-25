@@ -4,6 +4,7 @@ members = [
     "components/cyfs-process-chain",
     "components/cyfs-dns",
     "components/cyfs-socks",
+    "components/cyfs-lookup",
     "components/cyfs-gateway-lib",
     "components/cyfs-sn",
     "components/cyfs-tun",
