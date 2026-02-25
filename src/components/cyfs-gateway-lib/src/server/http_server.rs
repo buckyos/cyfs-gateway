@@ -287,9 +287,13 @@ impl ProcessChainHttpServer {
         let org_url = req.uri().to_string();
         // Trim URL boundary slashes so we don't end up with "//" when target_url ends with '/'
         // and org_url starts with '/'.
-        let base = target_url.trim_end_matches('/');
-        let path = org_url.trim_start_matches('/');
-        let raw_url = format!("{}/{}", base, path);
+        let raw_url = if target_url.ends_with('/') || org_url.starts_with('/') {
+            let base = target_url.trim_end_matches('/');
+            let path = org_url.trim_start_matches('/');
+            format!("{}/{}", base, path)
+        } else {
+            format!("{}{}", target_url, org_url)
+        };
         let request_url = Url::parse(&raw_url).map_err(|e| {
             server_err!(
                 ServerErrorCode::InvalidConfig,
