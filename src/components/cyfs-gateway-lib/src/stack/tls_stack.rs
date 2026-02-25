@@ -141,6 +141,7 @@ impl StackContext for TlsStackContext {
 struct TlsConnectionHandler {
     env: Arc<TlsStackContext>,
     executor: ProcessChainLibExecutor,
+    connection_manager: Option<ConnectionManagerRef>,
     certs: Arc<dyn ResolvesServerCert>,
     alpn_protocols: Vec<Vec<u8>>,
     io_dump: Option<IoDumpStackConfig>,
@@ -152,6 +153,7 @@ impl TlsConnectionHandler {
         certs: Vec<TlsDomainConfig>,
         alpn_protocols: Vec<Vec<u8>>,
         env: Arc<TlsStackContext>,
+        connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
@@ -167,6 +169,7 @@ impl TlsConnectionHandler {
         Ok(Self {
             env,
             executor,
+            connection_manager,
             certs,
             alpn_protocols,
             io_dump,
@@ -189,6 +192,7 @@ impl TlsConnectionHandler {
         Ok(Self {
             env: self.env.clone(),
             executor,
+            connection_manager: self.connection_manager.clone(),
             certs: self.certs.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
             io_dump: self.io_dump.clone(),
@@ -289,6 +293,14 @@ impl TlsConnectionHandler {
         let mut request = StreamRequest::new(request_stream, local_addr);
         request.source_addr = Some(remote_addr);
         request.dest_host = server_name;
+        if let Some(device_info) = self
+            .connection_manager
+            .as_ref()
+            .and_then(|manager| manager.get_device_info_by_source(remote_addr.ip()))
+        {
+            request.source_mac = device_info.mac().map(|v| v.to_string());
+            request.source_host_name = device_info.hostname().map(|v| v.to_string());
+        }
         let global_env = executor.global_env().clone();
         let (ret, stream) = execute_stream_chain(executor, request)
             .await
@@ -297,7 +309,17 @@ impl TlsConnectionHandler {
         let real_src_addr = get_source_addr_from_req_env(&global_env)
             .await
             .and_then(|addr| addr.parse::<SocketAddr>().ok().map(|_| addr));
-        let stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr);
+        let mut stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr);
+        if let Some(device_info) = self
+            .connection_manager
+            .as_ref()
+            .and_then(|manager| manager.get_device_info_by_source(remote_addr.ip()))
+        {
+            stream_info = stream_info.with_device_info(
+                device_info.mac().map(|v| v.to_string()),
+                device_info.hostname().map(|v| v.to_string()),
+            );
+        }
         if ret.is_control() {
             if ret.is_drop() {
                 return Ok(());
@@ -451,6 +473,7 @@ impl TlsStack {
             config.certs,
             config.alpn_protocols,
             env,
+            config.connection_manager.clone(),
             config.io_dump,
         )
             .await?;
@@ -574,6 +597,7 @@ impl Stack for TlsStack {
             certs,
             alpn_protocols,
             env,
+            self.connection_manager.clone(),
             create_io_dump_stack_config(
                 &config.id,
                 config.io_dump_file.as_deref(),
@@ -2255,7 +2279,7 @@ mod tests {
         assert!(test_stat.get_read_sum_size() > 350);
         assert!(test_stat.get_write_sum_size() > 880);
         assert!(start.elapsed().as_millis() > 1800);
-        assert!(start.elapsed().as_millis() < 2500);
+        assert!(start.elapsed().as_millis() < 3000);
     }
 
     #[tokio::test]

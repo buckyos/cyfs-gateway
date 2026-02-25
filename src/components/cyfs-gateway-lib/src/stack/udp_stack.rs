@@ -105,6 +105,21 @@ impl UdpDatagramHandler {
         map.insert("source_addr", CollectionValue::String(src_addr.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_addr error: {}", e))?;
 
+        if let Some(device_info) = state
+            .connection_manager
+            .as_ref()
+            .and_then(|manager| manager.get_device_info_by_source(src_addr.ip()))
+        {
+            if let Some(mac) = device_info.mac() {
+                map.insert("source_mac", CollectionValue::String(mac.to_string())).await
+                    .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_mac error: {}", e))?;
+            }
+            if let Some(host_name) = device_info.hostname() {
+                map.insert("source_host_name", CollectionValue::String(host_name.to_string())).await
+                    .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_host_name error: {}", e))?;
+            }
+        }
+
         map.insert("dest_addr", CollectionValue::String(dest_addr.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_addr error: {}", e))?;
 

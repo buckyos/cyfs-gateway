@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::net::{SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
 use buckyos_kit::AsyncStream;
 use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig};
@@ -54,6 +55,7 @@ impl StackContext for RtcpStackContext {
 struct RtcpConnectionHandler {
     env: Arc<RtcpStackContext>,
     executor: ProcessChainLibExecutor,
+    connection_manager: Option<ConnectionManagerRef>,
     io_dump: Option<IoDumpStackConfig>,
 }
 
@@ -61,6 +63,7 @@ impl RtcpConnectionHandler {
     async fn create(
         hook_point: ProcessChainConfigs,
         env: Arc<RtcpStackContext>,
+        connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
@@ -75,6 +78,7 @@ impl RtcpConnectionHandler {
         Ok(Self {
             env,
             executor,
+            connection_manager,
             io_dump,
         })
     }
@@ -97,6 +101,7 @@ impl RtcpConnectionHandler {
         Ok(Self {
             env,
             executor,
+            connection_manager: self.connection_manager.clone(),
             io_dump,
         })
     }
@@ -110,10 +115,22 @@ impl RtcpConnectionHandler {
         path: String,
         _endpoint: TunnelEndpoint,
         stat: MutComposedSpeedStatRef,
+        remote_addr: SocketAddr,
+        _local_addr: SocketAddr
     ) -> StackResult<()> {
         let executor = self.executor.fork();
         let servers = self.env.servers.clone();
+        let remote_ip = remote_addr.ip();
+        let device_info = self
+            .connection_manager
+            .as_ref()
+            .and_then(|manager| {
+                manager.get_device_info_by_source(remote_ip)
+            });
+        let remote_addr_str = remote_addr.to_string();
         let map = MemoryMapCollection::new_ref();
+        map.insert("source_addr", CollectionValue::String(remote_addr_str.clone())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("dest_port", CollectionValue::String(dest_port.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("dest_host", CollectionValue::String(dest_host.clone().unwrap_or_default())).await
@@ -122,6 +139,16 @@ impl RtcpConnectionHandler {
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("path", CollectionValue::String(path)).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        if let Some(device_info) = device_info.as_ref() {
+            if let Some(mac) = device_info.mac() {
+                map.insert("source_mac", CollectionValue::String(mac.to_string())).await
+                    .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+            }
+            if let Some(host_name) = device_info.hostname() {
+                map.insert("source_host_name", CollectionValue::String(host_name.to_string())).await
+                    .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+            }
+        }
         let global_env = executor.global_env().clone();
         let ret = execute_chain(executor, map)
             .await
@@ -193,12 +220,20 @@ impl RtcpConnectionHandler {
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
                                     Server::Http(server) => {
-                                        hyper_serve_http(stream, server, StreamInfo::default()).await
+                                        let stream_info = StreamInfo::new(remote_addr_str.clone()).with_device_info(
+                                            device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
+                                            device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                        );
+                                        hyper_serve_http(stream, server, stream_info).await
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
                                     }
                                     Server::Stream(server) => {
+                                        let stream_info = StreamInfo::new(remote_addr_str.clone()).with_device_info(
+                                            device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
+                                            device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                        );
                                         server
-                                            .serve_connection(stream, StreamInfo::default())
+                                            .serve_connection(stream, stream_info)
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
                                     }
@@ -230,14 +265,21 @@ impl RtcpConnectionHandler {
         path: String,
         _endpoint: TunnelEndpoint,
         stat: MutComposedSpeedStatRef,
+        remote_addr: SocketAddr,
+        _local_addr: SocketAddr
     ) -> StackResult<()> {
         let executor = self.executor.fork();
         let servers = self.env.servers.clone();
-        let remote_addr = match dest_host.clone() {
-            Some(host) => format!("{}:{}", host, dest_port),
-            None => format!("127.0.0.1:{}", dest_port),
-        };
+        let remote_ip = remote_addr.ip();
+        let device_info = self
+            .connection_manager
+            .as_ref()
+            .and_then(|manager| {
+                manager.get_device_info_by_source(remote_ip)
+            });
         let map = MemoryMapCollection::new_ref();
+        map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("dest_port", CollectionValue::String(dest_port.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("dest_host", CollectionValue::String(dest_host.unwrap_or_default())).await
@@ -246,6 +288,16 @@ impl RtcpConnectionHandler {
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("path", CollectionValue::String(path)).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        if let Some(device_info) = device_info.as_ref() {
+            if let Some(mac) = device_info.mac() {
+                map.insert("source_mac", CollectionValue::String(mac.to_string())).await
+                    .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+            }
+            if let Some(host_name) = device_info.hostname() {
+                map.insert("source_host_name", CollectionValue::String(host_name.to_string())).await
+                    .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+            }
+        }
         let global_env = executor.global_env().clone();
         let ret = execute_chain(executor, map)
             .await
@@ -322,7 +374,10 @@ impl RtcpConnectionHandler {
                                         loop {
                                             let len = datagram_stream.recv_datagram(&mut buf).await
                                                 .map_err(into_stack_err!(StackErrorCode::IoError, "recv datagram error"))?;
-                                            let resp = server.serve_datagram(&buf[..len], DatagramInfo::new(Some(remote_addr.clone()))).await
+                                            let resp = server.serve_datagram(&buf[..len], DatagramInfo::new(Some(remote_addr.to_string())).with_device_info(
+                                                device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
+                                                device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                            )).await
                                                 .map_err(into_stack_err!(StackErrorCode::ServerError, "serve datagram error"))?;
                                             datagram_stream.send_datagram(resp.as_slice()).await
                                                 .map_err(into_stack_err!(StackErrorCode::IoError, "send datagram error"))?;
@@ -370,7 +425,7 @@ impl Listener {
 
 #[async_trait::async_trait]
 impl RTcpListener for Listener {
-    async fn on_new_stream(&self, stream: Box<dyn AsyncStream>, dest_host: Option<String>, dest_port: u16, endpoint: TunnelEndpoint) -> TunnelResult<()> {
+    async fn on_new_stream(&self, stream: Box<dyn AsyncStream>, dest_host: Option<String>, dest_port: u16, endpoint: TunnelEndpoint, remote_addr: SocketAddr, local_addr: SocketAddr) -> TunnelResult<()> {
         let (protocol, dest_host, dest_port, path) = if dest_port == 0 {
             if dest_host.is_none() {
                 let msg = format!("dest_host and dest_port can not be empty {:?}", endpoint);
@@ -409,16 +464,14 @@ impl RTcpListener for Listener {
             let handler = self.handler.read().unwrap();
             handler.clone()
         };
-        let remote_addr = match dest_host.clone() {
-            Some(host) => format!("{}:{}", host, dest_port),
-            None => format!("{}:{}", endpoint.device_id, dest_port),
-        };
+        let remote_addr_str = remote_addr.to_string();
+        let local_addr_str = local_addr.to_string();
         let stream: Box<dyn AsyncStream> = if let Some(io_dump) = handler_snapshot.io_dump.clone() {
             Box::new(DumpStream::new(
                 stream,
                 io_dump,
-                remote_addr.clone(),
-                self.bind_addr.clone(),
+                remote_addr_str.clone(),
+                local_addr_str.clone(),
             ))
         } else {
             stream
@@ -429,18 +482,18 @@ impl RTcpListener for Listener {
 
         let speed = stat_stream.get_speed_stat();
         let handle = tokio::spawn(async move {
-            if let Err(e) = handler_snapshot.handle_stream(stat_stream, protocol, dest_host, dest_port, path, endpoint, stat).await {
+            if let Err(e) = handler_snapshot.handle_stream(stat_stream, protocol, dest_host, dest_port, path, endpoint, stat, remote_addr, local_addr).await {
                 error!("on_new_stream error: {}", e);
             }
         });
         if let Some(manager) = &self.connection_manager {
             let controller = HandleConnectionController::new(handle);
-            manager.add_connection(ConnectionInfo::new(remote_addr, self.bind_addr.clone(), StackProtocol::Rtcp, speed, controller))
+            manager.add_connection(ConnectionInfo::new(remote_addr_str, local_addr_str, StackProtocol::Rtcp, speed, controller))
         }
         Ok(())
     }
 
-    async fn on_new_datagram(&self, stream: Box<dyn AsyncStream>, dest_host: Option<String>, dest_port: u16, endpoint: TunnelEndpoint) -> TunnelResult<()> {
+    async fn on_new_datagram(&self, stream: Box<dyn AsyncStream>, dest_host: Option<String>, dest_port: u16, endpoint: TunnelEndpoint, remote_addr: SocketAddr, local_addr: SocketAddr) -> TunnelResult<()> {
         let (protocol, dest_host, dest_port, path) = if dest_port == 0 {
             if dest_host.is_none() {
                 let msg = format!("dest_host and dest_port can not be empty {:?}", endpoint);
@@ -479,16 +532,14 @@ impl RTcpListener for Listener {
             let handler = self.handler.read().unwrap();
             handler.clone()
         };
-        let remote_addr = match dest_host.clone() {
-            Some(host) => format!("{}:{}", host, dest_port),
-            None => format!("{}:{}", endpoint.device_id, dest_port),
-        };
+        let remote_addr_str = remote_addr.to_string();
+        let local_addr_str = local_addr.to_string();
         let stream: Box<dyn AsyncStream> = if let Some(io_dump) = handler_snapshot.io_dump.clone() {
             Box::new(DumpStream::new(
                 stream,
                 io_dump,
-                remote_addr.clone(),
-                self.bind_addr.clone(),
+                remote_addr_str.clone(),
+                local_addr_str.clone(),
             ))
         } else {
             stream
@@ -498,14 +549,14 @@ impl RTcpListener for Listener {
 
         let speed = stat_stream.get_speed_stat();
         let handle = tokio::spawn(async move {
-            if let Err(e) = handler_snapshot.handle_datagram(stat_stream, protocol, dest_host, dest_port, path, endpoint, stat).await {
+            if let Err(e) = handler_snapshot.handle_datagram(stat_stream, protocol, dest_host, dest_port, path, endpoint, stat, remote_addr, local_addr).await {
                 error!("on_new_stream error: {}", e);
             }
         });
 
         if let Some(manager) = &self.connection_manager {
             let controller = HandleConnectionController::new(handle);
-            manager.add_connection(ConnectionInfo::new(remote_addr, self.bind_addr.clone(), StackProtocol::Rtcp, speed, controller))
+            manager.add_connection(ConnectionInfo::new(remote_addr_str, local_addr_str, StackProtocol::Rtcp, speed, controller))
         }
         Ok(())
     }
@@ -583,6 +634,7 @@ impl RtcpStack {
         let handler = RtcpConnectionHandler::create(
             builder.hook_point.unwrap(),
             stack_context.clone(),
+            connection_manager.clone(),
             builder.io_dump,
         )
         .await?;
@@ -660,7 +712,12 @@ impl Stack for RtcpStack {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
-        let handler = RtcpConnectionHandler::create(config.hook_point.clone(), env, io_dump).await?;
+        let handler = RtcpConnectionHandler::create(
+            config.hook_point.clone(),
+            env,
+            self.connection_manager.clone(),
+            io_dump,
+        ).await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(handler));
         Ok(())
     }

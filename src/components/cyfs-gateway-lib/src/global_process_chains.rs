@@ -224,6 +224,16 @@ impl MapCollection for StreamRequestMap {
                     return Err(msg);
                 }
             }
+            "source_host_name" => {
+                prev = request.source_host_name.clone().map(CollectionValue::String);
+                if let CollectionValue::String(host_name) = value {
+                    request.source_host_name = Some(host_name);
+                } else {
+                    let msg = format!("source_host_name must be a string, got {:?}", value);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
             "source_device_id" => {
                 prev = request
                     .source_device_id
@@ -320,6 +330,7 @@ impl MapCollection for StreamRequestMap {
                 .source_addr
                 .map(|addr| CollectionValue::String(addr.to_string()))),
             "source_mac" => Ok(request.source_mac.clone().map(CollectionValue::String)),
+            "source_host_name" => Ok(request.source_host_name.clone().map(CollectionValue::String)),
             "source_device_id" => Ok(request
                 .source_device_id
                 .clone()
@@ -353,6 +364,7 @@ impl MapCollection for StreamRequestMap {
             "dest_url" => Ok(request.dest_url.is_some()),
             "source_addr" => Ok(request.source_addr.is_some()),
             "source_mac" => Ok(request.source_mac.is_some()),
+            "source_host_name" => Ok(request.source_host_name.is_some()),
             "source_device_id" => Ok(request.source_device_id.is_some()),
             "source_app_id" => Ok(request.source_app_id.is_some()),
             "source_user_id" => Ok(request.source_user_id.is_some()),
@@ -391,6 +403,7 @@ impl MapCollection for StreamRequestMap {
                 .take()
                 .map(|addr| CollectionValue::String(addr.to_string()))),
             "source_mac" => Ok(request.source_mac.take().map(CollectionValue::String)),
+            "source_host_name" => Ok(request.source_host_name.take().map(CollectionValue::String)),
             "source_device_id" => Ok(request.source_device_id.take().map(CollectionValue::String)),
             "source_app_id" => Ok(request.source_app_id.take().map(CollectionValue::String)),
             "source_user_id" => Ok(request.source_user_id.take().map(CollectionValue::String)),
@@ -434,6 +447,10 @@ impl MapCollection for StreamRequestMap {
                     .unwrap_or_default(),
             ),
             ("source_mac", request.source_mac.clone().unwrap_or_default()),
+            (
+                "source_host_name",
+                request.source_host_name.clone().unwrap_or_default(),
+            ),
             (
                 "source_device_id",
                 request.source_device_id.clone().unwrap_or_default(),
@@ -497,6 +514,12 @@ impl MapCollection for StreamRequestMap {
             result.push((
                 "source_mac".to_string(),
                 CollectionValue::String(mac.clone()),
+            ));
+        }
+        if let Some(host_name) = &request.source_host_name {
+            result.push((
+                "source_host_name".to_string(),
+                CollectionValue::String(host_name.clone()),
             ));
         }
         if let Some(device_id) = &request.source_device_id {

@@ -173,6 +173,20 @@ impl QuicConnectionHandler {
         let map = MemoryMapCollection::new_ref();
         map.insert("dest_host", CollectionValue::String(server_name)).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        let device_info = self
+            .connection_manager
+            .as_ref()
+            .and_then(|manager| manager.get_device_info_by_source(remote_addr.ip()));
+        if let Some(device_info) = device_info.as_ref() {
+            if let Some(mac) = device_info.mac() {
+                map.insert("source_mac", CollectionValue::String(mac.to_string())).await
+                    .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+            }
+            if let Some(host_name) = device_info.hostname() {
+                map.insert("source_host_name", CollectionValue::String(host_name.to_string())).await
+                    .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+            }
+        }
 
         let executor = self.executor.fork();
         let global_env = executor.global_env().clone();
@@ -301,6 +315,7 @@ impl QuicConnectionHandler {
                                             let limiter = limiter.clone();
                                             let server = server.clone();
                                             let speed_stat = speed_stat.clone();
+                                            let device_info = device_info.clone();
                                             let handle = tokio::spawn(async move {
                                                 let ret: StackResult<()> = async move {
                                                     let (req, stream) = resolver.unwrap().resolve_request().await
@@ -329,7 +344,13 @@ impl QuicConnectionHandler {
                                                         req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
                                                         req.uri().to_string());
                                                     let resp = server
-                                                        .serve_request(req, StreamInfo::new(remote_addr.to_string()))
+                                                        .serve_request(
+                                                            req,
+                                                            StreamInfo::new(remote_addr.to_string()).with_device_info(
+                                                                device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
+                                                                device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                                            ),
+                                                        )
                                                         .await
                                                         .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
                                                     let (parts, mut body) = resp.into_parts();
@@ -400,8 +421,18 @@ impl QuicConnectionHandler {
                                             } else {
                                                 Box::new(stat_stream)
                                             };
+                                            let device_info = device_info.clone();
                                             let handle = tokio::spawn(async move {
-                                                if let Err(e) = server.serve_connection(stream, StreamInfo::new(remote_addr.to_string())).await {
+                                                if let Err(e) = server
+                                                    .serve_connection(
+                                                        stream,
+                                                        StreamInfo::new(remote_addr.to_string()).with_device_info(
+                                                            device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
+                                                            device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                                        ),
+                                                    )
+                                                    .await
+                                                {
                                                     log::error!("server error: {}", e);
                                                 }
                                             });

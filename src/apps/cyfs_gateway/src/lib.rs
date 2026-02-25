@@ -133,6 +133,18 @@ async fn run_gateway_with_config(
     info!("Parse cyfs-gatway config success");
 
     let connect_manager = ConnectionManager::new();
+    if gateway_config.device_manager.enabled {
+        let offline_timeout = Duration::from_secs(gateway_config.device_manager.offline_timeout_seconds.max(1));
+        let cleanup_interval = Duration::from_secs(gateway_config.device_manager.cleanup_interval_seconds.max(1));
+        connect_manager.set_device_manager(DeviceManager::new(offline_timeout, cleanup_interval));
+        info!(
+            "device_manager enabled: offline_timeout={}s cleanup_interval={}s",
+            offline_timeout.as_secs(),
+            cleanup_interval.as_secs(),
+        );
+    } else {
+        info!("device_manager disabled");
+    }
 
     let factory = GatewayFactory::new(
         connect_manager.clone(),
@@ -477,6 +489,20 @@ pub async fn cyfs_gateway_main() {
                 .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("show_connections")
             .about("Show current connections")
+            .arg(Arg::new("format")
+                .long("format")
+                .short('f')
+                .help("Show format, optional json | yaml")
+                .required(false)
+                .default_value("yaml"))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CONTROL_SERVER)))
+        .subcommand(Command::new("show_connection_devices")
+            .about("Show current connection devices")
             .arg(Arg::new("format")
                 .long("format")
                 .short('f')
@@ -945,6 +971,31 @@ pub async fn cyfs_gateway_main() {
                 }
                 Err(e) => {
                     println!("show connections error: {}", e);
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(("show_connection_devices", sub_matches)) => {
+            let server = sub_matches.get_one::<String>("server").unwrap();
+            let format = sub_matches.get_one::<String>("format").unwrap();
+            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client.get_connection_devices().await {
+                Ok(result) => {
+                    if format == "json" {
+                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    } else {
+                        println!("{}", serde_yaml_ng::to_string(&result).unwrap());
+                    }
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("show connection devices error: {}", e);
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }

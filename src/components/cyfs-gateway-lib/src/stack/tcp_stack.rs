@@ -63,6 +63,7 @@ impl StackContext for TcpStackContext {
 struct TcpConnectionHandler {
     env: Arc<TcpStackContext>,
     executor: ProcessChainLibExecutor,
+    connection_manager: Option<ConnectionManagerRef>,
     io_dump: Option<IoDumpStackConfig>,
 }
 
@@ -70,6 +71,7 @@ impl TcpConnectionHandler {
     async fn create(
         hook_point: ProcessChainConfigs,
         env: Arc<TcpStackContext>,
+        connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
@@ -84,6 +86,7 @@ impl TcpConnectionHandler {
         Ok(Self {
             env,
             executor,
+            connection_manager,
             io_dump,
         })
     }
@@ -105,6 +108,7 @@ impl TcpConnectionHandler {
         Ok(Self {
             env: self.env.clone(),
             executor,
+            connection_manager: self.connection_manager.clone(),
             io_dump,
         })
     }
@@ -130,6 +134,14 @@ impl TcpConnectionHandler {
         };
         let mut request = StreamRequest::new(req_stream, dest_addr);
         request.source_addr = Some(remote_addr);
+        if let Some(device_info) = self
+            .connection_manager
+            .as_ref()
+            .and_then(|manager| manager.get_device_info_by_source(remote_addr.ip()))
+        {
+            request.source_mac = device_info.mac().map(|v| v.to_string());
+            request.source_host_name = device_info.hostname().map(|v| v.to_string());
+        }
         let global_env = executor.global_env().clone();
         let (ret, stream) = execute_stream_chain(executor, request)
             .await
@@ -138,7 +150,17 @@ impl TcpConnectionHandler {
         let real_src_addr = get_source_addr_from_req_env(&global_env)
             .await
             .and_then(|addr| addr.parse::<SocketAddr>().ok().map(|_| addr));
-        let stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr);
+        let mut stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr);
+        if let Some(device_info) = self
+            .connection_manager
+            .as_ref()
+            .and_then(|manager| manager.get_device_info_by_source(remote_addr.ip()))
+        {
+            stream_info = stream_info.with_device_info(
+                device_info.mac().map(|v| v.to_string()),
+                device_info.hostname().map(|v| v.to_string()),
+            );
+        }
         if ret.is_control() {
             if ret.is_drop() {
                 return Ok(());
@@ -321,6 +343,7 @@ impl TcpStack {
         let handler = TcpConnectionHandler::create(
             config.hook_point.unwrap(),
             env,
+            config.connection_manager.clone(),
             config.io_dump,
         )
             .await?;
@@ -501,7 +524,12 @@ impl Stack for TcpStack {
         )
             .await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
-        let new_handler = TcpConnectionHandler::create(config.hook_point.clone(), env, io_dump).await?;
+        let new_handler = TcpConnectionHandler::create(
+            config.hook_point.clone(),
+            env,
+            self.connection_manager.clone(),
+            io_dump,
+        ).await?;
 
         *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())

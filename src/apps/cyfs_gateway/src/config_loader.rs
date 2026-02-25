@@ -560,6 +560,34 @@ pub struct TimerConfig {
     pub process_chain: String,
 }
 
+fn default_offline_timeout_seconds() -> u64 {
+    600
+}
+
+fn default_cleanup_interval_seconds() -> u64 {
+    60
+}
+
+#[derive(Deserialize, Clone, Eq, PartialEq)]
+pub struct DeviceManagerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_offline_timeout_seconds")]
+    pub offline_timeout_seconds: u64,
+    #[serde(default = "default_cleanup_interval_seconds")]
+    pub cleanup_interval_seconds: u64,
+}
+
+impl Default for DeviceManagerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            offline_timeout_seconds: default_offline_timeout_seconds(),
+            cleanup_interval_seconds: default_cleanup_interval_seconds(),
+        }
+    }
+}
+
 impl TimerConfig {
     pub fn to_process_chains(&self) -> ProcessChainConfigs {
         vec![ProcessChainConfig {
@@ -834,6 +862,22 @@ impl GatewayConfigParser {
             }
         }
 
+        let device_manager = json_value
+            .get("device_manager")
+            .map(|value| {
+                serde_json::from_value::<DeviceManagerConfig>(value.clone()).map_err(|e| {
+                    config_err!(
+                        ConfigErrorCode::InvalidConfig,
+                        "invalid device_manager config: {:?}\n{}",
+                        e,
+                        serde_json::to_string_pretty(value)
+                            .unwrap_or_else(|_| "<invalid json>".to_string())
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+
         Ok(GatewayConfig {
             raw_config,
             limiters_config,
@@ -844,6 +888,7 @@ impl GatewayConfigParser {
             global_process_chains,
             collections,
             timers,
+            device_manager,
         })
     }
 }
@@ -907,6 +952,7 @@ pub struct GatewayConfig {
     pub global_process_chains: ProcessChainConfigs,
     pub collections: Vec<CollectionConfig>,
     pub timers: Vec<TimerConfig>,
+    pub device_manager: DeviceManagerConfig,
 }
 
 #[cfg(test)]

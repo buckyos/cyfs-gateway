@@ -176,6 +176,12 @@ impl GatewayControlClient {
         Ok(result)
     }
 
+    pub async fn get_connection_devices(&self) -> ControlResult<Value> {
+        let result = self.krpc.call("get_connection_devices", Value::Null).await
+            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+        Ok(result)
+    }
+
     pub async fn collection_list(&self) -> ControlResult<Value> {
         let result = self.krpc.call("collection_list", Value::Null).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;

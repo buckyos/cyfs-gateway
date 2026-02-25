@@ -2430,6 +2430,30 @@ impl Gateway {
     }
 
     pub async fn reload(&self, config: GatewayConfig) -> Result<()> {
+        let old_device_manager = { self.config.lock().unwrap().device_manager.clone() };
+        if old_device_manager != config.device_manager {
+            if config.device_manager.enabled {
+                let offline_timeout = std::time::Duration::from_secs(
+                    config.device_manager.offline_timeout_seconds.max(1),
+                );
+                let cleanup_interval = std::time::Duration::from_secs(
+                    config.device_manager.cleanup_interval_seconds.max(1),
+                );
+                self.connection_manager
+                    .set_device_manager(DeviceManager::new(offline_timeout, cleanup_interval));
+                info!(
+                    "device_manager reloaded: enabled=true offline_timeout={}s cleanup_interval={}s",
+                    offline_timeout.as_secs(),
+                    cleanup_interval.as_secs(),
+                );
+            } else {
+                self.connection_manager.remove_device_manager();
+                info!("device_manager reloaded: enabled=false");
+            }
+        } else {
+            info!("device_manager config unchanged, keep current manager");
+        }
+
         let user_name: Option<String> = match config.raw_config.get("user_name") {
             Some(user_name) => user_name.as_str().map(|value| value.to_string()),
             None => None,
@@ -2753,6 +2777,17 @@ struct ConnInfo {
     download_speed: u64,
 }
 
+#[derive(Serialize)]
+struct DeviceConnInfo {
+    ip: String,
+    mac: Option<String>,
+    hostname: Option<String>,
+    active_connections: u32,
+    online: bool,
+    last_connected_at: u64,
+    last_disconnected_at: Option<u64>,
+}
+
 #[async_trait::async_trait]
 impl GatewayControlCmdHandler for GatewayCmdHandler {
     async fn handle(&self, method: &str, params: Value) -> ControlResult<Value> {
@@ -3041,6 +3076,24 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     }
                 }).collect::<Vec<_>>();
                 Ok(serde_json::to_value(conn_infos).map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
+            }
+            "get_connection_devices" => {
+                let mut device_infos = gateway
+                    .connection_manager
+                    .get_all_connection_device_info()
+                    .iter()
+                    .map(|info| DeviceConnInfo {
+                        ip: info.ip().to_string(),
+                        mac: info.mac().map(|v| v.to_string()),
+                        hostname: info.hostname().map(|v| v.to_string()),
+                        active_connections: info.active_connections(),
+                        online: info.active_connections() > 0,
+                        last_connected_at: info.last_connected_at(),
+                        last_disconnected_at: info.last_disconnected_at(),
+                    })
+                    .collect::<Vec<_>>();
+                device_infos.sort_by(|a, b| a.ip.cmp(&b.ip));
+                Ok(serde_json::to_value(device_infos).map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
             }
             "add_rule" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)

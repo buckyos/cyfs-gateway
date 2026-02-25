@@ -733,6 +733,13 @@ impl RTcpTunnel {
         )
             .await?;
 
+        let remote_addr = rtcp_stream
+            .peer_addr()
+            .map_err(|e| anyhow::format_err!("get peer_addr error: {}", e))?;
+        let local_addr = rtcp_stream
+            .local_addr()
+            .map_err(|e| anyhow::format_err!("get local_addr error: {}", e))?;
+
         let nonce_bytes: [u8; 16] = hex::decode(ropen_package.body.stream_id.as_str())
             .map_err(|op| anyhow::format_err!("decode stream_id error:{}", op))?
             .try_into()
@@ -752,6 +759,8 @@ impl RTcpTunnel {
                 self.on_stream_ropen(
                     ropen_package.body.dest_host,
                     ropen_package.body.dest_port,
+                    remote_addr,
+                    local_addr,
                     Box::new(aes_stream),
                 )
                     .await
@@ -760,6 +769,8 @@ impl RTcpTunnel {
                 self.on_datagram_ropen(
                     ropen_package.body.dest_host,
                     ropen_package.body.dest_port,
+                    remote_addr,
+                    local_addr,
                     Box::new(aes_stream),
                 )
                     .await
@@ -771,6 +782,8 @@ impl RTcpTunnel {
         &self,
         dest_host: Option<String>,
         dest_port: u16,
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
         stream: Box<dyn AsyncStream>,
     ) -> Result<(), anyhow::Error> {
         //TODO: bug?
@@ -778,7 +791,9 @@ impl RTcpTunnel {
             device_id: self.target.did.to_string(),
             port: self.target.stack_port,
         };
-        self.listener.on_new_stream(stream, dest_host, dest_port, end_point).await?;
+        self.listener
+            .on_new_stream(stream, dest_host, dest_port, end_point, remote_addr, local_addr)
+            .await?;
         Ok(())
     }
 
@@ -786,13 +801,17 @@ impl RTcpTunnel {
         &self,
         dest_host: Option<String>,
         dest_port: u16,
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
         stream: Box<dyn AsyncStream>,
     ) -> Result<(), anyhow::Error> {
         let end_point = TunnelEndpoint {
             device_id: self.target.did.to_string(),
             port: self.target.stack_port,
         };
-        self.listener.on_new_datagram(stream, dest_host, dest_port, end_point).await?;
+        self.listener
+            .on_new_datagram(stream, dest_host, dest_port, end_point, remote_addr, local_addr)
+            .await?;
         Ok(())
     }
 
@@ -821,6 +840,13 @@ impl RTcpTunnel {
         // 3. Wait for the new stream
         let stream = self.wait_ropen_stream(&open_package.body.stream_id).await?;
 
+        let remote_addr = stream
+            .peer_addr()
+            .map_err(|e| anyhow::format_err!("get peer_addr error: {}", e))?;
+        let local_addr = stream
+            .local_addr()
+            .map_err(|e| anyhow::format_err!("get local_addr error: {}", e))?;
+
         let nonce_bytes: [u8; 16] = hex::decode(open_package.body.stream_id.as_str())
             .map_err(|op| anyhow::format_err!("decode stream_id error:{}", op))?
             .try_into()
@@ -840,6 +866,8 @@ impl RTcpTunnel {
                 self.on_stream_ropen(
                     open_package.body.dest_host,
                     open_package.body.dest_port,
+                    remote_addr,
+                    local_addr,
                     Box::new(aes_stream),
                 )
                     .await
@@ -848,6 +876,8 @@ impl RTcpTunnel {
                 self.on_datagram_ropen(
                     open_package.body.dest_host,
                     open_package.body.dest_port,
+                    remote_addr,
+                    local_addr,
                     Box::new(aes_stream),
                 )
                     .await
@@ -1114,12 +1144,16 @@ pub trait RTcpListener: 'static + Send + Sync {
                            stream: Box<dyn AsyncStream>,
                            dest_host: Option<String>,
                            dest_port: u16,
-                           endpoint: TunnelEndpoint,) -> TunnelResult<()>;
+                           endpoint: TunnelEndpoint,
+                           remote_addr: SocketAddr,
+                           local_addr: SocketAddr,) -> TunnelResult<()>;
     async fn on_new_datagram(&self,
                              stream: Box<dyn AsyncStream>,
                              dest_host: Option<String>,
                              dest_port: u16,
-                             endpoint: TunnelEndpoint,) -> TunnelResult<()>;
+                             endpoint: TunnelEndpoint,
+                             remote_addr: SocketAddr,
+                             local_addr: SocketAddr,) -> TunnelResult<()>;
 }
 pub type RTcpListenerRef = Arc<dyn RTcpListener>;
 
@@ -1207,6 +1241,8 @@ mod tests {
             _dest_host: Option<String>,
             _dest_port: u16,
             _endpoint: TunnelEndpoint,
+            _remote_addr: SocketAddr,
+            _local_addr: SocketAddr,
         ) -> TunnelResult<()> {
             loop {
                 let mut buf = [0u8; 1024];
@@ -1232,6 +1268,8 @@ mod tests {
             _dest_host: Option<String>,
             _dest_port: u16,
             _endpoint: TunnelEndpoint,
+            _remote_addr: SocketAddr,
+            _local_addr: SocketAddr,
         ) -> TunnelResult<()> {
             let datagram_stream = AsyncStreamWithDatagram::new(stream);
             let mut buf = [0u8; 1024];
