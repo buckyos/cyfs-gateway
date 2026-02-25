@@ -38,6 +38,7 @@ stacks:
   test1:
     bind: 0.0.0.0:18080
     protocol: tcp
+    io_dump_file: {{test_io_dump}}
     hook_point:
       main:
         priority: 1

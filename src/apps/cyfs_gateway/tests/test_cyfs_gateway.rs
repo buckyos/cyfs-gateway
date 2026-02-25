@@ -2,6 +2,7 @@
 mod tests {
     use std::io::Cursor;
     use std::net::{IpAddr, SocketAddr};
+    use std::path::Path;
     use std::str::FromStr;
     use async_compression::tokio::bufread::GzipDecoder;
     use buckyos_kit::init_logging;
@@ -22,6 +23,77 @@ mod tests {
         let mut output = Vec::new();
         decoder.read_to_end(&mut output).await.unwrap();
         Bytes::from(output)
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct DecodedIoDumpFrame {
+        upload: Vec<u8>,
+        download: Vec<u8>,
+    }
+
+    fn decode_io_dump_frames(mut data: &[u8]) -> Result<Vec<DecodedIoDumpFrame>, String> {
+        let mut frames = Vec::new();
+        while !data.is_empty() {
+            if data.len() < 9 {
+                return Err("truncated frame header".to_string());
+            }
+            if &data[0..4] != b"CGDP" {
+                return Err("invalid frame magic".to_string());
+            }
+            if data[4] != 1 {
+                return Err(format!("unsupported frame version: {}", data[4]));
+            }
+            let frame_len = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
+            if frame_len < 9 || frame_len > data.len() {
+                return Err("invalid frame length".to_string());
+            }
+            let frame = &data[9..frame_len];
+            let mut offset = 0usize;
+
+            fn take<'a>(buf: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8], String> {
+                if *offset + len > buf.len() {
+                    return Err("truncated frame payload".to_string());
+                }
+                let part = &buf[*offset..*offset + len];
+                *offset += len;
+                Ok(part)
+            }
+
+            let _ = take(frame, &mut offset, 8)?;
+            let _ = take(frame, &mut offset, 8)?;
+
+            let src_len = u16::from_le_bytes(take(frame, &mut offset, 2)?.try_into().unwrap()) as usize;
+            let _ = take(frame, &mut offset, src_len)?;
+
+            let dst_len = u16::from_le_bytes(take(frame, &mut offset, 2)?.try_into().unwrap()) as usize;
+            let _ = take(frame, &mut offset, dst_len)?;
+
+            let upload_len = u32::from_le_bytes(take(frame, &mut offset, 4)?.try_into().unwrap()) as usize;
+            let upload = take(frame, &mut offset, upload_len)?.to_vec();
+
+            let download_len = u32::from_le_bytes(take(frame, &mut offset, 4)?.try_into().unwrap()) as usize;
+            let download = take(frame, &mut offset, download_len)?.to_vec();
+
+            frames.push(DecodedIoDumpFrame { upload, download });
+            data = &data[frame_len..];
+        }
+        Ok(frames)
+    }
+
+    async fn wait_dump_frames(file: &Path, min_frames: usize) -> Vec<DecodedIoDumpFrame> {
+        for _ in 0..80 {
+            if let Ok(data) = std::fs::read(file) {
+                if !data.is_empty() {
+                    if let Ok(frames) = decode_io_dump_frames(&data) {
+                        if frames.len() >= min_frames {
+                            return frames;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("io dump frames not ready");
     }
 
     #[tokio::test]
@@ -61,6 +133,9 @@ function test_js_hook(context, host) {
 
         let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
         let config = config.replace("{{sn_db}}", db.path().to_str().unwrap());
+
+        let io_dump = tempfile::NamedTempFile::with_suffix(".dump").unwrap();
+        let config = config.replace("{{test_io_dump}}", io_dump.path().to_str().unwrap());
 
         let local_dir = tempfile::TempDir::new().unwrap();
         let config = config.replace("{{web3_dir}}", local_dir.path().to_str().unwrap());
@@ -112,6 +187,11 @@ function test_js_hook(context, host) {
             let body = response.into_body();
             let data = body.collect().await.unwrap();
             assert_eq!(data.to_bytes().as_ref(), b"web3.buckyos.com");
+
+            let frames = wait_dump_frames(io_dump.path(), 1).await;
+            assert!(frames.iter().any(|f| {
+                f.upload.starts_with(b"GET /") && f.download.starts_with(b"HTTP/1.1")
+            }));
 
 
             let request = hyper::Request::get("/test.txt")
