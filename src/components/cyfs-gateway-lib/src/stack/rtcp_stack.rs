@@ -148,6 +148,12 @@ impl RtcpConnectionHandler {
                 map.insert("source_hostname", CollectionValue::String(host_name.to_string())).await
                     .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
             }
+            map.insert(
+                "source_online_secs",
+                CollectionValue::String(device_info.today_online_seconds().to_string()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         }
         let global_env = executor.global_env().clone();
         let ret = execute_chain(executor, map)
@@ -223,6 +229,7 @@ impl RtcpConnectionHandler {
                                         let stream_info = StreamInfo::new(remote_addr_str.clone()).with_device_info(
                                             device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
                                             device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                            device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
                                         );
                                         hyper_serve_http(stream, server, stream_info).await
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
@@ -231,6 +238,7 @@ impl RtcpConnectionHandler {
                                         let stream_info = StreamInfo::new(remote_addr_str.clone()).with_device_info(
                                             device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
                                             device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                            device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
                                         );
                                         server
                                             .serve_connection(stream, stream_info)
@@ -297,6 +305,12 @@ impl RtcpConnectionHandler {
                 map.insert("source_hostname", CollectionValue::String(host_name.to_string())).await
                     .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
             }
+            map.insert(
+                "source_online_secs",
+                CollectionValue::String(device_info.today_online_seconds().to_string()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         }
         let global_env = executor.global_env().clone();
         let ret = execute_chain(executor, map)
@@ -377,6 +391,7 @@ impl RtcpConnectionHandler {
                                             let resp = server.serve_datagram(&buf[..len], DatagramInfo::new(Some(remote_addr.to_string())).with_device_info(
                                                 device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
                                                 device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                                device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
                                             )).await
                                                 .map_err(into_stack_err!(StackErrorCode::ServerError, "serve datagram error"))?;
                                             datagram_stream.send_datagram(resp.as_slice()).await

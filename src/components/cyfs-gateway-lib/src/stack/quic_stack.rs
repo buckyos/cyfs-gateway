@@ -186,6 +186,12 @@ impl QuicConnectionHandler {
                 map.insert("source_hostname", CollectionValue::String(host_name.to_string())).await
                     .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
             }
+            map.insert(
+                "source_online_secs",
+                CollectionValue::String(device_info.today_online_seconds().to_string()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         }
 
         let executor = self.executor.fork();
@@ -349,6 +355,7 @@ impl QuicConnectionHandler {
                                                             StreamInfo::new(remote_addr.to_string()).with_device_info(
                                                                 device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
                                                                 device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                                                device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
                                                             ),
                                                         )
                                                         .await
@@ -429,6 +436,7 @@ impl QuicConnectionHandler {
                                                         StreamInfo::new(remote_addr.to_string()).with_device_info(
                                                             device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
                                                             device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                                            device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
                                                         ),
                                                     )
                                                     .await

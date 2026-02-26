@@ -125,6 +125,7 @@ pub struct StreamInfo {
     pub real_src_addr: Option<String>,
     pub source_mac: Option<String>,
     pub source_hostname: Option<String>,
+    pub source_online_secs: Option<String>,
 }
 
 impl StreamInfo {
@@ -135,6 +136,7 @@ impl StreamInfo {
             real_src_addr: None,
             source_mac: None,
             source_hostname: None,
+            source_online_secs: None,
         }
     }
 
@@ -146,12 +148,19 @@ impl StreamInfo {
             real_src_addr,
             source_mac: None,
             source_hostname: None,
+            source_online_secs: None,
         }
     }
 
-    pub fn with_device_info(mut self, source_mac: Option<String>, source_hostname: Option<String>) -> Self {
+    pub fn with_device_info(
+        mut self,
+        source_mac: Option<String>,
+        source_hostname: Option<String>,
+        source_online_secs: Option<String>,
+    ) -> Self {
         self.source_mac = source_mac;
         self.source_hostname = source_hostname;
+        self.source_online_secs = source_online_secs;
         self
     }
 }
@@ -858,6 +867,7 @@ pub struct DatagramInfo {
     pub src_addr: Option<String>,
     pub source_mac: Option<String>,
     pub source_hostname: Option<String>,
+    pub source_online_secs: Option<String>,
 }
 
 impl DatagramInfo {
@@ -866,12 +876,19 @@ impl DatagramInfo {
             src_addr,
             source_mac: None,
             source_hostname: None,
+            source_online_secs: None,
         }
     }
 
-    pub fn with_device_info(mut self, source_mac: Option<String>, source_hostname: Option<String>) -> Self {
+    pub fn with_device_info(
+        mut self,
+        source_mac: Option<String>,
+        source_hostname: Option<String>,
+        source_online_secs: Option<String>,
+    ) -> Self {
         self.source_mac = source_mac;
         self.source_hostname = source_hostname;
+        self.source_online_secs = source_online_secs;
         self
     }
 }

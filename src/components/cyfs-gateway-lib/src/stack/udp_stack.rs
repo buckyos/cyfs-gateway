@@ -118,6 +118,12 @@ impl UdpDatagramHandler {
                 map.insert("source_hostname", CollectionValue::String(host_name.to_string())).await
                     .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_hostname error: {}", e))?;
             }
+            map.insert(
+                "source_online_secs",
+                CollectionValue::String(device_info.today_online_seconds().to_string()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_online_secs error: {}", e))?;
         }
 
         map.insert("dest_addr", CollectionValue::String(dest_addr.to_string())).await

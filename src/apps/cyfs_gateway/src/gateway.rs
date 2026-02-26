@@ -1,42 +1,47 @@
+use super::config_loader::GatewayConfig;
+use cyfs_gateway_lib::*;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use super::config_loader::GatewayConfig;
-use cyfs_gateway_lib::*;
 
+use crate::acme_sn_provider::AcmeSnProviderFactory;
+use crate::config_loader::GatewayConfigParserRef;
+use crate::gateway_control_client::{cmd_err, into_cmd_err};
+use crate::gateway_control_server::{
+    ControlErrorCode, ControlResult, CyfsTokenFactory, CyfsTokenVerifier, GatewayControlCmdHandler,
+};
+use crate::gateway_control_server::{
+    GatewayControlServerConfigParser, GatewayControlServerContext, GATEWAY_CONTROL_SERVER_CONFIG,
+    GATEWAY_CONTROL_SERVER_KEY,
+};
+use crate::socks::SocksTunnelBuilder;
+use crate::{merge, AcmeConfig, TlsCA};
+use anyhow::{anyhow, Result};
+use buckyos_kit::*;
+use chrono::Utc;
+use cyfs_dns::{
+    DnsServerContext, InnerDnsRecordManager, InnerDnsRecordManagerRef, LocalDnsServerContext,
+};
+use cyfs_process_chain::CollectionValue;
+use cyfs_socks::SocksServerContext;
+use cyfs_tun::TunStackContext;
+use jsonwebtoken::jwk::Jwk;
+use jsonwebtoken::{DecodingKey, EncodingKey};
+use kRPC::RPCSessionToken;
 use log::*;
 use name_client::*;
 use name_lib::*;
-use buckyos_kit::*;
-use url::Url;
-use anyhow::{anyhow, Result};
-use chrono::{Utc};
-use jsonwebtoken::{DecodingKey, EncodingKey};
-use jsonwebtoken::jwk::Jwk;
-use kRPC::RPCSessionToken;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
-use sfo_js::{JsEngine, JsPkg, JsPkgManager, JsPkgManagerRef, JsString, JsValue, NativeFunction};
-use sfo_js::object::builtins::JsArray;
-use sha2::Digest;
-use rand::{Rng};
 use rand::distr::Alphanumeric;
 use rand::rng;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use sfo_js::object::builtins::JsArray;
+use sfo_js::{JsEngine, JsPkg, JsPkgManager, JsPkgManagerRef, JsString, JsValue, NativeFunction};
+use sha2::Digest;
 use tokio::fs::create_dir_all;
-use crate::gateway_control_client::{cmd_err, into_cmd_err};
-use crate::gateway_control_server::{ControlErrorCode, ControlResult, GatewayControlCmdHandler, CyfsTokenFactory, CyfsTokenVerifier};
-use crate::config_loader::GatewayConfigParserRef;
-use crate::gateway_control_server::{
-    GatewayControlServerConfigParser, GatewayControlServerContext, GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY,
-};
-use cyfs_dns::{DnsServerContext, InnerDnsRecordManager, InnerDnsRecordManagerRef, LocalDnsServerContext};
-use cyfs_socks::SocksServerContext;
-use cyfs_tun::TunStackContext;
-use cyfs_process_chain::CollectionValue;
-use crate::acme_sn_provider::AcmeSnProviderFactory;
-use crate::{merge, AcmeConfig, TlsCA};
-use crate::socks::SocksTunnelBuilder;
+use url::Url;
 
 fn get_default_saved_gateway_config_path() -> PathBuf {
     get_buckyos_service_data_dir("cyfs_gateway").join("cyfs_gateway_saved.json")
@@ -106,9 +111,7 @@ fn build_server_context(
             control_token_verifier,
             control_token_factory,
         ))),
-        _ => {
-            None
-        }
+        _ => None,
     }
 }
 
@@ -122,7 +125,8 @@ fn build_stack_context(
     global_collection_manager: Option<GlobalCollectionManagerRef>,
     js_externals: Option<JsExternalsManagerRef>,
     acme_manager: AcmeCertManagerRef,
-    self_cert_mgr: SelfCertMgrRef, ) -> StackResult<Arc<dyn StackContext>> {
+    self_cert_mgr: SelfCertMgrRef,
+) -> StackResult<Arc<dyn StackContext>> {
     match protocol {
         StackProtocol::Tcp => Ok(Arc::new(TcpStackContext::new(
             servers.clone(),
@@ -151,50 +155,44 @@ fn build_stack_context(
             global_collection_manager.clone(),
             js_externals.clone(),
         ))),
-        StackProtocol::Tls => {
-            Ok(Arc::new(TlsStackContext::new(
+        StackProtocol::Tls => Ok(Arc::new(TlsStackContext::new(
+            servers.clone(),
+            tunnel_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
+            acme_manager.clone(),
+            self_cert_mgr.clone(),
+            global_process_chains.clone(),
+            global_collection_manager.clone(),
+            js_externals.clone(),
+        ))),
+        StackProtocol::Quic => Ok(Arc::new(QuicStackContext::new(
+            servers.clone(),
+            tunnel_manager.clone(),
+            limiter_manager.clone(),
+            stat_manager.clone(),
+            acme_manager,
+            self_cert_mgr,
+            global_process_chains.clone(),
+            global_collection_manager.clone(),
+            js_externals.clone(),
+        ))),
+        StackProtocol::Extension(name) => match name.as_str() {
+            "tun" => Ok(Arc::new(TunStackContext::new(
                 servers.clone(),
                 tunnel_manager.clone(),
                 limiter_manager.clone(),
                 stat_manager.clone(),
-                acme_manager.clone(),
-                self_cert_mgr.clone(),
                 global_process_chains.clone(),
                 global_collection_manager.clone(),
                 js_externals.clone(),
-            )))
-        }
-        StackProtocol::Quic => {
-            Ok(Arc::new(QuicStackContext::new(
-                servers.clone(),
-                tunnel_manager.clone(),
-                limiter_manager.clone(),
-                stat_manager.clone(),
-                acme_manager,
-                self_cert_mgr,
-                global_process_chains.clone(),
-                global_collection_manager.clone(),
-                js_externals.clone(),
-            )))
-        }
-        StackProtocol::Extension(name) => {
-            match name.as_str() {
-                "tun" => {
-                    Ok(Arc::new(TunStackContext::new(
-                        servers.clone(),
-                        tunnel_manager.clone(),
-                        limiter_manager.clone(),
-                        stat_manager.clone(),
-                        global_process_chains.clone(),
-                        global_collection_manager.clone(),
-                        js_externals.clone(),
-                    )))
-                },
-                _ => {
-                    Err(server_err!(StackErrorCode::InvalidConfig, "invalid protocol: {}", name))
-                }
-            }
-        }
+            ))),
+            _ => Err(server_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid protocol: {}",
+                name
+            )),
+        },
     }
 }
 fn read_config_value(path: &Path) -> Result<Value> {
@@ -232,7 +230,11 @@ fn load_include_paths(config: &Value, config_dir: &Path) -> Vec<PathBuf> {
     includes
 }
 
-fn saved_config_newer_than_others(saved_path: &Path, config_file: &Path, config_dir: &Path) -> bool {
+fn saved_config_newer_than_others(
+    saved_path: &Path,
+    config_file: &Path,
+    config_dir: &Path,
+) -> bool {
     let saved_mtime = match std::fs::metadata(saved_path).and_then(|meta| meta.modified()) {
         Ok(time) => time,
         Err(_) => return false,
@@ -295,7 +297,11 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Val
         match read_config_value(saved_path.as_path()) {
             Ok(config) => Some(config),
             Err(e) => {
-                warn!("load saved config {} failed: {}", saved_path.to_string_lossy(), e);
+                warn!(
+                    "load saved config {} failed: {}",
+                    saved_path.to_string_lossy(),
+                    e
+                );
                 None
             }
         }
@@ -304,57 +310,81 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Val
     };
 
     let cache_dir = get_gateway_remote_config_cache_path().await;
-    let mut config_json = crate::ConfigMerger::load_dir_with_root(
-        &config_dir,
-        &config_file,
-        saved_mtime,
-        &cache_dir,
-    )
-        .await
-        .map_err(|e| {
-            let msg = format!("local config {} failed {:?}", config_file.to_string_lossy().to_string(), e);
-            error!("{}", msg);
-            anyhow::anyhow!(msg)
-        })?;
+    let mut config_json =
+        crate::ConfigMerger::load_dir_with_root(&config_dir, &config_file, saved_mtime, &cache_dir)
+            .await
+            .map_err(|e| {
+                let msg = format!(
+                    "local config {} failed {:?}",
+                    config_file.to_string_lossy().to_string(),
+                    e
+                );
+                error!("{}", msg);
+                anyhow::anyhow!(msg)
+            })?;
     if let Some(mut saved_config) = saved_config.clone() {
         merge(&mut saved_config, &config_json);
         config_json = saved_config;
-        info!("Merge saved gateway config {}", saved_path.to_string_lossy());
+        info!(
+            "Merge saved gateway config {}",
+            saved_path.to_string_lossy()
+        );
     }
 
-    info!("Gateway config before merge: {}", serde_json::to_string_pretty(&config_json).unwrap());
+    info!(
+        "Gateway config before merge: {}",
+        serde_json::to_string_pretty(&config_json).unwrap()
+    );
 
-    let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
+    let mut cmd_config: serde_json::Value =
+        serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
     merge(&mut cmd_config, &config_json);
 
-    let mut config_json = buckyos_kit::apply_params_to_json(&cmd_config, None)
-        .map_err(|e| {
-            let msg = format!("apply params to config json failed: {}", e);
-            error!("{}", msg);
-            anyhow::anyhow!(msg)
-        })?;
+    let mut config_json = buckyos_kit::apply_params_to_json(&cmd_config, None).map_err(|e| {
+        let msg = format!("apply params to config json failed: {}", e);
+        error!("{}", msg);
+        anyhow::anyhow!(msg)
+    })?;
     info!("Apply params to gateway config.");
-    normalize_all_path_value_config(&mut config_json,config_dir);
+    normalize_all_path_value_config(&mut config_json, config_dir);
     info!("normalize_all_path_value_config for gateway config.");
     Ok(config_json)
 }
 
-pub(crate) async fn run_server_tempalte_pkg(mut pkg: JsPkg, args: Vec<String>) -> ControlResult<String> {
-    pkg.enable_fetch(false)
-        .init_callback(move |engine| {
-            engine.register_global_builtin_callable("currentDir".to_string(), 0, NativeFunction::from_copy_closure(|_, _, _| {
-                Ok(JsValue::from(JsString::from(std::env::current_dir().unwrap_or(PathBuf::new()).to_string_lossy().to_string())))
-            }))?;
-            Ok(())
-        });
-    let output = pkg.run(args).await.map_err(into_cmd_err!(ControlErrorCode::Failed, "run pkg failed"))?;
+pub(crate) async fn run_server_tempalte_pkg(
+    mut pkg: JsPkg,
+    args: Vec<String>,
+) -> ControlResult<String> {
+    pkg.enable_fetch(false).init_callback(move |engine| {
+        engine.register_global_builtin_callable(
+            "currentDir".to_string(),
+            0,
+            NativeFunction::from_copy_closure(|_, _, _| {
+                Ok(JsValue::from(JsString::from(
+                    std::env::current_dir()
+                        .unwrap_or(PathBuf::new())
+                        .to_string_lossy()
+                        .to_string(),
+                )))
+            }),
+        )?;
+        Ok(())
+    });
+    let output = pkg
+        .run(args)
+        .await
+        .map_err(into_cmd_err!(ControlErrorCode::Failed, "run pkg failed"))?;
     Ok(output)
 }
 
-async fn build_acme_mgr_from_config(acme_config: &Option<AcmeConfig>) -> Result<AcmeCertManagerRef> {
+async fn build_acme_mgr_from_config(
+    acme_config: &Option<AcmeConfig>,
+) -> Result<AcmeCertManagerRef> {
     let mut cert_config = CertManagerConfig::default();
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
-    let dns_provider_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("acme_dns_provider");
+    let dns_provider_dir = get_buckyos_system_etc_dir()
+        .join("cyfs_gateway")
+        .join("acme_dns_provider");
     cert_config.keystore_path = data_dir.to_string_lossy().to_string();
     if let Some(acme_config) = acme_config.clone() {
         cert_config.account = acme_config.account;
@@ -363,13 +393,17 @@ async fn build_acme_mgr_from_config(acme_config: &Option<AcmeConfig>) -> Result<
         }
         cert_config.dns_providers = acme_config.dns_providers;
         if acme_config.check_interval.is_some() {
-            if let Some(check_interval) = chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0) {
+            if let Some(check_interval) =
+                chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0)
+            {
                 cert_config.check_interval = check_interval;
             }
         }
 
         if acme_config.renew_before_expiry.is_some() {
-            if let Some(renew_before_expiry) = chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0) {
+            if let Some(renew_before_expiry) =
+                chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0)
+            {
                 cert_config.renew_before_expiry = renew_before_expiry;
             }
         }
@@ -392,7 +426,10 @@ async fn build_self_cert_mgr_from_config(tls_ca: &Option<TlsCA>) -> Result<SelfC
     Ok(self_cert_manager)
 }
 
-async fn build_js_externals_from_raw_config(base_dir: &Path, raw_config: &Value) -> Result<JsExternalsManagerRef> {
+async fn build_js_externals_from_raw_config(
+    base_dir: &Path,
+    raw_config: &Value,
+) -> Result<JsExternalsManagerRef> {
     let manager = Arc::new(JsExternalsManager::new());
     let js_externals = raw_config
         .get("js_externals")
@@ -403,13 +440,19 @@ async fn build_js_externals_from_raw_config(base_dir: &Path, raw_config: &Value)
     };
 
     for (name, source_path) in js_externals {
-        let source_path = source_path.as_str().ok_or_else(|| {
-            anyhow!("js_externals.{} must be a string file path", name)
-        })?;
+        let source_path = source_path
+            .as_str()
+            .ok_or_else(|| anyhow!("js_externals.{} must be a string file path", name))?;
 
         let source_path = normalize_config_file_path(PathBuf::from(source_path), base_dir);
-        let source = std::fs::read_to_string(source_path.as_path())
-            .map_err(|e| anyhow!("read js external {} from {} failed: {}", name, source_path.to_string_lossy(), e))?;
+        let source = std::fs::read_to_string(source_path.as_path()).map_err(|e| {
+            anyhow!(
+                "read js external {} from {} failed: {}",
+                name,
+                source_path.to_string_lossy(),
+                e
+            )
+        })?;
 
         manager
             .add_js_external(name, source)
@@ -420,7 +463,9 @@ async fn build_js_externals_from_raw_config(base_dir: &Path, raw_config: &Value)
     Ok(manager)
 }
 
-async fn build_global_process_chains_from_config(global_process_configs: &ProcessChainConfigs) -> Result<GlobalProcessChainsRef> {
+async fn build_global_process_chains_from_config(
+    global_process_configs: &ProcessChainConfigs,
+) -> Result<GlobalProcessChainsRef> {
     let mut global_process_chains = GlobalProcessChains::new();
     for process_chain_config in global_process_configs.iter() {
         let process_chain = process_chain_config.create_process_chain()?;
@@ -445,9 +490,7 @@ pub struct GatewayFactory {
 }
 
 impl GatewayFactory {
-    pub fn new(
-        connection_manager: ConnectionManagerRef,
-        parser: GatewayConfigParserRef, ) -> Self {
+    pub fn new(connection_manager: ConnectionManagerRef, parser: GatewayConfigParserRef) -> Self {
         Self {
             connection_manager,
             stack_factory: Arc::new(CyfsStackFactory::new()),
@@ -460,7 +503,11 @@ impl GatewayFactory {
         self.stack_factory.register(protocol, factory);
     }
 
-    pub fn register_server_factory<T: Into<String>>(&self, server_type: T, factory: Arc<dyn ServerFactory>) {
+    pub fn register_server_factory<T: Into<String>>(
+        &self,
+        server_type: T,
+        factory: Arc<dyn ServerFactory>,
+    ) {
         self.server_factory.register(server_type.into(), factory);
     }
 
@@ -478,18 +525,27 @@ impl GatewayFactory {
             None => None,
         };
 
-
         let mut limiter_manager = DefaultLimiterManager::new();
         let stat_manager = StatManager::new();
         if let Some(limiters_config) = config.limiters_config.clone() {
             for limiter_config in limiters_config.iter() {
-                if limiter_manager.get_limiter(limiter_config.id.clone()).is_some() {
-                    log::error!("Create limiter {} error: limiter already exists", limiter_config.id);
+                if limiter_manager
+                    .get_limiter(limiter_config.id.clone())
+                    .is_some()
+                {
+                    log::error!(
+                        "Create limiter {} error: limiter already exists",
+                        limiter_config.id
+                    );
                     continue;
                 }
                 if let Some(upper_limiter) = limiter_config.upper_limiter.clone() {
                     if limiter_manager.get_limiter(upper_limiter.clone()).is_none() {
-                        log::error!("Create limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
+                        log::error!(
+                            "Create limiter {} error: upper limiter {} not found",
+                            limiter_config.id,
+                            upper_limiter
+                        );
                     }
                 }
                 let _ = limiter_manager.new_limiter(
@@ -507,28 +563,37 @@ impl GatewayFactory {
         if !sn_acme_data.exists() {
             std::fs::create_dir_all(&sn_acme_data).unwrap();
         }
-        AcmeCertManager::register_dns_provider_factory("sn-dns", AcmeSnProviderFactory::new(sn_acme_data));
+        AcmeCertManager::register_dns_provider_factory(
+            "sn-dns",
+            AcmeSnProviderFactory::new(sn_acme_data),
+        );
 
         let cert_manager = build_acme_mgr_from_config(&config.acme_config).await?;
         let inner_dns_record_manager = InnerDnsRecordManager::new();
         let record_manager = inner_dns_record_manager.clone();
-        cert_manager.register_dns_provider("local", move |op: String, domain: String, key_hash: String| {
-            let record_manager = record_manager.clone();
-            async move {
-                if op == "add_challenge" {
-                    record_manager.add_record(domain, "TXT", key_hash).map_err(|e| anyhow!(e.to_string()))
-                } else if op == "del_challenge" {
-                    record_manager.remove_record(domain, "TXT");
-                    Ok(())
-                } else {
-                    Err(anyhow!("Unsupported op: {}", op))
+        cert_manager.register_dns_provider(
+            "local",
+            move |op: String, domain: String, key_hash: String| {
+                let record_manager = record_manager.clone();
+                async move {
+                    if op == "add_challenge" {
+                        record_manager
+                            .add_record(domain, "TXT", key_hash)
+                            .map_err(|e| anyhow!(e.to_string()))
+                    } else if op == "del_challenge" {
+                        record_manager.remove_record(domain, "TXT");
+                        Ok(())
+                    } else {
+                        Err(anyhow!("Unsupported op: {}", op))
+                    }
                 }
-            }
-        });
+            },
+        );
 
         let self_cert_manager = build_self_cert_mgr_from_config(&config.tls_ca).await?;
 
-        let global_collections = GlobalCollectionManager::create(config.collections.clone()).await?;
+        let global_collections =
+            GlobalCollectionManager::create(config.collections.clone()).await?;
 
         let base_dir = if let Some(config_file) = config_file.clone() {
             let config_dir = config_file.parent().ok_or_else(|| {
@@ -541,9 +606,12 @@ impl GatewayFactory {
             get_gateway_main_config_dir()
         };
 
-        let js_externals = build_js_externals_from_raw_config(base_dir.as_path(), &config.raw_config).await?;
+        let js_externals =
+            build_js_externals_from_raw_config(base_dir.as_path(), &config.raw_config).await?;
 
-        let chain_cmds = get_buckyos_system_etc_dir().join("cyfs_gateway").join("server_templates");
+        let chain_cmds = get_buckyos_system_etc_dir()
+            .join("cyfs_gateway")
+            .join("server_templates");
         let external_cmds = JsPkgManager::new(chain_cmds);
         let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("token_key");
         if !data_dir.exists() {
@@ -552,9 +620,11 @@ impl GatewayFactory {
 
         let store = LocalTokenKeyStore::new(data_dir);
         let token_manager = LocalTokenManager::new(user_name, password, store).await?;
-        let handler = GatewayCmdHandler::new(config_file.map(|v| v.to_path_buf()), self.parser.clone());
+        let handler =
+            GatewayCmdHandler::new(config_file.map(|v| v.to_path_buf()), self.parser.clone());
 
-        let global_process_chains = build_global_process_chains_from_config(&config.global_process_chains).await?;
+        let global_process_chains =
+            build_global_process_chains_from_config(&config.global_process_chains).await?;
 
         let tunnel_manager = TunnelManager::new();
         let server_manager = Arc::new(ServerManager::new());
@@ -573,7 +643,10 @@ impl GatewayFactory {
                 token_manager.clone(),
                 token_manager.clone(),
             );
-            let servers = self.server_factory.create(server_config.clone(), context).await?;
+            let servers = self
+                .server_factory
+                .create(server_config.clone(), context)
+                .await?;
             for server in servers.into_iter() {
                 server_manager.add_server(server)?;
             }
@@ -593,7 +666,10 @@ impl GatewayFactory {
                 cert_manager.clone(),
                 self_cert_manager.clone(),
             )?;
-            let stack = self.stack_factory.create(stack_config.clone(), stack_context).await?;
+            let stack = self
+                .stack_factory
+                .create(stack_config.clone(), stack_context)
+                .await?;
             stack_manager.add_stack(stack)?;
         }
 
@@ -696,7 +772,10 @@ impl Gateway {
         }
         let init_result = init_name_lib(&real_machine_config.web3_bridge).await;
         if init_result.is_err() {
-            let msg = format!("init default name client failed, err:{}", init_result.err().unwrap());
+            let msg = format!(
+                "init default name client failed, err:{}",
+                init_result.err().unwrap()
+            );
             error!("{}", msg);
             return Err(anyhow!("{}", msg));
         }
@@ -771,8 +850,8 @@ impl Gateway {
     }
 
     fn strip_control_config(raw_config: &mut Value) {
-        let control_config: Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG)
-            .unwrap_or(Value::Null);
+        let control_config: Value =
+            serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap_or(Value::Null);
         if let Some(stacks) = control_config.get("stacks").and_then(|v| v.as_object()) {
             if let Some(raw_stacks) = raw_config.get_mut("stacks").and_then(|v| v.as_object_mut()) {
                 for key in stacks.keys() {
@@ -781,7 +860,10 @@ impl Gateway {
             }
         }
         if let Some(servers) = control_config.get("servers").and_then(|v| v.as_object()) {
-            if let Some(raw_servers) = raw_config.get_mut("servers").and_then(|v| v.as_object_mut()) {
+            if let Some(raw_servers) = raw_config
+                .get_mut("servers")
+                .and_then(|v| v.as_object_mut())
+            {
                 for key in servers.keys() {
                     raw_servers.remove(key);
                 }
@@ -792,9 +874,10 @@ impl Gateway {
     pub fn get_config(&self, config_type: &str, config_id: &str) -> Result<Value> {
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow::Error::new(cmd_err!(
-            ControlErrorCode::ConfigNotFound,
-            "Config not found: {}", config_id,
-        )));
+                ControlErrorCode::ConfigNotFound,
+                "Config not found: {}",
+                config_id,
+            )));
         }
         let config = self.config.lock().unwrap();
         match config_type {
@@ -823,14 +906,16 @@ impl Gateway {
                 warn!("Invalid config type: {}", config_type);
                 Err(cmd_err!(
                     ControlErrorCode::InvalidConfigType,
-                    "Invalid config type: {}", config_type,
+                    "Invalid config type: {}",
+                    config_type,
                 ))?;
             }
         }
 
         Err(anyhow::Error::new(cmd_err!(
             ControlErrorCode::ConfigNotFound,
-            "Config not found: {}", config_id,
+            "Config not found: {}",
+            config_id,
         )))
     }
 
@@ -853,7 +938,8 @@ impl Gateway {
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
                 ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
+                "Config not found: {}",
+                config_id,
             )));
         }
 
@@ -911,9 +997,13 @@ impl Gateway {
             return Ok(config_value);
         }
 
-        let target_config = config_value
-            .as_object()
-            .ok_or_else(|| anyhow!("Invalid {} config: {}", parsed.config_type, parsed.config_id))?;
+        let target_config = config_value.as_object().ok_or_else(|| {
+            anyhow!(
+                "Invalid {} config: {}",
+                parsed.config_type,
+                parsed.config_id
+            )
+        })?;
         if parsed.config_type == "server" {
             let server_type = target_config
                 .get("type")
@@ -980,7 +1070,9 @@ impl Gateway {
             .ok_or_else(|| anyhow!("Invalid {} config: {}", config_type, config_id))?;
         if config_type == "server" {
             let server_type = target_config.get("type");
-            if server_type != Some(&Value::String("http".to_string())) && server_type != Some(&Value::String("dns".to_string())) {
+            if server_type != Some(&Value::String("http".to_string()))
+                && server_type != Some(&Value::String("dns".to_string()))
+            {
                 return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
             }
         }
@@ -1105,7 +1197,12 @@ impl Gateway {
         max_priority.map(|p| p + 1).unwrap_or(1)
     }
 
-    fn insert_rule_to_config(mut raw_config: Value, id: &str, pos: i32, rule: &str) -> Result<Value> {
+    fn insert_rule_to_config(
+        mut raw_config: Value,
+        id: &str,
+        pos: i32,
+        rule: &str,
+    ) -> Result<Value> {
         let parsed = Self::parse_rule_id(id)?;
         let config_type = parsed.config_type;
         let config_id = parsed.config_id;
@@ -1134,7 +1231,9 @@ impl Gateway {
 
         if config_type == "server" {
             let server_type = target_config.get("type");
-            if server_type != Some(&Value::String("http".to_string())) && server_type != Some(&Value::String("dns".to_string())) {
+            if server_type != Some(&Value::String("http".to_string()))
+                && server_type != Some(&Value::String("dns".to_string()))
+            {
                 return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
             }
         }
@@ -1185,10 +1284,16 @@ impl Gateway {
                         .get("block")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let mut lines: Vec<String> = content.split('\n').map(|s| s.to_string()).collect();
-                    let insert_at = if pos <= 0 { 0 } else { (pos as usize).saturating_sub(1) };
+                    let mut lines: Vec<String> =
+                        content.split('\n').map(|s| s.to_string()).collect();
+                    let insert_at = if pos <= 0 {
+                        0
+                    } else {
+                        (pos as usize).saturating_sub(1)
+                    };
                     let insert_at = insert_at.min(lines.len());
-                    let mut new_lines: Vec<String> = rule.split('\n').map(|s| s.to_string()).collect();
+                    let mut new_lines: Vec<String> =
+                        rule.split('\n').map(|s| s.to_string()).collect();
                     lines.splice(insert_at..insert_at, new_lines.drain(..));
                     let new_content = lines.join("\n");
                     block_value.insert("block".to_string(), Value::String(new_content));
@@ -1214,7 +1319,9 @@ impl Gateway {
         let block_id = parsed.block_id;
         let line_spec = parsed.line_spec;
         if line_spec.is_some() && block_id.is_none() {
-            return Err(anyhow!("line position can only be used when block id is specified"));
+            return Err(anyhow!(
+                "line position can only be used when block id is specified"
+            ));
         }
 
         let root_key = if config_type == "stack" {
@@ -1239,7 +1346,9 @@ impl Gateway {
 
         if config_type == "server" {
             let server_type = target_config.get("type");
-            if server_type != Some(&Value::String("http".to_string())) && server_type != Some(&Value::String("dns".to_string())) {
+            if server_type != Some(&Value::String("http".to_string()))
+                && server_type != Some(&Value::String("dns".to_string()))
+            {
                 return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
             }
         }
@@ -1289,8 +1398,12 @@ impl Gateway {
                 } else {
                     (line_spec.as_str(), line_spec.as_str())
                 };
-                let start: usize = start_str.parse().map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
-                let end: usize = end_str.parse().map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
+                let start: usize = start_str
+                    .parse()
+                    .map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
+                let end: usize = end_str
+                    .parse()
+                    .map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
                 if start == 0 || end == 0 || start > end || end > lines.len() {
                     return Err(anyhow!("line range out of bounds"));
                 }
@@ -1341,11 +1454,17 @@ impl Gateway {
                 .next()
                 .ok_or_else(|| anyhow!("invalid local: {}", local))?
                 .trim();
-            let ip_addr: std::net::IpAddr = ip.parse().map_err(|_| anyhow!("invalid ip: {}", ip))?;
-            let port: u16 = port.parse().map_err(|_| anyhow!("invalid port: {}", local))?;
+            let ip_addr: std::net::IpAddr =
+                ip.parse().map_err(|_| anyhow!("invalid ip: {}", ip))?;
+            let port: u16 = port
+                .parse()
+                .map_err(|_| anyhow!("invalid port: {}", local))?;
             Ok((format!("{}:{}", ip_addr, port), ip_addr.to_string(), port))
         } else {
-            let port: u16 = local.trim().parse().map_err(|_| anyhow!("invalid port: {}", local))?;
+            let port: u16 = local
+                .trim()
+                .parse()
+                .map_err(|_| anyhow!("invalid port: {}", local))?;
             let ip = "0.0.0.0".to_string();
             Ok((format!("{}:{}", ip, port), ip, port))
         }
@@ -1361,8 +1480,12 @@ impl Gateway {
             .next()
             .ok_or_else(|| anyhow!("invalid target: {}", target))?
             .trim();
-        let ip_addr: std::net::IpAddr = ip.parse().map_err(|_| anyhow!("invalid target ip: {}", ip))?;
-        let port: u16 = port.parse().map_err(|_| anyhow!("invalid target port: {}", target))?;
+        let ip_addr: std::net::IpAddr = ip
+            .parse()
+            .map_err(|_| anyhow!("invalid target ip: {}", ip))?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| anyhow!("invalid target port: {}", target))?;
         Ok(format!("{}:{}", ip_addr, port))
     }
 
@@ -1445,7 +1568,10 @@ impl Gateway {
         if !servers.contains_key(&server_id) {
             let mut server = Map::new();
             server.insert("type".to_string(), Value::String("dir".to_string()));
-            server.insert("root_path".to_string(), Value::String(root_path.to_string()));
+            server.insert(
+                "root_path".to_string(),
+                Value::String(root_path.to_string()),
+            );
             servers.insert(server_id.clone(), Value::Object(server));
         }
         Ok(server_id)
@@ -1467,11 +1593,7 @@ impl Gateway {
             .and_then(|v| v.as_object())
             .ok_or_else(|| anyhow!("servers not found"))?;
         for (server_id, server) in servers.iter() {
-            if server
-                .get("type")
-                .and_then(|v| v.as_str())
-                != Some("http")
-            {
+            if server.get("type").and_then(|v| v.as_str()) != Some("http") {
                 continue;
             }
             if let Some(hook_point) = server.get("hook_point").and_then(|v| v.as_object()) {
@@ -1570,15 +1692,9 @@ impl Gateway {
             } else {
                 if target_trim.ends_with('/') {
                     rewrite = if uri_value.ends_with('/') {
-                        Some(format!(
-                            r#"rewrite ${{REQ.path}} "{}*" "/*""#,
-                            uri_value,
-                        ))
+                        Some(format!(r#"rewrite ${{REQ.path}} "{}*" "/*""#, uri_value,))
                     } else {
-                        Some(format!(
-                            r#"rewrite ${{REQ.path}} "{}*" "*""#,
-                            uri_value,
-                        ))
+                        Some(format!(r#"rewrite ${{REQ.path}} "{}*" "*""#, uri_value,))
                     };
                 }
             }
@@ -1604,7 +1720,9 @@ impl Gateway {
             if is_http {
                 let url = Url::parse(target_trim)
                     .map_err(|e| anyhow!("invalid target url {}: {}", target_trim, e))?;
-                let host = url.host_str().ok_or_else(|| anyhow!("invalid target url host"))?;
+                let host = url
+                    .host_str()
+                    .ok_or_else(|| anyhow!("invalid target url host"))?;
                 let port = url.port().map(|p| format!(":{}", p)).unwrap_or_default();
                 let base = format!("{}://{}{}", url.scheme(), host, port);
                 forward_to = Some(base);
@@ -1617,15 +1735,9 @@ impl Gateway {
                         ));
                     } else if path.len() > 1 {
                         if path.ends_with('/') {
-                            rewrite = Some(format!(
-                                r#"rewrite ${{REQ.path}} "/*" "{}*""#,
-                                path
-                            ));
+                            rewrite = Some(format!(r#"rewrite ${{REQ.path}} "/*" "{}*""#, path));
                         } else {
-                            rewrite = Some(format!(
-                                r#"rewrite ${{REQ.path}} "/*" "{}/*""#,
-                                path
-                            ));
+                            rewrite = Some(format!(r#"rewrite ${{REQ.path}} "/*" "{}/*""#, path));
                         }
                     }
                 } else {
@@ -1656,9 +1768,15 @@ impl Gateway {
                             format!("{}*", p.trim_end_matches('*'))
                         };
                         if kind == "regex" {
-                            rewrite = Some(format!(r#"rewrite-reg ${{REQ.path}} "{}" "{}""#, regex_value, replace));
+                            rewrite = Some(format!(
+                                r#"rewrite-reg ${{REQ.path}} "{}" "{}""#,
+                                regex_value, replace
+                            ));
                         } else {
-                            rewrite = Some(format!(r#"rewrite ${{REQ.path}} "{}" "{}""#, from_pattern, replace));
+                            rewrite = Some(format!(
+                                r#"rewrite ${{REQ.path}} "{}" "{}""#,
+                                from_pattern, replace
+                            ));
                         }
                     }
                 }
@@ -1702,7 +1820,10 @@ impl Gateway {
         }
 
         let mut block = Map::new();
-        block.insert("block".to_string(), Value::String(format!("forward \"{}:///{}\";", protocol, target)));
+        block.insert(
+            "block".to_string(),
+            Value::String(format!("forward \"{}:///{}\";", protocol, target)),
+        );
         let mut blocks = Map::new();
         blocks.insert("default".to_string(), Value::Object(block));
 
@@ -1762,13 +1883,18 @@ impl Gateway {
         };
 
         Self::ensure_http_server(&mut raw_config, &server_id)?;
-        let (rule, priority, block_id, _maybe_dir) = Self::build_router_rule(&mut raw_config, uri, target)?;
+        let (rule, priority, block_id, _maybe_dir) =
+            Self::build_router_rule(&mut raw_config, uri, target)?;
 
         let servers = raw_config
             .get_mut("servers")
             .and_then(|v| v.as_object_mut())
             .unwrap();
-        let server = servers.get_mut(&server_id).unwrap().as_object_mut().unwrap();
+        let server = servers
+            .get_mut(&server_id)
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
         let hook_point = server
             .entry("hook_point")
             .or_insert_with(|| Value::Object(Map::new()))
@@ -1824,10 +1950,7 @@ impl Gateway {
             .ok_or_else(|| anyhow!("server not found: {}", server_id))?
             .as_object_mut()
             .ok_or_else(|| anyhow!("server {} must be object", server_id))?;
-        let server_type = server
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let server_type = server.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if server_type != "http" {
             return Err(anyhow!("server {} must be http", server_id));
         }
@@ -1872,7 +1995,9 @@ impl Gateway {
         let block_id = parsed.block_id;
         let line_spec = parsed.line_spec;
         if line_spec.is_some() && block_id.is_none() {
-            return Err(anyhow!("line position can only be used when block id is specified"));
+            return Err(anyhow!(
+                "line position can only be used when block id is specified"
+            ));
         }
 
         let root_key = match config_type {
@@ -1948,8 +2073,12 @@ impl Gateway {
                 } else {
                     (line_spec.as_str(), line_spec.as_str())
                 };
-                let start: usize = start_str.parse().map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
-                let end: usize = end_str.parse().map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
+                let start: usize = start_str
+                    .parse()
+                    .map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
+                let end: usize = end_str
+                    .parse()
+                    .map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
                 if start == 0 || end == 0 || start > end || end > lines.len() {
                     return Err(anyhow!("line range out of bounds"));
                 }
@@ -2023,7 +2152,9 @@ impl Gateway {
 
         if config_type == "server" {
             let server_type = target_config.get("type");
-            if server_type != Some(&Value::String("http".to_string())) && server_type != Some(&Value::String("dns".to_string())) {
+            if server_type != Some(&Value::String("http".to_string()))
+                && server_type != Some(&Value::String("dns".to_string()))
+            {
                 return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
             }
         }
@@ -2103,15 +2234,15 @@ impl Gateway {
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
                 ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
+                "Config not found: {}",
+                config_id,
             )));
         }
 
-        let raw_config = {
-            self.config.lock().unwrap().raw_config.clone()
-        };
+        let raw_config = { self.config.lock().unwrap().raw_config.clone() };
         let raw_config = Self::add_rule_to_config(raw_config, id, rule)?;
-        let gateway_config = self.parser
+        let gateway_config = self
+            .parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
         self.reload(gateway_config).await?;
@@ -2128,15 +2259,15 @@ impl Gateway {
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
                 ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
+                "Config not found: {}",
+                config_id,
             )));
         }
 
-        let raw_config = {
-            self.config.lock().unwrap().raw_config.clone()
-        };
+        let raw_config = { self.config.lock().unwrap().raw_config.clone() };
         let raw_config = Self::append_rule_to_config(raw_config, id, rule)?;
-        let gateway_config = self.parser
+        let gateway_config = self
+            .parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
 
@@ -2153,15 +2284,15 @@ impl Gateway {
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
                 ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
+                "Config not found: {}",
+                config_id,
             )));
         }
 
-        let raw_config = {
-            self.config.lock().unwrap().raw_config.clone()
-        };
+        let raw_config = { self.config.lock().unwrap().raw_config.clone() };
         let raw_config = Self::insert_rule_to_config(raw_config, id, pos, rule)?;
-        let gateway_config = self.parser
+        let gateway_config = self
+            .parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
 
@@ -2178,15 +2309,15 @@ impl Gateway {
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
                 ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
+                "Config not found: {}",
+                config_id,
             )));
         }
 
-        let raw_config = {
-            self.config.lock().unwrap().raw_config.clone()
-        };
+        let raw_config = { self.config.lock().unwrap().raw_config.clone() };
         let raw_config = Self::move_rule_in_config(raw_config, id, new_pos)?;
-        let gateway_config = self.parser
+        let gateway_config = self
+            .parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
 
@@ -2194,12 +2325,16 @@ impl Gateway {
         Ok(())
     }
 
-    pub async fn add_dispatch(&self, local: &str, target: &str, protocol: Option<&str>) -> Result<()> {
-        let raw_config = {
-            self.config.lock().unwrap().raw_config.clone()
-        };
+    pub async fn add_dispatch(
+        &self,
+        local: &str,
+        target: &str,
+        protocol: Option<&str>,
+    ) -> Result<()> {
+        let raw_config = { self.config.lock().unwrap().raw_config.clone() };
         let (raw_config, _) = Self::add_dispatch_to_config(raw_config, local, target, protocol)?;
-        let gateway_config = self.parser
+        let gateway_config = self
+            .parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
 
@@ -2207,12 +2342,17 @@ impl Gateway {
         Ok(())
     }
 
-    pub async fn add_router(&self, server_id: Option<&str>, uri: &str, target: &str) -> Result<String> {
-        let raw_config = {
-            self.config.lock().unwrap().raw_config.clone()
-        };
-        let (raw_config, server_id, _) = Self::add_router_to_config(raw_config, server_id, uri, target)?;
-        let gateway_config = self.parser
+    pub async fn add_router(
+        &self,
+        server_id: Option<&str>,
+        uri: &str,
+        target: &str,
+    ) -> Result<String> {
+        let raw_config = { self.config.lock().unwrap().raw_config.clone() };
+        let (raw_config, server_id, _) =
+            Self::add_router_to_config(raw_config, server_id, uri, target)?;
+        let gateway_config = self
+            .parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
 
@@ -2221,12 +2361,16 @@ impl Gateway {
         Ok(server_id)
     }
 
-    pub async fn remove_router(&self, server_id: Option<&str>, uri: &str, target: &str) -> Result<()> {
-        let raw_config = {
-            self.config.lock().unwrap().raw_config.clone()
-        };
+    pub async fn remove_router(
+        &self,
+        server_id: Option<&str>,
+        uri: &str,
+        target: &str,
+    ) -> Result<()> {
+        let raw_config = { self.config.lock().unwrap().raw_config.clone() };
         let (raw_config, _) = Self::remove_router_from_config(raw_config, server_id, uri, target)?;
-        let gateway_config = self.parser
+        let gateway_config = self
+            .parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
 
@@ -2235,11 +2379,11 @@ impl Gateway {
     }
 
     pub async fn remove_dispatch(&self, local: &str, protocol: Option<&str>) -> Result<()> {
-        let raw_config = {
-            self.config.lock().unwrap().raw_config.clone()
-        };
-        let (raw_config, stack_id) = Self::remove_dispatch_from_config(raw_config, local, protocol)?;
-        let gateway_config = self.parser
+        let raw_config = { self.config.lock().unwrap().raw_config.clone() };
+        let (raw_config, stack_id) =
+            Self::remove_dispatch_from_config(raw_config, local, protocol)?;
+        let gateway_config = self
+            .parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
 
@@ -2259,15 +2403,15 @@ impl Gateway {
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
                 ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
+                "Config not found: {}",
+                config_id,
             )));
         }
 
-        let raw_config = {
-            self.config.lock().unwrap().raw_config.clone()
-        };
+        let raw_config = { self.config.lock().unwrap().raw_config.clone() };
         let raw_config = Self::set_rule_in_config(raw_config, id, rule)?;
-        let gateway_config = self.parser
+        let gateway_config = self
+            .parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
         self.reload(gateway_config).await?;
@@ -2306,7 +2450,9 @@ impl Gateway {
 
         if config_type == "server" {
             let server_type = target_config.get("type");
-            if server_type != Some(&Value::String("http".to_string())) && server_type != Some(&Value::String("dns".to_string())) {
+            if server_type != Some(&Value::String("http".to_string()))
+                && server_type != Some(&Value::String("dns".to_string()))
+            {
                 return Err(anyhow!("Invalid server type: {}", server_type.unwrap()));
             }
         }
@@ -2321,7 +2467,9 @@ impl Gateway {
         let only_chain = hook_point.len() == 1;
         let line_spec = parsed.line_spec;
         if line_spec.is_some() && block_id.is_none() {
-            return Err(anyhow!("line range can only be used when block id is specified"));
+            return Err(anyhow!(
+                "line range can only be used when block id is specified"
+            ));
         }
 
         let chain_value = hook_point
@@ -2367,8 +2515,12 @@ impl Gateway {
                 } else {
                     (line_spec, line_spec)
                 };
-                let start: usize = start_str.parse().map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
-                let end: usize = end_str.parse().map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
+                let start: usize = start_str
+                    .parse()
+                    .map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
+                let end: usize = end_str
+                    .parse()
+                    .map_err(|_| anyhow!("invalid line spec {}", line_spec))?;
                 if start == 0 || end == 0 || start > end || end > lines.len() {
                     return Err(anyhow!("line range out of bounds"));
                 }
@@ -2381,7 +2533,8 @@ impl Gateway {
                     blocks.remove(block_id);
                 } else {
                     let mut new_content = lines.join("\n");
-                    if ends_with_newline && !new_content.is_empty() && !new_content.ends_with('\n') {
+                    if ends_with_newline && !new_content.is_empty() && !new_content.ends_with('\n')
+                    {
                         new_content.push('\n');
                     }
                     block_obj.insert("block".to_string(), Value::String(new_content));
@@ -2414,15 +2567,15 @@ impl Gateway {
         if config_id == GATEWAY_CONTROL_SERVER_KEY {
             return Err(anyhow!(cmd_err!(
                 ControlErrorCode::ConfigNotFound,
-                "Config not found: {}", config_id,
+                "Config not found: {}",
+                config_id,
             )));
         }
 
-        let raw_config = {
-            self.config.lock().unwrap().raw_config.clone()
-        };
+        let raw_config = { self.config.lock().unwrap().raw_config.clone() };
         let raw_config = Self::remove_rule_from_config(raw_config, id)?;
-        let gateway_config = self.parser
+        let gateway_config = self
+            .parser
             .parse(raw_config)
             .map_err(|e| anyhow!("parse config failed: {}", e))?;
         self.reload(gateway_config).await?;
@@ -2439,8 +2592,14 @@ impl Gateway {
                 let cleanup_interval = std::time::Duration::from_secs(
                     config.device_manager.cleanup_interval_seconds.max(1),
                 );
-                self.connection_manager
-                    .set_device_manager(DeviceManager::new(offline_timeout, cleanup_interval));
+                let device_online_db_path =
+                    get_buckyos_service_data_dir("cyfs_gateway").join("device_online.db");
+                let store = SqliteDeviceOnlineStore::new(device_online_db_path)
+                    .await
+                    .map_err(|e| anyhow!("create sqlite device online store failed: {}", e))?;
+                self.connection_manager.set_device_manager(
+                    DeviceManager::new(Arc::new(store), offline_timeout, cleanup_interval).await,
+                );
                 info!(
                     "device_manager reloaded: enabled=true offline_timeout={}s cleanup_interval={}s",
                     offline_timeout.as_secs(),
@@ -2463,9 +2622,7 @@ impl Gateway {
             None => None,
         };
 
-        let mut limiter_manager = {
-            self.limiter_manager.lock().unwrap().clone_manager()
-        };
+        let mut limiter_manager = { self.limiter_manager.lock().unwrap().clone_manager() };
         let mut exist_limters = HashSet::new();
         if let Some(limiters_config) = config.limiters_config.clone() {
             for limiter_config in limiters_config.iter() {
@@ -2480,9 +2637,12 @@ impl Gateway {
                 if let Some(upper_limiter) = limiter_config.upper_limiter.clone() {
                     let upper = limiter_manager.get_limiter(upper_limiter.clone());
                     if upper.is_none() {
-                        let msg = format!("Create limiter {} error: upper limiter {} not found", limiter_config.id, upper_limiter);
+                        let msg = format!(
+                            "Create limiter {} error: upper limiter {} not found",
+                            limiter_config.id, upper_limiter
+                        );
                         log::error!("{}", msg);
-                        return Err(anyhow!(msg))
+                        return Err(anyhow!(msg));
                     }
                 }
                 let _ = limiter_manager.new_limiter(
@@ -2494,31 +2654,35 @@ impl Gateway {
                 );
             }
         }
-        limiter_manager.retain(Box::new(move |id, _| {
-            exist_limters.contains(id)
-        }));
+        limiter_manager.retain(Box::new(move |id, _| exist_limters.contains(id)));
         let limiter_manager = Arc::new(limiter_manager);
 
         let cert_manager = build_acme_mgr_from_config(&config.acme_config).await?;
         let inner_dns_record_manager = InnerDnsRecordManager::new();
         let record_manager = inner_dns_record_manager.clone();
-        cert_manager.register_dns_provider("local", move |op: String, domain: String, key_hash: String| {
-            let record_manager = record_manager.clone();
-            async move {
-                if op == "add_challenge" {
-                    record_manager.add_record(domain, "TXT", key_hash).map_err(|e| anyhow!(e.to_string()))
-                } else if op == "del_challenge" {
-                    record_manager.remove_record(domain, "TXT");
-                    Ok(())
-                } else {
-                    Err(anyhow!("Unsupported op: {}", op))
+        cert_manager.register_dns_provider(
+            "local",
+            move |op: String, domain: String, key_hash: String| {
+                let record_manager = record_manager.clone();
+                async move {
+                    if op == "add_challenge" {
+                        record_manager
+                            .add_record(domain, "TXT", key_hash)
+                            .map_err(|e| anyhow!(e.to_string()))
+                    } else if op == "del_challenge" {
+                        record_manager.remove_record(domain, "TXT");
+                        Ok(())
+                    } else {
+                        Err(anyhow!("Unsupported op: {}", op))
+                    }
                 }
-            }
-        });
+            },
+        );
 
         let self_cert_manager = build_self_cert_mgr_from_config(&config.tls_ca).await?;
 
-        let global_collections = GlobalCollectionManager::create(config.collections.clone()).await?;
+        let global_collections =
+            GlobalCollectionManager::create(config.collections.clone()).await?;
 
         let base_dir = if let Some(config_file) = self.config_file.clone() {
             let config_dir = config_file.parent().ok_or_else(|| {
@@ -2531,9 +2695,11 @@ impl Gateway {
             get_gateway_main_config_dir()
         };
 
-        let js_externals = build_js_externals_from_raw_config(base_dir.as_path(), &config.raw_config).await?;
+        let js_externals =
+            build_js_externals_from_raw_config(base_dir.as_path(), &config.raw_config).await?;
 
-        let global_process_chains = build_global_process_chains_from_config(&config.global_process_chains).await?;
+        let global_process_chains =
+            build_global_process_chains_from_config(&config.global_process_chains).await?;
 
         let server_manager = Arc::new(ServerManager::new());
         let control_handler: Arc<dyn GatewayControlCmdHandler> = self.control_handler.clone();
@@ -2551,12 +2717,14 @@ impl Gateway {
                 self.control_token_manager.clone(),
                 self.control_token_manager.clone(),
             );
-            let servers = self.server_factory.create(server_config.clone(), context).await?;
+            let servers = self
+                .server_factory
+                .create(server_config.clone(), context)
+                .await?;
             for server in servers.into_iter() {
                 server_manager.add_server(server)?;
             }
         }
-
 
         let mut exist_stacks = HashSet::new();
         let mut new_stacks = Vec::new();
@@ -2576,14 +2744,25 @@ impl Gateway {
             )?;
             exist_stacks.insert(stack_config.id().clone());
             if let Some(stack) = self.stack_manager.get_stack(stack_config.id().as_str()) {
-                stack.prepare_update(stack_config.clone(), Some(stack_context)).await.map_err(|e| {
-                    let msg = format!("Failed to prepare update stack {}: {}", stack_config.id(), e);
-                    log::error!("{}", msg);
-                    anyhow!(msg)
-                })?;
+                stack
+                    .prepare_update(stack_config.clone(), Some(stack_context))
+                    .await
+                    .map_err(|e| {
+                        let msg = format!(
+                            "Failed to prepare update stack {}: {}",
+                            stack_config.id(),
+                            e
+                        );
+                        log::error!("{}", msg);
+                        anyhow!(msg)
+                    })?;
                 changed_stacks.push(stack);
             } else {
-                let new_stack = match self.stack_factory.create(stack_config.clone(), stack_context).await {
+                let new_stack = match self
+                    .stack_factory
+                    .create(stack_config.clone(), stack_context)
+                    .await
+                {
                     Ok(stack) => stack,
                     Err(e) => {
                         log::error!("Failed to create stack {}: {}", stack_config.id(), e);
@@ -2599,9 +2778,7 @@ impl Gateway {
             }
         }
 
-        self.stack_manager.retain(|id| {
-            exist_stacks.contains(id)
-        });
+        self.stack_manager.retain(|id| exist_stacks.contains(id));
 
         for changed_stack in changed_stacks.into_iter() {
             changed_stack.commit_update().await;
@@ -2611,14 +2788,17 @@ impl Gateway {
             let _ = self.stack_manager.add_stack(new_stack);
         }
 
-        self.control_token_manager.update_credentials(user_name, password);
+        self.control_token_manager
+            .update_credentials(user_name, password);
 
         if let Some(limiters_config) = config.limiters_config.clone() {
             for limiter_config in limiters_config.iter() {
                 if let Some(limiter) = limiter_manager.get_limiter(limiter_config.id.clone()) {
-                    limiter.set_speed(limiter_config.concurrent.map(|v| v as u32),
-                                      limiter_config.download_speed.map(|v| v as u32),
-                                      limiter_config.upload_speed.map(|v| v as u32));
+                    limiter.set_speed(
+                        limiter_config.concurrent.map(|v| v as u32),
+                        limiter_config.download_speed.map(|v| v as u32),
+                        limiter_config.upload_speed.map(|v| v as u32),
+                    );
                 }
             }
         }
@@ -2669,8 +2849,7 @@ pub struct GatewayCmdHandler {
 }
 
 impl GatewayCmdHandler {
-    pub fn new(config_file: Option<PathBuf>,
-               parser: GatewayConfigParserRef, ) -> Arc<Self> {
+    pub fn new(config_file: Option<PathBuf>, parser: GatewayConfigParserRef) -> Arc<Self> {
         Arc::new(Self {
             gateway: Mutex::new(None),
             config_file,
@@ -2679,7 +2858,10 @@ impl GatewayCmdHandler {
     }
 
     pub fn set_gateway(&self, gateway: Arc<Gateway>) {
-        self.gateway.lock().unwrap().replace(Arc::downgrade(&gateway));
+        self.gateway
+            .lock()
+            .unwrap()
+            .replace(Arc::downgrade(&gateway));
     }
 
     fn get_gateway(&self) -> Option<Arc<Gateway>> {
@@ -2691,29 +2873,39 @@ impl GatewayCmdHandler {
     }
 
     async fn start_template(&self, template_id: &str, args: Vec<String>) -> ControlResult<Value> {
-        let gateway = self.get_gateway().ok_or_else(|| cmd_err!(ControlErrorCode::NoGateway, "gateway not init"))?;
-        let current_config = {
-            gateway.config.lock().unwrap().clone()
-        };
-        let pkg = gateway.external_cmds.get_pkg(template_id)
+        let gateway = self
+            .get_gateway()
+            .ok_or_else(|| cmd_err!(ControlErrorCode::NoGateway, "gateway not init"))?;
+        let current_config = { gateway.config.lock().unwrap().clone() };
+        let pkg = gateway
+            .external_cmds
+            .get_pkg(template_id)
             .await
             .map_err(into_cmd_err!(ControlErrorCode::Failed, "get pkg failed"))?;
         let output = run_server_tempalte_pkg(pkg, args).await?;
-        let template_config: Value = serde_json::from_str(output.as_str())
-            .map_err(into_cmd_err!(ControlErrorCode::InvalidParams, "invalid template config"))?;
+        let template_config: Value = serde_json::from_str(output.as_str()).map_err(
+            into_cmd_err!(ControlErrorCode::InvalidParams, "invalid template config"),
+        )?;
         let mut raw_config = current_config.raw_config.clone();
         merge(&mut raw_config, &template_config);
-        let gateway_config = self.parser
-            .parse(raw_config)
-            .map_err(into_cmd_err!(ControlErrorCode::Failed, "parse config failed"))?;
-        gateway.reload(gateway_config).await.map_err(|e| cmd_err!(ControlErrorCode::Failed, "reload gateway failed. {:?}", e))?;
+        let gateway_config = self.parser.parse(raw_config).map_err(into_cmd_err!(
+            ControlErrorCode::Failed,
+            "parse config failed"
+        ))?;
+        gateway
+            .reload(gateway_config)
+            .await
+            .map_err(|e| cmd_err!(ControlErrorCode::Failed, "reload gateway failed. {:?}", e))?;
         Ok(template_config)
     }
 
     async fn get_external_cmds(&self) -> ControlResult<Vec<ExternalCmd>> {
         let mut cmds = Vec::new();
         if let Some(gateway) = self.get_gateway() {
-            let external_cmds = gateway.external_cmds.list_pkgs().await
+            let external_cmds = gateway
+                .external_cmds
+                .list_pkgs()
+                .await
                 .map_err(into_cmd_err!(ControlErrorCode::Failed, "list pkgs failed"))?;
             for external_cmd in external_cmds {
                 cmds.push(ExternalCmd {
@@ -2727,25 +2919,40 @@ impl GatewayCmdHandler {
 
     async fn get_external_cmd_help(&self, cmd: &str) -> ControlResult<String> {
         if let Some(gateway) = self.get_gateway() {
-            let mut pkg = gateway.external_cmds.get_pkg(cmd)
+            let mut pkg = gateway
+                .external_cmds
+                .get_pkg(cmd)
                 .await
                 .map_err(into_cmd_err!(ControlErrorCode::Failed, "get pkg failed"))?;
 
             pkg.init_callback(move |engine| {
-                engine.register_global_builtin_callable("currentDir".to_string(), 0, NativeFunction::from_copy_closure(|_, _, _| {
-                    Ok(JsValue::from(JsString::from(std::env::current_dir().unwrap_or(PathBuf::new()).to_string_lossy().to_string())))
-                }))?;
+                engine.register_global_builtin_callable(
+                    "currentDir".to_string(),
+                    0,
+                    NativeFunction::from_copy_closure(|_, _, _| {
+                        Ok(JsValue::from(JsString::from(
+                            std::env::current_dir()
+                                .unwrap_or(PathBuf::new())
+                                .to_string_lossy()
+                                .to_string(),
+                        )))
+                    }),
+                )?;
                 Ok(())
             });
 
-            pkg.help().await.map_err(into_cmd_err!(ControlErrorCode::Failed, "get help failed"))
+            pkg.help()
+                .await
+                .map_err(into_cmd_err!(ControlErrorCode::Failed, "get help failed"))
         } else {
             Ok("".to_string())
         }
     }
 
     async fn save_config_to_device(&self, requested_path: Option<&str>) -> ControlResult<String> {
-        let gateway = self.get_gateway().ok_or_else(|| cmd_err!(ControlErrorCode::NoGateway, "gateway not init"))?;
+        let gateway = self
+            .get_gateway()
+            .ok_or_else(|| cmd_err!(ControlErrorCode::NoGateway, "gateway not init"))?;
         let raw_config = {
             let config = gateway.config.lock().unwrap();
             strip_includes_field(config.raw_config.clone())
@@ -2754,13 +2961,19 @@ impl GatewayCmdHandler {
         if let Some(parent) = save_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(into_cmd_err!(ControlErrorCode::Failed, "create config dir failed"))?;
+                .map_err(into_cmd_err!(
+                    ControlErrorCode::Failed,
+                    "create config dir failed"
+                ))?;
         }
         let content = serde_json::to_string_pretty(&raw_config)
             .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?;
         tokio::fs::write(save_path.as_path(), content)
             .await
-            .map_err(into_cmd_err!(ControlErrorCode::Failed, "write config failed"))?;
+            .map_err(into_cmd_err!(
+                ControlErrorCode::Failed,
+                "write config failed"
+            ))?;
         let config = gateway.config.lock().unwrap().clone();
         let mut init_config = gateway.init_config.lock().unwrap();
         *init_config = config;
@@ -2786,6 +2999,8 @@ struct DeviceConnInfo {
     online: bool,
     last_connected_at: u64,
     last_disconnected_at: Option<u64>,
+    today_online_seconds: u64,
+    current_session_online_seconds: u64,
 }
 
 #[async_trait::async_trait]
@@ -2799,26 +3014,29 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
         match method {
             "get_config" => {
                 if params.is_null() {
-                    return gateway.get_all_config()
+                    return gateway
+                        .get_all_config()
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e));
                 }
                 let params = serde_json::from_value::<HashMap<String, String>>(params)
                     .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
                 if let Some(id) = params.get("id") {
-                    return gateway.get_config_by_id(id)
+                    return gateway
+                        .get_config_by_id(id)
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e));
                 } else {
-                    gateway.get_all_config()
+                    gateway
+                        .get_all_config()
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))
                 }
-            },
-            "get_init_config" => {
-                gateway.get_init_config()
-                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))
-            },
+            }
+            "get_init_config" => gateway
+                .get_init_config()
+                .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e)),
             "collection_list" => {
                 let collections = gateway.global_collection_manager().list();
-                Ok(serde_json::to_value(collections).map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
+                Ok(serde_json::to_value(collections)
+                    .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
             }
             "collection_get" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)
@@ -2834,7 +3052,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 let key = params.get("key");
                 let manager = gateway.global_collection_manager();
                 if let Some(set) = manager.get_set(name.as_str()) {
-                    let items = set.get_all().await
+                    let items = set
+                        .get_all()
+                        .await
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                     return Ok(json!({
                         "name": name,
@@ -2844,7 +3064,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 }
                 if let Some(map) = manager.get_map(name.as_str()) {
                     if let Some(key) = key {
-                        let value = map.get(key.as_str()).await
+                        let value = map
+                            .get(key.as_str())
+                            .await
                             .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                         let value = value
                             .as_ref()
@@ -2857,7 +3079,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                             "value": value,
                         }));
                     }
-                    let entries = map.dump().await
+                    let entries = map
+                        .dump()
+                        .await
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                     let mut items = Map::new();
                     for (k, v) in entries {
@@ -2890,7 +3114,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 let value = value.unwrap();
                 let manager = gateway.global_collection_manager();
                 if let Some(set) = manager.get_set(name.as_str()) {
-                    let inserted = set.insert(value.as_str()).await
+                    let inserted = set
+                        .insert(value.as_str())
+                        .await
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                     return Ok(json!({
                         "name": name,
@@ -2927,7 +3153,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 let value = value.unwrap();
                 let manager = gateway.global_collection_manager();
                 if let Some(set) = manager.get_set(name.as_str()) {
-                    let removed = set.remove(value.as_str()).await
+                    let removed = set
+                        .remove(value.as_str())
+                        .await
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                     return Ok(json!({
                         "name": name,
@@ -3048,9 +3276,11 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
                     params.get("config").cloned()
                 };
-                let saved_path = self.save_config_to_device(requested_path.as_deref()).await?;
+                let saved_path = self
+                    .save_config_to_device(requested_path.as_deref())
+                    .await?;
                 Ok(Value::String(saved_path))
-            },
+            }
             "remove_rule" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)
                     .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
@@ -3061,21 +3291,27 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         "Invalid params: id is None",
                     ))?;
                 }
-                gateway.remove_rule(id.unwrap()).await
+                gateway
+                    .remove_rule(id.unwrap())
+                    .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
             "get_connections" => {
-                let conn_infos = gateway.connection_manager.get_all_connection_info().iter().map(|info| {
-                    ConnInfo {
+                let conn_infos = gateway
+                    .connection_manager
+                    .get_all_connection_info()
+                    .iter()
+                    .map(|info| ConnInfo {
                         source: info.source().to_string(),
                         dest: info.destination().to_string(),
                         protocol: info.protocol(),
                         upload_speed: info.get_upload_speed(),
                         download_speed: info.get_download_speed(),
-                    }
-                }).collect::<Vec<_>>();
-                Ok(serde_json::to_value(conn_infos).map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
+                    })
+                    .collect::<Vec<_>>();
+                Ok(serde_json::to_value(conn_infos)
+                    .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
             }
             "get_connection_devices" => {
                 let mut device_infos = gateway
@@ -3090,10 +3326,13 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         online: info.active_connections() > 0,
                         last_connected_at: info.last_connected_at(),
                         last_disconnected_at: info.last_disconnected_at(),
+                        today_online_seconds: info.today_online_seconds(),
+                        current_session_online_seconds: info.current_session_online_seconds(),
                     })
                     .collect::<Vec<_>>();
                 device_infos.sort_by(|a, b| a.ip.cmp(&b.ip));
-                Ok(serde_json::to_value(device_infos).map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
+                Ok(serde_json::to_value(device_infos)
+                    .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
             }
             "add_rule" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)
@@ -3106,10 +3345,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         "Invalid params: id or rule is None",
                     ))?;
                 }
-                gateway.add_rule(
-                    id.unwrap(),
-                    rule.unwrap(),
-                ).await
+                gateway
+                    .add_rule(id.unwrap(), rule.unwrap())
+                    .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
@@ -3125,7 +3363,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         "Invalid params: local or target is None",
                     ))?;
                 }
-                gateway.add_dispatch(local.unwrap(), target.unwrap(), protocol).await
+                gateway
+                    .add_dispatch(local.unwrap(), target.unwrap(), protocol)
+                    .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
@@ -3140,7 +3380,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         "Invalid params: local is None",
                     ))?;
                 }
-                gateway.remove_dispatch(local.unwrap(), protocol).await
+                gateway
+                    .remove_dispatch(local.unwrap(), protocol)
+                    .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
@@ -3156,7 +3398,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     ))?;
                 }
                 let server_id = params.get("id").map(|s| s.as_str());
-                let server_id = gateway.add_router(server_id, uri.unwrap(), target.unwrap()).await
+                let server_id = gateway
+                    .add_router(server_id, uri.unwrap(), target.unwrap())
+                    .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String(server_id))
             }
@@ -3173,7 +3417,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     ))?;
                 }
                 let id = id.map(|s| s.as_str());
-                gateway.remove_router(id, uri.unwrap(), target.unwrap()).await
+                gateway
+                    .remove_router(id, uri.unwrap(), target.unwrap())
+                    .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
@@ -3188,10 +3434,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         "Invalid params: id or rule is None",
                     ))?;
                 }
-                gateway.append_rule(
-                    id.unwrap(),
-                    rule.unwrap(),
-                ).await
+                gateway
+                    .append_rule(id.unwrap(), rule.unwrap())
+                    .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
@@ -3210,11 +3455,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 let pos: i32 = pos.unwrap().parse().map_err(|_| {
                     cmd_err!(ControlErrorCode::InvalidParams, "pos must be integer")
                 })?;
-                gateway.insert_rule(
-                    id.unwrap(),
-                    pos,
-                    rule.unwrap(),
-                ).await
+                gateway
+                    .insert_rule(id.unwrap(), pos, rule.unwrap())
+                    .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
@@ -3232,10 +3475,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 let pos: i32 = pos.unwrap().parse().map_err(|_| {
                     cmd_err!(ControlErrorCode::InvalidParams, "new_pos must be integer")
                 })?;
-                gateway.move_rule(
-                    id.unwrap(),
-                    pos,
-                ).await
+                gateway
+                    .move_rule(id.unwrap(), pos)
+                    .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
@@ -3250,10 +3492,9 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         "Invalid params: id or rule is None",
                     ))?;
                 }
-                gateway.set_rule(
-                    id.unwrap(),
-                    rule.unwrap(),
-                ).await
+                gateway
+                    .set_rule(id.unwrap(), rule.unwrap())
+                    .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 Ok(Value::String("ok".to_string()))
             }
@@ -3265,11 +3506,17 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     ))?;
                 }
                 info!("*** reload gateway config ...");
-                let gateway_config = load_config_from_file(self.config_file.as_ref().unwrap().as_path()).await
-                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
-                let gateway_config = self.parser.parse(gateway_config)
+                let gateway_config =
+                    load_config_from_file(self.config_file.as_ref().unwrap().as_path())
+                        .await
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                let gateway_config = self
+                    .parser
+                    .parse(gateway_config)
                     .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
-                gateway.reload(gateway_config).await
+                gateway
+                    .reload(gateway_config)
+                    .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 info!("*** reload gateway config success !");
                 Ok(Value::String("ok".to_string()))
@@ -3278,23 +3525,29 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 let params = serde_json::from_value::<StartTemplateParams>(params)
                     .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
                 let args = params.args.unwrap_or_default();
-                let result = self.start_template(params.template_id.as_str(), args).await?;
+                let result = self
+                    .start_template(params.template_id.as_str(), args)
+                    .await?;
                 Ok(result)
             }
             "external_cmds" => {
                 let cmds = self.get_external_cmds().await?;
-                Ok(serde_json::to_value(cmds).map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
+                Ok(serde_json::to_value(cmds)
+                    .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
             }
             "cmd_help" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)
                     .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
                 let cmd = params.get("cmd").unwrap();
                 let help = self.get_external_cmd_help(cmd).await?;
-                Ok(serde_json::to_value(help).map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
+                Ok(serde_json::to_value(help)
+                    .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
             }
-            v => {
-                Err(cmd_err!(ControlErrorCode::InvalidMethod, "Invalid method: {}", v))
-            }
+            v => Err(cmd_err!(
+                ControlErrorCode::InvalidMethod,
+                "Invalid method: {}",
+                v
+            )),
         }
     }
 }
@@ -3323,22 +3576,28 @@ impl TokenKeyStore for LocalTokenKeyStore {
         let encode_key = load_private_key(private_key.as_path())
             .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
 
-        let public_key = tokio::fs::read_to_string(public_key).await
+        let public_key = tokio::fs::read_to_string(public_key)
+            .await
             .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         let public_key: Jwk = serde_json::from_str(public_key.as_str())
             .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
-        let decode_key = DecodingKey::from_jwk(&public_key)
-            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
+        let decode_key =
+            DecodingKey::from_jwk(&public_key).map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         Ok((encode_key, decode_key))
     }
 
     async fn save_key(&self, sign_key: String, public_key: Value) -> ControlResult<()> {
         let private_key = self.data_dir.join("private_key.pem");
         let public_key_path = self.data_dir.join("public_key.json");
-        tokio::fs::write(private_key.as_path(), sign_key).await
+        tokio::fs::write(private_key.as_path(), sign_key)
+            .await
             .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
-        tokio::fs::write(public_key_path.as_path(), serde_json::to_string(&public_key).unwrap()).await
-            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
+        tokio::fs::write(
+            public_key_path.as_path(),
+            serde_json::to_string(&public_key).unwrap(),
+        )
+        .await
+        .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         Ok(())
     }
 }
@@ -3356,13 +3615,13 @@ pub struct LocalTokenManager<S: TokenKeyStore> {
 }
 
 impl<S: TokenKeyStore> LocalTokenManager<S> {
-    pub async fn new(user_name: Option<String>,
-                     password: Option<String>,
-                     store: S) -> ControlResult<Arc<Self>> {
+    pub async fn new(
+        user_name: Option<String>,
+        password: Option<String>,
+        store: S,
+    ) -> ControlResult<Arc<Self>> {
         let (encode_key, decode_key) = match store.load_key().await {
-            Ok(ret) => {
-                ret
-            }
+            Ok(ret) => ret,
             Err(_) => {
                 let (sign_key, public_key_value) = generate_ed25519_key_pair();
                 let jwk = serde_json::from_value::<Jwk>(public_key_value.clone()).unwrap();
@@ -3394,45 +3653,68 @@ impl<S: TokenKeyStore> LocalTokenManager<S> {
             return Err(cmd_err!(ControlErrorCode::Failed));
         }
 
-        let encode_key = load_private_key(private_key)
-            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
+        let encode_key =
+            load_private_key(private_key).map_err(into_cmd_err!(ControlErrorCode::Failed))?;
 
-        let public_key = std::fs::read_to_string(public_key)
-            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
+        let public_key =
+            std::fs::read_to_string(public_key).map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         let public_key: Jwk = serde_json::from_str(public_key.as_str())
             .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
-        let decode_key = DecodingKey::from_jwk(&public_key)
-            .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
+        let decode_key =
+            DecodingKey::from_jwk(&public_key).map_err(into_cmd_err!(ControlErrorCode::Failed))?;
         Ok((encode_key, decode_key))
     }
 }
 #[async_trait::async_trait]
 impl<S: TokenKeyStore> CyfsTokenFactory for LocalTokenManager<S> {
-    async fn create(&self, user_name: &str, password: &str, timestamp: u64) -> ControlResult<String> {
+    async fn create(
+        &self,
+        user_name: &str,
+        password: &str,
+        timestamp: u64,
+    ) -> ControlResult<String> {
         let credentials = self.credentials.read().unwrap();
         if credentials.user_name.is_none() || credentials.password.is_none() {
-            return Err(cmd_err!(ControlErrorCode::NotSupportLogin, "not support login"));
+            return Err(cmd_err!(
+                ControlErrorCode::NotSupportLogin,
+                "not support login"
+            ));
         }
         if (Utc::now().timestamp() - timestamp as i64).abs() > 120 {
             return Err(cmd_err!(ControlErrorCode::Expired, "login session expired"));
         }
 
         if user_name != credentials.user_name.as_ref().unwrap() {
-            return Err(cmd_err!(ControlErrorCode::InvalidUserName, "invalid user name"));
+            return Err(cmd_err!(
+                ControlErrorCode::InvalidUserName,
+                "invalid user name"
+            ));
         }
 
         let mut sha256 = sha2::Sha256::new();
-        sha256.update(format!("{}_{}_{}", user_name, credentials.password.as_ref().unwrap(), timestamp));
+        sha256.update(format!(
+            "{}_{}_{}",
+            user_name,
+            credentials.password.as_ref().unwrap(),
+            timestamp
+        ));
         if hex::encode(sha256.finalize()).to_lowercase() != password.to_lowercase() {
-            return Err(cmd_err!(ControlErrorCode::InvalidPassword, "invalid password"));
+            return Err(cmd_err!(
+                ControlErrorCode::InvalidPassword,
+                "invalid password"
+            ));
         }
 
         let (token, _) = RPCSessionToken::generate_jwt_token(
             user_name,
             "cyfs-gateway",
             None,
-            &self.token_encode_key, )
-            .map_err(into_cmd_err!(ControlErrorCode::CreateTokenFailed, "create token failed"))?;
+            &self.token_encode_key,
+        )
+        .map_err(into_cmd_err!(
+            ControlErrorCode::CreateTokenFailed,
+            "create token failed"
+        ))?;
         Ok(token)
     }
 }
@@ -3463,13 +3745,10 @@ impl<S: TokenKeyStore> CyfsTokenVerifier for LocalTokenManager<S> {
                 user_name,
                 "cyfs-gateway",
                 None,
-                &self.token_encode_key) {
-                Ok((token, _)) => {
-                    Ok(Some(token))
-                },
-                Err(_) => {
-                    Err(cmd_err!(ControlErrorCode::InvalidToken))
-                }
+                &self.token_encode_key,
+            ) {
+                Ok((token, _)) => Ok(Some(token)),
+                Err(_) => Err(cmd_err!(ControlErrorCode::InvalidToken)),
             }
         } else {
             Ok(None)
@@ -3479,12 +3758,12 @@ impl<S: TokenKeyStore> CyfsTokenVerifier for LocalTokenManager<S> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::gateway::*;
+    use chrono::Utc;
+    use kRPC::RPCSessionToken;
+    use serde_json::json;
     use std::io::{Read, Write};
     use std::path::PathBuf;
-    use super::super::gateway::*;
-    use kRPC::RPCSessionToken;
-    use chrono::Utc;
-    use serde_json::json;
     use tempfile::TempDir;
 
     pub struct TempKeyStore {
@@ -3511,13 +3790,15 @@ mod tests {
         async fn load_key(&self) -> ControlResult<(EncodingKey, DecodingKey)> {
             let mut private_key = self.private_key.lock().await;
             let mut content: String = String::new();
-            private_key.read_to_string(&mut content)
+            private_key
+                .read_to_string(&mut content)
                 .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
             let private_key = EncodingKey::from_ed_pem(content.as_bytes())
                 .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
             let mut public_key = self.public_key.lock().await;
             let mut content: String = String::new();
-            public_key.read_to_string(&mut content)
+            public_key
+                .read_to_string(&mut content)
                 .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
 
             let public_key: Jwk = serde_json::from_str(content.as_str())
@@ -3531,7 +3812,9 @@ mod tests {
             let mut private_key = self.private_key.lock().await;
             private_key.write_all(sign_key.as_bytes()).unwrap();
             let mut public_file = self.public_key.lock().await;
-            public_file.write_all(serde_json::to_string(&public_key).unwrap().as_bytes()).unwrap();
+            public_file
+                .write_all(serde_json::to_string(&public_key).unwrap().as_bytes())
+                .unwrap();
             Ok(())
         }
     }
@@ -3578,39 +3861,65 @@ mod tests {
             }
         });
 
-        let ret = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:hook_point:main:default", "new;");
+        let ret = Gateway::add_rule_to_config(
+            raw_config.clone(),
+            "stack:s1:hook_point:main:default",
+            "new;",
+        );
         assert!(ret.is_ok());
         let updated = ret.unwrap();
-        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default"].as_object().unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default"]
+            .as_object()
+            .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(2));
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
         println!("{}", block_str);
         assert_eq!(block_str, "new;\nold;");
 
-        let ret = Gateway::add_rule_to_config(raw_config.clone(), "stack:s2:hook_point:main", "new;");
-        assert!(ret.is_err());        
+        let ret =
+            Gateway::add_rule_to_config(raw_config.clone(), "stack:s2:hook_point:main", "new;");
+        assert!(ret.is_err());
         let ret = Gateway::add_rule_to_config(raw_config.clone(), "server:s2", "new;");
         assert!(ret.is_err());
 
-        let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:hook_point:main:default1", "new;").unwrap();
+        let updated = Gateway::add_rule_to_config(
+            raw_config.clone(),
+            "stack:s1:hook_point:main:default1",
+            "new;",
+        )
+        .unwrap();
 
-        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"].as_object().unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"]
+            .as_object()
+            .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(1));
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
 
-        let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main:default1", "new;").unwrap();
-        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"].as_object().unwrap();
+        let updated =
+            Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main:default1", "new;")
+                .unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"]
+            .as_object()
+            .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(1));
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
         assert_eq!(block_str, "new;");
 
-        let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main:blocks:default1", "new;").unwrap();
-        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"].as_object().unwrap();
+        let updated = Gateway::add_rule_to_config(
+            raw_config.clone(),
+            "stack:s1:main:blocks:default1",
+            "new;",
+        )
+        .unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"]
+            .as_object()
+            .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(1));
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
         assert_eq!(block_str, "new;");
 
-        let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main", "new;").unwrap();
+        let updated =
+            Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main", "new;").unwrap();
         let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].clone();
         let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
         let blocks = updated["stacks"]["s1"]["hook_point"].clone();
@@ -3648,37 +3957,51 @@ mod tests {
             }
         });
 
-        let updated = Gateway::add_rule_to_config(raw_config, "server:s1:post_hook_point:main:b2", "new;").unwrap();
+        let updated =
+            Gateway::add_rule_to_config(raw_config, "server:s1:post_hook_point:main:b2", "new;")
+                .unwrap();
         let content = updated["servers"]["s1"]["post_hook_point"]["main"]["blocks"]["b2"]["block"]
             .as_str()
             .unwrap();
         assert_eq!(content, "new;");
 
-        let updated = Gateway::append_rule_to_config(updated, "server:s1:post_hook_point:main:b2", "tail;").unwrap();
+        let updated =
+            Gateway::append_rule_to_config(updated, "server:s1:post_hook_point:main:b2", "tail;")
+                .unwrap();
         let content = updated["servers"]["s1"]["post_hook_point"]["main"]["blocks"]["b2"]["block"]
             .as_str()
             .unwrap();
         assert_eq!(content, "new;\ntail;");
 
-        let updated = Gateway::insert_rule_to_config(updated, "server:s1:post_hook_point:main:b2", 1, "head;").unwrap();
+        let updated = Gateway::insert_rule_to_config(
+            updated,
+            "server:s1:post_hook_point:main:b2",
+            1,
+            "head;",
+        )
+        .unwrap();
         let content = updated["servers"]["s1"]["post_hook_point"]["main"]["blocks"]["b2"]["block"]
             .as_str()
             .unwrap();
         assert_eq!(content, "head;\nnew;\ntail;");
 
-        let updated = Gateway::set_rule_in_config(updated, "server:s1:post_hook_point:main:b2", "replaced;").unwrap();
+        let updated =
+            Gateway::set_rule_in_config(updated, "server:s1:post_hook_point:main:b2", "replaced;")
+                .unwrap();
         let content = updated["servers"]["s1"]["post_hook_point"]["main"]["blocks"]["b2"]["block"]
             .as_str()
             .unwrap();
         assert_eq!(content, "replaced;");
 
-        let updated = Gateway::move_rule_in_config(updated, "server:s1:post_hook_point:main", 9).unwrap();
+        let updated =
+            Gateway::move_rule_in_config(updated, "server:s1:post_hook_point:main", 9).unwrap();
         let priority = updated["servers"]["s1"]["post_hook_point"]["main"]["priority"]
             .as_i64()
             .unwrap();
         assert_eq!(priority, 9);
 
-        let updated = Gateway::remove_rule_from_config(updated, "server:s1:post_hook_point:main:b2").unwrap();
+        let updated =
+            Gateway::remove_rule_from_config(updated, "server:s1:post_hook_point:main:b2").unwrap();
         assert!(updated["servers"]["s1"]["post_hook_point"]["main"]["blocks"]["b2"].is_null());
     }
 
@@ -3725,46 +4048,89 @@ mod tests {
         });
 
         // append into existing block
-        let updated = Gateway::append_rule_to_config(raw_config.clone(), "stack:s1:hook_point:main:b1", "new").unwrap();
-        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"].as_object().unwrap();
+        let updated = Gateway::append_rule_to_config(
+            raw_config.clone(),
+            "stack:s1:hook_point:main:b1",
+            "new",
+        )
+        .unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]
+            .as_object()
+            .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(2));
         let content = block.get("block").and_then(|v| v.as_str()).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert!(lines.ends_with(&["old1", "old2", "new"]));
 
-        let ret = Gateway::append_rule_to_config(raw_config.clone(), "stack:s2:hook_point:main", "new;");
+        let ret =
+            Gateway::append_rule_to_config(raw_config.clone(), "stack:s2:hook_point:main", "new;");
         assert!(ret.is_err());
         let ret = Gateway::append_rule_to_config(raw_config.clone(), "server:s2", "new;");
         assert!(ret.is_err());
 
         // append new block should get lowest priority (max+1)
-        let updated = Gateway::append_rule_to_config(raw_config.clone(), "stack:s1:hook_point:main:b2", "newblock").unwrap();
-        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].as_object().unwrap();
-        let p1 = blocks.get("b1").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()).unwrap();
-        let p2 = blocks.get("b2").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()).unwrap();
+        let updated = Gateway::append_rule_to_config(
+            raw_config.clone(),
+            "stack:s1:hook_point:main:b2",
+            "newblock",
+        )
+        .unwrap();
+        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]
+            .as_object()
+            .unwrap();
+        let p1 = blocks
+            .get("b1")
+            .and_then(|v| v.get("priority"))
+            .and_then(|v| v.as_i64())
+            .unwrap();
+        let p2 = blocks
+            .get("b2")
+            .and_then(|v| v.get("priority"))
+            .and_then(|v| v.as_i64())
+            .unwrap();
         assert!(p2 > p1);
 
-        let updated = Gateway::append_rule_to_config(raw_config.clone(), "stack:s1:hook_point:main:default1", "new;").unwrap();
+        let updated = Gateway::append_rule_to_config(
+            raw_config.clone(),
+            "stack:s1:hook_point:main:default1",
+            "new;",
+        )
+        .unwrap();
 
-        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"].as_object().unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"]
+            .as_object()
+            .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(3));
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
 
-        let updated = Gateway::append_rule_to_config(raw_config.clone(), "stack:s1:main:default1", "new;").unwrap();
-        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"].as_object().unwrap();
+        let updated =
+            Gateway::append_rule_to_config(raw_config.clone(), "stack:s1:main:default1", "new;")
+                .unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"]
+            .as_object()
+            .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(3));
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
         assert_eq!(block_str, "new;");
 
-        let updated = Gateway::append_rule_to_config(raw_config.clone(), "stack:s1:main:blocks:default1", "new;").unwrap();
-        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"].as_object().unwrap();
+        let updated = Gateway::append_rule_to_config(
+            raw_config.clone(),
+            "stack:s1:main:blocks:default1",
+            "new;",
+        )
+        .unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["default1"]
+            .as_object()
+            .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(3));
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
         assert_eq!(block_str, "new;");
 
-        let updated = Gateway::append_rule_to_config(raw_config.clone(), "stack:s1:main", "new;").unwrap();
+        let updated =
+            Gateway::append_rule_to_config(raw_config.clone(), "stack:s1:main", "new;").unwrap();
         let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].clone();
-        let updated = Gateway::append_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
+        let updated =
+            Gateway::append_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
         let blocks = updated["stacks"]["s1"]["hook_point"].clone();
     }
 
@@ -3791,21 +4157,46 @@ mod tests {
         });
 
         // insert inside existing block
-        let updated = Gateway::insert_rule_to_config(raw_config.clone(), "stack:s1:hook_point:main:b1", 2, "l2").unwrap();
-        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"].as_object().unwrap();
+        let updated = Gateway::insert_rule_to_config(
+            raw_config.clone(),
+            "stack:s1:hook_point:main:b1",
+            2,
+            "l2",
+        )
+        .unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]
+            .as_object()
+            .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(5));
-        let lines: Vec<&str> = block.get("block").and_then(|v| v.as_str()).unwrap().lines().collect();
+        let lines: Vec<&str> = block
+            .get("block")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .lines()
+            .collect();
         assert_eq!(lines, vec!["l1", "l2", "l3"]);
 
         // insert new block with given priority
-        let updated = Gateway::insert_rule_to_config(raw_config.clone(), "stack:s1:hook_point:main:b2", 10, "nb").unwrap();
-        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b2"].as_object().unwrap();
+        let updated = Gateway::insert_rule_to_config(
+            raw_config.clone(),
+            "stack:s1:hook_point:main:b2",
+            10,
+            "nb",
+        )
+        .unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b2"]
+            .as_object()
+            .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(10));
         assert_eq!(block.get("block").and_then(|v| v.as_str()), Some("nb"));
 
         // insert new chain and block with given priority
-        let updated = Gateway::insert_rule_to_config(raw_config.clone(), "stack:s1:new_chain", 7, "nc").unwrap();
-        let chain = updated["stacks"]["s1"]["hook_point"]["new_chain"].as_object().unwrap();
+        let updated =
+            Gateway::insert_rule_to_config(raw_config.clone(), "stack:s1:new_chain", 7, "nc")
+                .unwrap();
+        let chain = updated["stacks"]["s1"]["hook_point"]["new_chain"]
+            .as_object()
+            .unwrap();
         assert_eq!(chain.get("priority").and_then(|v| v.as_i64()), Some(7));
         let blocks = chain.get("blocks").and_then(|v| v.as_object()).unwrap();
         let b = blocks.values().next().unwrap().as_object().unwrap();
@@ -3849,27 +4240,72 @@ mod tests {
         });
 
         // move chain priority
-        let updated = Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:hook_point:other", 2).unwrap();
+        let updated =
+            Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:hook_point:other", 2)
+                .unwrap();
         let chains = updated["stacks"]["s1"]["hook_point"].as_object().unwrap();
-        assert_eq!(chains.get("other").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()), Some(2));
-        assert_eq!(chains.get("main").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()), Some(5));
+        assert_eq!(
+            chains
+                .get("other")
+                .and_then(|v| v.get("priority"))
+                .and_then(|v| v.as_i64()),
+            Some(2)
+        );
+        assert_eq!(
+            chains
+                .get("main")
+                .and_then(|v| v.get("priority"))
+                .and_then(|v| v.as_i64()),
+            Some(5)
+        );
 
-        let updated = Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:other", 2).unwrap();
+        let updated =
+            Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:other", 2).unwrap();
         let chains = updated["stacks"]["s1"]["hook_point"].as_object().unwrap();
-        assert_eq!(chains.get("other").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()), Some(2));
-        assert_eq!(chains.get("main").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()), Some(5));
+        assert_eq!(
+            chains
+                .get("other")
+                .and_then(|v| v.get("priority"))
+                .and_then(|v| v.as_i64()),
+            Some(2)
+        );
+        assert_eq!(
+            chains
+                .get("main")
+                .and_then(|v| v.get("priority"))
+                .and_then(|v| v.as_i64()),
+            Some(5)
+        );
 
         let updated = Gateway::move_rule_in_config(raw_config.clone(), "stack:2other", 2);
         assert!(updated.is_err());
 
         // move block priority
-        let updated = Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b2", -1).unwrap();
-        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].as_object().unwrap();
-        assert_eq!(blocks.get("b2").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()), Some(-1));
-        assert_eq!(blocks.get("b1").and_then(|v| v.get("priority")).and_then(|v| v.as_i64()), Some(10));
+        let updated =
+            Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b2", -1)
+                .unwrap();
+        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            blocks
+                .get("b2")
+                .and_then(|v| v.get("priority"))
+                .and_then(|v| v.as_i64()),
+            Some(-1)
+        );
+        assert_eq!(
+            blocks
+                .get("b1")
+                .and_then(|v| v.get("priority"))
+                .and_then(|v| v.as_i64()),
+            Some(10)
+        );
 
         // move single line to top, keep trailing newline
-        let updated = Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b1:3", 1).unwrap();
+        let updated =
+            Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b1:3", 1)
+                .unwrap();
         let content = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]["block"]
             .as_str()
             .unwrap()
@@ -3877,7 +4313,9 @@ mod tests {
         assert_eq!(content, "l3\nl1\nl2\nl4\n");
 
         // move multiple lines toward end
-        let updated = Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b1:1:2", 3).unwrap();
+        let updated =
+            Gateway::move_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b1:1:2", 3)
+                .unwrap();
         let content = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]["block"]
             .as_str()
             .unwrap()
@@ -3885,7 +4323,9 @@ mod tests {
         assert_eq!(content, "l3\nl4\nl1\nl2\n");
 
         // move multiple lines toward end
-        let updated = Gateway::move_rule_in_config(raw_config, "stack:s1:hook_point:main:b1:1:2", 30).unwrap();
+        let updated =
+            Gateway::move_rule_in_config(raw_config, "stack:s1:hook_point:main:b1:1:2", 30)
+                .unwrap();
         let content = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]["block"]
             .as_str()
             .unwrap()
@@ -3920,22 +4360,50 @@ mod tests {
         });
 
         // replace whole block content, priority unchanged
-        let updated = Gateway::set_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b1", "new_block").unwrap();
-        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"].as_object().unwrap();
+        let updated = Gateway::set_rule_in_config(
+            raw_config.clone(),
+            "stack:s1:hook_point:main:b1",
+            "new_block",
+        )
+        .unwrap();
+        let block = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]
+            .as_object()
+            .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(5));
-        assert_eq!(block.get("block").and_then(|v| v.as_str()), Some("new_block"));
-        assert_eq!(updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b2"]["block"].as_str(), Some("keep;"));
+        assert_eq!(
+            block.get("block").and_then(|v| v.as_str()),
+            Some("new_block")
+        );
+        assert_eq!(
+            updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b2"]["block"].as_str(),
+            Some("keep;")
+        );
 
         // replace chain rules with a single block, keep first block id and priority
-        let updated = Gateway::set_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main", "chain_new").unwrap();
-        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let updated = Gateway::set_rule_in_config(
+            raw_config.clone(),
+            "stack:s1:hook_point:main",
+            "chain_new",
+        )
+        .unwrap();
+        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]
+            .as_object()
+            .unwrap();
         assert_eq!(blocks.len(), 1);
         let block = blocks.get("b1").unwrap().as_object().unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(5));
-        assert_eq!(block.get("block").and_then(|v| v.as_str()), Some("chain_new"));
+        assert_eq!(
+            block.get("block").and_then(|v| v.as_str()),
+            Some("chain_new")
+        );
 
         // replace specific line range, preserve trailing newline
-        let updated = Gateway::set_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b1:2", "middle").unwrap();
+        let updated = Gateway::set_rule_in_config(
+            raw_config.clone(),
+            "stack:s1:hook_point:main:b1:2",
+            "middle",
+        )
+        .unwrap();
         let content = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]["block"]
             .as_str()
             .unwrap()
@@ -3943,7 +4411,12 @@ mod tests {
         assert_eq!(content, "a\nmiddle\nc\n");
 
         // replace multiple lines
-        let updated = Gateway::set_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b1:1:2", "x\ny").unwrap();
+        let updated = Gateway::set_rule_in_config(
+            raw_config.clone(),
+            "stack:s1:hook_point:main:b1:1:2",
+            "x\ny",
+        )
+        .unwrap();
         let content = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]["block"]
             .as_str()
             .unwrap()
@@ -3973,7 +4446,8 @@ mod tests {
             }
         });
 
-        let err = Gateway::set_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b1:0", "x");
+        let err =
+            Gateway::set_rule_in_config(raw_config.clone(), "stack:s1:hook_point:main:b1:0", "x");
         assert!(err.is_err());
         let err = Gateway::set_rule_in_config(raw_config, "stack:s1:hook_point:main:b1:5", "x");
         assert!(err.is_err());
@@ -4000,10 +4474,16 @@ mod tests {
             }
         });
 
-        let err = Gateway::set_rule_in_config(raw_config.clone(), "invalid:dns1:hook_point:main:default", "b;");
+        let err = Gateway::set_rule_in_config(
+            raw_config.clone(),
+            "invalid:dns1:hook_point:main:default",
+            "b;",
+        );
         assert!(err.is_err());
 
-        let updated = Gateway::set_rule_in_config(raw_config, "server:dns1:hook_point:main:default", "b;").unwrap();
+        let updated =
+            Gateway::set_rule_in_config(raw_config, "server:dns1:hook_point:main:default", "b;")
+                .unwrap();
         let block = updated["servers"]["dns1"]["hook_point"]["main"]["blocks"]["default"]
             .as_object()
             .unwrap();
@@ -4017,31 +4497,57 @@ mod tests {
         });
 
         // default protocol tcp, port only
-        let (updated, stack_id) = Gateway::add_dispatch_to_config(raw_config.clone(), "18080", "192.168.0.1:1900", None).unwrap();
+        let (updated, stack_id) =
+            Gateway::add_dispatch_to_config(raw_config.clone(), "18080", "192.168.0.1:1900", None)
+                .unwrap();
         assert_eq!(stack_id, "dispatch_tcp_0_0_0_0_18080");
         let stack = updated["stacks"][stack_id.as_str()].as_object().unwrap();
-        assert_eq!(stack.get("bind").and_then(|v| v.as_str()), Some("0.0.0.0:18080"));
+        assert_eq!(
+            stack.get("bind").and_then(|v| v.as_str()),
+            Some("0.0.0.0:18080")
+        );
         assert_eq!(stack.get("protocol").and_then(|v| v.as_str()), Some("tcp"));
-        let block = stack["hook_point"]["main"]["blocks"]["default"].as_object().unwrap();
+        let block = stack["hook_point"]["main"]["blocks"]["default"]
+            .as_object()
+            .unwrap();
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
         assert!(block_str.contains("tcp:///192.168.0.1:1900"));
 
         // udp with explicit ip
-        let (updated, stack_id_udp) = Gateway::add_dispatch_to_config(raw_config.clone(), "0.0.0.0:8080", "10.0.0.1:9000", Some("udp")).unwrap();
+        let (updated, stack_id_udp) = Gateway::add_dispatch_to_config(
+            raw_config.clone(),
+            "0.0.0.0:8080",
+            "10.0.0.1:9000",
+            Some("udp"),
+        )
+        .unwrap();
         assert_eq!(stack_id_udp, "dispatch_udp_0_0_0_0_8080");
-        let stack = updated["stacks"][stack_id_udp.as_str()].as_object().unwrap();
-        assert_eq!(stack.get("bind").and_then(|v| v.as_str()), Some("0.0.0.0:8080"));
+        let stack = updated["stacks"][stack_id_udp.as_str()]
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            stack.get("bind").and_then(|v| v.as_str()),
+            Some("0.0.0.0:8080")
+        );
         assert_eq!(stack.get("protocol").and_then(|v| v.as_str()), Some("udp"));
-        let block = stack["hook_point"]["main"]["blocks"]["default"].as_object().unwrap();
+        let block = stack["hook_point"]["main"]["blocks"]["default"]
+            .as_object()
+            .unwrap();
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
         assert!(block_str.contains("udp:///10.0.0.1:9000"));
 
         // duplicate add
-        let dup = Gateway::add_dispatch_to_config(updated.clone(), "0.0.0.0:8080", "10.0.0.1:9000", Some("udp"));
+        let dup = Gateway::add_dispatch_to_config(
+            updated.clone(),
+            "0.0.0.0:8080",
+            "10.0.0.1:9000",
+            Some("udp"),
+        );
         assert!(dup.is_err());
 
         // remove existing
-        let (removed, removed_id) = Gateway::remove_dispatch_from_config(updated, "0.0.0.0:8080", Some("udp")).unwrap();
+        let (removed, removed_id) =
+            Gateway::remove_dispatch_from_config(updated, "0.0.0.0:8080", Some("udp")).unwrap();
         assert_eq!(removed_id, "dispatch_udp_0_0_0_0_8080");
         assert!(removed["stacks"].get(removed_id).is_none());
 
@@ -4054,7 +4560,8 @@ mod tests {
         assert!(err.is_err());
 
         // invalid protocol
-        let err = Gateway::add_dispatch_to_config(raw_config, "18080", "192.168.0.1:1900", Some("http"));
+        let err =
+            Gateway::add_dispatch_to_config(raw_config, "18080", "192.168.0.1:1900", Some("http"));
         assert!(err.is_err());
     }
 
@@ -4065,151 +4572,321 @@ mod tests {
         });
 
         // create with generated server id, http target with trailing slash
-        let (updated, sid, _) = Gateway::add_router_to_config(raw_config.clone(), None, "/sn", "http://127.0.0.1:9000/").unwrap();
+        let (updated, sid, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            None,
+            "/sn",
+            "http://127.0.0.1:9000/",
+        )
+        .unwrap();
         assert!(sid.starts_with("router_"));
         let server = updated["servers"][sid.as_str()].as_object().unwrap();
         assert_eq!(server.get("type").and_then(|v| v.as_str()), Some("http"));
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
         assert_eq!(blocks.len(), 1);
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
-        assert_eq!(rule, r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "*" && forward "http://127.0.0.1:9000";"#);
+        assert_eq!(
+            rule,
+            r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "*" && forward "http://127.0.0.1:9000";"#
+        );
 
-        let (updated, removed_id) = Gateway::remove_router_from_config(updated, Some(sid.as_str()), "/sn", "http://127.0.0.1:9000/").unwrap();
+        let (updated, removed_id) = Gateway::remove_router_from_config(
+            updated,
+            Some(sid.as_str()),
+            "/sn",
+            "http://127.0.0.1:9000/",
+        )
+        .unwrap();
         assert_eq!(removed_id, sid);
         assert!(updated["servers"].get(&removed_id).is_none());
 
-        let (updated, sid, _) = Gateway::add_router_to_config(raw_config.clone(), None, "/sn/", "http://127.0.0.1:9000/").unwrap();
+        let (updated, sid, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            None,
+            "/sn/",
+            "http://127.0.0.1:9000/",
+        )
+        .unwrap();
         assert!(sid.starts_with("router_"));
         let server = updated["servers"][sid.as_str()].as_object().unwrap();
         assert_eq!(server.get("type").and_then(|v| v.as_str()), Some("http"));
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
         assert_eq!(blocks.len(), 1);
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
-        assert_eq!(rule, r#"starts-with ${REQ.path} "/sn/" && rewrite ${REQ.path} "/sn/*" "/*" && forward "http://127.0.0.1:9000";"#);
+        assert_eq!(
+            rule,
+            r#"starts-with ${REQ.path} "/sn/" && rewrite ${REQ.path} "/sn/*" "/*" && forward "http://127.0.0.1:9000";"#
+        );
 
-        let (updated, sid, _) = Gateway::add_router_to_config(raw_config.clone(), None, "/sn/*", "http://127.0.0.1:9000/").unwrap();
+        let (updated, sid, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            None,
+            "/sn/*",
+            "http://127.0.0.1:9000/",
+        )
+        .unwrap();
         assert!(sid.starts_with("router_"));
         let server = updated["servers"][sid.as_str()].as_object().unwrap();
         assert_eq!(server.get("type").and_then(|v| v.as_str()), Some("http"));
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
         assert_eq!(blocks.len(), 1);
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
-        assert_eq!(rule, r#"match ${REQ.path} "/sn/*" && rewrite ${REQ.path} "/sn/*" "/*" && forward "http://127.0.0.1:9000";"#);
+        assert_eq!(
+            rule,
+            r#"match ${REQ.path} "/sn/*" && rewrite ${REQ.path} "/sn/*" "/*" && forward "http://127.0.0.1:9000";"#
+        );
 
-        let (updated, sid, _) = Gateway::add_router_to_config(raw_config.clone(), None, "/sn/*", "http://127.0.0.1:9000/api/").unwrap();
+        let (updated, sid, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            None,
+            "/sn/*",
+            "http://127.0.0.1:9000/api/",
+        )
+        .unwrap();
         assert!(sid.starts_with("router_"));
         let server = updated["servers"][sid.as_str()].as_object().unwrap();
         assert_eq!(server.get("type").and_then(|v| v.as_str()), Some("http"));
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
         assert_eq!(blocks.len(), 1);
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
-        assert_eq!(rule, r#"match ${REQ.path} "/sn/*" && rewrite ${REQ.path} "/sn/*" "/api/*" && forward "http://127.0.0.1:9000";"#);
+        assert_eq!(
+            rule,
+            r#"match ${REQ.path} "/sn/*" && rewrite ${REQ.path} "/sn/*" "/api/*" && forward "http://127.0.0.1:9000";"#
+        );
 
-
-        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "http://127.0.0.1:9000/$1").unwrap();
+        let (updated, sid2, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            Some("router_test"),
+            "~^/static/(.*)$",
+            "http://127.0.0.1:9000/$1",
+        )
+        .unwrap();
         assert_eq!(sid2, "router_test");
         let server = updated["servers"][sid2.as_str()].as_object().unwrap();
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
         assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "^/static/(.*)$" "/$1" && forward "http://127.0.0.1:9000";"#));
 
-        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "http://127.0.0.1:9000/api/$1").unwrap();
+        let (updated, sid2, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            Some("router_test"),
+            "~^/static/(.*)$",
+            "http://127.0.0.1:9000/api/$1",
+        )
+        .unwrap();
         assert_eq!(sid2, "router_test");
         let server = updated["servers"][sid2.as_str()].as_object().unwrap();
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
         assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "^/static/(.*)$" "/api/$1" && forward "http://127.0.0.1:9000";"#));
 
-        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "http://127.0.0.1:9000/api/").unwrap();
+        let (updated, sid2, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            Some("router_test"),
+            "~^/static/(.*)$",
+            "http://127.0.0.1:9000/api/",
+        )
+        .unwrap();
         assert_eq!(sid2, "router_test");
         let server = updated["servers"][sid2.as_str()].as_object().unwrap();
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
-        assert_eq!(rule, r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "/*" "/api/*" && forward "http://127.0.0.1:9000";"#);
+        assert_eq!(
+            rule,
+            r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "/*" "/api/*" && forward "http://127.0.0.1:9000";"#
+        );
 
-        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "http://127.0.0.1:9000").unwrap();
+        let (updated, sid2, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            Some("router_test"),
+            "~^/static/(.*)$",
+            "http://127.0.0.1:9000",
+        )
+        .unwrap();
         assert_eq!(sid2, "router_test");
         let server = updated["servers"][sid2.as_str()].as_object().unwrap();
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
-        assert_eq!(rule, r#"match-reg ${REQ.path} "^/static/(.*)$" && forward "http://127.0.0.1:9000";"#);
+        assert_eq!(
+            rule,
+            r#"match-reg ${REQ.path} "^/static/(.*)$" && forward "http://127.0.0.1:9000";"#
+        );
 
         // create with local dir target and explicit server id
-        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "/static/*", "/www/").unwrap();
+        let (updated, sid2, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            Some("router_test"),
+            "/static/*",
+            "/www/",
+        )
+        .unwrap();
         assert_eq!(sid2, "router_test");
         let server = updated["servers"][sid2.as_str()].as_object().unwrap();
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
         assert!(rule.starts_with(r#"match ${REQ.path} "/static/*" && rewrite ${REQ.path} "/static/*" "/*" && call-server"#));
         // dir server created
-        assert!(updated["servers"].as_object().unwrap().keys().any(|k| k.starts_with("router_dir_")));
+        assert!(updated["servers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|k| k.starts_with("router_dir_")));
 
-        let (updated, removed_id) = Gateway::remove_router_from_config(updated, Some("router_test"), "/static/*", "/www/").unwrap();
+        let (updated, removed_id) =
+            Gateway::remove_router_from_config(updated, Some("router_test"), "/static/*", "/www/")
+                .unwrap();
         let servers = updated["servers"].as_object().unwrap();
         let server = servers.get(&removed_id);
         assert!(server.is_none());
 
         // create with local dir target and explicit server id
-        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "/static/", "/www/").unwrap();
+        let (updated, sid2, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            Some("router_test"),
+            "/static/",
+            "/www/",
+        )
+        .unwrap();
         assert_eq!(sid2, "router_test");
         let server = updated["servers"][sid2.as_str()].as_object().unwrap();
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
         assert!(rule.starts_with(r#"starts-with ${REQ.path} "/static/" && rewrite ${REQ.path} "/static/*" "/*" && call-server"#));
 
-        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "/static/", "/www").unwrap();
+        let (updated, sid2, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            Some("router_test"),
+            "/static/",
+            "/www",
+        )
+        .unwrap();
         assert_eq!(sid2, "router_test");
         let server = updated["servers"][sid2.as_str()].as_object().unwrap();
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
         println!("{}", serde_json::to_string_pretty(&updated).unwrap());
         assert!(rule.starts_with(r#"starts-with ${REQ.path} "/static/" && call-server"#));
 
         // create with local dir target and explicit server id
-        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "/static", "/www/").unwrap();
+        let (updated, sid2, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            Some("router_test"),
+            "/static",
+            "/www/",
+        )
+        .unwrap();
         assert_eq!(sid2, "router_test");
         let server = updated["servers"][sid2.as_str()].as_object().unwrap();
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
         assert!(rule.starts_with(r#"starts-with ${REQ.path} "/static" && rewrite ${REQ.path} "/static*" "*" && call-server"#));
 
-        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "/static", "/www").unwrap();
+        let (updated, sid2, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            Some("router_test"),
+            "/static",
+            "/www",
+        )
+        .unwrap();
         assert_eq!(sid2, "router_test");
         let server = updated["servers"][sid2.as_str()].as_object().unwrap();
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
         assert!(rule.starts_with(r#"starts-with ${REQ.path} "/static" && call-server"#));
 
-        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "/www/$1").unwrap();
+        let (updated, sid2, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            Some("router_test"),
+            "~^/static/(.*)$",
+            "/www/$1",
+        )
+        .unwrap();
         assert_eq!(sid2, "router_test");
         let server = updated["servers"][sid2.as_str()].as_object().unwrap();
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
         assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && rewrite ${REQ.path} "^/static/(.*)$" "/$1" && call-server"#));
-        let (updated, removed_id) = Gateway::remove_router_from_config(updated, Some("router_test"), "~^/static/(.*)$", "/www/$1").unwrap();
+        let (updated, removed_id) = Gateway::remove_router_from_config(
+            updated,
+            Some("router_test"),
+            "~^/static/(.*)$",
+            "/www/$1",
+        )
+        .unwrap();
         let servers = updated["servers"].as_object().unwrap();
         let server = servers.get(&removed_id);
         assert!(server.is_none());
 
-        let (updated, sid2, _) = Gateway::add_router_to_config(raw_config.clone(), Some("router_test"), "~^/static/(.*)$", "/www/").unwrap();
+        let (updated, sid2, _) = Gateway::add_router_to_config(
+            raw_config.clone(),
+            Some("router_test"),
+            "~^/static/(.*)$",
+            "/www/",
+        )
+        .unwrap();
         assert_eq!(sid2, "router_test");
         let server = updated["servers"][sid2.as_str()].as_object().unwrap();
         let blocks = server["hook_point"]["main"]["blocks"].as_object().unwrap();
-        let rule = blocks.values().next().unwrap()["block"].as_str().unwrap().to_string();
+        let rule = blocks.values().next().unwrap()["block"]
+            .as_str()
+            .unwrap()
+            .to_string();
         println!("{}", rule);
         assert!(rule.starts_with(r#"match-reg ${REQ.path} "^/static/(.*)$" && call-server"#));
     }
@@ -4254,13 +4931,18 @@ mod tests {
         });
 
         // remove a specific block
-        let updated = Gateway::remove_rule_from_config(raw_config.clone(), "stack:s1:hook_point:main:b1").unwrap();
-        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].as_object().unwrap();
+        let updated =
+            Gateway::remove_rule_from_config(raw_config.clone(), "stack:s1:hook_point:main:b1")
+                .unwrap();
+        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]
+            .as_object()
+            .unwrap();
         assert!(!blocks.contains_key("b1"));
         assert!(blocks.contains_key("b2"));
 
         // remove last block should drop chain
-        let updated = Gateway::remove_rule_from_config(updated, "stack:s1:hook_point:main:b2").unwrap();
+        let updated =
+            Gateway::remove_rule_from_config(updated, "stack:s1:hook_point:main:b2").unwrap();
         assert!(updated["stacks"]["s1"]["hook_point"].get("main").is_none());
 
         // single chain/block guard
@@ -4314,7 +4996,9 @@ mod tests {
         });
 
         // remove middle line
-        let updated = Gateway::remove_rule_from_config(raw_config.clone(), "stack:s1:hook_point:main:b1:2").unwrap();
+        let updated =
+            Gateway::remove_rule_from_config(raw_config.clone(), "stack:s1:hook_point:main:b1:2")
+                .unwrap();
         let content = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]["b1"]["block"]
             .as_str()
             .unwrap()
@@ -4324,7 +5008,8 @@ mod tests {
         assert!(!content.contains("line2"));
 
         // remove remaining lines, block should be removed but chain stays because b2 exists
-        let updated = Gateway::remove_rule_from_config(updated, "stack:s1:hook_point:main:b1:1:2").unwrap();
+        let updated =
+            Gateway::remove_rule_from_config(updated, "stack:s1:hook_point:main:b1:1:2").unwrap();
         let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]
             .as_object()
             .unwrap();
@@ -4340,7 +5025,8 @@ mod tests {
         let user_name = "test_user".to_string();
         let password = "test_password".to_string();
         let store = TempKeyStore::new();
-        let manager = LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
+        let manager =
+            LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
         assert!(manager.is_ok());
         let manager = manager.unwrap();
 
@@ -4359,7 +5045,8 @@ mod tests {
         let user_name = "test_user".to_string();
         let password = "test_password".to_string();
         let store = TempKeyStore::new();
-        let manager = LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
+        let manager =
+            LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
         assert!(manager.is_ok());
         let manager = manager.unwrap();
 
@@ -4379,7 +5066,8 @@ mod tests {
         let user_name = "test_user".to_string();
         let password = "test_password".to_string();
         let store = TempKeyStore::new();
-        let manager = LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
+        let manager =
+            LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
         assert!(manager.is_ok());
         let manager = manager.unwrap();
 
@@ -4388,7 +5076,9 @@ mod tests {
         sha256.update(format!("{}_{}_{}", "wrong_user", password, timestamp));
         let password_hash = hex::encode(sha256.finalize()).to_lowercase();
 
-        let result = manager.create("wrong_user", &password_hash, timestamp).await;
+        let result = manager
+            .create("wrong_user", &password_hash, timestamp)
+            .await;
         assert!(result.is_err());
         let error = result.err().unwrap();
         assert_eq!(error.code(), ControlErrorCode::InvalidUserName);
@@ -4399,7 +5089,8 @@ mod tests {
         let user_name = "test_user".to_string();
         let password = "test_password".to_string();
         let store = TempKeyStore::new();
-        let manager = LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
+        let manager =
+            LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
         assert!(manager.is_ok());
         let manager = manager.unwrap();
 
@@ -4419,7 +5110,8 @@ mod tests {
         let user_name = "test_user".to_string();
         let password = "test_password".to_string();
         let store = TempKeyStore::new();
-        let manager = LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
+        let manager =
+            LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
         assert!(manager.is_ok());
         let manager = manager.unwrap();
 
@@ -4428,7 +5120,10 @@ mod tests {
         sha256.update(format!("{}_{}_{}", user_name, password, timestamp));
         let password_hash = hex::encode(sha256.finalize()).to_lowercase();
 
-        let token = manager.create(&user_name, &password_hash, timestamp).await.unwrap();
+        let token = manager
+            .create(&user_name, &password_hash, timestamp)
+            .await
+            .unwrap();
         let result = manager.verify_and_renew(&token).await;
 
         assert!(result.is_ok());
@@ -4441,7 +5136,8 @@ mod tests {
         let user_name = "test_user".to_string();
         let password = "test_password".to_string();
         let store = TempKeyStore::new();
-        let manager = LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
+        let manager =
+            LocalTokenManager::new(Some(user_name.clone()), Some(password.clone()), store).await;
         assert!(manager.is_ok());
         let manager = manager.unwrap();
 

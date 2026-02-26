@@ -677,6 +677,15 @@ impl ProcessChainHttpServer {
                     .await
                     .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
             }
+            if let Some(source_online_secs) = info.source_online_secs.as_ref() {
+                global_env
+                    .create(
+                        "REQ_source_online_secs",
+                        CollectionValue::String(source_online_secs.to_string()),
+                    )
+                    .await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+            }
         }
         resp_map
             .register_visitors(&global_env)
@@ -809,6 +818,15 @@ impl HttpServer for ProcessChainHttpServer {
                 .create(
                     "REQ_source_hostname",
                     CollectionValue::String(source_hostname.to_string()),
+                )
+                .await
+                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+        }
+        if let Some(source_online_secs) = info.source_online_secs.as_ref() {
+            global_env
+                .create(
+                    "REQ_source_online_secs",
+                    CollectionValue::String(source_online_secs.to_string()),
                 )
                 .await
                 .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;

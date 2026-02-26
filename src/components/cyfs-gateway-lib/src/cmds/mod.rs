@@ -1,6 +1,7 @@
 mod error;
 mod forward;
 mod in_time_range;
+mod num_cmp;
 mod proxy_protocol_probe;
 mod redirect;
 mod set_limit;
@@ -12,6 +13,7 @@ use cyfs_process_chain::{ExternalCommand, ExternalCommandRef, HttpProbeCommand, 
 pub use error::*;
 pub use forward::*;
 pub use in_time_range::*;
+pub use num_cmp::*;
 pub use proxy_protocol_probe::*;
 pub use redirect::*;
 pub use set_limit::*;
@@ -58,6 +60,10 @@ pub fn get_external_commands(server_manager: ServerManagerWeakRef) -> Vec<(Strin
     let in_time_range_command = InTimeRange::new();
     let name = in_time_range_command.name().to_owned();
     cmds.push((name, Arc::new(Box::new(in_time_range_command) as Box<dyn ExternalCommand>)));
+
+    let num_cmp_command = NumCmp::new();
+    let name = num_cmp_command.name().to_owned();
+    cmds.push((name, Arc::new(Box::new(num_cmp_command) as Box<dyn ExternalCommand>)));
 
     let server_command = CallServer::new();
     let name = server_command.name().to_owned();

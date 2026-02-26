@@ -1,11 +1,11 @@
+use crate::{DeviceInfo, DeviceManagerRef, StackErrorCode, StackProtocol, StackResult, stack_err};
+use cyfs_process_chain::*;
+use sfo_io::{SfoSpeedStat, SpeedStat, SpeedTracker};
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::AtomicU64;
-use sfo_io::{SfoSpeedStat, SpeedStat, SpeedTracker};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::task::{AbortHandle, JoinHandle};
-use cyfs_process_chain::*;
-use crate::{stack_err, DeviceInfo, DeviceManagerRef, StackErrorCode, StackProtocol, StackResult};
 
 pub type SpeedStatRef = Arc<dyn SpeedStat>;
 pub type SpeedTrackerRef = Arc<dyn SpeedTracker>;
@@ -44,11 +44,13 @@ impl sfo_io::SpeedStat for NoSpeedStat {
 
 impl sfo_io::SpeedTracker for NoSpeedStat {
     fn add_write_data_size(&self, size: u64) {
-        self.write_stat.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        self.write_stat
+            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn add_read_data_size(&self, size: u64) {
-        self.read_stat.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        self.read_stat
+            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -87,7 +89,10 @@ impl StatManager {
     }
 
     pub fn new_speed_stat(&self, id: &str, speed_stat: SpeedTrackerRef) {
-        self.speed_stats.write().unwrap().insert(id.to_string(), speed_stat);
+        self.speed_stats
+            .write()
+            .unwrap()
+            .insert(id.to_string(), speed_stat);
     }
 }
 
@@ -197,18 +202,20 @@ impl sfo_io::SpeedTracker for ComposedSpeedStat {
     }
 }
 
-
 pub async fn get_stat_info(chain_env: EnvRef) -> StackResult<Vec<String>> {
-    let stat = chain_env.get("STAT").await.map_err(
-        |e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+    let stat = chain_env
+        .get("STAT")
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
 
     match stat {
         Some(CollectionValue::Set(set)) => {
-            let stat_ids = set.get_all().await.map_err(
-                |e| stack_err!(StackErrorCode::ProcessChainError, "{e}")
-            )?;
+            let stat_ids = set
+                .get_all()
+                .await
+                .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
             Ok(stat_ids)
-        },
+        }
         _ => Ok(vec![]),
     }
 }
@@ -382,11 +389,9 @@ impl ConnectionManager {
             let removed_ip = {
                 let mut connections = this.connections.lock().unwrap();
                 match connections.get(&connection_id) {
-                    Some(current) if Arc::ptr_eq(current, &info) => {
-                        connections
-                            .remove(&connection_id)
-                            .and_then(|old| parse_source_ip(old.source()))
-                    }
+                    Some(current) if Arc::ptr_eq(current, &info) => connections
+                        .remove(&connection_id)
+                        .and_then(|old| parse_source_ip(old.source())),
                     _ => None,
                 }
             };
@@ -438,10 +443,23 @@ fn parse_source_ip(source: &str) -> Option<IpAddr> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::DeviceManager;
+    use crate::{DeviceManager, DeviceOnlineStoreRef, SqliteDeviceOnlineStore};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio;
+
+    async fn new_test_store() -> DeviceOnlineStoreRef {
+        let db_path = std::env::temp_dir().join(format!(
+            "cyfs_gateway_device_online_conn_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|v| v.as_nanos())
+                .unwrap_or(0)
+        ));
+        let store = SqliteDeviceOnlineStore::new(db_path).await.unwrap();
+        Arc::new(store)
+    }
 
     pub struct MockSpeedStat {
         write_speed: AtomicU64,
@@ -495,14 +513,23 @@ mod tests {
         });
 
         let controller = HandleConnectionController::new(handle);
-        let connection_info = ConnectionInfo::new(source.to_string(), destination.to_string(), protocol, speed, controller);
+        let connection_info = ConnectionInfo::new(
+            source.to_string(),
+            destination.to_string(),
+            protocol,
+            speed,
+            controller,
+        );
 
         assert_eq!(connection_info.source(), source.to_string());
         assert_eq!(connection_info.destination(), destination.to_string());
         assert_eq!(connection_info.protocol(), StackProtocol::Tcp);
         assert_eq!(connection_info.get_upload_speed(), 100);
         assert_eq!(connection_info.get_download_speed(), 200);
-        assert_eq!(connection_info.connection_id(), "127.0.0.1:8080 -> 127.0.0.1:9090");
+        assert_eq!(
+            connection_info.connection_id(),
+            "127.0.0.1:8080 -> 127.0.0.1:9090"
+        );
     }
 
     #[tokio::test]
@@ -517,7 +544,13 @@ mod tests {
         });
 
         let controller = HandleConnectionController::new(handle);
-        let connection_info = ConnectionInfo::new(source.to_string(), destination.to_string(), protocol, speed, controller);
+        let connection_info = ConnectionInfo::new(
+            source.to_string(),
+            destination.to_string(),
+            protocol,
+            speed,
+            controller,
+        );
         let connection_id = connection_info.connection_id();
 
         manager.add_connection(connection_info);
@@ -548,8 +581,20 @@ mod tests {
 
         let controller1 = HandleConnectionController::new(handle1);
         let controller2 = HandleConnectionController::new(handle2);
-        let connection_info1 = ConnectionInfo::new(source1.to_string(), destination1.to_string(), protocol1, speed1, controller1);
-        let connection_info2 = ConnectionInfo::new(source2.to_string(), destination2.to_string(), protocol2, speed2, controller2);
+        let connection_info1 = ConnectionInfo::new(
+            source1.to_string(),
+            destination1.to_string(),
+            protocol1,
+            speed1,
+            controller1,
+        );
+        let connection_info2 = ConnectionInfo::new(
+            source2.to_string(),
+            destination2.to_string(),
+            protocol2,
+            speed2,
+            controller2,
+        );
 
         manager.add_connection(connection_info1);
         manager.add_connection(connection_info2);
@@ -571,7 +616,13 @@ mod tests {
         });
 
         let controller = HandleConnectionController::new(handle);
-        let connection_info = ConnectionInfo::new(source.to_string(), destination.to_string(), protocol, speed, controller);
+        let connection_info = ConnectionInfo::new(
+            source.to_string(),
+            destination.to_string(),
+            protocol,
+            speed,
+            controller,
+        );
         assert!(!connection_info.is_aborted());
 
         connection_info.stop_connection();
@@ -593,7 +644,13 @@ mod tests {
         });
 
         let controller = HandleConnectionController::new(handle);
-        let connection_info = ConnectionInfo::new(source.to_string(), destination.to_string(), protocol, speed, controller);
+        let connection_info = ConnectionInfo::new(
+            source.to_string(),
+            destination.to_string(),
+            protocol,
+            speed,
+            controller,
+        );
         let connection_id = connection_info.connection_id();
 
         manager.add_connection(connection_info);
@@ -613,9 +670,11 @@ mod tests {
     async fn test_set_device_manager_keeps_current_devices() {
         let manager = ConnectionManager::new();
         let first_device_manager = DeviceManager::new(
+            new_test_store().await,
             tokio::time::Duration::from_secs(60),
             tokio::time::Duration::from_secs(60),
-        );
+        )
+        .await;
         manager.set_device_manager(first_device_manager);
 
         let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 10, 10, 10)), 8080);
@@ -638,9 +697,11 @@ mod tests {
         assert_eq!(manager.get_all_connection_device_info().len(), 1);
 
         let second_device_manager = DeviceManager::new(
+            new_test_store().await,
             tokio::time::Duration::from_secs(60),
             tokio::time::Duration::from_secs(60),
-        );
+        )
+        .await;
         manager.set_device_manager(second_device_manager);
 
         let devices = manager.get_all_connection_device_info();

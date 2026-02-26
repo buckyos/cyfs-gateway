@@ -141,6 +141,7 @@ impl TcpConnectionHandler {
         {
             request.source_mac = device_info.mac().map(|v| v.to_string());
             request.source_hostname = device_info.hostname().map(|v| v.to_string());
+            request.source_online_secs = Some(device_info.today_online_seconds().to_string());
         }
         let global_env = executor.global_env().clone();
         let (ret, stream) = execute_stream_chain(executor, request)
@@ -159,6 +160,7 @@ impl TcpConnectionHandler {
             stream_info = stream_info.with_device_info(
                 device_info.mac().map(|v| v.to_string()),
                 device_info.hostname().map(|v| v.to_string()),
+                Some(device_info.today_online_seconds().to_string()),
             );
         }
         if ret.is_control() {
