@@ -2298,6 +2298,7 @@ mod tests {
                 real_src_addr: None,
                 source_mac: None,
                 source_hostname: None,
+                source_online_secs: None,
             }).await.unwrap();
         });
 
