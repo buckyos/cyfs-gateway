@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use cyfs_process_chain::{CollectionValue, EnvRef, MapCollectionRef, MemoryMapCollection, MemorySetCollection, SetCollectionRef};
-use crate::{config_err, ConfigErrorCode, ConfigResult, JsonMap, JsonSet, SqliteMap, SqliteSet, TextSet};
+use crate::{config_err, ConfigErrorCode, ConfigResult, IpRegionMap, IpRegionMapConfig, JsonMap, JsonSet, SqliteMap, SqliteSet, TextSet};
 
 #[derive(Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CollectionType {
@@ -20,6 +21,8 @@ pub enum CollectionType {
     JsonMap,
     #[serde(rename = "sqlite_map")]
     SqliteMap,
+    #[serde(rename = "ip_region_map")]
+    IpRegionMap,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -54,6 +57,51 @@ pub struct GlobalCollectionManager {
 pub type GlobalCollectionManagerRef = Arc<GlobalCollectionManager>;
 
 impl GlobalCollectionManager {
+    fn parse_ip_region_data(data: Option<&serde_json::Value>) -> ConfigResult<(Option<String>, Option<String>, Option<u64>, Option<u64>, Option<String>, Option<String>, PathBuf)> {
+        let Some(data) = data else {
+            return Err(config_err!(ConfigErrorCode::InvalidConfig, "ip_region_map requires data.cache_path"));
+        };
+
+        let read_string = |key: &str| -> ConfigResult<Option<String>> {
+            match data.get(key) {
+                Some(value) if value.is_string() => Ok(value.as_str().map(|v| v.to_string())),
+                Some(_) => Err(config_err!(
+                    ConfigErrorCode::InvalidConfig,
+                    "{} in ip_region_map.data must be string",
+                    key
+                )),
+                None => Ok(None),
+            }
+        };
+
+        let read_u64 = |key: &str| -> ConfigResult<Option<u64>> {
+            match data.get(key) {
+                Some(value) if value.is_u64() => Ok(value.as_u64()),
+                Some(_) => Err(config_err!(
+                    ConfigErrorCode::InvalidConfig,
+                    "{} in ip_region_map.data must be unsigned integer",
+                    key
+                )),
+                None => Ok(None),
+            }
+        };
+
+        let cache_path = read_string("cache_path")?.ok_or(config_err!(
+            ConfigErrorCode::InvalidConfig,
+            "cache_path in ip_region_map.data is required"
+        ))?;
+
+        Ok((
+            read_string("ipv6_file_path")?,
+            read_string("cache_policy")?,
+            read_u64("auto_update_interval_secs")?,
+            read_u64("request_timeout_secs")?,
+            read_string("ipv4_sha256")?,
+            read_string("ipv6_sha256")?,
+            PathBuf::from(cache_path),
+        ))
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(GlobalCollectionManager {
             sets: HashMap::new(),
@@ -153,6 +201,29 @@ impl GlobalCollectionManager {
                 }
                 CollectionType::MemoryMap => {
                     let map: MapCollectionRef = Arc::new(Box::new(MemoryMapCollection::new()));
+                    maps.insert(config.name, map);
+                }
+                CollectionType::IpRegionMap => {
+                    if config.file_path.is_none() {
+                        return Err(config_err!(ConfigErrorCode::InvalidConfig, "file_path is required for ip_region_map"));
+                    }
+                    let (ipv6_file_path, cache_policy, auto_update_interval_secs, request_timeout_secs, ipv4_sha256, ipv6_sha256, cache_path) =
+                        Self::parse_ip_region_data(config.data.as_ref())?;
+
+                    let map: MapCollectionRef = Arc::new(Box::new(
+                        IpRegionMap::load_from(IpRegionMapConfig {
+                            ipv4_file_path: config.file_path.unwrap(),
+                            ipv6_file_path,
+                            cache_policy,
+                            auto_update_interval_secs,
+                            request_timeout_secs,
+                            ipv4_sha256,
+                            ipv6_sha256,
+                            cache_dir: cache_path,
+                        })
+                        .await
+                        .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{}", e))?,
+                    ));
                     maps.insert(config.name, map);
                 }
             }
@@ -258,6 +329,29 @@ impl GlobalCollectionManager {
                         let map: MapCollectionRef = Arc::new(Box::new(MemoryMapCollection::new()));
                         self.add_map(config.name, map);
                     }
+                }
+                CollectionType::IpRegionMap => {
+                    if config.file_path.is_none() {
+                        return Err(config_err!(ConfigErrorCode::InvalidConfig, "file_path is required for ip_region_map"));
+                    }
+                    let (ipv6_file_path, cache_policy, auto_update_interval_secs, request_timeout_secs, ipv4_sha256, ipv6_sha256, cache_path) =
+                        Self::parse_ip_region_data(config.data.as_ref())?;
+
+                    let map: MapCollectionRef = Arc::new(Box::new(
+                        IpRegionMap::load_from(IpRegionMapConfig {
+                            ipv4_file_path: config.file_path.unwrap(),
+                            ipv6_file_path,
+                            cache_policy,
+                            auto_update_interval_secs,
+                            request_timeout_secs,
+                            ipv4_sha256,
+                            ipv6_sha256,
+                            cache_dir: cache_path,
+                        })
+                        .await
+                        .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{}", e))?,
+                    ));
+                    self.add_map(config.name, map);
                 }
             }
         }

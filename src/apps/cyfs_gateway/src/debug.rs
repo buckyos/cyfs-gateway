@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex, Weak};
 use anyhow::{Result, anyhow};
 use buckyos_kit::AsyncStream;
 use cyfs_gateway_lib::{
-    CollectionConfig,
     GlobalCollectionManager, GlobalCollectionManagerRef, GlobalProcessChains,
     GlobalProcessChainsRef, JsExternalsManager, JsExternalsManagerRef, ProcessChainConfig,
     ProcessChainConfigs, create_process_chain_executor, get_external_commands,
@@ -16,6 +15,7 @@ use cyfs_process_chain::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use crate::config_loader::parse_collections_from_raw_config;
 use crate::{get_default_config_path, load_config_from_file, set_gateway_main_config_dir};
 
 async fn build_js_externals_from_raw_config(
@@ -63,14 +63,6 @@ async fn build_global_process_chains_from_config(
         global_process_chains.add_process_chain(Arc::new(process_chain))?;
     }
     Ok(Arc::new(global_process_chains))
-}
-
-fn parse_collections_from_raw_config(raw_config: &Value) -> Result<Vec<CollectionConfig>> {
-    let Some(collections) = raw_config.get("collections") else {
-        return Ok(vec![]);
-    };
-    serde_json::from_value(collections.clone())
-        .map_err(|e| anyhow!("invalid collections config: {}", e))
 }
 
 fn parse_global_process_chains_from_raw_config(raw_config: &Value) -> Result<ProcessChainConfigs> {

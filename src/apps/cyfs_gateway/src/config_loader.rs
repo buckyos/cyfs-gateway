@@ -1,3 +1,4 @@
+use buckyos_kit::get_buckyos_service_data_dir;
 use cyfs_dns::{DnsServerConfig, LocalDnsConfig};
 use cyfs_gateway_lib::{
     config_err, AcmeHttpChallengeServerConfig, BlockConfig, CollectionConfig, ConfigErrorCode,
@@ -158,6 +159,54 @@ fn hook_point_value_map_to_vector<D: for<'de> Deserializer<'de> + Clone>(
     })?;
 
     hook_point_value_map_to_vector_in_value(stack_config, key_name)
+}
+
+pub fn parse_collections_from_raw_config(
+    raw_config: &serde_json::Value,
+) -> ConfigResult<Vec<CollectionConfig>> {
+    let mut collections = Vec::new();
+    let Some(collections_value) = raw_config.get("collections") else {
+        return Ok(collections);
+    };
+
+    let Some(collections_value) = collections_value.as_object() else {
+        return Ok(collections);
+    };
+
+    let geo_ip_cache_path = get_buckyos_service_data_dir("cyfs_gateway")
+        .join("geo_ip")
+        .to_string_lossy()
+        .to_string();
+
+    for (name, process_chain) in collections_value.iter() {
+        let mut chain_value = process_chain.clone();
+        chain_value["name"] = serde_json::Value::String(name.clone());
+
+        if chain_value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "ip_region_map")
+        {
+            if let Some(obj) = chain_value.as_object_mut() {
+                obj.insert(
+                    "cache_path".to_string(),
+                    serde_json::Value::String(geo_ip_cache_path.clone()),
+                );
+            }
+        }
+
+        let chain = serde_json::from_value::<CollectionConfig>(chain_value).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid collections: {:?}\n{}",
+                e,
+                serde_json::to_string_pretty(collections_value).unwrap()
+            )
+        })?;
+        collections.push(chain);
+    }
+
+    Ok(collections)
 }
 
 pub struct TcpStackConfigParser {}
@@ -815,25 +864,7 @@ impl GatewayConfigParser {
             None => None,
         };
 
-        let mut collections = Vec::new();
-        if let Some(collections_value) = json_value.get("collections") {
-            if let Some(collections_value) = collections_value.as_object() {
-                for (name, process_chain) in collections_value.iter() {
-                    let mut chain_value = process_chain.clone();
-                    chain_value["name"] = serde_json::Value::String(name.clone());
-                    let chain =
-                        serde_json::from_value::<CollectionConfig>(chain_value).map_err(|e| {
-                            config_err!(
-                                ConfigErrorCode::InvalidConfig,
-                                "invalid collections: {:?}\n{}",
-                                e,
-                                serde_json::to_string_pretty(collections_value).unwrap()
-                            )
-                        })?;
-                    collections.push(chain);
-                }
-            }
-        }
+        let collections = parse_collections_from_raw_config(&json_value)?;
 
         let mut timers = Vec::new();
         if let Some(timers_value) = json_value.get("timers") {
