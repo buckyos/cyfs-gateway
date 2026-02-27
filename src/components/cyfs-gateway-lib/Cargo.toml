@@ -65,6 +65,7 @@ local-ip-address = "0.6"
 rcgen.workspace = true
 clap.workspace = true
 percent-encoding = "*"
+httpdate = "1.0"
 regex.workspace = true
 mini-moka = "0.10"
 callback-trait = "0.1"

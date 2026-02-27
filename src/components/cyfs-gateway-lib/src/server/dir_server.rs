@@ -1,8 +1,10 @@
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use http::{Version, StatusCode};
 use http_body_util::combinators::{BoxBody};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
+use hyper::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Local};
@@ -34,6 +36,26 @@ pub struct DirServerBuilder {
     fallback_file: Option<String>,
     base_url: Option<String>,
     autoindex: bool,
+    etag: Option<bool>,
+    if_modified_since: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IfModifiedSinceMode {
+    Off,
+    Exact,
+    Before,
+}
+
+impl IfModifiedSinceMode {
+    fn parse(mode: &str) -> Option<Self> {
+        match mode {
+            "off" => Some(Self::Off),
+            "exact" => Some(Self::Exact),
+            "before" => Some(Self::Before),
+            _ => None,
+        }
+    }
 }
 
 impl DirServerBuilder {
@@ -72,6 +94,16 @@ impl DirServerBuilder {
         self
     }
 
+    pub fn etag(mut self, etag: bool) -> Self {
+        self.etag = Some(etag);
+        self
+    }
+
+    pub fn if_modified_since(mut self, mode: impl Into<String>) -> Self {
+        self.if_modified_since = Some(mode.into());
+        self
+    }
+
     pub async fn build(self) -> ServerResult<DirServer> {
         DirServer::create_server(self).await
     }
@@ -86,6 +118,8 @@ pub struct DirServer {
     fallback_file: Option<String>,
     base_url: String,
     autoindex: bool,
+    etag: bool,
+    if_modified_since: IfModifiedSinceMode,
 }
 
 impl DirServer {
@@ -98,6 +132,8 @@ impl DirServer {
             fallback_file: None,
             base_url: None,
             autoindex: false,
+            etag: None,
+            if_modified_since: None,
         }
     }
 
@@ -134,6 +170,17 @@ impl DirServer {
         };
 
         let index_file = builder.index_file.unwrap_or_else(|| "index.html".to_string());
+        let etag = builder.etag.unwrap_or(true);
+        let if_modified_since = match builder.if_modified_since {
+            Some(mode) => IfModifiedSinceMode::parse(mode.as_str()).ok_or_else(|| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "invalid if_modified_since: {}, expected one of off|exact|before",
+                    mode
+                )
+            })?,
+            None => IfModifiedSinceMode::Exact,
+        };
         let fallback_file = if let Some(fallback_file) = builder.fallback_file {
             let fallback_path = Path::new(&fallback_file);
             if fallback_path.is_absolute() {
@@ -167,7 +214,90 @@ impl DirServer {
             fallback_file,
             base_url: builder.base_url.unwrap_or_else(|| "/".to_string()),
             autoindex: builder.autoindex,
+            etag,
+            if_modified_since,
         })
+    }
+
+    fn format_http_date(st: SystemTime) -> String {
+        httpdate::fmt_http_date(st)
+    }
+
+    fn normalize_etag_tag(token: &str) -> &str {
+        let token = token.trim();
+        if let Some(stripped) = token.strip_prefix("W/") {
+            stripped.trim()
+        } else {
+            token
+        }
+    }
+
+    fn etag_matches_if_none_match(current_etag: Option<&str>, if_none_match: &str) -> bool {
+        let current_etag = match current_etag {
+            Some(etag) => etag,
+            None => return false,
+        };
+
+        let target = Self::normalize_etag_tag(current_etag);
+        if_none_match
+            .split(',')
+            .map(str::trim)
+            .any(|item| item == "*" || Self::normalize_etag_tag(item) == target)
+    }
+
+    fn compare_if_modified_since(&self, last_modified: SystemTime, if_modified_since: &str) -> bool {
+        let since = match httpdate::parse_http_date(if_modified_since) {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+
+        let mtime_secs = last_modified
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        let since_secs = since
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+
+        match self.if_modified_since {
+            IfModifiedSinceMode::Off => false,
+            IfModifiedSinceMode::Exact => mtime_secs == since_secs,
+            IfModifiedSinceMode::Before => mtime_secs <= since_secs,
+        }
+    }
+
+    fn request_not_modified(
+        &self,
+        req: &http::Request<BoxBody<Bytes, ServerError>>,
+        current_etag: Option<&str>,
+        last_modified: Option<SystemTime>,
+    ) -> bool {
+        let if_none_match = req
+            .headers()
+            .get(IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok());
+
+        if let Some(if_none_match) = if_none_match {
+            return Self::etag_matches_if_none_match(current_etag, if_none_match);
+        }
+
+        let if_modified_since = req
+            .headers()
+            .get(IF_MODIFIED_SINCE)
+            .and_then(|v| v.to_str().ok());
+
+        if let (Some(last_modified), Some(if_modified_since)) = (last_modified, if_modified_since) {
+            return self.compare_if_modified_since(last_modified, if_modified_since);
+        }
+
+        false
+    }
+
+    fn build_etag(file_meta: &std::fs::Metadata) -> Option<String> {
+        let modified = file_meta.modified().ok()?;
+        let dur = modified.duration_since(UNIX_EPOCH).ok()?;
+        Some(format!("\"{:x}-{:x}-{:x}\"", file_meta.len(), dur.as_secs(), dur.subsec_nanos()))
     }
 
     /// Parse Range header (e.g., "bytes=start-end")
@@ -209,9 +339,32 @@ impl DirServer {
 
         let file_size = file_meta.len();
         let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
+        let last_modified = file_meta.modified().ok();
+        let etag = if self.etag {
+            Self::build_etag(&file_meta)
+        } else {
+            None
+        };
+
+        if self.request_not_modified(&req, etag.as_deref(), last_modified) {
+            let mut response_builder = http::Response::builder().status(StatusCode::NOT_MODIFIED);
+            if let Some(etag) = etag.as_ref() {
+                response_builder = response_builder.header(ETAG, etag.as_str());
+            }
+            if let Some(last_modified) = last_modified {
+                let formatted = Self::format_http_date(last_modified);
+                response_builder = response_builder.header(LAST_MODIFIED, formatted);
+            }
+
+            return response_builder
+                .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+                .map_err(|e| {
+                    server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e)
+                });
+        }
 
         // Handle Range requests
-        if let Some(range_header) = req.headers().get(hyper::header::RANGE) {
+        if let Some(range_header) = req.headers().get(RANGE) {
             if let Ok(range_str) = range_header.to_str() {
                 if let Ok((start, end)) = self.parse_range(range_str, file_size) {
                     let mut file = tokio::io::BufReader::new(file);
@@ -232,12 +385,22 @@ impl DirServer {
                     );
                     let stream_body = StreamBody::new(stream.map_ok(Frame::data));
 
-                    return Ok(http::Response::builder()
+                    let mut response_builder = http::Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
                         .header("Content-Type", mime_type.as_ref())
                         .header("Content-Length", content_length)
                         .header("Content-Range", format!("bytes {}-{}/{}", start, end, file_size))
-                        .header("Accept-Ranges", "bytes")
+                        .header("Accept-Ranges", "bytes");
+
+                    if let Some(etag) = etag.as_ref() {
+                        response_builder = response_builder.header(ETAG, etag.as_str());
+                    }
+                    if let Some(last_modified) = last_modified {
+                        let formatted = Self::format_http_date(last_modified);
+                        response_builder = response_builder.header(LAST_MODIFIED, formatted);
+                    }
+
+                    return Ok(response_builder
                         .body(
                             BodyExt::map_err(stream_body, |e| {
                                 ServerError::new(ServerErrorCode::StreamError, format!("Stream error: {}", e))
@@ -255,11 +418,21 @@ impl DirServer {
         let stream = tokio_util::io::ReaderStream::with_capacity(file, file_size as usize);
         let stream_body = StreamBody::new(stream.map_ok(Frame::data));
         
-        Ok(http::Response::builder()
+        let mut response_builder = http::Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", mime_type.as_ref())
             .header("Content-Length", file_size)
-            .header("Accept-Ranges", "bytes")
+            .header("Accept-Ranges", "bytes");
+
+        if let Some(etag) = etag.as_ref() {
+            response_builder = response_builder.header(ETAG, etag.as_str());
+        }
+        if let Some(last_modified) = last_modified {
+            let formatted = Self::format_http_date(last_modified);
+            response_builder = response_builder.header(LAST_MODIFIED, formatted);
+        }
+
+        Ok(response_builder
             .body(
                 BodyExt::map_err(stream_body, |e| {
                     ServerError::new(ServerErrorCode::StreamError, format!("Stream error: {}", e))
@@ -567,6 +740,14 @@ pub struct DirServerConfig {
     pub fallback_file: Option<String>,
     #[serde(default)]
     pub autoindex: bool,
+    #[serde(default = "dir_server_default_etag")]
+    pub etag: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub if_modified_since: Option<String>,
+}
+
+fn dir_server_default_etag() -> bool {
+    true
 }
 
 impl ServerConfig for DirServerConfig {
@@ -621,6 +802,11 @@ impl ServerFactory for DirServerFactory {
         }
 
         builder = builder.autoindex(config.autoindex);
+        builder = builder.etag(config.etag);
+
+        if let Some(if_modified_since) = &config.if_modified_since {
+            builder = builder.if_modified_since(if_modified_since.clone());
+        }
 
         let server = builder.build().await?;
         Ok(vec![Server::Http(Arc::new(server))])
@@ -789,6 +975,8 @@ mod tests {
             index_file: None,
             fallback_file: None,
             autoindex: false,
+            etag: true,
+            if_modified_since: None,
         };
         
         let factory = DirServerFactory::new();
@@ -901,5 +1089,216 @@ mod tests {
         assert!(body.contains("visible.txt"));
         assert!(!body.contains(".hidden.txt"));
         assert!(body.contains("Index of /"));
+    }
+
+    #[tokio::test]
+    async fn test_if_none_match_returns_not_modified() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("etag.txt");
+        tokio::fs::write(&file_path, b"etag-body").await.unwrap();
+
+        let server = Arc::new(
+            DirServer::builder()
+                .id("test")
+                .root_path(temp_dir.path().to_path_buf())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let (client, server_stream) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let first_req = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/etag.txt")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let first_resp = sender.send_request(first_req).await.unwrap();
+        assert_eq!(first_resp.status(), StatusCode::OK);
+        let etag = first_resp
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+
+        let second_req = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/etag.txt")
+            .header(IF_NONE_MATCH, etag)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let second_resp = sender.send_request(second_req).await.unwrap();
+        assert_eq!(second_resp.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn test_if_modified_since_exact_returns_not_modified() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("ims.txt");
+        tokio::fs::write(&file_path, b"ims-body").await.unwrap();
+
+        let metadata = tokio::fs::metadata(&file_path).await.unwrap();
+        let modified = metadata.modified().unwrap();
+        let since = httpdate::fmt_http_date(modified);
+
+        let server = Arc::new(
+            DirServer::builder()
+                .id("test")
+                .root_path(temp_dir.path().to_path_buf())
+                .if_modified_since("exact")
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let (client, server_stream) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/ims.txt")
+            .header(IF_MODIFIED_SINCE, since)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn test_if_none_match_precedence_over_if_modified_since() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("precedence.txt");
+        tokio::fs::write(&file_path, b"precedence-body").await.unwrap();
+
+        let metadata = tokio::fs::metadata(&file_path).await.unwrap();
+        let modified = metadata.modified().unwrap();
+        let since = httpdate::fmt_http_date(modified);
+
+        let server = Arc::new(
+            DirServer::builder()
+                .id("test")
+                .root_path(temp_dir.path().to_path_buf())
+                .if_modified_since("exact")
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let (client, server_stream) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/precedence.txt")
+            .header(IF_NONE_MATCH, "\"mismatch-etag\"")
+            .header(IF_MODIFIED_SINCE, since)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_response_contains_etag_and_last_modified() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("headers.txt");
+        tokio::fs::write(&file_path, b"headers-body").await.unwrap();
+
+        let server = Arc::new(
+            DirServer::builder()
+                .id("test")
+                .root_path(temp_dir.path().to_path_buf())
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        let (client, server_stream) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/headers.txt")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key(ETAG));
+        assert!(resp.headers().contains_key(LAST_MODIFIED));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_if_modified_since_config() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = DirServer::builder()
+            .id("test")
+            .root_path(temp_dir.path().to_path_buf())
+            .if_modified_since("invalid")
+            .build()
+            .await;
+
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.code(), ServerErrorCode::InvalidConfig);
+        }
     }
 }
