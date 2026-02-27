@@ -13,7 +13,7 @@ use hickory_server::server::{Request, RequestHandler, RequestInfo, ResponseHandl
 use hickory_server::ServerFuture;
 use log::trace;
 use log::{debug, error, info, warn};
-use rdata::{A, AAAA, CNAME, TXT};
+use rdata::{A, AAAA, CNAME, PTR, TXT};
 use tokio::net::UdpSocket;
 
 use anyhow::Result;
@@ -95,6 +95,19 @@ fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RDat
             let mut records = Vec::new();
             for txt in name_info.txt.iter() {
                 records.push(RData::TXT(TXT::new(vec![txt.clone()])));
+            }
+            return Ok(records);
+        }
+        "PTR" => {
+            if name_info.ptr_records.is_empty() {
+                return Err(anyhow::anyhow!("PTR is none"));
+            }
+            let mut records = Vec::new();
+            for ptr in name_info.ptr_records.iter() {
+                let target = Name::from_str(ptr)
+                    .or_else(|_| Name::from_str(format!("{}.", ptr).as_str()))
+                    .map_err(|e| anyhow::anyhow!("invalid PTR target {}: {}", ptr, e))?;
+                records.push(RData::PTR(PTR(target)));
             }
             return Ok(records);
         }
@@ -585,7 +598,7 @@ mod tests {
     use hickory_proto::op::{Message, Query};
     use hickory_proto::rr::RecordType;
     use hickory_server::proto::rr::{Name, RData};
-    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager, GlobalProcessChains, Server, ServerFactory, ServerManager, StackContext, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackContext, UdpStackFactory};
+    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager, GlobalProcessChains, JsExternalsManager, Server, ServerFactory, ServerManager, StackContext, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackContext, UdpStackFactory};
     use cyfs_gateway_lib::server::DatagramServer;
     use crate::{DnsServerConfig, DnsServerContext, InnerDnsRecordManager, LocalDns, ProcessChainDnsServer, ProcessChainDnsServerFactory};
 
@@ -748,6 +761,27 @@ hook_point:
         assert_eq!(resp.answers().len(), 1);
         assert_eq!(resp.answers()[0].record_type(), RecordType::A);
         assert_eq!(resp.answers()[0].data(), &RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::from_str("192.168.1.1").unwrap())));
+
+        let mut message = Message::new();
+        let name = Name::from_str("1.1.168.192.in-addr.arpa.").unwrap();
+        let query = Query::query(name, RecordType::PTR);
+        message.add_query(query);
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let msg_vec = message.to_vec();
+        assert!(msg_vec.is_ok());
+        let msg_vec = msg_vec.unwrap();
+
+        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.answers()[0].record_type(), RecordType::PTR);
+        match resp.answers()[0].data() {
+            RData::PTR(ptr) => assert_eq!(ptr.0.to_string(), "www.buckyos.com."),
+            _ => panic!("expected PTR answer"),
+        }
 
         let mut message = Message::new();
         // 添加查询

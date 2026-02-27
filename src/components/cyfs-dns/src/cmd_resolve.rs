@@ -1,4 +1,5 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::str::FromStr;
 use clap::{Arg, Command};
 use hickory_proto::xfer::Protocol;
 use log::{error, warn};
@@ -25,6 +26,7 @@ impl CmdResolve {
 Examples:
     resolve example.com A
     resolve example.com AAAA
+    resolve 192.168.1.1 PTR
     resolve example.com A 127.0.0.1
     resolve example.com A sn
                 "#
@@ -58,6 +60,82 @@ Examples:
     pub fn name(&self) -> &str {
         self.name.as_str()
     }
+}
+
+fn parse_ipv4_arpa_name(domain: &str) -> Option<IpAddr> {
+    let normalized = domain.trim_end_matches('.').to_lowercase();
+    let suffix = ".in-addr.arpa";
+    if !normalized.ends_with(suffix) {
+        return None;
+    }
+
+    let prefix = normalized.strip_suffix(suffix)?;
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let octets: Vec<&str> = prefix.split('.').collect();
+    if octets.len() != 4 {
+        return None;
+    }
+
+    let a = octets[3].parse::<u8>().ok()?;
+    let b = octets[2].parse::<u8>().ok()?;
+    let c = octets[1].parse::<u8>().ok()?;
+    let d = octets[0].parse::<u8>().ok()?;
+    Some(IpAddr::V4(Ipv4Addr::new(a, b, c, d)))
+}
+
+fn parse_ipv6_arpa_name(domain: &str) -> Option<IpAddr> {
+    let normalized = domain.trim_end_matches('.').to_lowercase();
+    let suffix = ".ip6.arpa";
+    if !normalized.ends_with(suffix) {
+        return None;
+    }
+
+    let prefix = normalized.strip_suffix(suffix)?;
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let nibbles: Vec<&str> = prefix.split('.').collect();
+    if nibbles.len() != 32 {
+        return None;
+    }
+
+    let mut hex = String::with_capacity(32);
+    for nibble in nibbles.iter().rev() {
+        if nibble.len() != 1 {
+            return None;
+        }
+        let c = nibble.chars().next()?;
+        if !c.is_ascii_hexdigit() {
+            return None;
+        }
+        hex.push(c);
+    }
+
+    Ipv6Addr::from_str(hex.as_str()).ok().map(IpAddr::V6)
+}
+
+fn normalize_ptr_query_name(domain: &str, record_type: RecordType) -> String {
+    if record_type != RecordType::PTR {
+        return domain.to_string();
+    }
+
+    if let Ok(ip) = domain.parse::<IpAddr>() {
+        return ip.to_string();
+    }
+
+    if let Some(ip) = parse_ipv4_arpa_name(domain) {
+        return ip.to_string();
+    }
+
+    if let Some(ip) = parse_ipv6_arpa_name(domain) {
+        return ip.to_string();
+    }
+
+    domain.to_string()
 }
 
 #[async_trait::async_trait]
@@ -121,31 +199,32 @@ impl ExternalCommand for CmdResolve {
             msg
         })?;
 
+        let query_name = normalize_ptr_query_name(domain, record_type);
         let server_address = matches.get_one::<String>("server_address");
         let name_info = if server_address.is_none() {
             let provider = DnsProvider::new(None);
-            match provider.query(domain.as_str(), Some(record_type), None).await {
+            match provider.query(query_name.as_str(), Some(record_type), None).await {
                 Ok(name_info) => name_info,
                 Err(e) => {
-                    return Ok(CommandResult::Error(format!("Failed to resolve domain {} record_type {}: {:?}", domain, record_type_str, e)));
+                    return Ok(CommandResult::Error(format!("Failed to resolve domain {} record_type {}: {:?}", query_name, record_type_str, e)));
                 }
             }
         } else {
             let server_address = server_address.unwrap();
             if let Ok(address) = server_address.parse::<IpAddr>() {
                 let provider = DnsProvider::new(Some(server_address.to_string()));
-                match provider.query(domain.as_str(), Some(record_type), None).await {
+                match provider.query(query_name.as_str(), Some(record_type), None).await {
                     Ok(name_info) => name_info,
                     Err(e) => {
-                        return Ok(CommandResult::Error(format!("Failed to resolve domain {} record_type {}: {:?}", domain, record_type_str, e)));
+                        return Ok(CommandResult::Error(format!("Failed to resolve domain {} record_type {}: {:?}", query_name, record_type_str, e)));
                     }
                 }
             } else if let Ok(address) = server_address.parse::<SocketAddr>() {
                 let provider = DnsProvider::new(Some(address.to_string()));
-                match provider.query(domain.as_str(), Some(record_type), None).await {
+                match provider.query(query_name.as_str(), Some(record_type), None).await {
                     Ok(name_info) => name_info,
                     Err(e) => {
-                        return Ok(CommandResult::Error(format!("Failed to resolve domain {} record_type {}: {:?}", domain, record_type_str, e)));
+                        return Ok(CommandResult::Error(format!("Failed to resolve domain {} record_type {}: {:?}", query_name, record_type_str, e)));
                     }
                 }
             } else {
@@ -158,11 +237,11 @@ impl ExternalCommand for CmdResolve {
                     }
                 };
                 if let Some(dns_service) = server_mgr.get_name_server(server_address) {
-                    match dns_service.query(domain, Some(record_type), None).await
+                    match dns_service.query(query_name.as_str(), Some(record_type), None).await
                         .map_err(|e| {
                             let msg = format!(
                                 "Resolve miss via {} for domain {} record_type {}: {:?}",
-                                server_address, domain, record_type_str, e
+                                server_address, query_name, record_type_str, e
                             );
                             match e.code() {
                                 cyfs_gateway_lib::ServerErrorCode::NotFound
@@ -192,5 +271,31 @@ impl ExternalCommand for CmdResolve {
 
         context.env().create("RESOLVE_RESP", CollectionValue::Map(result), EnvLevel::Global).await?;
         Ok(CommandResult::Success("RESOLVE_RESP".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_ptr_query_name_ipv4_arpa() {
+        let name = normalize_ptr_query_name("1.1.168.192.in-addr.arpa.", RecordType::PTR);
+        assert_eq!(name, "192.168.1.1");
+    }
+
+    #[test]
+    fn test_normalize_ptr_query_name_ipv6_arpa() {
+        let name = normalize_ptr_query_name(
+            "b.a.0.0.9.8.7.6.5.0.4.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa.",
+            RecordType::PTR,
+        );
+        assert_eq!(name, "fe80::405:6789:ab");
+    }
+
+    #[test]
+    fn test_normalize_ptr_query_name_plain_ip() {
+        let name = normalize_ptr_query_name("192.168.1.1", RecordType::PTR);
+        assert_eq!(name, "192.168.1.1");
     }
 }
