@@ -168,11 +168,94 @@ impl CommandArgEvaluator {
         Ok(results)
     }
 
+    fn find_matching_paren(input: &str, start: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (offset, c) in input[start..].char_indices() {
+            if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset);
+                }
+            }
+        }
+        None
+    }
+
+    #[async_recursion::async_recursion]
+    async fn resolve_dynamic_var_path(var: &str, context: &Context) -> Result<String, String> {
+        let mut i = 0usize;
+        let mut resolved = String::new();
+
+        while i < var.len() {
+            let ch = var[i..].chars().next().ok_or_else(|| {
+                let msg = format!("Invalid dynamic variable expression: {}", var);
+                error!("{}", msg);
+                msg
+            })?;
+
+            if ch == '(' && resolved.ends_with('.') {
+                let end = Self::find_matching_paren(var, i).ok_or_else(|| {
+                    let msg = format!("Unclosed dynamic segment in variable: {}", var);
+                    error!("{}", msg);
+                    msg
+                })?;
+                let inner = var[i + 1..end].trim();
+
+                let segment = if let Some(inner_var) = inner.strip_prefix("${") {
+                    if !inner.ends_with('}') {
+                        let msg = format!("Invalid braced variable segment: {}", inner);
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+                    let inner_var = inner_var[..inner_var.len() - 1].trim();
+                    let full = if inner_var.contains(".(") {
+                        Self::resolve_dynamic_var_path(inner_var, context).await?
+                    } else {
+                        inner_var.to_string()
+                    };
+                    match context.env().get(&full, None).await? {
+                        Some(value) => value.try_as_str()?.to_string(),
+                        None => String::new(),
+                    }
+                } else if let Some(inner_var) = inner.strip_prefix('$') {
+                    let full = if inner_var.contains(".(") {
+                        Self::resolve_dynamic_var_path(inner_var, context).await?
+                    } else {
+                        inner_var.to_string()
+                    };
+                    match context.env().get(&full, None).await? {
+                        Some(value) => value.try_as_str()?.to_string(),
+                        None => String::new(),
+                    }
+                } else {
+                    inner.to_string()
+                };
+
+                resolved.push_str(&segment);
+                i = end + 1;
+                continue;
+            }
+
+            resolved.push(ch);
+            i += ch.len_utf8();
+        }
+
+        Ok(resolved)
+    }
+
+    #[async_recursion::async_recursion]
     pub async fn evaluate(arg: &CommandArg, context: &Context) -> Result<CollectionValue, String> {
         let ret = match arg {
             CommandArg::Literal(value) => CollectionValue::String(value.clone()),
             CommandArg::Var(var) => {
                 debug!("Resolving variable: {}", var);
+                let var = if var.contains(".(") {
+                    Self::resolve_dynamic_var_path(var, context).await?
+                } else {
+                    var.clone()
+                };
                 if let Some(value) = context.env().get(&var, None).await? {
                     value
                 } else {

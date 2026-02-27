@@ -197,13 +197,23 @@ impl EnvManager {
         }
     }
 
-    fn parse_var(key: &str) -> Vec<&str> {
-        key.split('.').collect()
+    fn parse_var(key: &str) -> Vec<String> {
+        key.split('.')
+            .map(|part| {
+                let part = part.trim();
+                if part.len() >= 2 && part.starts_with('(') && part.ends_with(')') {
+                    part[1..part.len() - 1].trim().to_string()
+                } else {
+                    part.to_string()
+                }
+            })
+            .collect()
     }
 
     pub fn get_var_level(&self, key: &str) -> EnvLevel {
         // Use the first part of the key to determine the level
-        let key = Self::parse_var(key)[0];
+        let key_list = Self::parse_var(key);
+        let key = key_list[0].as_str();
 
         let tracker = self.var_level_tracker.read().unwrap();
         tracker.get(key).cloned().unwrap_or_default()
@@ -211,7 +221,8 @@ impl EnvManager {
 
     pub fn change_var_level(&self, key: &str, level: Option<EnvLevel>) {
         // Use the first part of the key to determine the level
-        let key = Self::parse_var(key)[0];
+        let key_list = Self::parse_var(key);
+        let key = key_list[0].as_str();
 
         let level = level.unwrap_or_default();
         let mut tracker = self.var_level_tracker.write().unwrap();
@@ -297,9 +308,10 @@ impl EnvManager {
         level: EnvLevel,
     ) -> Result<bool, String> {
         let key_list = Self::parse_var(key);
+        let key_refs: Vec<&str> = key_list.iter().map(|s| s.as_str()).collect();
 
         // let level = level.unwrap_or_default();
-        let ret = self.create_inner(level, &key_list, value).await?;
+        let ret = self.create_inner(level, &key_refs, value).await?;
 
         if ret {
             // Track the variable's level
@@ -421,13 +433,14 @@ impl EnvManager {
             value
         );
         let key_list = Self::parse_var(key);
+        let key_refs: Vec<&str> = key_list.iter().map(|s| s.as_str()).collect();
         let level = match level {
             Some(l) => l,
-            None => self.get_var_level(key_list[0]),
+            None => self.get_var_level(key_refs[0]),
         };
 
-        let ret = self.set_inner(level, &key_list, value).await?;
-        self.change_var_level(key_list[0], Some(level));
+        let ret = self.set_inner(level, &key_refs, value).await?;
+        self.change_var_level(key_refs[0], Some(level));
 
         Ok(ret)
     }
@@ -459,12 +472,13 @@ impl EnvManager {
         level: Option<EnvLevel>,
     ) -> Result<Option<CollectionValue>, String> {
         let key_list = Self::parse_var(key);
+        let key_refs: Vec<&str> = key_list.iter().map(|s| s.as_str()).collect();
         let level = match level {
             Some(l) => l,
-            None => self.get_var_level(key_list[0]),
+            None => self.get_var_level(key_refs[0]),
         };
 
-        self.get_inner(level, &key_list).await
+        self.get_inner(level, &key_refs).await
     }
 
     async fn get_inner(
@@ -499,12 +513,13 @@ impl EnvManager {
         level: Option<EnvLevel>,
     ) -> Result<Option<CollectionValue>, String> {
         let key_list = Self::parse_var(key);
+        let key_refs: Vec<&str> = key_list.iter().map(|s| s.as_str()).collect();
         let level = match level {
             Some(l) => l,
-            None => self.get_var_level(key_list[0]),
+            None => self.get_var_level(key_refs[0]),
         };
 
-        self.remove_inner(level, &key_list).await
+        self.remove_inner(level, &key_refs).await
     }
 
     async fn remove_inner(
@@ -525,5 +540,28 @@ impl EnvManager {
         let coll = parent.unwrap();
         let key = key_list.last().unwrap();
         coll.remove(key).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EnvManager;
+
+    #[test]
+    fn test_parse_var_dynamic_segments() {
+        assert_eq!(
+            EnvManager::parse_var("test1.test2"),
+            vec!["test1".to_string(), "test2".to_string()]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("test1.(key2)"),
+            vec!["test1".to_string(), "key2".to_string()]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("a.(b).(c)"),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 }

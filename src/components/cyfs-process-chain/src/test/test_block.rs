@@ -138,6 +138,12 @@ const PROCESS_CHAIN: &str = r#"
 
             map-add test1 key1 value1;
             map-add test1 key2 value2;
+            map-add test1 key3 key2;
+
+            echo --verbose "====> test nest" test1.($test1.key3);
+            echo --verbose "====> test nest value" $test1.($test1.key3);
+            echo --verbose "====> test nest value" ${test1.($test1.key3)};
+            echo --verbose "====> test nest value not exist" ${test1.($test1.key4)};
 
             map $test1 $(echo "=====>" ${__key} ${__value});
 

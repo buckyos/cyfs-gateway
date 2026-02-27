@@ -419,16 +419,8 @@ impl BlockParser {
 
     fn parse_var_dollar(input: &str) -> IResult<&str, CommandArg> {
         debug!("Parsing var dollar: {}", input);
-        let (input, var) = preceded(
-            char('$'),
-            recognize(pair(
-                alt((alpha1, tag("_"))), // Variable must start with a letter or underscore
-                many0(alt((alphanumeric1, tag("_"), tag("."), tag("-")))), // followed by letters, digits, underscores, dot or hyphen
-            )),
-        )
-        .parse(input)?;
-
-        if var.is_empty() {
+        let (rest, _) = char('$').parse(input)?;
+        if rest.is_empty() {
             let msg = format!(
                 "Variable name must not be empty after '$', input: {}",
                 input
@@ -440,29 +432,122 @@ impl BlockParser {
             )));
         }
 
-        debug!("Parsed var dollar: {}, {}", input, var);
-        Ok((input, CommandArg::Var(var.to_string())))
+        let mut i = 0usize;
+        let mut depth = 0usize;
+        let mut parsed = String::new();
+
+        while i < rest.len() {
+            let ch = rest[i..].chars().next().ok_or_else(|| {
+                nom::Err::Error(nom::error::Error::from_error_kind(rest, ErrorKind::Tag))
+            })?;
+
+            // End of current arg token
+            if depth == 0 && (ch.is_whitespace() || ch == ';' || ch == ')') {
+                break;
+            }
+
+            // Dynamic nested segment: .(...)
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+
+            parsed.push(ch);
+            i += ch.len_utf8();
+        }
+
+        if parsed.is_empty() {
+            let msg = format!(
+                "Variable name must not be empty after '$', input: {}",
+                input
+            );
+            error!("{}", msg);
+            return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                rest,
+                ErrorKind::Tag,
+            )));
+        }
+
+        // Validate non-dynamic plain variable syntax for compatibility
+        if !parsed.contains(".(") {
+            let mut chars = parsed.chars();
+            let first = chars.next().unwrap();
+            if !(first.is_alphabetic() || first == '_') {
+                return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                    rest,
+                    ErrorKind::Tag,
+                )));
+            }
+
+            for c in chars {
+                if !(c.is_alphanumeric() || c == '_' || c == '.' || c == '-') {
+                    return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                        rest,
+                        ErrorKind::Tag,
+                    )));
+                }
+            }
+        }
+
+        if depth != 0 {
+            return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                rest,
+                ErrorKind::Tag,
+            )));
+        }
+
+        debug!("Parsed var dollar: {}, {}", &rest[i..], parsed);
+        Ok((&rest[i..], CommandArg::Var(parsed)))
     }
 
     fn parse_var_braced(input: &str) -> IResult<&str, CommandArg> {
         debug!("Parsing var braced: {}", input);
-        // ${var}
-        let ret = map(
-            preceded(
-                tag("${"),
-                terminated(
-                    take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '.' || c == '-'),
-                    char('}'),
-                ),
-            ),
-            |var: &str| CommandArg::Var(var.to_string()),
-        )
-        .parse(input)
-        .map_err(|e| {
-            let msg = format!("Parse var braced error: {}, {:?}", input, e);
+        let (rest, _) = tag("${").parse(input)?;
+        let mut i = 0usize;
+        let mut depth = 0usize;
+        let mut parsed = String::new();
+
+        while i < rest.len() {
+            let ch = rest[i..].chars().next().ok_or_else(|| {
+                nom::Err::Error(nom::error::Error::from_error_kind(rest, ErrorKind::Tag))
+            })?;
+
+            if ch == '}' && depth == 0 {
+                break;
+            }
+
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                if depth == 0 {
+                    let msg = format!("Unexpected ')' in braced variable: {}", input);
+                    debug!("{}", msg);
+                    return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                        rest,
+                        ErrorKind::Tag,
+                    )));
+                }
+                depth -= 1;
+            }
+
+            parsed.push(ch);
+            i += ch.len_utf8();
+        }
+
+        if parsed.is_empty() || i >= rest.len() || !rest[i..].starts_with('}') || depth != 0 {
+            let msg = format!("Parse var braced error: {}", input);
             debug!("{}", msg);
-            e
-        })?;
+            return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                rest,
+                ErrorKind::Tag,
+            )));
+        }
+
+        let ret = (&rest[i + 1..], CommandArg::Var(parsed));
 
         debug!("Parsed var braced: {}, {:?}", ret.0, ret.1);
         Ok(ret)
@@ -542,6 +627,95 @@ impl BlockParser {
         Ok((input, CommandArg::Literal(option.to_string())))
     }
 
+    // Parse unquoted arg with dynamic nested segments, such as: a.($b).($c)
+    // This is translated to an append command substitution at parse-time.
+    fn parse_interpolated_unquoted(input: &str) -> IResult<&str, CommandArg> {
+        let mut i = 0usize;
+        let mut literal = String::new();
+        let mut parts: Vec<CommandArg> = Vec::new();
+        let mut used_dynamic = false;
+
+        while i < input.len() {
+            let ch = input[i..]
+                .chars()
+                .next()
+                .ok_or_else(|| {
+                    nom::Err::Error(nom::error::Error::from_error_kind(input, ErrorKind::Tag))
+                })?;
+
+            if ch.is_whitespace() || ch == ';' {
+                break;
+            }
+
+            if ch == '(' && literal.ends_with('.') {
+                let mut depth = 0usize;
+                let mut end_index = None;
+                for (offset, c) in input[i..].char_indices() {
+                    if c == '(' {
+                        depth += 1;
+                    } else if c == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end_index = Some(i + offset);
+                            break;
+                        }
+                    }
+                }
+
+                let end_index = end_index.ok_or_else(|| {
+                    nom::Err::Error(nom::error::Error::from_error_kind(input, ErrorKind::Tag))
+                })?;
+
+                let inner = input[i + 1..end_index].trim();
+                let (inner_rest, inner_arg) = Self::parse_arg(inner)?;
+                if !inner_rest.trim().is_empty() {
+                    return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                        input,
+                        ErrorKind::Tag,
+                    )));
+                }
+
+                if !literal.is_empty() {
+                    parts.push(CommandArg::Literal(literal.clone()));
+                    literal.clear();
+                }
+                parts.push(inner_arg);
+                used_dynamic = true;
+                i = end_index + 1;
+                continue;
+            }
+
+            literal.push(ch);
+            i += ch.len_utf8();
+        }
+
+        if !used_dynamic {
+            return Err(nom::Err::Error(nom::error::Error::from_error_kind(
+                input,
+                ErrorKind::Tag,
+            )));
+        }
+
+        if !literal.is_empty() {
+            parts.push(CommandArg::Literal(literal));
+        }
+
+        let arg = if parts.len() == 1 {
+            parts.into_iter().next().unwrap()
+        } else {
+            let args = vec![CommandArg::Literal("append".to_string())]
+                .into_iter()
+                .chain(parts.into_iter())
+                .collect::<Vec<_>>();
+            CommandArg::CommandSubstitution(Box::new(Expression::Command(CommandItem::new(
+                "append".to_string(),
+                CommandArgs::new(args),
+            ))))
+        };
+
+        Ok((&input[i..], arg))
+    }
+
     fn parse_arg(input: &str) -> IResult<&str, CommandArg> {
         debug!("Parsing arg: {}", input);
         let ret = preceded(
@@ -550,6 +724,7 @@ impl BlockParser {
                 Self::parse_command_subst, // $(...)
                 Self::parse_var_braced,    // ${VAR}
                 Self::parse_var_dollar,    // $VAR
+                Self::parse_interpolated_unquoted, // a.($b).($c)
                 Self::parse_literal,       // "..." or '...' or unquoted
                 Self::parse_option,        // -o or --option
             )),
@@ -591,6 +766,29 @@ mod tests {
         let (input, arg) = BlockParser::parse_literal("tcp://127.0.0.1:8083").unwrap();
         assert_eq!(input, "");
         assert_eq!(arg.as_literal_str().unwrap(), "tcp://127.0.0.1:8083");
+    }
+
+    #[test]
+    fn test_parse_interpolated_unquoted() {
+        let (rest, arg) = BlockParser::parse_arg("test1.($test1.key3)").unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_command_substitution());
+    }
+
+    #[test]
+    fn test_parse_dynamic_var_dollar() {
+        let (rest, arg) = BlockParser::parse_arg("$test1.($test1.key3)").unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_var());
+        assert_eq!(arg.as_var_str(), Some("test1.($test1.key3)"));
+    }
+
+    #[test]
+    fn test_parse_dynamic_var_braced() {
+        let (rest, arg) = BlockParser::parse_arg("${test1.($test1.key3)}").unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_var());
+        assert_eq!(arg.as_var_str(), Some("test1.($test1.key3)"));
     }
 
     #[test]
