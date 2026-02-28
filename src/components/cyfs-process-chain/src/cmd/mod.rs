@@ -12,6 +12,7 @@ mod string;
 mod map;
 mod exec;
 mod type_;
+mod capture;
 
 pub use cmd::*;
 pub use factory::*;

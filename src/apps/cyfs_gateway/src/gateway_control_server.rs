@@ -283,6 +283,40 @@ impl HttpServer for GatewayControlServer {
                 return Ok(http::Response::new(Full::new(Bytes::from(data)).map_err(|e| ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))).boxed()));
             }
 
+            if req.method == "refresh_token" {
+                if req.sys.len() != 2 {
+                    let resp = http::Response::builder()
+                        .status(http::StatusCode::UNAUTHORIZED)
+                        .body(Full::new(Bytes::new())
+                            .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
+                    return Ok(resp)
+                }
+                let seq = req.sys[0].clone();
+                let token = req.sys[1].clone();
+                let token_str = token.as_str().unwrap_or("").to_string();
+                let new_token = match self.token_verifier.verify_and_renew(token_str.as_str()).await {
+                    Ok(token) => {
+                        token
+                    },
+                    Err(e) => {
+                        let resp = http::Response::builder()
+                            .status(http::StatusCode::UNAUTHORIZED)
+                            .body(Full::new(Bytes::from(e.msg().to_string()))
+                                .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
+                        return Ok(resp);
+                    }
+                };
+                let token_value = new_token.unwrap_or(token_str);
+                let resp = CmdResp::<Value> {
+                    sys: vec![seq, Value::String(token_value.clone())],
+                    result: Some(Value::String(token_value)),
+                    error: None,
+                };
+                let data = serde_json::to_vec(&resp)
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                return Ok(http::Response::new(Full::new(Bytes::from(data)).map_err(|e| ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))).boxed()));
+            }
+
             if req.sys.len() != 2 {
                 let resp = http::Response::builder()
                     .status(http::StatusCode::UNAUTHORIZED)

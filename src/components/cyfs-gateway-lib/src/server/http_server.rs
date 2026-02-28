@@ -744,6 +744,23 @@ impl HttpServer for ProcessChainHttpServer {
                     .await;
             }
         };
+
+        // Capture request meta early so we can log it even if the process chain
+        // decides to drop/reject without forwarding the request.
+        let req_method = req.method().to_string();
+        let req_host = req
+            .headers()
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("none")
+            .to_string();
+        let req_uri = req.uri().to_string();
+        let req_remote = info
+            .src_addr
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_string();
+
         let executor = {
             self.executor.lock().unwrap().fork()
         };
@@ -847,7 +864,14 @@ impl HttpServer for ProcessChainHttpServer {
                     .apply_post_chain_result(Ok(response), &req_info, Some(&info))
                     .await;
             } else if ret.is_reject() {
-                debug!("Request rejected by the process chain");
+                debug!(
+                    "process_chain_reject server={} remote={} method={} host={} uri={}",
+                    self.id,
+                    req_remote,
+                    req_method,
+                    req_host,
+                    req_uri,
+                );
                 let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 return self
@@ -2232,7 +2256,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_chain_http_server_forward() {
-        // 创建一个监听8090端口的HTTP服务器来处理请求
+        // 鍒涘缓涓�涓洃鍚�8090绔彛鐨凥TTP鏈嶅姟鍣ㄦ潵澶勭悊璇锋眰
         tokio::spawn(async move {
             use http_body_util::BodyExt;
             use tokio::net::TcpListener;
@@ -2247,7 +2271,7 @@ mod tests {
                     assert_eq!(req.headers().get("X-Real-IP").map(|v| v.to_str().unwrap()), Some("127.0.0.1"));
                     assert!(req.headers().get("X-Real-Port").is_some());
                     assert_eq!(req.headers().get("X-Real-Port").map(|v| v.to_str().unwrap()), Some("344"));
-                    let _ = req.collect().await; // 消费请求体
+                    let _ = req.collect().await; // 娑堣垂璇锋眰浣�
                     Ok::<_, ServerError>(http::Response::builder()
                         .status(StatusCode::OK)
                         .body(Full::new(Bytes::from("forward success")).map_err(|e| match e {}).boxed())
@@ -2262,7 +2286,7 @@ mod tests {
             }
         });
 
-        // 等待服务器启动
+        // 绛夊緟鏈嶅姟鍣ㄥ惎鍔�
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mock_server_mgr = Arc::new(ServerManager::new());
@@ -2336,7 +2360,7 @@ mod tests {
                 let (stream, _) = listener.accept().await.unwrap();
                 let service = hyper::service::service_fn(|req: http::Request<hyper::body::Incoming>| async move {
                     println!("{:?}", req.headers());
-                    let _ = req.collect().await; // 消费请求体
+                    let _ = req.collect().await; // 娑堣垂璇锋眰浣�
                     Ok::<_, ServerError>(http::Response::builder()
                         .status(StatusCode::OK)
                         .body(Full::new(Bytes::from("forward success")).map_err(|e| match e {}).boxed())
@@ -2351,7 +2375,7 @@ mod tests {
             }
         });
 
-        // 等待服务器启动
+        // 绛夊緟鏈嶅姟鍣ㄥ惎鍔�
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mock_server_mgr = Arc::new(ServerManager::new());
@@ -2455,7 +2479,7 @@ mod tests {
         });
 
         let resp = sender.send_request(request).await.unwrap();
-        // 当forward失败时，应该返回500错误
+        // 褰揻orward澶辫触鏃讹紝搴旇杩斿洖500閿欒
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 

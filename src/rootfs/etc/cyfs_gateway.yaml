@@ -1,26 +1,208 @@
+# cyfs_gateway configuration field reference (ready to run)
+# - This file explains all config fields and provides a minimal runnable HTTP service
+# - Default binds to 0.0.0.0:80
+
+# includes:            # extra config files or directories (merged in order), paths are relative to this file
+#   - path: extra.yaml
+#   - path: configs/
+
+# user_name: "root"    # console login username, optional
+# password: "123456"   # console login password, optional (plain text, hashed on login)
+
+# acme:               # ACME certificate config (optional)
+#   account: "admin@example.com"  # ACME account
+#   issuer: "https://acme-v02.api.letsencrypt.org/directory"  # ACME directory URL
+#   dns_providers:     # DNS challenge config
+#     aliyun: // Alibaba Cloud
+#       accessKeyId: "***"
+#       accessKeySecret: "***"
+#    sn-dns: // buckyos sn
+#      sn: https://sn.buckyos.ai
+#      key_path: ***
+#      device_config_path: ***
+#   check_interval: 43200          # certificate check interval (seconds), default 12h
+#   renew_before_expiry: 2592000   # renew ahead of expiry (seconds), default 30d
+
+# tls_ca:             # self-signed/CA certificate config (optional)
+#   cert_path: ./ca.crt
+#   key_path: ./ca.key
+
+# limiter config (optional; empty object disables)
+# limiters:
+#   global:            # limiter id (from map key)
+#     upper_limiter: ***          # upper limiter id (optional)
+#     download_speed: "1GB/s"      # download bandwidth (supports KB/s, MB/s, GB/s)
+#     upload_speed: "1GB/s"        # upload bandwidth
+#     concurrent: 2048             # concurrency
+
+# global collection config (optional; empty object disables)
+# collections:
+#   memory_set_example:
+#     type: memory_set
+#   json_set_example:
+#     type: json_set
+#     file_path: ./data.json
+#   sqlite_set_example:
+#     type: sqlite_set
+#     file_path: ./data.db
+#     data:
+#       table_name: items
+#       column_name: value
+#   text_set_example:
+#     type: text_set
+#     file_path: ./data.txt
+#   memory_map_example:
+#     type: memory_map
+#   json_map_example:
+#     type: json_map
+#     file_path: ./map.json
+#   sqlite_map_example:
+#     type: sqlite_map
+#     file_path: ./map.db
+#     data:
+#       table_name: kv
+#       key_name: k
+#       value_name: v
+
+# global process chain config (optional; empty object disables)
+# global_process_chains:
+#   global_chain:
+#     priority: 1
+#     blocks:
+#       default:
+#         priority: 1
+#         block: |
+#           echo "hello";
+
 stacks:
-  test4:
-    bind: 0.0.0.0:8089
-    protocol: tcp
-    hook_point:
+  http_tcp:
+    # id comes from map key (here: http_tcp)
+    protocol: tcp                 # tcp | udp | tls | quic | rtcp | tun
+    bind: 0.0.0.0:80            # bind address
+    # transparent: false          # transparent proxy mode (tcp/udp optional, default false)
+    # reuse_address: false      # set EADDRINUSE on socket, default false, linux only
+    hook_point: # process chains (map form, converted to array)
       main:
-        priority: 1
+        priority: 1000
         blocks:
           default:
+            priority: 1
             block: |
-              call https-sni-probe && return "forward tcp:///${REQ.dest_host}:443";
-              call http-probe || reject;
-              eq ${REQ.ext.method} "CONNECT" && return "forward tcp:///${REQ.dest_host}";
-              return "forward tcp:///${REQ.dest_host}:80";
+              call-server welcome;
 
-includes:
-  - path: user_gateway.json
-  - path: boot_gateway.yaml
-  - path: node_gateway.json
-  - path: post_gateway.json
+    # udp_example:
+    #   protocol: udp
+    #   bind: 0.0.0.0:53
+    #   concurrency: 200            # default 200
+    #   session_idle_time: 120      # session timeout (seconds), default 120
+    #   transparent: false
+    #   hook_point: { }
 
-timers:
-  test_timer:
-    timeout: 120
-    process-chain: |
-      echo "test"
+    # tls_example:
+    #   protocol: tls
+    #   bind: 0.0.0.0:443
+    #   concurrency: 0              # default 0 (unlimited)
+    #   alpn_protocols: ["http/1.1"] # default http/1.1, supports h2/h3
+    #   certs:
+    #     - domain: example.com # local certificate
+    #       cert_path: ./cert.pem
+    #       key_path: ./key.pem
+    #     - domain: example.org # ACME certificate
+    #       acme_type: optional, default tls-alpn-01, supports dns-01 | http-01 | tls-alpn-01
+    #     - domain: * # local default certificate; all connections through this stack use certs generated from the local root, configured via tls_ca
+    #   hook_point: { }
+
+    # quic_example:
+    #   protocol: quic
+    #   bind: 0.0.0.0:4433
+    #   concurrency: 1024           # default 1024
+    #   alpn_protocols: ["h3"] # supports h2/h3
+    #   certs:
+    #     - domain: example.com # local certificate
+    #       cert_path: ./cert.pem
+    #       key_path: ./key.pem
+    #     - domain: example.org # ACME certificate
+    #       acme_type: optional, default tls-alpn-01, supports dns-01 | http-01 | tls-alpn-01
+    #     - domain: * # local default certificate; all connections through this stack use certs generated from the local root, configured via tls_ca
+    #   hook_point: { }
+
+    # rtcp_example:
+    #   protocol: rtcp
+    #   bind: 0.0.0.0:2980
+    #   key_path: ./sn_private_key.pem
+    #   device_config_path: ./sn_device_config.json
+    #   name: optional_name
+    #   hook_point: { }
+
+    # tun_example:
+    #   protocol: tun
+    #   bind: 10.0.0.1
+    #   mask: 255.255.255.0         # default 255.255.255.0
+    #   mtu: 1500                   # default 1500
+    #   tcp_timeout: 60             # default 60
+    #   udp_timeout: 60             # default 60
+    #   hook_point: { }
+
+    #servers:
+    #  http_main:
+    #     id comes from map key (here: http_main)
+    #     type: http
+    #     version: "HTTP/1.1"         # optional: HTTP/1.1, HTTP/2, HTTP/3; default HTTP/1.1
+    #     h3_port: 443                # optional: HTTP/3 port
+    #    hook_point:
+    #      main:
+    #        priority: 1
+    #        blocks:
+    #          default:
+    #            priority: 1
+    #            block: |
+    #              call-server http_dir;
+    #
+    #  http_dir:
+    #    type: dir
+    #    root_path: ./www              # static directory
+    # version: "HTTP/1.1"         # optional: HTTP/1.1, HTTP/2; default HTTP/1.1
+    # index_file: index.html
+    # fallback_file: 404.html
+
+  # dns_example:
+  #   type: dns
+  #   hook_point:
+  #     main:
+  #       priority: 1
+  #       blocks:
+  #         default:
+  #           priority: 1
+  #           block: |
+  #             resolve ${REQ.name} ${REQ.record_type} local_dns && return;
+
+  # local_dns_example:
+  #   type: local_dns
+  #   file_path: ./local_dns.toml
+
+  # sn_example:
+  #   type: sn
+  #   host: example.com
+  #   ip: 1.2.3.4
+  #   boot_jwt: "<jwt>"
+  #   owner_pkx: "<pkx>"
+  #   device_jwt:
+  #     - "<jwt>"
+  #   aliases: []                 # optional
+  #   db_type: sqlite             # optional
+  #   db_params:
+  #     db_path: ./sn.db
+
+  # socks_example:
+  #   type: socks
+  #   target: "http://127.0.0.1:1080"
+  #   username: ""  # if username/password are absent, no password is set
+  #   password: ""
+  #   hook_point:
+  #     main:
+  #       priority: 1
+  #       blocks:
+  #         default:
+  #           priority: 1
+  #           block: |
+  #             reject;

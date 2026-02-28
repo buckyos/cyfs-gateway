@@ -599,6 +599,7 @@ impl TunnelBuilder for RtcpTunnelBuilder {
 pub struct RtcpStack {
     id: String,
     bind_addr: String,
+    reuse_address: bool,
     rtcp: Mutex<Option<RTcp>>,
     rtcp_ref: Mutex<Option<Arc<RTcp>>>,
     connection_manager: Option<ConnectionManagerRef>,
@@ -655,10 +656,12 @@ impl RtcpStack {
         .await?;
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
         let listener = Listener::new(bind_addr.clone(), connection_manager.clone(), handler.clone());
-        let rtcp = RTcp::new(device_config.id.clone(), bind_addr.clone(), private_key, Arc::new(listener));
+        let mut rtcp = RTcp::new(device_config.id.clone(), bind_addr.clone(), private_key, Arc::new(listener));
+        rtcp.set_reuse_address(builder.reuse_address);
         Ok(Self {
             id,
             bind_addr,
+            reuse_address: builder.reuse_address,
             rtcp: Mutex::new(Some(rtcp)),
             rtcp_ref: Mutex::new(None),
             connection_manager,
@@ -709,6 +712,10 @@ impl Stack for RtcpStack {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
         }
 
+        if config.reuse_address.unwrap_or(false) != self.reuse_address {
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "reuse_address unmatch"));
+        }
+
         let env = match context {
             Some(context) => {
                 let rtcp_context = context.as_ref().as_any().downcast_ref::<RtcpStackContext>()
@@ -757,6 +764,7 @@ pub struct RtcpStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     stack_context: Option<Arc<RtcpStackContext>>,
     io_dump: Option<IoDumpStackConfig>,
+    reuse_address: bool,
 }
 
 impl RtcpStackBuilder {
@@ -770,6 +778,7 @@ impl RtcpStackBuilder {
             connection_manager: None,
             stack_context: None,
             io_dump: None,
+            reuse_address: false,
         }
     }
 
@@ -812,6 +821,11 @@ impl RtcpStackBuilder {
         self.io_dump = io_dump;
         self
     }
+    
+    pub fn reuse_address(mut self, reuse_address: bool) -> Self {
+        self.reuse_address = reuse_address;
+        self
+    }
 
     pub async fn build(self) -> StackResult<RtcpStack> {
         RtcpStack::create(self).await
@@ -837,6 +851,7 @@ pub struct RtcpStackConfig {
     pub io_dump_max_upload_bytes_per_conn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_max_download_bytes_per_conn: Option<String>,
+    pub reuse_address: Option<bool>,
 }
 
 impl crate::StackConfig for RtcpStackConfig {
@@ -931,6 +946,7 @@ impl StackFactory for RtcpStackFactory {
             .hook_point(config.hook_point.clone())
             .stack_context(stack_context.clone())
             .io_dump(io_dump)
+            .reuse_address(config.reuse_address.unwrap_or(false))
             .build().await?;
         Ok(Arc::new(stack))
     }
@@ -3798,6 +3814,7 @@ mod tests {
             io_dump_rotate_max_files: None,
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
+            reuse_address: None,
         };
 
         let stack_context: Arc<dyn StackContext> = Arc::new(RtcpStackContext::new(
@@ -3825,6 +3842,7 @@ mod tests {
             io_dump_rotate_max_files: None,
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
+            reuse_address: None,
         };
 
         let ret = factory.create(Arc::new(config), stack_context).await;

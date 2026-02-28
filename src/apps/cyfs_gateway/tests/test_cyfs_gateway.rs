@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::collections::HashSet;
     use std::net::{IpAddr, SocketAddr};
     use std::path::Path;
     use std::str::FromStr;
@@ -13,7 +14,8 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use http_body_util::BodyExt;
     use serde_json::json;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
     use cyfs_gateway::{gateway_service_main, read_login_token, GatewayControlClient, GatewayParams, CONTROL_SERVER};
 
     async fn gunzip_bytes(data: Bytes) -> Bytes {
@@ -94,11 +96,187 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         panic!("io dump frames not ready");
+
+    const SOCKS_VERSION: u8 = 0x05;
+    const SOCKS_AUTH_NONE: u8 = 0x00;
+    const SOCKS_AUTH_USERNAME_PASSWORD: u8 = 0x02;
+    const SOCKS_AUTH_NO_ACCEPTABLE: u8 = 0xff;
+    const SOCKS_CMD_CONNECT: u8 = 0x01;
+    const SOCKS_ADDR_IPV4: u8 = 0x01;
+    const SOCKS_ADDR_DOMAIN: u8 = 0x03;
+    const SOCKS_ADDR_IPV6: u8 = 0x04;
+    const SOCKS_REPLY_SUCCEEDED: u8 = 0x00;
+
+    #[derive(Debug)]
+    enum SocksClientError {
+        Io(std::io::Error),
+        InvalidReply(&'static str),
+        AuthFailed(u8),
+        ConnectFailed(u8),
+    }
+
+    impl From<std::io::Error> for SocksClientError {
+        fn from(e: std::io::Error) -> Self {
+            Self::Io(e)
+        }
+    }
+
+    impl std::fmt::Display for SocksClientError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                SocksClientError::Io(e) => write!(f, "io error: {}", e),
+                SocksClientError::InvalidReply(msg) => write!(f, "invalid reply: {}", msg),
+                SocksClientError::AuthFailed(code) => write!(f, "auth failed, code={}", code),
+                SocksClientError::ConnectFailed(code) => {
+                    write!(f, "connect failed, code={}", code)
+                }
+            }
+        }
+    }
+
+    async fn allocate_free_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    async fn start_echo_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = match stream.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        };
+
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        port
+    }
+
+    async fn read_socks_addr(stream: &mut TcpStream, atyp: u8) -> Result<(), std::io::Error> {
+        match atyp {
+            SOCKS_ADDR_IPV4 => {
+                let mut rest = [0u8; 6];
+                stream.read_exact(&mut rest).await?;
+            }
+            SOCKS_ADDR_DOMAIN => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).await?;
+                let mut rest = vec![0u8; len[0] as usize + 2];
+                stream.read_exact(&mut rest).await?;
+            }
+            SOCKS_ADDR_IPV6 => {
+                let mut rest = [0u8; 18];
+                stream.read_exact(&mut rest).await?;
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid addr type",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn socks5_connect(
+        socks_addr: &str,
+        username: &str,
+        password: &str,
+        target_port: u16,
+    ) -> Result<TcpStream, SocksClientError> {
+        let mut stream = TcpStream::connect(socks_addr).await?;
+
+        stream
+            .write_all(&[
+                SOCKS_VERSION,
+                2,
+                SOCKS_AUTH_NONE,
+                SOCKS_AUTH_USERNAME_PASSWORD,
+            ])
+            .await?;
+
+        let mut method_reply = [0u8; 2];
+        stream.read_exact(&mut method_reply).await?;
+        if method_reply[0] != SOCKS_VERSION {
+            return Err(SocksClientError::InvalidReply("invalid method reply version"));
+        }
+        if method_reply[1] != SOCKS_AUTH_USERNAME_PASSWORD {
+            return Err(SocksClientError::InvalidReply(
+                "server did not choose username/password method",
+            ));
+        }
+
+        let mut auth_req = vec![0x01, username.len() as u8];
+        auth_req.extend_from_slice(username.as_bytes());
+        auth_req.push(password.len() as u8);
+        auth_req.extend_from_slice(password.as_bytes());
+        stream.write_all(&auth_req).await?;
+
+        let mut auth_reply = [0u8; 2];
+        stream.read_exact(&mut auth_reply).await?;
+        if auth_reply[0] != 0x01 {
+            return Err(SocksClientError::InvalidReply("invalid auth reply version"));
+        }
+        if auth_reply[1] != 0x00 {
+            return Err(SocksClientError::AuthFailed(auth_reply[1]));
+        }
+
+        let mut req = vec![SOCKS_VERSION, SOCKS_CMD_CONNECT, 0x00, SOCKS_ADDR_IPV4, 127, 0, 0, 1];
+        req.extend_from_slice(&target_port.to_be_bytes());
+        stream.write_all(&req).await?;
+
+        let mut reply_head = [0u8; 4];
+        stream.read_exact(&mut reply_head).await?;
+        if reply_head[0] != SOCKS_VERSION {
+            return Err(SocksClientError::InvalidReply("invalid connect reply version"));
+        }
+
+        read_socks_addr(&mut stream, reply_head[3]).await?;
+        if reply_head[1] != SOCKS_REPLY_SUCCEEDED {
+            return Err(SocksClientError::ConnectFailed(reply_head[1]));
+        }
+
+        Ok(stream)
     }
 
     #[tokio::test]
     async fn test_cyfs_gateway() {
         init_logging("test_cyfs_gateway", false);
+        let root_dir = tempfile::TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var("BUCKYOS_ROOT", root_dir.path().to_string_lossy().to_string());
+        }
+
+        let gateway_socks_user = "gateway_user";
+        let gateway_socks_pass = "gateway_pass";
+        let upstream_socks_user = "upstream_user";
+        let upstream_socks_pass = "upstream_pass";
+
+        let echo_direct_port = start_echo_server().await;
+        let echo_proxy_port = start_echo_server().await;
+        let reject_port = allocate_free_port().await;
+        let socks_stack_port = allocate_free_port().await;
+        let upstream_socks_stack_port = allocate_free_port().await;
+
         let config = include_str!("test_cyfs_gateway.yaml");
         let local_dns = include_str!("local_dns.toml");
         let config_file = tempfile::NamedTempFile::with_suffix(".yaml").unwrap();
@@ -107,7 +285,8 @@ mod tests {
         let config = config.replace("{{local_dns}}", local_dns_file.path().to_str().unwrap());
 
         let json_set = tempfile::NamedTempFile::with_suffix(".json").unwrap();
-        let config = config.replace("{{test_json_set}}", json_set.path().to_str().unwrap());
+        let json_set_path = json_set.path().to_path_buf();
+        let config = config.replace("{{test_json_set}}", json_set_path.to_str().unwrap());
 
         let json_map = tempfile::NamedTempFile::with_suffix(".json").unwrap();
         let config = config.replace("{{test_json_map}}", json_map.path().to_str().unwrap());
@@ -152,6 +331,14 @@ function test_js_hook(context, host) {
         let path = local_dir.path().join("index2.html");
         let raw_compress_body = "www.buckyos.comwww.buckyos.comwww.buckyos.comwww.buckyos.comwww.buckyos.comwww.buckyos.comwww.buckyos.comwww.buckyos.com";
         std::fs::write(path, raw_compress_body).unwrap();
+        let config = config.replace("{{socks_stack_port}}", socks_stack_port.to_string().as_str());
+        let config = config.replace("{{socks_user}}", gateway_socks_user);
+        let config = config.replace("{{socks_pass}}", gateway_socks_pass);
+        let config = config.replace("{{upstream_socks_user}}", upstream_socks_user);
+        let config = config.replace("{{upstream_socks_pass}}", upstream_socks_pass);
+        let config = config.replace("{{upstream_socks_stack_port}}", upstream_socks_stack_port.to_string().as_str());
+        let config = config.replace("{{echo_direct_port}}", echo_direct_port.to_string().as_str());
+        let config = config.replace("{{echo_proxy_port}}", echo_proxy_port.to_string().as_str());
 
         std::fs::write(config_file.path(), config).unwrap();
 
@@ -307,6 +494,32 @@ function test_js_hook(context, host) {
             let body = response.into_body();
             let data = body.collect().await.unwrap();
             assert_eq!(data.to_bytes().as_ref(), b"www.buckyos.com");
+        }
+
+        {
+            let stream = tokio::net::TcpStream::connect("127.0.0.1:18080").await.unwrap();
+
+            // 用hyper构造一个http请求
+            let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(stream)).await.unwrap();
+            let request = hyper::Request::get("/test_return")
+                .header("Host", "web3.buckyos.com")
+                .version(hyper::Version::HTTP_11)
+                .body(Full::new(Bytes::new())).unwrap();
+
+            tokio::spawn(async move {
+                conn.await.unwrap();
+            });
+
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), hyper::StatusCode::OK);
+            assert_eq!(response.headers().get("content-type").unwrap(), "text/html");
+            assert_eq!(response.headers().get("content-length").unwrap(), format!("{}", "web3.buckyos.com".len()).as_str());
+            // assert_eq!(response.headers().get("content-length").unwrap(), format!("{}", "www.buckyos.com".len()).as_str());
+            let body = response.into_body();
+            let data = body.collect().await.unwrap();
+            assert_eq!(data.to_bytes().as_ref(), b"web3.buckyos.com");
+            // assert_eq!(data.to_bytes().as_ref(), b"www.buckyos.com");
         }
 
         {
@@ -786,5 +999,84 @@ function test_js_hook(context, host) {
             let ret = tokio::net::TcpStream::connect("127.0.0.1:19080").await;
             assert!(ret.is_err());
         }
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let ret = socks5_connect(
+                format!("127.0.0.1:{}", socks_stack_port).as_str(),
+                gateway_socks_user,
+                "wrong_password",
+                echo_direct_port,
+            )
+            .await;
+            assert!(matches!(ret, Err(SocksClientError::AuthFailed(_))));
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut stream = socks5_connect(
+                format!("127.0.0.1:{}", socks_stack_port).as_str(),
+                gateway_socks_user,
+                gateway_socks_pass,
+                echo_direct_port,
+            )
+            .await
+            .unwrap();
+            let payload = b"socks-direct";
+            stream.write_all(payload).await.unwrap();
+            let mut recv = vec![0u8; payload.len()];
+            stream.read_exact(&mut recv).await.unwrap();
+            assert_eq!(recv.as_slice(), payload);
+        })
+        .await
+        .unwrap();
+
+        let json_set_content = std::fs::read_to_string(&json_set_path).unwrap_or_default();
+        if !json_set_content.is_empty() {
+            let set: HashSet<String> = serde_json::from_str(json_set_content.as_str()).unwrap();
+            assert!(!set.contains("upstream_socks_hit"));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let ret = socks5_connect(
+                format!("127.0.0.1:{}", socks_stack_port).as_str(),
+                gateway_socks_user,
+                gateway_socks_pass,
+                reject_port,
+            )
+            .await;
+
+            match ret {
+                Err(SocksClientError::ConnectFailed(code)) => {
+                    assert_eq!(code, 0x04);
+                }
+                _ => panic!("expected socks connect failure"),
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut stream = socks5_connect(
+                format!("127.0.0.1:{}", socks_stack_port).as_str(),
+                gateway_socks_user,
+                gateway_socks_pass,
+                echo_proxy_port,
+            )
+            .await
+            .unwrap();
+            let payload = b"socks-proxy";
+            stream.write_all(payload).await.unwrap();
+            let mut recv = vec![0u8; payload.len()];
+            stream.read_exact(&mut recv).await.unwrap();
+            assert_eq!(recv.as_slice(), payload);
+        })
+        .await
+        .unwrap();
+
+        let json_set_content = std::fs::read_to_string(&json_set_path).unwrap_or_default();
+        assert!(!json_set_content.is_empty());
+        let set: HashSet<String> = serde_json::from_str(json_set_content.as_str()).unwrap();
+        assert!(set.contains("upstream_socks_hit"));
     }
 }

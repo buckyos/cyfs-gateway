@@ -17,6 +17,10 @@ use percent_encoding::percent_decode_str;
 use sha2::{Digest, Sha256};
 use url::Url;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, IntoRawFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
@@ -63,6 +67,14 @@ impl RTcp {
         }
     }
 
+    pub fn set_reuse_address(&mut self, reuse_address: bool) {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.reuse_address = reuse_address;
+        } else {
+            warn!("set_reuse_address ignored: rtcp already shared");
+        }
+    }
+
     pub async fn start(&mut self) -> TunnelResult<()> {
         let inner = self.inner.clone();
         let handle = inner.start().await?;
@@ -84,6 +96,7 @@ struct RTcpInner {
     listener: RTcpListenerRef,
 
     bind_addr: String,
+    reuse_address: bool,
     this_device_did: DID, //name or did
     this_device_ed25519_sk: Option<EncodingKey>,
     this_device_x25519_sk: Option<StaticSecret>,
@@ -125,6 +138,7 @@ impl RTcpInner {
 
             listener,
             bind_addr,
+            reuse_address: false,
             this_device_did,
             this_device_ed25519_sk: this_device_ed25519_sk, //for sign tunnel token
             this_device_x25519_sk: this_device_x25519_sk,   //for decode tunnel token from remote
@@ -279,7 +293,56 @@ impl RTcpInner {
     }
 
     pub async fn start(self: &Arc<Self>) -> TunnelResult<JoinHandle<()>> {
-        let rtcp_listener = TcpListener::bind(&self.bind_addr).await.map_err(|e| {
+        let addr: SocketAddr = self.bind_addr.parse().map_err(|e| {
+            let msg = format!("invalid bind address {}: {}", self.bind_addr, e);
+            error!("{}", msg);
+            TunnelError::BindError(msg)
+        })?;
+        let sockaddr: socket2::SockAddr = addr.into();
+        let domain = match addr {
+            std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
+            std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+            .map_err(|e| {
+                let msg = format!("create socket error:{}", e);
+                error!("{}", msg);
+                TunnelError::BindError(msg)
+            })?;
+        socket.set_nonblocking(true).map_err(|e| {
+            let msg = format!("set nonblocking error:{}", e);
+            error!("{}", msg);
+            TunnelError::BindError(msg)
+        })?;
+        #[cfg(target_os = "linux")]
+        {
+            if self.reuse_address {
+                socket.set_reuse_address(true).map_err(|e| {
+                    let msg = format!("set reuse address error:{}", e);
+                    error!("{}", msg);
+                    TunnelError::BindError(msg)
+                })?;
+            }
+        }
+        socket.bind(&sockaddr).map_err(|e| {
+            let msg = format!("bind rtcp listener error:{}", e);
+            error!("{}", msg);
+            TunnelError::BindError(msg)
+        })?;
+        socket.listen(1024).map_err(|e| {
+            let msg = format!("listen rtcp listener error:{}", e);
+            error!("{}", msg);
+            TunnelError::BindError(msg)
+        })?;
+        #[cfg(unix)]
+        let std_listener = unsafe {
+            std::net::TcpListener::from_raw_fd(socket.into_raw_fd())
+        };
+        #[cfg(windows)]
+        let std_listener = unsafe {
+            std::net::TcpListener::from_raw_socket(socket.into_raw_socket())
+        };
+        let rtcp_listener = TcpListener::from_std(std_listener).map_err(|e| {
             let msg = format!("bind rtcp listener error:{}", e);
             error!("{}", msg);
             TunnelError::BindError(msg)

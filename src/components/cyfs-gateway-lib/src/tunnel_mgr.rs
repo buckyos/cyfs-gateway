@@ -9,6 +9,7 @@ use buckyos_kit::AsyncStream;
 use log::*;
 use url::Url;
 use crate::quic_tunnel::QuicTunnelBuilder;
+use crate::socks::SocksTunnelBuilder;
 use crate::tls_tunnel::TlsTunnelBuilder;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,6 +59,7 @@ impl TunnelManager {
         this.register_tunnel_builder("udp", Arc::new(IPTunnelBuilder::new()));
         this.register_tunnel_builder("quic", Arc::new(QuicTunnelBuilder::new()));
         this.register_tunnel_builder("tls", Arc::new(TlsTunnelBuilder::new()));
+        this.register_tunnel_builder("socks", Arc::new(SocksTunnelBuilder::new()));
 
         this
     }
@@ -95,7 +97,13 @@ impl TunnelManager {
                 error!("Get tunnel builder by protocol failed: {:?}", e);
                 e
             })?;
-        let tunnel = builder.create_tunnel(target_url.host_str())
+            let auth = target_url.authority();
+        let tunnel_stack_id = if auth.is_empty() {
+                None
+            } else {
+                Some(auth)
+        };
+        let tunnel = builder.create_tunnel(tunnel_stack_id)
             .await.map_err(|e| {
                 error!("create_tunnel to {} failed: {:?}", target_url, e);
                 e
@@ -153,6 +161,61 @@ impl TunnelManager {
 
 
 mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct MockTunnel {
+    }
+
+    #[async_trait]
+    impl crate::Tunnel for MockTunnel {
+        async fn ping(&self) -> Result<(), io::Error> {
+            Ok(())
+        }
+
+        async fn open_stream_by_dest(
+            &self,
+            _dest_port: u16,
+            _dest_host: Option<String>,
+        ) -> Result<Box<dyn AsyncStream>, io::Error> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "not used in test"))
+        }
+
+        async fn open_stream(&self, _stream_id: &str) -> Result<Box<dyn AsyncStream>, io::Error> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "not used in test"))
+        }
+
+        async fn create_datagram_client_by_dest(
+            &self,
+            _dest_port: u16,
+            _dest_host: Option<String>,
+        ) -> Result<Box<dyn crate::DatagramClientBox>, io::Error> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "not used in test"))
+        }
+
+        async fn create_datagram_client(
+            &self,
+            _session_id: &str,
+        ) -> Result<Box<dyn crate::DatagramClientBox>, io::Error> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "not used in test"))
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockTunnelBuilder {
+        captured: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl TunnelBuilder for MockTunnelBuilder {
+        async fn create_tunnel(&self, tunnel_stack_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>> {
+            *self.captured.lock().unwrap() = tunnel_stack_id.map(|s| s.to_string());
+            Ok(Box::new(MockTunnel::default()))
+        }
+    }
 
 
 
@@ -188,5 +251,39 @@ mod tests {
         println!("decoded_path: {}", decoded_path);
         assert_eq!(decoded_path, embedded_url);
 
+    }
+
+    #[tokio::test]
+    async fn test_get_tunnel_preserves_socks_authority() {
+        let manager = TunnelManager::new();
+        let captured = Arc::new(Mutex::new(None));
+        let builder = MockTunnelBuilder {
+            captured: captured.clone(),
+        };
+        manager.register_tunnel_builder("socks", Arc::new(builder));
+
+        let url = Url::parse("socks://u:p@127.0.0.1:12345").unwrap();
+        let ret = manager.get_tunnel(&url, None).await;
+        assert!(ret.is_ok());
+
+        let value = captured.lock().unwrap().clone();
+        assert_eq!(value.as_deref(), Some("u:p@127.0.0.1:12345"));
+    }
+
+    #[tokio::test]
+    async fn test_get_tunnel_non_socks_keeps_host_only_behavior() {
+        let manager = TunnelManager::new();
+        let captured = Arc::new(Mutex::new(None));
+        let builder = MockTunnelBuilder {
+            captured: captured.clone(),
+        };
+        manager.register_tunnel_builder("tcp", Arc::new(builder));
+
+        let url = Url::parse("tcp://127.0.0.1:18080").unwrap();
+        let ret = manager.get_tunnel(&url, None).await;
+        assert!(ret.is_ok());
+
+        let value = captured.lock().unwrap().clone();
+        assert_eq!(value.as_deref(), Some("127.0.0.1:18080"));
     }
 }

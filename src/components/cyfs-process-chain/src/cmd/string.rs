@@ -1138,10 +1138,14 @@ impl CommandExecutor for StringStartsWithCommand {
             string_value.starts_with(&prefix)
         };
 
-        info!(
-            "String '{}' starts with '{}': {}",
-            string_value, prefix, starts_with
-        );
+        // This command is frequently used in routing rules; logging every false
+        // predicate at INFO is noisy. Keep a single INFO line only on matches,
+        // and leave the full trace at DEBUG when needed.
+        if starts_with {
+            info!("starts-with matched str='{}' prefix='{}'", string_value, prefix);
+        } else {
+            debug!("starts-with not-matched str='{}' prefix='{}'", string_value, prefix);
+        }
 
         if starts_with {
             Ok(super::CommandResult::success_with_value("true"))
@@ -1282,10 +1286,11 @@ impl CommandExecutor for StringEndsWithCommand {
             string_value.ends_with(&suffix)
         };
 
-        info!(
-            "String '{}' ends with '{}': {}",
-            string_value, suffix, ends_with
-        );
+        if ends_with {
+            info!("ends-with matched str='{}' suffix='{}'", string_value, suffix);
+        } else {
+            debug!("ends-with not-matched str='{}' suffix='{}'", string_value, suffix);
+        }
 
         if ends_with {
             Ok(super::CommandResult::success_with_value("true"))

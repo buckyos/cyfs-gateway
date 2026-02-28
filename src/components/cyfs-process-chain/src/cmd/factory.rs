@@ -1,4 +1,5 @@
 use super::action::ActionCommandParser;
+use super::capture::CaptureCommandParser;
 use super::cmd::*;
 use super::coll::*;
 use super::control::*;
@@ -81,6 +82,7 @@ impl CommandParserFactory {
         self.register("assign", Arc::new(Box::new(AssignCommandParser::new())));
         self.register("delete", Arc::new(Box::new(DeleteCommandParser::new())));
         self.register("type", Arc::new(Box::new(TypeCommandParser::new())));
+        self.register("capture", Arc::new(Box::new(CaptureCommandParser::new())));
 
         // match command
         self.register("match", Arc::new(Box::new(MatchCommandParser::new())));

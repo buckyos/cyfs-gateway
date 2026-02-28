@@ -365,14 +365,14 @@ async fn test_http_probe() {
     });
 
     // Start the forward server to handle incoming connections
-    start_forward_server(1002).await;
+    start_forward_server(10020).await;
 
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
 
     let req = Request::builder()
         .method(Method::GET)
         .header("content-type", "text/html")
-        .uri("http://127.0.0.1:1002/index.html")
+        .uri("http://127.0.0.1:10020/index.html")
         .header("HOST", "buckyos.com")
         .body(Full::new(Bytes::new()))
         .expect("Failed to build request");
