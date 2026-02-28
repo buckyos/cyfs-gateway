@@ -3,11 +3,31 @@
 # - Default binds to 0.0.0.0:80
 
 # includes:            # extra config files or directories (merged in order), paths are relative to this file
+#                      # NOTE: use `includes` (new style); `include` is kept for compatibility in some flows
 #   - path: extra.yaml
 #   - path: configs/
 
 # user_name: "root"    # console login username, optional
 # password: "123456"   # console login password, optional (plain text, hashed on login)
+
+# js_externals:         # external JS commands (optional)
+#   geo_block: ./scripts/geo_block.js
+#   custom_auth: ./scripts/custom_auth.js
+
+# timers:               # periodic process-chain tasks (optional)
+#   clean_cache:
+#     timeout: 300      # seconds, must be > 0
+#     process-chain: |
+#       echo "clean cache";
+#   metrics_report:
+#     timeout: 60
+#     process_chain: |
+#       echo "report metrics"; # process-chain / process_chain both supported
+
+# device_manager:       # device online-state manager (optional)
+#   enabled: true
+#   offline_timeout_seconds: 600   # default 600
+#   cleanup_interval_seconds: 60   # default 60
 
 # acme:               # ACME certificate config (optional)
 #   account: "admin@example.com"  # ACME account
@@ -80,7 +100,12 @@ stacks:
     protocol: tcp                 # tcp | udp | tls | quic | rtcp | tun
     bind: 0.0.0.0:80            # bind address
     # transparent: false          # transparent proxy mode (tcp/udp optional, default false)
-    # reuse_address: false      # set EADDRINUSE on socket, default false, linux only
+    # reuse_address: false        # SO_REUSEADDR (optional, default false)
+    # io_dump_file: tcp.dump      # enable io dump; relative path resolves to service data dir/dumps/
+    # io_dump_rotate_size: 1GB    # rotate size; supports B/KB/MB/GB/TB
+    # io_dump_rotate_max_files: 8 # optional, keep at most N rotated files
+    # io_dump_max_upload_bytes_per_conn: 1MB   # optional, default 1MB
+    # io_dump_max_download_bytes_per_conn: 1MB # optional, default 1MB
     hook_point: # process chains (map form, converted to array)
       main:
         priority: 1000
@@ -96,6 +121,8 @@ stacks:
     #   concurrency: 200            # default 200
     #   session_idle_time: 120      # session timeout (seconds), default 120
     #   transparent: false
+    #   reuse_address: false
+    #   io_dump_file: udp.dump
     #   hook_point: { }
 
     # tls_example:
@@ -103,6 +130,8 @@ stacks:
     #   bind: 0.0.0.0:443
     #   concurrency: 0              # default 0 (unlimited)
     #   alpn_protocols: ["http/1.1"] # default http/1.1, supports h2/h3
+    #   reuse_address: false
+    #   io_dump_file: tls.dump
     #   certs:
     #     - domain: example.com # local certificate
     #       cert_path: ./cert.pem
@@ -117,6 +146,8 @@ stacks:
     #   bind: 0.0.0.0:4433
     #   concurrency: 1024           # default 1024
     #   alpn_protocols: ["h3"] # supports h2/h3
+    #   reuse_address: false
+    #   io_dump_file: quic.dump
     #   certs:
     #     - domain: example.com # local certificate
     #       cert_path: ./cert.pem
@@ -132,6 +163,8 @@ stacks:
     #   key_path: ./sn_private_key.pem
     #   device_config_path: ./sn_device_config.json
     #   name: optional_name
+    #   reuse_address: false
+    #   io_dump_file: rtcp.dump
     #   hook_point: { }
 
     # tun_example:
@@ -141,6 +174,7 @@ stacks:
     #   mtu: 1500                   # default 1500
     #   tcp_timeout: 60             # default 60
     #   udp_timeout: 60             # default 60
+    #   io_dump_file: tun.dump
     #   hook_point: { }
 
     #servers:
@@ -149,6 +183,26 @@ stacks:
     #     type: http
     #     version: "HTTP/1.1"         # optional: HTTP/1.1, HTTP/2, HTTP/3; default HTTP/1.1
     #     h3_port: 443                # optional: HTTP/3 port
+    #     post_hook_point:            # optional response post-processing hook
+    #       main:
+    #         priority: 1
+    #         blocks:
+    #           default:
+    #             priority: 1
+    #             block: |
+    #               map-add RESP x-from-gateway true;
+    #     gzip: false                 # default false
+    #     gzip_types: []              # optional content-types white list
+    #     gzip_min_length: 20         # default 20 bytes
+    #     gzip_comp_level: 1          # default 1, range 1..9
+    #     gzip_http_version: "1.1"    # default 1.1
+    #     gzip_vary: false            # default false
+    #     gzip_disable: "msie6"       # optional regex
+    #     gzip_request: false         # default false, unzip gzip request body
+    #     brotli: false               # default false
+    #     brotli_types: []            # optional content-types white list
+    #     brotli_min_length: 20       # default 20 bytes
+    #     brotli_comp_level: 4        # default 4, range 0..11
     #    hook_point:
     #      main:
     #        priority: 1
@@ -161,9 +215,12 @@ stacks:
     #  http_dir:
     #    type: dir
     #    root_path: ./www              # static directory
-    # version: "HTTP/1.1"         # optional: HTTP/1.1, HTTP/2; default HTTP/1.1
-    # index_file: index.html
-    # fallback_file: 404.html
+    #    version: "HTTP/1.1"         # optional: HTTP/1.1, HTTP/2; default HTTP/1.1
+    #    index_file: index.html
+    #    fallback_file: 404.html
+    #    autoindex: false             # default false, list dir when no index_file
+    #    etag: true                   # default true
+    #    if_modified_since: "exact"   # optional; exact | before | off
 
   # dns_example:
   #   type: dns
@@ -198,6 +255,8 @@ stacks:
   #   target: "http://127.0.0.1:1080"
   #   username: ""  # if username/password are absent, no password is set
   #   password: ""
+  #   enable_tunnel: []               # optional allowed tunnel schemes list
+  #   rule_config: ./socks_rules.yaml # optional rule file path
   #   hook_point:
   #     main:
   #       priority: 1
