@@ -8,6 +8,7 @@ const PROCESS_CHAIN_LIB_VAR: &str = r#"
         <block id="route">
             <![CDATA[
                 local clientIp=$REQ.clientIp;
+                local tmp = $geoByIp.($REQ.clientIp).country;
                 local geo_country=$geoByIp.($clientIp).country;
                 local geo_isp=$geoByIp.($clientIp).isp;
 
@@ -47,13 +48,13 @@ async fn set_client_ip(req: &MapCollectionRef, client_ip: &str) {
 #[tokio::test]
 async fn test_dynamic_map_lookup_routing() {
     TermLogger::init(
-        LevelFilter::Info,
+        LevelFilter::Debug,
         Config::default(),
         TerminalMode::Mixed,
         ColorChoice::Auto,
     )
     .unwrap_or_else(|_| {
-        let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
+        let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
     });
 
     let hook_point = HookPoint::new("test_var");
@@ -70,35 +71,35 @@ async fn test_dynamic_map_lookup_routing() {
     // Use '_' instead of '.' in keys because '.' is the path separator in process-chain vars.
     geo_by_ip
         .insert(
-            "1_2_3_4",
+            "1.2.3.4",
             CollectionValue::Map(make_geo_entry("CN", "中国电信", "Shenzhen").await),
         )
         .await
         .unwrap();
     geo_by_ip
         .insert(
-            "5_6_7_8",
+            "5.6.7.8",
             CollectionValue::Map(make_geo_entry("CN", "中国联通", "Guangzhou").await),
         )
         .await
         .unwrap();
     geo_by_ip
         .insert(
-            "9_9_9_9",
+            "9.9.9.9",
             CollectionValue::Map(make_geo_entry("US", "Comcast", "SanJose").await),
         )
         .await
         .unwrap();
     geo_by_ip
         .insert(
-            "8_8_8_8",
+            "8.8.8.8",
             CollectionValue::Map(make_geo_entry("CN", "OtherIsp", "Beijing").await),
         )
         .await
         .unwrap();
 
     let req = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
-    set_client_ip(&req, "1_2_3_4").await;
+    set_client_ip(&req, "1.2.3.4").await;
 
     hook_point_env
         .hook_point_env()
@@ -113,19 +114,19 @@ async fn test_dynamic_map_lookup_routing() {
 
     let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
 
-    set_client_ip(&req, "1_2_3_4").await;
+    set_client_ip(&req, "1.2.3.4").await;
     let ret = exec.execute_lib("test_var_lib").await.unwrap();
     assert_eq!(ret.value(), "upstreamA");
 
-    set_client_ip(&req, "5_6_7_8").await;
+    set_client_ip(&req, "5.6.7.8").await;
     let ret = exec.execute_lib("test_var_lib").await.unwrap();
     assert_eq!(ret.value(), "upstreamB");
 
-    set_client_ip(&req, "9_9_9_9").await;
+    set_client_ip(&req, "9.9.9.9").await;
     let ret = exec.execute_lib("test_var_lib").await.unwrap();
     assert_eq!(ret.value(), "upstreamC");
 
-    set_client_ip(&req, "8_8_8_8").await;
+    set_client_ip(&req, "8.8.8.8").await;
     let ret = exec.execute_lib("test_var_lib").await.unwrap();
     assert_eq!(ret.value(), "upstreamDefault");
 }
