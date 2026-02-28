@@ -153,7 +153,10 @@ mod tests {
     use super::*;
     use crate::{SocksDataTunnelProvider, SocksError, SocksResult};
     use buckyos_kit::AsyncStream;
-    use cyfs_gateway_lib::{BlockConfig, GlobalCollectionManager, GlobalProcessChains, ProcessChainConfig};
+    use cyfs_gateway_lib::{
+        BlockConfig, GlobalCollectionManager, GlobalProcessChains, JsExternalsManager,
+        ProcessChainConfig,
+    };
     use fast_socks5::consts;
     use fast_socks5::util::target_addr::TargetAddr;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -259,6 +262,7 @@ mod tests {
 
         let context = SocksServerContext::new(
             Arc::new(GlobalProcessChains::new()),
+            Arc::new(JsExternalsManager::new()),
             GlobalCollectionManager::create(vec![]).await.unwrap(),
             provider,
         );
