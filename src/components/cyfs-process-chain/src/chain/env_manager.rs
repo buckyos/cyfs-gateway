@@ -198,7 +198,40 @@ impl EnvManager {
     }
 
     fn parse_var(key: &str) -> Vec<String> {
-        key.split('.')
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut escaped = false;
+
+        for ch in key.chars() {
+            if escaped {
+                current.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+
+            if ch == '.' {
+                parts.push(current);
+                current = String::new();
+                continue;
+            }
+
+            current.push(ch);
+        }
+
+        if escaped {
+            // Keep a trailing escape as a literal backslash.
+            current.push('\\');
+        }
+
+        parts.push(current);
+
+        parts
+            .into_iter()
             .map(|part| {
                 let part = part.trim();
                 if part.len() >= 2 && part.starts_with('(') && part.ends_with(')') {
@@ -562,6 +595,15 @@ mod tests {
         assert_eq!(
             EnvManager::parse_var("a.(b).(c)"),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("geoByIp.1\\.2\\.3\\.4.country"),
+            vec![
+                "geoByIp".to_string(),
+                "1.2.3.4".to_string(),
+                "country".to_string()
+            ]
         );
     }
 }

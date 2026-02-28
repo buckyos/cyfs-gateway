@@ -183,6 +183,19 @@ impl CommandArgEvaluator {
         None
     }
 
+    fn escape_path_segment(segment: &str) -> String {
+        let mut escaped = String::with_capacity(segment.len());
+        for ch in segment.chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '.' => escaped.push_str("\\."),
+                _ => escaped.push(ch),
+            }
+        }
+
+        escaped
+    }
+
     #[async_recursion::async_recursion]
     async fn resolve_dynamic_var_path(var: &str, context: &Context) -> Result<String, String> {
         let mut i = 0usize;
@@ -233,7 +246,9 @@ impl CommandArgEvaluator {
                     inner.to_string()
                 };
 
-                resolved.push_str(&segment);
+                // Dynamic segment value is a single path token. Escape separators
+                // so map keys like IP/domain are not split by '.' later.
+                resolved.push_str(&Self::escape_path_segment(&segment));
                 i = end + 1;
                 continue;
             }
