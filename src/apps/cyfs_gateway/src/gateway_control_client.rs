@@ -173,13 +173,13 @@ impl GatewayControlClient {
     }
 
     pub async fn get_connection_devices(&self) -> ControlResult<Value> {
-        let result = self.krpc.call("get_connection_devices", Value::Null).await
+        let result = self.call("get_connection_devices", Value::Null).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
 
     pub async fn collection_list(&self) -> ControlResult<Value> {
-        let result = self.krpc.call("collection_list", Value::Null).await
+        let result = self.call("collection_list", Value::Null).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
@@ -190,7 +190,7 @@ impl GatewayControlClient {
         if let Some(key) = key {
             params.insert("key", key);
         }
-        let result = self.krpc.call("collection_get", serde_json::to_value(&params).unwrap()).await
+        let result = self.call("collection_get", serde_json::to_value(&params).unwrap()).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
@@ -199,7 +199,7 @@ impl GatewayControlClient {
         let mut params = HashMap::new();
         params.insert("name", name);
         params.insert("value", value);
-        let result = self.krpc.call("collection_set_add", serde_json::to_value(&params).unwrap()).await
+        let result = self.call("collection_set_add", serde_json::to_value(&params).unwrap()).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
@@ -208,7 +208,7 @@ impl GatewayControlClient {
         let mut params = HashMap::new();
         params.insert("name", name);
         params.insert("value", value);
-        let result = self.krpc.call("collection_set_del", serde_json::to_value(&params).unwrap()).await
+        let result = self.call("collection_set_del", serde_json::to_value(&params).unwrap()).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
@@ -218,7 +218,7 @@ impl GatewayControlClient {
         params.insert("name", name);
         params.insert("key", key);
         params.insert("value", value);
-        let result = self.krpc.call("collection_map_put", serde_json::to_value(&params).unwrap()).await
+        let result = self.call("collection_map_put", serde_json::to_value(&params).unwrap()).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
@@ -227,7 +227,7 @@ impl GatewayControlClient {
         let mut params = HashMap::new();
         params.insert("name", name);
         params.insert("key", key);
-        let result = self.krpc.call("collection_map_del", serde_json::to_value(&params).unwrap()).await
+        let result = self.call("collection_map_del", serde_json::to_value(&params).unwrap()).await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
