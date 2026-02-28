@@ -324,11 +324,20 @@ impl MapCollection for StreamRequestMap {
             "dest_addr" => Ok(request
                 .dest_addr
                 .map(|addr| CollectionValue::String(addr.to_string()))),
+            "dest_ip" => Ok(request
+                .dest_addr
+                .map(|addr| CollectionValue::String(addr.ip().to_string()))),
             "app_protocol" => Ok(request.app_protocol.clone().map(CollectionValue::String)),
             "dest_url" => Ok(request.dest_url.clone().map(CollectionValue::String)),
             "source_addr" => Ok(request
                 .source_addr
                 .map(|addr| CollectionValue::String(addr.to_string()))),
+            "source_ip" => Ok(request
+                .source_addr
+                .map(|addr| CollectionValue::String(addr.ip().to_string()))),
+            "source_port" => Ok(request
+                .source_addr
+                .map(|addr| CollectionValue::String(addr.port().to_string()))),
             "source_mac" => Ok(request.source_mac.clone().map(CollectionValue::String)),
             "source_hostname" => Ok(request.source_hostname.clone().map(CollectionValue::String)),
             "source_device_id" => Ok(request
@@ -360,9 +369,12 @@ impl MapCollection for StreamRequestMap {
             "dest_port" => Ok(true),
             "dest_host" => Ok(request.dest_host.is_some()),
             "dest_addr" => Ok(request.dest_addr.is_some()),
+            "dest_ip" => Ok(request.dest_addr.is_some()),
             "app_protocol" => Ok(request.app_protocol.is_some()),
             "dest_url" => Ok(request.dest_url.is_some()),
             "source_addr" => Ok(request.source_addr.is_some()),
+            "source_ip" => Ok(request.source_addr.is_some()),
+            "source_port" => Ok(request.source_addr.is_some()),
             "source_mac" => Ok(request.source_mac.is_some()),
             "source_hostname" => Ok(request.source_hostname.is_some()),
             "source_device_id" => Ok(request.source_device_id.is_some()),
@@ -435,6 +447,13 @@ impl MapCollection for StreamRequestMap {
                     .unwrap_or_default(),
             ),
             (
+                "dest_ip",
+                request
+                    .dest_addr
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
                 "app_protocol",
                 request.app_protocol.clone().unwrap_or_default(),
             ),
@@ -444,6 +463,20 @@ impl MapCollection for StreamRequestMap {
                 request
                     .source_addr
                     .map(|addr| addr.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "source_ip",
+                request
+                    .source_addr
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "source_port",
+                request
+                    .source_addr
+                    .map(|addr| addr.port().to_string())
                     .unwrap_or_default(),
             ),
             ("source_mac", request.source_mac.clone().unwrap_or_default()),
@@ -494,6 +527,10 @@ impl MapCollection for StreamRequestMap {
                 "dest_addr".to_string(),
                 CollectionValue::String(addr.to_string()),
             ));
+            result.push((
+                "dest_ip".to_string(),
+                CollectionValue::String(addr.ip().to_string()),
+            ));
         }
         if let Some(protocol) = &request.app_protocol {
             result.push((
@@ -508,6 +545,14 @@ impl MapCollection for StreamRequestMap {
             result.push((
                 "source_addr".to_string(),
                 CollectionValue::String(addr.to_string()),
+            ));
+            result.push((
+                "source_ip".to_string(),
+                CollectionValue::String(addr.ip().to_string()),
+            ));
+            result.push((
+                "source_port".to_string(),
+                CollectionValue::String(addr.port().to_string()),
             ));
         }
         if let Some(mac) = &request.source_mac {

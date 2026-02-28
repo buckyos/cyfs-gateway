@@ -177,6 +177,11 @@ impl QuicConnectionHandler {
         let map = MemoryMapCollection::new_ref();
         map.insert("dest_host", CollectionValue::String(server_name)).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_ip", CollectionValue::String(remote_addr.ip().to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_port", CollectionValue::String(remote_addr.port().to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_addr", CollectionValue::String(local_addr.to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_ip", CollectionValue::String(local_addr.ip().to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_port", CollectionValue::String(local_addr.port().to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         let device_info = self
             .connection_manager
             .as_ref()
@@ -356,7 +361,7 @@ impl QuicConnectionHandler {
                                                     let resp = server
                                                         .serve_request(
                                                             req,
-                                                            StreamInfo::new(remote_addr.to_string()).with_device_info(
+                                                            StreamInfo::new(remote_addr.to_string()).with_dst_addr(Some(local_addr.to_string())).with_device_info(
                                                                 device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
                                                                 device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
                                                                 device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
@@ -437,7 +442,7 @@ impl QuicConnectionHandler {
                                                 if let Err(e) = server
                                                     .serve_connection(
                                                         stream,
-                                                        StreamInfo::new(remote_addr.to_string()).with_device_info(
+                                                        StreamInfo::new(remote_addr.to_string()).with_dst_addr(Some(local_addr.to_string())).with_device_info(
                                                             device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
                                                             device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
                                                             device_info.as_ref().map(|v| v.today_online_seconds().to_string()),

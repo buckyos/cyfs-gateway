@@ -116,7 +116,7 @@ impl RtcpConnectionHandler {
         _endpoint: TunnelEndpoint,
         stat: MutComposedSpeedStatRef,
         remote_addr: SocketAddr,
-        _local_addr: SocketAddr
+        local_addr: SocketAddr
     ) -> StackResult<()> {
         let executor = self.executor.fork();
         let servers = self.env.servers.clone();
@@ -130,6 +130,14 @@ impl RtcpConnectionHandler {
         let remote_addr_str = remote_addr.to_string();
         let map = MemoryMapCollection::new_ref();
         map.insert("source_addr", CollectionValue::String(remote_addr_str.clone())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_ip", CollectionValue::String(remote_addr.ip().to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_port", CollectionValue::String(remote_addr.port().to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_addr", CollectionValue::String(local_addr.to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_ip", CollectionValue::String(local_addr.ip().to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("dest_port", CollectionValue::String(dest_port.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -226,7 +234,7 @@ impl RtcpConnectionHandler {
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
                                     Server::Http(server) => {
-                                        let stream_info = StreamInfo::new(remote_addr_str.clone()).with_device_info(
+                                        let stream_info = StreamInfo::new(remote_addr_str.clone()).with_dst_addr(Some(local_addr.to_string())).with_device_info(
                                             device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
                                             device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
                                             device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
@@ -235,7 +243,7 @@ impl RtcpConnectionHandler {
                                             .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
                                     }
                                     Server::Stream(server) => {
-                                        let stream_info = StreamInfo::new(remote_addr_str.clone()).with_device_info(
+                                        let stream_info = StreamInfo::new(remote_addr_str.clone()).with_dst_addr(Some(local_addr.to_string())).with_device_info(
                                             device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
                                             device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
                                             device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
@@ -274,7 +282,7 @@ impl RtcpConnectionHandler {
         _endpoint: TunnelEndpoint,
         stat: MutComposedSpeedStatRef,
         remote_addr: SocketAddr,
-        _local_addr: SocketAddr
+        local_addr: SocketAddr
     ) -> StackResult<()> {
         let executor = self.executor.fork();
         let servers = self.env.servers.clone();
@@ -287,6 +295,14 @@ impl RtcpConnectionHandler {
             });
         let map = MemoryMapCollection::new_ref();
         map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_ip", CollectionValue::String(remote_addr.ip().to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_port", CollectionValue::String(remote_addr.port().to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_addr", CollectionValue::String(local_addr.to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_ip", CollectionValue::String(local_addr.ip().to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("dest_port", CollectionValue::String(dest_port.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -388,7 +404,7 @@ impl RtcpConnectionHandler {
                                         loop {
                                             let len = datagram_stream.recv_datagram(&mut buf).await
                                                 .map_err(into_stack_err!(StackErrorCode::IoError, "recv datagram error"))?;
-                                            let resp = server.serve_datagram(&buf[..len], DatagramInfo::new(Some(remote_addr.to_string())).with_device_info(
+                                            let resp = server.serve_datagram(&buf[..len], DatagramInfo::new(Some(remote_addr.to_string())).with_dst_addr(Some(local_addr.to_string())).with_device_info(
                                                 device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
                                                 device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
                                                 device_info.as_ref().map(|v| v.today_online_seconds().to_string()),

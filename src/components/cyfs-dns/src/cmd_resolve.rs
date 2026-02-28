@@ -115,7 +115,10 @@ fn parse_ipv6_arpa_name(domain: &str) -> Option<IpAddr> {
         hex.push(c);
     }
 
-    Ipv6Addr::from_str(hex.as_str()).ok().map(IpAddr::V6)
+    u128::from_str_radix(hex.as_str(), 16)
+        .ok()
+        .map(Ipv6Addr::from)
+        .map(IpAddr::V6)
 }
 
 fn normalize_ptr_query_name(domain: &str, record_type: RecordType) -> String {

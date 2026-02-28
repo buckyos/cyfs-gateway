@@ -104,6 +104,10 @@ impl UdpDatagramHandler {
         let map = MemoryMapCollection::new_ref();
         map.insert("source_addr", CollectionValue::String(src_addr.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_addr error: {}", e))?;
+        map.insert("source_ip", CollectionValue::String(src_addr.ip().to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_ip error: {}", e))?;
+        map.insert("source_port", CollectionValue::String(src_addr.port().to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_port error: {}", e))?;
 
         if let Some(device_info) = state
             .connection_manager
@@ -128,6 +132,10 @@ impl UdpDatagramHandler {
 
         map.insert("dest_addr", CollectionValue::String(dest_addr.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert source_addr error: {}", e))?;
+        map.insert("dest_ip", CollectionValue::String(dest_addr.ip().to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert dest_ip error: {}", e))?;
+        map.insert("dest_port", CollectionValue::String(dest_addr.port().to_string())).await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "insert dest_port error: {}", e))?;
 
         global_env.create("REQ", CollectionValue::Map(map)).await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create chain env error: {}", e))?;
@@ -376,8 +384,11 @@ impl UdpDatagramHandler {
                                             loop {
                                                 match receive_datagram.recv_from(&mut buffer).await {
                                                     Ok(len) => {
-                                                        let buf = match datagram_server.serve_datagram(&buffer[0..len],
-                                                                                              DatagramInfo::new(Some(src_addr.to_string()))).await {
+                                                        let buf = match datagram_server.serve_datagram(
+                                                            &buffer[0..len],
+                                                            DatagramInfo::new(Some(src_addr.to_string()))
+                                                                .with_dst_addr(Some(dest_addr_copy.to_string())),
+                                                        ).await {
                                                             Ok(buf) => buf,
                                                             Err(e) => {
                                                                 log::error!("server error: {}", e);
@@ -895,7 +906,14 @@ impl UdpStackInner {
                     } else {
                         match &server_session.server {
                             Server::Datagram(server) => {
-                                match server.serve_datagram(&data[..len], DatagramInfo::new(Some(src_addr.to_string()))).await {
+                                match server
+                                    .serve_datagram(
+                                        &data[..len],
+                                        DatagramInfo::new(Some(src_addr.to_string()))
+                                            .with_dst_addr(Some(dest_addr.to_string())),
+                                    )
+                                    .await
+                                {
                                     Ok(resp) => {
                                         if let Err(e) = udp_socket.send_to(resp.as_slice(), &src_addr).await {
                                             log::error!("send datagram error: {}", e);

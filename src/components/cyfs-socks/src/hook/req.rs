@@ -351,12 +351,32 @@ impl SocksRequestMap {
         let map = Arc::new(Box::new(map) as Box<dyn MapCollection>);
         CollectionValue::Map(map)
     }
+
+    fn source_ip_value(&self) -> CollectionValue {
+        let ip = self
+            .inbound_addr
+            .as_ref()
+            .and_then(|addr| addr.parse::<SocketAddr>().ok())
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_default();
+        CollectionValue::String(ip)
+    }
+
+    fn source_port_value(&self) -> CollectionValue {
+        let port = self
+            .inbound_addr
+            .as_ref()
+            .and_then(|addr| addr.parse::<SocketAddr>().ok())
+            .map(|addr| addr.port().to_string())
+            .unwrap_or_default();
+        CollectionValue::String(port)
+    }
 }
 
 #[async_trait::async_trait]
 impl MapCollection for SocksRequestMap {
     async fn len(&self) -> Result<usize, String> {
-        Ok(2)
+        Ok(4)
     }
 
     async fn insert_new(&self, key: &str, _value: CollectionValue) -> Result<bool, String> {
@@ -379,6 +399,8 @@ impl MapCollection for SocksRequestMap {
         match key {
             "inbound" => Ok(Some(self.inbound_addr_value())),
             "target" => Ok(Some(self.target_addr_value())),
+            "source_ip" => Ok(Some(self.source_ip_value())),
+            "source_port" => Ok(Some(self.source_port_value())),
             _ => {
                 warn!("Key '{}' not found in SocksRequestMap", key);
                 Ok(None)
@@ -388,7 +410,7 @@ impl MapCollection for SocksRequestMap {
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
         match key {
-            "inbound" | "target" => Ok(true),
+            "inbound" | "target" | "source_ip" | "source_port" => Ok(true),
             _ => Ok(false),
         }
     }
@@ -402,6 +424,8 @@ impl MapCollection for SocksRequestMap {
     async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String> {
         callback.call("inbound", &self.inbound_addr_value()).await?;
         callback.call("target", &self.target_addr_value()).await?;
+        callback.call("source_ip", &self.source_ip_value()).await?;
+        callback.call("source_port", &self.source_port_value()).await?;
 
         Ok(())
     }
@@ -410,6 +434,8 @@ impl MapCollection for SocksRequestMap {
         Ok(vec![
             ("inbound".to_string(), self.inbound_addr_value()),
             ("target".to_string(), self.target_addr_value()),
+            ("source_ip".to_string(), self.source_ip_value()),
+            ("source_port".to_string(), self.source_port_value()),
         ])
     }
 }

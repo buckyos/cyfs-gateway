@@ -659,6 +659,24 @@ impl ProcessChainHttpServer {
                         .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
                 }
             }
+            if let Some(dst_addr) = info.dst_addr.as_ref() {
+                if let Ok(socket_addr) = dst_addr.parse::<SocketAddr>() {
+                    global_env
+                        .create(
+                            "REQ_target_ip",
+                            CollectionValue::String(socket_addr.ip().to_string()),
+                        )
+                        .await
+                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                    global_env
+                        .create(
+                            "REQ_target_port",
+                            CollectionValue::String(socket_addr.port().to_string()),
+                        )
+                        .await
+                        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                }
+            }
             if let Some(source_mac) = info.source_mac.as_ref() {
                 global_env
                     .create(
@@ -815,6 +833,24 @@ impl HttpServer for ProcessChainHttpServer {
                 global_env
                     .create(
                         "REQ_real_remote_port",
+                        CollectionValue::String(socket_addr.port().to_string()),
+                    )
+                    .await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+            }
+        }
+        if let Some(dst_addr) = info.dst_addr.as_ref() {
+            if let Ok(socket_addr) = dst_addr.parse::<SocketAddr>() {
+                global_env
+                    .create(
+                        "REQ_target_ip",
+                        CollectionValue::String(socket_addr.ip().to_string()),
+                    )
+                    .await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                global_env
+                    .create(
+                        "REQ_target_port",
                         CollectionValue::String(socket_addr.port().to_string()),
                     )
                     .await
@@ -2318,6 +2354,7 @@ mod tests {
         tokio::spawn(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo {
                 src_addr: Some("127.0.0.1:344".to_string()),
+                dst_addr: None,
                 conn_src_addr: Some("127.0.0.1:344".to_string()),
                 real_src_addr: None,
                 source_mac: None,

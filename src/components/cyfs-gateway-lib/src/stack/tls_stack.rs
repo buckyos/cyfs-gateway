@@ -296,6 +296,7 @@ impl TlsConnectionHandler {
         };
         let mut request = StreamRequest::new(request_stream, local_addr);
         request.source_addr = Some(remote_addr);
+        request.dest_port = local_addr.port();
         request.dest_host = server_name;
         if let Some(device_info) = self
             .connection_manager
@@ -314,7 +315,8 @@ impl TlsConnectionHandler {
         let real_src_addr = get_source_addr_from_req_env(&global_env)
             .await
             .and_then(|addr| addr.parse::<SocketAddr>().ok().map(|_| addr));
-        let mut stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr);
+        let mut stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr)
+            .with_dst_addr(Some(local_addr.to_string()));
         if let Some(device_info) = self
             .connection_manager
             .as_ref()

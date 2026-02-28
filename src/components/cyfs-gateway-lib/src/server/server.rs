@@ -121,6 +121,7 @@ impl Server {
 #[derive(Default, Debug, Clone)]
 pub struct StreamInfo {
     pub src_addr: Option<String>,
+    pub dst_addr: Option<String>,
     pub conn_src_addr: Option<String>,
     pub real_src_addr: Option<String>,
     pub source_mac: Option<String>,
@@ -132,6 +133,7 @@ impl StreamInfo {
     pub fn new(src_addr: String) -> Self {
         Self {
             src_addr: Some(src_addr.clone()),
+            dst_addr: None,
             conn_src_addr: Some(src_addr),
             real_src_addr: None,
             source_mac: None,
@@ -144,6 +146,7 @@ impl StreamInfo {
         let src_addr = real_src_addr.clone().or_else(|| conn_src_addr.clone());
         Self {
             src_addr,
+            dst_addr: None,
             conn_src_addr,
             real_src_addr,
             source_mac: None,
@@ -161,6 +164,11 @@ impl StreamInfo {
         self.source_mac = source_mac;
         self.source_hostname = source_hostname;
         self.source_online_secs = source_online_secs;
+        self
+    }
+
+    pub fn with_dst_addr(mut self, dst_addr: Option<String>) -> Self {
+        self.dst_addr = dst_addr;
         self
     }
 }
@@ -865,6 +873,7 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
 
 pub struct DatagramInfo {
     pub src_addr: Option<String>,
+    pub dst_addr: Option<String>,
     pub source_mac: Option<String>,
     pub source_hostname: Option<String>,
     pub source_online_secs: Option<String>,
@@ -874,10 +883,16 @@ impl DatagramInfo {
     pub fn new(src_addr: Option<String>) -> Self {
         DatagramInfo {
             src_addr,
+            dst_addr: None,
             source_mac: None,
             source_hostname: None,
             source_online_secs: None,
         }
+    }
+
+    pub fn with_dst_addr(mut self, dst_addr: Option<String>) -> Self {
+        self.dst_addr = dst_addr;
+        self
     }
 
     pub fn with_device_info(

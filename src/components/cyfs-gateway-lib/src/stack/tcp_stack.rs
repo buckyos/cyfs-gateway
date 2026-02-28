@@ -134,6 +134,7 @@ impl TcpConnectionHandler {
         };
         let mut request = StreamRequest::new(req_stream, dest_addr);
         request.source_addr = Some(remote_addr);
+        request.dest_port = dest_addr.port();
         if let Some(device_info) = self
             .connection_manager
             .as_ref()
@@ -151,7 +152,8 @@ impl TcpConnectionHandler {
         let real_src_addr = get_source_addr_from_req_env(&global_env)
             .await
             .and_then(|addr| addr.parse::<SocketAddr>().ok().map(|_| addr));
-        let mut stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr);
+        let mut stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr)
+            .with_dst_addr(Some(dest_addr.to_string()));
         if let Some(device_info) = self
             .connection_manager
             .as_ref()

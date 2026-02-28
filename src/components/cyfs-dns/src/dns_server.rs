@@ -323,7 +323,7 @@ impl ProcessChainDnsServer {
     async fn handle_request<'a, >(
         &self,
         request: &Request,
-        src_addr: Option<String>,
+        dst_addr: Option<String>,
     ) -> ServerResult<Vec<u8>>
     {
         if request.op_code() != OpCode::Query {
@@ -356,6 +356,16 @@ impl ProcessChainDnsServer {
             .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
         map.insert("source_port", CollectionValue::String(from_ip.port().to_string())).await
             .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+        if let Some(dst_addr) = dst_addr {
+            if let Ok(socket_addr) = dst_addr.parse::<SocketAddr>() {
+                map.insert("dest_addr", CollectionValue::String(socket_addr.to_string())).await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+                map.insert("dest_ip", CollectionValue::String(socket_addr.ip().to_string())).await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+                map.insert("dest_port", CollectionValue::String(socket_addr.port().to_string())).await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+            }
+        }
 
         let executor = {
             self.executor.lock().unwrap().fork()
@@ -402,6 +412,7 @@ impl ProcessChainDnsServer {
         &self,
         message_bytes: &[u8],
         src_addr: Option<String>,
+        dst_addr: Option<String>,
     ) -> ServerResult<Vec<u8>> {
         let mut decoder = BinDecoder::new(message_bytes);
 
@@ -422,7 +433,7 @@ impl ProcessChainDnsServer {
                 };
 
                 let request = Request::new(message, addr, Protocol::Udp);
-                match self.handle_request(&request, src_addr).await {
+                match self.handle_request(&request, dst_addr).await {
                     Ok(response) => Ok(response),
                     Err(e) => {
                         let mut builder = MessageResponseBuilder::from_message_request(&request);
@@ -479,7 +490,7 @@ impl ProcessChainDnsServer {
 #[async_trait::async_trait]
 impl cyfs_gateway_lib::server::DatagramServer for ProcessChainDnsServer {
     async fn serve_datagram(&self, buf: &[u8], info: DatagramInfo) -> ServerResult<Vec<u8>> {
-        let response = self.handle(buf, info.src_addr).await?;
+        let response = self.handle(buf, info.src_addr, info.dst_addr).await?;
 
         Ok(response)
     }

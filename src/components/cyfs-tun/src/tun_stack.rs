@@ -186,7 +186,8 @@ impl TunConnectionHandler {
                                         hyper_serve_http(
                                             stream,
                                             server,
-                                            StreamInfo::new(remote_addr.to_string()),
+                                            StreamInfo::new(remote_addr.to_string())
+                                                .with_dst_addr(Some(dest_addr.to_string())),
                                         )
                                             .await
                                             .map_err(into_stack_err!(
@@ -198,7 +199,8 @@ impl TunConnectionHandler {
                                         server
                                             .serve_connection(
                                                 stream,
-                                                StreamInfo::new(remote_addr.to_string()),
+                                                StreamInfo::new(remote_addr.to_string())
+                                                    .with_dst_addr(Some(dest_addr.to_string())),
                                             )
                                             .await
                                             .map_err(into_stack_err!(
@@ -210,7 +212,8 @@ impl TunConnectionHandler {
                                         serve_qa_from_stream(
                                             Box::new(stream),
                                             server,
-                                            StreamInfo::new(remote_addr.to_string()),
+                                            StreamInfo::new(remote_addr.to_string())
+                                                .with_dst_addr(Some(dest_addr.to_string())),
                                         )
                                             .await
                                             .map_err(into_stack_err!(
@@ -255,6 +258,15 @@ impl TunConnectionHandler {
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("source_addr", CollectionValue::String(remote_addr.to_string()))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_ip", CollectionValue::String(remote_addr.ip().to_string()))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_port", CollectionValue::String(remote_addr.port().to_string()))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_ip", CollectionValue::String(dest_addr.ip().to_string()))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("app_protocol", CollectionValue::String("udp".to_string()))
@@ -365,7 +377,8 @@ impl TunConnectionHandler {
                                             let resp = server
                                                 .serve_datagram(
                                                     &buf[..len],
-                                                    DatagramInfo::new(Some(dest_addr.to_string())),
+                                                    DatagramInfo::new(Some(dest_addr.to_string()))
+                                                        .with_dst_addr(Some(remote_addr.to_string())),
                                                 )
                                                 .await
                                                 .map_err(into_stack_err!(
