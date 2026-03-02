@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use super::package::*;
 use super::protocol::*;
 use super::stream_helper::RTcpStreamBuildHelper;
@@ -14,6 +14,8 @@ use log::*;
 use name_client::*;
 use name_lib::*;
 use percent_encoding::percent_decode_str;
+use reqwest::StatusCode;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 use std::net::SocketAddr;
@@ -109,6 +111,337 @@ impl Drop for RTcpInner {
 }
 
 impl RTcpInner {
+    fn extract_txt_value(record: &str, key: &str) -> Option<String> {
+        let prefix = format!("{}=", key);
+        for segment in record.split(';') {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            if let Some(value) = segment.strip_prefix(prefix.as_str()) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    async fn resolve_exchange_key_by_web_name_info(
+        remote_did: &DID,
+    ) -> Result<Option<[u8; 32]>, String> {
+        if remote_did.method != "web" {
+            return Ok(None);
+        }
+
+        let web_host = remote_did
+            .id
+            .split(':')
+            .next()
+            .unwrap_or(remote_did.id.as_str())
+            .trim();
+        if web_host.is_empty() {
+            return Ok(None);
+        }
+
+        info!(
+            "try resolve target device {} exchange key by TXT records of {}",
+            remote_did.to_string(),
+            web_host
+        );
+
+        let name_info = resolve(web_host, Some(RecordType::TXT))
+            .await
+            .map_err(|e| format!("resolve {} TXT failed: {}", web_host, e))?;
+
+        if name_info.txt.is_empty() {
+            return Ok(None);
+        }
+
+        debug!(
+            "resolve {} TXT for {} got {} records",
+            web_host,
+            remote_did.to_string(),
+            name_info.txt.len()
+        );
+
+        let mut parse_errors = Vec::new();
+
+        for (idx, record) in name_info.txt.iter().enumerate() {
+            if let Some(dev_jwt) = Self::extract_txt_value(record.as_str(), "DEV") {
+                let claims = match decode_jwt_claim_without_verify(dev_jwt.as_str()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if parse_errors.len() < 6 {
+                            parse_errors.push(format!("TXT[{}] DEV jwt decode failed: {}", idx, e));
+                        }
+                        continue;
+                    }
+                };
+
+                let x = match claims.get("x").and_then(|v| v.as_str()) {
+                    Some(v) if !v.is_empty() => v,
+                    _ => {
+                        if parse_errors.len() < 6 {
+                            parse_errors.push(format!("TXT[{}] DEV jwt has no x", idx));
+                        }
+                        continue;
+                    }
+                };
+
+                let dev_did = DID::new("dev", x);
+                if let Some(exchange_key) = dev_did.get_ed25519_auth_key() {
+                    info!(
+                        "resolve target device {} exchange key by {} TXT DEV",
+                        remote_did.to_string(),
+                        web_host
+                    );
+                    return Ok(Some(exchange_key));
+                }
+            }
+        }
+
+        for (idx, record) in name_info.txt.iter().enumerate() {
+            if let Some(pkx) = Self::extract_txt_value(record.as_str(), "PKX") {
+                let x = pkx.split(':').next().unwrap_or(pkx.as_str());
+                if !x.is_empty() {
+                    let dev_did = DID::new("dev", x);
+                    if let Some(exchange_key) = dev_did.get_ed25519_auth_key() {
+                        info!(
+                            "resolve target device {} exchange key by {} TXT PKX",
+                            remote_did.to_string(),
+                            web_host
+                        );
+                        return Ok(Some(exchange_key));
+                    }
+                } else if parse_errors.len() < 6 {
+                    parse_errors.push(format!("TXT[{}] PKX is empty", idx));
+                }
+            }
+        }
+
+        if !parse_errors.is_empty() {
+            return Err(parse_errors.join("; "));
+        }
+
+        Ok(None)
+    }
+
+    async fn resolve_exchange_key(remote_did: &DID) -> Result<[u8; 32], String> {
+        debug!(
+            "resolve exchange key for target device {}",
+            remote_did.to_string()
+        );
+
+        match resolve_ed25519_exchange_key(remote_did).await {
+            Ok(exchange_key) => {
+                debug!(
+                    "resolve exchange key for {} by DID doc success",
+                    remote_did.to_string()
+                );
+                Ok(exchange_key)
+            }
+            Err(primary_err) => {
+                warn!(
+                    "resolve exchange key for {} by DID doc failed: {}",
+                    remote_did.to_string(),
+                    primary_err
+                );
+
+                if remote_did.method == "web" {
+                    info!(
+                        "try resolve exchange key for {} by web TXT fallback",
+                        remote_did.to_string()
+                    );
+
+                    match Self::resolve_exchange_key_by_web_name_info(remote_did).await {
+                        Ok(Some(exchange_key)) => {
+                            info!(
+                                "resolve exchange key for {} by web TXT fallback success",
+                                remote_did.to_string()
+                            );
+                            return Ok(exchange_key);
+                        }
+                        Ok(None) => {
+                            return Err(format!(
+                                "resolve_ed25519_exchange_key failed: {}; web did TXT fallback has no DEV/PKX",
+                                primary_err
+                            ));
+                        }
+                        Err(fallback_err) => {
+                            return Err(format!(
+                                "resolve_ed25519_exchange_key failed: {}; web did TXT fallback failed: {}",
+                                primary_err, fallback_err
+                            ));
+                        }
+                    }
+                }
+
+                Err(format!("{}", primary_err))
+            }
+        }
+    }
+
+    fn extract_ip_from_info_json(info_json: &Value) -> Option<std::net::IpAddr> {
+        if let Some(ip_str) = info_json.get("ip").and_then(|v| v.as_str()) {
+            if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+                return Some(ip);
+            }
+        }
+
+        if let Some(ips) = info_json.get("ips").and_then(|v| v.as_array()) {
+            for ip in ips.iter().filter_map(|v| v.as_str()) {
+                if let Ok(ip) = ip.parse::<std::net::IpAddr>() {
+                    return Some(ip);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn did_info_fallback_base_urls() -> Vec<String> {
+        if let Ok(value) = std::env::var("CYFS_DID_INFO_FALLBACK_BASE_URLS") {
+            let urls: Vec<String> = value
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            if !urls.is_empty() {
+                return urls;
+            }
+        }
+
+        vec!["https://sn.buckyos.ai".to_string()]
+    }
+
+    async fn resolve_ip_by_did_info_http_fallback(
+        target_did: &DID,
+    ) -> Result<Option<std::net::IpAddr>, String> {
+        let fallback_urls = Self::did_info_fallback_base_urls();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .map_err(|e| format!("create http client failed: {}", e))?;
+
+        let mut errors = Vec::new();
+        for base in fallback_urls.iter() {
+            let base = base.trim_end_matches('/');
+            let url = format!(
+                "{}/1.0/identifiers/{}?type=info",
+                base,
+                target_did.to_string()
+            );
+
+            let response = client.get(url.as_str()).send().await;
+            let response = match response {
+                Ok(resp) => resp,
+                Err(e) => {
+                    errors.push(format!("{} => request failed: {}", base, e));
+                    continue;
+                }
+            };
+
+            if response.status() == StatusCode::NOT_FOUND {
+                errors.push(format!("{} => did not found", base));
+                continue;
+            }
+
+            if !response.status().is_success() {
+                errors.push(format!(
+                    "{} => http status {}",
+                    base,
+                    response.status().as_u16()
+                ));
+                continue;
+            }
+
+            let body = response
+                .text()
+                .await
+                .map_err(|e| format!("{} => read body failed: {}", base, e))?;
+            let info_json: Value = serde_json::from_str(body.as_str())
+                .map_err(|e| format!("{} => parse json failed: {}", base, e))?;
+
+            if let Some(ip) = Self::extract_ip_from_info_json(&info_json) {
+                info!(
+                    "resolve target device {} ip by did-info fallback {} => {}",
+                    target_did.to_string(),
+                    base,
+                    ip
+                );
+                return Ok(Some(ip));
+            }
+
+            errors.push(format!("{} => did-info has no ip/ips field", base));
+        }
+
+        if errors.is_empty() {
+            Ok(None)
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    async fn resolve_ip_by_did_info(target_did: &DID) -> Result<Option<std::net::IpAddr>, String> {
+        let mut errors = Vec::new();
+        match resolve_did(target_did, Some("info")).await {
+            Ok(info_doc) => {
+                let info_json = info_doc
+                    .to_json_value()
+                    .map_err(|e| format!("parse did info doc failed: {}", e))?;
+                if let Some(ip) = Self::extract_ip_from_info_json(&info_json) {
+                    return Ok(Some(ip));
+                }
+                errors.push("did-info has no ip/ips field".to_string());
+            }
+            Err(e) => {
+                errors.push(format!("resolve_did(info) failed: {}", e));
+            }
+        }
+
+        match Self::resolve_ip_by_did_info_http_fallback(target_did).await {
+            Ok(Some(ip)) => Ok(Some(ip)),
+            Ok(None) => {
+                if errors.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(errors.join("; "))
+                }
+            }
+            Err(e) => {
+                errors.push(format!("did-info fallback failed: {}", e));
+                Err(errors.join("; "))
+            }
+        }
+    }
+
+    fn get_resolve_candidates(&self, tunnel_stack_id: &str, target: &RTcpTargetStackEP) -> Vec<String> {
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+
+        let host_from_stack_id = if let Some((host, _)) = tunnel_stack_id.rsplit_once(':') {
+            host.to_string()
+        } else {
+            tunnel_stack_id.to_string()
+        };
+
+        for candidate in [
+            host_from_stack_id,
+            target.did.to_host_name(),
+            target.did.to_raw_host_name(),
+            target.did.to_string(),
+        ] {
+            if seen.insert(candidate.clone()) {
+                candidates.push(candidate);
+            }
+        }
+
+        candidates
+    }
+
     pub fn new(
         this_device_did: DID,
         bind_addr: String,
@@ -160,7 +493,7 @@ impl RTcpInner {
             TunnelError::DocumentError(format!("invalid target device is not did: {}",op))
         })?;
 
-        let exchange_key = resolve_ed25519_exchange_key(&remote_did)
+        let exchange_key = Self::resolve_exchange_key(&remote_did)
             .await
             .map_err(|op| {
                 let msg = format!(
@@ -542,8 +875,63 @@ impl RTcpInner {
 
         // 1） resolve target auth-key and ip (rtcp base on tcp,so need ip)
 
-        let device_ip = resolve_ip(target_id_str.as_str()).await.map_err(|_err| {
-            let msg = format!("cann't resolve target device {} ip", target_id_str);
+        let resolve_candidates = self.get_resolve_candidates(tunnel_stack_id, &target);
+        debug!(
+            "resolve target device {} ip with candidates: {:?}",
+            target_id_str,
+            resolve_candidates
+        );
+
+        let mut device_ip = None;
+        let mut resolve_errors = Vec::new();
+        for candidate in resolve_candidates.iter() {
+            match resolve_ip(candidate.as_str()).await {
+                Ok(ip) => {
+                    info!(
+                        "resolve target device {} ip by {} => {}",
+                        target_id_str,
+                        candidate,
+                        ip
+                    );
+                    device_ip = Some(ip);
+                    break;
+                }
+                Err(err) => {
+                    let err_msg = format!("{} => {}", candidate, err);
+                    debug!(
+                        "resolve target device {} failed: {}",
+                        target_id_str,
+                        err_msg
+                    );
+                    resolve_errors.push(err_msg);
+                }
+            }
+        }
+
+        if device_ip.is_none() {
+            match Self::resolve_ip_by_did_info(&target.did).await {
+                Ok(Some(ip)) => {
+                    info!(
+                        "resolve target device {} ip by did-info => {}",
+                        target_id_str,
+                        ip
+                    );
+                    device_ip = Some(ip);
+                }
+                Ok(None) => {
+                    resolve_errors.push("did-info has no ip/ips field".to_string());
+                }
+                Err(err) => {
+                    resolve_errors.push(format!("did-info => {}", err));
+                }
+            }
+        }
+
+        let device_ip = device_ip.ok_or_else(|| {
+            let msg = format!(
+                "cann't resolve target device {} ip, tried {:?}, errors: {:?}",
+                target_id_str, resolve_candidates, resolve_errors
+            );
             error!("{}", msg);
             TunnelError::DocumentError(msg)
         })?;
@@ -559,14 +947,21 @@ impl RTcpInner {
         // connect to target
         let tunnel_stream = tokio::net::TcpStream::connect(remote_addr.clone()).await;
         if tunnel_stream.is_err() {
-            warn!(
-                "connect to {} error:{}",
-                remote_addr,
-                tunnel_stream.err().unwrap()
-            );
+            let connect_err = tunnel_stream.err().unwrap();
+            if connect_err.kind() == std::io::ErrorKind::ConnectionRefused {
+                warn!(
+                    "connect to {} refused when opening tunnel to {} (did resolved, but rtcp port {} is unreachable/refused)",
+                    remote_addr,
+                    target_id_str,
+                    port
+                );
+            } else {
+                warn!("connect to {} error: {}", remote_addr, connect_err);
+            }
             return Err(TunnelError::ConnectError(format!(
-                "connect to {} error.",
-                remote_addr
+                "connect to {} error: {}",
+                remote_addr,
+                connect_err
             )));
         }
         // create tunnel token
