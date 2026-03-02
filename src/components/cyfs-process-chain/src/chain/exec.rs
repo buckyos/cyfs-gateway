@@ -148,7 +148,10 @@ impl ProcessChainLibExecutor {
         }
     }
 
-    pub(crate) fn new_with_context(process_chain_lib: ProcessChainLibRef, context: Context) -> Self {
+    pub(crate) fn new_with_context(
+        process_chain_lib: ProcessChainLibRef,
+        context: Context,
+    ) -> Self {
         Self {
             process_chain_lib,
             context,
@@ -188,6 +191,7 @@ impl ProcessChainLibExecutor {
             counter,
             self.context.pipe().clone(),
         );
+        context.env().set_policy(self.context.env().policy());
 
         Self {
             process_chain_lib: self.process_chain_lib.clone(),

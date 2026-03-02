@@ -271,6 +271,7 @@ impl Context {
 
         // Use the same global and chain environment
         let env = EnvManager::new(self.env.get_global().clone(), self.env.get_chain().clone());
+        env.set_policy(self.env.policy());
         Self {
             current_pointer: self.current_pointer.clone(),
             process_chain_manager: self.process_chain_manager.clone(),
@@ -284,6 +285,7 @@ impl Context {
         // Create a new chain environment that inherits from the global environment
         let chain_env = Arc::new(Env::new(EnvLevel::Chain, Some(self.global_env().clone())));
         let env = EnvManager::new(self.env.get_global().clone(), chain_env);
+        env.set_policy(self.env.policy());
 
         Self {
             current_pointer: self.current_pointer.clone(),

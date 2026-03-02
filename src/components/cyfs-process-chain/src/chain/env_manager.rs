@@ -112,6 +112,35 @@ impl PathCollection {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MissingVarPolicy {
+    #[default]
+    Lenient,
+    Strict,
+}
+
+impl MissingVarPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MissingVarPolicy::Lenient => "lenient",
+            MissingVarPolicy::Strict => "strict",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionPolicy {
+    pub missing_var: MissingVarPolicy,
+}
+
+impl Default for ExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            missing_var: MissingVarPolicy::Lenient,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EnvManager {
     global: EnvRef,
@@ -120,6 +149,7 @@ pub struct EnvManager {
 
     // Tracking variables current level
     var_level_tracker: Arc<RwLock<HashMap<String, EnvLevel>>>,
+    policy: Arc<RwLock<ExecutionPolicy>>,
 }
 
 impl EnvManager {
@@ -145,12 +175,43 @@ impl EnvManager {
 
         let block = Arc::new(Env::new(EnvLevel::Block, Some(chain_env.clone())));
         let var_level_tracker = Arc::new(RwLock::new(HashMap::new()));
+        let policy = Arc::new(RwLock::new(ExecutionPolicy::default()));
 
         Self {
             global: global_env,
             chain: chain_env,
             block,
             var_level_tracker,
+            policy,
+        }
+    }
+
+    pub fn policy(&self) -> ExecutionPolicy {
+        *self.policy.read().unwrap()
+    }
+
+    pub fn set_policy(&self, policy: ExecutionPolicy) {
+        let mut guard = self.policy.write().unwrap();
+        if *guard != policy {
+            log!(
+                self.get_log_level(),
+                "Execution policy changed from '{:?}' to '{:?}'",
+                *guard,
+                policy
+            );
+            *guard = policy;
+        }
+    }
+
+    pub fn missing_var_policy(&self) -> MissingVarPolicy {
+        self.policy().missing_var
+    }
+
+    pub fn set_missing_var_policy(&self, policy: MissingVarPolicy) {
+        let mut current = self.policy();
+        if current.missing_var != policy {
+            current.missing_var = policy;
+            self.set_policy(current);
         }
     }
 
@@ -642,12 +703,11 @@ impl EnvManager {
         );
         let parent = self.get_parent_collection_by_path(key_list, level).await?;
         if parent.is_none() {
-            let msg = format!(
-                "Parent collection not found for key list '{:?}', please create the collection first",
+            debug!(
+                "Parent collection not found while getting key list '{:?}', returning None",
                 key_list
             );
-            warn!("{}", msg);
-            return Err(msg);
+            return Ok(None);
         }
 
         let coll = parent.unwrap();

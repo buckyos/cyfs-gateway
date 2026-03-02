@@ -52,6 +52,19 @@ const PROCESS_CHAIN_LIB_VAR_COMPLEX: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_LIB_VAR_POLICY: &str = r#"
+<process_chain_lib id="test_var_policy_lib" priority="100">
+    <process_chain id="route_chain_policy">
+        <block id="route">
+            <![CDATA[
+                local country=$geoByIp[$REQ.clientIp].country;
+                return --from lib $country;
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 async fn make_geo_entry(country: &str, isp: &str, city: &str) -> MapCollectionRef {
     let map = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
     map.insert("country", CollectionValue::String(country.to_string()))
@@ -91,14 +104,13 @@ async fn make_geo_entry_with_meta(
     )
     .await
     .unwrap();
-    meta.insert(
-        "zone-name",
-        CollectionValue::String(zone_name.to_string()),
-    )
-    .await
-    .unwrap();
+    meta.insert("zone-name", CollectionValue::String(zone_name.to_string()))
+        .await
+        .unwrap();
 
-    map.insert("meta", CollectionValue::Map(meta)).await.unwrap();
+    map.insert("meta", CollectionValue::Map(meta))
+        .await
+        .unwrap();
     map
 }
 
@@ -269,7 +281,8 @@ async fn test_dynamic_map_lookup_complex_nested() {
         .insert(
             "5.6.7.8",
             CollectionValue::Map(
-                make_geo_entry_with_meta("CN", "中国联通", "Guangzhou", "CN.GZ", "south-zone").await,
+                make_geo_entry_with_meta("CN", "中国联通", "Guangzhou", "CN.GZ", "south-zone")
+                    .await,
             ),
         )
         .await
@@ -343,7 +356,7 @@ async fn test_dynamic_map_lookup_complex_nested() {
 }
 
 #[tokio::test]
-async fn test_dynamic_map_lookup_missing_ip_returns_error() {
+async fn test_dynamic_map_lookup_missing_ip_lenient_returns_empty() {
     TermLogger::init(
         LevelFilter::Debug,
         Config::default(),
@@ -354,15 +367,15 @@ async fn test_dynamic_map_lookup_missing_ip_returns_error() {
         let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
     });
 
-    let hook_point = HookPoint::new("test_var_missing_ip");
+    let hook_point = HookPoint::new("test_var_missing_ip_lenient");
     hook_point
-        .load_process_chain_lib("test_var_lib", 0, PROCESS_CHAIN_LIB_VAR)
+        .load_process_chain_lib("test_var_policy_lib", 0, PROCESS_CHAIN_LIB_VAR_POLICY)
         .await
         .unwrap();
 
-    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-var-missing-ip");
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-var-missing-ip-lenient");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let hook_point_env = HookPointEnv::new("test-var-missing-ip", data_dir);
+    let hook_point_env = HookPointEnv::new("test-var-missing-ip-lenient", data_dir);
 
     let geo_by_ip = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
     geo_by_ip
@@ -388,9 +401,120 @@ async fn test_dynamic_map_lookup_missing_ip_returns_error() {
         .unwrap();
 
     let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
-    let err = exec.execute_lib("test_var_lib").await.unwrap_err();
+    let ret = exec.execute_lib("test_var_policy_lib").await.unwrap();
+    assert_eq!(ret.value(), "");
+}
+
+#[tokio::test]
+async fn test_dynamic_map_lookup_missing_ip_strict_returns_error() {
+    TermLogger::init(
+        LevelFilter::Debug,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
+    });
+
+    let hook_point = HookPoint::new("test_var_missing_ip_strict");
+    hook_point
+        .load_process_chain_lib("test_var_policy_lib", 0, PROCESS_CHAIN_LIB_VAR_POLICY)
+        .await
+        .unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-var-missing-ip-strict");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-var-missing-ip-strict", data_dir);
+
+    let geo_by_ip = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    geo_by_ip
+        .insert(
+            "1.2.3.4",
+            CollectionValue::Map(make_geo_entry("CN", "中国电信", "Shenzhen").await),
+        )
+        .await
+        .unwrap();
+
+    let req = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    set_client_ip(&req, "10.10.10.10").await;
+
+    hook_point_env
+        .hook_point_env()
+        .create("geoByIp", CollectionValue::Map(geo_by_ip))
+        .await
+        .unwrap();
+    hook_point_env
+        .hook_point_env()
+        .create("REQ", CollectionValue::Map(req.clone()))
+        .await
+        .unwrap();
+    hook_point_env.set_execution_policy(ExecutionPolicy {
+        missing_var: MissingVarPolicy::Strict,
+    });
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+    let err = exec.execute_lib("test_var_policy_lib").await.unwrap_err();
     assert!(
-        err.contains("Parent collection not found"),
+        err.contains("Variable 'geoByIp.10\\.10\\.10\\.10.country' not found in context"),
+        "unexpected error: {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn test_dynamic_map_lookup_missing_dynamic_segment_strict_returns_error() {
+    TermLogger::init(
+        LevelFilter::Debug,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
+    });
+
+    let hook_point = HookPoint::new("test_var_missing_dynamic_segment_strict");
+    hook_point
+        .load_process_chain_lib("test_var_policy_lib", 0, PROCESS_CHAIN_LIB_VAR_POLICY)
+        .await
+        .unwrap();
+
+    let data_dir =
+        std::env::temp_dir().join("cyfs-process-chain-test-var-missing-dynamic-segment-strict");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-var-missing-dynamic-segment-strict", data_dir);
+
+    let geo_by_ip = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    geo_by_ip
+        .insert(
+            "1.2.3.4",
+            CollectionValue::Map(make_geo_entry("CN", "中国电信", "Shenzhen").await),
+        )
+        .await
+        .unwrap();
+
+    let req = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    // No clientIp on purpose: dynamic segment `$REQ.clientIp` should fail in strict mode.
+
+    hook_point_env
+        .hook_point_env()
+        .create("geoByIp", CollectionValue::Map(geo_by_ip))
+        .await
+        .unwrap();
+    hook_point_env
+        .hook_point_env()
+        .create("REQ", CollectionValue::Map(req.clone()))
+        .await
+        .unwrap();
+    hook_point_env.set_missing_var_policy(MissingVarPolicy::Strict);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+    let err = exec.execute_lib("test_var_policy_lib").await.unwrap_err();
+    assert!(
+        err.contains(
+            "Dynamic segment variable 'REQ.clientIp' not found while resolving 'geoByIp[$REQ.clientIp].country'"
+        ),
         "unexpected error: {}",
         err
     );

@@ -1,6 +1,6 @@
 use super::block::{Block, CommandArg, CommandItem, Expression};
 use super::exec::BlockExecuter;
-use crate::chain::{Context, ParserContextRef};
+use crate::chain::{Context, MissingVarPolicy, ParserContextRef};
 use crate::cmd::CommandParserFactory;
 use crate::collection::CollectionValue;
 
@@ -412,6 +412,7 @@ impl CommandArgEvaluator {
     async fn resolve_var_path(var: &str, context: &Context) -> Result<String, String> {
         let parsed = Self::parse_var_path(var)?;
         let mut resolved = Vec::with_capacity(parsed.len());
+        let policy = context.env().policy();
 
         for segment in parsed {
             match segment {
@@ -420,7 +421,17 @@ impl CommandArgEvaluator {
                     let lookup_key = Self::resolve_var_path(&expr, context).await?;
                     let value = match context.env().get(&lookup_key, None).await? {
                         Some(value) => value.try_as_str()?.to_string(),
-                        None => String::new(),
+                        None => match policy.missing_var {
+                            MissingVarPolicy::Lenient => String::new(),
+                            MissingVarPolicy::Strict => {
+                                let msg = format!(
+                                    "Dynamic segment variable '{}' not found while resolving '{}'",
+                                    lookup_key, var
+                                );
+                                error!("{}", msg);
+                                return Err(msg);
+                            }
+                        },
                     };
                     resolved.push(value);
                 }
@@ -437,15 +448,25 @@ impl CommandArgEvaluator {
             CommandArg::Var(var) => {
                 debug!("Resolving variable: {}", var);
                 let var = Self::resolve_var_path(var, context).await?;
+                let policy = context.env().policy();
                 if let Some(value) = context.env().get(&var, None).await? {
                     value
                 } else {
-                    // If variable is not found, push an empty string
-                    warn!(
-                        "Variable '{}' not found in context, using empty string",
-                        var
-                    );
-                    CollectionValue::String(String::new())
+                    match policy.missing_var {
+                        MissingVarPolicy::Lenient => {
+                            // Backward compatible behavior: keep missing variables as empty string.
+                            warn!(
+                                "Variable '{}' not found in context, using empty string",
+                                var
+                            );
+                            CollectionValue::String(String::new())
+                        }
+                        MissingVarPolicy::Strict => {
+                            let msg = format!("Variable '{}' not found in context", var);
+                            error!("{}", msg);
+                            return Err(msg);
+                        }
+                    }
                 }
             }
             CommandArg::CommandSubstitution(cmd) => {
