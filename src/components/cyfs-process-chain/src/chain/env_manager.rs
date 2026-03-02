@@ -1,4 +1,4 @@
-use log::{log, Level};
+use log::{Level, log};
 
 use super::env::{Env, EnvLevel, EnvRef};
 use super::external::EnvExternalRef;
@@ -127,13 +127,12 @@ impl EnvManager {
         let global_level = self.global.log_level();
         let chain_level = self.chain.log_level();
         let block_level = self.block.log_level();
-        
+
         // Return the highest level among the three
         // Level ordering: Trace < Debug < Info < Warn < Error
         global_level.max(chain_level).max(block_level)
     }
 
-    
     pub fn new(global_env: EnvRef, chain_env: EnvRef) -> Self {
         assert!(
             global_env.level() == EnvLevel::Global,
@@ -166,9 +165,7 @@ impl EnvManager {
         external: EnvExternalRef,
     ) -> Result<(), String> {
         let env = self.get_env(level);
-        env.env_external_manager()
-            .add_external(id, external)
-            .await
+        env.env_external_manager().add_external(id, external).await
     }
 
     pub async fn remove_env_external(
@@ -197,50 +194,168 @@ impl EnvManager {
         }
     }
 
-    fn parse_var(key: &str) -> Vec<String> {
-        let mut parts = Vec::new();
-        let mut current = String::new();
-        let mut escaped = false;
+    fn normalize_path_part(part: String) -> String {
+        let part = part.trim();
+        if part.len() >= 2 && part.starts_with('(') && part.ends_with(')') {
+            part[1..part.len() - 1].trim().to_string()
+        } else {
+            part.to_string()
+        }
+    }
 
-        for ch in key.chars() {
-            if escaped {
-                current.push(ch);
-                escaped = false;
+    fn parse_bracket_part(key: &str, start: usize) -> Result<(String, usize), String> {
+        let mut i = start + '['.len_utf8();
+        if i >= key.len() {
+            return Err(format!("Unclosed bracket segment in key: {}", key));
+        }
+
+        while i < key.len() {
+            let ch = key[i..].chars().next().unwrap();
+            if ch.is_whitespace() {
+                i += ch.len_utf8();
+                continue;
+            }
+            break;
+        }
+
+        if i >= key.len() {
+            return Err(format!("Unclosed bracket segment in key: {}", key));
+        }
+
+        let first = key[i..].chars().next().unwrap();
+        if first == '"' || first == '\'' {
+            let quote = first;
+            i += quote.len_utf8();
+
+            let mut content = String::new();
+            let mut escaped = false;
+            let mut closed = false;
+
+            while i < key.len() {
+                let ch = key[i..].chars().next().unwrap();
+                i += ch.len_utf8();
+
+                if escaped {
+                    content.push(ch);
+                    escaped = false;
+                    continue;
+                }
+
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+
+                if ch == quote {
+                    closed = true;
+                    break;
+                }
+
+                content.push(ch);
+            }
+
+            if !closed {
+                return Err(format!("Unclosed quoted bracket segment in key: {}", key));
+            }
+
+            while i < key.len() {
+                let ch = key[i..].chars().next().unwrap();
+                if ch.is_whitespace() {
+                    i += ch.len_utf8();
+                    continue;
+                }
+                break;
+            }
+
+            if i >= key.len() || !key[i..].starts_with(']') {
+                return Err(format!("Missing closing ']' in key: {}", key));
+            }
+
+            return Ok((content, i + ']'.len_utf8()));
+        }
+
+        let mut depth = 1usize;
+        let mut content = String::new();
+        while i < key.len() {
+            let ch = key[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+
+            if ch == '[' {
+                depth += 1;
+                content.push(ch);
                 continue;
             }
 
+            if ch == ']' {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok((content.trim().to_string(), i));
+                }
+                content.push(ch);
+                continue;
+            }
+
+            content.push(ch);
+        }
+
+        Err(format!("Unclosed bracket segment in key: {}", key))
+    }
+
+    fn parse_var(key: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut i = 0usize;
+        while i < key.len() {
+            let ch = key[i..].chars().next().unwrap();
+
             if ch == '\\' {
-                escaped = true;
+                i += ch.len_utf8();
+                if i < key.len() {
+                    let escaped = key[i..].chars().next().unwrap();
+                    current.push(escaped);
+                    i += escaped.len_utf8();
+                } else {
+                    current.push('\\');
+                }
                 continue;
             }
 
             if ch == '.' {
-                parts.push(current);
-                current = String::new();
+                if !current.is_empty() {
+                    parts.push(Self::normalize_path_part(std::mem::take(&mut current)));
+                }
+                i += ch.len_utf8();
+                continue;
+            }
+
+            if ch == '[' {
+                if !current.is_empty() {
+                    parts.push(Self::normalize_path_part(std::mem::take(&mut current)));
+                }
+
+                match Self::parse_bracket_part(key, i) {
+                    Ok((part, next)) => {
+                        parts.push(Self::normalize_path_part(part));
+                        i = next;
+                    }
+                    Err(_e) => {
+                        // Keep backward compatible behavior: treat unmatched '[' as a normal character.
+                        current.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
                 continue;
             }
 
             current.push(ch);
+            i += ch.len_utf8();
         }
 
-        if escaped {
-            // Keep a trailing escape as a literal backslash.
-            current.push('\\');
+        if !current.is_empty() || parts.is_empty() {
+            parts.push(Self::normalize_path_part(current));
         }
-
-        parts.push(current);
 
         parts
-            .into_iter()
-            .map(|part| {
-                let part = part.trim();
-                if part.len() >= 2 && part.starts_with('(') && part.ends_with(')') {
-                    part[1..part.len() - 1].trim().to_string()
-                } else {
-                    part.to_string()
-                }
-            })
-            .collect()
     }
 
     pub fn get_var_level(&self, key: &str) -> EnvLevel {
@@ -602,6 +717,33 @@ mod tests {
             vec![
                 "geoByIp".to_string(),
                 "1.2.3.4".to_string(),
+                "country".to_string()
+            ]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("geoByIp[\"1.2.3.4\"].country"),
+            vec![
+                "geoByIp".to_string(),
+                "1.2.3.4".to_string(),
+                "country".to_string()
+            ]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("REQ.headers['x-forwarded-for']"),
+            vec![
+                "REQ".to_string(),
+                "headers".to_string(),
+                "x-forwarded-for".to_string()
+            ]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("geoByIp[$REQ.clientIp].country"),
+            vec![
+                "geoByIp".to_string(),
+                "$REQ.clientIp".to_string(),
                 "country".to_string()
             ]
         );

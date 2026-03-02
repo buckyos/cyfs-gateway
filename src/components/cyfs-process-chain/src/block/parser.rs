@@ -433,7 +433,10 @@ impl BlockParser {
         }
 
         let mut i = 0usize;
-        let mut depth = 0usize;
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut quote_in_bracket: Option<char> = None;
+        let mut escaped_in_quote = false;
         let mut parsed = String::new();
 
         while i < rest.len() {
@@ -441,19 +444,58 @@ impl BlockParser {
                 nom::Err::Error(nom::error::Error::from_error_kind(rest, ErrorKind::Tag))
             })?;
 
-            // End of current arg token
-            if depth == 0 && (ch.is_whitespace() || ch == ';' || ch == ')') {
+            if let Some(quote) = quote_in_bracket {
+                parsed.push(ch);
+                i += ch.len_utf8();
+
+                if escaped_in_quote {
+                    escaped_in_quote = false;
+                    continue;
+                }
+
+                if ch == '\\' {
+                    escaped_in_quote = true;
+                    continue;
+                }
+
+                if ch == quote {
+                    quote_in_bracket = None;
+                }
+
+                continue;
+            }
+
+            // End of current arg token, only when not inside dynamic/bracket segment
+            if paren_depth == 0
+                && bracket_depth == 0
+                && (ch.is_whitespace() || ch == ';' || ch == ')')
+            {
                 break;
             }
 
-            // Dynamic nested segment: .(...)
-            if ch == '(' {
-                depth += 1;
+            if bracket_depth > 0 {
+                if ch == '"' || ch == '\'' {
+                    quote_in_bracket = Some(ch);
+                } else if ch == '[' {
+                    bracket_depth += 1;
+                } else if ch == ']' {
+                    bracket_depth -= 1;
+                }
+
+                parsed.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+
+            if ch == '[' {
+                bracket_depth += 1;
+            } else if ch == '(' {
+                paren_depth += 1;
             } else if ch == ')' {
-                if depth == 0 {
+                if paren_depth == 0 {
                     break;
                 }
-                depth -= 1;
+                paren_depth -= 1;
             }
 
             parsed.push(ch);
@@ -473,7 +515,7 @@ impl BlockParser {
         }
 
         // Validate non-dynamic plain variable syntax for compatibility
-        if !parsed.contains(".(") {
+        if !parsed.contains(".(") && !parsed.contains('[') {
             let mut chars = parsed.chars();
             let first = chars.next().unwrap();
             if !(first.is_alphabetic() || first == '_') {
@@ -493,7 +535,7 @@ impl BlockParser {
             }
         }
 
-        if depth != 0 {
+        if paren_depth != 0 || bracket_depth != 0 || quote_in_bracket.is_some() {
             return Err(nom::Err::Error(nom::error::Error::from_error_kind(
                 rest,
                 ErrorKind::Tag,
@@ -508,7 +550,10 @@ impl BlockParser {
         debug!("Parsing var braced: {}", input);
         let (rest, _) = tag("${").parse(input)?;
         let mut i = 0usize;
-        let mut depth = 0usize;
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut quote_in_bracket: Option<char> = None;
+        let mut escaped_in_quote = false;
         let mut parsed = String::new();
 
         while i < rest.len() {
@@ -516,14 +561,50 @@ impl BlockParser {
                 nom::Err::Error(nom::error::Error::from_error_kind(rest, ErrorKind::Tag))
             })?;
 
-            if ch == '}' && depth == 0 {
+            if let Some(quote) = quote_in_bracket {
+                parsed.push(ch);
+                i += ch.len_utf8();
+
+                if escaped_in_quote {
+                    escaped_in_quote = false;
+                    continue;
+                }
+
+                if ch == '\\' {
+                    escaped_in_quote = true;
+                    continue;
+                }
+
+                if ch == quote {
+                    quote_in_bracket = None;
+                }
+                continue;
+            }
+
+            if ch == '}' && paren_depth == 0 && bracket_depth == 0 {
                 break;
             }
 
-            if ch == '(' {
-                depth += 1;
+            if bracket_depth > 0 {
+                if ch == '"' || ch == '\'' {
+                    quote_in_bracket = Some(ch);
+                } else if ch == '[' {
+                    bracket_depth += 1;
+                } else if ch == ']' {
+                    bracket_depth -= 1;
+                }
+
+                parsed.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+
+            if ch == '[' {
+                bracket_depth += 1;
+            } else if ch == '(' {
+                paren_depth += 1;
             } else if ch == ')' {
-                if depth == 0 {
+                if paren_depth == 0 {
                     let msg = format!("Unexpected ')' in braced variable: {}", input);
                     debug!("{}", msg);
                     return Err(nom::Err::Error(nom::error::Error::from_error_kind(
@@ -531,14 +612,20 @@ impl BlockParser {
                         ErrorKind::Tag,
                     )));
                 }
-                depth -= 1;
+                paren_depth -= 1;
             }
 
             parsed.push(ch);
             i += ch.len_utf8();
         }
 
-        if parsed.is_empty() || i >= rest.len() || !rest[i..].starts_with('}') || depth != 0 {
+        if parsed.is_empty()
+            || i >= rest.len()
+            || !rest[i..].starts_with('}')
+            || paren_depth != 0
+            || bracket_depth != 0
+            || quote_in_bracket.is_some()
+        {
             let msg = format!("Parse var braced error: {}", input);
             debug!("{}", msg);
             return Err(nom::Err::Error(nom::error::Error::from_error_kind(
@@ -636,12 +723,9 @@ impl BlockParser {
         let mut used_dynamic = false;
 
         while i < input.len() {
-            let ch = input[i..]
-                .chars()
-                .next()
-                .ok_or_else(|| {
-                    nom::Err::Error(nom::error::Error::from_error_kind(input, ErrorKind::Tag))
-                })?;
+            let ch = input[i..].chars().next().ok_or_else(|| {
+                nom::Err::Error(nom::error::Error::from_error_kind(input, ErrorKind::Tag))
+            })?;
 
             if ch.is_whitespace() || ch == ';' {
                 break;
@@ -721,12 +805,12 @@ impl BlockParser {
         let ret = preceded(
             space0,
             alt((
-                Self::parse_command_subst, // $(...)
-                Self::parse_var_braced,    // ${VAR}
-                Self::parse_var_dollar,    // $VAR
+                Self::parse_command_subst,         // $(...)
+                Self::parse_var_braced,            // ${VAR}
+                Self::parse_var_dollar,            // $VAR
                 Self::parse_interpolated_unquoted, // a.($b).($c)
-                Self::parse_literal,       // "..." or '...' or unquoted
-                Self::parse_option,        // -o or --option
+                Self::parse_literal,               // "..." or '...' or unquoted
+                Self::parse_option,                // -o or --option
             )),
         )
         .parse(input)?;
@@ -789,6 +873,22 @@ mod tests {
         assert_eq!(rest, "");
         assert!(arg.is_var());
         assert_eq!(arg.as_var_str(), Some("test1.($test1.key3)"));
+    }
+
+    #[test]
+    fn test_parse_bracket_var_dollar() {
+        let (rest, arg) = BlockParser::parse_arg("$geoByIp[$REQ.clientIp].country").unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_var());
+        assert_eq!(arg.as_var_str(), Some("geoByIp[$REQ.clientIp].country"));
+    }
+
+    #[test]
+    fn test_parse_bracket_var_braced_with_quotes() {
+        let (rest, arg) = BlockParser::parse_arg("${geoByIp[\"1.2.3.4\"].country}").unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_var());
+        assert_eq!(arg.as_var_str(), Some("geoByIp[\"1.2.3.4\"].country"));
     }
 
     #[test]
