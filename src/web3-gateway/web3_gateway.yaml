@@ -42,6 +42,7 @@ servers:
             id: default
             priority: 1
             block: |
+              eq ${REQ.host} "sn.{{sn_host}}" && match ${REQ.path} "/1.0/identifiers/*" && return "server web3_sn";
               eq ${REQ.host} "sn.{{sn_host}}" && return "server web3_sn";
               eq ${REQ.host} "web3.{{sn_host}}" && return "server web3_sn";
               map-create "QUESTION" && map-add "QUESTION" "dest_host" "${REQ.host}" && map-add "QUESTION" "method" "query_by_hostname";
@@ -136,5 +137,4 @@ stacks:
               match ${REQ.dest_host} "*.web3.{{sn_host}}" && return "forward tcp:///:3443";
               reject;
   
-
 
