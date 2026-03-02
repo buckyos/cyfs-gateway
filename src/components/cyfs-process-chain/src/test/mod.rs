@@ -1,5 +1,7 @@
 pub mod shlex_example;
-mod test_block;
+mod test_block_process_chain;
+mod test_block_hook_point;
+mod test_js_external;
 mod test_exec;
 mod test_env;
 mod test_var;
