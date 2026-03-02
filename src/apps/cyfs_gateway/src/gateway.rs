@@ -1,6 +1,6 @@
 use super::config_loader::GatewayConfig;
 use cyfs_gateway_lib::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -68,6 +68,176 @@ fn strip_includes_field(mut config: Value) -> Value {
         obj.remove("includes");
     }
     config
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedConfigChange {
+    path: Vec<String>,
+    base_exists: bool,
+    #[serde(default)]
+    base: Value,
+    value_exists: bool,
+    #[serde(default)]
+    value: Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SavedConfigPatch {
+    #[serde(default)]
+    changes: Vec<SavedConfigChange>,
+}
+
+fn build_saved_config_patch(base: &Value, current: &Value) -> SavedConfigPatch {
+    let mut changes = Vec::new();
+    let mut path = Vec::new();
+    collect_saved_config_changes(base, current, &mut path, &mut changes);
+
+    let mut dedup = BTreeMap::new();
+    for change in changes {
+        dedup.insert(change.path.join("\u{1f}"), change);
+    }
+
+    SavedConfigPatch {
+        changes: dedup.into_values().collect(),
+    }
+}
+
+fn collect_saved_config_changes(
+    base: &Value,
+    current: &Value,
+    path: &mut Vec<String>,
+    changes: &mut Vec<SavedConfigChange>,
+) {
+    match (base, current) {
+        (Value::Object(base_obj), Value::Object(current_obj)) => {
+            for (key, current_value) in current_obj {
+                path.push(key.clone());
+                if let Some(base_value) = base_obj.get(key) {
+                    collect_saved_config_changes(base_value, current_value, path, changes);
+                } else {
+                    changes.push(SavedConfigChange {
+                        path: path.clone(),
+                        base_exists: false,
+                        base: Value::Null,
+                        value_exists: true,
+                        value: current_value.clone(),
+                    });
+                }
+                path.pop();
+            }
+
+            for (key, base_value) in base_obj {
+                if current_obj.contains_key(key) {
+                    continue;
+                }
+
+                path.push(key.clone());
+                changes.push(SavedConfigChange {
+                    path: path.clone(),
+                    base_exists: true,
+                    base: base_value.clone(),
+                    value_exists: false,
+                    value: Value::Null,
+                });
+                path.pop();
+            }
+        }
+        _ => {
+            if base != current {
+                changes.push(SavedConfigChange {
+                    path: path.clone(),
+                    base_exists: true,
+                    base: base.clone(),
+                    value_exists: true,
+                    value: current.clone(),
+                });
+            }
+        }
+    }
+}
+
+fn get_value_by_path<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        let object = current.as_object()?;
+        current = object.get(key)?;
+    }
+    Some(current)
+}
+
+fn set_value_by_path(value: &mut Value, path: &[String], new_value: Value) {
+    if path.is_empty() {
+        *value = new_value;
+        return;
+    }
+
+    let mut current = value;
+    for key in &path[..path.len() - 1] {
+        if !current.is_object() {
+            *current = Value::Object(Map::new());
+        }
+        let object = current.as_object_mut().unwrap();
+        current = object
+            .entry(key.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+    }
+
+    if !current.is_object() {
+        *current = Value::Object(Map::new());
+    }
+    current
+        .as_object_mut()
+        .unwrap()
+        .insert(path[path.len() - 1].clone(), new_value);
+}
+
+fn remove_value_by_path(value: &mut Value, path: &[String]) {
+    if path.is_empty() {
+        return;
+    }
+
+    let mut current = value;
+    for key in &path[..path.len() - 1] {
+        let object = match current.as_object_mut() {
+            Some(object) => object,
+            None => return,
+        };
+
+        current = match object.get_mut(key) {
+            Some(next) => next,
+            None => return,
+        };
+    }
+
+    if let Some(object) = current.as_object_mut() {
+        object.remove(&path[path.len() - 1]);
+    }
+}
+
+fn apply_saved_config_patch(mut user_config: Value, patch: &SavedConfigPatch) -> Value {
+    for change in &patch.changes {
+        if change.path.is_empty() {
+            continue;
+        }
+        let current = get_value_by_path(&user_config, &change.path);
+        let current_exists = current.is_some();
+        let should_apply = if change.base_exists {
+            current == Some(&change.base)
+        } else {
+            !current_exists
+        };
+
+        if !should_apply {
+            continue;
+        }
+
+        if change.value_exists {
+            set_value_by_path(&mut user_config, &change.path, change.value.clone());
+        } else {
+            remove_value_by_path(&mut user_config, &change.path);
+        }
+    }
+    user_config
 }
 
 fn build_server_context(
@@ -278,40 +448,61 @@ fn resolve_save_path(requested: Option<&str>) -> PathBuf {
     path
 }
 
-pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Value> {
-    let config_dir = config_file.parent().ok_or_else(|| {
-        let msg = format!("cannot get config dir: {:?}", config_file);
-        error!("{}", msg);
-        anyhow::anyhow!(msg)
-    })?;
+#[derive(Debug, Clone)]
+pub struct LoadedGatewayConfig {
+    pub user_config: Value,
+    pub effective_config: Value,
+}
+
+pub async fn load_config_from_file(config_file: &Path) -> Result<LoadedGatewayConfig> {
+    let user_config = load_user_config_from_file(config_file).await?;
+    let mut effective_config = user_config.clone();
 
     let saved_path = get_default_saved_gateway_config_path();
-    let saved_mtime = if is_default_gateway_config(config_file) && saved_path.exists() {
-        std::fs::metadata(saved_path.as_path())
-            .and_then(|meta| meta.modified())
-            .ok()
-    } else {
-        None
-    };
-    let saved_config = if saved_mtime.is_some() {
+    if is_default_gateway_config(config_file) && saved_path.exists() {
         match read_config_value(saved_path.as_path()) {
-            Ok(config) => Some(config),
+            Ok(saved_value) => match serde_json::from_value::<SavedConfigPatch>(saved_value) {
+                Ok(saved_patch) => {
+                    effective_config = apply_saved_config_patch(effective_config, &saved_patch);
+                    info!(
+                        "Apply saved gateway config patch {}",
+                        saved_path.to_string_lossy()
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "invalid saved config patch {}: {}",
+                        saved_path.to_string_lossy(),
+                        e
+                    );
+                }
+            },
             Err(e) => {
                 warn!(
                     "load saved config {} failed: {}",
                     saved_path.to_string_lossy(),
                     e
                 );
-                None
             }
         }
-    } else {
-        None
-    };
+    }
+
+    Ok(LoadedGatewayConfig {
+        user_config,
+        effective_config,
+    })
+}
+
+async fn load_user_config_from_file(config_file: &Path) -> Result<serde_json::Value> {
+    let config_dir = config_file.parent().ok_or_else(|| {
+        let msg = format!("cannot get config dir: {:?}", config_file);
+        error!("{}", msg);
+        anyhow::anyhow!(msg)
+    })?;
 
     let cache_dir = get_gateway_remote_config_cache_path().await;
-    let mut config_json =
-        crate::ConfigMerger::load_dir_with_root(&config_dir, &config_file, saved_mtime, &cache_dir)
+    let config_json =
+        crate::ConfigMerger::load_dir_with_root(&config_dir, &config_file, None, &cache_dir)
             .await
             .map_err(|e| {
                 let msg = format!(
@@ -322,14 +513,6 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<serde_json::Val
                 error!("{}", msg);
                 anyhow::anyhow!(msg)
             })?;
-    if let Some(mut saved_config) = saved_config.clone() {
-        merge(&mut saved_config, &config_json);
-        config_json = saved_config;
-        info!(
-            "Merge saved gateway config {}",
-            saved_path.to_string_lossy()
-        );
-    }
 
     info!(
         "Gateway config before merge: {}",
@@ -515,6 +698,7 @@ impl GatewayFactory {
         &self,
         config_file: Option<&Path>,
         config: GatewayConfig,
+        init_config: GatewayConfig,
     ) -> Result<Arc<Gateway>> {
         let user_name: Option<String> = match config.raw_config.get("user_name") {
             Some(user_name) => user_name.as_str().map(|value| value.to_string()),
@@ -679,7 +863,7 @@ impl GatewayFactory {
         let timer_manager = TimerManager::new();
         let gateway = Arc::new(Gateway {
             config_file: config_file.map(|v| v.to_path_buf()),
-            init_config: Mutex::new(config.clone()),
+            init_config: Mutex::new(init_config),
             config: Arc::new(Mutex::new(config)),
             stack_manager,
             tunnel_manager,
@@ -849,6 +1033,10 @@ impl Gateway {
         let mut raw_config = init_config.raw_config.clone();
         Self::strip_control_config(&mut raw_config);
         Ok(raw_config)
+    }
+
+    pub fn update_init_config(&self, config: GatewayConfig) {
+        *self.init_config.lock().unwrap() = config;
     }
 
     fn strip_control_config(raw_config: &mut Value) {
@@ -2955,10 +3143,6 @@ impl GatewayCmdHandler {
         let gateway = self
             .get_gateway()
             .ok_or_else(|| cmd_err!(ControlErrorCode::NoGateway, "gateway not init"))?;
-        let raw_config = {
-            let config = gateway.config.lock().unwrap();
-            strip_includes_field(config.raw_config.clone())
-        };
         let save_path = resolve_save_path(requested_path);
         if let Some(parent) = save_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -2968,17 +3152,35 @@ impl GatewayCmdHandler {
                     "create config dir failed"
                 ))?;
         }
-        let content = serde_json::to_string_pretty(&raw_config)
-            .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?;
+
+        let default_saved_path = get_default_saved_gateway_config_path();
+        let content = if save_path == default_saved_path {
+            let current_raw = {
+                let config = gateway.config.lock().unwrap();
+                strip_includes_field(config.raw_config.clone())
+            };
+            let base_raw = {
+                let config = gateway.init_config.lock().unwrap();
+                strip_includes_field(config.raw_config.clone())
+            };
+            let patch = build_saved_config_patch(&base_raw, &current_raw);
+            serde_json::to_string_pretty(&patch)
+                .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?
+        } else {
+            let raw_config = {
+                let config = gateway.config.lock().unwrap();
+                strip_includes_field(config.raw_config.clone())
+            };
+            serde_json::to_string_pretty(&raw_config)
+                .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?
+        };
+
         tokio::fs::write(save_path.as_path(), content)
             .await
             .map_err(into_cmd_err!(
                 ControlErrorCode::Failed,
                 "write config failed"
             ))?;
-        let config = gateway.config.lock().unwrap().clone();
-        let mut init_config = gateway.init_config.lock().unwrap();
-        *init_config = config;
         Ok(save_path.to_string_lossy().to_string())
     }
 }
@@ -3508,18 +3710,23 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     ))?;
                 }
                 info!("*** reload gateway config ...");
-                let gateway_config =
+                let loaded_config =
                     load_config_from_file(self.config_file.as_ref().unwrap().as_path())
                         .await
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 let gateway_config = self
                     .parser
-                    .parse(gateway_config)
+                    .parse(loaded_config.effective_config)
+                    .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
+                let init_config = self
+                    .parser
+                    .parse(loaded_config.user_config)
                     .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
                 gateway
                     .reload(gateway_config)
                     .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                gateway.update_init_config(init_config);
                 info!("*** reload gateway config success !");
                 Ok(Value::String("ok".to_string()))
             }
@@ -5149,5 +5356,149 @@ mod tests {
         assert!(result.is_err());
         let error = result.err().unwrap();
         assert_eq!(error.code(), ControlErrorCode::InvalidToken);
+    }
+
+    #[test]
+    fn test_saved_config_patch_apply_when_user_not_changed() {
+        let base = json!({
+            "stacks": {
+                "s1": {
+                    "bind": "0.0.0.0:80"
+                }
+            }
+        });
+        let current = json!({
+            "stacks": {
+                "s1": {
+                    "bind": "0.0.0.0:8080"
+                },
+                "s2": {
+                    "bind": "0.0.0.0:81"
+                }
+            }
+        });
+
+        let patch = build_saved_config_patch(&base, &current);
+        let merged = apply_saved_config_patch(base, &patch);
+        assert_eq!(merged, current);
+    }
+
+    #[test]
+    fn test_saved_config_patch_skip_when_user_changed() {
+        let base = json!({
+            "stacks": {
+                "s1": {
+                    "bind": "0.0.0.0:80"
+                }
+            }
+        });
+        let saved_current = json!({
+            "stacks": {
+                "s1": {
+                    "bind": "0.0.0.0:8080"
+                }
+            }
+        });
+        let user_changed = json!({
+            "stacks": {
+                "s1": {
+                    "bind": "127.0.0.1:80"
+                }
+            }
+        });
+
+        let patch = build_saved_config_patch(&base, &saved_current);
+        let merged = apply_saved_config_patch(user_changed.clone(), &patch);
+        assert_eq!(merged, user_changed);
+    }
+
+    #[test]
+    fn test_saved_config_patch_records_value_update() {
+        let base = json!({
+            "stacks": {
+                "s1": {
+                    "bind": "0.0.0.0:80"
+                }
+            }
+        });
+        let current = json!({
+            "stacks": {
+                "s1": {
+                    "bind": "0.0.0.0:8080"
+                }
+            }
+        });
+
+        let patch = build_saved_config_patch(&base, &current);
+        assert_eq!(patch.changes.len(), 1);
+        let change = &patch.changes[0];
+        assert_eq!(change.path, vec!["stacks", "s1", "bind"]);
+        assert!(change.base_exists);
+        assert!(change.value_exists);
+        assert_eq!(change.base, json!("0.0.0.0:80"));
+        assert_eq!(change.value, json!("0.0.0.0:8080"));
+    }
+
+    #[test]
+    fn test_saved_config_patch_apply_delete_when_user_not_changed() {
+        let base = json!({
+            "stacks": {
+                "s1": {
+                    "bind": "0.0.0.0:80",
+                    "desc": "old"
+                }
+            }
+        });
+        let current = json!({
+            "stacks": {
+                "s1": {
+                    "bind": "0.0.0.0:80"
+                }
+            }
+        });
+
+        let patch = build_saved_config_patch(&base, &current);
+        let delete_change = patch
+            .changes
+            .iter()
+            .find(|c| c.path == vec!["stacks", "s1", "desc"])
+            .expect("delete change missing");
+        assert!(delete_change.base_exists);
+        assert!(!delete_change.value_exists);
+        assert_eq!(delete_change.base, json!("old"));
+
+        let merged = apply_saved_config_patch(base, &patch);
+        assert_eq!(merged, current);
+    }
+
+    #[test]
+    fn test_saved_config_patch_skip_delete_when_user_changed() {
+        let base = json!({
+            "stacks": {
+                "s1": {
+                    "bind": "0.0.0.0:80",
+                    "desc": "old"
+                }
+            }
+        });
+        let saved_current = json!({
+            "stacks": {
+                "s1": {
+                    "bind": "0.0.0.0:80"
+                }
+            }
+        });
+        let user_changed = json!({
+            "stacks": {
+                "s1": {
+                    "bind": "0.0.0.0:80",
+                    "desc": "user-updated"
+                }
+            }
+        });
+
+        let patch = build_saved_config_patch(&base, &saved_current);
+        let merged = apply_saved_config_patch(user_changed.clone(), &patch);
+        assert_eq!(merged, user_changed);
     }
 }

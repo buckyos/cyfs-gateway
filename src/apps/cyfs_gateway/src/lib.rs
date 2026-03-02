@@ -94,17 +94,24 @@ fn parse_size_bytes(input: &str) -> Result<u64> {
 }
 
 pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
-    let config_json = load_config_from_file(config_file).await?;
+    let loaded_config = load_config_from_file(config_file).await?;
     info!(
         "Gateway config: {}",
-        serde_json::to_string_pretty(&config_json).unwrap()
+        serde_json::to_string_pretty(&loaded_config.effective_config).unwrap()
     );
 
-    run_gateway_with_config(config_json, Some(config_file), params).await
+    run_gateway_with_config(
+        loaded_config.effective_config,
+        Some(loaded_config.user_config),
+        Some(config_file),
+        params,
+    )
+    .await
 }
 
 async fn run_gateway_with_config(
     config_json: Value,
+    user_config_json: Option<Value>,
     config_file: Option<&Path>,
     params: GatewayParams,
 ) -> Result<()> {
@@ -137,6 +144,15 @@ async fn run_gateway_with_config(
         error!("{}", msg);
         anyhow::anyhow!(msg)
     })?;
+    let init_gateway_config = if let Some(user_config_json) = user_config_json {
+        parser.parse(user_config_json).map_err(|e| {
+            let msg = format!("Error loading user config: {}", e.msg());
+            error!("{}", msg);
+            anyhow::anyhow!(msg)
+        })?
+    } else {
+        gateway_config.clone()
+    };
     info!("Parse cyfs-gatway config success");
 
     let connect_manager = ConnectionManager::new();
@@ -219,7 +235,7 @@ async fn run_gateway_with_config(
     factory.register_server_factory("sn", Arc::new(sn_factory));
     info!("Register sn server factory");
     let gateway = factory
-        .create_gateway(config_file, gateway_config)
+        .create_gateway(config_file, gateway_config, init_gateway_config)
         .await
         .map_err(|e| {
             let msg = format!("create gateway failed: {}", e);
@@ -333,6 +349,72 @@ struct StartTemplateArgs {
     help: bool,
 }
 
+fn infer_subcommand_path_from_args(command: &Command, args: &[String]) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut current = command;
+
+    for arg in args {
+        if arg == "--help" || arg == "-h" {
+            break;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        if let Some(sub_cmd) = current
+            .get_subcommands()
+            .find(|sub| sub.get_name() == arg.as_str())
+        {
+            path.push(arg.clone());
+            current = sub_cmd;
+        }
+    }
+
+    path
+}
+
+fn parse_server_arg_after_command(command: &str) -> String {
+    let args: Vec<String> = std::env::args().collect();
+    let mut seen = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        if !seen {
+            if arg == command {
+                seen = true;
+            }
+            continue;
+        }
+
+        if arg == "--server" || arg == "-s" {
+            if let Some(server) = iter.next() {
+                return server;
+            }
+            break;
+        }
+        if let Some(server) = arg.strip_prefix("--server=") {
+            return server.to_owned();
+        }
+        if let Some(server) = arg.strip_prefix("-s=") {
+            return server.to_owned();
+        }
+    }
+
+    CONTROL_SERVER.to_owned()
+}
+
+fn print_help_for_subcommand_path(command: &mut Command, path: &[String]) -> bool {
+    let mut current = command;
+    for name in path {
+        if let Some(sub_cmd) = current.find_subcommand_mut(name) {
+            current = sub_cmd;
+        } else {
+            return false;
+        }
+    }
+    current.print_help().unwrap();
+    println!();
+    true
+}
+
 fn parse_template_args(command: &str, ignore_server: bool) -> StartTemplateArgs {
     let mut args = Vec::new();
     let mut seen_start = false;
@@ -415,6 +497,7 @@ async fn run_template_local(template_id: &str, args: Vec<String>) -> Result<()> 
     run_gateway_with_config(
         config_json,
         None,
+        None,
         GatewayParams {
             keep_tunnel: vec![],
         },
@@ -423,8 +506,17 @@ async fn run_template_local(template_id: &str, args: Vec<String>) -> Result<()> 
 }
 
 pub async fn cyfs_gateway_main() {
-    let command = Command::new("CYFS Gateway Service")
+    let mut command = Command::new("CYFS Gateway Service")
         .version(buckyos_kit::get_version())
+        .disable_help_flag(true)
+        .disable_help_subcommand(true)
+        .arg(
+            Arg::new("help")
+                .long("help")
+                .short('h')
+                .help("Show help information")
+                .action(ArgAction::SetTrue),
+        )
         .arg(
             Arg::new("config")
                 .long("config")
@@ -861,11 +953,111 @@ pub async fn cyfs_gateway_main() {
                 .short('s')
                 .help("server url")
                 .required(false)
-                .default_value(CONTROL_SERVER)));
+                .default_value(CONTROL_SERVER)))
+        .subcommand(Command::new("help")
+            .about("Show help for a command or subcommand")
+            .arg(
+                Arg::new("subcommand")
+                    .help("Subcommand to display help for")
+                    .required(false),
+            ));
+
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let help_requested = raw_args.iter().any(|arg| arg == "--help" || arg == "-h");
+    if help_requested {
+        let subcommand_path = infer_subcommand_path_from_args(&command, &raw_args);
+
+        if subcommand_path.is_empty() {
+            command.print_help().unwrap();
+            std::process::exit(0);
+        }
+
+        if subcommand_path.first().map(|s| s.as_str()) == Some("start") {
+            let start_args = parse_template_args("start", true);
+            let server = parse_server_arg_after_command("start");
+            if start_args.template_id.is_none() {
+                let _ = print_help_for_subcommand_path(&mut command, &subcommand_path);
+                let cyfs_cmd_client =
+                    GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+                match cyfs_cmd_client.get_external_cmds().await {
+                    Ok(cmds) => {
+                        println!("Available templates ({}):", cmds.len());
+                        for cmd in cmds {
+                            if cmd.description.is_empty() {
+                                println!("  {}", cmd.name);
+                            } else {
+                                println!("  {} - {}", cmd.name, cmd.description);
+                            }
+                        }
+                        if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                            save_login_token(server.as_str(), token.as_str());
+                        }
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        println!("start template list error: {}", e);
+                        if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                            save_login_token(server.as_str(), token.as_str());
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            if let Some(template_id) = start_args.template_id {
+                let cyfs_cmd_client =
+                    GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+                match cyfs_cmd_client
+                    .get_external_cmd_help(template_id.as_str())
+                    .await
+                {
+                    Ok(help) => {
+                        println!("{}", help);
+                        if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                            save_login_token(server.as_str(), token.as_str());
+                        }
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        println!("start template help error: {}", e);
+                        if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                            save_login_token(server.as_str(), token.as_str());
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+
+        if !print_help_for_subcommand_path(&mut command, &subcommand_path) {
+            command.print_help().unwrap();
+            println!();
+        }
+        std::process::exit(0);
+    }
 
     let matches = command.clone().get_matches();
 
     match matches.subcommand() {
+        Some(("help", sub_matches)) => {
+            if let Some(sub_name) = sub_matches.get_one::<String>("subcommand") {
+                if let Some(sub_cmd) = command.find_subcommand_mut(sub_name) {
+                    sub_cmd.print_help().unwrap();
+                    println!();
+                } else {
+                    let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                    if let Ok(help) = cyfs_cmd_client.get_external_cmd_help(sub_name).await {
+                        println!("{}", help);
+                    } else {
+                        println!("Unknown command: {}", sub_name);
+                    }
+                }
+            } else {
+                command.print_help().unwrap();
+                println!();
+            }
+            std::process::exit(0);
+        }
         Some(("gen_rtcp_key", sub_matches)) => {
             let name = sub_matches
                 .get_one::<String>("name")

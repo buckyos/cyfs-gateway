@@ -571,7 +571,8 @@ pub async fn run_debug_command(
 
     let req_base_dir = resolve_req_file_base_dir(req_file);
     let config_file = resolve_debug_config_file_path(config_file);
-    let config_json = load_config_from_file(config_file.as_path()).await?;
+    let loaded_config = load_config_from_file(config_file.as_path()).await?;
+    let config_json = loaded_config.effective_config;
 
     let collections = parse_collections_from_raw_config(&config_json)?;
     let global_process_chain_configs = parse_global_process_chains_from_raw_config(&config_json)?;
