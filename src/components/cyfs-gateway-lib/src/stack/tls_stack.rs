@@ -14,7 +14,7 @@ use crate::{
 use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
@@ -24,15 +24,33 @@ use rustls::pki_types::pem::PemObject;
 use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use sfo_io::{LimitStream, StatStream};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use crate::stack::{get_limit_info, get_source_addr_from_req_env, stream_forward, TlsCertResolver};
 use serde::{Deserialize, Serialize};
 use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType, ACME_TLS_ALPN_NAME};
+use cyfs_process_chain::PrefixedStream;
 use crate::self_cert_mgr::SelfCertMgrRef;
 use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
+
+const MAX_PROXY_READ_SIZE: usize = 4096;
+const PROXY_V1_PREFIX: &[u8; 6] = b"PROXY ";
+const PROXY_V2_SIGNATURE: [u8; 12] = [
+    0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
+];
+
+#[derive(Debug, Clone, Copy)]
+enum ProxyProbeResult {
+    NeedMore,
+    NotProxy,
+    Matched {
+        consumed: usize,
+        source_addr: Option<SocketAddr>,
+    },
+}
 
 pub async fn load_certs(path: &str) -> StackResult<Vec<CertificateDer<'static>>> {
     let certs = CertificateDer::pem_file_iter(path).map_err(
@@ -152,6 +170,198 @@ struct TlsConnectionHandler {
 }
 
 impl TlsConnectionHandler {
+    async fn probe_proxy_protocol_stream(
+        mut stream: Box<dyn buckyos_kit::AsyncStream>,
+    ) -> StackResult<(Box<dyn buckyos_kit::AsyncStream>, Option<SocketAddr>)> {
+        let mut buffer = vec![0u8; MAX_PROXY_READ_SIZE];
+        let mut total = 0usize;
+        let mut consumed = 0usize;
+        let mut source_addr = None;
+
+        loop {
+            if total >= MAX_PROXY_READ_SIZE {
+                break;
+            }
+
+            let read = stream
+                .read(&mut buffer[total..])
+                .await
+                .map_err(into_stack_err!(StackErrorCode::StreamError, "read stream for proxy protocol failed"))?;
+
+            if read == 0 {
+                if total == 0 {
+                    return Err(stack_err!(
+                        StackErrorCode::StreamError,
+                        "read stream for proxy protocol failed: early eof"
+                    ));
+                }
+                break;
+            }
+
+            total += read;
+
+            match Self::parse_proxy_protocol(&buffer[..total]) {
+                ProxyProbeResult::Matched {
+                    consumed: parsed,
+                    source_addr: parsed_source,
+                } => {
+                    consumed = parsed;
+                    source_addr = parsed_source;
+                    break;
+                }
+                ProxyProbeResult::NotProxy => {
+                    break;
+                }
+                ProxyProbeResult::NeedMore => {
+                    if total >= MAX_PROXY_READ_SIZE {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let prefixed_stream = PrefixedStream::new(buffer[consumed..total].to_vec(), stream);
+        Ok((Box::new(prefixed_stream), source_addr))
+    }
+
+    fn parse_proxy_protocol(data: &[u8]) -> ProxyProbeResult {
+        match Self::parse_proxy_v2(data) {
+            ProxyProbeResult::NotProxy => Self::parse_proxy_v1(data),
+            ret => ret,
+        }
+    }
+
+    fn parse_proxy_v2(data: &[u8]) -> ProxyProbeResult {
+        let check_len = data.len().min(PROXY_V2_SIGNATURE.len());
+        if data[..check_len] != PROXY_V2_SIGNATURE[..check_len] {
+            return ProxyProbeResult::NotProxy;
+        }
+
+        if data.len() < PROXY_V2_SIGNATURE.len() {
+            return ProxyProbeResult::NeedMore;
+        }
+
+        if data.len() < 16 {
+            return ProxyProbeResult::NeedMore;
+        }
+
+        let ver_cmd = data[12];
+        if (ver_cmd >> 4) != 0x2 {
+            return ProxyProbeResult::NotProxy;
+        }
+
+        let fam_proto = data[13];
+        let len = u16::from_be_bytes([data[14], data[15]]) as usize;
+        if data.len() < 16 + len {
+            return ProxyProbeResult::NeedMore;
+        }
+
+        let cmd = ver_cmd & 0x0f;
+        if cmd != 0x1 {
+            return ProxyProbeResult::Matched {
+                consumed: 16 + len,
+                source_addr: None,
+            };
+        }
+
+        let family = fam_proto >> 4;
+        let addresses = &data[16..16 + len];
+        let source_addr = match family {
+            0x1 => {
+                if addresses.len() < 12 {
+                    return ProxyProbeResult::NotProxy;
+                }
+
+                let src_ip = IpAddr::from([addresses[0], addresses[1], addresses[2], addresses[3]]);
+                let src_port = u16::from_be_bytes([addresses[8], addresses[9]]);
+                Some(SocketAddr::new(src_ip, src_port))
+            }
+            0x2 => {
+                if addresses.len() < 36 {
+                    return ProxyProbeResult::NotProxy;
+                }
+
+                let src_ip = match <[u8; 16]>::try_from(&addresses[0..16]) {
+                    Ok(v) => IpAddr::from(v),
+                    Err(_) => return ProxyProbeResult::NotProxy,
+                };
+                let src_port = u16::from_be_bytes([addresses[32], addresses[33]]);
+                Some(SocketAddr::new(src_ip, src_port))
+            }
+            _ => None,
+        };
+
+        ProxyProbeResult::Matched {
+            consumed: 16 + len,
+            source_addr,
+        }
+    }
+
+    fn parse_proxy_v1(data: &[u8]) -> ProxyProbeResult {
+        let check_len = data.len().min(PROXY_V1_PREFIX.len());
+        if data[..check_len] != PROXY_V1_PREFIX[..check_len] {
+            return ProxyProbeResult::NotProxy;
+        }
+
+        if data.len() < PROXY_V1_PREFIX.len() {
+            return ProxyProbeResult::NeedMore;
+        }
+
+        let header_end = match data.windows(2).position(|w| w == b"\r\n") {
+            Some(pos) => pos + 2,
+            None => {
+                if data.len() < MAX_PROXY_READ_SIZE {
+                    return ProxyProbeResult::NeedMore;
+                }
+                return ProxyProbeResult::NotProxy;
+            }
+        };
+
+        let line = match std::str::from_utf8(&data[..header_end - 2]) {
+            Ok(line) => line,
+            Err(_) => return ProxyProbeResult::NotProxy,
+        };
+
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("PROXY") {
+            return ProxyProbeResult::NotProxy;
+        }
+
+        let protocol = match parts.next() {
+            Some(protocol) => protocol,
+            None => return ProxyProbeResult::NotProxy,
+        };
+
+        if protocol.eq_ignore_ascii_case("UNKNOWN") {
+            return ProxyProbeResult::Matched {
+                consumed: header_end,
+                source_addr: None,
+            };
+        }
+
+        let src_ip = match parts.next().and_then(|v| v.parse::<IpAddr>().ok()) {
+            Some(ip) => ip,
+            None => return ProxyProbeResult::NotProxy,
+        };
+        let _dst_ip = match parts.next().and_then(|v| v.parse::<IpAddr>().ok()) {
+            Some(ip) => ip,
+            None => return ProxyProbeResult::NotProxy,
+        };
+        let src_port = match parts.next().and_then(|v| v.parse::<u16>().ok()) {
+            Some(port) => port,
+            None => return ProxyProbeResult::NotProxy,
+        };
+        let _dst_port = match parts.next().and_then(|v| v.parse::<u16>().ok()) {
+            Some(port) => port,
+            None => return ProxyProbeResult::NotProxy,
+        };
+
+        ProxyProbeResult::Matched {
+            consumed: header_end,
+            source_addr: Some(SocketAddr::new(src_ip, src_port)),
+        }
+    }
+
     async fn create(
         hook_point: ProcessChainConfigs,
         certs: Vec<TlsDomainConfig>,
@@ -252,6 +462,8 @@ impl TlsConnectionHandler {
             .raw_stream()
             .peer_addr()
             .map_err(into_stack_err!(StackErrorCode::ServerError, "read remote addr failed"))?;
+        let (stream, proxy_source_addr) = Self::probe_proxy_protocol_stream(Box::new(stream)).await?;
+        let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
 
         let mut server_config = ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
@@ -283,7 +495,22 @@ impl TlsConnectionHandler {
         if server_name.is_none() {
             return Ok(());
         }
-        log::info!("accept tls stream from {} to {} name {}", remote_addr, local_addr, server_name.as_ref().unwrap_or(&"".to_string()));
+        if let Some(proxy_addr) = proxy_source_addr {
+            log::info!(
+                "accept tls stream from {} (proxy via {}) to {} name {}",
+                proxy_addr,
+                remote_addr,
+                local_addr,
+                server_name.as_ref().unwrap_or(&"".to_string())
+            );
+        } else {
+            log::info!(
+                "accept tls stream from {} to {} name {}",
+                remote_addr,
+                local_addr,
+                server_name.as_ref().unwrap_or(&"".to_string())
+            );
+        }
         let request_stream: Box<dyn buckyos_kit::AsyncStream> = if let Some(io_dump) = self.io_dump.clone() {
             Box::new(DumpStream::new(
                 tls_stream,
@@ -295,13 +522,13 @@ impl TlsConnectionHandler {
             Box::new(tls_stream)
         };
         let mut request = StreamRequest::new(request_stream, local_addr);
-        request.source_addr = Some(remote_addr);
+        request.source_addr = Some(request_source_addr);
         request.dest_port = local_addr.port();
         request.dest_host = server_name;
         if let Some(device_info) = self
             .connection_manager
             .as_ref()
-            .and_then(|manager| manager.get_device_info_by_source(remote_addr.ip()))
+            .and_then(|manager| manager.get_device_info_by_source(request_source_addr.ip()))
         {
             request.source_mac = device_info.mac().map(|v| v.to_string());
             request.source_hostname = device_info.hostname().map(|v| v.to_string());
@@ -312,15 +539,18 @@ impl TlsConnectionHandler {
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let conn_src_addr = Some(remote_addr.to_string());
-        let real_src_addr = get_source_addr_from_req_env(&global_env)
+        let mut real_src_addr = get_source_addr_from_req_env(&global_env)
             .await
             .and_then(|addr| addr.parse::<SocketAddr>().ok().map(|_| addr));
+        if real_src_addr.is_none() {
+            real_src_addr = proxy_source_addr.map(|addr| addr.to_string());
+        }
         let mut stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr)
             .with_dst_addr(Some(local_addr.to_string()));
         if let Some(device_info) = self
             .connection_manager
             .as_ref()
-            .and_then(|manager| manager.get_device_info_by_source(remote_addr.ip()))
+            .and_then(|manager| manager.get_device_info_by_source(request_source_addr.ip()))
         {
             stream_info = stream_info.with_device_info(
                 device_info.mac().map(|v| v.to_string()),
