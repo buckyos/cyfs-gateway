@@ -346,11 +346,16 @@ Notes:
     - If a variable already exists, its value will be overwritten.
     - When assigning (VAR=VALUE), scope defaults to 'chain' unless explicitly specified.
     - When only VAR is given after a scope, it sets default lookup scope for VAR.
+    - RHS supports non-string values (e.g. Map/Set/MultiMap), not only string.
+    - Collection assignment uses reference semantics (shared reference), not deep copy.
+      After `a=$b`, mutations through `a` and `b` are visible to each other.
 
 Examples:
     my_var=123
     global my_var=456
     block my_var
+    local currentGeo=$geoByIp[$REQ.clientIp]
+    local trustedSet=$trustedCountrySet
 ```
 
 ### `capture`
@@ -1409,4 +1414,3 @@ Requirements:
 Examples:
   https-sni-probe && accept
 ```
-

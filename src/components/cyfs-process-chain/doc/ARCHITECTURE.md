@@ -93,6 +93,22 @@
 - `export KEY=VALUE` / `global KEY=VALUE`（global 级）
 - `local KEY=VALUE` / `block KEY=VALUE`（block 级）
 
+赋值 RHS 支持 `CollectionValue` 全类型（不仅是 string）：
+
+- `String`
+- `Set`
+- `Map`
+- `MultiMap`
+- 以及其他内部 `CollectionValue` 变体
+
+例如：
+
+- `local geo=$geoByIp[$REQ.clientIp]`（Map 赋值）
+- `local trusted=$trustedCountrySet`（Set 赋值）
+
+注意：集合赋值是引用语义（共享引用），不是深拷贝。  
+`a=$b` 后，对 `a` 和 `b` 的集合内容修改会相互可见。
+
 ### 4.3 参数类型
 
 - 字面量：`abc` / `'abc'` / `"abc"`

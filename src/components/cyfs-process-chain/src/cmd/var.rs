@@ -2,7 +2,6 @@ use super::cmd::*;
 use crate::block::{AssignKind, CommandArg, CommandArgs};
 use crate::chain::EnvLevel;
 use crate::chain::{Context, ParserContext};
-use crate::collection::CollectionValue;
 use clap::{Arg, ArgAction, Command};
 use std::sync::Arc;
 
@@ -123,19 +122,15 @@ impl CommandExecutor for AssignCommand {
 
         match self.value {
             Some(ref value) => {
-                let value = value.evaluate_string(context).await?;
+                let value = value.evaluate(context).await?;
 
                 // Handle assignment with value
                 context
                     .env()
-                    .set(
-                        self.key.as_str(),
-                        CollectionValue::String(value.clone()),
-                        Some(env_level),
-                    )
+                    .set(self.key.as_str(), value.clone(), Some(env_level))
                     .await?;
 
-                Ok(CommandResult::success_with_value(value))
+                Ok(CommandResult::success_with_value(value.treat_as_str()))
             }
             None => {
                 // Handle assignment without value, which will change the variable scope

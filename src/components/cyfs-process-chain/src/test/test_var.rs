@@ -65,6 +65,24 @@ const PROCESS_CHAIN_LIB_VAR_POLICY: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_LIB_VAR_COLLECTION_ASSIGN: &str = r#"
+<process_chain_lib id="test_var_collection_assign_lib" priority="100">
+    <process_chain id="collection_assign_chain">
+        <block id="route">
+            <![CDATA[
+                local currentGeo=$geoByIp[$REQ.clientIp];
+                local country=$currentGeo.country;
+
+                local trustedSet=$trustedCountrySet;
+                match-include $trustedSet $country || error --from lib "country_not_trusted";
+
+                return --from lib $country;
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 async fn make_geo_entry(country: &str, isp: &str, city: &str) -> MapCollectionRef {
     let map = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
     map.insert("country", CollectionValue::String(country.to_string()))
@@ -157,6 +175,76 @@ async fn set_meta_field(req: &MapCollectionRef, field: &str) {
     req.insert("metaField", CollectionValue::String(field.to_string()))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_collection_assignment_supports_map_and_set() {
+    TermLogger::init(
+        LevelFilter::Debug,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
+    });
+
+    let hook_point = HookPoint::new("test_var_collection_assign");
+    hook_point
+        .load_process_chain_lib(
+            "test_var_collection_assign_lib",
+            0,
+            PROCESS_CHAIN_LIB_VAR_COLLECTION_ASSIGN,
+        )
+        .await
+        .unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-var-collection-assign");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-var-collection-assign", data_dir);
+
+    let geo_by_ip = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    geo_by_ip
+        .insert(
+            "1.2.3.4",
+            CollectionValue::Map(make_geo_entry("CN", "中国电信", "Shenzhen").await),
+        )
+        .await
+        .unwrap();
+
+    let req = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    set_client_ip(&req, "1.2.3.4").await;
+
+    let trusted_country_set =
+        Arc::new(Box::new(MemorySetCollection::new()) as Box<dyn SetCollection>);
+    trusted_country_set.insert("CN").await.unwrap();
+    trusted_country_set.insert("US").await.unwrap();
+
+    hook_point_env
+        .hook_point_env()
+        .create("geoByIp", CollectionValue::Map(geo_by_ip))
+        .await
+        .unwrap();
+    hook_point_env
+        .hook_point_env()
+        .create("REQ", CollectionValue::Map(req.clone()))
+        .await
+        .unwrap();
+    hook_point_env
+        .hook_point_env()
+        .create(
+            "trustedCountrySet",
+            CollectionValue::Set(trusted_country_set),
+        )
+        .await
+        .unwrap();
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+    let ret = exec
+        .execute_lib("test_var_collection_assign_lib")
+        .await
+        .unwrap();
+    assert_eq!(ret.value(), "CN");
 }
 
 #[tokio::test]
