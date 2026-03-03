@@ -1,4 +1,6 @@
-use super::block::{Block, CommandItem, Expression, Line, Operator, Statement};
+use super::block::{
+    Block, CommandItem, Expression, ExpressionChain, IfStatement, Line, Operator, Statement,
+};
 use crate::chain::{Context, ProcessChainError, ProcessChainErrorCode};
 use crate::cmd::CommandResult;
 use log::log;
@@ -110,6 +112,7 @@ impl BlockExecuter {
     }
 
     // Execute a single line with multiple statements
+    #[async_recursion::async_recursion]
     async fn execute_line(
         line: &Line,
         line_no: usize,
@@ -136,57 +139,19 @@ impl BlockExecuter {
         source: &str,
         context: &Context,
     ) -> Result<CommandResult, String> {
-        let mut result = CommandResult::success();
-
-        for (prefix_op, expr, post_op) in &statement.expressions {
-            debug!("Executing expression: {:?}", expr);
-            result = Self::execute_expression_with_location(
-                expr,
-                context,
-                Some(line_no),
-                Some(source.to_string()),
-            )
-            .await
-            .map_err(|e| {
-                Self::wrap_runtime_error(
-                    context,
-                    ProcessChainErrorCode::RuntimeExpressionExecute,
-                    "Failed to execute expression",
-                    Some(line_no),
-                    Some(source),
-                    None,
-                    e,
-                )
-            })?;
-
-            result = match prefix_op {
-                Some(Operator::Not) => result.try_not().map_err(|e| {
-                    Self::wrap_runtime_error(
-                        context,
-                        ProcessChainErrorCode::RuntimeExpressionExecute,
-                        "Failed to apply NOT operator",
-                        Some(line_no),
-                        Some(source),
-                        None,
-                        e,
-                    )
-                })?,
-                _ => result,
-            };
-
-            // Check if the result is a special action such as goto/drop/pass
-            if result.is_control() {
-                return Ok(result);
-            }
-
-            match *post_op {
-                Some(Operator::And) if !result.is_success() => return Ok(result),
-                Some(Operator::Or) if result.is_success() => return Ok(result),
-                _ => continue,
-            }
+        if let Some(if_statement) = statement.if_statement.as_ref() {
+            return Self::execute_if_statement(if_statement, line_no, source, context).await;
         }
 
-        Ok(result)
+        Self::execute_expression_chain(
+            &statement.expressions,
+            context,
+            Some(line_no),
+            Some(source),
+            true,
+            "",
+        )
+        .await
     }
 
     // Execute a single expression
@@ -223,49 +188,138 @@ impl BlockExecuter {
                 Ok(result)
             }
             Expression::Group(exprs) => {
-                let mut result = CommandResult::success();
-                for (prefix_op, sub_expr, post_op) in exprs {
-                    result = {
-                        let sub_result = Self::execute_expression_with_location(
-                            sub_expr,
-                            context,
-                            line_no,
-                            source.clone(),
-                        )
-                        .await?;
-
-                        let sub_result = match prefix_op {
-                            Some(Operator::Not) => sub_result.try_not().map_err(|e| {
-                                Self::wrap_runtime_error(
-                                    context,
-                                    ProcessChainErrorCode::RuntimeExpressionExecute,
-                                    "Failed to apply NOT operator in group expression",
-                                    line_no,
-                                    source.as_deref(),
-                                    None,
-                                    e,
-                                )
-                            })?,
-                            _ => sub_result,
-                        };
-
-                        // Check if the result is a special action such as goto/drop/pass
-                        if sub_result.is_control() {
-                            return Ok(sub_result);
-                        }
-
-                        sub_result
-                    };
-
-                    match post_op {
-                        Some(Operator::And) if !result.is_success() => return Ok(result),
-                        Some(Operator::Or) if result.is_success() => return Ok(result),
-                        _ => continue,
-                    }
-                }
-                Ok(result)
+                Self::execute_expression_chain(
+                    exprs,
+                    context,
+                    line_no,
+                    source.as_deref(),
+                    true,
+                    "",
+                )
+                .await
             }
         }
+    }
+
+    async fn execute_expression_chain(
+        expressions: &ExpressionChain,
+        context: &Context,
+        line_no: Option<usize>,
+        source: Option<&str>,
+        allow_control: bool,
+        control_error_message: &str,
+    ) -> Result<CommandResult, String> {
+        let mut result = CommandResult::success();
+
+        for (prefix_op, expr, post_op) in expressions {
+            debug!("Executing expression: {:?}", expr);
+            result = Self::execute_expression_with_location(
+                expr,
+                context,
+                line_no,
+                source.map(|s| s.to_string()),
+            )
+            .await
+            .map_err(|e| {
+                Self::wrap_runtime_error(
+                    context,
+                    ProcessChainErrorCode::RuntimeExpressionExecute,
+                    "Failed to execute expression",
+                    line_no,
+                    source,
+                    None,
+                    e,
+                )
+            })?;
+
+            result = match prefix_op {
+                Some(Operator::Not) => result.try_not().map_err(|e| {
+                    Self::wrap_runtime_error(
+                        context,
+                        ProcessChainErrorCode::RuntimeExpressionExecute,
+                        "Failed to apply NOT operator",
+                        line_no,
+                        source,
+                        None,
+                        e,
+                    )
+                })?,
+                _ => result,
+            };
+
+            if result.is_control() {
+                if allow_control {
+                    return Ok(result);
+                }
+
+                let msg = if control_error_message.is_empty() {
+                    "Control action is not allowed in this expression chain".to_string()
+                } else {
+                    control_error_message.to_string()
+                };
+                return Err(Self::wrap_runtime_error(
+                    context,
+                    ProcessChainErrorCode::RuntimeExpressionExecute,
+                    msg,
+                    line_no,
+                    source,
+                    None,
+                    format!("{:?}", result),
+                ));
+            }
+
+            match *post_op {
+                Some(Operator::And) if !result.is_success() => return Ok(result),
+                Some(Operator::Or) if result.is_success() => return Ok(result),
+                _ => continue,
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn execute_nested_lines(
+        lines: &[Line],
+        line_no: usize,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let mut result = CommandResult::success();
+        for line in lines {
+            result = Self::execute_line(line, line_no, context).await?;
+            if result.is_control() {
+                return Ok(result);
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn execute_if_statement(
+        if_statement: &IfStatement,
+        line_no: usize,
+        source: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        for branch in &if_statement.branches {
+            let cond_result = Self::execute_expression_chain(
+                &branch.condition,
+                context,
+                Some(line_no),
+                Some(source),
+                false,
+                "Control action is not allowed in if condition",
+            )
+            .await?;
+            if cond_result.is_success() {
+                return Self::execute_nested_lines(&branch.lines, line_no, context).await;
+            }
+        }
+
+        if let Some(else_lines) = if_statement.else_lines.as_ref() {
+            return Self::execute_nested_lines(else_lines, line_no, context).await;
+        }
+
+        Ok(CommandResult::success())
     }
 
     async fn execute_command(

@@ -286,6 +286,8 @@ pub enum Expression {
     Group(Vec<(Option<Operator>, Expression, Option<Operator>)>), // Sub-expression in brackets
 }
 
+pub type ExpressionChain = Vec<(Option<Operator>, Expression, Option<Operator>)>;
+
 impl Expression {
     pub fn is_command(&self) -> bool {
         matches!(self, Expression::Command(_))
@@ -311,9 +313,39 @@ impl Expression {
         }
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct IfBranch {
+    pub condition: ExpressionChain,
+    pub lines: Vec<Line>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IfStatement {
+    pub branches: Vec<IfBranch>,
+    pub else_lines: Option<Vec<Line>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Statement {
-    pub expressions: Vec<(Option<Operator>, Expression, Option<Operator>)>,
+    pub expressions: ExpressionChain,
+    pub if_statement: Option<IfStatement>,
+}
+
+impl Statement {
+    pub fn new_expressions(expressions: ExpressionChain) -> Self {
+        Self {
+            expressions,
+            if_statement: None,
+        }
+    }
+
+    pub fn new_if(if_statement: IfStatement) -> Self {
+        Self {
+            expressions: Vec::new(),
+            if_statement: Some(if_statement),
+        }
+    }
 }
 
 // Line of commands, top level structure

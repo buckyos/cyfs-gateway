@@ -1,4 +1,4 @@
-use super::block::{Block, CommandArg, CommandItem, Expression};
+use super::block::{Block, CommandArg, CommandItem, Expression, IfStatement, Line, Statement};
 use super::exec::BlockExecuter;
 use crate::chain::{Context, MissingVarPolicy, ParserContextRef};
 use crate::cmd::CommandParserFactory;
@@ -16,11 +16,47 @@ impl BlockCommandLinker {
 
     pub async fn link(&self, block: &mut Block) -> Result<(), String> {
         for line in &mut block.lines {
-            for statement in &mut line.statements {
-                // For each statement, we need to link the expressions
-                for (_, expr, _) in &mut statement.expressions {
-                    self.link_expression(expr)?;
-                }
+            self.link_line(line)?;
+        }
+
+        Ok(())
+    }
+
+    fn link_line(&self, line: &mut Line) -> Result<(), String> {
+        for statement in &mut line.statements {
+            self.link_statement(statement)?;
+        }
+
+        Ok(())
+    }
+
+    fn link_statement(&self, statement: &mut Statement) -> Result<(), String> {
+        if let Some(if_statement) = statement.if_statement.as_mut() {
+            self.link_if_statement(if_statement)?;
+            return Ok(());
+        }
+
+        // For each statement, we need to link the expressions
+        for (_, expr, _) in &mut statement.expressions {
+            self.link_expression(expr)?;
+        }
+
+        Ok(())
+    }
+
+    fn link_if_statement(&self, if_statement: &mut IfStatement) -> Result<(), String> {
+        for branch in &mut if_statement.branches {
+            for (_, expr, _) in &mut branch.condition {
+                self.link_expression(expr)?;
+            }
+            for line in &mut branch.lines {
+                self.link_line(line)?;
+            }
+        }
+
+        if let Some(else_lines) = if_statement.else_lines.as_mut() {
+            for line in else_lines {
+                self.link_line(line)?;
             }
         }
 

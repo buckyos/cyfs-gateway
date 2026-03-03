@@ -34,12 +34,17 @@ impl BlockParser {
             return Ok(block);
         }
 
-        for (i, line) in lines.iter().enumerate() {
-            debug!("Parsing line {}: {}", i, line.trim());
-            let parsed_line = Self::parse_line(line)?;
-            info!("Parsed line {}: {:?}", i, parsed_line);
-            block.lines.push(parsed_line);
+        let (parsed_lines, index) = Self::parse_lines(&lines, 0, false)?;
+        if index != lines.len() {
+            let msg = format!(
+                "Unexpected parser stop at line {}, total lines {}",
+                index + 1,
+                lines.len()
+            );
+            error!("{}", msg);
+            return Err(msg);
         }
+        block.lines = parsed_lines;
 
         Ok(block)
     }
@@ -59,6 +64,181 @@ impl BlockParser {
                 !line.starts_with('#') && !line.starts_with("//")
             }) // Filter out empty lines
             .collect()
+    }
+
+    fn parse_lines(
+        lines: &[&str],
+        mut index: usize,
+        stop_at_control_keywords: bool,
+    ) -> Result<(Vec<Line>, usize), String> {
+        let mut parsed_lines = Vec::new();
+        while index < lines.len() {
+            let line = lines[index].trim();
+            if let Some(keyword) = Self::line_control_keyword(line) {
+                if stop_at_control_keywords {
+                    break;
+                } else {
+                    let msg = format!(
+                        "Unexpected '{}' at line {} without matching 'if'",
+                        keyword,
+                        index + 1
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
+
+            debug!("Parsing line {}: {}", index, line);
+            let (parsed_line, next_index) = if Self::is_if_header(line) {
+                Self::parse_if_statement(lines, index)?
+            } else {
+                (Self::parse_line(line)?, index + 1)
+            };
+
+            info!("Parsed line {}: {:?}", index, parsed_line);
+            parsed_lines.push(parsed_line);
+            index = next_index;
+        }
+
+        Ok((parsed_lines, index))
+    }
+
+    fn line_control_keyword(line: &str) -> Option<&'static str> {
+        let line = line.trim();
+        if line == "else" {
+            return Some("else");
+        }
+        if line == "end" {
+            return Some("end");
+        }
+        if line.starts_with("elif ") && line.ends_with(" then") {
+            return Some("elif");
+        }
+
+        None
+    }
+
+    fn is_if_header(line: &str) -> bool {
+        let line = line.trim();
+        line.starts_with("if ") && line.ends_with(" then")
+    }
+
+    fn parse_if_condition(line: &str, keyword: &str) -> Result<ExpressionChain, String> {
+        let line = line.trim();
+        let condition_part = line
+            .strip_prefix(keyword)
+            .ok_or_else(|| format!("Invalid '{}' header: '{}'", keyword, line))?
+            .trim_start();
+
+        let condition_part = condition_part.strip_suffix("then").ok_or_else(|| {
+            let msg = format!("'{}' header must end with 'then': '{}'", keyword, line);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let condition_part = condition_part.trim_end();
+        if condition_part.is_empty() {
+            let msg = format!("'{}' condition must not be empty: '{}'", keyword, line);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let (rest, condition) = Self::parse_expressions(condition_part).map_err(|e| {
+            let msg = format!("Parse '{}' condition error: '{}', {:?}", keyword, line, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        if !rest.trim().is_empty() {
+            let msg = format!(
+                "Unexpected content in '{}' condition: line='{}', rest='{}'",
+                keyword, line, rest
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        if condition.is_empty() {
+            let msg = format!("'{}' condition must not be empty: '{}'", keyword, line);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        Ok(condition)
+    }
+
+    fn parse_if_statement(lines: &[&str], index: usize) -> Result<(Line, usize), String> {
+        let if_source = lines[index].trim().to_string();
+        let mut branches = Vec::new();
+        let mut else_lines = None;
+
+        let mut current_condition = Self::parse_if_condition(if_source.as_str(), "if")?;
+        let mut cursor = index + 1;
+
+        loop {
+            let (branch_lines, next_cursor) = Self::parse_lines(lines, cursor, true)?;
+            branches.push(IfBranch {
+                condition: current_condition,
+                lines: branch_lines,
+            });
+
+            if next_cursor >= lines.len() {
+                let msg = format!(
+                    "Missing 'end' for if statement starting at line {}: '{}'",
+                    index + 1,
+                    if_source
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            let control_line = lines[next_cursor].trim();
+            match Self::line_control_keyword(control_line) {
+                Some("elif") => {
+                    current_condition = Self::parse_if_condition(control_line, "elif")?;
+                    cursor = next_cursor + 1;
+                }
+                Some("else") => {
+                    let (parsed_else_lines, end_cursor) =
+                        Self::parse_lines(lines, next_cursor + 1, true)?;
+
+                    if end_cursor >= lines.len() || lines[end_cursor].trim() != "end" {
+                        let msg = format!(
+                            "Missing 'end' after else branch for if starting at line {}",
+                            index + 1
+                        );
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+
+                    else_lines = Some(parsed_else_lines);
+                    cursor = end_cursor + 1;
+                    break;
+                }
+                Some("end") => {
+                    cursor = next_cursor + 1;
+                    break;
+                }
+                Some(other) => {
+                    let msg = format!(
+                        "Unexpected control keyword '{}' in if statement at line {}",
+                        other,
+                        next_cursor + 1
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+                None => unreachable!("parse_lines(stop_at_control_keywords=true) must stop at a control keyword"),
+            }
+        }
+
+        let statement = Statement::new_if(IfStatement { branches, else_lines });
+        let line = Line {
+            source: if_source,
+            statements: vec![statement],
+        };
+
+        Ok((line, cursor))
     }
 
     // Parse a single line, support label and expressions
@@ -106,7 +286,7 @@ impl BlockParser {
             let stmts = expr_groups
                 .into_iter()
                 .filter(|expressions| !expressions.is_empty())
-                .map(|expressions| Statement { expressions })
+                .map(Statement::new_expressions)
                 .collect();
             (rest, stmts)
         })
