@@ -7,4 +7,5 @@ mod test_env;
 mod test_var;
 mod test_capture;
 mod test_external_namespace;
+mod test_invoke;
 mod external;

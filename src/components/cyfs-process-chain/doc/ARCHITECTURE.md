@@ -168,6 +168,13 @@
 - 目标返回 `Error` -> `Error(value)`
 - 目标返回 `Exit/Break` -> 视为错误（非法控制动作）
 
+`invoke` 在 `exec` 目标解析规则之上增加参数传递：
+
+- `invoke --chain auth_flow --arg user $REQ.user --arg pass $REQ.pass`
+- 被调流程通过 `$__args.<key>` 读取参数。
+- 参数值支持 `CollectionValue` 全类型，集合类型按引用语义传递。
+- 当前返回值语义与 `exec` 保持一致（字符串归一化返回）。
+
 ## 7. 外部命令扩展
 
 ### 7.1 Rust 外部命令

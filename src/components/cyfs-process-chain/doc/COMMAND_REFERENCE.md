@@ -1171,6 +1171,47 @@ EXAMPLES:
   exec --lib common_utils
 ```
 
+### `invoke`
+```
+Invoke a block, process-chain, or library with named arguments.
+
+Usage: invoke [OPTIONS] <--block <BLOCK_ID>|--chain <CHAIN_ID>|--lib <LIB_ID>|BLOCK_ID>
+
+Arguments:
+  [BLOCK_ID]
+          Default: invoke a block from the current chain.
+
+Options:
+      --block <BLOCK_ID>
+          Invoke a block by ID.
+
+      --chain <CHAIN_ID>
+          Invoke a process-chain by ID.
+
+      --lib <LIB_ID>
+          Invoke a library by ID.
+
+      --arg <KEY> <VALUE>
+          Named argument for callee, can be repeated.
+
+  -h, --help
+          Print help
+
+
+DESCRIPTION:
+  invoke is similar to exec, but it passes named arguments to the callee
+  through $__args.<key>.
+
+ARGUMENT PASSING:
+  - `--arg <key> <value>` can be repeated.
+  - `<value>` can be literal, variable, command substitution, or collection reference.
+  - The callee reads arguments via `$__args.<key>`.
+
+EXAMPLES:
+  invoke --chain auth_flow --arg user $REQ.user --arg pass $REQ.pass
+  invoke --block helper_block --arg req $REQ
+```
+
 ### `exit`
 ```
 Return from the current process chain list, optionally with a value.
