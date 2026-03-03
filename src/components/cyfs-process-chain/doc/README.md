@@ -11,6 +11,8 @@
   - 注意：当前文件中的 external 命令来自 REPL 默认初始化（例如 `http-probe`、`https-sni-probe`），网关运行时可注册更多命令。
 - [RFC_LIGHTWEIGHT_TYPE_SYSTEM.md](./RFC_LIGHTWEIGHT_TYPE_SYSTEM.md)
   - 轻量类型系统演进草案（兼容策略、policy 设计、分阶段落地方案）。
+- [RFC_SCRIPT_MODULARIZATION.md](./RFC_SCRIPT_MODULARIZATION.md)
+  - 脚本模块化能力草案（基于 `invoke` 的参数签名、调用边界与命名空间设计）。
 
 ## 版本与时间
 
