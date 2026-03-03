@@ -38,7 +38,7 @@ impl GatewayControlClient {
     async fn call(&self, method: &str, params: Value) -> ControlResult<Value> {
         let krpc = self.build_krpc();
         let result = krpc.call(method, params).await
-            .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
+            .map_err(|e| cmd_err!(ControlErrorCode::RpcError, "{:?}", e))?;
         Ok(result)
     }
 

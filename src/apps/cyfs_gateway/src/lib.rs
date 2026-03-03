@@ -1098,7 +1098,7 @@ pub async fn cyfs_gateway_main() {
             let login_result = match cyfs_cmd_client.login(user, password).await {
                 Ok(result) => result,
                 Err(e) => {
-                    println!("login error: {}", e);
+                    println!("{}", e.msg());
                     std::process::exit(1);
                 }
             };
@@ -1127,7 +1127,7 @@ pub async fn cyfs_gateway_main() {
                         std::process::exit(0);
                     }
                     Err(e) => {
-                        println!("show init config error: {}", e);
+                        println!("{}", e.msg());
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
@@ -1153,7 +1153,7 @@ pub async fn cyfs_gateway_main() {
                         std::process::exit(0);
                     }
                     Err(e) => {
-                        println!("show config error: {}", e);
+                        println!("{}", e.msg());
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
@@ -1181,7 +1181,7 @@ pub async fn cyfs_gateway_main() {
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("save config error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1207,7 +1207,7 @@ pub async fn cyfs_gateway_main() {
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("show connections error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1233,7 +1233,7 @@ pub async fn cyfs_gateway_main() {
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("show connection devices error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1249,15 +1249,15 @@ pub async fn cyfs_gateway_main() {
             let cyfs_cmd_client =
                 GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.remove_rule(id).await {
-                Ok(result) => {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                Ok(_result) => {
+                    println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("del rule error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1276,15 +1276,15 @@ pub async fn cyfs_gateway_main() {
             let cyfs_cmd_client =
                 GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.add_rule(config_type, config_id).await {
-                Ok(result) => {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                Ok(_result) => {
+                    println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("add chain error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1303,15 +1303,15 @@ pub async fn cyfs_gateway_main() {
             let cyfs_cmd_client =
                 GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.append_rule(id, rule).await {
-                Ok(result) => {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                Ok(_result) => {
+                    println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("append rule error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1334,15 +1334,15 @@ pub async fn cyfs_gateway_main() {
             let cyfs_cmd_client =
                 GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.insert_rule(id, pos, rule).await {
-                Ok(result) => {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                Ok(_result) => {
+                    println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("insert rule error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1362,15 +1362,15 @@ pub async fn cyfs_gateway_main() {
             let cyfs_cmd_client =
                 GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.move_rule(id, pos).await {
-                Ok(result) => {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                Ok(_result) => {
+                    println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("move rule error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1389,15 +1389,15 @@ pub async fn cyfs_gateway_main() {
             let cyfs_cmd_client =
                 GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.set_rule(id, rule).await {
-                Ok(result) => {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                Ok(_result) => {
+                    println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("set rule error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1421,15 +1421,15 @@ pub async fn cyfs_gateway_main() {
             let cyfs_cmd_client =
                 GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.add_dispatch(local, target, protocol).await {
-                Ok(result) => {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                Ok(_result) => {
+                    println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("add dispatch error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1451,15 +1451,15 @@ pub async fn cyfs_gateway_main() {
             let cyfs_cmd_client =
                 GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.add_router(server_id, uri, target).await {
-                Ok(result) => {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                Ok(_result) => {
+                    println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("add router error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1481,15 +1481,15 @@ pub async fn cyfs_gateway_main() {
             let cyfs_cmd_client =
                 GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.remove_router(server_id, uri, target).await {
-                Ok(result) => {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                Ok(_result) => {
+                    println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("remove router error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1510,15 +1510,15 @@ pub async fn cyfs_gateway_main() {
             let cyfs_cmd_client =
                 GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.remove_dispatch(local, protocol).await {
-                Ok(result) => {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                Ok(_result) => {
+                    println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("remove dispatch error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1542,7 +1542,7 @@ pub async fn cyfs_gateway_main() {
                         std::process::exit(0);
                     }
                     Err(e) => {
-                        println!("collection list error: {}", e);
+                        println!("{}", e.msg());
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
@@ -1569,7 +1569,7 @@ pub async fn cyfs_gateway_main() {
                         std::process::exit(0);
                     }
                     Err(e) => {
-                        println!("collection get error: {}", e);
+                        println!("{}", e.msg());
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
@@ -1590,15 +1590,15 @@ pub async fn cyfs_gateway_main() {
                 let cyfs_cmd_client =
                     GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
                 match cyfs_cmd_client.collection_set_add(name, value).await {
-                    Ok(result) => {
-                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    Ok(_result) => {
+                        println!("success");
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
                         std::process::exit(0);
                     }
                     Err(e) => {
-                        println!("collection set-add error: {}", e);
+                        println!("{}", e.msg());
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
@@ -1619,15 +1619,15 @@ pub async fn cyfs_gateway_main() {
                 let cyfs_cmd_client =
                     GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
                 match cyfs_cmd_client.collection_set_del(name, value).await {
-                    Ok(result) => {
-                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    Ok(_result) => {
+                        println!("success");
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
                         std::process::exit(0);
                     }
                     Err(e) => {
-                        println!("collection set-del error: {}", e);
+                        println!("{}", e.msg());
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
@@ -1649,7 +1649,7 @@ pub async fn cyfs_gateway_main() {
                     match serde_json::from_str::<Value>(raw_value.as_str()) {
                         Ok(v) => v.to_string(),
                         Err(e) => {
-                            println!("collection map-put error: invalid --json value: {}", e);
+                            println!("invalid --json value: {}", e);
                             std::process::exit(1);
                         }
                     }
@@ -1665,15 +1665,15 @@ pub async fn cyfs_gateway_main() {
                     .collection_map_put(name, key, value.as_str())
                     .await
                 {
-                    Ok(result) => {
-                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    Ok(_result) => {
+                        println!("success");
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
                         std::process::exit(0);
                     }
                     Err(e) => {
-                        println!("collection map-put error: {}", e);
+                        println!("{}", e.msg());
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
@@ -1694,15 +1694,15 @@ pub async fn cyfs_gateway_main() {
                 let cyfs_cmd_client =
                     GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
                 match cyfs_cmd_client.collection_map_del(name, key).await {
-                    Ok(result) => {
-                        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                    Ok(_result) => {
+                        println!("success");
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
                         std::process::exit(0);
                     }
                     Err(e) => {
-                        println!("collection map-del error: {}", e);
+                        println!("{}", e.msg());
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
@@ -1735,7 +1735,7 @@ pub async fn cyfs_gateway_main() {
 
             if let Some(path) = sub_matches.get_one::<String>("file") {
                 if let Err(e) = std::fs::write(path, output) {
-                    println!("process_chain write error: {}", e);
+                    println!("{}", e);
                     std::process::exit(1);
                 }
                 println!("Documentation saved to {}", path);
@@ -1767,15 +1767,15 @@ pub async fn cyfs_gateway_main() {
             let cyfs_cmd_client =
                 GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.reload().await {
-                Ok(result) => {
-                    println!("{}", result.to_string());
+                Ok(_result) => {
+                    println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("reload error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1805,7 +1805,7 @@ pub async fn cyfs_gateway_main() {
                         std::process::exit(0);
                     }
                     Err(e) => {
-                        println!("start template list error: {}", e);
+                        println!("{}", e.msg());
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
@@ -1828,7 +1828,7 @@ pub async fn cyfs_gateway_main() {
                         std::process::exit(0);
                     }
                     Err(e) => {
-                        println!("start template help error: {}", e);
+                        println!("{}", e);
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                             save_login_token(server.as_str(), token.as_str());
                         }
@@ -1841,15 +1841,15 @@ pub async fn cyfs_gateway_main() {
                 .start_template(template_id.as_str(), start_args.args)
                 .await
             {
-                Ok(result) => {
-                    println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                Ok(_result) => {
+                    println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("start template error: {}", e);
+                    println!("{}", e.msg());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
                         save_login_token(server.as_str(), token.as_str());
                     }
@@ -1877,7 +1877,7 @@ pub async fn cyfs_gateway_main() {
                         std::process::exit(0);
                     }
                     Err(e) => {
-                        println!("run template list error: {:?}", e);
+                        println!("{}", e.msg());
                         std::process::exit(1);
                     }
                 }
@@ -1892,12 +1892,12 @@ pub async fn cyfs_gateway_main() {
                             std::process::exit(0);
                         }
                         Err(e) => {
-                            println!("run template help error: {:?}", e);
+                            println!("{}", e.msg());
                             std::process::exit(1);
                         }
                     },
                     Err(e) => {
-                        println!("run template help error: {:?}", e);
+                        println!("{}", e.msg());
                         std::process::exit(1);
                     }
                 }
@@ -1924,7 +1924,7 @@ pub async fn cyfs_gateway_main() {
                     std::process::exit(0);
                 }
                 Err(e) => {
-                    println!("run template error: {}", e);
+                    println!("{}", e);
                     std::process::exit(1);
                 }
             }
