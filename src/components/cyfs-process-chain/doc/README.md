@@ -9,6 +9,8 @@
 - [COMMAND_REFERENCE.md](./COMMAND_REFERENCE.md)
   - 由 REPL `help doc` 自动导出的命令帮助（含内置命令和已注册外部命令）。
   - 注意：当前文件中的 external 命令来自 REPL 默认初始化（例如 `http-probe`、`https-sni-probe`），网关运行时可注册更多命令。
+- [RFC_LIGHTWEIGHT_TYPE_SYSTEM.md](./RFC_LIGHTWEIGHT_TYPE_SYSTEM.md)
+  - 轻量类型系统演进草案（兼容策略、policy 设计、分阶段落地方案）。
 
 ## 版本与时间
 
