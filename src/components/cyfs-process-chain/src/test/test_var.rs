@@ -601,6 +601,7 @@ async fn test_dynamic_map_lookup_missing_ip_strict_returns_error() {
         .unwrap();
     hook_point_env.set_execution_policy(ExecutionPolicy {
         missing_var: MissingVarPolicy::Strict,
+        coercion: CoercionPolicy::Legacy,
     });
 
     let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();

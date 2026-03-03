@@ -10,6 +10,7 @@ use super::map::*;
 use super::match_::*;
 use super::string::*;
 use super::type_::*;
+use super::value::*;
 use super::var::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -83,6 +84,14 @@ impl CommandParserFactory {
         self.register("assign", Arc::new(Box::new(AssignCommandParser::new())));
         self.register("delete", Arc::new(Box::new(DeleteCommandParser::new())));
         self.register("type", Arc::new(Box::new(TypeCommandParser::new())));
+        self.register("to-bool", Arc::new(Box::new(ToBoolCommandParser::new())));
+        self.register(
+            "to-number",
+            Arc::new(Box::new(ToNumberCommandParser::new())),
+        );
+        self.register("is-null", Arc::new(Box::new(create_is_null_parser())));
+        self.register("is-bool", Arc::new(Box::new(create_is_bool_parser())));
+        self.register("is-number", Arc::new(Box::new(create_is_number_parser())));
         self.register("capture", Arc::new(Box::new(CaptureCommandParser::new())));
 
         // match command

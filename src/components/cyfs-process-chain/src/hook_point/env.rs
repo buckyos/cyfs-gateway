@@ -98,6 +98,12 @@ impl HookPointEnv {
         self.set_execution_policy(current);
     }
 
+    pub fn set_coercion_policy(&self, policy: CoercionPolicy) {
+        let mut current = self.execution_policy();
+        current.coercion = policy;
+        self.set_execution_policy(current);
+    }
+
     pub fn register_external_command(
         &self,
         name: &str,

@@ -1,7 +1,8 @@
 use super::linker::CommandArgEvaluator;
+use crate::chain::CoercionPolicy;
 use crate::chain::Context;
 use crate::cmd::*;
-use crate::collection::CollectionValue;
+use crate::collection::{CollectionValue, NumberValue};
 use std::fmt;
 use std::ops::Deref;
 
@@ -45,6 +46,158 @@ pub enum CommandArg {
 }
 
 impl CommandArg {
+    fn parse_bool_literal(raw: &str) -> Option<bool> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn parse_number_literal(raw: &str) -> Option<NumberValue> {
+        let trimmed = raw.trim();
+        if let Ok(v) = trimmed.parse::<i64>() {
+            return Some(NumberValue::Int(v));
+        }
+        if let Ok(v) = trimmed.parse::<f64>() {
+            return Some(NumberValue::Float(v));
+        }
+        None
+    }
+
+    fn coerce_to_string(value: CollectionValue, policy: CoercionPolicy) -> Result<String, String> {
+        if let CollectionValue::String(s) = value {
+            return Ok(s);
+        }
+
+        match value {
+            CollectionValue::Null => match policy {
+                CoercionPolicy::Legacy => Ok(String::new()),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Null to empty string under warn coercion policy");
+                    Ok(String::new())
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected string value, found Null (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            CollectionValue::Bool(v) => match policy {
+                CoercionPolicy::Legacy => Ok(v.to_string()),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Bool to string under warn coercion policy");
+                    Ok(v.to_string())
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected string value, found Bool (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            CollectionValue::Number(v) => match policy {
+                CoercionPolicy::Legacy => Ok(v.to_string()),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Number to string under warn coercion policy");
+                    Ok(v.to_string())
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected string value, found Number (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            other => {
+                let msg = format!("Expected string value, found: {:?}", other);
+                warn!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+
+    fn coerce_to_bool(value: CollectionValue, policy: CoercionPolicy) -> Result<bool, String> {
+        match value {
+            CollectionValue::Bool(v) => Ok(v),
+            CollectionValue::String(s) => Self::parse_bool_literal(&s).ok_or_else(|| {
+                let msg = format!("Cannot convert string '{}' to bool", s);
+                warn!("{}", msg);
+                msg
+            }),
+            CollectionValue::Number(v) => match policy {
+                CoercionPolicy::Legacy => Ok(v.as_f64() != 0.0),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Number to bool under warn coercion policy");
+                    Ok(v.as_f64() != 0.0)
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected bool value, found Number (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            CollectionValue::Null => match policy {
+                CoercionPolicy::Legacy => Ok(false),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Null to bool=false under warn coercion policy");
+                    Ok(false)
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected bool value, found Null (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            other => {
+                let msg = format!("Expected bool value, found: {:?}", other);
+                warn!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+
+    fn coerce_to_number(
+        value: CollectionValue,
+        policy: CoercionPolicy,
+    ) -> Result<NumberValue, String> {
+        match value {
+            CollectionValue::Number(v) => Ok(v),
+            CollectionValue::String(s) => Self::parse_number_literal(&s).ok_or_else(|| {
+                let msg = format!("Cannot convert string '{}' to number", s);
+                warn!("{}", msg);
+                msg
+            }),
+            CollectionValue::Bool(v) => match policy {
+                CoercionPolicy::Legacy => Ok(NumberValue::Int(if v { 1 } else { 0 })),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Bool to number under warn coercion policy");
+                    Ok(NumberValue::Int(if v { 1 } else { 0 }))
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected number value, found Bool (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            CollectionValue::Null => match policy {
+                CoercionPolicy::Legacy => Ok(NumberValue::Int(0)),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Null to number=0 under warn coercion policy");
+                    Ok(NumberValue::Int(0))
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected number value, found Null (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            other => {
+                let msg = format!("Expected number value, found: {:?}", other);
+                warn!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+
     pub fn is_literal(&self) -> bool {
         matches!(self, CommandArg::Literal(_))
     }
@@ -103,12 +256,28 @@ impl CommandArg {
 
     pub async fn evaluate_string(&self, context: &Context) -> Result<String, String> {
         let value = self.evaluate(context).await?;
-        if value.is_string() {
-            Ok(value.into_string().unwrap())
+        Self::coerce_to_string(value, context.env().coercion_policy())
+    }
+
+    pub async fn evaluate_bool(&self, context: &Context) -> Result<bool, String> {
+        let value = self.evaluate(context).await?;
+        Self::coerce_to_bool(value, context.env().coercion_policy())
+    }
+
+    pub async fn evaluate_number(&self, context: &Context) -> Result<NumberValue, String> {
+        let value = self.evaluate(context).await?;
+        Self::coerce_to_number(value, context.env().coercion_policy())
+    }
+
+    pub async fn evaluate_nullable(
+        &self,
+        context: &Context,
+    ) -> Result<Option<CollectionValue>, String> {
+        let value = self.evaluate(context).await?;
+        if value.is_null() {
+            Ok(None)
         } else {
-            let msg = format!("Expected string value, found: {:?}", value);
-            warn!("{}", msg);
-            Err(msg)
+            Ok(Some(value))
         }
     }
 
@@ -124,15 +293,10 @@ impl CommandArg {
         context: &Context,
     ) -> Result<Vec<String>, String> {
         let values = Self::evaluate_list(args, context).await?;
+        let coercion = context.env().coercion_policy();
         let mut result = Vec::with_capacity(values.len());
         for value in values {
-            if value.is_string() {
-                result.push(value.into_string().unwrap());
-            } else {
-                let msg = format!("Expected string value, found: {:?}", value);
-                warn!("{}", msg);
-                return Err(msg);
-            }
+            result.push(Self::coerce_to_string(value, coercion)?);
         }
 
         Ok(result)

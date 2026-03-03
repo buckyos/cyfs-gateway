@@ -128,15 +128,35 @@ impl MissingVarPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CoercionPolicy {
+    #[default]
+    Legacy,
+    Warn,
+    Strict,
+}
+
+impl CoercionPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CoercionPolicy::Legacy => "legacy",
+            CoercionPolicy::Warn => "warn",
+            CoercionPolicy::Strict => "strict",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionPolicy {
     pub missing_var: MissingVarPolicy,
+    pub coercion: CoercionPolicy,
 }
 
 impl Default for ExecutionPolicy {
     fn default() -> Self {
         Self {
             missing_var: MissingVarPolicy::Lenient,
+            coercion: CoercionPolicy::Legacy,
         }
     }
 }
@@ -211,6 +231,18 @@ impl EnvManager {
         let mut current = self.policy();
         if current.missing_var != policy {
             current.missing_var = policy;
+            self.set_policy(current);
+        }
+    }
+
+    pub fn coercion_policy(&self) -> CoercionPolicy {
+        self.policy().coercion
+    }
+
+    pub fn set_coercion_policy(&self, policy: CoercionPolicy) {
+        let mut current = self.policy();
+        if current.coercion != policy {
+            current.coercion = policy;
             self.set_policy(current);
         }
     }

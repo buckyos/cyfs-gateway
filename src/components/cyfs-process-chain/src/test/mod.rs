@@ -11,4 +11,5 @@ mod test_invoke;
 mod test_goto;
 mod test_if;
 mod test_list;
+mod test_coercion;
 mod external;
