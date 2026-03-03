@@ -1,19 +1,32 @@
 use super::cmd::*;
 use super::exec::{
-    parse_exec_scope_and_target, parse_invoke_args, ExecScope, InvokeArgSpec, InvokeCommandExecutor,
+    ExecScope, InvokeArgSpec, InvokeCommandExecutor, parse_exec_scope_and_target, parse_invoke_args,
 };
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
-use clap::{Arg, ArgAction, ArgGroup, Command};
+use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
 use std::str::FromStr;
 use std::sync::Arc;
 
-fn default_goto_from_level(scope: ExecScope) -> CommandControlLevel {
-    match scope {
-        ExecScope::Block => CommandControlLevel::Block,
-        ExecScope::Chain => CommandControlLevel::Chain,
-        ExecScope::Lib => CommandControlLevel::Lib,
-    }
+fn default_goto_from_level() -> CommandControlLevel {
+    // Keep goto default aligned with `return` / `error` default behavior.
+    CommandControlLevel::Block
+}
+
+fn parse_goto_from_level(
+    matches: &ArgMatches,
+    option_name: &str,
+) -> Result<Option<CommandControlLevel>, String> {
+    matches
+        .get_one::<String>(option_name)
+        .map(|s| s.as_str())
+        .map(CommandControlLevel::from_str)
+        .transpose()
+        .map_err(|e| {
+            let msg = format!("Invalid goto scope for --{}: {}", option_name, e);
+            error!("{}", msg);
+            msg
+        })
 }
 
 // goto command: tail-transfer style control command.
@@ -31,7 +44,7 @@ impl GotoCommandParser {
 DESCRIPTION:
   goto is a structured tail-transfer command. It first executes the target
   (same semantics as invoke), then converts the result to return/error from
-  the selected caller scope.
+  the selected caller scope(s).
 
 TARGET:
   Exactly one of --block/--chain/--lib must be provided.
@@ -40,16 +53,16 @@ TARGET:
     --chain: chain | lib:chain
     --lib:   lib
 
-RETURN LEVEL (--from):
-  Optional. Decouples target scope from caller return scope.
-  If omitted, defaults to the same level as target:
-    --block -> block
-    --chain -> chain
-    --lib   -> lib
+RETURN LEVEL:
+  --from      Optional common default for success/error mapping.
+  --ok-from   Optional success scope override.
+  --err-from  Optional error scope override.
+  If omitted, defaults to block (same as return/error without --from).
 
 Examples:
   goto --chain fallback_chain
   goto --chain auth_flow --from lib
+  goto --chain auth_flow --from chain --err-from lib
   goto --block helper --arg req $REQ
 "#,
             )
@@ -74,7 +87,21 @@ Examples:
             .arg(
                 Arg::new("from")
                     .long("from")
-                    .help("Return/error scope after target execution.")
+                    .help("Default return/error scope after target execution.")
+                    .value_name("LEVEL")
+                    .value_parser(["block", "chain", "lib"]),
+            )
+            .arg(
+                Arg::new("ok-from")
+                    .long("ok-from")
+                    .help("Success return scope override after target execution.")
+                    .value_name("LEVEL")
+                    .value_parser(["block", "chain", "lib"]),
+            )
+            .arg(
+                Arg::new("err-from")
+                    .long("err-from")
+                    .help("Error return scope override after target execution.")
                     .value_name("LEVEL")
                     .value_parser(["block", "chain", "lib"]),
             )
@@ -123,20 +150,17 @@ impl CommandParser for GotoCommandParser {
 
         let (scope, target) = parse_exec_scope_and_target(&matches, args, "goto")?;
         let goto_args = parse_invoke_args(&matches, args)?;
+        let default_from_level = default_goto_from_level();
 
-        let from_level = matches
-            .get_one::<String>("from")
-            .map(|s| s.as_str())
-            .map(CommandControlLevel::from_str)
-            .transpose()
-            .map_err(|e| {
-                let msg = format!("Invalid goto return scope: {}", e);
-                error!("{}", msg);
-                msg
-            })?
-            .unwrap_or_else(|| default_goto_from_level(scope));
+        let from_level = parse_goto_from_level(&matches, "from")?;
+        let ok_from_level = parse_goto_from_level(&matches, "ok-from")?
+            .or(from_level)
+            .unwrap_or(default_from_level);
+        let err_from_level = parse_goto_from_level(&matches, "err-from")?
+            .or(from_level)
+            .unwrap_or(default_from_level);
 
-        let cmd = GotoCommandExecutor::new(scope, target, goto_args, from_level);
+        let cmd = GotoCommandExecutor::new(scope, target, goto_args, ok_from_level, err_from_level);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -145,7 +169,8 @@ pub struct GotoCommandExecutor {
     scope: ExecScope,
     target: CommandArg,
     args: Vec<InvokeArgSpec>,
-    from_level: CommandControlLevel,
+    ok_from_level: CommandControlLevel,
+    err_from_level: CommandControlLevel,
 }
 
 impl GotoCommandExecutor {
@@ -153,13 +178,15 @@ impl GotoCommandExecutor {
         scope: ExecScope,
         target: CommandArg,
         args: Vec<InvokeArgSpec>,
-        from_level: CommandControlLevel,
+        ok_from_level: CommandControlLevel,
+        err_from_level: CommandControlLevel,
     ) -> Self {
         Self {
             scope,
             target,
             args,
-            from_level,
+            ok_from_level,
+            err_from_level,
         }
     }
 }
@@ -172,14 +199,14 @@ impl CommandExecutor for GotoCommandExecutor {
 
         if invoke_ret.is_success() {
             return Ok(CommandResult::return_with_value(
-                self.from_level,
+                self.ok_from_level,
                 invoke_ret.value().to_owned(),
             ));
         }
 
         if invoke_ret.is_error() {
             return Ok(CommandResult::return_error_with_value(
-                self.from_level,
+                self.err_from_level,
                 invoke_ret.value().to_owned(),
             ));
         }

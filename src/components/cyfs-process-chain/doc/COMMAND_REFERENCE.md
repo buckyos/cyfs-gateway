@@ -1262,7 +1262,13 @@ Options:
           Transfer to a library by ID.
 
       --from <LEVEL>
-          Return/error scope after target execution. Values: block|chain|lib.
+          Default return/error scope after target execution. Values: block|chain|lib.
+
+      --ok-from <LEVEL>
+          Success return scope override. Values: block|chain|lib.
+
+      --err-from <LEVEL>
+          Error return scope override. Values: block|chain|lib.
 
       --arg <KEY> <VALUE>
           Named argument for target, can be repeated.
@@ -1282,15 +1288,15 @@ TARGET ID FORMAT:
   - --chain: chain | lib:chain
   - --lib: lib
 
-RETURN LEVEL (--from):
-  If omitted, defaults to target level:
-  - --block -> block
-  - --chain -> chain
-  - --lib -> lib
+RETURN LEVEL:
+  - `--from` sets the common default for success/error mapping.
+  - `--ok-from` overrides success mapping scope.
+  - `--err-from` overrides error mapping scope.
+  - If all are omitted, defaults to `block` (same as `return`/`error` without `--from`).
 
 RESULT MAPPING:
-  - target success(value) -> return --from <level> value
-  - target error(value)   -> error  --from <level> value
+  - target success(value) -> return --from <ok-level> value
+  - target error(value)   -> error  --from <err-level> value
 
 NOTES:
   - This is not a low-level instruction pointer jump.
@@ -1299,6 +1305,8 @@ NOTES:
 EXAMPLES:
   goto --chain fallback_chain
   goto --chain auth_flow --from lib
+  goto --chain auth_flow --from chain --err-from lib
+  goto --chain auth_flow --ok-from lib --err-from chain
   goto --block helper --arg req $REQ
 ```
 

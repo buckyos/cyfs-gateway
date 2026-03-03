@@ -164,7 +164,7 @@
 注意：
 
 - `goto` 目前采用“结构化 tail-transfer”实现（不是传统 PC 跳转）。
-- 其行为可理解为：先执行目标（类似 `invoke`），再将结果映射为 `return/error` 返回到指定 `--from` 作用域。
+- 其行为可理解为：先执行目标（类似 `invoke`），再将结果映射为 `return/error` 返回到指定作用域。
 
 ### 6.2 控制流语义
 
@@ -172,7 +172,7 @@
 - `error  [--from block|chain|lib] [value]`
 - `exit [value]`
 - `break [value]`（仅 map-reduce 内有效）
-- `goto --block|--chain|--lib <target> [--from block|chain|lib] [--arg k v]...`
+- `goto --block|--chain|--lib <target> [--from block|chain|lib] [--ok-from block|chain|lib] [--err-from block|chain|lib] [--arg k v]...`
 - `drop/accept/reject` 等价为 `exit` 并携带对应动作值。
 
 `exec` 支持按作用域执行目标：
@@ -198,9 +198,10 @@
 `goto` 与 `invoke` 的关系：
 
 - `goto` 复用 `invoke` 目标执行与参数传递能力（包括 `--arg`）。
-- 目标执行成功 -> 映射为 `return --from <level> <value>`。
-- 目标执行失败 -> 映射为 `error  --from <level> <value>`。
-- `--from` 省略时默认与目标级别一致：`block->block`、`chain->chain`、`lib->lib`。
+- 目标执行成功 -> 映射为 `return --from <ok-level> <value>`。
+- 目标执行失败 -> 映射为 `error  --from <err-level> <value>`。
+- `--from` 可作为 success/error 的共同默认值；也可用 `--ok-from` / `--err-from` 分别覆盖。
+- 所有映射参数省略时，默认 `block`（与 `return/error` 不带 `--from` 一致）。
 
 ## 7. 外部命令扩展
 
