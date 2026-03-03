@@ -323,6 +323,39 @@ Examples:
 
 ## variable
 
+### Variable Path, Safe Access, and Default
+```
+These are DSL expression rules for variable arguments (not a standalone command).
+
+Supported forms:
+  - Basic path:
+      $REQ.clientIp
+      ${REQ.clientIp}
+
+  - Bracket path:
+      $geoByIp[$REQ.clientIp]
+      ${geoByIp["1.2.3.4"].country}
+
+  - Optional/safe access:
+      ${geoByIp[$REQ.clientIp]?.country}
+      $geoByIp[$REQ.clientIp]?.meta?.["region.code"]
+
+  - Coalesce default:
+      ${geoByIp[$REQ.clientIp]?.country ?? "unknown"}
+      $geoByIp[$REQ.clientIp]?.country??$REQ.defaultCountry
+
+Semantics:
+  - `?.` / `?[...]` mark the following segment as optional.
+  - Optional segment missing or type mismatch does not trigger strict missing-var error.
+  - Optional missing without `??` yields empty string.
+  - `??` only applies when left side is missing.
+  - If left side exists, right side is not evaluated.
+
+Default RHS support:
+  - Supported: string literal, variable expression.
+  - Not supported yet: command substitution `$(...)` on RHS of `??`.
+```
+
 ### `assign`
 ```
 Manage variable definitions and scope preferences.

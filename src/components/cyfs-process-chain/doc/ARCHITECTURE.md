@@ -113,6 +113,7 @@
 
 - 字面量：`abc` / `'abc'` / `"abc"`
 - 变量：`$name`、`${name}`、`$map["k"]`、`$map[$k]`
+- 安全访问与默认值：`${geoByIp[$REQ.clientIp]?.country ?? "unknown"}`、`$geoByIp[$REQ.clientIp]?.country??"unknown"`
 - 命令替换：`$( ... )`
 
 ## 5. 变量与环境
@@ -131,6 +132,24 @@
 - 字面 `.` 可用反斜杠转义：`1\.2\.3\.4`。
 - 支持 bracket 访问：`a["b.c"]`、`a['b.c']`、`a[$key]`、`a[${key}]`。
 - 支持动态路径段：`a.($key).b`、`a.(${key}).b`。
+- 支持可选访问：`a?.b`、`a?["b"]`、`a[$k]?.meta?.["region.code"]`。
+- 支持默认值（coalesce）：`a?.b ?? "x"`、`a?.b??$fallback`。
+
+可选访问语义（`?.` / `?[...]`）：
+
+- 在可选段上发生“缺失”或“类型不匹配”时，不抛 strict missing-var 错误，结果按 missing 处理。
+- 若后续带 `??`，则使用右侧默认值；若不带 `??`，最终返回空串。
+
+默认值语义（`??`）：
+
+- 仅在左侧结果为 missing 时生效；左侧存在值（即使空串）则不触发默认值。
+- 右侧当前支持字面量与变量表达式（如 `"x"`、`'x'`、`$REQ.country`、`${REQ.country}`）。
+- 右侧暂不支持命令替换 `$(...)`（会报明确错误）。
+
+与 policy 的关系：
+
+- `missing_var=strict` 时，普通路径缺失仍报错。
+- 显式可选访问（`?.` / `?[...]`）会绕过 strict 的缺失报错，按上述可选语义执行。
 
 ### 5.3 外部环境
 
@@ -228,6 +247,7 @@
 - `map-add` 在 multi value 场景只取第一个值（代码内有 FIXME）。
 - 若干 HTTP body/TCP probe 分支存在 FIXME（错误处理策略待统一）。
 - `collection/db.rs` 为空，`collection/manager.rs` 未在 `mod.rs` 导出。
+- `??` 默认值右侧暂不支持命令替换 `$(...)`（当前仅支持字面量/变量表达式）。
 
 ## 11. 运行时错误定位（当前）
 
