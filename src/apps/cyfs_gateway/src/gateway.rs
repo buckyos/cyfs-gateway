@@ -3272,10 +3272,11 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                             .get(key.as_str())
                             .await
                             .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
-                        let value = value
-                            .as_ref()
-                            .map(collection_value_to_json_value)
-                            .unwrap_or(Value::Null);
+                        let value = if let Some(v) = value.as_ref() {
+                            collection_value_to_json_value(v).await
+                        } else {
+                            Value::Null
+                        };
                         return Ok(json!({
                             "name": name,
                             "type": "map",
@@ -3289,7 +3290,7 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                     let mut items = Map::new();
                     for (k, v) in entries {
-                        items.insert(k, collection_value_to_json_value(&v));
+                        items.insert(k, collection_value_to_json_value(&v).await);
                     }
                     return Ok(json!({
                         "name": name,
@@ -3402,10 +3403,11 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         .insert(key.as_str(), CollectionValue::String(value.clone()))
                         .await
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
-                    let old = old
-                        .as_ref()
-                        .map(collection_value_to_json_value)
-                        .unwrap_or(Value::Null);
+                    let old = if let Some(v) = old.as_ref() {
+                        collection_value_to_json_value(v).await
+                    } else {
+                        Value::Null
+                    };
                     return Ok(json!({
                         "name": name,
                         "type": "map",
@@ -3447,10 +3449,11 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         .remove(key.as_str())
                         .await
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
-                    let old = old
-                        .as_ref()
-                        .map(collection_value_to_json_value)
-                        .unwrap_or(Value::Null);
+                    let old = if let Some(v) = old.as_ref() {
+                        collection_value_to_json_value(v).await
+                    } else {
+                        Value::Null
+                    };
                     return Ok(json!({
                         "name": name,
                         "type": "map",

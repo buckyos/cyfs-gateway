@@ -1,6 +1,8 @@
 use std::collections::{HashMap};
+use std::future::Future;
 use std::ops::Deref;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::RwLock;
 use cyfs_process_chain::{CollectionValue, MapCollection, MapCollectionRef, MapCollectionTraverseCallBackRef, MemoryMapCollection};
 
@@ -69,7 +71,7 @@ impl JsonMapCollection for MapCollectionRef {
 
         let mut json_obj = serde_json::Map::new();
         for (key, value) in map_dump {
-            let json_value = collection_value_to_json_value(&value);
+            let json_value = collection_value_to_json_value(&value).await;
             json_obj.insert(key, json_value);
         }
 
@@ -102,38 +104,82 @@ pub fn json_value_to_collection_value(value: &serde_json::Value) -> CollectionVa
 /// - 尝试解析字符串为布尔值
 /// - 尝试解析字符串为 JSON（如果是对象或数组）
 /// - 其他情况保持为字符串
-pub fn collection_value_to_json_value(value: &CollectionValue) -> serde_json::Value {
-    match value {
-        CollectionValue::String(s) => {
-            // 尝试解析为数字
-            if let Ok(n) = s.parse::<i64>() {
-                return serde_json::Value::Number(serde_json::Number::from(n));
-            }
-
-            // 尝试解析为浮点数
-            if let Ok(f) = s.parse::<f64>() {
-                if let Some(n) = serde_json::Number::from_f64(f) {
-                    return serde_json::Value::Number(n);
+pub fn collection_value_to_json_value<'a>(value: &'a CollectionValue) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send + 'a>> {
+    Box::pin(async move {
+        match value {
+            CollectionValue::String(s) => {
+                // 尝试解析为数字
+                if let Ok(n) = s.parse::<i64>() {
+                    return serde_json::Value::Number(serde_json::Number::from(n));
                 }
-            }
 
-            // 尝试解析为布尔值
-            if let Ok(b) = s.parse::<bool>() {
-                return serde_json::Value::Bool(b);
-            }
-
-            // 尝试解析为 JSON（支持嵌套对象/数组）
-            if s.starts_with('{') || s.starts_with('[') {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(s) {
-                    return json;
+                // 尝试解析为浮点数
+                if let Ok(f) = s.parse::<f64>() {
+                    if let Some(n) = serde_json::Number::from_f64(f) {
+                        return serde_json::Value::Number(n);
+                    }
                 }
-            }
 
-            // 默认返回字符串
-            serde_json::Value::String(s.clone())
+                // 尝试解析为布尔值
+                if let Ok(b) = s.parse::<bool>() {
+                    return serde_json::Value::Bool(b);
+                }
+
+                // 尝试解析为 JSON（支持嵌套对象/数组）
+                if s.starts_with('{') || s.starts_with('[') {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(s) {
+                        return json;
+                    }
+                }
+
+                // 默认返回字符串
+                serde_json::Value::String(s.clone())
+            }
+            CollectionValue::Set(set) => match set.dump().await {
+                Ok(values) => serde_json::Value::Array(values.into_iter().map(serde_json::Value::String).collect()),
+                Err(e) => {
+                    warn!("Failed to dump set for json conversion: {}", e);
+                    serde_json::Value::String("[Set]".to_string())
+                }
+            },
+            CollectionValue::Map(map) => match map.dump().await {
+                Ok(entries) => {
+                    let mut obj = serde_json::Map::new();
+                    for (key, item) in entries {
+                        obj.insert(key, collection_value_to_json_value(&item).await);
+                    }
+                    serde_json::Value::Object(obj)
+                }
+                Err(e) => {
+                    warn!("Failed to dump map for json conversion: {}", e);
+                    serde_json::Value::String("[Map]".to_string())
+                }
+            },
+            CollectionValue::MultiMap(multi_map) => match multi_map.dump().await {
+                Ok(entries) => {
+                    let mut obj = serde_json::Map::new();
+                    for (key, values) in entries {
+                        obj.insert(
+                            key,
+                            serde_json::Value::Array(
+                                values
+                                    .into_iter()
+                                    .map(serde_json::Value::String)
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    serde_json::Value::Object(obj)
+                }
+                Err(e) => {
+                    warn!("Failed to dump multi map for json conversion: {}", e);
+                    serde_json::Value::String("[MultiMap]".to_string())
+                }
+            },
+            CollectionValue::Visitor(_) => serde_json::Value::String("[Visitor]".to_string()),
+            CollectionValue::Any(_) => serde_json::Value::String("[Any]".to_string()),
         }
-        _ => serde_json::Value::String(value.to_string()),
-    }
+    })
 }
 
 /// 简化版本：只将 JSON 转为 MapCollection，不尝试智能类型转换
@@ -210,21 +256,23 @@ impl MapCollection for JsonMap {
     }
 
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
+        let json_value = collection_value_to_json_value(&value).await;
         {
             let mut map = self.map.write().unwrap();
             if map.contains_key(key) {
                 return Ok(false);
             }
-            map.insert(key.to_string(), collection_value_to_json_value(&value));
+            map.insert(key.to_string(), json_value);
         }
         self.save().await?;
         Ok(true)
     }
 
     async fn insert(&self, key: &str, value: CollectionValue) -> Result<Option<CollectionValue>, String> {
+        let json_value = collection_value_to_json_value(&value).await;
         let old = {
             let mut map = self.map.write().unwrap();
-            map.insert(key.to_string(), collection_value_to_json_value(&value))
+            map.insert(key.to_string(), json_value)
         };
         self.save().await?;
         Ok(old.map(|v| json_value_to_collection_value(&v)))
@@ -279,6 +327,7 @@ mod tests {
     use std::io::Write;
     use super::*;
     use serde_json::json;
+    use cyfs_process_chain::MemorySetCollection;
 
     #[tokio::test]
     async fn test_json_to_map() {
@@ -345,6 +394,22 @@ mod tests {
         assert_eq!(result_json["name"], "test");
         assert_eq!(result_json["count"], 42);
         assert_eq!(result_json["enabled"], true);
+    }
+
+    #[tokio::test]
+    async fn test_collection_value_to_json_value_all_types() {
+        let set = MemorySetCollection::new_ref();
+        set.insert("a").await.unwrap();
+        set.insert("b").await.unwrap();
+
+        let nested_map = MemoryMapCollection::new_ref();
+        nested_map.insert("k", CollectionValue::String("1".to_string())).await.unwrap();
+
+        let set_json = collection_value_to_json_value(&CollectionValue::Set(set)).await;
+        assert!(set_json.as_array().is_some());
+
+        let map_json = collection_value_to_json_value(&CollectionValue::Map(nested_map)).await;
+        assert_eq!(map_json["k"], 1);
     }
 
     #[tokio::test]
@@ -452,4 +517,3 @@ mod tests {
         assert_eq!(entries_map.get("key2"), Some(&"second".to_string()));
     }
 }
-

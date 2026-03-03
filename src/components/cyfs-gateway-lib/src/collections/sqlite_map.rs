@@ -128,7 +128,7 @@ impl MapCollection for SqliteMap {
                     self.table_name, self.key_column, self.value_column
                 ))
                     .bind(key)
-                    .bind(collection_value_to_json_value(&value).to_string()),
+                    .bind(collection_value_to_json_value(&value).await.to_string()),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -154,7 +154,7 @@ impl MapCollection for SqliteMap {
                 self.table_name, self.key_column, self.value_column
             ))
                 .bind(key)
-                .bind(collection_value_to_json_value(&value).to_string()),
+                .bind(collection_value_to_json_value(&value).await.to_string()),
         )
             .await
             .map_err(|e| e.to_string())?;
