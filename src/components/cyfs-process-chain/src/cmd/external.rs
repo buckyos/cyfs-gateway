@@ -126,6 +126,8 @@ Examples:
   call verify_token $REQ.token
   call user_lookup alice
   call plugin.process_json '{"key": "value"}'
+  call local::user_lookup alice
+  call global::verify_token $REQ.token
 "#,
             )
             .arg(
