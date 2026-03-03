@@ -93,6 +93,34 @@ const PROCESS_CHAIN_LIB_VAR_SAFE_TYPE_MISMATCH: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_LIB_VAR_SAFE_DEFAULT_EXPR: &str = r#"
+<process_chain_lib id="test_var_safe_default_expr_lib" priority="100">
+    <process_chain id="route_chain_safe_default_expr">
+        <block id="route">
+            <![CDATA[
+                local safe_dollar=$geoByIp[$REQ.clientIp]?.country;
+                local fallback_var=${geoByIp[$REQ.clientIp]?.country ?? $REQ.defaultCountry};
+                local fallback_inline=$geoByIp[$REQ.clientIp]?.country??"inline_unknown";
+                return --from lib $(append $safe_dollar "|" $fallback_var "|" $fallback_inline);
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_LIB_VAR_SAFE_DEFAULT_CMD_UNSUPPORTED: &str = r#"
+<process_chain_lib id="test_var_safe_default_cmd_unsupported_lib" priority="100">
+    <process_chain id="route_chain_safe_default_cmd_unsupported">
+        <block id="route">
+            <![CDATA[
+                local fallback_cmd=${geoByIp[$REQ.clientIp]?.country ?? $(append "cmd_" $REQ.defaultCountry)};
+                return --from lib $fallback_cmd;
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 const PROCESS_CHAIN_LIB_VAR_COLLECTION_ASSIGN: &str = r#"
 <process_chain_lib id="test_var_collection_assign_lib" priority="100">
     <process_chain id="collection_assign_chain">
@@ -201,6 +229,12 @@ async fn set_client_ip(req: &MapCollectionRef, client_ip: &str) {
 
 async fn set_meta_field(req: &MapCollectionRef, field: &str) {
     req.insert("metaField", CollectionValue::String(field.to_string()))
+        .await
+        .unwrap();
+}
+
+async fn set_default_country(req: &MapCollectionRef, country: &str) {
+    req.insert("defaultCountry", CollectionValue::String(country.to_string()))
         .await
         .unwrap();
 }
@@ -778,6 +812,118 @@ async fn test_safe_access_type_mismatch_uses_default() {
         .await
         .unwrap();
     assert_eq!(ret.value(), "fallback_region");
+}
+
+#[tokio::test]
+async fn test_safe_access_default_supports_var_expression() {
+    TermLogger::init(
+        LevelFilter::Debug,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
+    });
+
+    let hook_point = HookPoint::new("test_var_safe_default_expr");
+    hook_point
+        .load_process_chain_lib(
+            "test_var_safe_default_expr_lib",
+            0,
+            PROCESS_CHAIN_LIB_VAR_SAFE_DEFAULT_EXPR,
+        )
+        .await
+        .unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-var-safe-default-expr");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-var-safe-default-expr", data_dir);
+    hook_point_env.set_missing_var_policy(MissingVarPolicy::Strict);
+
+    let geo_by_ip = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    geo_by_ip
+        .insert(
+            "1.2.3.4",
+            CollectionValue::Map(make_geo_entry("CN", "中国电信", "Shenzhen").await),
+        )
+        .await
+        .unwrap();
+
+    let req = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    set_client_ip(&req, "1.2.3.4").await;
+    set_default_country(&req, "US").await;
+
+    hook_point_env
+        .hook_point_env()
+        .create("geoByIp", CollectionValue::Map(geo_by_ip))
+        .await
+        .unwrap();
+    hook_point_env
+        .hook_point_env()
+        .create("REQ", CollectionValue::Map(req.clone()))
+        .await
+        .unwrap();
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+
+    let ret = exec.execute_lib("test_var_safe_default_expr_lib").await.unwrap();
+    assert_eq!(ret.value(), "CN|CN|CN");
+
+    set_client_ip(&req, "10.10.10.10").await;
+    let ret = exec.execute_lib("test_var_safe_default_expr_lib").await.unwrap();
+    assert_eq!(ret.value(), "|US|inline_unknown");
+}
+
+#[tokio::test]
+async fn test_safe_access_default_rejects_command_substitution() {
+    TermLogger::init(
+        LevelFilter::Debug,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
+    });
+
+    let hook_point = HookPoint::new("test_var_safe_default_cmd_unsupported");
+    hook_point
+        .load_process_chain_lib(
+            "test_var_safe_default_cmd_unsupported_lib",
+            0,
+            PROCESS_CHAIN_LIB_VAR_SAFE_DEFAULT_CMD_UNSUPPORTED,
+        )
+        .await
+        .unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-var-safe-default-cmd");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-var-safe-default-cmd", data_dir);
+    hook_point_env.set_missing_var_policy(MissingVarPolicy::Strict);
+
+    let geo_by_ip = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    let req = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    set_client_ip(&req, "10.10.10.10").await;
+    set_default_country(&req, "US").await;
+
+    hook_point_env
+        .hook_point_env()
+        .create("geoByIp", CollectionValue::Map(geo_by_ip))
+        .await
+        .unwrap();
+    hook_point_env
+        .hook_point_env()
+        .create("REQ", CollectionValue::Map(req.clone()))
+        .await
+        .unwrap();
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+    let err = exec
+        .execute_lib("test_var_safe_default_cmd_unsupported_lib")
+        .await
+        .unwrap_err();
+    assert!(err.contains("Command substitution is not supported in default expression yet"));
 }
 
 #[tokio::test]

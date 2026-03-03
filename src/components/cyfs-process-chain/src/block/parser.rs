@@ -706,7 +706,7 @@ impl BlockParser {
             }
 
             for c in chars {
-                if !(c.is_alphanumeric() || c == '_' || c == '.' || c == '-') {
+                if !(c.is_alphanumeric() || c == '_' || c == '.' || c == '-' || c == '?') {
                     return Err(nom::Err::Error(nom::error::Error::from_error_kind(
                         rest,
                         ErrorKind::Tag,
@@ -980,7 +980,7 @@ impl BlockParser {
         Ok((&input[i..], arg))
     }
 
-    fn parse_arg(input: &str) -> IResult<&str, CommandArg> {
+    pub(crate) fn parse_arg(input: &str) -> IResult<&str, CommandArg> {
         debug!("Parsing arg: {}", input);
         let ret = preceded(
             space0,
@@ -1080,6 +1080,26 @@ mod tests {
         assert_eq!(
             arg.as_var_str(),
             Some("geoByIp[$REQ.clientIp]?.country ?? \"unknown\"")
+        );
+    }
+
+    #[test]
+    fn test_parse_dollar_var_with_safe_access() {
+        let (rest, arg) = BlockParser::parse_arg("$REQ.geo?.country").unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_var());
+        assert_eq!(arg.as_var_str(), Some("REQ.geo?.country"));
+    }
+
+    #[test]
+    fn test_parse_dollar_var_with_safe_access_and_inline_default() {
+        let (rest, arg) = BlockParser::parse_arg("$geoByIp[$REQ.clientIp]?.country??\"unknown\"")
+            .unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_var());
+        assert_eq!(
+            arg.as_var_str(),
+            Some("geoByIp[$REQ.clientIp]?.country??\"unknown\"")
         );
     }
 

@@ -1,5 +1,6 @@
 use super::block::{Block, CommandArg, CommandItem, Expression, IfStatement, Line, Statement};
 use super::exec::BlockExecuter;
+use super::parser::BlockParser;
 use crate::chain::{Context, MissingVarPolicy, ParserContextRef};
 use crate::cmd::CommandParserFactory;
 use crate::collection::CollectionValue;
@@ -648,54 +649,9 @@ impl CommandArgEvaluator {
         None
     }
 
-    fn parse_default_literal(expr: &str) -> Option<String> {
-        let expr = expr.trim();
-        if expr.len() < 2 {
-            return None;
-        }
-
-        let first = expr.chars().next()?;
-        let last = expr.chars().last()?;
-
-        if first == '\'' && last == '\'' {
-            return Some(expr[1..expr.len() - 1].to_string());
-        }
-
-        if first != '"' || last != '"' {
-            return None;
-        }
-
-        let mut out = String::new();
-        let mut escaped = false;
-        for ch in expr[1..expr.len() - 1].chars() {
-            if escaped {
-                match ch {
-                    'n' => out.push('\n'),
-                    't' => out.push('\t'),
-                    'r' => out.push('\r'),
-                    '\\' => out.push('\\'),
-                    '"' => out.push('"'),
-                    '$' => out.push('$'),
-                    ' ' => out.push(' '),
-                    other => out.push(other),
-                }
-                escaped = false;
-                continue;
-            }
-
-            if ch == '\\' {
-                escaped = true;
-                continue;
-            }
-
-            out.push(ch);
-        }
-
-        if escaped {
-            out.push('\\');
-        }
-
-        Some(out)
+    fn should_parse_default_as_arg(expr: &str) -> bool {
+        let expr = expr.trim_start();
+        expr.starts_with('$') || expr.starts_with('"') || expr.starts_with('\'')
     }
 
     #[async_recursion::async_recursion]
@@ -703,8 +659,40 @@ impl CommandArgEvaluator {
         expr: &str,
         context: &Context,
     ) -> Result<VarEvalResult, String> {
-        if let Some(literal) = Self::parse_default_literal(expr) {
-            return Ok(VarEvalResult::Value(CollectionValue::String(literal)));
+        let expr = expr.trim();
+        if expr.is_empty() {
+            let msg = "Default expression is empty".to_string();
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        if Self::should_parse_default_as_arg(expr) {
+            let (rest, arg) = BlockParser::parse_arg(expr).map_err(|e| {
+                let msg = format!("Invalid default expression '{}': {:?}", expr, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+            if !rest.trim().is_empty() {
+                let msg = format!(
+                    "Invalid trailing content in default expression '{}': '{}'",
+                    expr, rest
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            if matches!(arg, CommandArg::CommandSubstitution(_)) {
+                let msg = format!(
+                    "Command substitution is not supported in default expression yet: '{}'",
+                    expr
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            let value = Self::evaluate(&arg, context).await?;
+            return Ok(VarEvalResult::Value(value));
         }
 
         Self::evaluate_var_expression(expr, context).await
