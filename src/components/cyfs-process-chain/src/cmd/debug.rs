@@ -115,6 +115,9 @@ impl EchoCommandExecutor {
 
     async fn print_verbose_output(&self, value: &CollectionValue) -> Result<String, String> {
         let ret = match value {
+            CollectionValue::Null => "null".to_string(),
+            CollectionValue::Bool(v) => v.to_string(),
+            CollectionValue::Number(v) => v.to_string(),
             CollectionValue::String(s) => s.clone(),
             CollectionValue::List(list) => {
                 let values = list.dump().await?;

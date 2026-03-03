@@ -246,6 +246,12 @@
 - JSON 文件集合：已实现（在 `HookPointEnv::load_collection` 里加载）。
 - SQLite 集合：接口占位，`unimplemented!`。
 
+`CollectionValue` 的 JSON 持久化当前规则：
+
+- 原生支持：`null` / `bool` / `number` / `string`。
+- 不支持：`List/Set/Map/MultiMap/Visitor/Any`（序列化时直接报错）。
+- 兼容策略：不再为历史“非 string 值降级为空字符串”的旧格式增加额外兼容分支。
+
 ## 10. 已知限制与待补齐点
 
 当前代码中的明确限制：

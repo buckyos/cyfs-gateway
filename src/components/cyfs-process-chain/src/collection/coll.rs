@@ -4,8 +4,49 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 pub type AnyRef = Arc<dyn Any + Send + Sync>;
+
+#[derive(Clone, Copy, Debug)]
+pub enum NumberValue {
+    Int(i64),
+    Float(f64),
+}
+
+impl NumberValue {
+    pub fn as_f64(&self) -> f64 {
+        match self {
+            NumberValue::Int(v) => *v as f64,
+            NumberValue::Float(v) => *v,
+        }
+    }
+}
+
+impl std::fmt::Display for NumberValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NumberValue::Int(v) => write!(f, "{}", v),
+            NumberValue::Float(v) => write!(f, "{}", v),
+        }
+    }
+}
+
+impl PartialEq for NumberValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (NumberValue::Int(a), NumberValue::Int(b)) => a == b,
+            // Keep strict variant equality to avoid surprising implicit numeric coercion.
+            (NumberValue::Float(a), NumberValue::Float(b)) => a.to_bits() == b.to_bits(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for NumberValue {}
+
 #[derive(Clone)]
 pub enum CollectionValue {
+    Null,
+    Bool(bool),
+    Number(NumberValue),
     String(String),
     List(ListCollectionRef),
     Set(SetCollectionRef),
@@ -16,6 +57,9 @@ pub enum CollectionValue {
 }
 
 pub enum CollectionValueRef<'a> {
+    Null,
+    Bool(bool),
+    Number(NumberValue),
     String(&'a str),
     List(&'a ListCollectionRef),
     Set(&'a SetCollectionRef),
@@ -28,6 +72,9 @@ pub enum CollectionValueRef<'a> {
 impl std::fmt::Display for CollectionValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CollectionValue::Null => write!(f, "null"),
+            CollectionValue::Bool(v) => write!(f, "{}", v),
+            CollectionValue::Number(v) => write!(f, "{}", v),
             CollectionValue::String(s) => write!(f, "{}", s),
             CollectionValue::List(_) => write!(f, "[List]"),
             CollectionValue::Set(_) => write!(f, "[Set]"),
@@ -49,6 +96,9 @@ impl std::fmt::Debug for CollectionValue {
 impl PartialEq for CollectionValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (CollectionValue::Null, CollectionValue::Null) => true,
+            (CollectionValue::Bool(a), CollectionValue::Bool(b)) => a == b,
+            (CollectionValue::Number(a), CollectionValue::Number(b)) => a == b,
             (CollectionValue::String(a), CollectionValue::String(b)) => a == b,
             _ => false,
         }
@@ -67,6 +117,9 @@ impl CollectionValue {
 
     pub fn get_type(&self) -> &str {
         match self {
+            CollectionValue::Null => "Null",
+            CollectionValue::Bool(_) => "Bool",
+            CollectionValue::Number(_) => "Number",
             CollectionValue::String(_) => "String",
             CollectionValue::List(_) => "List",
             CollectionValue::Set(_) => "Set",
@@ -83,6 +136,9 @@ impl CollectionValue {
 
     pub fn as_ref(&self) -> CollectionValueRef<'_> {
         match self {
+            CollectionValue::Null => CollectionValueRef::Null,
+            CollectionValue::Bool(v) => CollectionValueRef::Bool(*v),
+            CollectionValue::Number(v) => CollectionValueRef::Number(*v),
             CollectionValue::String(s) => CollectionValueRef::String(s.as_str()),
             CollectionValue::List(l) => CollectionValueRef::List(l),
             CollectionValue::Set(s) => CollectionValueRef::Set(s),
@@ -96,6 +152,50 @@ impl CollectionValue {
     pub fn into_string(self) -> Option<String> {
         if let CollectionValue::String(s) = self {
             Some(s)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, CollectionValue::Null)
+    }
+
+    pub fn is_bool(&self) -> bool {
+        matches!(self, CollectionValue::Bool(_))
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        if let CollectionValue::Bool(v) = self {
+            Some(*v)
+        } else {
+            None
+        }
+    }
+
+    pub fn into_bool(self) -> Option<bool> {
+        if let CollectionValue::Bool(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_number(&self) -> bool {
+        matches!(self, CollectionValue::Number(_))
+    }
+
+    pub fn as_number(&self) -> Option<&NumberValue> {
+        if let CollectionValue::Number(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    pub fn into_number(self) -> Option<NumberValue> {
+        if let CollectionValue::Number(v) = self {
+            Some(v)
         } else {
             None
         }
@@ -124,6 +224,9 @@ impl CollectionValue {
 
     pub fn treat_as_str(&self) -> &str {
         match self {
+            CollectionValue::Null => "null",
+            CollectionValue::Bool(_) => "[Bool]",
+            CollectionValue::Number(_) => "[Number]",
             CollectionValue::String(s) => s.as_str(),
             CollectionValue::List(_) => "[List]",
             CollectionValue::Set(_) => "[Set]",

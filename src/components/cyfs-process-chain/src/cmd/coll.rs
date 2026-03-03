@@ -264,9 +264,11 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
             | CollectionValue::Set(_)
             | CollectionValue::Map(_)
             | CollectionValue::MultiMap(_) => collection,
-            CollectionValue::Visitor(_) | CollectionValue::Any(_) => {
-                let msg = "Collection cannot be a visitor or any type for match-include command"
-                    .to_string();
+            _ => {
+                let msg = format!(
+                    "Collection must be List/Set/Map/MultiMap for match-include command, found {}",
+                    collection.get_type()
+                );
                 warn!("{}", msg);
                 return Err(msg);
             }

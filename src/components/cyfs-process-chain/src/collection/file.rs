@@ -1,6 +1,5 @@
 use super::coll::*;
 use super::mem::*;
-use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 use serde::{Deserializer, Serializer};
 use std::collections::{HashMap, HashSet};
@@ -259,8 +258,20 @@ impl Serialize for CollectionValue {
         S: Serializer,
     {
         match self {
+            CollectionValue::Null => serializer.serialize_none(),
+            CollectionValue::Bool(v) => serializer.serialize_bool(*v),
+            CollectionValue::Number(NumberValue::Int(v)) => serializer.serialize_i64(*v),
+            CollectionValue::Number(NumberValue::Float(v)) => serializer.serialize_f64(*v),
             CollectionValue::String(s) => serializer.serialize_str(s),
-            _ => serializer.serialize_str(""),
+            CollectionValue::List(_)
+            | CollectionValue::Set(_)
+            | CollectionValue::Map(_)
+            | CollectionValue::MultiMap(_)
+            | CollectionValue::Visitor(_)
+            | CollectionValue::Any(_) => Err(serde::ser::Error::custom(format!(
+                "CollectionValue type '{}' is not supported for JSON persistence",
+                self.get_type()
+            ))),
         }
     }
 }
@@ -270,31 +281,44 @@ impl<'de> Deserialize<'de> for CollectionValue {
     where
         D: Deserializer<'de>,
     {
-        struct StringVisitor;
-
-        impl<'de> Visitor<'de> for StringVisitor {
-            type Value = CollectionValue;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("string")
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let ret = match value {
+            serde_json::Value::Null => CollectionValue::Null,
+            serde_json::Value::Bool(v) => CollectionValue::Bool(v),
+            serde_json::Value::Number(v) => {
+                if let Some(i) = v.as_i64() {
+                    CollectionValue::Number(NumberValue::Int(i))
+                } else if let Some(u) = v.as_u64() {
+                    if u > i64::MAX as u64 {
+                        return Err(serde::de::Error::custom(format!(
+                            "u64 value {} exceeds i64 range",
+                            u
+                        )));
+                    }
+                    CollectionValue::Number(NumberValue::Int(u as i64))
+                } else if let Some(f) = v.as_f64() {
+                    CollectionValue::Number(NumberValue::Float(f))
+                } else {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported number value: {}",
+                        v
+                    )));
+                }
             }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(CollectionValue::String(v.to_string()))
+            serde_json::Value::String(v) => CollectionValue::String(v),
+            serde_json::Value::Array(_) => {
+                return Err(serde::de::Error::custom(
+                    "JSON array is not supported for CollectionValue persistence yet",
+                ));
             }
-
-            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(CollectionValue::String(v))
+            serde_json::Value::Object(_) => {
+                return Err(serde::de::Error::custom(
+                    "JSON object is not supported for CollectionValue persistence yet",
+                ));
             }
-        }
+        };
 
-        deserializer.deserialize_string(StringVisitor)
+        Ok(ret)
     }
 }
 
@@ -348,7 +372,7 @@ impl MapCollection for JsonMapCollection {
         let new_value = value.clone();
         let ret = self.data.insert(key, value).await?;
         if let Some(prev) = &ret {
-            if let Some(false) = prev.compare_string(&new_value) {
+            if *prev != new_value {
                 self.file.mark_dirty();
             }
         }
@@ -664,5 +688,35 @@ mod tests {
             assert!(loaded_collection.remove_all(&key).await.unwrap().is_some());
             assert!(!loaded_collection.contains_key(&key).await.unwrap());
         }
+    }
+
+    #[test]
+    fn test_collection_value_json_roundtrip_typed_values() {
+        let cases = vec![
+            CollectionValue::Null,
+            CollectionValue::Bool(true),
+            CollectionValue::Bool(false),
+            CollectionValue::Number(NumberValue::Int(123)),
+            CollectionValue::Number(NumberValue::Float(12.5)),
+            CollectionValue::String("hello".to_string()),
+        ];
+
+        for value in cases {
+            let json = serde_json::to_string(&value).unwrap();
+            let decoded: CollectionValue = serde_json::from_str(&json).unwrap();
+            assert_eq!(value, decoded);
+        }
+    }
+
+    #[test]
+    fn test_collection_value_json_rejects_unsupported_reference_types() {
+        let value = CollectionValue::List(MemoryListCollection::new_ref());
+        let err = serde_json::to_string(&value).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not supported for JSON persistence"),
+            "unexpected error: {}",
+            err
+        );
     }
 }
