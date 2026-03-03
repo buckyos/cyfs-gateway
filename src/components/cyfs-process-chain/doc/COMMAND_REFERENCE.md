@@ -1245,6 +1245,63 @@ EXAMPLES:
   invoke --block helper_block --arg req $REQ
 ```
 
+### `goto`
+```
+Tail-transfer to a block/chain/lib and then return from a chosen scope.
+
+Usage: goto [OPTIONS] <--block <BLOCK_ID>|--chain <CHAIN_ID>|--lib <LIB_ID>>
+
+Options:
+      --block <BLOCK_ID>
+          Transfer to a block by ID.
+
+      --chain <CHAIN_ID>
+          Transfer to a process-chain by ID.
+
+      --lib <LIB_ID>
+          Transfer to a library by ID.
+
+      --from <LEVEL>
+          Return/error scope after target execution. Values: block|chain|lib.
+
+      --arg <KEY> <VALUE>
+          Named argument for target, can be repeated.
+
+  -h, --help
+          Print help
+
+
+DESCRIPTION:
+  goto is a structured tail-transfer command. It first executes the target
+  (same semantics as invoke), then maps result to return/error from the
+  selected caller scope.
+
+TARGET ID FORMAT:
+  Same as exec/invoke:
+  - --block: block | chain:block | lib:chain:block
+  - --chain: chain | lib:chain
+  - --lib: lib
+
+RETURN LEVEL (--from):
+  If omitted, defaults to target level:
+  - --block -> block
+  - --chain -> chain
+  - --lib -> lib
+
+RESULT MAPPING:
+  - target success(value) -> return --from <level> value
+  - target error(value)   -> error  --from <level> value
+
+NOTES:
+  - This is not a low-level instruction pointer jump.
+  - Statements after goto in the same execution path will not be executed.
+
+EXAMPLES:
+  goto --chain fallback_chain
+  goto --chain auth_flow --from lib
+  goto --block helper --arg req $REQ
+```
+
 ### `exit`
 ```
 Return from the current process chain list, optionally with a value.

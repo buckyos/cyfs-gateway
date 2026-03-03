@@ -163,8 +163,8 @@
 
 注意：
 
-- `goto` 实现在 `cmd/control.rs` 中已被注释，且未注册到 factory。
-- 因此当前运行时不支持 `goto`。
+- `goto` 目前采用“结构化 tail-transfer”实现（不是传统 PC 跳转）。
+- 其行为可理解为：先执行目标（类似 `invoke`），再将结果映射为 `return/error` 返回到指定 `--from` 作用域。
 
 ### 6.2 控制流语义
 
@@ -172,6 +172,7 @@
 - `error  [--from block|chain|lib] [value]`
 - `exit [value]`
 - `break [value]`（仅 map-reduce 内有效）
+- `goto --block|--chain|--lib <target> [--from block|chain|lib] [--arg k v]...`
 - `drop/accept/reject` 等价为 `exit` 并携带对应动作值。
 
 `exec` 支持按作用域执行目标：
@@ -193,6 +194,13 @@
 - 被调流程通过 `$__args.<key>` 读取参数。
 - 参数值支持 `CollectionValue` 全类型，集合类型按引用语义传递。
 - 当前返回值语义与 `exec` 保持一致（字符串归一化返回）。
+
+`goto` 与 `invoke` 的关系：
+
+- `goto` 复用 `invoke` 目标执行与参数传递能力（包括 `--arg`）。
+- 目标执行成功 -> 映射为 `return --from <level> <value>`。
+- 目标执行失败 -> 映射为 `error  --from <level> <value>`。
+- `--from` 省略时默认与目标级别一致：`block->block`、`chain->chain`、`lib->lib`。
 
 ## 7. 外部命令扩展
 
@@ -241,7 +249,7 @@
 
 当前代码中的明确限制：
 
-- `goto` 命令未启用（仅保留注释实现）。
+- `goto` 是结构化语义糖，不支持 label/行号等“任意跳转”能力。
 - SQLite collection 未实现。
 - `break` 只能在 map-reduce 循环里使用。
 - `map-add` 在 multi value 场景只取第一个值（代码内有 FIXME）。

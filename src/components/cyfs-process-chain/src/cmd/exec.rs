@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExecScope {
+pub(crate) enum ExecScope {
     Block,
     Chain,
     Lib,
@@ -27,7 +27,7 @@ impl ExecScope {
     }
 }
 
-fn parse_exec_scope_and_target(
+pub(crate) fn parse_exec_scope_and_target(
     matches: &ArgMatches,
     args: &CommandArgs,
     cmd_name: &str,
@@ -62,7 +62,7 @@ fn parse_exec_scope_and_target(
     Ok((scope, target_arg))
 }
 
-fn normalize_exec_result(
+pub(crate) fn normalize_exec_result(
     command_name: &str,
     target_id: &str,
     cmd_ret: CommandResult,
@@ -105,7 +105,7 @@ fn normalize_exec_result(
     Ok(ret)
 }
 
-struct ExecTarget {
+pub(crate) struct ExecTarget {
     lib: Option<String>,
     chain: Option<String>,
     block: Option<String>,
@@ -124,7 +124,7 @@ impl ExecTarget {
         self.block.as_deref().unwrap()
     }
 
-    pub fn parse(scope: ExecScope, target: &str) -> Result<Self, String> {
+    pub(crate) fn parse(scope: ExecScope, target: &str) -> Result<Self, String> {
         let parts: Vec<&str> = target.split(':').collect();
         match scope {
             ExecScope::Block => {
@@ -463,9 +463,9 @@ impl CommandExecutor for ExecCommandExecutor {
 }
 
 #[derive(Debug, Clone)]
-struct InvokeArgSpec {
-    key: String,
-    value: CommandArg,
+pub(crate) struct InvokeArgSpec {
+    pub(crate) key: String,
+    pub(crate) value: CommandArg,
 }
 
 fn validate_invoke_arg_key(key: &str) -> Result<(), String> {
@@ -492,7 +492,10 @@ fn validate_invoke_arg_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_invoke_args(matches: &ArgMatches, args: &CommandArgs) -> Result<Vec<InvokeArgSpec>, String> {
+pub(crate) fn parse_invoke_args(
+    matches: &ArgMatches,
+    args: &CommandArgs,
+) -> Result<Vec<InvokeArgSpec>, String> {
     let indices = matches
         .indices_of("arg")
         .map(|idx| idx.collect::<Vec<_>>())
@@ -647,14 +650,14 @@ impl CommandParser for InvokeCommandParser {
     }
 }
 
-struct InvokeCommandExecutor {
+pub(crate) struct InvokeCommandExecutor {
     scope: ExecScope,
     target: CommandArg,
     args: Vec<InvokeArgSpec>,
 }
 
 impl InvokeCommandExecutor {
-    pub fn new(scope: ExecScope, target: CommandArg, args: Vec<InvokeArgSpec>) -> Self {
+    pub(crate) fn new(scope: ExecScope, target: CommandArg, args: Vec<InvokeArgSpec>) -> Self {
         Self { scope, target, args }
     }
 
