@@ -197,6 +197,18 @@ enum VarPathSegment {
     Dynamic(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VarPathAccessSegment {
+    segment: VarPathSegment,
+    optional: bool,
+}
+
+#[derive(Debug, Clone)]
+enum VarEvalResult {
+    Value(CollectionValue),
+    Missing { key: String, explicit: bool },
+}
+
 impl CommandArgEvaluator {
     pub async fn evaluate_list(
         args: &[CommandArg],
@@ -280,6 +292,20 @@ impl CommandArgEvaluator {
         escaped
     }
 
+    fn push_static_segment(
+        segments: &mut Vec<VarPathAccessSegment>,
+        current: &mut String,
+        pending_optional: &mut bool,
+    ) {
+        if !current.is_empty() {
+            segments.push(VarPathAccessSegment {
+                segment: VarPathSegment::Static(std::mem::take(current)),
+                optional: *pending_optional,
+            });
+            *pending_optional = false;
+        }
+    }
+
     fn parse_dynamic_segment(inner: &str) -> Result<VarPathSegment, String> {
         let inner = inner.trim();
         if let Some(inner_var) = inner.strip_prefix("${") {
@@ -353,10 +379,11 @@ impl CommandArgEvaluator {
         Ok((segment, end + 1))
     }
 
-    fn parse_var_path(var: &str) -> Result<Vec<VarPathSegment>, String> {
+    fn parse_var_path(var: &str) -> Result<Vec<VarPathAccessSegment>, String> {
         let mut i = 0usize;
         let mut current = String::new();
         let mut segments = Vec::new();
+        let mut pending_optional = false;
 
         while i < var.len() {
             let ch = var[i..].chars().next().ok_or_else(|| {
@@ -382,13 +409,67 @@ impl CommandArgEvaluator {
                 continue;
             }
 
+            if ch == '?' {
+                let next = i + ch.len_utf8();
+                if next < var.len() && var[next..].starts_with('.') {
+                    if current.is_empty() && segments.is_empty() {
+                        let msg = format!(
+                            "Invalid optional access at beginning of variable path: {}",
+                            var
+                        );
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+
+                    Self::push_static_segment(&mut segments, &mut current, &mut pending_optional);
+                    pending_optional = true;
+                    i = next + 1;
+
+                    // Optional legacy dynamic segment: a?.($var)
+                    if i < var.len() && var[i..].starts_with('(') {
+                        let end = Self::find_matching_paren(var, i).ok_or_else(|| {
+                            let msg = format!("Unclosed dynamic segment in variable: {}", var);
+                            error!("{}", msg);
+                            msg
+                        })?;
+                        let inner = &var[i + 1..end];
+                        segments.push(VarPathAccessSegment {
+                            segment: Self::parse_dynamic_segment(inner)?,
+                            optional: pending_optional,
+                        });
+                        pending_optional = false;
+                        i = end + 1;
+                    }
+                    continue;
+                }
+
+                if next < var.len() && var[next..].starts_with('[') {
+                    if current.is_empty() && segments.is_empty() {
+                        let msg = format!(
+                            "Invalid optional bracket access at beginning of variable path: {}",
+                            var
+                        );
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+
+                    Self::push_static_segment(&mut segments, &mut current, &mut pending_optional);
+                    let (segment, next_index) = Self::parse_bracket_segment(var, next)?;
+                    segments.push(VarPathAccessSegment {
+                        segment,
+                        optional: true,
+                    });
+                    pending_optional = false;
+                    i = next_index;
+                    continue;
+                }
+            }
+
             if ch == '.' {
                 // Legacy dynamic segment syntax: a.($var) / a.(${var}) / a.(literal)
                 let next_index = i + ch.len_utf8();
                 if next_index < var.len() && var[next_index..].starts_with('(') {
-                    if !current.is_empty() {
-                        segments.push(VarPathSegment::Static(std::mem::take(&mut current)));
-                    }
+                    Self::push_static_segment(&mut segments, &mut current, &mut pending_optional);
 
                     let end = Self::find_matching_paren(var, next_index).ok_or_else(|| {
                         let msg = format!("Unclosed dynamic segment in variable: {}", var);
@@ -396,25 +477,29 @@ impl CommandArgEvaluator {
                         msg
                     })?;
                     let inner = &var[next_index + 1..end];
-                    segments.push(Self::parse_dynamic_segment(inner)?);
+                    segments.push(VarPathAccessSegment {
+                        segment: Self::parse_dynamic_segment(inner)?,
+                        optional: pending_optional,
+                    });
+                    pending_optional = false;
                     i = end + 1;
                     continue;
                 }
 
-                if !current.is_empty() {
-                    segments.push(VarPathSegment::Static(std::mem::take(&mut current)));
-                }
+                Self::push_static_segment(&mut segments, &mut current, &mut pending_optional);
                 i += ch.len_utf8();
                 continue;
             }
 
             if ch == '[' {
-                if !current.is_empty() {
-                    segments.push(VarPathSegment::Static(std::mem::take(&mut current)));
-                }
+                Self::push_static_segment(&mut segments, &mut current, &mut pending_optional);
 
                 let (segment, next_index) = Self::parse_bracket_segment(var, i)?;
-                segments.push(segment);
+                segments.push(VarPathAccessSegment {
+                    segment,
+                    optional: pending_optional,
+                });
+                pending_optional = false;
                 i = next_index;
                 continue;
             }
@@ -423,8 +508,17 @@ impl CommandArgEvaluator {
             i += ch.len_utf8();
         }
 
+        if pending_optional && current.is_empty() {
+            let msg = format!("Invalid variable path ending with optional access: {}", var);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
         if !current.is_empty() {
-            segments.push(VarPathSegment::Static(current));
+            segments.push(VarPathAccessSegment {
+                segment: VarPathSegment::Static(current),
+                optional: pending_optional,
+            });
         }
 
         if segments.is_empty() {
@@ -445,36 +539,319 @@ impl CommandArgEvaluator {
     }
 
     #[async_recursion::async_recursion]
-    async fn resolve_var_path(var: &str, context: &Context) -> Result<String, String> {
-        let parsed = Self::parse_var_path(var)?;
-        let mut resolved = Vec::with_capacity(parsed.len());
+    async fn resolve_segment_key(
+        segment: &VarPathSegment,
+        current_var_path: &str,
+        context: &Context,
+    ) -> Result<String, String> {
         let policy = context.env().policy();
-
-        for segment in parsed {
-            match segment {
-                VarPathSegment::Static(value) => resolved.push(value),
-                VarPathSegment::Dynamic(expr) => {
-                    let lookup_key = Self::resolve_var_path(&expr, context).await?;
-                    let value = match context.env().get(&lookup_key, None).await? {
-                        Some(value) => value.try_as_str()?.to_string(),
-                        None => match policy.missing_var {
-                            MissingVarPolicy::Lenient => String::new(),
-                            MissingVarPolicy::Strict => {
-                                let msg = format!(
-                                    "Dynamic segment variable '{}' not found while resolving '{}'",
-                                    lookup_key, var
-                                );
-                                error!("{}", msg);
-                                return Err(msg);
-                            }
-                        },
-                    };
-                    resolved.push(value);
+        match segment {
+            VarPathSegment::Static(value) => Ok(value.clone()),
+            VarPathSegment::Dynamic(expr) => {
+                let resolved = Self::evaluate_var_expression(expr, context).await?;
+                match resolved {
+                    VarEvalResult::Value(value) => value.try_as_str().map(|v| v.to_string()),
+                    VarEvalResult::Missing { key, explicit } => {
+                        if explicit || policy.missing_var == MissingVarPolicy::Lenient {
+                            Ok(String::new())
+                        } else {
+                            let missing_key = if key.is_empty() {
+                                expr.to_string()
+                            } else {
+                                key
+                            };
+                            let msg = format!(
+                                "Dynamic segment variable '{}' not found while resolving '{}'",
+                                missing_key, current_var_path
+                            );
+                            error!("{}", msg);
+                            Err(msg)
+                        }
+                    }
                 }
             }
         }
+    }
 
-        Ok(Self::normalize_segment_list(&resolved))
+    fn find_top_level_coalesce(expr: &str) -> Option<usize> {
+        let mut i = 0usize;
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+
+        while i < expr.len() {
+            let ch = expr[i..].chars().next()?;
+
+            if let Some(q) = quote {
+                i += ch.len_utf8();
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+
+                if ch == q {
+                    quote = None;
+                }
+                continue;
+            }
+
+            if ch == '"' || ch == '\'' {
+                quote = Some(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+
+            if ch == '[' {
+                bracket_depth += 1;
+                i += ch.len_utf8();
+                continue;
+            }
+            if ch == ']' {
+                if bracket_depth > 0 {
+                    bracket_depth -= 1;
+                }
+                i += ch.len_utf8();
+                continue;
+            }
+
+            if ch == '(' {
+                paren_depth += 1;
+                i += ch.len_utf8();
+                continue;
+            }
+            if ch == ')' {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                }
+                i += ch.len_utf8();
+                continue;
+            }
+
+            if ch == '?'
+                && bracket_depth == 0
+                && paren_depth == 0
+                && i + ch.len_utf8() < expr.len()
+                && expr[i + ch.len_utf8()..].starts_with('?')
+            {
+                return Some(i);
+            }
+
+            i += ch.len_utf8();
+        }
+
+        None
+    }
+
+    fn parse_default_literal(expr: &str) -> Option<String> {
+        let expr = expr.trim();
+        if expr.len() < 2 {
+            return None;
+        }
+
+        let first = expr.chars().next()?;
+        let last = expr.chars().last()?;
+
+        if first == '\'' && last == '\'' {
+            return Some(expr[1..expr.len() - 1].to_string());
+        }
+
+        if first != '"' || last != '"' {
+            return None;
+        }
+
+        let mut out = String::new();
+        let mut escaped = false;
+        for ch in expr[1..expr.len() - 1].chars() {
+            if escaped {
+                match ch {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    '\\' => out.push('\\'),
+                    '"' => out.push('"'),
+                    '$' => out.push('$'),
+                    ' ' => out.push(' '),
+                    other => out.push(other),
+                }
+                escaped = false;
+                continue;
+            }
+
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+
+            out.push(ch);
+        }
+
+        if escaped {
+            out.push('\\');
+        }
+
+        Some(out)
+    }
+
+    #[async_recursion::async_recursion]
+    async fn evaluate_default_expression(
+        expr: &str,
+        context: &Context,
+    ) -> Result<VarEvalResult, String> {
+        if let Some(literal) = Self::parse_default_literal(expr) {
+            return Ok(VarEvalResult::Value(CollectionValue::String(literal)));
+        }
+
+        Self::evaluate_var_expression(expr, context).await
+    }
+
+    #[async_recursion::async_recursion]
+    async fn evaluate_var_path(var: &str, context: &Context) -> Result<VarEvalResult, String> {
+        let parsed = Self::parse_var_path(var)?;
+        let mut resolved_segments = Vec::with_capacity(parsed.len());
+
+        let first = parsed.first().ok_or_else(|| {
+            let msg = format!("Variable path is empty: {}", var);
+            error!("{}", msg);
+            msg
+        })?;
+        if first.optional {
+            let msg = format!(
+                "Invalid optional access for root segment in variable path: {}",
+                var
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let root_key = Self::resolve_segment_key(&first.segment, var, context).await?;
+        resolved_segments.push(root_key.clone());
+
+        let mut current_value = context.env().get(&root_key, None).await?;
+        if parsed.len() == 1 {
+            return match current_value {
+                Some(value) => Ok(VarEvalResult::Value(value)),
+                None => Ok(VarEvalResult::Missing {
+                    key: Self::normalize_segment_list(&resolved_segments),
+                    explicit: false,
+                }),
+            };
+        }
+
+        let mut current_key = root_key;
+        for (index, access) in parsed.iter().enumerate().skip(1) {
+            let segment_key = Self::resolve_segment_key(&access.segment, var, context).await?;
+            resolved_segments.push(segment_key.clone());
+            let is_last = index == parsed.len() - 1;
+
+            let next_value = match current_value {
+                Some(CollectionValue::Map(map)) => map.get(&segment_key).await?,
+                Some(CollectionValue::Set(set)) => {
+                    if is_last {
+                        if set.contains(&segment_key).await? {
+                            Some(CollectionValue::String(segment_key.clone()))
+                        } else {
+                            None
+                        }
+                    } else if access.optional {
+                        return Ok(VarEvalResult::Missing {
+                            key: Self::normalize_segment_list(&resolved_segments),
+                            explicit: true,
+                        });
+                    } else {
+                        let found = CollectionValue::Set(set.clone());
+                        let msg = format!("Expected a map at '{}', found: {}", current_key, found);
+                        warn!("{}", msg);
+                        return Err(msg);
+                    }
+                }
+                Some(CollectionValue::MultiMap(multi_map)) => {
+                    if is_last {
+                        multi_map
+                            .get_many(&segment_key)
+                            .await?
+                            .map(CollectionValue::Set)
+                    } else if access.optional {
+                        return Ok(VarEvalResult::Missing {
+                            key: Self::normalize_segment_list(&resolved_segments),
+                            explicit: true,
+                        });
+                    } else {
+                        let found = CollectionValue::MultiMap(multi_map.clone());
+                        let msg = format!("Expected a map at '{}', found: {}", current_key, found);
+                        warn!("{}", msg);
+                        return Err(msg);
+                    }
+                }
+                Some(value) => {
+                    if access.optional {
+                        return Ok(VarEvalResult::Missing {
+                            key: Self::normalize_segment_list(&resolved_segments),
+                            explicit: true,
+                        });
+                    }
+
+                    let msg = format!("Expected a map at '{}', found: {}", current_key, value);
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+                None => {
+                    return Ok(VarEvalResult::Missing {
+                        key: Self::normalize_segment_list(&resolved_segments),
+                        explicit: access.optional,
+                    });
+                }
+            };
+
+            current_key = segment_key;
+            current_value = next_value;
+        }
+
+        match current_value {
+            Some(value) => Ok(VarEvalResult::Value(value)),
+            None => Ok(VarEvalResult::Missing {
+                key: Self::normalize_segment_list(&resolved_segments),
+                explicit: parsed.last().map(|s| s.optional).unwrap_or(false),
+            }),
+        }
+    }
+
+    #[async_recursion::async_recursion]
+    async fn evaluate_var_expression(
+        var: &str,
+        context: &Context,
+    ) -> Result<VarEvalResult, String> {
+        let var = var.trim();
+        if var.is_empty() {
+            let msg = "Variable expression is empty".to_string();
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        if let Some(index) = Self::find_top_level_coalesce(var) {
+            let lhs = var[..index].trim();
+            let rhs = var[index + 2..].trim();
+            if lhs.is_empty() || rhs.is_empty() {
+                let msg = format!("Invalid coalesce expression: '{}'", var);
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            let lhs_value = Self::evaluate_var_expression(lhs, context).await?;
+            match lhs_value {
+                VarEvalResult::Value(value) => Ok(VarEvalResult::Value(value)),
+                VarEvalResult::Missing { .. } => {
+                    Self::evaluate_default_expression(rhs, context).await
+                }
+            }
+        } else {
+            Self::evaluate_var_path(var, context).await
+        }
     }
 
     #[async_recursion::async_recursion]
@@ -483,24 +860,28 @@ impl CommandArgEvaluator {
             CommandArg::Literal(value) => CollectionValue::String(value.clone()),
             CommandArg::Var(var) => {
                 debug!("Resolving variable: {}", var);
-                let var = Self::resolve_var_path(var, context).await?;
                 let policy = context.env().policy();
-                if let Some(value) = context.env().get(&var, None).await? {
-                    value
-                } else {
-                    match policy.missing_var {
-                        MissingVarPolicy::Lenient => {
-                            // Backward compatible behavior: keep missing variables as empty string.
-                            warn!(
-                                "Variable '{}' not found in context, using empty string",
-                                var
-                            );
+                match Self::evaluate_var_expression(var, context).await? {
+                    VarEvalResult::Value(value) => value,
+                    VarEvalResult::Missing { key, explicit } => {
+                        if explicit {
+                            // Explicit optional access (?. / ?[]) suppresses strict missing-var errors.
                             CollectionValue::String(String::new())
-                        }
-                        MissingVarPolicy::Strict => {
-                            let msg = format!("Variable '{}' not found in context", var);
-                            error!("{}", msg);
-                            return Err(msg);
+                        } else {
+                            match policy.missing_var {
+                                MissingVarPolicy::Lenient => {
+                                    warn!(
+                                        "Variable '{}' not found in context, using empty string",
+                                        key
+                                    );
+                                    CollectionValue::String(String::new())
+                                }
+                                MissingVarPolicy::Strict => {
+                                    let msg = format!("Variable '{}' not found in context", key);
+                                    error!("{}", msg);
+                                    return Err(msg);
+                                }
+                            }
                         }
                     }
                 }

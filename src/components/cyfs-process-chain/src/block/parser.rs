@@ -1072,6 +1072,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_braced_var_with_safe_access_and_default() {
+        let (rest, arg) =
+            BlockParser::parse_arg("${geoByIp[$REQ.clientIp]?.country ?? \"unknown\"}").unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_var());
+        assert_eq!(
+            arg.as_var_str(),
+            Some("geoByIp[$REQ.clientIp]?.country ?? \"unknown\"")
+        );
+    }
+
+    #[test]
     fn test_parse() {
         let parser = BlockParser::new("test_block");
 

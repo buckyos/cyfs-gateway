@@ -65,6 +65,34 @@ const PROCESS_CHAIN_LIB_VAR_POLICY: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_LIB_VAR_SAFE_DEFAULT: &str = r#"
+<process_chain_lib id="test_var_safe_default_lib" priority="100">
+    <process_chain id="route_chain_safe_default">
+        <block id="route">
+            <![CDATA[
+                local country=${geoByIp[$REQ.clientIp]?.country ?? "unknown_country"};
+                local region=${geoByIp[$REQ.clientIp]?.meta?.["region.code"] ?? "unknown_region"};
+                local safe_only=${geoByIp[$REQ.clientIp]?.meta?.["missing.field"]};
+                return --from lib $(append $country "|" $region "|" $safe_only);
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_LIB_VAR_SAFE_TYPE_MISMATCH: &str = r#"
+<process_chain_lib id="test_var_safe_type_mismatch_lib" priority="100">
+    <process_chain id="route_chain_safe_type_mismatch">
+        <block id="route">
+            <![CDATA[
+                local region=${geoByIp[$REQ.clientIp]?.meta?.["region.code"] ?? "fallback_region"};
+                return --from lib $region;
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 const PROCESS_CHAIN_LIB_VAR_COLLECTION_ASSIGN: &str = r#"
 <process_chain_lib id="test_var_collection_assign_lib" priority="100">
     <process_chain id="collection_assign_chain">
@@ -628,6 +656,128 @@ async fn test_dynamic_map_lookup_missing_dynamic_segment_strict_returns_error() 
         "unexpected error: {}",
         err
     );
+}
+
+#[tokio::test]
+async fn test_safe_access_and_default_with_strict_policy() {
+    TermLogger::init(
+        LevelFilter::Debug,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
+    });
+
+    let hook_point = HookPoint::new("test_var_safe_default");
+    hook_point
+        .load_process_chain_lib(
+            "test_var_safe_default_lib",
+            0,
+            PROCESS_CHAIN_LIB_VAR_SAFE_DEFAULT,
+        )
+        .await
+        .unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-var-safe-default");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-var-safe-default", data_dir);
+    hook_point_env.set_missing_var_policy(MissingVarPolicy::Strict);
+
+    let geo_by_ip = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    geo_by_ip
+        .insert(
+            "1.2.3.4",
+            CollectionValue::Map(
+                make_geo_entry_with_meta("CN", "中国电信", "Shenzhen", "CN.SZ", "south-zone").await,
+            ),
+        )
+        .await
+        .unwrap();
+
+    let req = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    set_client_ip(&req, "1.2.3.4").await;
+
+    hook_point_env
+        .hook_point_env()
+        .create("geoByIp", CollectionValue::Map(geo_by_ip))
+        .await
+        .unwrap();
+    hook_point_env
+        .hook_point_env()
+        .create("REQ", CollectionValue::Map(req.clone()))
+        .await
+        .unwrap();
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+
+    let ret = exec.execute_lib("test_var_safe_default_lib").await.unwrap();
+    assert_eq!(ret.value(), "CN|CN.SZ|");
+
+    set_client_ip(&req, "10.10.10.10").await;
+    let ret = exec.execute_lib("test_var_safe_default_lib").await.unwrap();
+    assert_eq!(ret.value(), "unknown_country|unknown_region|");
+}
+
+#[tokio::test]
+async fn test_safe_access_type_mismatch_uses_default() {
+    TermLogger::init(
+        LevelFilter::Debug,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
+    });
+
+    let hook_point = HookPoint::new("test_var_safe_type_mismatch");
+    hook_point
+        .load_process_chain_lib(
+            "test_var_safe_type_mismatch_lib",
+            0,
+            PROCESS_CHAIN_LIB_VAR_SAFE_TYPE_MISMATCH,
+        )
+        .await
+        .unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-var-safe-type-mismatch");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-var-safe-type-mismatch", data_dir);
+    hook_point_env.set_missing_var_policy(MissingVarPolicy::Strict);
+
+    let geo_by_ip = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    geo_by_ip
+        .insert(
+            "1.2.3.4",
+            CollectionValue::Map(
+                make_geo_entry_with_bad_meta("CN", "中国电信", "Shenzhen", "not-a-map").await,
+            ),
+        )
+        .await
+        .unwrap();
+
+    let req = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    set_client_ip(&req, "1.2.3.4").await;
+
+    hook_point_env
+        .hook_point_env()
+        .create("geoByIp", CollectionValue::Map(geo_by_ip))
+        .await
+        .unwrap();
+    hook_point_env
+        .hook_point_env()
+        .create("REQ", CollectionValue::Map(req.clone()))
+        .await
+        .unwrap();
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+    let ret = exec
+        .execute_lib("test_var_safe_type_mismatch_lib")
+        .await
+        .unwrap();
+    assert_eq!(ret.value(), "fallback_region");
 }
 
 #[tokio::test]
