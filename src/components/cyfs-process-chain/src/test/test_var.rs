@@ -544,6 +544,28 @@ async fn test_dynamic_map_lookup_missing_ip_strict_returns_error() {
     let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
     let err = exec.execute_lib("test_var_policy_lib").await.unwrap_err();
     assert!(
+        err.contains("[PC-RUNTIME-0101]"),
+        "unexpected error: {}",
+        err
+    );
+    assert!(
+        err.contains("lib=test_var_policy_lib"),
+        "unexpected error: {}",
+        err
+    );
+    assert!(
+        err.contains("chain=route_chain_policy"),
+        "unexpected error: {}",
+        err
+    );
+    assert!(err.contains("block=route"), "unexpected error: {}", err);
+    assert!(err.contains("line=1"), "unexpected error: {}", err);
+    assert!(
+        err.contains("source=local country=$geoByIp[$REQ.clientIp].country;"),
+        "unexpected error: {}",
+        err
+    );
+    assert!(
         err.contains("Variable 'geoByIp.10\\.10\\.10\\.10.country' not found in context"),
         "unexpected error: {}",
         err

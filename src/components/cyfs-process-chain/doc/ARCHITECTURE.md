@@ -222,7 +222,20 @@
 - 若干 HTTP body/TCP probe 分支存在 FIXME（错误处理策略待统一）。
 - `collection/db.rs` 为空，`collection/manager.rs` 未在 `mod.rs` 导出。
 
-## 11. 与网关工程的关系
+## 11. 运行时错误定位（当前）
+
+运行时异常已统一为结构化错误字符串，包含：
+
+- 错误码（如 `PC-RUNTIME-0101`）
+- `lib/chain/block/line/source`
+- 可选 `command`
+- `cause`（下层原始错误）
+
+格式示例：
+
+- `[PC-RUNTIME-0101] Failed to execute line | lib=test_var_policy_lib chain=route_chain_policy block=route line=1 source=local country=$geoByIp[$REQ.clientIp].country; command=- | cause=...`
+
+## 12. 与网关工程的关系
 
 workspace 内以下组件直接依赖本 crate：
 
@@ -234,7 +247,7 @@ workspace 内以下组件直接依赖本 crate：
 
 网关侧通常通过配置构建 process chain，再注入全局集合、外部命令、JS externals，最终在 HTTP/UDP/TCP 等入口执行。
 
-## 12. 参考文档
+## 13. 参考文档
 
 - 命令级帮助请看 [COMMAND_REFERENCE.md](./COMMAND_REFERENCE.md)。
 - 该文件中的 external 命令基于 REPL 默认注册集合；实际网关运行时以业务注册为准。
