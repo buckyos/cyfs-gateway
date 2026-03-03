@@ -130,6 +130,29 @@ impl CommandParserFactory {
         );
 
         self.register(
+            "list-create",
+            Arc::new(Box::new(ListCreateCommandParser::new())),
+        );
+        self.register(
+            "list-push",
+            Arc::new(Box::new(ListPushCommandParser::new())),
+        );
+        self.register(
+            "list-insert",
+            Arc::new(Box::new(ListInsertCommandParser::new())),
+        );
+        self.register("list-set", Arc::new(Box::new(ListSetCommandParser::new())));
+        self.register(
+            "list-remove",
+            Arc::new(Box::new(ListRemoveCommandParser::new())),
+        );
+        self.register("list-pop", Arc::new(Box::new(ListPopCommandParser::new())));
+        self.register(
+            "list-clear",
+            Arc::new(Box::new(ListClearCommandParser::new())),
+        );
+
+        self.register(
             "set-create",
             Arc::new(Box::new(SetCreateCommandParser::new())),
         );

@@ -1,4 +1,4 @@
-use log::{Level, log};
+use log::{log, Level};
 
 use super::env::{Env, EnvLevel, EnvRef};
 use super::external::EnvExternalRef;
@@ -603,6 +603,11 @@ impl EnvManager {
         level: EnvLevel,
     ) -> Result<Option<CollectionValue>, String> {
         let value = match collection_type {
+            CollectionType::List => {
+                let collection =
+                    Arc::new(Box::new(MemoryListCollection::new()) as Box<dyn ListCollection>);
+                CollectionValue::List(collection)
+            }
             CollectionType::Set => {
                 let collection =
                     Arc::new(Box::new(MemorySetCollection::new()) as Box<dyn SetCollection>);

@@ -1,10 +1,92 @@
 use super::cmd::*;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, EnvLevel, ParserContext};
-use crate::collection::{CollectionType, CollectionValue};
+use crate::collection::{
+    CollectionType, CollectionValue, SetCollectionRef, SetCollectionTraverseCallBack,
+};
 use clap::{Arg, Command};
 use log::log;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+fn parse_list_index(raw: &str, cmd_name: &str, arg_name: &str) -> Result<usize, String> {
+    raw.parse::<usize>().map_err(|e| {
+        let msg = format!(
+            "Invalid {} '{}' for {} command, expected non-negative integer: {}",
+            arg_name, raw, cmd_name, e
+        );
+        warn!("{}", msg);
+        msg
+    })
+}
+
+struct SetJoinTraverseState {
+    output: Mutex<String>,
+    first: Mutex<bool>,
+}
+
+impl SetJoinTraverseState {
+    fn new() -> Self {
+        Self {
+            output: Mutex::new(String::new()),
+            first: Mutex::new(true),
+        }
+    }
+
+    fn push_value(&self, value: &str) -> Result<(), String> {
+        let mut first_guard = self
+            .first
+            .lock()
+            .map_err(|_| "SetJoinTraverseState first lock poisoned".to_string())?;
+        let mut output_guard = self
+            .output
+            .lock()
+            .map_err(|_| "SetJoinTraverseState output lock poisoned".to_string())?;
+
+        if !*first_guard {
+            output_guard.push(' ');
+        }
+        output_guard.push_str(value);
+        *first_guard = false;
+        Ok(())
+    }
+
+    fn output(&self) -> Result<String, String> {
+        let guard = self
+            .output
+            .lock()
+            .map_err(|_| "SetJoinTraverseState output lock poisoned".to_string())?;
+        Ok(guard.clone())
+    }
+}
+
+struct SetJoinTraverseCallBack {
+    state: Arc<SetJoinTraverseState>,
+}
+
+impl SetJoinTraverseCallBack {
+    fn new(state: Arc<SetJoinTraverseState>) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait::async_trait]
+impl SetCollectionTraverseCallBack for SetJoinTraverseCallBack {
+    async fn call(&self, key: &str) -> Result<bool, String> {
+        self.state.push_value(key)?;
+        Ok(true)
+    }
+}
+
+async fn join_set_collection_values(set: &SetCollectionRef) -> Result<String, String> {
+    let state = Arc::new(SetJoinTraverseState::new());
+    let callback = SetJoinTraverseCallBack::new(state.clone());
+    set.traverse(Arc::new(
+        Box::new(callback) as Box<dyn SetCollectionTraverseCallBack>
+    ))
+    .await?;
+
+    state.output()
+}
 
 /*
 // Map collection commands support both normal map and multi map.
@@ -169,7 +251,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                 let coll = ret.unwrap();
                 if !coll.is_collection() {
                     let msg = format!(
-                        "Expected CollectionValue::Set, CollectionValue::Map or CollectionValue::MultiMap, found {}",
+                        "Expected a collection type for match-include command, found {}",
                         coll.get_type(),
                     );
                     warn!("{}", msg);
@@ -178,9 +260,10 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
 
                 coll
             }
-            CollectionValue::Set(_) | CollectionValue::Map(_) | CollectionValue::MultiMap(_) => {
-                collection
-            }
+            CollectionValue::List(_)
+            | CollectionValue::Set(_)
+            | CollectionValue::Map(_)
+            | CollectionValue::MultiMap(_) => collection,
             CollectionValue::Visitor(_) | CollectionValue::Any(_) => {
                 let msg = "Collection cannot be a visitor or any type for match-include command"
                     .to_string();
@@ -190,6 +273,34 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
         };
 
         match collection {
+            CollectionValue::List(collection) => {
+                let mut expected_values = Vec::with_capacity(values.len() + 1);
+                expected_values.push(key.clone());
+                expected_values.extend(values.iter().cloned());
+
+                let all_included = collection.contains_all_strings(&expected_values).await?;
+
+                if !all_included {
+                    debug!(
+                        "MatchInclude command for list missing expected values from collection '{:?}'",
+                        self.collection
+                    );
+                }
+
+                log!(
+                    context.env().get_log_level(),
+                    "MatchInclude command for list: values='{:?}', collection='{:?}', contains_all={}",
+                    expected_values,
+                    self.collection,
+                    all_included
+                );
+
+                if all_included {
+                    Ok(CommandResult::success_with_value("true"))
+                } else {
+                    Ok(CommandResult::error_with_value("false"))
+                }
+            }
             CollectionValue::Set(collection) => {
                 // For set collection, we check if the key is included
                 let contains = collection.contains(&key).await?;
@@ -303,6 +414,941 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                 );
             }
         }
+    }
+}
+
+/// list-create [-global|-chain|-block] <list_id>
+/// Create a new list collection with the given id.
+pub struct ListCreateCommandParser {
+    cmd: Command,
+}
+
+impl ListCreateCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("list-create")
+            .about("Create a new list collection with a given identifier and scope.")
+            .after_help(
+                r#"
+Arguments:
+  <list_id>   The identifier of the list collection to create.
+
+Scope Options:
+  -global, -export    Create the list in the global scope.
+  -chain              Create the list in the current process chain scope (default).
+  -block, -local      Create the list in the current execution block (local) scope.
+
+Notes:
+  - If no scope is specified, the default is chain-level.
+
+Examples:
+  list-create -global request_history
+  list-create session_steps
+  list-create -block temp_values
+"#,
+            )
+            .arg(
+                Arg::new("global")
+                    .long("global")
+                    .visible_alias("export")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with_all(["chain", "block"])
+                    .help("Use global scope"),
+            )
+            .arg(
+                Arg::new("chain")
+                    .long("chain")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with_all(["global", "block"])
+                    .help("Use chain scope (default)"),
+            )
+            .arg(
+                Arg::new("block")
+                    .visible_alias("local")
+                    .long("block")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with_all(["global", "chain"])
+                    .help("Use block scope"),
+            )
+            .arg(
+                Arg::new("list_id")
+                    .required(true)
+                    .value_name("list_id")
+                    .help("The ID of the list to create"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for ListCreateCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid list-create command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let level = if matches.get_flag("global") {
+            EnvLevel::Global
+        } else if matches.get_flag("block") {
+            EnvLevel::Block
+        } else {
+            EnvLevel::Chain
+        };
+
+        let list_index = matches.index_of("list_id").ok_or_else(|| {
+            let msg = "list_id argument is required for list-create command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let list_id = args[list_index].clone();
+
+        let cmd = ListCreateCommandExecutor::new(level, list_id);
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct ListCreateCommandExecutor {
+    level: EnvLevel,
+    list_id: CommandArg,
+}
+
+impl ListCreateCommandExecutor {
+    pub fn new(level: EnvLevel, list_id: CommandArg) -> Self {
+        Self { level, list_id }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for ListCreateCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let list_id = self.list_id.evaluate_string(context).await?;
+        match context
+            .env()
+            .create_collection(&list_id, CollectionType::List, self.level)
+            .await?
+        {
+            Some(_) => {
+                log!(
+                    context.env().get_log_level(),
+                    "List collection with id '{:?}' {:?} created successfully",
+                    self.list_id,
+                    self.level
+                );
+                Ok(CommandResult::success())
+            }
+            None => {
+                let msg = format!(
+                    "Failed to create list collection with id '{:?}' {:?}",
+                    self.list_id, self.level
+                );
+                warn!("{}", msg);
+                Ok(CommandResult::error_with_value(msg))
+            }
+        }
+    }
+}
+
+/// list-push <list_id> <value1> <value2> ...
+/// Append one or more values to the end of the list.
+pub struct ListPushCommandParser {
+    cmd: Command,
+}
+
+impl ListPushCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("list-push")
+            .about("Append one or more values to a list collection.")
+            .after_help(
+                r#"
+Arguments:
+  <list_id>   The identifier of the target list.
+  <value>...  One or more values to append.
+
+Examples:
+  list-push request_history "step1" "step2"
+  list-push records $REQ
+"#,
+            )
+            .arg(
+                Arg::new("list_id")
+                    .required(true)
+                    .value_name("list_id")
+                    .help("The ID of the target list"),
+            )
+            .arg(
+                Arg::new("values")
+                    .required(true)
+                    .num_args(1..)
+                    .value_name("value")
+                    .help("One or more values to append to the list"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for ListPushCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid list-push command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let list_index = matches.index_of("list_id").ok_or_else(|| {
+            let msg = "list_id argument is required for list-push command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let list = args[list_index].clone();
+
+        let values = match matches.indices_of("values") {
+            Some(indices) => indices.map(|i| args[i].clone()).collect(),
+            None => {
+                let msg = "At least one value is required for list-push command".to_string();
+                error!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        let cmd = ListPushCommandExecutor::new(list, values);
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct ListPushCommandExecutor {
+    list: CommandArg,
+    values: Vec<CommandArg>,
+}
+
+impl ListPushCommandExecutor {
+    pub fn new(list: CommandArg, values: Vec<CommandArg>) -> Self {
+        Self { list, values }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for ListPushCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let list = self.list.evaluate(context).await?;
+        let values = CommandArg::evaluate_list(&self.values, context).await?;
+
+        let list = match list {
+            CollectionValue::String(list_id) => {
+                let ret = context.env().get(&list_id, None).await?;
+                if ret.is_none() {
+                    let msg = format!("List collection with id '{}' not found", list_id);
+                    warn!("{}", msg);
+                    return Ok(CommandResult::error_with_value(msg));
+                }
+                let coll = ret.unwrap();
+                if !coll.is_list() {
+                    let msg = format!("Expected CollectionValue::List, found {}", coll.get_type());
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+
+                coll.into_list().unwrap()
+            }
+            CollectionValue::List(list) => list,
+            _ => {
+                let msg = "Collection must be a List for list-push command".to_string();
+                warn!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        for value in values {
+            list.push(value).await?;
+        }
+
+        Ok(CommandResult::success())
+    }
+}
+
+/// list-insert <list_id> <index> <value>
+/// Insert a value at index.
+pub struct ListInsertCommandParser {
+    cmd: Command,
+}
+
+impl ListInsertCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("list-insert")
+            .about("Insert a value into a list collection at a specific index.")
+            .after_help(
+                r#"
+Arguments:
+  <list_id>   The identifier of the target list.
+  <index>     Zero-based index to insert at.
+  <value>     Value to insert.
+
+Examples:
+  list-insert request_history 0 "begin"
+  list-insert records 1 $REQ
+"#,
+            )
+            .arg(
+                Arg::new("list_id")
+                    .required(true)
+                    .value_name("list_id")
+                    .help("The ID of the target list"),
+            )
+            .arg(
+                Arg::new("index")
+                    .required(true)
+                    .value_name("index")
+                    .help("Zero-based index"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .value_name("value")
+                    .help("The value to insert"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for ListInsertCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid list-insert command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let list_index = matches.index_of("list_id").ok_or_else(|| {
+            let msg = "list_id argument is required for list-insert command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let list = args[list_index].clone();
+
+        let index_index = matches.index_of("index").ok_or_else(|| {
+            let msg = "index argument is required for list-insert command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let index = args[index_index].clone();
+
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = "value argument is required for list-insert command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        let cmd = ListInsertCommandExecutor::new(list, index, value);
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct ListInsertCommandExecutor {
+    list: CommandArg,
+    index: CommandArg,
+    value: CommandArg,
+}
+
+impl ListInsertCommandExecutor {
+    pub fn new(list: CommandArg, index: CommandArg, value: CommandArg) -> Self {
+        Self { list, index, value }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for ListInsertCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let list = self.list.evaluate(context).await?;
+        let index = self.index.evaluate_string(context).await?;
+        let index = parse_list_index(&index, "list-insert", "index")?;
+        let value = self.value.evaluate(context).await?;
+
+        let list = match list {
+            CollectionValue::String(list_id) => {
+                let ret = context.env().get(&list_id, None).await?;
+                if ret.is_none() {
+                    let msg = format!("List collection with id '{}' not found", list_id);
+                    warn!("{}", msg);
+                    return Ok(CommandResult::error_with_value(msg));
+                }
+                let coll = ret.unwrap();
+                if !coll.is_list() {
+                    let msg = format!("Expected CollectionValue::List, found {}", coll.get_type());
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+
+                coll.into_list().unwrap()
+            }
+            CollectionValue::List(list) => list,
+            _ => {
+                let msg = "Collection must be a List for list-insert command".to_string();
+                warn!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        list.insert(index, value).await?;
+        Ok(CommandResult::success())
+    }
+}
+
+/// list-set <list_id> <index> <value>
+/// Replace the value at index.
+pub struct ListSetCommandParser {
+    cmd: Command,
+}
+
+impl ListSetCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("list-set")
+            .about("Set a value in a list collection at a specific index.")
+            .after_help(
+                r#"
+Arguments:
+  <list_id>   The identifier of the target list.
+  <index>     Zero-based index to replace.
+  <value>     New value.
+
+Examples:
+  list-set request_history 0 "start"
+  list-set records 2 $REQ
+"#,
+            )
+            .arg(
+                Arg::new("list_id")
+                    .required(true)
+                    .value_name("list_id")
+                    .help("The ID of the target list"),
+            )
+            .arg(
+                Arg::new("index")
+                    .required(true)
+                    .value_name("index")
+                    .help("Zero-based index"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .value_name("value")
+                    .help("The value to set"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for ListSetCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid list-set command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let list_index = matches.index_of("list_id").ok_or_else(|| {
+            let msg = "list_id argument is required for list-set command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let list = args[list_index].clone();
+
+        let index_index = matches.index_of("index").ok_or_else(|| {
+            let msg = "index argument is required for list-set command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let index = args[index_index].clone();
+
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = "value argument is required for list-set command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        let cmd = ListSetCommandExecutor::new(list, index, value);
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct ListSetCommandExecutor {
+    list: CommandArg,
+    index: CommandArg,
+    value: CommandArg,
+}
+
+impl ListSetCommandExecutor {
+    pub fn new(list: CommandArg, index: CommandArg, value: CommandArg) -> Self {
+        Self { list, index, value }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for ListSetCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let list = self.list.evaluate(context).await?;
+        let index = self.index.evaluate_string(context).await?;
+        let index = parse_list_index(&index, "list-set", "index")?;
+        let value = self.value.evaluate(context).await?;
+
+        let list = match list {
+            CollectionValue::String(list_id) => {
+                let ret = context.env().get(&list_id, None).await?;
+                if ret.is_none() {
+                    let msg = format!("List collection with id '{}' not found", list_id);
+                    warn!("{}", msg);
+                    return Ok(CommandResult::error_with_value(msg));
+                }
+                let coll = ret.unwrap();
+                if !coll.is_list() {
+                    let msg = format!("Expected CollectionValue::List, found {}", coll.get_type());
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+
+                coll.into_list().unwrap()
+            }
+            CollectionValue::List(list) => list,
+            _ => {
+                let msg = "Collection must be a List for list-set command".to_string();
+                warn!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        match list.set(index, value).await? {
+            Some(prev) => Ok(CommandResult::success_with_value(prev.treat_as_str())),
+            None => Ok(CommandResult::success()),
+        }
+    }
+}
+
+/// list-remove <list_id> <index>
+/// Remove the value at index.
+pub struct ListRemoveCommandParser {
+    cmd: Command,
+}
+
+impl ListRemoveCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("list-remove")
+            .about("Remove a value from a list collection at a specific index.")
+            .after_help(
+                r#"
+Arguments:
+  <list_id>   The identifier of the target list.
+  <index>     Zero-based index to remove.
+
+Examples:
+  list-remove request_history 0
+"#,
+            )
+            .arg(
+                Arg::new("list_id")
+                    .required(true)
+                    .value_name("list_id")
+                    .help("The ID of the target list"),
+            )
+            .arg(
+                Arg::new("index")
+                    .required(true)
+                    .value_name("index")
+                    .help("Zero-based index"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for ListRemoveCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid list-remove command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let list_index = matches.index_of("list_id").ok_or_else(|| {
+            let msg = "list_id argument is required for list-remove command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let list = args[list_index].clone();
+
+        let index_index = matches.index_of("index").ok_or_else(|| {
+            let msg = "index argument is required for list-remove command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let index = args[index_index].clone();
+
+        let cmd = ListRemoveCommandExecutor::new(list, index);
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct ListRemoveCommandExecutor {
+    list: CommandArg,
+    index: CommandArg,
+}
+
+impl ListRemoveCommandExecutor {
+    pub fn new(list: CommandArg, index: CommandArg) -> Self {
+        Self { list, index }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for ListRemoveCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let list = self.list.evaluate(context).await?;
+        let index = self.index.evaluate_string(context).await?;
+        let index = parse_list_index(&index, "list-remove", "index")?;
+
+        let list = match list {
+            CollectionValue::String(list_id) => {
+                let ret = context.env().get(&list_id, None).await?;
+                if ret.is_none() {
+                    let msg = format!("List collection with id '{}' not found", list_id);
+                    warn!("{}", msg);
+                    return Ok(CommandResult::error_with_value(msg));
+                }
+                let coll = ret.unwrap();
+                if !coll.is_list() {
+                    let msg = format!("Expected CollectionValue::List, found {}", coll.get_type());
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+
+                coll.into_list().unwrap()
+            }
+            CollectionValue::List(list) => list,
+            _ => {
+                let msg = "Collection must be a List for list-remove command".to_string();
+                warn!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        match list.remove(index).await? {
+            Some(value) => Ok(CommandResult::success_with_value(value.treat_as_str())),
+            None => Ok(CommandResult::error()),
+        }
+    }
+}
+
+/// list-pop <list_id>
+/// Pop the last value from the list.
+pub struct ListPopCommandParser {
+    cmd: Command,
+}
+
+impl ListPopCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("list-pop")
+            .about("Pop the last value from a list collection.")
+            .after_help(
+                r#"
+Arguments:
+  <list_id>   The identifier of the target list.
+
+Examples:
+  list-pop request_history
+"#,
+            )
+            .arg(
+                Arg::new("list_id")
+                    .required(true)
+                    .value_name("list_id")
+                    .help("The ID of the target list"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for ListPopCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid list-pop command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let list_index = matches.index_of("list_id").ok_or_else(|| {
+            let msg = "list_id argument is required for list-pop command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let list = args[list_index].clone();
+
+        let cmd = ListPopCommandExecutor::new(list);
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct ListPopCommandExecutor {
+    list: CommandArg,
+}
+
+impl ListPopCommandExecutor {
+    pub fn new(list: CommandArg) -> Self {
+        Self { list }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for ListPopCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let list = self.list.evaluate(context).await?;
+
+        let list = match list {
+            CollectionValue::String(list_id) => {
+                let ret = context.env().get(&list_id, None).await?;
+                if ret.is_none() {
+                    let msg = format!("List collection with id '{}' not found", list_id);
+                    warn!("{}", msg);
+                    return Ok(CommandResult::error_with_value(msg));
+                }
+                let coll = ret.unwrap();
+                if !coll.is_list() {
+                    let msg = format!("Expected CollectionValue::List, found {}", coll.get_type());
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+
+                coll.into_list().unwrap()
+            }
+            CollectionValue::List(list) => list,
+            _ => {
+                let msg = "Collection must be a List for list-pop command".to_string();
+                warn!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        match list.pop().await? {
+            Some(value) => Ok(CommandResult::success_with_value(value.treat_as_str())),
+            None => Ok(CommandResult::error()),
+        }
+    }
+}
+
+/// list-clear <list_id>
+/// Clear all values in the list.
+pub struct ListClearCommandParser {
+    cmd: Command,
+}
+
+impl ListClearCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("list-clear")
+            .about("Clear all values from a list collection.")
+            .after_help(
+                r#"
+Arguments:
+  <list_id>   The identifier of the target list.
+
+Examples:
+  list-clear request_history
+"#,
+            )
+            .arg(
+                Arg::new("list_id")
+                    .required(true)
+                    .value_name("list_id")
+                    .help("The ID of the target list"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for ListClearCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Collection
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid list-clear command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let list_index = matches.index_of("list_id").ok_or_else(|| {
+            let msg = "list_id argument is required for list-clear command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let list = args[list_index].clone();
+
+        let cmd = ListClearCommandExecutor::new(list);
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct ListClearCommandExecutor {
+    list: CommandArg,
+}
+
+impl ListClearCommandExecutor {
+    pub fn new(list: CommandArg) -> Self {
+        Self { list }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for ListClearCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let list = self.list.evaluate(context).await?;
+
+        let list = match list {
+            CollectionValue::String(list_id) => {
+                let ret = context.env().get(&list_id, None).await?;
+                if ret.is_none() {
+                    let msg = format!("List collection with id '{}' not found", list_id);
+                    warn!("{}", msg);
+                    return Ok(CommandResult::error_with_value(msg));
+                }
+                let coll = ret.unwrap();
+                if !coll.is_list() {
+                    let msg = format!("Expected CollectionValue::List, found {}", coll.get_type());
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+
+                coll.into_list().unwrap()
+            }
+            CollectionValue::List(list) => list,
+            _ => {
+                let msg = "Collection must be a List for list-clear command".to_string();
+                warn!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        list.clear().await?;
+        Ok(CommandResult::success())
     }
 }
 
@@ -653,7 +1699,7 @@ Examples:
                     .required(true)
                     .value_name("value")
                     .num_args(1..)
-                    .help("One or more values to remove from the set")
+                    .help("One or more values to remove from the set"),
             );
 
         Self { cmd }
@@ -1376,12 +2422,16 @@ impl CommandExecutor for MapRemoveCommandExecutor {
 
                 let ret = if values.len() == 0 {
                     match collection.remove_all(&key).await? {
-                        Some(ret) => Some(ret.get_all().await?.join(" ")),
+                        Some(ret) => Some(join_set_collection_values(&ret).await?),
                         None => None,
                     }
                 } else if values.len() == 1 {
                     let ret = collection.remove(&key, &values[0]).await?;
-                    if ret { Some(values[0].clone()) } else { None }
+                    if ret {
+                        Some(values[0].clone())
+                    } else {
+                        None
+                    }
                 } else {
                     let values = self
                         .values
@@ -1389,7 +2439,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                         .map(|s| s.as_str())
                         .collect::<Vec<&str>>();
                     match collection.remove_many(&key, &values).await? {
-                        Some(ret) => Some(ret.get_all().await?.join(" ")),
+                        Some(ret) => Some(join_set_collection_values(&ret).await?),
                         None => None,
                     }
                 };

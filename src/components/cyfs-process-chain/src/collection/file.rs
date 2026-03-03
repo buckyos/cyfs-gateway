@@ -6,8 +6,8 @@ use serde::{Deserializer, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub struct JsonFileCollection<T: Send + Sync + for<'a> Deserialize<'a> + Serialize + Default> {
     file: PathBuf,
@@ -147,6 +147,112 @@ impl SetCollection for JsonSetCollection {
     }
 }
 
+#[derive(Clone)]
+pub struct JsonListCollection {
+    data: Arc<MemoryListCollection>,
+    file: Arc<JsonFileCollection<Vec<CollectionValue>>>,
+}
+
+impl JsonListCollection {
+    pub fn new(file: PathBuf) -> Result<Self, String> {
+        let file = JsonFileCollection::new(file);
+        let list = file.load()?;
+        let data = MemoryListCollection::from_list(list);
+        Ok(Self {
+            data: Arc::new(data),
+            file: Arc::new(file),
+        })
+    }
+
+    pub async fn flush(&self) -> Result<(), String> {
+        if self.file.is_dirty() {
+            self.file.save(&*self.data.data().read().await)?;
+            self.file.clear_dirty();
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ListCollection for JsonListCollection {
+    async fn len(&self) -> Result<usize, String> {
+        self.data.len().await
+    }
+
+    async fn push(&self, value: CollectionValue) -> Result<(), String> {
+        self.data.push(value).await?;
+        self.file.mark_dirty();
+        Ok(())
+    }
+
+    async fn insert(&self, index: usize, value: CollectionValue) -> Result<(), String> {
+        self.data.insert(index, value).await?;
+        self.file.mark_dirty();
+        Ok(())
+    }
+
+    async fn set(
+        &self,
+        index: usize,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
+        let ret = self.data.set(index, value).await?;
+        self.file.mark_dirty();
+        Ok(ret)
+    }
+
+    async fn get(&self, index: usize) -> Result<Option<CollectionValue>, String> {
+        self.data.get(index).await
+    }
+
+    async fn remove(&self, index: usize) -> Result<Option<CollectionValue>, String> {
+        let ret = self.data.remove(index).await?;
+        if ret.is_some() {
+            self.file.mark_dirty();
+        }
+        Ok(ret)
+    }
+
+    async fn pop(&self) -> Result<Option<CollectionValue>, String> {
+        let ret = self.data.pop().await?;
+        if ret.is_some() {
+            self.file.mark_dirty();
+        }
+        Ok(ret)
+    }
+
+    async fn clear(&self) -> Result<(), String> {
+        self.data.clear().await?;
+        self.file.mark_dirty();
+        Ok(())
+    }
+
+    async fn get_all(&self) -> Result<Vec<CollectionValue>, String> {
+        self.data.get_all().await
+    }
+
+    async fn traverse(&self, callback: ListCollectionTraverseCallBackRef) -> Result<(), String> {
+        self.data.traverse(callback).await
+    }
+
+    async fn contains_all_strings(&self, values: &[String]) -> Result<bool, String> {
+        self.data.contains_all_strings(values).await
+    }
+
+    fn is_flushable(&self) -> bool {
+        self.file.is_dirty()
+    }
+
+    async fn flush(&self) -> Result<(), String> {
+        self.flush().await
+    }
+
+    async fn dump(&self) -> Result<Vec<CollectionValue>, String> {
+        self.data.dump().await
+    }
+}
+
 impl Serialize for CollectionValue {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -267,10 +373,7 @@ impl MapCollection for JsonMapCollection {
         Ok(ret)
     }
 
-    async fn traverse(
-        &self,
-        callback: MapCollectionTraverseCallBackRef,
-    ) -> Result<(), String> {
+    async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String> {
         self.data.traverse(callback).await
     }
 

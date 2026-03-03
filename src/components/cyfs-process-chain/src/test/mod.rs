@@ -10,4 +10,5 @@ mod test_external_namespace;
 mod test_invoke;
 mod test_goto;
 mod test_if;
+mod test_list;
 mod external;

@@ -7,6 +7,7 @@ pub type AnyRef = Arc<dyn Any + Send + Sync>;
 #[derive(Clone)]
 pub enum CollectionValue {
     String(String),
+    List(ListCollectionRef),
     Set(SetCollectionRef),
     Map(MapCollectionRef),
     MultiMap(MultiMapCollectionRef),
@@ -16,6 +17,7 @@ pub enum CollectionValue {
 
 pub enum CollectionValueRef<'a> {
     String(&'a str),
+    List(&'a ListCollectionRef),
     Set(&'a SetCollectionRef),
     Map(&'a MapCollectionRef),
     MultiMap(&'a MultiMapCollectionRef),
@@ -27,6 +29,7 @@ impl std::fmt::Display for CollectionValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CollectionValue::String(s) => write!(f, "{}", s),
+            CollectionValue::List(_) => write!(f, "[List]"),
             CollectionValue::Set(_) => write!(f, "[Set]"),
             CollectionValue::Map(_) => write!(f, "[Map]"),
             CollectionValue::MultiMap(_) => write!(f, "[MultiMap]"),
@@ -65,6 +68,7 @@ impl CollectionValue {
     pub fn get_type(&self) -> &str {
         match self {
             CollectionValue::String(_) => "String",
+            CollectionValue::List(_) => "List",
             CollectionValue::Set(_) => "Set",
             CollectionValue::Map(_) => "Map",
             CollectionValue::MultiMap(_) => "MultiMap",
@@ -80,6 +84,7 @@ impl CollectionValue {
     pub fn as_ref(&self) -> CollectionValueRef<'_> {
         match self {
             CollectionValue::String(s) => CollectionValueRef::String(s.as_str()),
+            CollectionValue::List(l) => CollectionValueRef::List(l),
             CollectionValue::Set(s) => CollectionValueRef::Set(s),
             CollectionValue::Map(m) => CollectionValueRef::Map(m),
             CollectionValue::MultiMap(mm) => CollectionValueRef::MultiMap(mm),
@@ -120,11 +125,42 @@ impl CollectionValue {
     pub fn treat_as_str(&self) -> &str {
         match self {
             CollectionValue::String(s) => s.as_str(),
+            CollectionValue::List(_) => "[List]",
             CollectionValue::Set(_) => "[Set]",
             CollectionValue::Map(_) => "[Map]",
             CollectionValue::MultiMap(_) => "[MultiMap]",
             CollectionValue::Visitor(_) => "[Visitor]",
             CollectionValue::Any(_) => "[Any]",
+        }
+    }
+
+    pub fn is_list(&self) -> bool {
+        matches!(self, CollectionValue::List(_))
+    }
+
+    pub fn as_list(&self) -> Option<&ListCollectionRef> {
+        if let CollectionValue::List(l) = self {
+            Some(l)
+        } else {
+            None
+        }
+    }
+
+    pub fn try_as_list(&self) -> Result<&ListCollectionRef, String> {
+        if let CollectionValue::List(l) = self {
+            Ok(l)
+        } else {
+            let msg = format!("Expected CollectionValue::List, found {}", self.get_type());
+            warn!("{}", msg);
+            Err(msg)
+        }
+    }
+
+    pub fn into_list(self) -> Option<ListCollectionRef> {
+        if let CollectionValue::List(l) = self {
+            Some(l)
+        } else {
+            None
         }
     }
 
@@ -224,7 +260,10 @@ impl CollectionValue {
     pub fn is_collection(&self) -> bool {
         matches!(
             self,
-            CollectionValue::Set(_) | CollectionValue::Map(_) | CollectionValue::MultiMap(_)
+            CollectionValue::List(_)
+                | CollectionValue::Set(_)
+                | CollectionValue::Map(_)
+                | CollectionValue::MultiMap(_)
         )
     }
 
@@ -267,6 +306,7 @@ impl CollectionValue {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CollectionType {
+    List,
     Set,
     Map,
     MultiMap,
@@ -327,6 +367,74 @@ pub trait SetCollection: Send + Sync {
 pub type SetCollectionRef = Arc<Box<dyn SetCollection>>;
 
 #[async_trait::async_trait]
+pub trait ListCollectionTraverseCallBack: Send + Sync {
+    /// Traverse the collection and apply the callback to each element.
+    /// If the callback returns false, the traversal stops.
+    async fn call(&self, index: usize, value: &CollectionValue) -> Result<bool, String>;
+}
+
+pub type ListCollectionTraverseCallBackRef = Arc<Box<dyn ListCollectionTraverseCallBack>>;
+
+#[async_trait::async_trait]
+pub trait ListCollection: Send + Sync {
+    /// Returns the number of elements in the collection.
+    async fn len(&self) -> Result<usize, String>;
+
+    /// Appends a value to the end of the list.
+    async fn push(&self, value: CollectionValue) -> Result<(), String>;
+
+    /// Inserts a value at the specified index.
+    async fn insert(&self, index: usize, value: CollectionValue) -> Result<(), String>;
+
+    /// Sets the value at the specified index.
+    /// Returns previous value if index already existed.
+    async fn set(
+        &self,
+        index: usize,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String>;
+
+    /// Gets the value at the specified index.
+    async fn get(&self, index: usize) -> Result<Option<CollectionValue>, String>;
+
+    /// Removes the value at the specified index.
+    async fn remove(&self, index: usize) -> Result<Option<CollectionValue>, String>;
+
+    /// Pops the last value from the list.
+    async fn pop(&self) -> Result<Option<CollectionValue>, String>;
+
+    /// Clears all values in the list.
+    async fn clear(&self) -> Result<(), String>;
+
+    /// Gets all values in the list.
+    async fn get_all(&self) -> Result<Vec<CollectionValue>, String>;
+
+    /// Traverses the list and applies the callback to each element.
+    async fn traverse(&self, callback: ListCollectionTraverseCallBackRef) -> Result<(), String>;
+
+    /// Checks if all string values are present in the list.
+    /// This is optimized for commands like `match-include` and only matches string elements.
+    async fn contains_all_strings(&self, values: &[String]) -> Result<bool, String>;
+
+    /// Checks if the collection is flushable.
+    fn is_flushable(&self) -> bool {
+        false
+    }
+
+    /// Flushes the collection to persistent storage if applicable.
+    async fn flush(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Dumps the collection to a vector of values.
+    async fn dump(&self) -> Result<Vec<CollectionValue>, String> {
+        self.get_all().await
+    }
+}
+
+pub type ListCollectionRef = Arc<Box<dyn ListCollection>>;
+
+#[async_trait::async_trait]
 pub trait MapCollectionTraverseCallBack: Send + Sync {
     /// Traverse the collection and apply the callback to each key-value pair.
     /// If the callback returns false, the traversal stops.
@@ -361,10 +469,7 @@ pub trait MapCollection: Send + Sync {
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String>;
 
     // Traverses the collection and applies the callback to each key-value pair.
-    async fn traverse(
-        &self,
-        callback: MapCollectionTraverseCallBackRef,
-    ) -> Result<(), String>;
+    async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String>;
 
     /// Checks if the collection is flushable.
     fn is_flushable(&self) -> bool {
@@ -391,8 +496,7 @@ pub trait MultiMapCollectionTraverseCallBack: Send + Sync {
     async fn call(&self, key: &str, value: &str) -> Result<bool, String>;
 }
 
-pub type MultiMapCollectionTraverseCallBackRef =
-    Arc<Box<dyn MultiMapCollectionTraverseCallBack>>;
+pub type MultiMapCollectionTraverseCallBackRef = Arc<Box<dyn MultiMapCollectionTraverseCallBack>>;
 
 #[async_trait::async_trait]
 pub trait MultiMapCollection: Send + Sync {
@@ -436,10 +540,8 @@ pub trait MultiMapCollection: Send + Sync {
     async fn remove_all(&self, key: &str) -> Result<Option<SetCollectionRef>, String>;
 
     /// Traverses the collection and applies the callback to each key-value pair.
-    async fn traverse(
-        &self,
-        callback: MultiMapCollectionTraverseCallBackRef,
-    ) -> Result<(), String>;
+    async fn traverse(&self, callback: MultiMapCollectionTraverseCallBackRef)
+        -> Result<(), String>;
 
     /// Checks if the collection is flushable.
     fn is_flushable(&self) -> bool {

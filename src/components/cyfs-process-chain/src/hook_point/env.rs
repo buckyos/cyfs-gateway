@@ -158,6 +158,30 @@ impl HookPointEnv {
         }
 
         match collection_type {
+            CollectionType::List => {
+                let list = match collection_format {
+                    CollectionFileFormat::Json => {
+                        let list = JsonListCollection::new(file_path.clone())?;
+                        Box::new(list) as Box<dyn ListCollection>
+                    }
+                    CollectionFileFormat::Sqlite => {
+                        unimplemented!("Sqlite collection not implemented yet");
+                    }
+                };
+
+                let ret = self
+                    .hook_point_env
+                    .create(id, CollectionValue::List(Arc::new(list)))
+                    .await?;
+                if !ret {
+                    let msg = format!(
+                        "Failed to add list collection with id '{}', already exists",
+                        id
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
             CollectionType::Set => {
                 let set = match collection_format {
                     CollectionFileFormat::Json => {
