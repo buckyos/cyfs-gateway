@@ -54,6 +54,102 @@ pub struct SNServer {
 }
 
 impl SNServer {
+    fn extract_missing_field_name(err: &str) -> Option<String> {
+        for marker in ["missing field `", "missing field '"] {
+            if let Some(start) = err.find(marker) {
+                let value_start = start + marker.len();
+                let tail = &err[value_start..];
+                if let Some(end) = tail.find(['`', '\'']) {
+                    let field = tail[..end].trim();
+                    if !field.is_empty() {
+                        return Some(field.to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn decode_mini_config_with_schema_compat(
+        mini_config_jwt: &str,
+        user_public_key: &DecodingKey,
+        context: &str,
+    ) -> Result<DeviceMiniConfig, String> {
+        match DeviceMiniConfig::from_jwt(mini_config_jwt, user_public_key) {
+            Ok(config) => Ok(config),
+            Err(primary_err) => {
+                let primary_err = primary_err.to_string();
+                let missing_field = Self::extract_missing_field_name(primary_err.as_str());
+                if missing_field.is_none() {
+                    return Err(primary_err);
+                }
+
+                warn!(
+                    "[schema_compat] mini_config decode failed in {}: {}; trying jwt-claims compatibility fallback",
+                    context,
+                    primary_err
+                );
+
+                let mut claims = decode_json_from_jwt_with_pk(mini_config_jwt, user_public_key)
+                    .map_err(|e| {
+                        format!(
+                            "mini_config decode failed in {} ({}); jwt-claims fallback decode failed: {}",
+                            context, primary_err, e
+                        )
+                    })?;
+
+                let Some(obj) = claims.as_object_mut() else {
+                    return Err(format!(
+                        "mini_config decode failed in {} ({}); jwt-claims fallback expected object",
+                        context, primary_err
+                    ));
+                };
+
+                if !obj.contains_key("n") {
+                    if let Some(v) = obj.get("name").cloned() {
+                        obj.insert("n".to_string(), v);
+                    }
+                }
+                if !obj.contains_key("name") {
+                    if let Some(v) = obj.get("n").cloned() {
+                        obj.insert("name".to_string(), v);
+                    }
+                }
+                if !obj.contains_key("p") {
+                    if let Some(v) = obj.get("rtcp_port").cloned() {
+                        obj.insert("p".to_string(), v);
+                    }
+                }
+                if !obj.contains_key("rtcp_port") {
+                    if let Some(v) = obj.get("p").cloned() {
+                        obj.insert("rtcp_port".to_string(), v);
+                    }
+                }
+                if !obj.contains_key("hostname") {
+                    if let Some(v) = obj.get("name").cloned().or_else(|| obj.get("n").cloned()) {
+                        obj.insert("hostname".to_string(), v);
+                    }
+                }
+
+                match serde_json::from_value::<DeviceMiniConfig>(claims) {
+                    Ok(config) => {
+                        warn!(
+                            "[schema_compat] mini_config fallback applied in {} due to missing required field `{}`; please regenerate activation data with latest make_config",
+                            context,
+                            missing_field.unwrap_or_else(|| "unknown".to_string())
+                        );
+                        Ok(config)
+                    }
+                    Err(fallback_err) => Err(format!(
+                        "mini_config decode failed in {} ({}); fallback parse failed: {}",
+                        context, primary_err, fallback_err
+                    )),
+                }
+            }
+        }
+    }
+
     pub async fn new(server_config: SNServerConfig, db: SnDBRef) -> Self {
         let server_host = server_config.host;
         let server_ip = IpAddr::from_str(server_config.ip.as_str()).unwrap();
@@ -251,7 +347,12 @@ impl SNServer {
             return Err(RPCErrors::ParseRequestError(format!("invalid aud {} expect sn", rpc_session_token.aud.clone().unwrap_or("None".to_string()))));
         }
 
-        let mini_device_config = DeviceMiniConfig::from_jwt(mini_config_jwt, &user_public_key);
+        let decode_context = format!("register_device {}.{}", user_name, device_name);
+        let mini_device_config = Self::decode_mini_config_with_schema_compat(
+            mini_config_jwt,
+            &user_public_key,
+            decode_context.as_str(),
+        );
         if mini_device_config.is_err() {
             return Err(RPCErrors::ParseRequestError(format!(
                 "Failed to parse mini device config: {}",
@@ -696,16 +797,25 @@ impl SNServer {
         let device_info = serde_json::from_str::<DeviceInfo>(device_info_json.as_str());
         if device_info.is_err() {
             let parse_err = device_info.err().unwrap();
+            let parse_err_str = parse_err.to_string();
+            if let Some(field) = Self::extract_missing_field_name(parse_err_str.as_str()) {
+                warn!(
+                    "[schema_compat] failed to parse device info for {}: missing required field `{}`; raw_error={}; please refresh device registration",
+                    key,
+                    field,
+                    parse_err_str
+                );
+            }
             warn!(
-                "failed to parse device info from db for {}: {} (schema/version mismatch, e.g. missing `iss`)",
+                "failed to parse device info from db for {}: {} (schema/version mismatch)",
                 key,
-                parse_err
+                parse_err_str
             );
             return Err(server_err!(
                 ServerErrorCode::InvalidData,
                 "device info schema mismatch for {}: {}",
                 key,
-                parse_err
+                parse_err_str
             ));
         }
         let device_info = device_info.unwrap();
@@ -1890,8 +2000,13 @@ impl SNServer {
         let decoding_key = DecodingKey::from_jwk(&owner_public_key_jwk)
             .map_err(|e| format!("failed to build decoding key from jwk: {}", e))?;
 
-        let mini = DeviceMiniConfig::from_jwt(mini_config_jwt, &decoding_key)
-            .map_err(|e| format!("failed to parse mini_config_jwt: {}", e))?;
+        let decode_context = format!("query_did device_doc for {}", owner_username);
+        let mini = Self::decode_mini_config_with_schema_compat(
+            mini_config_jwt,
+            &decoding_key,
+            decode_context.as_str(),
+        )
+        .map_err(|e| format!("failed to parse mini_config_jwt: {}", e))?;
 
         // In this gateway, we use did:bns:<username> as both zone_did and owner did.
         let owner_did_str = format!("did:bns:{}", owner_username);

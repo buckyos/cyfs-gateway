@@ -111,6 +111,23 @@ impl Drop for RTcpInner {
 }
 
 impl RTcpInner {
+    fn extract_missing_field_name(err: &str) -> Option<String> {
+        for marker in ["missing field `", "missing field '"] {
+            if let Some(start) = err.find(marker) {
+                let value_start = start + marker.len();
+                let tail = &err[value_start..];
+                if let Some(end) = tail.find(['`', '\'']) {
+                    let field = tail[..end].trim();
+                    if !field.is_empty() {
+                        return Some(field.to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     fn extract_txt_value(record: &str, key: &str) -> Option<String> {
         let prefix = format!("{}=", key);
         for segment in record.split(';') {
@@ -243,11 +260,20 @@ impl RTcpInner {
                 Ok(exchange_key)
             }
             Err(primary_err) => {
+                let primary_err_str = primary_err.to_string();
                 warn!(
                     "resolve exchange key for {} by DID doc failed: {}",
                     remote_did.to_string(),
-                    primary_err
+                    primary_err_str
                 );
+
+                if let Some(field) = Self::extract_missing_field_name(primary_err_str.as_str()) {
+                    warn!(
+                        "[schema_compat] DID doc for {} is missing required field `{}`; keeping fallback path enabled and recommend regenerating activation/config data",
+                        remote_did.to_string(),
+                        field
+                    );
+                }
 
                 if remote_did.method == "web" {
                     info!(
@@ -266,19 +292,19 @@ impl RTcpInner {
                         Ok(None) => {
                             return Err(format!(
                                 "resolve_ed25519_exchange_key failed: {}; web did TXT fallback has no DEV/PKX",
-                                primary_err
+                                primary_err_str
                             ));
                         }
                         Err(fallback_err) => {
                             return Err(format!(
                                 "resolve_ed25519_exchange_key failed: {}; web did TXT fallback failed: {}",
-                                primary_err, fallback_err
+                                primary_err_str, fallback_err
                             ));
                         }
                     }
                 }
 
-                Err(format!("{}", primary_err))
+                Err(primary_err_str)
             }
         }
     }
