@@ -1148,9 +1148,9 @@ impl CommandExecutor for StringStartsWithCommand {
         }
 
         if starts_with {
-            Ok(super::CommandResult::success_with_string("true"))
+            Ok(super::CommandResult::success_with_value(CollectionValue::Bool(true)))
         } else {
-            Ok(super::CommandResult::error_with_string("false"))
+            Ok(super::CommandResult::error_with_value(CollectionValue::Bool(false)))
         }
     }
 }
@@ -1293,9 +1293,9 @@ impl CommandExecutor for StringEndsWithCommand {
         }
 
         if ends_with {
-            Ok(super::CommandResult::success_with_string("true"))
+            Ok(super::CommandResult::success_with_value(CollectionValue::Bool(true)))
         } else {
-            Ok(super::CommandResult::error_with_string("false"))
+            Ok(super::CommandResult::error_with_value(CollectionValue::Bool(false)))
         }
     }
 }

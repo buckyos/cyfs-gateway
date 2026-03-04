@@ -284,9 +284,9 @@ impl JavaScriptFunctionCaller {
         // Check if the result is boolean
         if let Some(boolean) = result.as_boolean() {
             if boolean {
-                return Ok(CommandResult::success_with_string("true"));
+                return Ok(CommandResult::success_with_value(CollectionValue::Bool(true)));
             } else {
-                return Ok(CommandResult::error_with_string("false"));
+                return Ok(CommandResult::error_with_value(CollectionValue::Bool(false)));
             }
         }
 
@@ -326,8 +326,8 @@ impl JavaScriptFunctionCaller {
         })?;
 
         let ret = match state {
-            true => CommandResult::success_with_string(value.treat_as_str()),
-            false => CommandResult::error_with_string(value.treat_as_str()),
+            true => CommandResult::success_with_value(value),
+            false => CommandResult::error_with_value(value),
         };
 
         Ok(ret)

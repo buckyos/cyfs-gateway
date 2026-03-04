@@ -1,6 +1,7 @@
 use super::cmd::*;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
+use crate::collection::CollectionValue;
 use clap::{Arg, Command};
 use std::sync::Arc;
 
@@ -189,9 +190,9 @@ impl CommandExecutor for ValuePredicateCommandExecutor {
         };
 
         if matched {
-            Ok(CommandResult::success_with_string("true"))
+            Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))
         } else {
-            Ok(CommandResult::error_with_string("false"))
+            Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
         }
     }
 }
