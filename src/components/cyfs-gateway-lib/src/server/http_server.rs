@@ -914,6 +914,26 @@ impl HttpServer for ProcessChainHttpServer {
                     .apply_post_chain_result(Ok(response), &req_info, Some(&info))
                     .await;
             }
+            if let Some(CommandControl::Error(ret)) = ret.as_control() {
+                debug!(
+                    "process_chain_error server={} remote={} method={} host={} uri={} message={}",
+                    self.id,
+                    req_remote,
+                    req_method,
+                    req_host,
+                    req_uri,
+                    ret.value,
+                );
+                let mut response = http::Response::new(
+                    Full::new(Bytes::from(ret.value.clone()))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                );
+                *response.status_mut() = StatusCode::BAD_GATEWAY;
+                return self
+                    .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                    .await;
+            }
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
                 if let Some(list) = shlex::split(ret.value.as_str()) {
                     if list.is_empty() {

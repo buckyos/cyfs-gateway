@@ -565,6 +565,14 @@ impl TlsConnectionHandler {
                 return Ok(());
             }
 
+            if let Some(CommandControl::Error(ret)) = ret.as_control() {
+                return Err(stack_err!(
+                    StackErrorCode::ProcessChainError,
+                    "process chain error: {}",
+                    ret.value
+                ));
+            }
+
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
                 if let Some(list) = shlex::split(ret.value.as_str()) {
                     if list.is_empty() {

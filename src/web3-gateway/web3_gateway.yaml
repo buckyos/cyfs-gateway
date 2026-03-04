@@ -46,7 +46,9 @@ servers:
               eq ${REQ.host} "sn.{{sn_host}}" && return "server web3_sn";
               eq ${REQ.host} "web3.{{sn_host}}" && return "server web3_sn";
               map-create "QUESTION" && map-add "QUESTION" "dest_host" "${REQ.host}" && map-add "QUESTION" "method" "query_by_hostname";
-              call qa "web3_sn" "QUESTION" && return "forward rtcp://${ANSWER.did_hostname}/:80";
+              call qa "web3_sn" "QUESTION";
+              match ${REQ.host} "*.*.web3.{{sn_host}}" && eq ${ANSWER.self_cert} "false" && return "error 503 self_cert_is_false_for_${REQ.host};_enable_self_cert_on_your_gateway";
+              return "forward rtcp://${ANSWER.did_hostname}/:80";
 stacks:
   dns_udp:
     bind: 0.0.0.0:53
@@ -133,8 +135,9 @@ stacks:
               eq ${REQ.dest_host} "{{sn_host}}" && return "forward tcp:///:3443";
               eq ${REQ.dest_host} "web3.{{sn_host}}" && return "forward tcp:///:3443";
               map-create "QUESTION" && map-add "QUESTION" "dest_host" "${REQ.dest_host}" && map-add "QUESTION" "method" "query_by_hostname";
-              call qa "web3_sn" "QUESTION" && eq ${ANSWER.self_cert} "true" && return "forward rtcp://${ANSWER.did_hostname}/:443";
+              call qa "web3_sn" "QUESTION";
+              eq ${ANSWER.self_cert} "true" && return "forward rtcp://${ANSWER.did_hostname}/:443";
+              match ${REQ.dest_host} "*.*.web3.{{sn_host}}" && eq ${ANSWER.self_cert} "false" && error --from chain "self_cert=false for ${REQ.dest_host}; enable self_cert to use nested web3 host over HTTPS";
               match ${REQ.dest_host} "*.web3.{{sn_host}}" && return "forward tcp:///:3443";
               reject;
   
-
