@@ -301,3 +301,55 @@ async fn test_if_not_equal_operator_sugar() -> Result<(), String> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_if_numeric_comparison_operator_sugar() -> Result<(), String> {
+    init_test_logger();
+
+    let script = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            local one=1;
+            local pi=3.14;
+
+            if $one > 0 then
+            else
+                return --from lib "gt_fail";
+            end
+
+            if $one >= 1 then
+            else
+                return --from lib "ge_fail";
+            end
+
+            if $one < 2 then
+            else
+                return --from lib "lt_fail";
+            end
+
+            if $one <= 1 then
+            else
+                return --from lib "le_fail";
+            end
+
+            if $pi >= 3.0 then
+            else
+                return --from lib "float_ge_fail";
+            end
+
+            if $one < "2" then
+                return --from lib "strict_should_not_loose";
+            end
+
+            return --from lib "ok";
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+    assert_eq!(execute_with_req(script, "user", "https", "yes").await?, "ok");
+    Ok(())
+}

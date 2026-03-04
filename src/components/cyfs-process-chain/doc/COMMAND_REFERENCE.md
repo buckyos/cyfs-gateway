@@ -927,10 +927,19 @@ Behavior:
   - Loose mode: String/Number mixed comparison is allowed if string is numeric.
   - Non-comparable values return false.
 
+Syntax sugar (strict mode):
+  - value1 > value2   => gt value1 value2
+  - value1 >= value2  => ge value1 value2
+  - value1 < value2   => lt value1 value2
+  - value1 <= value2  => le value1 value2
+  - If loose parsing is needed, use explicit commands: gt/ge/lt/le --loose ...
+
 Examples:
   gt 10 9
   ge --loose "2" 2
   lt --loose "1.5" 2
+  if $REQ.port >= 443 then ...
+  if $latency_ms < 100 then ...
 ```
 
 ### `match`
