@@ -62,44 +62,39 @@ impl ExternalCommand for AddCommand {
         args: &[CollectionValue],
         _origin_args: &CommandArgs,
     ) -> Result<CommandResult, String> {
-        // All args should be string, then covert to f64
-        let mut str_args = Vec::with_capacity(args.len());
-        for arg in args {
-            if !arg.is_string() {
-                let msg = format!("Invalid argument type: expected string, got {:?}", arg);
-                error!("{}", msg);
-                return Err(msg);
-            }
-
-            str_args.push(arg.as_str().unwrap());
+        if args.len() < 3 {
+            let msg = format!(
+                "Invalid add command args length: expected at least 3, got {}",
+                args.len()
+            );
+            error!("{}", msg);
+            return Err(msg);
         }
 
+        let parse_number = |arg: &CollectionValue, index: usize| -> Result<f64, String> {
+            match arg {
+                CollectionValue::Number(number) => Ok(number.as_f64()),
+                _ => {
+                    let msg = format!(
+                        "Invalid argument type at position {}: expected Number, got {:?}",
+                        index, arg
+                    );
+                    error!("{}", msg);
+                    Err(msg)
+                }
+            }
+        };
 
-        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
-            let msg = format!("Invalid add command: {:?}, {}", str_args, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let a = parse_number(&args[1], 1)?;
+        let b = parse_number(&args[2], 2)?;
 
-        let a = matches.get_one::<String>("a").unwrap().parse::<f64>().map_err(|e| {
-            let msg = format!("Invalid first number: {}, error: {}", matches.get_one::<String>("a").unwrap(), e);
-            error!("{}", msg);
-            msg
-        })?;
-
-        let b = matches.get_one::<String>("b").unwrap().parse::<f64>().map_err(|e| {
-            let msg = format!("Invalid second number: {}, error: {}", matches.get_one::<String>("b").unwrap(), e);
-            error!("{}", msg);
-            msg
-        })?;
-        
         let result = a + b;
         let ret = CommandResult::success_with_string(result.to_string());
 
         info!(
             "Executed add command: {}, args: {:?}, result: {:?}",
             self.cmd.get_name(),
-            str_args,
+            args,
             ret
         );
 
