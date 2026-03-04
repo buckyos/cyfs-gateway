@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Template: maintenance_guard
+Input:
+  - SYS.maintenance (string: "true"/"false", required)
+  - REQ.path (string, required)
+Output:
+  - return --from lib <upstream_id>
+Error:
+  - error --from lib PC-TPL-MAINT-0001 (maintenance mode)
+Behavior:
+  - In maintenance mode, only /healthz and /status are allowed.
+-->
+<process_chain_lib id="tpl_maintenance_guard" priority="100">
+  <process_chain id="route">
+    <block id="entry">
+      <![CDATA[
+        match $SYS.maintenance "true" || return --from lib "upstream_default";
+
+        match $REQ.path "/healthz" && return --from lib "upstream_health";
+        match $REQ.path "/status" && return --from lib "upstream_status";
+
+        error --from lib "PC-TPL-MAINT-0001";
+      ]]>
+    </block>
+  </process_chain>
+</process_chain_lib>

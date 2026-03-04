@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Template: canary_by_header
+Input:
+  - REQ.headers["x-canary"] (string, optional)
+Output:
+  - return --from lib <upstream_id>
+Behavior:
+  - x-canary=1 -> canary upstream
+  - others      -> stable upstream
+-->
+<process_chain_lib id="tpl_canary_by_header" priority="100">
+  <process_chain id="route">
+    <block id="entry">
+      <![CDATA[
+        local canary=${REQ.headers?.["x-canary"] ?? ""};
+        match $canary "1" && return --from lib "upstream_canary";
+        return --from lib "upstream_stable";
+      ]]>
+    </block>
+  </process_chain>
+</process_chain_lib>

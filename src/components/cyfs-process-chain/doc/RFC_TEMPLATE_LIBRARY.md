@@ -93,6 +93,15 @@ src/components/cyfs-process-chain/doc/templates/
    - Bearer 鉴权
    - path rewrite
    - fallback 到默认上游
+3. `canary_by_header`
+   - 基于请求头灰度路由
+   - canary/stable 双上游
+4. `geo_route_fallback`
+   - 基于 IP 的地域路由
+   - 缺失地域映射时默认回退
+5. `maintenance_guard`
+   - 维护模式放行健康检查
+   - 非白名单路径统一拒绝
 
 ## 9. 迭代计划
 
