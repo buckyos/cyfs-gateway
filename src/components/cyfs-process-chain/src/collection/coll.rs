@@ -43,7 +43,7 @@ impl PartialEq for NumberValue {
 impl Eq for NumberValue {}
 
 #[derive(Clone)]
-pub enum CollectionValue {
+pub enum TypedValue {
     Null,
     Bool(bool),
     Number(NumberValue),
@@ -56,7 +56,7 @@ pub enum CollectionValue {
     Any(AnyRef),
 }
 
-pub enum CollectionValueRef<'a> {
+pub enum TypedValueRef<'a> {
     Null,
     Bool(bool),
     Number(NumberValue),
@@ -69,88 +69,92 @@ pub enum CollectionValueRef<'a> {
     Any(&'a AnyRef),
 }
 
-impl std::fmt::Display for CollectionValue {
+// Backward-compatible aliases kept for existing call sites and scripts/docs.
+pub type CollectionValue = TypedValue;
+pub type CollectionValueRef<'a> = TypedValueRef<'a>;
+
+impl std::fmt::Display for TypedValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CollectionValue::Null => write!(f, "null"),
-            CollectionValue::Bool(v) => write!(f, "{}", v),
-            CollectionValue::Number(v) => write!(f, "{}", v),
-            CollectionValue::String(s) => write!(f, "{}", s),
-            CollectionValue::List(_) => write!(f, "[List]"),
-            CollectionValue::Set(_) => write!(f, "[Set]"),
-            CollectionValue::Map(_) => write!(f, "[Map]"),
-            CollectionValue::MultiMap(_) => write!(f, "[MultiMap]"),
-            CollectionValue::Visitor(_) => write!(f, "[Visitor]"),
-            CollectionValue::Any(_) => write!(f, "[Any]"),
+            TypedValue::Null => write!(f, "null"),
+            TypedValue::Bool(v) => write!(f, "{}", v),
+            TypedValue::Number(v) => write!(f, "{}", v),
+            TypedValue::String(s) => write!(f, "{}", s),
+            TypedValue::List(_) => write!(f, "[List]"),
+            TypedValue::Set(_) => write!(f, "[Set]"),
+            TypedValue::Map(_) => write!(f, "[Map]"),
+            TypedValue::MultiMap(_) => write!(f, "[MultiMap]"),
+            TypedValue::Visitor(_) => write!(f, "[Visitor]"),
+            TypedValue::Any(_) => write!(f, "[Any]"),
         }
     }
 }
 
-impl std::fmt::Debug for CollectionValue {
+impl std::fmt::Debug for TypedValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Call the Display implementation for a cleaner output
         write!(f, "{}", self)
     }
 }
 
-impl PartialEq for CollectionValue {
+impl PartialEq for TypedValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (CollectionValue::Null, CollectionValue::Null) => true,
-            (CollectionValue::Bool(a), CollectionValue::Bool(b)) => a == b,
-            (CollectionValue::Number(a), CollectionValue::Number(b)) => a == b,
-            (CollectionValue::String(a), CollectionValue::String(b)) => a == b,
+            (TypedValue::Null, TypedValue::Null) => true,
+            (TypedValue::Bool(a), TypedValue::Bool(b)) => a == b,
+            (TypedValue::Number(a), TypedValue::Number(b)) => a == b,
+            (TypedValue::String(a), TypedValue::String(b)) => a == b,
             _ => false,
         }
     }
 }
 
-impl Eq for CollectionValue {}
+impl Eq for TypedValue {}
 
-impl CollectionValue {
+impl TypedValue {
     pub fn compare_string(&self, other: &Self) -> Option<bool> {
         match (self, other) {
-            (CollectionValue::String(s1), CollectionValue::String(s2)) => Some(s1 == s2),
+            (TypedValue::String(s1), TypedValue::String(s2)) => Some(s1 == s2),
             _ => None,
         }
     }
 
     pub fn get_type(&self) -> &str {
         match self {
-            CollectionValue::Null => "Null",
-            CollectionValue::Bool(_) => "Bool",
-            CollectionValue::Number(_) => "Number",
-            CollectionValue::String(_) => "String",
-            CollectionValue::List(_) => "List",
-            CollectionValue::Set(_) => "Set",
-            CollectionValue::Map(_) => "Map",
-            CollectionValue::MultiMap(_) => "MultiMap",
-            CollectionValue::Visitor(_) => "Visitor",
-            CollectionValue::Any(_) => "Any",
+            TypedValue::Null => "Null",
+            TypedValue::Bool(_) => "Bool",
+            TypedValue::Number(_) => "Number",
+            TypedValue::String(_) => "String",
+            TypedValue::List(_) => "List",
+            TypedValue::Set(_) => "Set",
+            TypedValue::Map(_) => "Map",
+            TypedValue::MultiMap(_) => "MultiMap",
+            TypedValue::Visitor(_) => "Visitor",
+            TypedValue::Any(_) => "Any",
         }
     }
 
     pub fn is_string(&self) -> bool {
-        matches!(self, CollectionValue::String(_))
+        matches!(self, TypedValue::String(_))
     }
 
-    pub fn as_ref(&self) -> CollectionValueRef<'_> {
+    pub fn as_ref(&self) -> TypedValueRef<'_> {
         match self {
-            CollectionValue::Null => CollectionValueRef::Null,
-            CollectionValue::Bool(v) => CollectionValueRef::Bool(*v),
-            CollectionValue::Number(v) => CollectionValueRef::Number(*v),
-            CollectionValue::String(s) => CollectionValueRef::String(s.as_str()),
-            CollectionValue::List(l) => CollectionValueRef::List(l),
-            CollectionValue::Set(s) => CollectionValueRef::Set(s),
-            CollectionValue::Map(m) => CollectionValueRef::Map(m),
-            CollectionValue::MultiMap(mm) => CollectionValueRef::MultiMap(mm),
-            CollectionValue::Visitor(v) => CollectionValueRef::Visitor(v),
-            CollectionValue::Any(a) => CollectionValueRef::Any(a),
+            TypedValue::Null => TypedValueRef::Null,
+            TypedValue::Bool(v) => TypedValueRef::Bool(*v),
+            TypedValue::Number(v) => TypedValueRef::Number(*v),
+            TypedValue::String(s) => TypedValueRef::String(s.as_str()),
+            TypedValue::List(l) => TypedValueRef::List(l),
+            TypedValue::Set(s) => TypedValueRef::Set(s),
+            TypedValue::Map(m) => TypedValueRef::Map(m),
+            TypedValue::MultiMap(mm) => TypedValueRef::MultiMap(mm),
+            TypedValue::Visitor(v) => TypedValueRef::Visitor(v),
+            TypedValue::Any(a) => TypedValueRef::Any(a),
         }
     }
 
     pub fn into_string(self) -> Option<String> {
-        if let CollectionValue::String(s) = self {
+        if let TypedValue::String(s) = self {
             Some(s)
         } else {
             None
@@ -158,15 +162,15 @@ impl CollectionValue {
     }
 
     pub fn is_null(&self) -> bool {
-        matches!(self, CollectionValue::Null)
+        matches!(self, TypedValue::Null)
     }
 
     pub fn is_bool(&self) -> bool {
-        matches!(self, CollectionValue::Bool(_))
+        matches!(self, TypedValue::Bool(_))
     }
 
     pub fn as_bool(&self) -> Option<bool> {
-        if let CollectionValue::Bool(v) = self {
+        if let TypedValue::Bool(v) = self {
             Some(*v)
         } else {
             None
@@ -174,7 +178,7 @@ impl CollectionValue {
     }
 
     pub fn into_bool(self) -> Option<bool> {
-        if let CollectionValue::Bool(v) = self {
+        if let TypedValue::Bool(v) = self {
             Some(v)
         } else {
             None
@@ -182,11 +186,11 @@ impl CollectionValue {
     }
 
     pub fn is_number(&self) -> bool {
-        matches!(self, CollectionValue::Number(_))
+        matches!(self, TypedValue::Number(_))
     }
 
     pub fn as_number(&self) -> Option<&NumberValue> {
-        if let CollectionValue::Number(v) = self {
+        if let TypedValue::Number(v) = self {
             Some(v)
         } else {
             None
@@ -194,7 +198,7 @@ impl CollectionValue {
     }
 
     pub fn into_number(self) -> Option<NumberValue> {
-        if let CollectionValue::Number(v) = self {
+        if let TypedValue::Number(v) = self {
             Some(v)
         } else {
             None
@@ -202,7 +206,7 @@ impl CollectionValue {
     }
 
     pub fn as_str(&self) -> Option<&str> {
-        if let CollectionValue::String(s) = self {
+        if let TypedValue::String(s) = self {
             Some(s)
         } else {
             None
@@ -210,11 +214,11 @@ impl CollectionValue {
     }
 
     pub fn try_as_str(&self) -> Result<&str, String> {
-        if let CollectionValue::String(s) = self {
+        if let TypedValue::String(s) = self {
             Ok(s)
         } else {
             let msg = format!(
-                "Expected CollectionValue::String, found {}",
+                "Expected TypedValue::String, found {}",
                 self.get_type(),
             );
             warn!("{}", msg);
@@ -224,25 +228,25 @@ impl CollectionValue {
 
     pub fn treat_as_str(&self) -> &str {
         match self {
-            CollectionValue::Null => "null",
-            CollectionValue::Bool(_) => "[Bool]",
-            CollectionValue::Number(_) => "[Number]",
-            CollectionValue::String(s) => s.as_str(),
-            CollectionValue::List(_) => "[List]",
-            CollectionValue::Set(_) => "[Set]",
-            CollectionValue::Map(_) => "[Map]",
-            CollectionValue::MultiMap(_) => "[MultiMap]",
-            CollectionValue::Visitor(_) => "[Visitor]",
-            CollectionValue::Any(_) => "[Any]",
+            TypedValue::Null => "null",
+            TypedValue::Bool(_) => "[Bool]",
+            TypedValue::Number(_) => "[Number]",
+            TypedValue::String(s) => s.as_str(),
+            TypedValue::List(_) => "[List]",
+            TypedValue::Set(_) => "[Set]",
+            TypedValue::Map(_) => "[Map]",
+            TypedValue::MultiMap(_) => "[MultiMap]",
+            TypedValue::Visitor(_) => "[Visitor]",
+            TypedValue::Any(_) => "[Any]",
         }
     }
 
     pub fn is_list(&self) -> bool {
-        matches!(self, CollectionValue::List(_))
+        matches!(self, TypedValue::List(_))
     }
 
     pub fn as_list(&self) -> Option<&ListCollectionRef> {
-        if let CollectionValue::List(l) = self {
+        if let TypedValue::List(l) = self {
             Some(l)
         } else {
             None
@@ -250,17 +254,17 @@ impl CollectionValue {
     }
 
     pub fn try_as_list(&self) -> Result<&ListCollectionRef, String> {
-        if let CollectionValue::List(l) = self {
+        if let TypedValue::List(l) = self {
             Ok(l)
         } else {
-            let msg = format!("Expected CollectionValue::List, found {}", self.get_type());
+            let msg = format!("Expected TypedValue::List, found {}", self.get_type());
             warn!("{}", msg);
             Err(msg)
         }
     }
 
     pub fn into_list(self) -> Option<ListCollectionRef> {
-        if let CollectionValue::List(l) = self {
+        if let TypedValue::List(l) = self {
             Some(l)
         } else {
             None
@@ -268,11 +272,11 @@ impl CollectionValue {
     }
 
     pub fn is_set(&self) -> bool {
-        matches!(self, CollectionValue::Set(_))
+        matches!(self, TypedValue::Set(_))
     }
 
     pub fn as_set(&self) -> Option<&SetCollectionRef> {
-        if let CollectionValue::Set(s) = self {
+        if let TypedValue::Set(s) = self {
             Some(s)
         } else {
             None
@@ -280,17 +284,17 @@ impl CollectionValue {
     }
 
     pub fn try_as_set(&self) -> Result<&SetCollectionRef, String> {
-        if let CollectionValue::Set(s) = self {
+        if let TypedValue::Set(s) = self {
             Ok(s)
         } else {
-            let msg = format!("Expected CollectionValue::Set, found {}", self.get_type(),);
+            let msg = format!("Expected TypedValue::Set, found {}", self.get_type(),);
             warn!("{}", msg);
             Err(msg)
         }
     }
 
     pub fn into_set(self) -> Option<SetCollectionRef> {
-        if let CollectionValue::Set(s) = self {
+        if let TypedValue::Set(s) = self {
             Some(s)
         } else {
             None
@@ -298,11 +302,11 @@ impl CollectionValue {
     }
 
     pub fn is_map(&self) -> bool {
-        matches!(self, CollectionValue::Map(_))
+        matches!(self, TypedValue::Map(_))
     }
 
     pub fn as_map(&self) -> Option<&MapCollectionRef> {
-        if let CollectionValue::Map(m) = self {
+        if let TypedValue::Map(m) = self {
             Some(m)
         } else {
             None
@@ -310,17 +314,17 @@ impl CollectionValue {
     }
 
     pub fn try_as_map(&self) -> Result<&MapCollectionRef, String> {
-        if let CollectionValue::Map(m) = self {
+        if let TypedValue::Map(m) = self {
             Ok(m)
         } else {
-            let msg = format!("Expected CollectionValue::Map, found {}", self.get_type(),);
+            let msg = format!("Expected TypedValue::Map, found {}", self.get_type(),);
             warn!("{}", msg);
             Err(msg)
         }
     }
 
     pub fn into_map(self) -> Option<MapCollectionRef> {
-        if let CollectionValue::Map(m) = self {
+        if let TypedValue::Map(m) = self {
             Some(m)
         } else {
             None
@@ -328,11 +332,11 @@ impl CollectionValue {
     }
 
     pub fn is_multi_map(&self) -> bool {
-        matches!(self, CollectionValue::MultiMap(_))
+        matches!(self, TypedValue::MultiMap(_))
     }
 
     pub fn as_multi_map(&self) -> Option<&MultiMapCollectionRef> {
-        if let CollectionValue::MultiMap(mm) = self {
+        if let TypedValue::MultiMap(mm) = self {
             Some(mm)
         } else {
             None
@@ -340,11 +344,11 @@ impl CollectionValue {
     }
 
     pub fn try_as_multi_map(&self) -> Result<&MultiMapCollectionRef, String> {
-        if let CollectionValue::MultiMap(mm) = self {
+        if let TypedValue::MultiMap(mm) = self {
             Ok(mm)
         } else {
             let msg = format!(
-                "Expected CollectionValue::MultiMap, found {}",
+                "Expected TypedValue::MultiMap, found {}",
                 self.get_type(),
             );
             warn!("{}", msg);
@@ -353,7 +357,7 @@ impl CollectionValue {
     }
 
     pub fn into_multi_map(self) -> Option<MultiMapCollectionRef> {
-        if let CollectionValue::MultiMap(mm) = self {
+        if let TypedValue::MultiMap(mm) = self {
             Some(mm)
         } else {
             None
@@ -363,15 +367,15 @@ impl CollectionValue {
     pub fn is_collection(&self) -> bool {
         matches!(
             self,
-            CollectionValue::List(_)
-                | CollectionValue::Set(_)
-                | CollectionValue::Map(_)
-                | CollectionValue::MultiMap(_)
+            TypedValue::List(_)
+                | TypedValue::Set(_)
+                | TypedValue::Map(_)
+                | TypedValue::MultiMap(_)
         )
     }
 
     pub fn as_visitor(&self) -> Option<&VariableVisitorRef> {
-        if let CollectionValue::Visitor(v) = self {
+        if let TypedValue::Visitor(v) = self {
             Some(v)
         } else {
             None
@@ -379,11 +383,11 @@ impl CollectionValue {
     }
 
     pub fn is_any(&self) -> bool {
-        matches!(self, CollectionValue::Any(_))
+        matches!(self, TypedValue::Any(_))
     }
 
     pub fn as_any(&self) -> Option<&AnyRef> {
-        if let CollectionValue::Any(a) = self {
+        if let TypedValue::Any(a) = self {
             Some(a)
         } else {
             None
@@ -391,7 +395,7 @@ impl CollectionValue {
     }
 
     pub fn as_any_type<T: Any + Send + Sync + 'static>(&self) -> Option<Arc<T>> {
-        if let CollectionValue::Any(a) = self {
+        if let TypedValue::Any(a) = self {
             a.clone().downcast::<T>().ok()
         } else {
             None
@@ -399,7 +403,7 @@ impl CollectionValue {
     }
 
     pub fn to_any_type<T: Any + Send + Sync + 'static>(self) -> Option<Arc<T>> {
-        if let CollectionValue::Any(a) = self {
+        if let TypedValue::Any(a) = self {
             a.downcast::<T>().ok()
         } else {
             None
@@ -473,7 +477,7 @@ pub type SetCollectionRef = Arc<Box<dyn SetCollection>>;
 pub trait ListCollectionTraverseCallBack: Send + Sync {
     /// Traverse the collection and apply the callback to each element.
     /// If the callback returns false, the traversal stops.
-    async fn call(&self, index: usize, value: &CollectionValue) -> Result<bool, String>;
+    async fn call(&self, index: usize, value: &TypedValue) -> Result<bool, String>;
 }
 
 pub type ListCollectionTraverseCallBackRef = Arc<Box<dyn ListCollectionTraverseCallBack>>;
@@ -484,33 +488,33 @@ pub trait ListCollection: Send + Sync {
     async fn len(&self) -> Result<usize, String>;
 
     /// Appends a value to the end of the list.
-    async fn push(&self, value: CollectionValue) -> Result<(), String>;
+    async fn push(&self, value: TypedValue) -> Result<(), String>;
 
     /// Inserts a value at the specified index.
-    async fn insert(&self, index: usize, value: CollectionValue) -> Result<(), String>;
+    async fn insert(&self, index: usize, value: TypedValue) -> Result<(), String>;
 
     /// Sets the value at the specified index.
     /// Returns previous value if index already existed.
     async fn set(
         &self,
         index: usize,
-        value: CollectionValue,
-    ) -> Result<Option<CollectionValue>, String>;
+        value: TypedValue,
+    ) -> Result<Option<TypedValue>, String>;
 
     /// Gets the value at the specified index.
-    async fn get(&self, index: usize) -> Result<Option<CollectionValue>, String>;
+    async fn get(&self, index: usize) -> Result<Option<TypedValue>, String>;
 
     /// Removes the value at the specified index.
-    async fn remove(&self, index: usize) -> Result<Option<CollectionValue>, String>;
+    async fn remove(&self, index: usize) -> Result<Option<TypedValue>, String>;
 
     /// Pops the last value from the list.
-    async fn pop(&self) -> Result<Option<CollectionValue>, String>;
+    async fn pop(&self) -> Result<Option<TypedValue>, String>;
 
     /// Clears all values in the list.
     async fn clear(&self) -> Result<(), String>;
 
     /// Gets all values in the list.
-    async fn get_all(&self) -> Result<Vec<CollectionValue>, String>;
+    async fn get_all(&self) -> Result<Vec<TypedValue>, String>;
 
     /// Traverses the list and applies the callback to each element.
     async fn traverse(&self, callback: ListCollectionTraverseCallBackRef) -> Result<(), String>;
@@ -530,7 +534,7 @@ pub trait ListCollection: Send + Sync {
     }
 
     /// Dumps the collection to a vector of values.
-    async fn dump(&self) -> Result<Vec<CollectionValue>, String> {
+    async fn dump(&self) -> Result<Vec<TypedValue>, String> {
         self.get_all().await
     }
 }
@@ -541,7 +545,7 @@ pub type ListCollectionRef = Arc<Box<dyn ListCollection>>;
 pub trait MapCollectionTraverseCallBack: Send + Sync {
     /// Traverse the collection and apply the callback to each key-value pair.
     /// If the callback returns false, the traversal stops.
-    async fn call(&self, key: &str, value: &CollectionValue) -> Result<bool, String>;
+    async fn call(&self, key: &str, value: &TypedValue) -> Result<bool, String>;
 }
 
 pub type MapCollectionTraverseCallBackRef = Arc<Box<dyn MapCollectionTraverseCallBack>>;
@@ -553,23 +557,23 @@ pub trait MapCollection: Send + Sync {
 
     /// Inserts a key-value pair into the collection.
     /// If the key already exists, it will return false.
-    async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String>;
+    async fn insert_new(&self, key: &str, value: TypedValue) -> Result<bool, String>;
 
     /// Sets the value for the given key in the collection.
     async fn insert(
         &self,
         key: &str,
-        value: CollectionValue,
-    ) -> Result<Option<CollectionValue>, String>;
+        value: TypedValue,
+    ) -> Result<Option<TypedValue>, String>;
 
     /// Gets the value for the given key from the collection.
-    async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String>;
+    async fn get(&self, key: &str) -> Result<Option<TypedValue>, String>;
 
     /// Checks if the collection contains the given key.
     async fn contains_key(&self, key: &str) -> Result<bool, String>;
 
     /// Removes the key from the collection.
-    async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String>;
+    async fn remove(&self, key: &str) -> Result<Option<TypedValue>, String>;
 
     // Traverses the collection and applies the callback to each key-value pair.
     async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String>;
@@ -587,7 +591,7 @@ pub trait MapCollection: Send + Sync {
     }
 
     /// Dumps the collection to a vector of strings.
-    async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String>;
+    async fn dump(&self) -> Result<Vec<(String, TypedValue)>, String>;
 }
 
 pub type MapCollectionRef = Arc<Box<dyn MapCollection>>;
