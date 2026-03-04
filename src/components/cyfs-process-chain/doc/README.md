@@ -17,6 +17,8 @@
   - 标准库与最佳实践模板草案（模板契约、错误码规范、分层落地路线）。
 - [MIGRATION_TYPED_LITERAL_BREAKING.md](./MIGRATION_TYPED_LITERAL_BREAKING.md)
   - typed literal 无兼容迁移草案（破坏性清单 + 批量迁移规则 + 扫描流程）。
+- [LINT.md](./LINT.md)
+  - `pc-lint` 静态检查器（MVP）使用说明与当前规则清单。
 - [templates/README.md](./templates/README.md)
   - 官方模板脚本目录（`route_basic`、`auth_rewrite_fallback`）。
 
