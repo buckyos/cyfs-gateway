@@ -3,7 +3,7 @@ use cyfs_process_chain::{
     ProcessChainXMLLoader, Statement,
 };
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -119,6 +119,7 @@ enum VarScope {
 struct VarDef {
     name: String,
     used: bool,
+    overwritten_before_use: bool,
     location: VarLocation,
 }
 
@@ -137,14 +138,26 @@ struct ScopeTable {
 }
 
 impl ScopeTable {
-    fn define(&mut self, name: String, location: VarLocation) {
+    fn define(&mut self, name: String, location: VarLocation) -> Option<VarLocation> {
+        let overwritten = self.current.get(&name).copied().and_then(|idx| {
+            let prev = self.defs.get_mut(idx)?;
+            if prev.used {
+                None
+            } else {
+                prev.overwritten_before_use = true;
+                Some(prev.location.clone())
+            }
+        });
+
         let idx = self.defs.len();
         self.defs.push(VarDef {
             name: name.clone(),
             used: false,
+            overwritten_before_use: false,
             location,
         });
         self.current.insert(name, idx);
+        overwritten
     }
 
     fn mark_used(&mut self, name: &str) -> bool {
@@ -583,9 +596,10 @@ impl Analyzer {
     ) {
         match arg {
             CommandArg::Var(expr) => {
-                for var in extract_roots_from_var_expression(expr) {
+                for read in extract_reads_from_var_expression(expr) {
                     self.mark_var_used(
-                        &var,
+                        &read.name,
+                        read.optional,
                         chain_id,
                         block_id,
                         line,
@@ -596,9 +610,10 @@ impl Analyzer {
                 }
             }
             CommandArg::StringLiteral(text) => {
-                for var in extract_roots_from_dollar(text) {
+                for read in extract_reads_from_dollar(text) {
                     self.mark_var_used(
-                        &var,
+                        &read.name,
+                        read.optional,
                         chain_id,
                         block_id,
                         line,
@@ -627,6 +642,7 @@ impl Analyzer {
     fn mark_var_used(
         &mut self,
         name: &str,
+        optional: bool,
         chain_id: &str,
         block_id: &str,
         line: usize,
@@ -639,6 +655,11 @@ impl Analyzer {
         }
 
         if block_scope.mark_used(name) || chain_scope.mark_used(name) || self.global_scope.mark_used(name) {
+            return;
+        }
+
+        if optional {
+            // Optional reads from safe/coalesce paths are treated as best-effort to avoid false positives.
             return;
         }
 
@@ -667,16 +688,71 @@ impl Analyzer {
             return;
         }
 
+        let mut shadow_scope = None;
         match scope {
-            VarScope::Global => self.global_scope.define(name, location),
-            VarScope::Chain => chain_scope.define(name, location),
-            VarScope::Block => block_scope.define(name, location),
+            VarScope::Chain => {
+                if self.global_scope.current.contains_key(&name) {
+                    shadow_scope = Some("global");
+                }
+            }
+            VarScope::Block => {
+                if chain_scope.current.contains_key(&name) {
+                    shadow_scope = Some("chain");
+                } else if self.global_scope.current.contains_key(&name) {
+                    shadow_scope = Some("global");
+                }
+            }
+            VarScope::Global => {}
+        }
+
+        if let Some(outer_scope) = shadow_scope {
+            self.diagnostics.push(Diagnostic {
+                code: "PC-LINT-3002".to_string(),
+                severity: LintSeverity::Warning,
+                message: format!(
+                    "Variable '{}' shadows an existing {} scope variable",
+                    name, outer_scope
+                ),
+                file: self.file.clone(),
+                lib: self.lib.clone(),
+                chain: location.chain.clone(),
+                block: location.block.clone(),
+                line: location.line,
+                source: location.source.clone(),
+            });
+        }
+
+        let overwritten = match scope {
+            VarScope::Global => self.global_scope.define(name.clone(), location.clone()),
+            VarScope::Chain => chain_scope.define(name.clone(), location.clone()),
+            VarScope::Block => block_scope.define(name.clone(), location.clone()),
+        };
+
+        if let Some(prev_location) = overwritten {
+            self.diagnostics.push(Diagnostic {
+                code: "PC-LINT-3003".to_string(),
+                severity: LintSeverity::Warning,
+                message: format!(
+                    "Variable '{}' is overwritten before being read (previous definition at line {})",
+                    name, prev_location.line
+                ),
+                file: self.file.clone(),
+                lib: self.lib.clone(),
+                chain: location.chain.clone(),
+                block: location.block.clone(),
+                line: location.line,
+                source: location.source.clone(),
+            });
         }
     }
 
     fn emit_unused_defs(&mut self, table: &ScopeTable, scope: VarScope) {
         for def in &table.defs {
-            if def.used || self.is_known_var(&def.name) || def.name.starts_with('_') {
+            if def.used
+                || def.overwritten_before_use
+                || self.is_known_var(&def.name)
+                || def.name.starts_with('_')
+            {
                 continue;
             }
 
@@ -766,20 +842,34 @@ fn extract_primary_root(text: &str) -> Option<String> {
     Some(root)
 }
 
-fn extract_roots_from_var_expression(expr: &str) -> Vec<String> {
-    let mut roots = Vec::new();
-    if let Some(root) = extract_primary_root(expr) {
-        roots.push(root);
-    }
-    roots.extend(extract_roots_from_dollar(expr));
-
-    dedup_strings(roots)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VarRead {
+    name: String,
+    optional: bool,
 }
 
-fn extract_roots_from_dollar(text: &str) -> Vec<String> {
+fn contains_optional_access_or_coalesce(expr: &str) -> bool {
+    expr.contains("?.") || expr.contains("?[") || expr.contains("??")
+}
+
+fn extract_reads_from_var_expression(expr: &str) -> Vec<VarRead> {
+    let mut reads = Vec::new();
+    let root_optional = contains_optional_access_or_coalesce(expr);
+    if let Some(root) = extract_primary_root(expr) {
+        reads.push(VarRead {
+            name: root,
+            optional: root_optional,
+        });
+    }
+    reads.extend(extract_reads_from_dollar(expr));
+
+    dedup_reads(reads)
+}
+
+fn extract_reads_from_dollar(text: &str) -> Vec<VarRead> {
     let bytes = text.as_bytes();
     let mut i = 0usize;
-    let mut result = Vec::new();
+    let mut result = Vec::<VarRead>::new();
 
     while i < bytes.len() {
         if bytes[i] != b'$' {
@@ -815,9 +905,12 @@ fn extract_roots_from_dollar(text: &str) -> Vec<String> {
             if j < bytes.len() && depth == 0 {
                 let inner = &text[i + 2..j];
                 if let Some(root) = extract_primary_root(inner) {
-                    result.push(root);
+                    result.push(VarRead {
+                        name: root,
+                        optional: contains_optional_access_or_coalesce(inner),
+                    });
                 }
-                result.extend(extract_roots_from_dollar(inner));
+                result.extend(extract_reads_from_dollar(inner));
                 i = j + 1;
                 continue;
             }
@@ -844,84 +937,39 @@ fn extract_roots_from_dollar(text: &str) -> Vec<String> {
             end = i + 1 + offset + c.len_utf8();
         }
 
-        result.push(text[i + 1..end].to_string());
+        result.push(VarRead {
+            name: text[i + 1..end].to_string(),
+            optional: false,
+        });
         i = end;
     }
 
-    dedup_strings(result)
+    dedup_reads(result)
 }
 
-fn dedup_strings(values: Vec<String>) -> Vec<String> {
-    let mut set = BTreeSet::new();
-    let mut out = Vec::new();
+fn dedup_reads(values: Vec<VarRead>) -> Vec<VarRead> {
+    let mut merged = BTreeMap::<String, bool>::new();
     for value in values {
-        if value.is_empty() {
+        if value.name.is_empty() {
             continue;
         }
-        if set.insert(value.clone()) {
-            out.push(value);
+        match merged.get_mut(&value.name) {
+            Some(existing_optional) => {
+                if *existing_optional && !value.optional {
+                    *existing_optional = false;
+                }
+            }
+            None => {
+                merged.insert(value.name, value.optional);
+            }
         }
     }
-    out
+
+    merged
+        .into_iter()
+        .map(|(name, optional)| VarRead { name, optional })
+        .collect()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lint_undefined_var() {
-        let xml = r#"
-<root>
-  <process_chain id="main">
-    <block id="entry"><![CDATA[
-      local a=1;
-      echo $a;
-      echo $missing;
-    ]]></block>
-  </process_chain>
-</root>
-"#;
-        let config = LintConfig::default();
-        let ret = lint_xml_content(xml, "test.xml", "test_lib", &config).unwrap();
-        assert!(ret.iter().any(|d| d.code == "PC-LINT-1001"));
-        assert_eq!(ret.iter().filter(|d| d.code == "PC-LINT-1001").count(), 1);
-    }
-
-    #[test]
-    fn test_lint_unused_var() {
-        let xml = r#"
-<root>
-  <process_chain id="main">
-    <block id="entry"><![CDATA[
-      local temp=1;
-      return --from lib "ok";
-    ]]></block>
-  </process_chain>
-</root>
-"#;
-        let config = LintConfig::default();
-        let ret = lint_xml_content(xml, "test.xml", "test_lib", &config).unwrap();
-        assert!(ret.iter().any(|d| d.code == "PC-LINT-3001"));
-    }
-
-    #[test]
-    fn test_lint_loose_compare() {
-        let xml = r#"
-<root>
-  <process_chain id="main">
-    <block id="entry"><![CDATA[
-      local a=1;
-      if $a == "1" then
-        return --from lib "ok";
-      end
-      return --from lib "ok";
-    ]]></block>
-  </process_chain>
-</root>
-"#;
-        let config = LintConfig::default();
-        let ret = lint_xml_content(xml, "test.xml", "test_lib", &config).unwrap();
-        assert!(ret.iter().any(|d| d.code == "PC-LINT-4001"));
-    }
-}
+mod test;

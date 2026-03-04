@@ -52,6 +52,7 @@ pc-lint check <INPUT> [--format text|json] [--fail-on error|warning|info] [--kno
 
 - 严重级别：`error`
 - 含义：检测到变量读取时未定义（按当前静态可见作用域判断）。
+- 说明：对 `?.` / `?[...]` / `??` 触发的“可选读取”做降噪处理，避免误报。
 
 ### `PC-LINT-3001` Unused variable
 
@@ -59,15 +60,25 @@ pc-lint check <INPUT> [--format text|json] [--fail-on error|warning|info] [--kno
 - 含义：检测到变量定义后未被使用。
 - 说明：以下划线 `_` 开头的变量默认忽略未使用告警。
 
+### `PC-LINT-3002` Scope shadowing
+
+- 严重级别：`warning`
+- 含义：检测到变量定义遮蔽了外层作用域同名变量（例如 block 遮蔽 chain/global）。
+
+### `PC-LINT-3003` Overwritten before read
+
+- 严重级别：`warning`
+- 含义：检测到变量在读取前被同作用域重新赋值覆盖。
+
 ### `PC-LINT-4001` Loose comparison risk
 
 - 严重级别：`warning`
 - 含义：检测到 `eq/ne/gt/ge/lt/le` 使用 `--loose`。
 - 目的：提示潜在隐式转换风险。
+- 说明：同样覆盖 `==` / `!=` 等语法糖映射后的 loose 比较。
 
 ## 当前限制
 
 - 分支与控制流是保守近似分析，不是完整路径敏感 CFG。
 - 动态变量名/动态路径属于启发式处理，可能存在少量误报或漏报。
 - 当前尚未覆盖“恒不可能分支/跨作用域副作用”等高级规则。
-
