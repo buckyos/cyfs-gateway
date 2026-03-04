@@ -83,7 +83,9 @@ impl ExternalCommand for CallServer {
             return Err("server_name is required".to_string());
         }
 
-        Ok(CommandResult::return_with_value(CommandControlLevel::Lib,
-                                            format!(r#"server {}"#, server_name.unwrap())))
+        Ok(CommandResult::return_with_string(
+            CommandControlLevel::Lib,
+            format!(r#"server {}"#, server_name.unwrap()),
+        ))
     }
 }

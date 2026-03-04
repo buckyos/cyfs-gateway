@@ -107,6 +107,20 @@ pub fn json_value_to_collection_value(value: &serde_json::Value) -> CollectionVa
 pub fn collection_value_to_json_value<'a>(value: &'a CollectionValue) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send + 'a>> {
     Box::pin(async move {
         match value {
+            CollectionValue::Null => serde_json::Value::Null,
+            CollectionValue::Bool(v) => serde_json::Value::Bool(*v),
+            CollectionValue::Number(v) => {
+                if let Ok(n) = v.to_string().parse::<i64>() {
+                    serde_json::Value::Number(serde_json::Number::from(n))
+                } else if let Ok(f) = v.to_string().parse::<f64>() {
+                    match serde_json::Number::from_f64(f) {
+                        Some(n) => serde_json::Value::Number(n),
+                        None => serde_json::Value::String(v.to_string()),
+                    }
+                } else {
+                    serde_json::Value::String(v.to_string())
+                }
+            }
             CollectionValue::String(s) => {
                 // 尝试解析为数字
                 if let Ok(n) = s.parse::<i64>() {
@@ -140,6 +154,19 @@ pub fn collection_value_to_json_value<'a>(value: &'a CollectionValue) -> Pin<Box
                 Err(e) => {
                     warn!("Failed to dump set for json conversion: {}", e);
                     serde_json::Value::String("[Set]".to_string())
+                }
+            },
+            CollectionValue::List(list) => match list.dump().await {
+                Ok(values) => {
+                    let mut arr = Vec::with_capacity(values.len());
+                    for item in values {
+                        arr.push(collection_value_to_json_value(&item).await);
+                    }
+                    serde_json::Value::Array(arr)
+                }
+                Err(e) => {
+                    warn!("Failed to dump list for json conversion: {}", e);
+                    serde_json::Value::String("[List]".to_string())
                 }
             },
             CollectionValue::Map(map) => match map.dump().await {

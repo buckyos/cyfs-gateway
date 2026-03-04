@@ -8,13 +8,14 @@ use crate::global_process_chains::{
     create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
 };
 use crate::{create_io_dump_stack_config, into_stack_err, stack_err, DumpStream, IoDumpStackConfig, ProcessChainConfigs, StackErrorCode, StackProtocol, ServerManagerRef, Server, hyper_serve_http, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, TunnelManager, StackConfig, StackFactory, ProcessChainConfig, StackRef, StreamInfo, get_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, MutComposedSpeedStat, MutComposedSpeedStatRef, GlobalCollectionManagerRef, JsExternalsManagerRef, StackContext};
-use cyfs_process_chain::{CommandControl, ProcessChainLibExecutor, StreamRequest};
+use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor, StreamRequest};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::sync::{Arc, Mutex, RwLock};
+use clap::value_parser;
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
 use tokio::net::TcpStream;
@@ -181,7 +182,12 @@ impl TcpConnectionHandler {
             }
 
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret.value.as_str()) {
+                let value = if let CollectionValue::String(value) = &(ret.value) {
+                    value
+                } else {
+                    return Ok(());
+                };
+                if let Some(list) = shlex::split(value.as_str()) {
                     if list.is_empty() {
                         return Ok(());
                     }

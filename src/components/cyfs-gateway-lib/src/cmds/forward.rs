@@ -276,7 +276,9 @@ impl ExternalCommand for Forward {
             self.select_upstream(context, algo.as_str(), upstreams.as_slice()).await?
         };
 
-        Ok(CommandResult::return_with_value(CommandControlLevel::Lib,
-                                            format!(r#"forward "{}""#, selected)))
+        Ok(CommandResult::return_with_string(
+            CommandControlLevel::Lib,
+            format!(r#"forward "{}""#, selected),
+        ))
     }
 }

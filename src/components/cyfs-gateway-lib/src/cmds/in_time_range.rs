@@ -409,40 +409,40 @@ impl ExternalCommand for InTimeRange {
 
         if let Some(spec) = matches.get_one::<String>("minute") {
             if !Self::match_numeric_spec(minute, spec, 0, 59, "minute")? {
-                return Ok(CommandResult::error_with_value("false"));
+                return Ok(CommandResult::error_with_string("false"));
             }
         }
 
         if let Some(spec) = matches.get_one::<String>("hour") {
             if !Self::match_numeric_spec(hour, spec, 0, 23, "hour")? {
-                return Ok(CommandResult::error_with_value("false"));
+                return Ok(CommandResult::error_with_string("false"));
             }
         }
 
         if let Some(spec) = matches.get_one::<String>("weekday") {
             if !Self::match_weekday_spec(weekday, spec)? {
-                return Ok(CommandResult::error_with_value("false"));
+                return Ok(CommandResult::error_with_string("false"));
             }
         }
 
         if let Some(spec) = matches.get_one::<String>("monthday") {
             if !Self::match_numeric_spec(monthday, spec, 1, 31, "monthday")? {
-                return Ok(CommandResult::error_with_value("false"));
+                return Ok(CommandResult::error_with_string("false"));
             }
         }
 
         if let Some(spec) = matches.get_one::<String>("month") {
             if !Self::match_numeric_spec(month, spec, 1, 12, "month")? {
-                return Ok(CommandResult::error_with_value("false"));
+                return Ok(CommandResult::error_with_string("false"));
             }
         }
 
         if let Some(spec) = matches.get_one::<String>("date") {
             if !Self::match_date_spec(date, spec)? {
-                return Ok(CommandResult::error_with_value("false"));
+                return Ok(CommandResult::error_with_string("false"));
             }
         }
 
-        Ok(CommandResult::success_with_value("true"))
+        Ok(CommandResult::success_with_string("true"))
     }
 }

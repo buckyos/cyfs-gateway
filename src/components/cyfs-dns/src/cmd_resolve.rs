@@ -209,7 +209,10 @@ impl ExternalCommand for CmdResolve {
             match provider.query(query_name.as_str(), Some(record_type), None).await {
                 Ok(name_info) => name_info,
                 Err(e) => {
-                    return Ok(CommandResult::Error(format!("Failed to resolve domain {} record_type {}: {:?}", query_name, record_type_str, e)));
+                    return Ok(CommandResult::error_with_string(format!(
+                        "Failed to resolve domain {} record_type {}: {:?}",
+                        query_name, record_type_str, e
+                    )));
                 }
             }
         } else {
@@ -219,7 +222,10 @@ impl ExternalCommand for CmdResolve {
                 match provider.query(query_name.as_str(), Some(record_type), None).await {
                     Ok(name_info) => name_info,
                     Err(e) => {
-                        return Ok(CommandResult::Error(format!("Failed to resolve domain {} record_type {}: {:?}", query_name, record_type_str, e)));
+                        return Ok(CommandResult::error_with_string(format!(
+                            "Failed to resolve domain {} record_type {}: {:?}",
+                            query_name, record_type_str, e
+                        )));
                     }
                 }
             } else if let Ok(address) = server_address.parse::<SocketAddr>() {
@@ -227,7 +233,10 @@ impl ExternalCommand for CmdResolve {
                 match provider.query(query_name.as_str(), Some(record_type), None).await {
                     Ok(name_info) => name_info,
                     Err(e) => {
-                        return Ok(CommandResult::Error(format!("Failed to resolve domain {} record_type {}: {:?}", query_name, record_type_str, e)));
+                        return Ok(CommandResult::error_with_string(format!(
+                            "Failed to resolve domain {} record_type {}: {:?}",
+                            query_name, record_type_str, e
+                        )));
                     }
                 }
             } else {
@@ -236,7 +245,7 @@ impl ExternalCommand for CmdResolve {
                     None => {
                         let msg = "Resolve command failed: server manager is unavailable".to_string();
                         error!("{}", msg);
-                        return Ok(CommandResult::Error(msg));
+                        return Ok(CommandResult::error_with_string(msg));
                     }
                 };
                 if let Some(dns_service) = server_mgr.get_name_server(server_address) {
@@ -259,13 +268,13 @@ impl ExternalCommand for CmdResolve {
                         }) {
                         Ok(name_info) => name_info,
                         Err(e) => {
-                            return Ok(CommandResult::Error(e))
+                            return Ok(CommandResult::error_with_string(e))
                         }
                     }
                 } else {
                     let msg = format!("Invalid resolve command: inner service {} not found", server_address);
                     error!("{}", msg);
-                    return Ok(CommandResult::Error(msg))
+                    return Ok(CommandResult::error_with_string(msg))
                 }
             }
         };
@@ -273,7 +282,7 @@ impl ExternalCommand for CmdResolve {
             .map_err(|e| format!("Failed to convert name info to map collection: {:?}", e))?;
 
         context.env().create("RESOLVE_RESP", CollectionValue::Map(result), EnvLevel::Global).await?;
-        Ok(CommandResult::Success("RESOLVE_RESP".to_string()))
+        Ok(CommandResult::success_with_string("RESOLVE_RESP"))
     }
 }
 

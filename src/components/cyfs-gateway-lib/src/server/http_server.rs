@@ -925,7 +925,7 @@ impl HttpServer for ProcessChainHttpServer {
                     ret.value,
                 );
                 let mut response = http::Response::new(
-                    Full::new(Bytes::from(ret.value.clone()))
+                    Full::new(Bytes::from(ret.value.to_string()))
                         .map_err(|e| match e {})
                         .boxed(),
                 );
@@ -935,7 +935,17 @@ impl HttpServer for ProcessChainHttpServer {
                     .await;
             }
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret.value.as_str()) {
+                let value = if let CollectionValue::String(value) = &(ret.value) {
+                    value
+                } else {
+                    log::error!("process chain return is not string: {}", ret.value.get_type());
+                    let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    return self
+                        .apply_post_chain_result(Ok(response), &req_info, Some(&info))
+                        .await;
+                };
+                if let Some(list) = shlex::split(value.as_str()) {
                     if list.is_empty() {
                         log::error!("process chain return is empty");
                         let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());

@@ -254,7 +254,7 @@ impl ExternalCommand for ProxyProtocolProbeCommand {
             None => {
                 let msg = "No $REQ map found in environment".to_string();
                 error!("{}", msg);
-                return Ok(CommandResult::error_with_value(msg));
+                return Ok(CommandResult::error_with_string(msg));
             }
         };
 
@@ -264,7 +264,7 @@ impl ExternalCommand for ProxyProtocolProbeCommand {
             None => {
                 let msg = "No incoming stream found in $REQ".to_string();
                 error!("{}", msg);
-                return Ok(CommandResult::error_with_value(msg));
+                return Ok(CommandResult::error_with_string(msg));
             }
         };
 
@@ -273,7 +273,7 @@ impl ExternalCommand for ProxyProtocolProbeCommand {
             None => {
                 let msg = "Incoming stream is not AnyType".to_string();
                 error!("{}", msg);
-                return Ok(CommandResult::error_with_value(msg));
+                return Ok(CommandResult::error_with_string(msg));
             }
         };
 
@@ -282,7 +282,7 @@ impl ExternalCommand for ProxyProtocolProbeCommand {
             None => {
                 let msg = "Incoming stream is None".to_string();
                 error!("{}", msg);
-                return Ok(CommandResult::error_with_value(msg));
+                return Ok(CommandResult::error_with_string(msg));
             }
         };
 
@@ -321,6 +321,6 @@ impl ExternalCommand for ProxyProtocolProbeCommand {
             .await?;
         }
 
-        Ok(CommandResult::success_with_value(version.as_str()))
+        Ok(CommandResult::success_with_string(version.as_str()))
     }
 }

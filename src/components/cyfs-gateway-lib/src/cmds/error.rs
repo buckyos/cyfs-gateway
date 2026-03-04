@@ -114,9 +114,6 @@ impl ExternalCommand for ErrorResponse {
             None => format!("error {}", status),
         };
 
-        Ok(CommandResult::return_with_value(
-            CommandControlLevel::Lib,
-            command,
-        ))
+        Ok(CommandResult::return_with_string(CommandControlLevel::Lib, command))
     }
 }

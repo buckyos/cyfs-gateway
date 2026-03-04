@@ -175,7 +175,12 @@ impl RtcpConnectionHandler {
             }
 
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret.value.as_str()) {
+                let value = if let CollectionValue::String(value) = &(ret.value) {
+                    value
+                } else {
+                    return Ok(());
+                };
+                if let Some(list) = shlex::split(value.as_str()) {
                     if list.is_empty() {
                         return Ok(());
                     }
@@ -340,7 +345,12 @@ impl RtcpConnectionHandler {
             }
 
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret.value.as_str()) {
+                let value = if let CollectionValue::String(value) = &(ret.value) {
+                    value
+                } else {
+                    return Ok(());
+                };
+                if let Some(list) = shlex::split(value.as_str()) {
                     if list.is_empty() {
                         return Ok(());
                     }

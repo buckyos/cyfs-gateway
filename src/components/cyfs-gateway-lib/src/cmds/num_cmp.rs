@@ -135,9 +135,9 @@ impl ExternalCommand for NumCmp {
 
         let result = Self::parse_and_eval(&matches)?;
         if result {
-            Ok(CommandResult::success_with_value("true"))
+            Ok(CommandResult::success_with_string("true"))
         } else {
-            Ok(CommandResult::error_with_value("false"))
+            Ok(CommandResult::error_with_string("false"))
         }
     }
 }

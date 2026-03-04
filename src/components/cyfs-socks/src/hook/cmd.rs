@@ -106,12 +106,12 @@ impl ExternalCommand for ResolveDNSCommand {
                 let ips: Vec<String> = addr.map(|addr| addr.ip().to_string()).collect();
                 let ip_string = ips.join(";");
 
-                Ok(CommandResult::success_with_value(ip_string))
+                Ok(CommandResult::success_with_string(ip_string))
             }
             Err(e) => {
                 let msg = format!("DNS resolution failed for '{}': {}", domain, e);
                 warn!("{}", msg);
-                Ok(CommandResult::error_with_value(msg))
+                Ok(CommandResult::error_with_string(msg))
             }
         }
     }

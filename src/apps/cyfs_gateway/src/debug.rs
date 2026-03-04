@@ -480,7 +480,33 @@ async fn bytes_to_async_stream_slot(
 #[async_recursion::async_recursion]
 async fn collection_value_to_json(value: CollectionValue) -> Result<Value> {
     match value {
+        CollectionValue::Null => Ok(Value::Null),
+        CollectionValue::Bool(v) => Ok(Value::Bool(v)),
+        CollectionValue::Number(v) => {
+            if let Ok(n) = v.to_string().parse::<i64>() {
+                Ok(Value::Number(n.into()))
+            } else if let Ok(f) = v.to_string().parse::<f64>() {
+                if let Some(n) = serde_json::Number::from_f64(f) {
+                    Ok(Value::Number(n))
+                } else {
+                    Ok(Value::String(v.to_string()))
+                }
+            } else {
+                Ok(Value::String(v.to_string()))
+            }
+        }
         CollectionValue::String(s) => Ok(Value::String(s)),
+        CollectionValue::List(list) => {
+            let values = list
+                .dump()
+                .await
+                .map_err(|e| anyhow!("dump list failed: {}", e))?;
+            let mut output = Vec::with_capacity(values.len());
+            for item in values {
+                output.push(collection_value_to_json(item).await?);
+            }
+            Ok(Value::Array(output))
+        }
         CollectionValue::Set(set) => {
             let values = set
                 .dump()

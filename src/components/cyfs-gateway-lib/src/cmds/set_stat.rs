@@ -90,6 +90,6 @@ impl ExternalCommand for SetStat {
         }
 
         context.env().create("STAT", CollectionValue::Set(set), EnvLevel::Global).await?;
-        Ok(CommandResult::Success("STAT".to_string()))
+        Ok(CommandResult::success_with_string("STAT"))
     }
 }

@@ -6,7 +6,7 @@ use crate::error::{SocksError, SocksResult};
 use crate::hook::*;
 use buckyos_kit::AsyncStream;
 use cyfs_gateway_lib::{StreamInfo};
-use cyfs_process_chain::{CommandControl, EnvExternal};
+use cyfs_process_chain::{CollectionValue, CommandControl, EnvExternal};
 use fast_socks5::{server::{Config, SimpleUserPassword}, util::target_addr::TargetAddr, Socks5Command};
 use once_cell::sync::OnceCell;
 use std::sync::{Arc, Mutex};
@@ -178,7 +178,11 @@ impl Socks5Proxy {
                 "REJECT".to_string()
             } else {
                 if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                    ret.value.clone()
+                    if let CollectionValue::String(value) = &(ret.value) {
+                        value.clone()
+                    } else {
+                        "DIRECT".to_string()
+                    }
                 } else {
                     "DIRECT".to_string()
                 }

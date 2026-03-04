@@ -118,9 +118,6 @@ impl ExternalCommand for Redirect {
             None => format!(r#"redirect "{}""#, location),
         };
 
-        Ok(CommandResult::return_with_value(
-            CommandControlLevel::Lib,
-            command,
-        ))
+        Ok(CommandResult::return_with_string(CommandControlLevel::Lib, command))
     }
 }
