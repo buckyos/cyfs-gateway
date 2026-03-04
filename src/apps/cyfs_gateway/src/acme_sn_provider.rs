@@ -14,6 +14,15 @@ pub struct AcmeSnProviderFactory {
     data_path: PathBuf,
 }
 
+fn normalize_sn_rpc_url(sn: &str) -> String {
+    let sn = sn.trim().trim_end_matches('/');
+    if sn.ends_with("/kapi/sn") {
+        sn.to_string()
+    } else {
+        format!("{}/kapi/sn", sn)
+    }
+}
+
 impl AcmeSnProviderFactory {
     pub fn new(data_path: PathBuf) -> Arc<AcmeSnProviderFactory> {
         Arc::new(AcmeSnProviderFactory {
@@ -67,7 +76,14 @@ impl DnsProviderFactory for AcmeSnProviderFactory {
         };
         let private_key = jsonwebtoken::EncodingKey::from_ed_der(private_key.as_slice());
 
-        Ok(AcmeSnProvider::new(self.data_path.clone(), acme_mgr, config.sn, private_key, device_config.id, device_config.name))
+        Ok(AcmeSnProvider::new(
+            self.data_path.clone(),
+            acme_mgr,
+            normalize_sn_rpc_url(config.sn.as_str()),
+            private_key,
+            device_config.id,
+            device_config.name,
+        ))
     }
 }
 
