@@ -188,6 +188,38 @@ const PROCESS_CHAIN_REWRITE_REGEX_PARSE_ERROR: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_MATCH_REGEX_CAPTURE_SUCCESS: &str = r#"
+<process_chain_lib id="match_regex_capture_success_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                map-create --block cap;
+                local input="AbC-123";
+                match-reg --capture cap $input "^([a-z]+)-([0-9]+)\$" || return --from lib "capture_fail";
+                eq $cap[0] "AbC-123" || return --from lib "capture_0_fail";
+                eq $cap[1] "AbC" || return --from lib "capture_1_fail";
+                eq $cap[2] "123" || return --from lib "capture_2_fail";
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_MATCH_REGEX_CAPTURE_REQUIRES_MAP: &str = r#"
+<process_chain_lib id="match_regex_capture_requires_map_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local input="abc-123";
+                match-reg --capture cap $input "^([a-z]+)-([0-9]+)\$";
+                return --from lib "unexpected";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 #[tokio::test]
 async fn test_range_command_basic_flow() -> Result<(), String> {
     init_test_logger();
@@ -443,6 +475,60 @@ async fn test_rewrite_regex_rejects_invalid_pattern_at_link_time() -> Result<(),
     assert!(
         err.contains("Invalid regex pattern"),
         "unexpected link error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_match_regex_capture_populates_capture_slots() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_match_regex_capture_success");
+    hook_point
+        .load_process_chain_lib(
+            "match_regex_capture_success_lib",
+            0,
+            PROCESS_CHAIN_MATCH_REGEX_CAPTURE_SUCCESS,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-match-regex-capture-success")?;
+    let hook_point_env = HookPointEnv::new("test-match-regex-capture-success", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("match_regex_capture_success_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_match_regex_capture_requires_target_map() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_match_regex_capture_requires_map");
+    hook_point
+        .load_process_chain_lib(
+            "match_regex_capture_requires_map_lib",
+            0,
+            PROCESS_CHAIN_MATCH_REGEX_CAPTURE_REQUIRES_MAP,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-match-regex-capture-requires-map")?;
+    let hook_point_env = HookPointEnv::new("test-match-regex-capture-requires-map", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = exec
+        .execute_lib("match_regex_capture_requires_map_lib")
+        .await
+        .err()
+        .ok_or_else(|| "match-reg capture without map should fail".to_string())?;
+    assert!(
+        err.contains("please create the collection first"),
+        "unexpected error: {}",
         err
     );
 

@@ -13,4 +13,5 @@ mod test_if;
 mod test_list;
 mod test_coercion;
 mod test_string_match_commands;
+mod test_break;
 mod external;
