@@ -408,13 +408,29 @@ Options:
       --status <VAR>
           Variable name to store status: success|error|control
 
+      --ok <VAR>
+          Variable name to store bool: result is success
+
+      --error <VAR>
+          Variable name to store bool: result is error
+
+      --control <VAR>
+          Variable name to store bool: result is control
+
+      --control-kind <VAR>
+          Variable name to store control kind: return|error|exit|break; Null if not control
+
+      --from <VAR>
+          Variable name to store control level: block|chain|lib; Null if not return/error control
+
   -h, --help
           Print help
 
 
 Examples:
-  capture --value geo --status st $(lookup-geo $clientIp)
+  capture --value geo --status st --ok ok $(lookup-geo $clientIp)
   capture --value out $(call check_something $arg)
+  capture --status st --control ctl --control-kind kind --from from $(some-command)
 
 Notes:
   - The sub-command must be provided as command substitution: $(...)

@@ -10,14 +10,33 @@ pub struct CaptureCommandParser {
 }
 
 impl CaptureCommandParser {
+    fn parse_target_var(
+        matches: &clap::ArgMatches,
+        args: &CommandArgs,
+        name: &str,
+    ) -> Result<Option<String>, String> {
+        if let Some(index) = matches.index_of(name) {
+            let arg = &args[index];
+            if !arg.is_literal() && !arg.is_var() {
+                let msg = format!("Invalid --{} variable name: {:?}", name, arg);
+                error!("{}", msg);
+                return Err(msg);
+            }
+            Ok(Some(arg.as_str().to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn new() -> Self {
         let cmd = Command::new("capture")
             .about("Execute a sub-command once, capture its result value/status into local variables, and return the original result.")
             .after_help(
                 r#"
 Examples:
-  capture --value geo --status st $(lookup-geo $clientIp)
+  capture --value geo --ok ok --status st $(lookup-geo $clientIp)
   capture --value out $(call check_something $arg)
+  capture --status st --control ctl --control-kind kind --from from $(some-command)
 
 Notes:
   - The sub-command must be provided as command substitution: $(...)
@@ -37,6 +56,41 @@ Notes:
                     .long("status")
                     .value_name("VAR")
                     .help("Variable name to store status: success|error|control")
+                    .required(false),
+            )
+            .arg(
+                Arg::new("ok")
+                    .long("ok")
+                    .value_name("VAR")
+                    .help("Variable name to store bool: result is success")
+                    .required(false),
+            )
+            .arg(
+                Arg::new("error")
+                    .long("error")
+                    .value_name("VAR")
+                    .help("Variable name to store bool: result is error")
+                    .required(false),
+            )
+            .arg(
+                Arg::new("control")
+                    .long("control")
+                    .value_name("VAR")
+                    .help("Variable name to store bool: result is control")
+                    .required(false),
+            )
+            .arg(
+                Arg::new("control_kind")
+                    .long("control-kind")
+                    .value_name("VAR")
+                    .help("Variable name to store control kind: return|error|exit|break; Null if not control")
+                    .required(false),
+            )
+            .arg(
+                Arg::new("from")
+                    .long("from")
+                    .value_name("VAR")
+                    .help("Variable name to store control level: block|chain|lib; Null if not return/error")
                     .required(false),
             )
             .arg(
@@ -75,32 +129,23 @@ impl CommandParser for CaptureCommandParser {
                 msg
             })?;
 
-        let value_var = if let Some(index) = matches.index_of("value") {
-            let arg = &args[index];
-            if !arg.is_literal() && !arg.is_var() {
-                let msg = format!("Invalid --value variable name: {:?}", arg);
-                error!("{}", msg);
-                return Err(msg);
-            }
-            Some(arg.as_str().to_string())
-        } else {
-            None
-        };
+        let value_var = Self::parse_target_var(&matches, args, "value")?;
+        let status_var = Self::parse_target_var(&matches, args, "status")?;
+        let ok_var = Self::parse_target_var(&matches, args, "ok")?;
+        let error_var = Self::parse_target_var(&matches, args, "error")?;
+        let control_var = Self::parse_target_var(&matches, args, "control")?;
+        let control_kind_var = Self::parse_target_var(&matches, args, "control_kind")?;
+        let from_var = Self::parse_target_var(&matches, args, "from")?;
 
-        let status_var = if let Some(index) = matches.index_of("status") {
-            let arg = &args[index];
-            if !arg.is_literal() && !arg.is_var() {
-                let msg = format!("Invalid --status variable name: {:?}", arg);
-                error!("{}", msg);
-                return Err(msg);
-            }
-            Some(arg.as_str().to_string())
-        } else {
-            None
-        };
-
-        if value_var.is_none() && status_var.is_none() {
-            let msg = "capture command requires at least one target: --value or --status"
+        if value_var.is_none()
+            && status_var.is_none()
+            && ok_var.is_none()
+            && error_var.is_none()
+            && control_var.is_none()
+            && control_kind_var.is_none()
+            && from_var.is_none()
+        {
+            let msg = "capture command requires at least one target option"
                 .to_string();
             error!("{}", msg);
             return Err(msg);
@@ -123,7 +168,16 @@ impl CommandParser for CaptureCommandParser {
         }
 
         let sub_command = cmd.as_command_substitution().unwrap().clone();
-        let executor = CaptureCommandExecutor::new(value_var, status_var, sub_command);
+        let executor = CaptureCommandExecutor::new(
+            value_var,
+            status_var,
+            ok_var,
+            error_var,
+            control_var,
+            control_kind_var,
+            from_var,
+            sub_command,
+        );
         Ok(Arc::new(Box::new(executor)))
     }
 }
@@ -131,6 +185,11 @@ impl CommandParser for CaptureCommandParser {
 pub struct CaptureCommandExecutor {
     value_var: Option<String>,
     status_var: Option<String>,
+    ok_var: Option<String>,
+    error_var: Option<String>,
+    control_var: Option<String>,
+    control_kind_var: Option<String>,
+    from_var: Option<String>,
     sub_command: Box<Expression>,
 }
 
@@ -138,11 +197,21 @@ impl CaptureCommandExecutor {
     pub fn new(
         value_var: Option<String>,
         status_var: Option<String>,
+        ok_var: Option<String>,
+        error_var: Option<String>,
+        control_var: Option<String>,
+        control_kind_var: Option<String>,
+        from_var: Option<String>,
         sub_command: Box<Expression>,
     ) -> Self {
         Self {
             value_var,
             status_var,
+            ok_var,
+            error_var,
+            control_var,
+            control_kind_var,
+            from_var,
             sub_command,
         }
     }
@@ -176,6 +245,70 @@ impl CommandExecutor for CaptureCommandExecutor {
                     CollectionValue::String(status.to_string()),
                     Some(EnvLevel::Block),
                 )
+                .await?;
+        }
+
+        if let Some(ok_var) = &self.ok_var {
+            context
+                .env()
+                .set(
+                    ok_var,
+                    CollectionValue::Bool(ret.is_success()),
+                    Some(EnvLevel::Block),
+                )
+                .await?;
+        }
+
+        if let Some(error_var) = &self.error_var {
+            context
+                .env()
+                .set(
+                    error_var,
+                    CollectionValue::Bool(ret.is_error()),
+                    Some(EnvLevel::Block),
+                )
+                .await?;
+        }
+
+        if let Some(control_var) = &self.control_var {
+            context
+                .env()
+                .set(
+                    control_var,
+                    CollectionValue::Bool(ret.is_control()),
+                    Some(EnvLevel::Block),
+                )
+                .await?;
+        }
+
+        if let Some(control_kind_var) = &self.control_kind_var {
+            let control_kind = match ret.as_control() {
+                Some(CommandControl::Return(_)) => {
+                    CollectionValue::String("return".to_string())
+                }
+                Some(CommandControl::Error(_)) => CollectionValue::String("error".to_string()),
+                Some(CommandControl::Exit(_)) => CollectionValue::String("exit".to_string()),
+                Some(CommandControl::Break(_)) => CollectionValue::String("break".to_string()),
+                None => CollectionValue::Null,
+            };
+
+            context
+                .env()
+                .set(control_kind_var, control_kind, Some(EnvLevel::Block))
+                .await?;
+        }
+
+        if let Some(from_var) = &self.from_var {
+            let from = match ret.as_control() {
+                Some(CommandControl::Return(v)) | Some(CommandControl::Error(v)) => {
+                    CollectionValue::String(v.level.as_str().to_string())
+                }
+                _ => CollectionValue::Null,
+            };
+
+            context
+                .env()
+                .set(from_var, from, Some(EnvLevel::Block))
                 .await?;
         }
 
