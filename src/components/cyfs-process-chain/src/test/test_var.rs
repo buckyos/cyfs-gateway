@@ -234,9 +234,12 @@ async fn set_meta_field(req: &MapCollectionRef, field: &str) {
 }
 
 async fn set_default_country(req: &MapCollectionRef, country: &str) {
-    req.insert("defaultCountry", CollectionValue::String(country.to_string()))
-        .await
-        .unwrap();
+    req.insert(
+        "defaultCountry",
+        CollectionValue::String(country.to_string()),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -868,11 +871,17 @@ async fn test_safe_access_default_supports_var_expression() {
 
     let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
 
-    let ret = exec.execute_lib("test_var_safe_default_expr_lib").await.unwrap();
+    let ret = exec
+        .execute_lib("test_var_safe_default_expr_lib")
+        .await
+        .unwrap();
     assert_eq!(ret.value(), "CN|CN|CN");
 
     set_client_ip(&req, "10.10.10.10").await;
-    let ret = exec.execute_lib("test_var_safe_default_expr_lib").await.unwrap();
+    let ret = exec
+        .execute_lib("test_var_safe_default_expr_lib")
+        .await
+        .unwrap();
     assert_eq!(ret.value(), "|US|inline_unknown");
 }
 

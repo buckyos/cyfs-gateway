@@ -35,8 +35,21 @@ impl Operator {
 
 #[derive(Debug, Clone)]
 pub enum CommandArg {
-    // A simple command arg in string format
+    // Unquoted token that keeps string semantics.
+    // Typical examples: command options/keywords/identifiers like
+    // `--from`, `lib`, `map-add`, `my_key`.
+    // Note: if an unquoted token matches typed literal rules, parser emits
+    // `TypedLiteral` instead of `Literal`.
     Literal(String),
+
+    // Quoted string literal (e.g. "123", 'false', "").
+    // Always preserved as string and never auto-promoted to typed literal.
+    StringLiteral(String),
+
+    // Unquoted typed literal recognized at parse-time, preserving both raw token text
+    // and parsed runtime value.
+    // Examples: true/false/null/123/12.5
+    TypedLiteral(String, CollectionValue),
 
     // A command arg that is a variable, like $VAR_NAME ${VAR_NAME}
     Var(String), // A reference to a variable, like $VAR_NAME
@@ -199,14 +212,18 @@ impl CommandArg {
     }
 
     pub fn is_literal(&self) -> bool {
-        matches!(self, CommandArg::Literal(_))
+        matches!(
+            self,
+            CommandArg::Literal(_) | CommandArg::StringLiteral(_) | CommandArg::TypedLiteral(_, _)
+        )
     }
 
     pub fn as_literal_str(&self) -> Option<&str> {
-        if let CommandArg::Literal(s) = self {
-            Some(s.as_str())
-        } else {
-            None
+        match self {
+            CommandArg::Literal(s)
+            | CommandArg::StringLiteral(s)
+            | CommandArg::TypedLiteral(s, _) => Some(s.as_str()),
+            _ => None,
         }
     }
 
@@ -224,7 +241,9 @@ impl CommandArg {
 
     pub fn as_str(&self) -> &str {
         match self {
-            CommandArg::Literal(s) => s.as_str(),
+            CommandArg::Literal(s)
+            | CommandArg::StringLiteral(s)
+            | CommandArg::TypedLiteral(s, _) => s.as_str(),
             CommandArg::Var(s) => s.as_str(),
             CommandArg::CommandSubstitution(_) => "[command substitution]",
         }

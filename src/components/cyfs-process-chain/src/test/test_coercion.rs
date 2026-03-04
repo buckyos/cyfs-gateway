@@ -72,6 +72,37 @@ const PROCESS_CHAIN_VALUE_CONVERSION_STRICT_POLICY: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_LITERAL_MODE_BASIC: &str = r#"
+<process_chain_lib id="literal_mode_basic_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local b=true;
+                local n1=123;
+                local n2=12.5;
+                local z=null;
+                return --from lib $(append $(type $b) "|" $(type $n1) "|" $(type $n2) "|" $(type $z));
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_LITERAL_MODE_QUOTED: &str = r#"
+<process_chain_lib id="literal_mode_quoted_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local q1="123";
+                local q2='false';
+                local u=123;
+                return --from lib $(append $(type $q1) "|" $(type $q2) "|" $(type $u));
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 fn init_logger() {
     TermLogger::init(
         LevelFilter::Info,
@@ -247,4 +278,50 @@ async fn test_to_number_respects_strict_coercion_policy() {
         .await
         .unwrap();
     assert_eq!(ret.value(), "coercion_failed");
+}
+
+#[tokio::test]
+async fn test_typed_literal_default_promotes_basic_literals() {
+    init_logger();
+
+    let hook_point = HookPoint::new("test_typed_literal_default");
+    hook_point
+        .load_process_chain_lib(
+            "literal_mode_basic_lib",
+            0,
+            PROCESS_CHAIN_LITERAL_MODE_BASIC,
+        )
+        .await
+        .unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-typed-literal-default");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-typed-literal-default", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+    let ret = exec.execute_lib("literal_mode_basic_lib").await.unwrap();
+    assert_eq!(ret.value(), "Bool|Number|Number|Null");
+}
+
+#[tokio::test]
+async fn test_typed_literal_preserves_quoted_string_literals() {
+    init_logger();
+
+    let hook_point = HookPoint::new("test_literal_mode_typed_quoted");
+    hook_point
+        .load_process_chain_lib(
+            "literal_mode_quoted_lib",
+            0,
+            PROCESS_CHAIN_LITERAL_MODE_QUOTED,
+        )
+        .await
+        .unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-literal-mode-typed-quoted");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-literal-mode-typed-quoted", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+    let ret = exec.execute_lib("literal_mode_quoted_lib").await.unwrap();
+    assert_eq!(ret.value(), "String|String|Number");
 }

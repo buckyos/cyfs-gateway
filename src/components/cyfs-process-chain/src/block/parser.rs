@@ -1,6 +1,6 @@
 use super::block::*;
+use crate::collection::{CollectionValue, NumberValue};
 use nom::{
-    IResult, Parser,
     branch::alt,
     bytes::complete::tag,
     bytes::complete::{escaped_transform, is_not},
@@ -12,6 +12,7 @@ use nom::{
     multi::many0,
     multi::separated_list0,
     sequence::{delimited, pair, preceded, terminated},
+    IResult, Parser,
 };
 
 pub struct BlockParser {
@@ -19,6 +20,65 @@ pub struct BlockParser {
 }
 
 impl BlockParser {
+    fn parse_typed_number_literal(input: &str) -> Option<CollectionValue> {
+        if input.is_empty() {
+            return None;
+        }
+
+        let (sign, rest) = if let Some(stripped) = input.strip_prefix('-') {
+            ("-", stripped)
+        } else {
+            ("", input)
+        };
+
+        if rest.is_empty() {
+            return None;
+        }
+
+        if !rest.contains('.') {
+            if rest.chars().all(|c| c.is_ascii_digit()) {
+                let raw = format!("{}{}", sign, rest);
+                if let Ok(v) = raw.parse::<i64>() {
+                    return Some(CollectionValue::Number(NumberValue::Int(v)));
+                }
+            }
+
+            return None;
+        }
+
+        let mut split = rest.split('.');
+        let int_part = split.next().unwrap_or_default();
+        let frac_part = split.next().unwrap_or_default();
+
+        if split.next().is_some() {
+            return None;
+        }
+
+        if int_part.is_empty() || frac_part.is_empty() {
+            return None;
+        }
+
+        if !int_part.chars().all(|c| c.is_ascii_digit())
+            || !frac_part.chars().all(|c| c.is_ascii_digit())
+        {
+            return None;
+        }
+
+        let raw = format!("{}{}", sign, rest);
+        raw.parse::<f64>()
+            .ok()
+            .map(|v| CollectionValue::Number(NumberValue::Float(v)))
+    }
+
+    fn parse_typed_literal(input: &str) -> Option<CollectionValue> {
+        match input {
+            "true" => Some(CollectionValue::Bool(true)),
+            "false" => Some(CollectionValue::Bool(false)),
+            "null" => Some(CollectionValue::Null),
+            _ => Self::parse_typed_number_literal(input),
+        }
+    }
+
     pub fn new(id: &str) -> Self {
         Self { id: id.to_owned() }
     }
@@ -228,11 +288,16 @@ impl BlockParser {
                     error!("{}", msg);
                     return Err(msg);
                 }
-                None => unreachable!("parse_lines(stop_at_control_keywords=true) must stop at a control keyword"),
+                None => unreachable!(
+                    "parse_lines(stop_at_control_keywords=true) must stop at a control keyword"
+                ),
             }
         }
 
-        let statement = Statement::new_if(IfStatement { branches, else_lines });
+        let statement = Statement::new_if(IfStatement {
+            branches,
+            else_lines,
+        });
         let line = Line {
             source: if_source,
             statements: vec![statement],
@@ -529,7 +594,7 @@ impl BlockParser {
                                 value("$", tag("$")),
                             )),
                         ),
-                        |s: String| CommandArg::Literal(s),
+                        |s: String| CommandArg::StringLiteral(s),
                     ),
                 ))),
                 |args: Vec<CommandArg>| {
@@ -539,14 +604,16 @@ impl BlockParser {
                     let args = args
                         .into_iter()
                         .filter(|arg| match arg {
-                            CommandArg::Literal(s) => !s.is_empty(),
+                            CommandArg::Literal(s)
+                            | CommandArg::StringLiteral(s)
+                            | CommandArg::TypedLiteral(s, _) => !s.is_empty(),
                             _ => true,
                         })
                         .collect::<Vec<_>>();
 
                     // If no args, return empty string
                     if args.is_empty() {
-                        CommandArg::Literal("".to_string())
+                        CommandArg::StringLiteral("".to_string())
                     }
                     // If there's only one argument, return it directly
                     else if args.len() == 1 {
@@ -570,7 +637,7 @@ impl BlockParser {
         let single_quoted = delimited(
             char('\''),
             map(opt(is_not("'")), |s: Option<&str>| {
-                CommandArg::Literal(s.unwrap_or("").to_string())
+                CommandArg::StringLiteral(s.unwrap_or("").to_string())
             }),
             char('\''),
         );
@@ -588,7 +655,13 @@ impl BlockParser {
                     tag("/"),
                 ))),
             )),
-            |s: &str| CommandArg::Literal(s.to_string()),
+            |s: &str| {
+                if let Some(value) = Self::parse_typed_literal(s) {
+                    CommandArg::TypedLiteral(s.to_string(), value)
+                } else {
+                    CommandArg::Literal(s.to_string())
+                }
+            },
         );
 
         let (input, arg) = complete(alt((double_quoted, single_quoted, unquoted))).parse(input)?;
@@ -940,7 +1013,7 @@ impl BlockParser {
                 }
 
                 if !literal.is_empty() {
-                    parts.push(CommandArg::Literal(literal.clone()));
+                    parts.push(CommandArg::StringLiteral(literal.clone()));
                     literal.clear();
                 }
                 parts.push(inner_arg);
@@ -961,7 +1034,7 @@ impl BlockParser {
         }
 
         if !literal.is_empty() {
-            parts.push(CommandArg::Literal(literal));
+            parts.push(CommandArg::StringLiteral(literal));
         }
 
         let arg = if parts.len() == 1 {
@@ -1003,16 +1076,48 @@ impl BlockParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collection::{CollectionValue, NumberValue};
 
     #[test]
     fn test_parse_literal() {
         let (input, arg) = BlockParser::parse_literal("abc").unwrap();
         assert_eq!(input, "");
         assert_eq!(arg.as_literal_str().unwrap(), "abc");
+        assert!(matches!(arg, CommandArg::Literal(_)));
+
+        let (input, arg) = BlockParser::parse_literal("true").unwrap();
+        assert_eq!(input, "");
+        assert!(matches!(
+            arg,
+            CommandArg::TypedLiteral(_, CollectionValue::Bool(true))
+        ));
+
+        let (input, arg) = BlockParser::parse_literal("123").unwrap();
+        assert_eq!(input, "");
+        assert!(matches!(
+            arg,
+            CommandArg::TypedLiteral(_, CollectionValue::Number(NumberValue::Int(123)))
+        ));
+
+        let (input, arg) = BlockParser::parse_literal("12.5").unwrap();
+        assert_eq!(input, "");
+        assert!(matches!(
+            arg,
+            CommandArg::TypedLiteral(_, CollectionValue::Number(NumberValue::Float(v)))
+            if (v - 12.5).abs() < f64::EPSILON
+        ));
+
+        let (input, arg) = BlockParser::parse_literal("null").unwrap();
+        assert_eq!(input, "");
+        assert!(matches!(
+            arg,
+            CommandArg::TypedLiteral(_, CollectionValue::Null)
+        ));
 
         let (input, arg) = BlockParser::parse_literal("\"abc def\"").unwrap();
         assert_eq!(input, "");
         assert_eq!(arg.as_literal_str().unwrap(), "abc def");
+        assert!(matches!(arg, CommandArg::StringLiteral(_)));
 
         let (input, arg) = BlockParser::parse_literal("\"line\\nbreak\"").unwrap();
         assert_eq!(input, "");
@@ -1021,6 +1126,7 @@ mod tests {
         let (input, arg) = BlockParser::parse_literal("'abc def'").unwrap();
         assert_eq!(input, "");
         assert_eq!(arg.as_literal_str().unwrap(), "abc def");
+        assert!(matches!(arg, CommandArg::StringLiteral(_)));
 
         let (input, arg) = BlockParser::parse_literal("test123_").unwrap();
         assert_eq!(input, "");
@@ -1093,8 +1199,8 @@ mod tests {
 
     #[test]
     fn test_parse_dollar_var_with_safe_access_and_inline_default() {
-        let (rest, arg) = BlockParser::parse_arg("$geoByIp[$REQ.clientIp]?.country??\"unknown\"")
-            .unwrap();
+        let (rest, arg) =
+            BlockParser::parse_arg("$geoByIp[$REQ.clientIp]?.country??\"unknown\"").unwrap();
         assert_eq!(rest, "");
         assert!(arg.is_var());
         assert_eq!(

@@ -846,6 +846,8 @@ impl CommandArgEvaluator {
     pub async fn evaluate(arg: &CommandArg, context: &Context) -> Result<CollectionValue, String> {
         let ret = match arg {
             CommandArg::Literal(value) => CollectionValue::String(value.clone()),
+            CommandArg::StringLiteral(value) => CollectionValue::String(value.clone()),
+            CommandArg::TypedLiteral(_, value) => value.clone(),
             CommandArg::Var(var) => {
                 debug!("Resolving variable: {}", var);
                 let policy = context.env().policy();

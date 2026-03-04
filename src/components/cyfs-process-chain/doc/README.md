@@ -13,6 +13,8 @@
   - 轻量类型系统演进草案（policy 设计、JSON 持久化策略、分阶段落地方案）。
 - [RFC_SCRIPT_MODULARIZATION.md](./RFC_SCRIPT_MODULARIZATION.md)
   - 脚本模块化能力草案（基于 `invoke` 的参数签名、调用边界与命名空间设计）。
+- [MIGRATION_TYPED_LITERAL_BREAKING.md](./MIGRATION_TYPED_LITERAL_BREAKING.md)
+  - typed literal 无兼容迁移草案（破坏性清单 + 批量迁移规则 + 扫描流程）。
 
 ## 版本与时间
 
