@@ -879,6 +879,46 @@ Examples:
   eq --ignore-case "Host" "HOST"
 ```
 
+### `ne`
+```
+Compare two values for inequality (strict typed by default).
+
+Usage: ne [OPTIONS] <value1> <value2>
+
+Options:
+  -i, --ignore-case   Case-insensitive for string-string only
+  -l, --loose         Enable loose comparison for string/number
+
+Examples:
+  ne 1 "1"                 # true under strict mode
+  ne --loose 1 "1"         # false under loose mode
+  ne --ignore-case "A" "a" # false
+```
+
+### `gt` / `ge` / `lt` / `le`
+```
+Numeric comparison commands.
+
+Usage:
+  gt [OPTIONS] <value1> <value2>   # value1 > value2
+  ge [OPTIONS] <value1> <value2>   # value1 >= value2
+  lt [OPTIONS] <value1> <value2>   # value1 < value2
+  le [OPTIONS] <value1> <value2>   # value1 <= value2
+
+Options:
+  -l, --loose    Enable loose number parsing for string/number
+
+Behavior:
+  - Strict mode: only Number values are comparable.
+  - Loose mode: String/Number mixed comparison is allowed if string is numeric.
+  - Non-comparable values return false.
+
+Examples:
+  gt 10 9
+  ge --loose "2" 2
+  lt --loose "1.5" 2
+```
+
 ### `match`
 ```
 Match a value using glob pattern.

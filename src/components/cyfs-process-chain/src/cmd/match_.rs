@@ -535,6 +535,315 @@ impl CommandExecutor for EQCommandExecutor {
     }
 }
 
+// NE command, like: ne REQ_HEADER.host "localhost"; ne --ignore-case REQ_HEADER.host "LOCALHOST"
+pub struct NECommandParser {
+    cmd: Command,
+}
+
+impl NECommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("ne")
+        .about("Compare two values for inequality (strict typed by default).")
+        .after_help(
+            r#"
+Compare two values for inequality.
+
+Arguments:
+  <value1>        First value to compare
+  <value2>        Second value to compare
+
+Options:
+  --ignore-case   Perform case-insensitive comparison (string-string only)
+  --loose         Enable loose comparison for string/number
+
+By default, ne uses strict typed comparison.
+Use --loose to enable string/number loose comparison.
+"#,
+        )
+        .arg(
+            Arg::new("ignore_case")
+                .long("ignore-case")
+                .short('i')
+                .action(ArgAction::SetTrue)
+                .help("Enable case-insensitive comparison"),
+        )
+        .arg(
+            Arg::new("loose")
+                .long("loose")
+                .short('l')
+                .action(ArgAction::SetTrue)
+                .help("Enable loose comparison for string/number"),
+        )
+        .arg(
+            Arg::new("value1")
+                .required(true)
+                .help("The first value to compare"),
+        )
+        .arg(
+            Arg::new("value2")
+                .required(true)
+                .help("The second value to compare"),
+        );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for NECommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Match
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+            let msg = format!("Invalid ne command: {:?}, {}", str_args, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let ignore_case = matches.get_flag("ignore_case");
+        let loose = matches.get_flag("loose");
+
+        let value_index1 = matches.index_of("value1").ok_or_else(|| {
+            let msg = "Value1 argument is required for ne command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value1 = args[value_index1].clone();
+
+        let value_index2 = matches.index_of("value2").ok_or_else(|| {
+            let msg = "Value2 argument is required for ne command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value2 = args[value_index2].clone();
+
+        let cmd = NECommandExecutor {
+            ignore_case,
+            loose,
+            value1,
+            value2,
+        };
+
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct NECommandExecutor {
+    pub ignore_case: bool,
+    pub loose: bool,
+    pub value1: CommandArg,
+    pub value2: CommandArg,
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for NECommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let value1 = self.value1.evaluate(context).await?;
+        let value2 = self.value2.evaluate(context).await?;
+
+        let eq = if self.loose {
+            EQCommandExecutor {
+                ignore_case: self.ignore_case,
+                loose: true,
+                value1: self.value1.clone(),
+                value2: self.value2.clone(),
+            }
+            .compare_loose(&value1, &value2)
+        } else {
+            EQCommandExecutor {
+                ignore_case: self.ignore_case,
+                loose: false,
+                value1: self.value1.clone(),
+                value2: self.value2.clone(),
+            }
+            .compare_strict(&value1, &value2)
+        };
+
+        if !eq {
+            Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))
+        } else {
+            Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NumberCompareOp {
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+
+impl NumberCompareOp {
+    fn compare(&self, left: f64, right: f64) -> bool {
+        match self {
+            NumberCompareOp::Gt => left > right,
+            NumberCompareOp::Ge => left >= right,
+            NumberCompareOp::Lt => left < right,
+            NumberCompareOp::Le => left <= right,
+        }
+    }
+}
+
+pub struct NumberCompareCommandParser {
+    cmd: Command,
+    op: NumberCompareOp,
+}
+
+impl NumberCompareCommandParser {
+    fn new(name: &'static str, about: &'static str, op: NumberCompareOp) -> Self {
+        let cmd = Command::new(name)
+            .about(about)
+            .arg(
+                Arg::new("loose")
+                    .long("loose")
+                    .short('l')
+                    .action(ArgAction::SetTrue)
+                    .help("Enable loose number parsing for string/number"),
+            )
+            .arg(
+                Arg::new("value1")
+                    .required(true)
+                    .help("The left value"),
+            )
+            .arg(
+                Arg::new("value2")
+                    .required(true)
+                    .help("The right value"),
+            );
+        Self { cmd, op }
+    }
+}
+
+impl CommandParser for NumberCompareCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Match
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+            let msg = format!(
+                "Invalid {} command: {:?}, {}",
+                self.cmd.get_name(),
+                str_args,
+                e
+            );
+            error!("{}", msg);
+            msg
+        })?;
+
+        let loose = matches.get_flag("loose");
+
+        let value_index1 = matches.index_of("value1").ok_or_else(|| {
+            let msg = format!(
+                "Value1 argument is required for {} command",
+                self.cmd.get_name()
+            );
+            error!("{}", msg);
+            msg
+        })?;
+        let value1 = args[value_index1].clone();
+
+        let value_index2 = matches.index_of("value2").ok_or_else(|| {
+            let msg = format!(
+                "Value2 argument is required for {} command",
+                self.cmd.get_name()
+            );
+            error!("{}", msg);
+            msg
+        })?;
+        let value2 = args[value_index2].clone();
+
+        let cmd = NumberCompareCommandExecutor::new(self.op, loose, value1, value2);
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct NumberCompareCommandExecutor {
+    op: NumberCompareOp,
+    loose: bool,
+    value1: CommandArg,
+    value2: CommandArg,
+}
+
+impl NumberCompareCommandExecutor {
+    fn new(op: NumberCompareOp, loose: bool, value1: CommandArg, value2: CommandArg) -> Self {
+        Self {
+            op,
+            loose,
+            value1,
+            value2,
+        }
+    }
+
+    fn parse_number(value: &CollectionValue, loose: bool) -> Option<f64> {
+        match value {
+            CollectionValue::Number(v) => Some(v.as_f64()),
+            CollectionValue::String(s) if loose => EQCommandExecutor::parse_number_literal(s),
+            _ => None,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for NumberCompareCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let value1 = self.value1.evaluate(context).await?;
+        let value2 = self.value2.evaluate(context).await?;
+
+        let matched =
+            match (
+                Self::parse_number(&value1, self.loose),
+                Self::parse_number(&value2, self.loose),
+            ) {
+                (Some(left), Some(right)) => self.op.compare(left, right),
+                _ => false,
+            };
+
+        if matched {
+            Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))
+        } else {
+            Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
+        }
+    }
+}
+
+pub fn create_gt_parser() -> NumberCompareCommandParser {
+    NumberCompareCommandParser::new("gt", "Check whether value1 > value2.", NumberCompareOp::Gt)
+}
+
+pub fn create_ge_parser() -> NumberCompareCommandParser {
+    NumberCompareCommandParser::new("ge", "Check whether value1 >= value2.", NumberCompareOp::Ge)
+}
+
+pub fn create_lt_parser() -> NumberCompareCommandParser {
+    NumberCompareCommandParser::new("lt", "Check whether value1 < value2.", NumberCompareOp::Lt)
+}
+
+pub fn create_le_parser() -> NumberCompareCommandParser {
+    NumberCompareCommandParser::new("le", "Check whether value1 <= value2.", NumberCompareOp::Le)
+}
+
 // Range command, like: range <var> <range_begin> <range_end>
 pub struct RangeCommandParser {
     cmd: Command,

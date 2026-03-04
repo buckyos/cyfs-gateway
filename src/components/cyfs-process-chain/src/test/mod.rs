@@ -15,4 +15,5 @@ mod test_coercion;
 mod test_string_match_commands;
 mod test_break;
 mod test_eq;
+mod test_compare_commands;
 mod external;

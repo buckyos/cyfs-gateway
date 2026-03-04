@@ -101,6 +101,11 @@ impl CommandParserFactory {
             Arc::new(Box::new(MatchRegexCommandParser::new())),
         );
         self.register("eq", Arc::new(Box::new(EQCommandParser::new())));
+        self.register("ne", Arc::new(Box::new(NECommandParser::new())));
+        self.register("gt", Arc::new(Box::new(create_gt_parser())));
+        self.register("ge", Arc::new(Box::new(create_ge_parser())));
+        self.register("lt", Arc::new(Box::new(create_lt_parser())));
+        self.register("le", Arc::new(Box::new(create_le_parser())));
         self.register("range", Arc::new(Box::new(RangeCommandParser::new())));
 
         // string command
