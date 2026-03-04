@@ -589,28 +589,9 @@ impl RangeCommandExecutor {
 impl CommandExecutor for RangeCommandExecutor {
     async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
         // First evaluate the value, min and max
-        let value = self.value.evaluate_string(_context).await?;
-        let min = self.min.evaluate_string(_context).await?;
-        let max = self.max.evaluate_string(_context).await?;
-
-        // Convert to f64 for comparison
-        let value = value.parse::<f64>().map_err(|e| {
-            let msg = format!("Invalid range value: {}: {}", value, e);
-            error!("{}", msg);
-            msg
-        })?;
-
-        let min = min.parse::<f64>().map_err(|e| {
-            let msg = format!("Invalid range min value: {}: {}", min, e);
-            error!("{}", msg);
-            msg
-        })?;
-
-        let max = max.parse::<f64>().map_err(|e| {
-            let msg = format!("Invalid range max value: {}: {}", max, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let value = self.value.evaluate_number(_context).await?.as_f64();
+        let min = self.min.evaluate_number(_context).await?.as_f64();
+        let max = self.max.evaluate_number(_context).await?.as_f64();
 
         if value >= min && value <= max {
             Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))

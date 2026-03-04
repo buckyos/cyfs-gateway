@@ -1,7 +1,7 @@
 use super::cmd::*;
 use crate::block::{CommandArg, CommandArgEvaluator, CommandArgs};
 use crate::chain::{Context, ParserContext};
-use crate::collection::CollectionValue;
+use crate::collection::{CollectionValue, NumberValue};
 use clap::{Arg, ArgAction, Command};
 use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
@@ -1002,8 +1002,10 @@ impl CommandExecutor for StringLengthCommand {
 
         info!("String length of '{}': {}", string_value, length);
 
-        // Return the length as a command result
-        Ok(super::CommandResult::success_with_string(length.to_string()))
+        // Return the length as typed number result
+        Ok(super::CommandResult::success_with_value(
+            CollectionValue::Number(NumberValue::Int(length as i64)),
+        ))
     }
 }
 

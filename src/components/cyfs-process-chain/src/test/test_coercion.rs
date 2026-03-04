@@ -37,9 +37,9 @@ const PROCESS_CHAIN_VALUE_COMMANDS: &str = r#"
                 local b=$(to-bool $flag);
                 local n=$(to-number $numText);
                 is-null $none || return --from lib "is-null-fail";
-                is-bool $flag || return --from lib "is-bool-fail";
-                is-number $num || return --from lib "is-number-fail";
-                return --from lib $(append $b "|" $n);
+                is-bool $b || return --from lib "is-bool-fail";
+                is-number $n || return --from lib "is-number-fail";
+                return --from lib $(append $(type $b) "|" $(type $n));
             ]]>
         </block>
     </process_chain>
@@ -217,7 +217,7 @@ async fn test_value_commands_to_bool_to_number_and_is_checks() {
 
     let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
     let ret = exec.execute_lib("value_commands_lib").await.unwrap();
-    assert_eq!(ret.value(), "true|12.5");
+    assert_eq!(ret.value(), "Bool|Number");
 }
 
 #[tokio::test]

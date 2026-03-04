@@ -991,7 +991,7 @@ impl CommandExecutor for ListSetCommandExecutor {
         };
 
         match list.set(index, value).await? {
-            Some(prev) => Ok(CommandResult::success_with_string(prev.treat_as_str())),
+            Some(prev) => Ok(CommandResult::success_with_value(prev)),
             None => Ok(CommandResult::success()),
         }
     }
@@ -1122,7 +1122,7 @@ impl CommandExecutor for ListRemoveCommandExecutor {
         };
 
         match list.remove(index).await? {
-            Some(value) => Ok(CommandResult::success_with_string(value.treat_as_str())),
+            Some(value) => Ok(CommandResult::success_with_value(value)),
             None => Ok(CommandResult::error()),
         }
     }
@@ -1236,7 +1236,7 @@ impl CommandExecutor for ListPopCommandExecutor {
         };
 
         match list.pop().await? {
-            Some(value) => Ok(CommandResult::success_with_string(value.treat_as_str())),
+            Some(value) => Ok(CommandResult::success_with_value(value)),
             None => Ok(CommandResult::error()),
         }
     }
@@ -2404,7 +2404,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                             self.map,
                             value,
                         );
-                        Ok(CommandResult::success_with_string(value.treat_as_str()))
+                        Ok(CommandResult::success_with_value(value))
                     }
                     None => {
                         warn!(

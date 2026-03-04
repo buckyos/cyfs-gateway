@@ -130,7 +130,7 @@ impl CommandExecutor for AssignCommand {
                     .set(self.key.as_str(), value.clone(), Some(env_level))
                     .await?;
 
-                Ok(CommandResult::success_with_string(value.treat_as_str()))
+                Ok(CommandResult::success_with_value(value))
             }
             None => {
                 // Handle assignment without value, which will change the variable scope
@@ -285,7 +285,7 @@ impl CommandExecutor for DeleteCommand {
         let result = context.env().remove(&self.var, self.level).await;
 
         match result {
-            Ok(Some(ret)) => Ok(CommandResult::success_with_string(ret.to_string())),
+            Ok(Some(ret)) => Ok(CommandResult::success_with_value(ret)),
             Ok(None) => {
                 let msg = format!(
                     "Variable '{}' not found in scope {:?}",
