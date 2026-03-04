@@ -224,7 +224,7 @@ async fn test_goto_chain_err_from_overrides_from_on_error() -> Result<(), String
     match control {
         CommandControl::Error(value) => {
             assert_eq!(value.level, CommandControlLevel::Lib);
-            assert_eq!(value.value, "callee_err");
+            assert_eq!(value.value.as_str(), Some("callee_err"));
         }
         _ => {
             return Err(format!(

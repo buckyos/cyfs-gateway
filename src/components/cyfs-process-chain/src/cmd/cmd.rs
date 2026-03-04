@@ -1,5 +1,6 @@
 use crate::block::CommandArgs;
 use crate::chain::{Context, ParserContext};
+use crate::collection::CollectionValue;
 use clap::Command;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -159,15 +160,15 @@ impl FromStr for CommandControlLevel {
 #[derive(Debug, Clone)]
 pub struct CommandControlValue {
     pub level: CommandControlLevel,
-    pub value: String,
+    pub value: CollectionValue,
 }
 
 #[derive(Debug, Clone)]
 pub enum CommandControl {
-    Break(String),               // Break the map-reduce loop with a specific value
+    Break(CollectionValue),      // Break the map-reduce loop with a specific value
     Return(CommandControlValue), // Return to caller with ok
     Error(CommandControlValue),  // Return to caller with error
-    Exit(String),                // Exit process chain list with value(string)
+    Exit(CollectionValue),       // Exit process chain list with value
 }
 
 impl CommandControl {
@@ -195,15 +196,15 @@ impl CommandControl {
         matches!(self, CommandControl::Break(_))
     }
 
-    pub fn as_break(&self) -> Option<&str> {
+    pub fn as_break(&self) -> Option<&CollectionValue> {
         if let CommandControl::Break(value) = self {
-            Some(value.as_str())
+            Some(value)
         } else {
             None
         }
     }
 
-    pub fn value(&self) -> &String {
+    pub fn value(&self) -> &CollectionValue {
         match self {
             CommandControl::Return(value) => &value.value,
             CommandControl::Error(value) => &value.value,
@@ -215,26 +216,34 @@ impl CommandControl {
 
 #[derive(Debug, Clone)]
 pub enum CommandResult {
-    Success(String),
-    Error(String),
+    Success(CollectionValue),
+    Error(CollectionValue),
     Control(CommandControl),
 }
 
 impl CommandResult {
     pub fn success() -> Self {
-        Self::Success("".to_string())
+        Self::Success(CollectionValue::String("".to_string()))
     }
 
-    pub fn success_with_value(value: impl Into<String>) -> Self {
-        Self::Success(value.into())
+    pub fn success_with_string(value: impl Into<String>) -> Self {
+        Self::Success(CollectionValue::String(value.into()))
+    }
+
+    pub fn success_with_value(value: CollectionValue) -> Self {
+        Self::Success(value)
     }
 
     pub fn error() -> Self {
-        Self::Error("".to_string())
+        Self::Error(CollectionValue::String("".to_string()))
     }
 
-    pub fn error_with_value(value: impl Into<String>) -> Self {
-        Self::Error(value.into())
+    pub fn error_with_string(value: impl Into<String>) -> Self {
+        Self::Error(CollectionValue::String(value.into()))
+    }
+
+    pub fn error_with_value(value: CollectionValue) -> Self {
+        Self::Error(value)
     }
 
     pub fn control(action: CommandControl) -> Self {
@@ -244,60 +253,80 @@ impl CommandResult {
     pub fn _return(level: CommandControlLevel) -> Self {
         Self::Control(CommandControl::Return(CommandControlValue {
             level,
-            value: "".to_string(),
+            value: CollectionValue::String("".to_string()),
         }))
     }
 
-    pub fn return_with_value(level: CommandControlLevel, value: impl Into<String>) -> Self {
+    pub fn return_with_string(level: CommandControlLevel, value: impl Into<String>) -> Self {
+        Self::return_with_value(level, CollectionValue::String(value.into()))
+    }
+
+    pub fn return_with_value(level: CommandControlLevel, value: CollectionValue) -> Self {
         Self::Control(CommandControl::Return(CommandControlValue {
             level,
-            value: value.into(),
+            value,
         }))
     }
 
     pub fn return_error(level: CommandControlLevel) -> Self {
         Self::Control(CommandControl::Error(CommandControlValue {
             level,
-            value: "".to_string(),
+            value: CollectionValue::String("".to_string()),
         }))
     }
 
-    pub fn return_error_with_value(level: CommandControlLevel, value: impl Into<String>) -> Self {
+    pub fn return_error_with_string(level: CommandControlLevel, value: impl Into<String>) -> Self {
+        Self::return_error_with_value(level, CollectionValue::String(value.into()))
+    }
+
+    pub fn return_error_with_value(level: CommandControlLevel, value: CollectionValue) -> Self {
         Self::Control(CommandControl::Error(CommandControlValue {
             level,
-            value: value.into(),
+            value,
         }))
     }
 
     pub fn exit_chain() -> Self {
-        Self::Control(CommandControl::Exit("".to_string()))
+        Self::Control(CommandControl::Exit(CollectionValue::String(
+            "".to_string(),
+        )))
     }
 
-    pub fn exit_chain_with_value(value: impl Into<String>) -> Self {
-        Self::Control(CommandControl::Exit(value.into()))
+    pub fn exit_chain_with_string(value: impl Into<String>) -> Self {
+        Self::exit_chain_with_value(CollectionValue::String(value.into()))
+    }
+
+    pub fn exit_chain_with_value(value: CollectionValue) -> Self {
+        Self::Control(CommandControl::Exit(value))
     }
 
     pub fn _break() -> Self {
-        Self::Control(CommandControl::Break("".to_string()))
+        Self::Control(CommandControl::Break(CollectionValue::String(
+            "".to_string(),
+        )))
     }
 
-    pub fn break_with_value(value: impl Into<String>) -> Self {
-        Self::Control(CommandControl::Break(value.into()))
+    pub fn break_with_string(value: impl Into<String>) -> Self {
+        Self::break_with_value(CollectionValue::String(value.into()))
+    }
+
+    pub fn break_with_value(value: CollectionValue) -> Self {
+        Self::Control(CommandControl::Break(value))
     }
 
     // drop is same as exit drop
     pub fn drop() -> Self {
-        Self::exit_chain_with_value(CommandAction::Drop.as_str())
+        Self::exit_chain_with_string(CommandAction::Drop.as_str())
     }
 
     // Accept is same as exit success
     pub fn accept() -> Self {
-        Self::exit_chain_with_value(CommandAction::Accept.as_str())
+        Self::exit_chain_with_string(CommandAction::Accept.as_str())
     }
 
     // Reject is same as exit reject
     pub fn reject() -> Self {
-        Self::exit_chain_with_value(CommandAction::Reject.as_str())
+        Self::exit_chain_with_string(CommandAction::Reject.as_str())
     }
 
     // ret = !ret, but  is action, then will return error
@@ -313,12 +342,16 @@ impl CommandResult {
         }
     }
 
-    pub fn value(&self) -> &String {
+    pub fn value_ref(&self) -> &CollectionValue {
         match self {
             CommandResult::Success(value) => value,
             CommandResult::Error(value) => value,
             CommandResult::Control(control) => control.value(),
         }
+    }
+
+    pub fn value(&self) -> String {
+        self.value_ref().treat_as_str().to_owned()
     }
 
     pub fn is_success(&self) -> bool {
@@ -334,15 +367,27 @@ impl CommandResult {
     }
 
     pub fn is_accept(&self) -> bool {
-        matches!(self, CommandResult::Control(CommandControl::Exit(value)) if value == CommandAction::Accept.as_str())
+        matches!(
+            self,
+            CommandResult::Control(CommandControl::Exit(value))
+                if value.as_str() == Some(CommandAction::Accept.as_str())
+        )
     }
 
     pub fn is_drop(&self) -> bool {
-        matches!(self, CommandResult::Control(CommandControl::Exit(value)) if value == CommandAction::Drop.as_str())
+        matches!(
+            self,
+            CommandResult::Control(CommandControl::Exit(value))
+                if value.as_str() == Some(CommandAction::Drop.as_str())
+        )
     }
 
     pub fn is_reject(&self) -> bool {
-        matches!(self, CommandResult::Control(CommandControl::Exit(value)) if value == CommandAction::Reject.as_str())
+        matches!(
+            self,
+            CommandResult::Control(CommandControl::Exit(value))
+                if value.as_str() == Some(CommandAction::Reject.as_str())
+        )
     }
 
     pub fn into_control(self) -> Option<CommandControl> {
@@ -365,7 +410,7 @@ impl CommandResult {
         matches!(self, CommandResult::Success(_) | CommandResult::Error(_))
     }
 
-    pub fn into_substitution_value(self) -> Option<String> {
+    pub fn into_substitution_value(self) -> Option<CollectionValue> {
         if let CommandResult::Success(value) = self {
             Some(value)
         } else if let CommandResult::Error(value) = self {

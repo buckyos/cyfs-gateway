@@ -200,14 +200,14 @@ impl CommandExecutor for GotoCommandExecutor {
         if invoke_ret.is_success() {
             return Ok(CommandResult::return_with_value(
                 self.ok_from_level,
-                invoke_ret.value().to_owned(),
+                invoke_ret.value_ref().clone(),
             ));
         }
 
         if invoke_ret.is_error() {
             return Ok(CommandResult::return_error_with_value(
                 self.err_from_level,
-                invoke_ret.value().to_owned(),
+                invoke_ret.value_ref().clone(),
             ));
         }
 
@@ -349,9 +349,9 @@ impl ReturnCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for ReturnCommandExecutor {
-    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         let value = match &self.value {
-            Some(val) => Some(val.evaluate_string(_context).await?),
+            Some(val) => Some(val.evaluate(context).await?),
             None => None,
         };
 
@@ -495,9 +495,9 @@ impl ErrorCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for ErrorCommandExecutor {
-    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         let value = match &self.value {
-            Some(val) => Some(val.evaluate_string(_context).await?),
+            Some(val) => Some(val.evaluate(context).await?),
             None => None,
         };
 
@@ -598,9 +598,9 @@ impl ExitCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for ExitCommandExecutor {
-    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         let value = match &self.value {
-            Some(val) => Some(val.evaluate_string(_context).await?),
+            Some(val) => Some(val.evaluate(context).await?),
             None => None,
         };
 
@@ -701,9 +701,9 @@ impl BreakCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for BreakCommandExecutor {
-    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         let value = match &self.value {
-            Some(val) => Some(val.evaluate_string(_context).await?),
+            Some(val) => Some(val.evaluate(context).await?),
             None => None,
         };
 

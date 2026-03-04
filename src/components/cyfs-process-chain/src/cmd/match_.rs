@@ -138,9 +138,9 @@ impl CommandExecutor for MatchCommandExecutor {
         let value = self.value.evaluate_string(context).await?;
 
         if self.pattern.is_match(&value) {
-            Ok(CommandResult::success_with_value("true"))
+            Ok(CommandResult::success_with_string("true"))
         } else {
-            Ok(CommandResult::error_with_value("false"))
+            Ok(CommandResult::error_with_string("false"))
         }
     }
 }
@@ -319,9 +319,9 @@ impl CommandExecutor for MatchRegexCommandExecutor {
                 }
             }
 
-            Ok(CommandResult::success_with_value("true"))
+            Ok(CommandResult::success_with_string("true"))
         } else {
-            Ok(CommandResult::error_with_value("false"))
+            Ok(CommandResult::error_with_string("false"))
         }
     }
 }
@@ -449,9 +449,9 @@ impl CommandExecutor for EQCommandExecutor {
         );
         */
         if is_eq {
-            Ok(CommandResult::success_with_value("true"))
+            Ok(CommandResult::success_with_string("true"))
         } else {
-            Ok(CommandResult::error_with_value("false"))
+            Ok(CommandResult::error_with_string("false"))
         }
     }
 }
@@ -613,9 +613,9 @@ impl CommandExecutor for RangeCommandExecutor {
         })?;
 
         if value >= min && value <= max {
-            Ok(CommandResult::success_with_value("true"))
+            Ok(CommandResult::success_with_string("true"))
         } else {
-            Ok(CommandResult::error_with_value("false"))
+            Ok(CommandResult::error_with_string("false"))
         }
     }
 }

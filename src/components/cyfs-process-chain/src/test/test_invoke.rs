@@ -215,3 +215,54 @@ async fn test_invoke_duplicate_arg_key_rejected() -> Result<(), String> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_invoke_typed_return_payload_preserved() -> Result<(), String> {
+    init_test_logger();
+
+    let process_chain = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            local n = $(invoke --chain callee_number);
+            is-number $n || return --from lib "not-number";
+
+            local b = $(invoke --chain callee_bool);
+            is-bool $b || return --from lib "not-bool";
+
+            return --from lib $(append $(type $n) "|" $(type $b));
+        ]]>
+    </block>
+</process_chain>
+<process_chain id="callee_number">
+    <block id="worker">
+        <![CDATA[
+            return --from chain 123;
+        ]]>
+    </block>
+</process_chain>
+<process_chain id="callee_bool">
+    <block id="worker">
+        <![CDATA[
+            return --from chain true;
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+    let hook_point = HookPoint::new("test_invoke_typed_return_payload");
+    hook_point
+        .load_process_chain_lib("invoke_typed_payload_lib", 0, process_chain)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-invoke-typed-return-payload")?;
+    let hook_point_env = HookPointEnv::new("test-invoke-typed-return-payload", data_dir);
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+
+    let ret = exec.execute_lib("invoke_typed_payload_lib").await?;
+    assert_eq!(ret.value(), "Number|Bool");
+
+    Ok(())
+}

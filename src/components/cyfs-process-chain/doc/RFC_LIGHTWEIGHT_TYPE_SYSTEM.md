@@ -6,11 +6,11 @@
 
 ## 1. 背景与现状
 
-当前实现已经支持集合类型引用（`Set/Map/MultiMap`）在变量中传递，但核心求值和命令返回仍偏字符串语义：
+当前实现已经支持集合类型引用（`Set/Map/MultiMap`）在变量中传递，并已完成控制流返回通道 typed 化；但命令参数与部分旧命令行为仍偏字符串语义：
 
 1. `CollectionValue` 缺少 `Bool/Number/Null/List/Object` 一等类型，见 [coll.rs](../src/collection/coll.rs)。
 2. 命令参数大量通过 `evaluate_string` 收敛为字符串，见 [block.rs](../src/block/block.rs)。
-3. `CommandResult` 的 success/error payload 仍是 `String`，见 [cmd.rs](../src/cmd/cmd.rs)。
+3. `CommandResult` 的 success/error payload 已升级为 `CollectionValue`（typed payload），见 [cmd.rs](../src/cmd/cmd.rs)。
 4. 多数命令实现天然字符串化，例如 `match`、`range`、`map-add` 等。
 
 这会导致：
@@ -142,10 +142,10 @@
    - `{}`
    - 或通过 `parse-json` 作为过渡方案。
 
-### 阶段 D（结构性升级）
+### 阶段 D（结构性升级，已完成核心部分）
 
-1. 将 `CommandResult::Success/Error` payload 从 `String` 升级为 typed value。
-2. 为 `$(...)` 增加 typed substitution（可与现有字符串替换并存）。
+1. 已完成：将 `CommandResult::Success/Error` payload 从 `String` 升级为 typed value。
+2. 已完成：`$(...)` 支持 typed substitution（不再强制字符串化）。
 
 ## 9. 兼容策略
 
@@ -176,7 +176,7 @@
 2. `P1`: 显式转换命令 + `type` 命令增强 + 错误码统一。
 3. `P2`: 比较/匹配命令 typed 化（先加新命令，再考虑替换旧命令）。
 4. `P3`: parser typed literal 与可选 list/object 字面量。
-5. `P4`: `CommandResult` typed payload（最后做，改动面最大）。
+5. `P4`: `CommandResult` typed payload（已完成）。
 
 ## 12. 与当前实现的关系
 

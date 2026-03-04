@@ -465,10 +465,12 @@ impl MapReduceCommand {
         // Execute reduce command if provided
         let ret = if let Some(reduce_cmd) = &self.inner.reduce_cmd {
             // Update reduce command environment with the result
-            let ret_value = ret.into_substitution_value().unwrap_or_default();
+            let ret_value = ret
+                .into_substitution_value()
+                .unwrap_or(CollectionValue::String(String::new()));
             map_reduce_env
                 .current_env()
-                .set(MAP_REDUCE_ENV_RESULT, CollectionValue::String(ret_value))
+                .set(MAP_REDUCE_ENV_RESULT, ret_value)
                 .await?;
 
             BlockExecuter::execute_expression(reduce_cmd, context).await?

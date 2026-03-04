@@ -184,7 +184,7 @@ impl CommandExecutor for RewriteCommand {
                         rewritten
                     );
 
-                    Ok(CommandResult::success_with_value(rewritten))
+                    Ok(CommandResult::success_with_string(rewritten))
                 } else {
                     let msg = format!(
                         "Pattern '{}' did not match '{}', expected prefix '{}'",
@@ -207,7 +207,7 @@ impl CommandExecutor for RewriteCommand {
                     )
                     .await?;
 
-                Ok(CommandResult::success_with_value(template_value.to_owned()))
+                Ok(CommandResult::success_with_string(template_value.to_owned()))
             }
         } else {
             info!(
@@ -404,7 +404,7 @@ impl CommandExecutor for RewriteRegexCommand {
                 .await?;
             info!("Rewritten value for {:?}: {}", self.key, result);
 
-            Ok(CommandResult::success_with_value(result))
+            Ok(CommandResult::success_with_string(result))
         } else {
             Ok(CommandResult::error())
         }
@@ -596,7 +596,7 @@ impl CommandExecutor for StringReplaceCommand {
                 .await?;
             info!("Replace value for {:?}: {}", self.key, rewritten);
 
-            Ok(super::CommandResult::success_with_value(rewritten))
+            Ok(super::CommandResult::success_with_string(rewritten))
         } else {
             Ok(super::CommandResult::error())
         }
@@ -723,7 +723,7 @@ impl CommandExecutor for StringAppendCommand {
             .join("");
 
         // Return the result as a command result
-        Ok(super::CommandResult::success_with_value(&result))
+        Ok(super::CommandResult::success_with_string(&result))
     }
 }
 
@@ -741,7 +741,7 @@ impl StringConstCommand {
 impl CommandExecutor for StringConstCommand {
     async fn exec(&self, _context: &Context) -> Result<super::CommandResult, String> {
         // Just return the result without modifying the context
-        Ok(super::CommandResult::success_with_value(&self.result))
+        Ok(super::CommandResult::success_with_string(&self.result))
     }
 }
 
@@ -893,7 +893,7 @@ impl CommandExecutor for StringSliceCommand {
                     "Sliced string: {}[{}:{}] = {}",
                     string_value, start, end, sliced
                 );
-                Ok(CommandResult::success_with_value(sliced))
+                Ok(CommandResult::success_with_string(sliced))
             }
             None => {
                 let msg = format!(
@@ -1003,7 +1003,7 @@ impl CommandExecutor for StringLengthCommand {
         info!("String length of '{}': {}", string_value, length);
 
         // Return the length as a command result
-        Ok(super::CommandResult::success_with_value(length.to_string()))
+        Ok(super::CommandResult::success_with_string(length.to_string()))
     }
 }
 
@@ -1148,9 +1148,9 @@ impl CommandExecutor for StringStartsWithCommand {
         }
 
         if starts_with {
-            Ok(super::CommandResult::success_with_value("true"))
+            Ok(super::CommandResult::success_with_string("true"))
         } else {
-            Ok(super::CommandResult::error_with_value("false"))
+            Ok(super::CommandResult::error_with_string("false"))
         }
     }
 }
@@ -1293,9 +1293,9 @@ impl CommandExecutor for StringEndsWithCommand {
         }
 
         if ends_with {
-            Ok(super::CommandResult::success_with_value("true"))
+            Ok(super::CommandResult::success_with_string("true"))
         } else {
-            Ok(super::CommandResult::error_with_value("false"))
+            Ok(super::CommandResult::error_with_string("false"))
         }
     }
 }

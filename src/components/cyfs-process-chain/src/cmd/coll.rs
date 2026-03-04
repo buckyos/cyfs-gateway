@@ -246,7 +246,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                 if ret.is_none() {
                     let msg = format!("Collection with id '{:?}' not found", self.collection);
                     warn!("{}", msg);
-                    return Ok(CommandResult::error_with_value(msg));
+                    return Ok(CommandResult::error_with_string(msg));
                 }
                 let coll = ret.unwrap();
                 if !coll.is_collection() {
@@ -298,9 +298,9 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                 );
 
                 if all_included {
-                    Ok(CommandResult::success_with_value("true"))
+                    Ok(CommandResult::success_with_string("true"))
                 } else {
-                    Ok(CommandResult::error_with_value("false"))
+                    Ok(CommandResult::error_with_string("false"))
                 }
             }
             CollectionValue::Set(collection) => {
@@ -314,9 +314,9 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                     contains
                 );
                 if contains {
-                    Ok(CommandResult::success_with_value("true"))
+                    Ok(CommandResult::success_with_string("true"))
                 } else {
-                    Ok(CommandResult::error_with_value("false"))
+                    Ok(CommandResult::error_with_string("false"))
                 }
             }
             CollectionValue::Map(collection) => {
@@ -331,7 +331,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                             self.collection,
                             value
                         );
-                        return Ok(CommandResult::success_with_value("true"));
+                        return Ok(CommandResult::success_with_string("true"));
                     } else {
                         if values.len() > 1 {
                             warn!(
@@ -352,7 +352,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                                         self.collection,
                                         v
                                     );
-                                    return Ok(CommandResult::success_with_value("true"));
+                                    return Ok(CommandResult::success_with_string("true"));
                                 } else {
                                     // value is string but not match
                                 }
@@ -376,7 +376,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                     self.collection
                 );
 
-                Ok(CommandResult::error_with_value("false"))
+                Ok(CommandResult::error_with_string("false"))
             }
 
             CollectionValue::MultiMap(collection) => {
@@ -396,7 +396,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                         self.collection
                     );
 
-                    Ok(CommandResult::success_with_value("true"))
+                    Ok(CommandResult::success_with_string("true"))
                 } else {
                     log!(
                         context.env().get_log_level(),
@@ -405,7 +405,7 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                         self.collection
                     );
 
-                    Ok(CommandResult::error_with_value("false"))
+                    Ok(CommandResult::error_with_string("false"))
                 }
             }
 
@@ -562,7 +562,7 @@ impl CommandExecutor for ListCreateCommandExecutor {
                     self.list_id, self.level
                 );
                 warn!("{}", msg);
-                Ok(CommandResult::error_with_value(msg))
+                Ok(CommandResult::error_with_string(msg))
             }
         }
     }
@@ -676,7 +676,7 @@ impl CommandExecutor for ListPushCommandExecutor {
                 if ret.is_none() {
                     let msg = format!("List collection with id '{}' not found", list_id);
                     warn!("{}", msg);
-                    return Ok(CommandResult::error_with_value(msg));
+                    return Ok(CommandResult::error_with_string(msg));
                 }
                 let coll = ret.unwrap();
                 if !coll.is_list() {
@@ -825,7 +825,7 @@ impl CommandExecutor for ListInsertCommandExecutor {
                 if ret.is_none() {
                     let msg = format!("List collection with id '{}' not found", list_id);
                     warn!("{}", msg);
-                    return Ok(CommandResult::error_with_value(msg));
+                    return Ok(CommandResult::error_with_string(msg));
                 }
                 let coll = ret.unwrap();
                 if !coll.is_list() {
@@ -971,7 +971,7 @@ impl CommandExecutor for ListSetCommandExecutor {
                 if ret.is_none() {
                     let msg = format!("List collection with id '{}' not found", list_id);
                     warn!("{}", msg);
-                    return Ok(CommandResult::error_with_value(msg));
+                    return Ok(CommandResult::error_with_string(msg));
                 }
                 let coll = ret.unwrap();
                 if !coll.is_list() {
@@ -991,7 +991,7 @@ impl CommandExecutor for ListSetCommandExecutor {
         };
 
         match list.set(index, value).await? {
-            Some(prev) => Ok(CommandResult::success_with_value(prev.treat_as_str())),
+            Some(prev) => Ok(CommandResult::success_with_string(prev.treat_as_str())),
             None => Ok(CommandResult::success()),
         }
     }
@@ -1102,7 +1102,7 @@ impl CommandExecutor for ListRemoveCommandExecutor {
                 if ret.is_none() {
                     let msg = format!("List collection with id '{}' not found", list_id);
                     warn!("{}", msg);
-                    return Ok(CommandResult::error_with_value(msg));
+                    return Ok(CommandResult::error_with_string(msg));
                 }
                 let coll = ret.unwrap();
                 if !coll.is_list() {
@@ -1122,7 +1122,7 @@ impl CommandExecutor for ListRemoveCommandExecutor {
         };
 
         match list.remove(index).await? {
-            Some(value) => Ok(CommandResult::success_with_value(value.treat_as_str())),
+            Some(value) => Ok(CommandResult::success_with_string(value.treat_as_str())),
             None => Ok(CommandResult::error()),
         }
     }
@@ -1216,7 +1216,7 @@ impl CommandExecutor for ListPopCommandExecutor {
                 if ret.is_none() {
                     let msg = format!("List collection with id '{}' not found", list_id);
                     warn!("{}", msg);
-                    return Ok(CommandResult::error_with_value(msg));
+                    return Ok(CommandResult::error_with_string(msg));
                 }
                 let coll = ret.unwrap();
                 if !coll.is_list() {
@@ -1236,7 +1236,7 @@ impl CommandExecutor for ListPopCommandExecutor {
         };
 
         match list.pop().await? {
-            Some(value) => Ok(CommandResult::success_with_value(value.treat_as_str())),
+            Some(value) => Ok(CommandResult::success_with_string(value.treat_as_str())),
             None => Ok(CommandResult::error()),
         }
     }
@@ -1330,7 +1330,7 @@ impl CommandExecutor for ListClearCommandExecutor {
                 if ret.is_none() {
                     let msg = format!("List collection with id '{}' not found", list_id);
                     warn!("{}", msg);
-                    return Ok(CommandResult::error_with_value(msg));
+                    return Ok(CommandResult::error_with_string(msg));
                 }
                 let coll = ret.unwrap();
                 if !coll.is_list() {
@@ -1506,7 +1506,7 @@ impl CommandExecutor for SetCreateCommandExecutor {
                     self.set_id, self.level
                 );
                 warn!("{}", msg);
-                Ok(CommandResult::error_with_value(msg))
+                Ok(CommandResult::error_with_string(msg))
             }
         }
     }
@@ -1628,7 +1628,7 @@ impl CommandExecutor for SetAddCommandExecutor {
                 if ret.is_none() {
                     let msg = format!("Set collection with id '{}' not found", set_id);
                     warn!("{}", msg);
-                    return Ok(CommandResult::error_with_value(msg));
+                    return Ok(CommandResult::error_with_string(msg));
                 }
                 let coll = ret.unwrap();
                 if !coll.is_set() {
@@ -1778,7 +1778,7 @@ impl CommandExecutor for SetRemoveCommandExecutor {
                 if ret.is_none() {
                     let msg = format!("Set collection with id '{}' not found", set_id);
                     warn!("{}", msg);
-                    return Ok(CommandResult::error_with_value(msg));
+                    return Ok(CommandResult::error_with_string(msg));
                 }
                 let coll = ret.unwrap();
                 if !coll.is_set() {
@@ -1982,7 +1982,7 @@ impl CommandExecutor for MapCreateCommandExecutor {
                     self.map_id, self.is_multi, self.level
                 );
                 warn!("{}", msg);
-                Ok(CommandResult::error_with_value(msg))
+                Ok(CommandResult::error_with_string(msg))
             }
         }
     }
@@ -2118,7 +2118,7 @@ impl CommandExecutor for MapAddCommandExecutor {
                 if ret.is_none() {
                     let msg = format!("Map collection with id '{}' not found", map_id);
                     warn!("{}", msg);
-                    return Ok(CommandResult::error_with_value(msg));
+                    return Ok(CommandResult::error_with_string(msg));
                 }
                 let coll = ret.unwrap();
                 if !coll.is_map() && !coll.is_multi_map() {
@@ -2214,7 +2214,7 @@ impl CommandExecutor for MapAddCommandExecutor {
                             key, values, self.map
                         );
                         warn!("{}", msg);
-                        Ok(CommandResult::error_with_value(msg))
+                        Ok(CommandResult::error_with_string(msg))
                     }
                 }
             }
@@ -2360,7 +2360,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                 if ret.is_none() {
                     let msg = format!("Map collection with id '{}' not found", map_id);
                     warn!("{}", msg);
-                    return Ok(CommandResult::error_with_value(msg));
+                    return Ok(CommandResult::error_with_string(msg));
                 }
                 let coll = ret.unwrap();
                 if !coll.is_map() && !coll.is_multi_map() {
@@ -2404,7 +2404,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                             self.map,
                             value,
                         );
-                        Ok(CommandResult::success_with_value(value.treat_as_str()))
+                        Ok(CommandResult::success_with_string(value.treat_as_str()))
                     }
                     None => {
                         warn!(
@@ -2417,7 +2417,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
             }
             CollectionValue::MultiMap(collection) => {
                 if values.is_empty() {
-                    return Ok(CommandResult::error_with_value(
+                    return Ok(CommandResult::error_with_string(
                         "No values provided for multi-map remove".to_string(),
                     ));
                 }
@@ -2454,7 +2454,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                         value,
                         self.map
                     );
-                    Ok(CommandResult::success_with_value(value))
+                    Ok(CommandResult::success_with_string(value))
                 } else {
                     warn!(
                         "Key '{}' with values '{:?}' not found in multi-map collection with id '{:?}'",

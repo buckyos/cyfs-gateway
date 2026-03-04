@@ -156,11 +156,7 @@ impl CommandExecutor for CaptureCommandExecutor {
         if let Some(value_var) = &self.value_var {
             context
                 .env()
-                .set(
-                    value_var,
-                    CollectionValue::String(ret.value().clone()),
-                    Some(EnvLevel::Block),
-                )
+                .set(value_var, ret.value_ref().clone(), Some(EnvLevel::Block))
                 .await?;
         }
 

@@ -56,8 +56,8 @@ impl ToBoolCommandExecutor {
 impl CommandExecutor for ToBoolCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         match self.value.evaluate_bool(context).await {
-            Ok(value) => Ok(CommandResult::success_with_value(value.to_string())),
-            Err(e) => Ok(CommandResult::error_with_value(e)),
+            Ok(value) => Ok(CommandResult::success_with_string(value.to_string())),
+            Err(e) => Ok(CommandResult::error_with_string(e)),
         }
     }
 }
@@ -114,8 +114,8 @@ impl ToNumberCommandExecutor {
 impl CommandExecutor for ToNumberCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         match self.value.evaluate_number(context).await {
-            Ok(value) => Ok(CommandResult::success_with_value(value.to_string())),
-            Err(e) => Ok(CommandResult::error_with_value(e)),
+            Ok(value) => Ok(CommandResult::success_with_string(value.to_string())),
+            Err(e) => Ok(CommandResult::error_with_string(e)),
         }
     }
 }
@@ -189,9 +189,9 @@ impl CommandExecutor for ValuePredicateCommandExecutor {
         };
 
         if matched {
-            Ok(CommandResult::success_with_value("true"))
+            Ok(CommandResult::success_with_string("true"))
         } else {
-            Ok(CommandResult::error_with_value("false"))
+            Ok(CommandResult::error_with_string("false"))
         }
     }
 }

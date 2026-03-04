@@ -142,10 +142,15 @@ async fn on_new_connection(
     let url = match &ret {
         CommandResult::Control(CommandControl::Return(forward)) => {
             // If the command was successful, we can get a URL to forward the request
-            let url = Url::parse(&forward.value).map_err(|e| {
+            let forward_url = forward.value.try_as_str().map_err(|e| {
+                let msg = format!("Process chain returned non-string URL payload: {}", e);
+                error!("{}", msg);
+                msg
+            })?;
+            let url = Url::parse(forward_url).map_err(|e| {
                 let msg = format!(
                     "Failed to parse URL from process chain: {}, {}",
-                    e, forward.value
+                    e, forward_url
                 );
                 error!("{}", msg);
                 msg

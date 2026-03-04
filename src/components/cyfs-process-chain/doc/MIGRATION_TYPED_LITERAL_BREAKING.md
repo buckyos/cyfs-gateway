@@ -170,4 +170,4 @@ rg -n '\b(match|match-reg|append|replace|map-add|set-add|return|error|exit)\b' c
 
 ---
 
-如果后续决定同时升级 `CommandResult` 为 typed payload，应基于本草案再补一份“控制流协议迁移”子文档，单独处理 `return/error/goto/invoke` 的调用边界变更。
+`CommandResult` typed payload 已落地（`return/error/goto/invoke` 控制流边界已切换为 typed value 传递）；如需进一步规范外部接口契约，建议补充“控制流协议迁移”子文档，集中约束跨模块调用边界。

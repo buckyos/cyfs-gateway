@@ -94,7 +94,7 @@ impl ExternalCommand for AddCommand {
         })?;
         
         let result = a + b;
-        let ret = CommandResult::success_with_value(result.to_string());
+        let ret = CommandResult::success_with_string(result.to_string());
 
         info!(
             "Executed add command: {}, args: {:?}, result: {:?}",

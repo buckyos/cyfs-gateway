@@ -225,6 +225,6 @@ impl CommandExecutor for EchoCommandExecutor {
             output_str = String::new();
         }
 
-        Ok(CommandResult::success_with_value(output_str))
+        Ok(CommandResult::success_with_string(output_str))
     }
 }

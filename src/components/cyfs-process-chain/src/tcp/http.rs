@@ -166,7 +166,7 @@ impl ExternalCommand for HttpProbeCommand {
         if ret.is_none() {
             let msg = "No $REQ found in the environment".to_string();
             error!("{}", msg);
-            return Ok(CommandResult::error_with_value(msg));
+            return Ok(CommandResult::error_with_string(msg));
         }
 
         let req = ret.unwrap();
@@ -174,7 +174,7 @@ impl ExternalCommand for HttpProbeCommand {
         if req.is_none() {
             let msg = "$REQ is not a map".to_string();
             error!("{}", msg);
-            return Ok(CommandResult::error_with_value(msg));
+            return Ok(CommandResult::error_with_string(msg));
         }
 
         let req = req.unwrap();
@@ -182,7 +182,7 @@ impl ExternalCommand for HttpProbeCommand {
         if stream.is_none() {
             let msg = "No incoming stream found in $REQ".to_string();
             error!("{}", msg);
-            return Ok(CommandResult::error_with_value(msg));
+            return Ok(CommandResult::error_with_string(msg));
         }
 
         let stream = stream.unwrap();
@@ -190,7 +190,7 @@ impl ExternalCommand for HttpProbeCommand {
         if ret.is_none() {
             let msg = "Incoming stream is not of type Any".to_string();
             error!("{}", msg);
-            return Ok(CommandResult::error_with_value(msg));
+            return Ok(CommandResult::error_with_string(msg));
         }
 
         let slot: Arc<Mutex<Option<Box<dyn AsyncStream>>>> = ret.unwrap();
@@ -198,7 +198,7 @@ impl ExternalCommand for HttpProbeCommand {
         if stream.is_none() {
             let msg = "Incoming stream is None".to_string();
             error!("{}", msg);
-            return Ok(CommandResult::error_with_value(msg));
+            return Ok(CommandResult::error_with_string(msg));
         }
 
         let stream = stream.unwrap();
@@ -298,7 +298,7 @@ impl ExternalCommand for HttpProbeCommand {
         }
 
         match host {
-            Some(value) => Ok(CommandResult::success_with_value(value)),
+            Some(value) => Ok(CommandResult::success_with_string(value)),
             None => Ok(CommandResult::error()),
         }
     }

@@ -884,7 +884,7 @@ impl CommandArgEvaluator {
                     return Err(msg);
                 }
 
-                CollectionValue::String(ret.into_substitution_value().unwrap())
+                ret.into_substitution_value().unwrap()
             }
         };
 

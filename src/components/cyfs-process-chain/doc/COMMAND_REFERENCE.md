@@ -403,7 +403,7 @@ Arguments:
 
 Options:
       --value <VAR>
-          Variable name to store CommandResult.value()
+          Variable name to store CommandResult payload (typed value)
 
       --status <VAR>
           Variable name to store status: success|error|control
