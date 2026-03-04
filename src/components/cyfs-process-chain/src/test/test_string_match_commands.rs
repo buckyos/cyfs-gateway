@@ -1,0 +1,450 @@
+use crate::*;
+use simplelog::*;
+use std::path::PathBuf;
+use std::sync::Once;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static LOGGER_INIT: Once = Once::new();
+
+fn init_test_logger() {
+    LOGGER_INIT.call_once(|| {
+        TermLogger::init(
+            LevelFilter::Info,
+            Config::default(),
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        )
+        .unwrap_or_else(|_| {
+            let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
+        });
+    });
+}
+
+fn new_test_data_dir(scope: &str) -> Result<PathBuf, String> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("system time error: {}", e))?
+        .as_nanos();
+    let pid = std::process::id();
+    let data_dir =
+        std::env::temp_dir().join(format!("cyfs-process-chain-{}-{}-{}", scope, pid, ts));
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("create test data dir {:?} failed: {}", data_dir, e))?;
+    Ok(data_dir)
+}
+
+const PROCESS_CHAIN_RANGE_BASIC: &str = r#"
+<process_chain_lib id="range_basic_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                range 5 1 10 || return --from lib "range_literal_fail";
+                range 20 1 10 && return --from lib "range_false_should_not_pass";
+                range $port 1000 2000 || return --from lib "range_var_fail";
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_RANGE_RUNTIME_ERROR: &str = r#"
+<process_chain_lib id="range_runtime_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                range $raw_port 1000 2000;
+                return --from lib "unexpected";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_RANGE_PARSE_ERROR: &str = r#"
+<process_chain_lib id="range_parse_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                range 5 abc 10;
+                return --from lib "unexpected";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_STRLEN_TYPED_NUMBER: &str = r#"
+<process_chain_lib id="strlen_typed_number_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local len=$(strlen "hello");
+                is-number $len || return --from lib "len_not_number";
+                range $len 5 5 || return --from lib "len_value_fail";
+                return --from lib $(type $len);
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_STRLEN_STRICT_ERROR: &str = r#"
+<process_chain_lib id="strlen_strict_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                strlen true;
+                return --from lib "unexpected";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_STARTS_ENDS: &str = r#"
+<process_chain_lib id="starts_ends_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                starts-with --ignore-case "HelloWorld" "hello" || return --from lib "starts_ignore_case_fail";
+                ends-with --ignore-case "HelloWorld" "WORLD" || return --from lib "ends_ignore_case_fail";
+
+                starts-with "HelloWorld" "world" && return --from lib "starts_should_fail";
+                ends-with "HelloWorld" "HELLO" && return --from lib "ends_should_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_SLICE_SUCCESS: &str = r#"
+<process_chain_lib id="slice_success_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                return --from lib $(slice "你好世界" 0:6);
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_SLICE_PARSE_ERROR: &str = r#"
+<process_chain_lib id="slice_parse_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                slice "abc" bad;
+                return --from lib "unexpected";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_STRING_REGEX_PIPELINE: &str = r#"
+<process_chain_lib id="string_regex_pipeline_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local path="/kapi/my-service/v1";
+
+                rewrite $path "/kapi/my-service/*" "/kapi/*" || return --from lib "rewrite_fail";
+                eq $path "/kapi/v1" || return --from lib "rewrite_value_fail";
+
+                rewrite-reg $path "^/kapi/([A-Za-z0-9_]+)\$" "/new/\$1" || return --from lib "rewrite_reg_fail";
+                eq $path "/new/v1" || return --from lib "rewrite_reg_value_fail";
+
+                replace $path "/new/" "/api/" || return --from lib "replace_fail";
+                eq $path "/api/v1" || return --from lib "replace_value_fail";
+
+                replace $path "not_found" "x" && return --from lib "replace_should_fail";
+
+                match-reg $path "^/api/[a-z0-9_]+\$" || return --from lib "match_reg_fail";
+                match-reg --no-ignore-case $path "^/API/[A-Z0-9_]+\$" && return --from lib "match_reg_case_should_fail";
+                match-reg $path "^/API/[A-Z0-9_]+\$" || return --from lib "match_reg_ignore_case_default_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_REWRITE_REGEX_PARSE_ERROR: &str = r#"
+<process_chain_lib id="rewrite_regex_parse_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local path="/kapi/v1";
+                rewrite-reg $path "(" "/x";
+                return --from lib "unexpected";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+#[tokio::test]
+async fn test_range_command_basic_flow() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_range_basic");
+    hook_point
+        .load_process_chain_lib("range_basic_lib", 0, PROCESS_CHAIN_RANGE_BASIC)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-range-basic")?;
+    let hook_point_env = HookPointEnv::new("test-range-basic", data_dir);
+    hook_point_env
+        .hook_point_env()
+        .create("port", CollectionValue::Number(NumberValue::Int(1500)))
+        .await?;
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("range_basic_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_range_command_runtime_rejects_non_numeric_value() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_range_runtime_error");
+    hook_point
+        .load_process_chain_lib(
+            "range_runtime_error_lib",
+            0,
+            PROCESS_CHAIN_RANGE_RUNTIME_ERROR,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-range-runtime-error")?;
+    let hook_point_env = HookPointEnv::new("test-range-runtime-error", data_dir);
+    hook_point_env
+        .hook_point_env()
+        .create("raw_port", CollectionValue::String("abc".to_owned()))
+        .await?;
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = exec
+        .execute_lib("range_runtime_error_lib")
+        .await
+        .err()
+        .ok_or_else(|| "range runtime error expected".to_string())?;
+    assert!(
+        err.contains("Cannot convert string 'abc' to number"),
+        "unexpected error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_range_command_parse_rejects_invalid_begin_literal() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_range_parse_error");
+    hook_point
+        .load_process_chain_lib(
+            "range_parse_error_lib",
+            0,
+            PROCESS_CHAIN_RANGE_PARSE_ERROR,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-range-parse-error")?;
+    let hook_point_env = HookPointEnv::new("test-range-parse-error", data_dir);
+
+    let err = hook_point_env
+        .link_hook_point(&hook_point)
+        .await
+        .err()
+        .ok_or_else(|| "link should fail on invalid range begin literal".to_string())?;
+    assert!(
+        err.contains("Invalid range command begin value"),
+        "unexpected link error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_strlen_returns_typed_number() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_strlen_typed_number");
+    hook_point
+        .load_process_chain_lib(
+            "strlen_typed_number_lib",
+            0,
+            PROCESS_CHAIN_STRLEN_TYPED_NUMBER,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-strlen-typed-number")?;
+    let hook_point_env = HookPointEnv::new("test-strlen-typed-number", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("strlen_typed_number_lib").await?;
+    assert_eq!(ret.value(), "Number");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_strlen_in_strict_mode_rejects_bool() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_strlen_strict_error");
+    hook_point
+        .load_process_chain_lib(
+            "strlen_strict_error_lib",
+            0,
+            PROCESS_CHAIN_STRLEN_STRICT_ERROR,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-strlen-strict-error")?;
+    let hook_point_env = HookPointEnv::new("test-strlen-strict-error", data_dir);
+    hook_point_env.set_coercion_policy(CoercionPolicy::Strict);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = exec
+        .execute_lib("strlen_strict_error_lib")
+        .await
+        .err()
+        .ok_or_else(|| "strict strlen should fail on bool".to_string())?;
+    assert!(
+        err.contains("Expected string value, found Bool (strict coercion)"),
+        "unexpected error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_starts_with_and_ends_with_case_behaviors() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_starts_ends");
+    hook_point
+        .load_process_chain_lib("starts_ends_lib", 0, PROCESS_CHAIN_STARTS_ENDS)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-starts-ends")?;
+    let hook_point_env = HookPointEnv::new("test-starts-ends", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("starts_ends_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_slice_success_with_utf8_boundary() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_slice_success");
+    hook_point
+        .load_process_chain_lib("slice_success_lib", 0, PROCESS_CHAIN_SLICE_SUCCESS)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-slice-success")?;
+    let hook_point_env = HookPointEnv::new("test-slice-success", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("slice_success_lib").await?;
+    assert_eq!(ret.value(), "你好");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_slice_rejects_invalid_range_format() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_slice_parse_error");
+    hook_point
+        .load_process_chain_lib("slice_parse_error_lib", 0, PROCESS_CHAIN_SLICE_PARSE_ERROR)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-slice-parse-error")?;
+    let hook_point_env = HookPointEnv::new("test-slice-parse-error", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = exec
+        .execute_lib("slice_parse_error_lib")
+        .await
+        .err()
+        .ok_or_else(|| "slice invalid range should fail".to_string())?;
+    assert!(
+        err.contains("Invalid range format: bad"),
+        "unexpected error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rewrite_replace_and_match_regex_pipeline() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_string_regex_pipeline");
+    hook_point
+        .load_process_chain_lib(
+            "string_regex_pipeline_lib",
+            0,
+            PROCESS_CHAIN_STRING_REGEX_PIPELINE,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-string-regex-pipeline")?;
+    let hook_point_env = HookPointEnv::new("test-string-regex-pipeline", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("string_regex_pipeline_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rewrite_regex_rejects_invalid_pattern_at_link_time() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_rewrite_regex_parse_error");
+    hook_point
+        .load_process_chain_lib(
+            "rewrite_regex_parse_error_lib",
+            0,
+            PROCESS_CHAIN_REWRITE_REGEX_PARSE_ERROR,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-rewrite-regex-parse-error")?;
+    let hook_point_env = HookPointEnv::new("test-rewrite-regex-parse-error", data_dir);
+
+    let err = hook_point_env
+        .link_hook_point(&hook_point)
+        .await
+        .err()
+        .ok_or_else(|| "link should fail on invalid rewrite-reg regex".to_string())?;
+    assert!(
+        err.contains("Invalid regex pattern"),
+        "unexpected link error: {}",
+        err
+    );
+
+    Ok(())
+}

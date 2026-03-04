@@ -12,4 +12,5 @@ mod test_goto;
 mod test_if;
 mod test_list;
 mod test_coercion;
+mod test_string_match_commands;
 mod external;
