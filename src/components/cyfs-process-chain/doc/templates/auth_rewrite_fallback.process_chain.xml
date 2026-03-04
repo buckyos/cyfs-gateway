@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Template: auth_rewrite_fallback
+Input:
+  - REQ.authToken (string, required, format: Bearer ...)
+  - REQ.path (string, required)
+Output:
+  - return --from lib <upstream_id>
+Error:
+  - error --from lib PC-TPL-AUTH-0001 (auth failed)
+-->
+<process_chain_lib id="tpl_auth_rewrite_fallback" priority="100">
+  <process_chain id="route">
+    <block id="entry">
+      <![CDATA[
+        starts-with $REQ.authToken "Bearer " || error --from lib "PC-TPL-AUTH-0001";
+
+        rewrite $REQ.path "/legacy/*" "/v2/*" || echo "skip_rewrite";
+
+        match $REQ.path "/v2/order/*" && return --from lib "upstream_order";
+        match $REQ.path "/v2/user/*" && return --from lib "upstream_user";
+
+        return --from lib "upstream_fallback";
+      ]]>
+    </block>
+  </process_chain>
+</process_chain_lib>
