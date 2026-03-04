@@ -871,10 +871,17 @@ By default, eq uses strict typed comparison:
   - Same-type scalar values are compared directly
   - Different types are not equal (e.g. Number(1) != String("1"))
 
+Syntax sugar:
+  - value1 == value2   => eq --loose value1 value2
+  - value1 === value2  => eq value1 value2
+  - Mainly used in if/elif conditions for readability.
+
 Examples:
   eq 1 1
   eq 1 "1"              # false under strict mode
   eq --loose 1 "1"      # true under loose mode
+  if $REQ.port == "443" then ...
+  if $REQ.role === "admin" then ...
   eq "host" "host"
   eq --ignore-case "Host" "HOST"
 ```
@@ -889,10 +896,17 @@ Options:
   -i, --ignore-case   Case-insensitive for string-string only
   -l, --loose         Enable loose comparison for string/number
 
+Syntax sugar:
+  - value1 != value2   => ne --loose value1 value2
+  - value1 !== value2  => ne value1 value2
+  - Mainly used in if/elif conditions for readability.
+
 Examples:
   ne 1 "1"                 # true under strict mode
   ne --loose 1 "1"         # false under loose mode
   ne --ignore-case "A" "a" # false
+  if $REQ.port != "443" then ...
+  if $REQ.role !== "admin" then ...
 ```
 
 ### `gt` / `ge` / `lt` / `le`

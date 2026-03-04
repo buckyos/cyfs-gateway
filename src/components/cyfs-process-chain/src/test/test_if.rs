@@ -215,3 +215,89 @@ async fn test_if_condition_rejects_control_action() -> Result<(), String> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn test_if_comparison_operator_sugar() -> Result<(), String> {
+    init_test_logger();
+
+    let script = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            local one=1;
+            if $one == "1" then
+                if $one === "1" then
+                    return --from lib "strict_should_fail";
+                end
+            else
+                return --from lib "loose_should_match";
+            end
+
+            if $REQ.role === "admin" then
+                return --from lib "strict_role_ok";
+            end
+
+            if $REQ.role == "ADMIN" then
+                return --from lib "loose_case_should_not_match";
+            end
+
+            return --from lib "final";
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+    assert_eq!(
+        execute_with_req(script, "admin", "https", "yes").await?,
+        "strict_role_ok"
+    );
+    assert_eq!(
+        execute_with_req(script, "user", "https", "yes").await?,
+        "final"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_if_not_equal_operator_sugar() -> Result<(), String> {
+    init_test_logger();
+
+    let script = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            local one=1;
+            if $one != "1" then
+                return --from lib "loose_ne_should_fail";
+            end
+
+            if $one !== "1" then
+                if $REQ.role == "admin" then
+                    return --from lib "strict_ne_branch";
+                end
+            end
+
+            if $REQ.role !== "admin" then
+                return --from lib "non_admin";
+            end
+
+            return --from lib "admin";
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+    assert_eq!(
+        execute_with_req(script, "admin", "https", "yes").await?,
+        "strict_ne_branch"
+    );
+    assert_eq!(
+        execute_with_req(script, "user", "https", "yes").await?,
+        "non_admin"
+    );
+    Ok(())
+}

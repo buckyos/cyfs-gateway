@@ -416,7 +416,13 @@ impl BlockParser {
     // Parse expression with brackets or command
     fn parse_expression(input: &str) -> IResult<&str, Expression> {
         debug!("Parsing expression: {}", input);
-        alt((Self::parse_assign, Self::parse_group, Self::parse_command)).parse(input)
+        alt((
+            Self::parse_assign,
+            Self::parse_group,
+            Self::parse_comparison_sugar,
+            Self::parse_command,
+        ))
+        .parse(input)
     }
 
     // Parse group of expressions with brackets
@@ -508,6 +514,34 @@ impl BlockParser {
 
         let args = CommandArgs::new(args);
         let cmd = CommandItem::new("assign".to_string(), args);
+        Ok((input, Expression::Command(cmd)))
+    }
+
+    // Parse infix comparison sugar:
+    //   value1 == value2   -> eq --loose value1 value2
+    //   value1 === value2  -> eq value1 value2
+    //   value1 != value2   -> ne --loose value1 value2
+    //   value1 !== value2  -> ne value1 value2
+    fn parse_comparison_sugar(input: &str) -> IResult<&str, Expression> {
+        debug!("Parsing comparison sugar: {}", input);
+        let (input, left) = Self::parse_arg(input)?;
+        let (input, op) =
+            preceded(space0, alt((tag("!=="), tag("!="), tag("==="), tag("==")))).parse(input)?;
+        let (input, right) = Self::parse_arg(input)?;
+
+        let command_name = match op {
+            "==" | "===" => "eq",
+            "!=" | "!==" => "ne",
+            _ => unreachable!("unsupported comparison operator: {}", op),
+        };
+        let mut args = vec![CommandArg::Literal(command_name.to_string())];
+        if op == "==" || op == "!=" {
+            args.push(CommandArg::Literal("--loose".to_string()));
+        }
+        args.push(left);
+        args.push(right);
+
+        let cmd = CommandItem::new(command_name.to_string(), CommandArgs::new(args));
         Ok((input, Expression::Command(cmd)))
     }
 
@@ -1273,5 +1307,59 @@ mod tests {
         let block = parser.parse(block_str).unwrap();
         assert_eq!(block.id, "test_block");
         assert_eq!(block.lines.len(), 5);
+    }
+
+    #[test]
+    fn test_parse_comparison_sugar_loose() {
+        let (rest, expr) = BlockParser::parse_expression("$a == \"1\"").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "eq");
+        assert_eq!(cmd.command.args.len(), 4);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("eq"));
+        assert_eq!(cmd.command.args[1].as_literal_str(), Some("--loose"));
+        assert!(matches!(cmd.command.args[2], CommandArg::Var(_)));
+        assert!(matches!(cmd.command.args[3], CommandArg::StringLiteral(_)));
+    }
+
+    #[test]
+    fn test_parse_comparison_sugar_strict() {
+        let (rest, expr) = BlockParser::parse_expression("$a === \"1\"").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "eq");
+        assert_eq!(cmd.command.args.len(), 3);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("eq"));
+        assert!(matches!(cmd.command.args[1], CommandArg::Var(_)));
+        assert!(matches!(cmd.command.args[2], CommandArg::StringLiteral(_)));
+    }
+
+    #[test]
+    fn test_parse_comparison_sugar_ne_loose() {
+        let (rest, expr) = BlockParser::parse_expression("$a != \"1\"").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "ne");
+        assert_eq!(cmd.command.args.len(), 4);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("ne"));
+        assert_eq!(cmd.command.args[1].as_literal_str(), Some("--loose"));
+        assert!(matches!(cmd.command.args[2], CommandArg::Var(_)));
+        assert!(matches!(cmd.command.args[3], CommandArg::StringLiteral(_)));
+    }
+
+    #[test]
+    fn test_parse_comparison_sugar_ne_strict() {
+        let (rest, expr) = BlockParser::parse_expression("$a !== \"1\"").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "ne");
+        assert_eq!(cmd.command.args.len(), 3);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("ne"));
+        assert!(matches!(cmd.command.args[1], CommandArg::Var(_)));
+        assert!(matches!(cmd.command.args[2], CommandArg::StringLiteral(_)));
     }
 }
