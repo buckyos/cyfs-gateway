@@ -835,7 +835,7 @@ Examples:
 
 ### `eq`
 ```
-Compare two strings for equality.
+Compare two values for equality (strict typed by default).
 
 Usage: eq [OPTIONS] <value1> <value2>
 
@@ -848,24 +848,33 @@ Arguments:
 
 Options:
   -i, --ignore-case
-          Enable case-insensitive comparison
+          Enable case-insensitive comparison (string-string only)
+
+  -l, --loose
+          Enable loose comparison for string/number
 
   -h, --help
           Print help
 
 
-Compare two strings for equality.
+Compare two values for equality.
 
 Arguments:
   <value1>        First value to compare
   <value2>        Second value to compare
 
 Options:
-  --ignore-case   Perform case-insensitive comparison
+  --ignore-case   Perform case-insensitive comparison (string-string only)
+  --loose         Enable loose comparison for string/number
 
-By default, the comparison is case-sensitive. Use --ignore-case to enable case-insensitive comparison.
+By default, eq uses strict typed comparison:
+  - Same-type scalar values are compared directly
+  - Different types are not equal (e.g. Number(1) != String("1"))
 
 Examples:
+  eq 1 1
+  eq 1 "1"              # false under strict mode
+  eq --loose 1 "1"      # true under loose mode
   eq "host" "host"
   eq --ignore-case "Host" "HOST"
 ```

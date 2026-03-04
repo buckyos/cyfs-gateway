@@ -1,7 +1,7 @@
 
 use crate::cmd::*;
 use clap::{Arg, Command};
-use crate::collection::CollectionValue;
+use crate::collection::{CollectionValue, NumberValue};
 use crate::chain::Context;
 use crate::block::CommandArgs;
 
@@ -89,7 +89,11 @@ impl ExternalCommand for AddCommand {
         let b = parse_number(&args[2], 2)?;
 
         let result = a + b;
-        let ret = CommandResult::success_with_string(result.to_string());
+        let ret = if result.fract() == 0.0 {
+            CommandResult::success_with_value(CollectionValue::Number(NumberValue::Int(result as i64)))
+        } else {
+            CommandResult::success_with_value(CollectionValue::Number(NumberValue::Float(result)))
+        };
 
         info!(
             "Executed add command: {}, args: {:?}, result: {:?}",

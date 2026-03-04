@@ -326,7 +326,7 @@ impl CommandExecutor for MatchRegexCommandExecutor {
     }
 }
 
-// EQ command, like: eq REQ_HEADER.host "localhost"; eq --ignore-case REQ_HEADER.host "LOCALHOST"
+// EQ command, like: eq REQ_HEADER.host "localhost"; eq --ignore-case REQ_HEADER.host "LOCALHOST"; eq --loose 1 "1"
 pub struct EQCommandParser {
     cmd: Command,
 }
@@ -334,21 +334,27 @@ pub struct EQCommandParser {
 impl EQCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("eq")
-        .about("Compare two strings for equality.")
+        .about("Compare two values for equality (strict typed by default).")
         .after_help(
             r#"
-Compare two strings for equality.
+Compare two values for equality.
 
 Arguments:
   <value1>        First value to compare
   <value2>        Second value to compare
 
 Options:
-  --ignore-case   Perform case-insensitive comparison
+  --ignore-case   Perform case-insensitive comparison (string-string only)
+  --loose         Enable loose comparison for string/number
 
-By default, the comparison is case-sensitive. Use --ignore-case to enable case-insensitive comparison.
+By default, eq uses strict typed comparison:
+  - Same-type scalar values are compared directly
+  - Different types are not equal (e.g. Number(1) != String("1"))
 
 Examples:
+  eq 1 1
+  eq 1 "1"              # false under strict mode
+  eq --loose 1 "1"      # true under loose mode
   eq "host" "host"
   eq --ignore-case "Host" "HOST"
 "#,
@@ -359,6 +365,13 @@ Examples:
                 .short('i')
                 .action(ArgAction::SetTrue)
                 .help("Enable case-insensitive comparison"),
+        )
+        .arg(
+            Arg::new("loose")
+                .long("loose")
+                .short('l')
+                .action(ArgAction::SetTrue)
+                .help("Enable loose comparison for string/number"),
         )
         .arg(
             Arg::new("value1")
@@ -397,6 +410,7 @@ impl CommandParser for EQCommandParser {
         })?;
 
         let ignore_case = matches.get_flag("ignore_case");
+        let loose = matches.get_flag("loose");
 
         let value_index1 = matches.index_of("value1").ok_or_else(|| {
             let msg = "Value1 argument is required for eq command".to_string();
@@ -414,6 +428,7 @@ impl CommandParser for EQCommandParser {
 
         let cmd = EQCommandExecutor {
             ignore_case,
+            loose,
             value1,
             value2,
         };
@@ -425,21 +440,85 @@ impl CommandParser for EQCommandParser {
 // EQ command executer
 pub struct EQCommandExecutor {
     pub ignore_case: bool, // Whether to ignore case, default is false
+    pub loose: bool,       // Whether to use loose comparison across scalar types
     pub value1: CommandArg,
     pub value2: CommandArg,
+}
+
+impl EQCommandExecutor {
+    fn parse_number_literal(raw: &str) -> Option<f64> {
+        let trimmed = raw.trim();
+        if let Ok(v) = trimmed.parse::<i64>() {
+            return Some(v as f64);
+        }
+        if let Ok(v) = trimmed.parse::<f64>() {
+            return Some(v);
+        }
+        None
+    }
+
+    fn as_loose_number(value: &CollectionValue) -> Option<f64> {
+        match value {
+            CollectionValue::Number(v) => Some(v.as_f64()),
+            CollectionValue::String(s) => Self::parse_number_literal(s),
+            _ => None,
+        }
+    }
+
+    fn compare_strict(&self, left: &CollectionValue, right: &CollectionValue) -> bool {
+        if self.ignore_case {
+            if let (CollectionValue::String(lhs), CollectionValue::String(rhs)) = (left, right) {
+                return lhs.eq_ignore_ascii_case(rhs);
+            }
+        }
+
+        left == right
+    }
+
+    fn compare_loose(&self, left: &CollectionValue, right: &CollectionValue) -> bool {
+        if let (CollectionValue::String(lhs), CollectionValue::String(rhs)) = (left, right) {
+            return if self.ignore_case {
+                lhs.eq_ignore_ascii_case(rhs)
+            } else {
+                lhs == rhs
+            };
+        }
+
+        if left.is_null() || right.is_null() {
+            return left.is_null() && right.is_null();
+        }
+
+        if let (CollectionValue::Number(lhs), CollectionValue::Number(rhs)) = (left, right) {
+            return lhs.as_f64() == rhs.as_f64();
+        }
+
+        if let (CollectionValue::Bool(lhs), CollectionValue::Bool(rhs)) = (left, right) {
+            return lhs == rhs;
+        }
+
+        if let (CollectionValue::String(_), CollectionValue::Number(_))
+            | (CollectionValue::Number(_), CollectionValue::String(_)) = (left, right)
+        {
+            if let (Some(lhs), Some(rhs)) = (Self::as_loose_number(left), Self::as_loose_number(right)) {
+                return lhs == rhs;
+            }
+        }
+
+        left == right
+    }
 }
 
 #[async_trait::async_trait]
 impl CommandExecutor for EQCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         // Evaluate both values
-        let value1 = self.value1.evaluate_string(context).await?;
-        let value2 = self.value2.evaluate_string(context).await?;
+        let value1 = self.value1.evaluate(context).await?;
+        let value2 = self.value2.evaluate(context).await?;
 
-        let is_eq = if self.ignore_case {
-            value1.eq_ignore_ascii_case(&value2)
+        let is_eq = if self.loose {
+            self.compare_loose(&value1, &value2)
         } else {
-            value1 == value2
+            self.compare_strict(&value1, &value2)
         };
 
         /*
