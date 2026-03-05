@@ -143,7 +143,7 @@ echo "Using interface: $LAN_IFACE"
 echo "Action: $ACTION"
 echo "Target port: $PORT"
 
-IPSET_NAME="localnetwork"
+IPSET_NAME="cyfslocalnetwork"
 
 if [ "$ACTION" = "remove" ]; then
     delete_iptables_rule nat PREROUTING -i "$LAN_IFACE" -p tcp -m set ! --match-set "$IPSET_NAME" dst -j REDIRECT --to-ports "$PORT"
@@ -195,7 +195,7 @@ fi
 
 if ! ipset list "$IPSET_NAME" &>/dev/null; then
 	echo "create ipset: $IPSET_NAME"
-	ipset create localnetwork hash:net
+	ipset create cyfslocalnetwork hash:net
 	ipset add $IPSET_NAME 0.0.0.0/8
 	ipset add $IPSET_NAME 127.0.0.0/8
 	ipset add $IPSET_NAME 10.0.0.0/8
