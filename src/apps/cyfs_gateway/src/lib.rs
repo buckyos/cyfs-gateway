@@ -41,6 +41,7 @@ use serde_json::Value;
 use sfo_js::object::builtins::JsArray;
 use sfo_js::{JsEngine, JsPkgManager, JsString, JsValue};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::create_dir_all;
@@ -347,6 +348,328 @@ struct StartTemplateArgs {
     template_id: Option<String>,
     args: Vec<String>,
     help: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolConfig {
+    description: Option<String>,
+    script: String,
+    #[serde(default, alias = "platfroms")]
+    platforms: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+struct LocalToolCommand {
+    name: String,
+    description: String,
+    platforms: Option<Vec<String>>,
+    tool_dir: PathBuf,
+    script_path: PathBuf,
+}
+
+fn parse_os_release_value(line: &str, key: &str) -> Option<String> {
+    let (k, v) = line.split_once('=')?;
+    if k != key {
+        return None;
+    }
+    Some(v.trim_matches('"').to_ascii_lowercase())
+}
+
+fn detect_platform_tags() -> HashSet<String> {
+    let mut tags = HashSet::new();
+    let os = std::env::consts::OS.to_ascii_lowercase();
+    tags.insert(os.clone());
+
+    match os.as_str() {
+        "windows" => {
+            tags.insert("win32".to_string());
+            tags.insert("win".to_string());
+        }
+        "macos" => {
+            tags.insert("darwin".to_string());
+            tags.insert("osx".to_string());
+        }
+        "linux" => {
+            if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
+                for line in content.lines() {
+                    if let Some(id) = parse_os_release_value(line, "ID") {
+                        if !id.is_empty() {
+                            tags.insert(id);
+                        }
+                        continue;
+                    }
+                    if let Some(id_like) = parse_os_release_value(line, "ID_LIKE") {
+                        for item in id_like.split_whitespace() {
+                            let item = item.trim();
+                            if !item.is_empty() {
+                                tags.insert(item.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    tags
+}
+
+fn is_tool_supported(platforms: &Option<Vec<String>>, tags: &HashSet<String>) -> bool {
+    match platforms {
+        None => true,
+        Some(list) if list.is_empty() => true,
+        Some(list) => list
+            .iter()
+            .any(|platform| tags.contains(&platform.to_ascii_lowercase())),
+    }
+}
+
+fn script_extension(script_path: &Path) -> String {
+    script_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn is_script_supported_on_current_os(script_path: &Path) -> bool {
+    let ext = script_extension(script_path);
+    let is_windows = std::env::consts::OS == "windows";
+
+    if is_windows {
+        return ext == "bat" || ext == "cmd";
+    }
+
+    ext != "bat" && ext != "cmd"
+}
+
+fn load_local_tools() -> Vec<LocalToolCommand> {
+    let tools_dir = get_buckyos_system_etc_dir()
+        .join("cyfs_gateway")
+        .join("tools");
+    let platform_tags = detect_platform_tags();
+    let mut tools = Vec::new();
+
+    let entries = match std::fs::read_dir(&tools_dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            return tools;
+        },
+    };
+
+    for entry in entries.flatten() {
+        let tool_dir = entry.path();
+        if !tool_dir.is_dir() {
+            continue;
+        }
+
+        let tool_name = match tool_dir.file_name().and_then(|name| name.to_str()) {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => continue,
+        };
+
+        let config_path = tool_dir.join("config.yaml");
+        if !config_path.is_file() {
+            continue;
+        }
+
+        let config_text = match std::fs::read_to_string(&config_path) {
+            Ok(text) => text,
+            Err(e) => {
+                warn!("read tool config failed {}: {}", config_path.display(), e);
+                continue;
+            }
+        };
+
+        let config: ToolConfig = match serde_yaml_ng::from_str(&config_text) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                warn!("parse tool config failed {}: {}", config_path.display(), e);
+                continue;
+            }
+        };
+
+        if !is_tool_supported(&config.platforms, &platform_tags) {
+            continue;
+        }
+
+        let script = config.script.trim();
+        if script.is_empty() {
+            warn!("tool script is empty: {}", config_path.display());
+            continue;
+        }
+
+        let script_path = tool_dir.join(script);
+        if !script_path.exists() {
+            warn!("tool script not found: {}", script_path.display());
+            continue;
+        }
+
+        if !is_script_supported_on_current_os(&script_path) {
+            continue;
+        }
+
+        tools.push(LocalToolCommand {
+            name: tool_name,
+            description: config.description.unwrap_or_default(),
+            platforms: config.platforms,
+            tool_dir,
+            script_path,
+        });
+    }
+
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    tools
+}
+
+fn build_command_with_local_tools_for_help(
+    command: &Command,
+    tools: &[LocalToolCommand],
+) -> Command {
+    let mut merged = command.clone();
+    for tool in tools {
+        if is_builtin_subcommand(&merged, tool.name.as_str()) {
+            continue;
+        }
+
+        let mut sub = Command::new(tool.name.clone());
+        if !tool.description.is_empty() {
+            sub = sub.about(tool.description.clone());
+        }
+        merged = merged.subcommand(sub);
+    }
+    merged
+}
+
+fn infer_top_level_command_from_args(args: &[String]) -> Option<(String, usize)> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+
+        if arg == "--" {
+            if index + 1 < args.len() {
+                return Some((args[index + 1].clone(), index + 1));
+            }
+            return None;
+        }
+
+        if arg == "--config" || arg == "--config_file" {
+            index += 2;
+            continue;
+        }
+
+        if arg == "--keep_tunnel" {
+            index += 1;
+            while index < args.len() && !args[index].starts_with('-') {
+                index += 1;
+            }
+            continue;
+        }
+
+        if arg == "--help"
+            || arg == "-h"
+            || arg == "--debug"
+            || arg.starts_with("--config=")
+            || arg.starts_with("--config_file=")
+            || arg.starts_with("--keep_tunnel=")
+        {
+            index += 1;
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+
+        return Some((arg.clone(), index));
+    }
+
+    None
+}
+
+fn run_local_tool(tool: &LocalToolCommand, args: &[String]) -> Result<i32> {
+    let platform_tags = detect_platform_tags();
+    if !is_tool_supported(&tool.platforms, &platform_tags) {
+        return Err(anyhow!(
+            "tool '{}' is not supported on current platform",
+            tool.name
+        ));
+    }
+
+    if !is_script_supported_on_current_os(&tool.script_path) {
+        let ext = script_extension(&tool.script_path);
+        if std::env::consts::OS == "windows" {
+            return Err(anyhow!(
+                "tool script type '.{}' is not supported on windows (only .bat/.cmd are supported)",
+                if ext.is_empty() { "" } else { ext.as_str() }
+            ));
+        }
+        return Err(anyhow!(
+            "tool script type '.{}' is only supported on windows",
+            if ext.is_empty() { "" } else { ext.as_str() }
+        ));
+    }
+
+    let ext = script_extension(&tool.script_path);
+    if std::env::consts::OS == "windows" {
+        let status = ProcessCommand::new("cmd")
+            .arg("/C")
+            .arg(&tool.script_path)
+            .args(args)
+            .current_dir(&tool.tool_dir)
+            .status()
+            .map_err(|e| anyhow!("run tool failed {}: {}", tool.script_path.display(), e))?;
+        return Ok(status.code().unwrap_or(1));
+    }
+
+    if ext == "bat" || ext == "cmd" {
+        return Err(anyhow!(
+            "tool script type '.{}' is only supported on windows",
+            ext
+        ));
+    }
+
+    if ext == "sh" {
+        let direct_status = ProcessCommand::new(&tool.script_path)
+            .args(args)
+            .current_dir(&tool.tool_dir)
+            .status();
+
+        match direct_status {
+            Ok(status) => return Ok(status.code().unwrap_or(1)),
+            Err(_) => {
+                let status = ProcessCommand::new("bash")
+                    .arg(&tool.script_path)
+                    .args(args)
+                    .current_dir(&tool.tool_dir)
+                    .status()
+                    .map_err(|e| anyhow!("run tool failed {}: {}", tool.script_path.display(), e))?;
+                return Ok(status.code().unwrap_or(1));
+            }
+        }
+    }
+
+    let direct_status = ProcessCommand::new(&tool.script_path)
+        .args(args)
+        .current_dir(&tool.tool_dir)
+        .status();
+
+    match direct_status {
+        Ok(status) => Ok(status.code().unwrap_or(1)),
+        Err(e) => Err(anyhow!(
+            "run tool failed {}: {}",
+            tool.script_path.display(),
+            e
+        )),
+    }
+}
+
+fn is_builtin_subcommand(command: &Command, cmd: &str) -> bool {
+    command
+        .get_subcommands()
+        .any(|subcommand| subcommand.get_name() == cmd)
 }
 
 fn infer_subcommand_path_from_args(command: &Command, args: &[String]) -> Vec<String> {
@@ -962,13 +1285,35 @@ pub async fn cyfs_gateway_main() {
                     .required(false),
             ));
 
+    let local_tools = load_local_tools();
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let help_requested = raw_args.iter().any(|arg| arg == "--help" || arg == "-h");
     if help_requested {
         let subcommand_path = infer_subcommand_path_from_args(&command, &raw_args);
 
         if subcommand_path.is_empty() {
-            command.print_help().unwrap();
+            if let Some((candidate_cmd, cmd_index)) = infer_top_level_command_from_args(&raw_args) {
+                if !is_builtin_subcommand(&command, candidate_cmd.as_str()) {
+                    if let Some(tool) = local_tools
+                        .iter()
+                        .find(|tool| tool.name == candidate_cmd)
+                    {
+                        let tool_args = raw_args.get(cmd_index + 1..).unwrap_or(&[]).to_vec();
+                        match run_local_tool(tool, &tool_args) {
+                            Ok(code) => std::process::exit(code),
+                            Err(e) => {
+                                println!("{}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if subcommand_path.is_empty() {
+            let mut help_command = build_command_with_local_tools_for_help(&command, &local_tools);
+            help_command.print_help().unwrap();
             std::process::exit(0);
         }
 
@@ -1030,10 +1375,29 @@ pub async fn cyfs_gateway_main() {
         }
 
         if !print_help_for_subcommand_path(&mut command, &subcommand_path) {
-            command.print_help().unwrap();
+            let mut help_command = build_command_with_local_tools_for_help(&command, &local_tools);
+            help_command.print_help().unwrap();
             println!();
         }
         std::process::exit(0);
+    }
+
+    if let Some((candidate_cmd, cmd_index)) = infer_top_level_command_from_args(&raw_args) {
+        if !is_builtin_subcommand(&command, candidate_cmd.as_str()) {
+            if let Some(tool) = local_tools
+                .iter()
+                .find(|tool| tool.name == candidate_cmd)
+            {
+                let tool_args = raw_args.get(cmd_index + 1..).unwrap_or(&[]).to_vec();
+                match run_local_tool(tool, &tool_args) {
+                    Ok(code) => std::process::exit(code),
+                    Err(e) => {
+                        println!("{}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
     }
 
     let matches = command.clone().get_matches();
@@ -1053,7 +1417,9 @@ pub async fn cyfs_gateway_main() {
                     }
                 }
             } else {
-                command.print_help().unwrap();
+                let mut help_command =
+                    build_command_with_local_tools_for_help(&command, &local_tools);
+                help_command.print_help().unwrap();
                 println!();
             }
             std::process::exit(0);
