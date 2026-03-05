@@ -31,6 +31,8 @@ use std::{
 use tokio::sync::Mutex;
 use crate::sqlite_db::SqliteSnDB;
 
+const CLEAR_STATE_ACTIVE_CODE: &str = "zX6cV7bN8mK9lJ0hG1fD";
+
 #[derive(Serialize, Deserialize)]
 pub struct OODInfo {
     //pub device_info: DeviceInfo,
@@ -229,6 +231,40 @@ impl SNServer {
             &req,
         );
         return Ok(resp);
+    }
+
+    pub async fn clear_state_by_active_code(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
+        if req.params.get("active_code").is_some() {
+            return Err(RPCErrors::ParseRequestError(
+                "Invalid params, active_code is not allowed".to_string(),
+            ));
+        }
+
+        let result = self
+            .db
+            .clear_state_by_active_code(CLEAR_STATE_ACTIVE_CODE)
+            .await
+            .map_err(|e| {
+            let err_str = e.to_string();
+            warn!(
+                "Failed to clear state for activation code {}: {}",
+                CLEAR_STATE_ACTIVE_CODE, err_str
+            );
+            RPCErrors::ReasonError(err_str)
+        })?;
+
+        let resp = RPCResponse::create_by_req(
+            RPCResult::Success(json!({
+                "code": 0,
+                "deleted_users": result.deleted_users,
+                "deleted_devices": result.deleted_devices,
+                "deleted_domain_records": result.deleted_domain_records,
+                "deleted_did_documents": result.deleted_did_documents,
+                "activation_code_reset": result.activation_code_reset
+            })),
+            &req,
+        );
+        Ok(resp)
     }
 
     pub async fn register_user(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
@@ -1505,6 +1541,9 @@ impl SNServer {
             "check_active_code" => {
                 //check active code
                 return self.check_active_code(req).await;
+            }
+            "clear_state_by_active_code" => {
+                return self.clear_state_by_active_code(req).await;
             }
             "check_username" => {
                 //check username
@@ -3022,7 +3061,7 @@ mod tests {
         {
             let db = SqliteSnDB::new_by_path(db.path().to_str().unwrap()).await.unwrap();
             db.initialize_database().await.unwrap();
-            db.insert_activation_code("test_code").await.unwrap();
+            db.insert_activation_code(CLEAR_STATE_ACTIVE_CODE).await.unwrap();
         }
         let config = json!({
             "id": "test",
@@ -3087,7 +3126,7 @@ mod tests {
         let result = krpc.call("register_user", json!({
             "user_name": "test",
             "public_key": user_public_key.to_string(),
-            "active_code": "test_code",
+            "active_code": CLEAR_STATE_ACTIVE_CODE,
             "zone_config": zone_jwt,
             "user_domain": "test.buckyos.ai",
         })).await.unwrap();
@@ -3368,5 +3407,33 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
+
+        let result = krpc
+            .call(
+                "clear_state_by_active_code",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.as_object().unwrap().get("code").unwrap().as_i64().unwrap(), 0);
+
+        let result = krpc.call("check_username", json!({
+            "username": "test"
+        })).await.unwrap();
+        assert!(result.as_object().unwrap().get("valid").unwrap().as_bool().unwrap());
+
+        let result = krpc.call("check_active_code", json!({
+            "active_code": CLEAR_STATE_ACTIVE_CODE
+        })).await.unwrap();
+        assert!(result.as_object().unwrap().get("valid").unwrap().as_bool().unwrap());
+
+        let result = krpc.call("register_user", json!({
+            "user_name": "test",
+            "public_key": user_public_key.to_string(),
+            "active_code": CLEAR_STATE_ACTIVE_CODE,
+            "zone_config": zone_jwt,
+            "user_domain": "test.buckyos.ai",
+        })).await.unwrap();
+        assert_eq!(result.as_object().unwrap().get("code").unwrap().as_i64().unwrap(), 0);
     }
 }

@@ -58,12 +58,22 @@ pub struct SNDeviceInfo {
     pub updated_at: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct SnClearStateResult {
+    pub deleted_users: u64,
+    pub deleted_devices: u64,
+    pub deleted_domain_records: u64,
+    pub deleted_did_documents: u64,
+    pub activation_code_reset: bool,
+}
+
 #[async_trait::async_trait]
 pub trait SnDB: Send + Sync + 'static {
     async fn get_activation_codes(&self) -> SnResult<Vec<String>>;
     async fn insert_activation_code(&self, code: &str) -> SnResult<()>;
     async fn generate_activation_codes(&self, count: usize) -> SnResult<Vec<String>>;
     async fn check_active_code(&self, active_code: &str) -> SnResult<bool>;
+    async fn clear_state_by_active_code(&self, active_code: &str) -> SnResult<SnClearStateResult>;
     async fn register_user(
         &self,
         active_code: &str,
