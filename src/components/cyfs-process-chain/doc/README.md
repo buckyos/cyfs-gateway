@@ -19,6 +19,8 @@
   - typed literal 无兼容迁移草案（破坏性清单 + 批量迁移规则 + 扫描流程）。
 - [LINT.md](./LINT.md)
   - `pc-lint` 静态检查器（MVP）使用说明与当前规则清单。
+- [SYNTAX_STRICT_SPEC.md](./SYNTAX_STRICT_SPEC.md)
+  - 严格语法规范草案（上下文语义、`$` 规则、`$(...)` 约束、推荐写法）。
 - [templates/README.md](./templates/README.md)
   - 官方模板脚本目录（`route_basic`、`auth_rewrite_fallback`）。
 

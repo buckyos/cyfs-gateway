@@ -77,6 +77,24 @@ pc-lint check <INPUT> [--format text|json] [--fail-on error|warning|info] [--kno
 - 目的：提示潜在隐式转换风险。
 - 说明：同样覆盖 `==` / `!=` 等语法糖映射后的 loose 比较。
 
+### `PC-LINT-4101` Rewrite-reg template `$` ambiguity
+
+- 严重级别：`warning`
+- 含义：在 `rewrite-reg/rewrite-regex` 的 template 参数中检测到非 `$<digit>` 的 `$` 用法。
+- 说明：该上下文中 `$name` 不表示 DSL 变量插值，通常是误用；双引号下字面 `$` 也需要 `\$`。
+
+### `PC-LINT-4102` Rewrite-reg template multi-digit capture risk
+
+- 严重级别：`warning`
+- 含义：检测到 template 中使用 `$10` 这类多位捕获组引用。
+- 说明：当前运行时会按 `$1` + `0` 解释，存在语义歧义。
+
+### `PC-LINT-4103` Command substitution composite expression error
+
+- 严重级别：`error`
+- 含义：解析失败且疑似在 `$(...)` 中混入 `&&/||/;` 组合表达。
+- 说明：`$(...)` 只支持单命令，建议将组合逻辑外提到 `if`/`capture`。
+
 ## 当前限制
 
 - 分支与控制流是保守近似分析，不是完整路径敏感 CFG。

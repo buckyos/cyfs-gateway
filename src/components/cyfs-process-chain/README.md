@@ -46,6 +46,7 @@ cargo test -p cyfs-process-chain -- --test-threads=1
 - 总览：[doc/README.md](./doc/README.md)
 - 架构：[doc/ARCHITECTURE.md](./doc/ARCHITECTURE.md)
 - 命令参考：[doc/COMMAND_REFERENCE.md](./doc/COMMAND_REFERENCE.md)
+- 严格语法规范草案：[doc/SYNTAX_STRICT_SPEC.md](./doc/SYNTAX_STRICT_SPEC.md)
 - 轻量类型系统 RFC：[doc/RFC_LIGHTWEIGHT_TYPE_SYSTEM.md](./doc/RFC_LIGHTWEIGHT_TYPE_SYSTEM.md)
 - 模块化 RFC：[doc/RFC_SCRIPT_MODULARIZATION.md](./doc/RFC_SCRIPT_MODULARIZATION.md)
 - lint 规则：[doc/LINT.md](./doc/LINT.md)

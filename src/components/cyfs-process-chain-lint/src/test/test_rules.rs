@@ -1,4 +1,4 @@
-use crate::{LintConfig, lint_xml_content};
+use crate::{classify_parse_error, lint_xml_content, LintConfig};
 
 #[test]
 fn test_lint_undefined_var() {
@@ -135,4 +135,54 @@ fn test_lint_shadowing_warning() {
     let config = LintConfig::default();
     let ret = lint_xml_content(xml, "test.xml", "test_lib", &config).unwrap();
     assert!(ret.iter().any(|d| d.code == "PC-LINT-3002"));
+}
+
+#[test]
+fn test_lint_rewrite_regex_template_dollar_context() {
+    let xml = r#"
+<root>
+  <process_chain id="main">
+    <block id="entry"><![CDATA[
+      local path="/a";
+      rewrite-reg $path '^/(.*)$' "/\$user/\$1";
+    ]]></block>
+  </process_chain>
+</root>
+"#;
+    let config = LintConfig::default();
+    let ret = lint_xml_content(xml, "test.xml", "test_lib", &config).unwrap();
+    assert!(
+        !ret.iter()
+            .any(|d| d.code == "PC-LINT-1001" && d.message.contains("user")),
+        "rewrite-reg template '$user' should not be treated as DSL var read: {:?}",
+        ret
+    );
+    assert!(ret.iter().any(|d| d.code == "PC-LINT-4101"));
+}
+
+#[test]
+fn test_lint_rewrite_regex_multi_digit_capture_warning() {
+    let xml = r#"
+<root>
+  <process_chain id="main">
+    <block id="entry"><![CDATA[
+      local path="/a";
+      rewrite-reg $path '^/(.*)$' "/\$10";
+    ]]></block>
+  </process_chain>
+</root>
+"#;
+    let config = LintConfig::default();
+    let ret = lint_xml_content(xml, "test.xml", "test_lib", &config).unwrap();
+    assert!(ret.iter().any(|d| d.code == "PC-LINT-4102"));
+}
+
+#[test]
+fn test_classify_parse_error_for_composite_command_substitution() {
+    let err = "Parse statements error: echo $(eq 1 1 && echo ok);, Failure(Error { input: \" && echo ok\", code: Tag })";
+    let classified = classify_parse_error(err);
+    assert!(classified.is_some());
+    let (code, message) = classified.unwrap();
+    assert_eq!(code, "PC-LINT-4103");
+    assert!(message.contains("$(...)"));
 }

@@ -87,6 +87,20 @@ pub fn lint_file(path: &Path, config: &LintConfig) -> Result<Vec<Diagnostic>, St
     Ok(lint_chains(&chains, &file, &lib, config))
 }
 
+pub fn classify_parse_error(err: &str) -> Option<(String, String)> {
+    let normalized = err.replace('\n', " ");
+    let has_command_subst = normalized.contains("$(");
+    let has_operator = normalized.contains("&&") || normalized.contains("||") || normalized.contains(';');
+    if has_command_subst && has_operator {
+        return Some((
+            "PC-LINT-4103".to_string(),
+            "Invalid command substitution syntax: $(...) accepts exactly one command. Move logical composition outside $(...) and use capture/if for branching.".to_string(),
+        ));
+    }
+
+    None
+}
+
 pub fn lint_xml_content(
     content: &str,
     file: &str,
@@ -417,7 +431,9 @@ impl Analyzer {
             );
         }
 
+        self.mark_regex_template_skip_reads(command_name, args, &mut skip_read_indices);
         self.detect_loose_compare(chain_id, block_id, line, source, command_name, args);
+        self.detect_regex_template_pitfall(chain_id, block_id, line, source, command_name, args);
 
         for (idx, arg) in args.iter().enumerate() {
             if skip_read_indices.contains(&idx) {
@@ -432,6 +448,26 @@ impl Analyzer {
                 chain_scope,
                 block_scope,
             );
+        }
+    }
+
+    fn mark_regex_template_skip_reads(
+        &self,
+        command_name: &str,
+        args: &[CommandArg],
+        skip_read_indices: &mut HashSet<usize>,
+    ) {
+        let Some(index) = Self::rewrite_regex_template_index(command_name, args) else {
+            return;
+        };
+
+        if matches!(
+            args[index],
+            CommandArg::Literal(_) | CommandArg::StringLiteral(_) | CommandArg::TypedLiteral(_, _)
+        ) {
+            // In rewrite-reg/rewrite-regex template context, `$x` means template text (or typo),
+            // not a DSL variable read. We do context-aware lint in dedicated checks.
+            skip_read_indices.insert(index);
         }
     }
 
@@ -573,6 +609,78 @@ impl Analyzer {
                     "Loose comparison detected in '{}' command; consider strict comparison to avoid implicit conversion risks",
                     command_name
                 ),
+                file: self.file.clone(),
+                lib: self.lib.clone(),
+                chain: chain_id.to_string(),
+                block: block_id.to_string(),
+                line,
+                source: source.to_string(),
+            });
+        }
+    }
+
+    fn detect_regex_template_pitfall(
+        &mut self,
+        chain_id: &str,
+        block_id: &str,
+        line: usize,
+        source: &str,
+        command_name: &str,
+        args: &[CommandArg],
+    ) {
+        let Some(template_index) = Self::rewrite_regex_template_index(command_name, args) else {
+            return;
+        };
+
+        let Some(template) = args[template_index].as_literal_str() else {
+            return;
+        };
+
+        let chars: Vec<char> = template.chars().collect();
+        let mut warn_non_capture_dollar = false;
+        let mut warn_multi_digit_capture = false;
+        for i in 0..chars.len() {
+            if chars[i] != '$' {
+                continue;
+            }
+
+            let escaped = i > 0 && chars[i - 1] == '\\';
+            let next = chars.get(i + 1).copied();
+            match next {
+                Some(next_char) if next_char.is_ascii_digit() => {
+                    if escaped {
+                        warn_non_capture_dollar = true;
+                    }
+                    if chars.get(i + 2).is_some_and(|c| c.is_ascii_digit()) {
+                        warn_multi_digit_capture = true;
+                    }
+                }
+                Some('$') => {}
+                Some(_) | None => {
+                    warn_non_capture_dollar = true;
+                }
+            }
+        }
+
+        if warn_non_capture_dollar {
+            self.diagnostics.push(Diagnostic {
+                code: "PC-LINT-4101".to_string(),
+                severity: LintSeverity::Warning,
+                message: "In rewrite-reg/rewrite-regex template, '$' is not DSL variable interpolation. Only '$<digit>' is capture replacement.".to_string(),
+                file: self.file.clone(),
+                lib: self.lib.clone(),
+                chain: chain_id.to_string(),
+                block: block_id.to_string(),
+                line,
+                source: source.to_string(),
+            });
+        }
+
+        if warn_multi_digit_capture {
+            self.diagnostics.push(Diagnostic {
+                code: "PC-LINT-4102".to_string(),
+                severity: LintSeverity::Warning,
+                message: "rewrite-reg/rewrite-regex template uses multi-digit capture like '$10'; runtime currently treats it as '$1' plus literal '0'.".to_string(),
                 file: self.file.clone(),
                 lib: self.lib.clone(),
                 chain: chain_id.to_string(),
@@ -802,6 +910,28 @@ impl Analyzer {
     fn arg_as_name(arg: &CommandArg) -> Option<String> {
         let raw = arg.as_str();
         extract_primary_root(raw)
+    }
+
+    fn rewrite_regex_template_index(command_name: &str, args: &[CommandArg]) -> Option<usize> {
+        if !matches!(command_name, "rewrite-reg" | "rewrite-regex") {
+            return None;
+        }
+
+        let mut base = 0usize;
+        if args
+            .first()
+            .and_then(CommandArg::as_literal_str)
+            .is_some_and(|v| matches!(v, "rewrite-reg" | "rewrite-regex"))
+        {
+            base = 1;
+        }
+
+        let index = base + 2;
+        if args.len() > index {
+            Some(index)
+        } else {
+            None
+        }
     }
 }
 
