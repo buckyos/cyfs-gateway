@@ -225,15 +225,15 @@ impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for TlsStackCon
         let tls_config = cyfs_gateway_lib::TlsStackConfig::deserialize(
             hook_point_value_map_to_vector(de.clone(), "hook_point")?,
         )
-            .map_err(|e| {
-                config_err!(
+        .map_err(|e| {
+            config_err!(
                 ConfigErrorCode::InvalidConfig,
                 "invalid tls stack config: {}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
                     .unwrap()
             )
-            })?;
+        })?;
         Ok(Arc::new(tls_config))
     }
 }
@@ -274,19 +274,17 @@ impl RtcpStackConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for RtcpStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let rtcp_config =
-            RtcpStackConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
-                .map_err(|e| {
-                    config_err!(
-                        ConfigErrorCode::InvalidConfig,
-                        "invalid rtcp stack config: {}\n{}",
-                        e,
-                        serde_json::to_string_pretty(
-                            &serde_json::Value::deserialize(de.clone()).unwrap()
-                        )
-                        .unwrap()
-                    )
-                })?;
+        let mut value = hook_point_value_map_to_vector(de.clone(), "hook_point")?;
+        value = hook_point_value_map_to_vector_in_value(value, "on_new_tunnel_hook_point")?;
+        let rtcp_config = RtcpStackConfig::deserialize(value).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid rtcp stack config: {}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
+                    .unwrap()
+            )
+        })?;
         Ok(Arc::new(rtcp_config))
     }
 }
@@ -437,15 +435,15 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for SocksServe
             de.clone(),
             "hook_point",
         )?)
-            .map_err(|e| {
-                config_err!(
+        .map_err(|e| {
+            config_err!(
                 ConfigErrorCode::InvalidConfig,
                 "invalid socks server config.{}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
                     .unwrap()
             )
-            })?;
+        })?;
 
         Ok(Arc::new(config))
     }
@@ -529,7 +527,7 @@ impl AcmeHttpChallengeServerConfigParser {
 }
 
 impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D>
-for AcmeHttpChallengeServerConfigParser
+    for AcmeHttpChallengeServerConfigParser
 {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
         let config = AcmeHttpChallengeServerConfig::deserialize(de.clone()).map_err(|e| {

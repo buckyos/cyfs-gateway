@@ -1,51 +1,50 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+mod acme_sn_provider;
+mod config_loader;
+mod config_merger;
 mod gateway;
 mod gateway_control_client;
 mod gateway_control_server;
-mod config_loader;
-mod config_merger;
-mod acme_sn_provider;
 mod process_chain_doc;
 mod socks;
 
+use acme_sn_provider::*;
+pub use config_loader::*;
+pub use config_merger::*;
 pub use gateway::*;
 pub use gateway_control_client::*;
 pub use gateway_control_server::*;
-pub use config_loader::*;
-pub use config_merger::*;
-use acme_sn_provider::*;
 
-
-use std::collections::HashSet;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
 use cyfs_dns::{InnerDnsRecordManager, LocalDnsFactory, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
 use process_chain_doc::GatewayProcessChainDoc;
+use std::collections::HashSet;
 
+use anyhow::anyhow;
+use anyhow::Result;
+use buckyos_kit::init_logging;
+use buckyos_kit::{get_buckyos_log_dir, get_buckyos_service_data_dir, get_buckyos_system_etc_dir};
+use cyfs_sn::{SnServerFactory, SqliteDBFactory};
+use cyfs_socks::SocksServerFactory;
+use cyfs_tun::TunStackFactory;
+use kRPC::RPCSessionToken;
 use log::*;
 use name_client::*;
 use name_lib::*;
+use serde::Deserialize;
+use serde_json::Value;
+use sfo_js::object::builtins::JsArray;
+use sfo_js::{JsEngine, JsPkgManager, JsString, JsValue};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use anyhow::anyhow;
-use anyhow::Result;
-use buckyos_kit::{get_buckyos_log_dir, get_buckyos_service_data_dir, get_buckyos_system_etc_dir};
-use kRPC::RPCSessionToken;
-use serde::{Deserialize};
-use serde_json::{Value};
-use sfo_js::{JsEngine, JsPkgManager, JsString, JsValue};
-use sfo_js::object::builtins::JsArray;
 use tokio::fs::create_dir_all;
 use tokio::task;
 use url::Url;
-use cyfs_sn::{SnServerFactory, SqliteDBFactory};
-use cyfs_socks::SocksServerFactory;
-use cyfs_tun::{TunStackFactory};
-
 
 #[derive(Deserialize)]
 pub struct LogParams {
@@ -95,7 +94,10 @@ fn parse_size_bytes(input: &str) -> Result<u64> {
 
 pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
     let config_json = load_config_from_file(config_file).await?;
-    info!("Gateway config: {}", serde_json::to_string_pretty(&config_json).unwrap());
+    info!(
+        "Gateway config: {}",
+        serde_json::to_string_pretty(&config_json).unwrap()
+    );
 
     run_gateway_with_config(config_json, Some(config_file), params).await
 }
@@ -117,10 +119,16 @@ async fn run_gateway_with_config(
     parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
     parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
     parser.register_server_config_parser("dir", Arc::new(DirServerConfigParser::new()));
-    parser.register_server_config_parser("control_server", Arc::new(GatewayControlServerConfigParser::new()));
+    parser.register_server_config_parser(
+        "control_server",
+        Arc::new(GatewayControlServerConfigParser::new()),
+    );
     parser.register_server_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
     parser.register_server_config_parser("sn", Arc::new(SNServerConfigParser::new()));
-    parser.register_server_config_parser("acme_response", Arc::new(AcmeHttpChallengeServerConfigParser::new()));
+    parser.register_server_config_parser(
+        "acme_response",
+        Arc::new(AcmeHttpChallengeServerConfigParser::new()),
+    );
 
     info!("Parse cyfs-gatway config...");
     let gateway_config = parser.parse(config_json.clone()).map_err(|e| {
@@ -132,32 +140,35 @@ async fn run_gateway_with_config(
 
     let connect_manager = ConnectionManager::new();
 
-    let factory = GatewayFactory::new(
-        connect_manager.clone(),
-        parser.clone(),
+    let factory = GatewayFactory::new(connect_manager.clone(), parser.clone());
+    factory.register_stack_factory(
+        StackProtocol::Tcp,
+        Arc::new(TcpStackFactory::new(connect_manager.clone())),
     );
-    factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
-        connect_manager.clone(),
-    )));
     debug!("Register tcp stack factory");
-    factory.register_stack_factory(StackProtocol::Udp, Arc::new(UdpStackFactory::new(
-        connect_manager.clone(),
-    )));
+    factory.register_stack_factory(
+        StackProtocol::Udp,
+        Arc::new(UdpStackFactory::new(connect_manager.clone())),
+    );
     debug!("Register udp stack factory");
-    factory.register_stack_factory(StackProtocol::Tls, Arc::new(TlsStackFactory::new(
-        connect_manager.clone(),
-    )));
+    factory.register_stack_factory(
+        StackProtocol::Tls,
+        Arc::new(TlsStackFactory::new(connect_manager.clone())),
+    );
     debug!("Register tls stack factory");
-    factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
-        connect_manager.clone(),
-    )));
-    factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
-        connect_manager.clone(),
-    )));
+    factory.register_stack_factory(
+        StackProtocol::Quic,
+        Arc::new(QuicStackFactory::new(connect_manager.clone())),
+    );
+    factory.register_stack_factory(
+        StackProtocol::Rtcp,
+        Arc::new(RtcpStackFactory::new(connect_manager.clone())),
+    );
     debug!("Register rtcp stack factory");
-    factory.register_stack_factory(StackProtocol::Extension("tun".to_string()), Arc::new(TunStackFactory::new(
-        connect_manager.clone(),
-    )));
+    factory.register_stack_factory(
+        StackProtocol::Extension("tun".to_string()),
+        Arc::new(TunStackFactory::new(connect_manager.clone())),
+    );
     debug!("Register tun stack context factory");
     factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new()));
     debug!("Register http server factory");
@@ -166,27 +177,30 @@ async fn run_gateway_with_config(
     debug!("Register dir server factory");
     factory.register_server_factory("dns", Arc::new(ProcessChainDnsServerFactory::new()));
     debug!("Register dns server factory");
-    factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new()));
+    factory.register_server_factory(
+        "acme_response",
+        Arc::new(AcmeHttpChallengeServerFactory::new()),
+    );
     debug!("Register acme response server factory");
     factory.register_server_factory(
         "control_server",
         Arc::new(GatewayControlServerFactory::new()),
     );
     info!("Register control server factory");
-    factory.register_server_factory(
-        "local_dns",
-        Arc::new(LocalDnsFactory::new()),
-    );
+    factory.register_server_factory("local_dns", Arc::new(LocalDnsFactory::new()));
     info!("Register local dns server factory");
     let mut sn_factory = SnServerFactory::new();
     sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
     factory.register_server_factory("sn", Arc::new(sn_factory));
     info!("Register sn server factory");
-    let gateway = factory.create_gateway(config_file, gateway_config).await.map_err(|e| {
-        let msg = format!("create gateway failed: {}", e);
-        error!("{}", msg);
-        anyhow::anyhow!(msg)
-    })?;
+    let gateway = factory
+        .create_gateway(config_file, gateway_config)
+        .await
+        .map_err(|e| {
+            let msg = format!("create gateway failed: {}", e);
+            error!("{}", msg);
+            anyhow::anyhow!(msg)
+        })?;
     gateway.start(params).await?;
 
     let _ = tokio::signal::ctrl_c().await;
@@ -212,7 +226,10 @@ fn get_config_file_path(matches: &clap::ArgMatches) -> PathBuf {
     let config_dir = if real_config_file.is_dir() {
         real_config_file.clone()
     } else {
-        real_config_file.parent().unwrap_or(base_dir.as_path()).to_path_buf()
+        real_config_file
+            .parent()
+            .unwrap_or(base_dir.as_path())
+            .to_path_buf()
     };
     set_gateway_main_config_dir(&config_dir);
     real_config_file
@@ -255,17 +272,14 @@ pub fn read_login_token(server: &str) -> Option<String> {
             }
         };
 
-        let (token, _) = match RPCSessionToken::generate_jwt_token(
-            "root",
-            "cyfs-gateway",
-            None,
-            &encode_key, ) {
-            Ok(token) => token,
-            Err(e) => {
-                error!("generate jwt token failed: {}", e);
-                return None;
-            }
-        };
+        let (token, _) =
+            match RPCSessionToken::generate_jwt_token("root", "cyfs-gateway", None, &encode_key) {
+                Ok(token) => token,
+                Err(e) => {
+                    error!("generate jwt token failed: {}", e);
+                    return None;
+                }
+            };
         Some(token)
     } else {
         let token_file = token_dir.join(hex::encode(server.to_lowercase()));
@@ -349,9 +363,12 @@ fn parse_template_args(command: &str, ignore_server: bool) -> StartTemplateArgs 
 }
 
 async fn run_template_local(template_id: &str, args: Vec<String>) -> Result<()> {
-    let template_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("server_templates");
+    let template_dir = get_buckyos_system_etc_dir()
+        .join("cyfs_gateway")
+        .join("server_templates");
     let external_cmds = JsPkgManager::new(template_dir);
-    let pkg = external_cmds.get_pkg(template_id)
+    let pkg = external_cmds
+        .get_pkg(template_id)
         .await
         .map_err(|e| anyhow!("get pkg failed: {:?}", e))?;
     let output = run_server_tempalte_pkg(pkg, args).await.map_err(|e| {
@@ -363,15 +380,22 @@ async fn run_template_local(template_id: &str, args: Vec<String>) -> Result<()> 
     if output.is_empty() {
         return Err(anyhow!("template returned empty config"));
     }
-    let template_config: Value = serde_json::from_str(output)
-        .map_err(|e| anyhow!("invalid template config: {}", e))?;
+    let template_config: Value =
+        serde_json::from_str(output).map_err(|e| anyhow!("invalid template config: {}", e))?;
     let mut config_json = buckyos_kit::apply_params_to_json(&template_config, None)
         .map_err(|e| anyhow!("apply params failed: {}", e))?;
-    let config_dir = std::env::current_dir().map_err(|e| anyhow!("read current dir failed: {}", e))?;
+    let config_dir =
+        std::env::current_dir().map_err(|e| anyhow!("read current dir failed: {}", e))?;
     normalize_all_path_value_config(&mut config_json, config_dir.as_path());
-    run_gateway_with_config(config_json, None, GatewayParams { keep_tunnel: vec![] }).await
+    run_gateway_with_config(
+        config_json,
+        None,
+        GatewayParams {
+            keep_tunnel: vec![],
+        },
+    )
+    .await
 }
-
 
 pub async fn cyfs_gateway_main() {
     let command = Command::new("CYFS Gateway Service")
@@ -703,12 +727,16 @@ pub async fn cyfs_gateway_main() {
 
     match matches.subcommand() {
         Some(("gen_rtcp_key", sub_matches)) => {
-            let name = sub_matches.get_one::<String>("name").expect("Missing key 'name'");
+            let name = sub_matches
+                .get_one::<String>("name")
+                .expect("Missing key 'name'");
             // Get temp path
             let temp_dir = std::env::temp_dir();
             let key_dir = temp_dir.join("buckyos").join("keys");
             let default_path = key_dir.to_string_lossy().to_string();
-            let save_path = sub_matches.get_one::<String>("path").unwrap_or(&default_path);
+            let save_path = sub_matches
+                .get_one::<String>("path")
+                .unwrap_or(&default_path);
             let key_dir = Path::new(save_path);
             if !key_dir.is_dir() {
                 std::fs::create_dir_all(&key_dir).unwrap();
@@ -716,7 +744,8 @@ pub async fn cyfs_gateway_main() {
             println!("key_dir: {:?}", key_dir);
 
             let (private_key, public_key) = generate_ed25519_key_pair();
-            let device_config = DeviceConfig::new_by_jwk(name, serde_json::from_value(public_key).unwrap());
+            let device_config =
+                DeviceConfig::new_by_jwk(name, serde_json::from_value(public_key).unwrap());
             let sk_file = key_dir.join("device.key.pem");
             std::fs::write(&sk_file, private_key).unwrap();
             println!("Private key saved to: {:?}", sk_file);
@@ -743,67 +772,70 @@ pub async fn cyfs_gateway_main() {
             };
             save_login_token(server.as_str(), login_result.as_str());
         }
-        Some(("show", sub_matches)) => {
-            match sub_matches.subcommand() {
-                Some(("config", config_matches)) => {
-                    let id = config_matches.get_one::<String>("id");
-                    let format = config_matches.get_one::<String>("format").unwrap();
-                    let server = config_matches.get_one::<String>("server").unwrap();
-                    let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
-                    let result = cyfs_cmd_client.get_config_by_id(id.map(|value| value.as_str())).await;
-                    match result {
-                        Ok(result) => {
-                            if format == "json" {
-                                println!("{}", serde_json::to_string_pretty(&result).unwrap());
-                            } else {
-                                println!("{}", serde_yaml_ng::to_string(&result).unwrap());
-                            }
-                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
-                                save_login_token(server.as_str(), token.as_str());
-                            }
-                            std::process::exit(0);
+        Some(("show", sub_matches)) => match sub_matches.subcommand() {
+            Some(("config", config_matches)) => {
+                let id = config_matches.get_one::<String>("id");
+                let format = config_matches.get_one::<String>("format").unwrap();
+                let server = config_matches.get_one::<String>("server").unwrap();
+                let cyfs_cmd_client =
+                    GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+                let result = cyfs_cmd_client
+                    .get_config_by_id(id.map(|value| value.as_str()))
+                    .await;
+                match result {
+                    Ok(result) => {
+                        if format == "json" {
+                            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                        } else {
+                            println!("{}", serde_yaml_ng::to_string(&result).unwrap());
                         }
-                        Err(e) => {
-                            println!("show init config error: {}", e);
-                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
-                                save_login_token(server.as_str(), token.as_str());
-                            }
-                            std::process::exit(1);
+                        if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                            save_login_token(server.as_str(), token.as_str());
                         }
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        println!("show init config error: {}", e);
+                        if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                            save_login_token(server.as_str(), token.as_str());
+                        }
+                        std::process::exit(1);
                     }
                 }
-                None => {
-                    let format = sub_matches.get_one::<String>("format").unwrap();
-                    let server = sub_matches.get_one::<String>("server").unwrap();
-                    let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
-                    match cyfs_cmd_client.get_init_config().await {
-                        Ok(result) => {
-                            if format == "json" {
-                                println!("{}", serde_json::to_string_pretty(&result).unwrap());
-                            } else {
-                                println!("{}", serde_yaml_ng::to_string(&result).unwrap());
-                            }
-                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
-                                save_login_token(server.as_str(), token.as_str());
-                            }
-                            std::process::exit(0);
-                        }
-                        Err(e) => {
-                            println!("show config error: {}", e);
-                            if let Some(token) = cyfs_cmd_client.get_latest_token().await {
-                                save_login_token(server.as_str(), token.as_str());
-                            }
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                _ => {}
             }
-        }
+            None => {
+                let format = sub_matches.get_one::<String>("format").unwrap();
+                let server = sub_matches.get_one::<String>("server").unwrap();
+                let cyfs_cmd_client =
+                    GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+                match cyfs_cmd_client.get_init_config().await {
+                    Ok(result) => {
+                        if format == "json" {
+                            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                        } else {
+                            println!("{}", serde_yaml_ng::to_string(&result).unwrap());
+                        }
+                        if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                            save_login_token(server.as_str(), token.as_str());
+                        }
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        println!("show config error: {}", e);
+                        if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                            save_login_token(server.as_str(), token.as_str());
+                        }
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ => {}
+        },
         Some(("save", sub_matches)) => {
             let server = sub_matches.get_one::<String>("server").unwrap();
             let path = sub_matches.get_one::<String>("config");
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.save_config(path.map(|s| s.as_str())).await {
                 Ok(result) => {
                     if let Some(path) = result.as_str() {
@@ -828,7 +860,8 @@ pub async fn cyfs_gateway_main() {
         Some(("show_connections", sub_matches)) => {
             let server = sub_matches.get_one::<String>("server").unwrap();
             let format = sub_matches.get_one::<String>("format").unwrap();
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.get_connections().await {
                 Ok(result) => {
                     if format == "json" {
@@ -852,8 +885,11 @@ pub async fn cyfs_gateway_main() {
         }
         Some(("remove_rule", sub_matches)) => {
             let id = sub_matches.get_one::<String>("id").expect("id is required");
-            let server = sub_matches.get_one::<String>("server").expect("server is required");
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let server = sub_matches
+                .get_one::<String>("server")
+                .expect("server is required");
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.remove_rule(id).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -873,9 +909,14 @@ pub async fn cyfs_gateway_main() {
         }
         Some(("add_rule", sub_matches)) => {
             let config_type = sub_matches.get_one::<String>("id").expect("id is required");
-            let config_id = sub_matches.get_one::<String>("rule").expect("rule is required");
-            let server = sub_matches.get_one::<String>("server").expect("server is required");
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let config_id = sub_matches
+                .get_one::<String>("rule")
+                .expect("rule is required");
+            let server = sub_matches
+                .get_one::<String>("server")
+                .expect("server is required");
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.add_rule(config_type, config_id).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -892,12 +933,17 @@ pub async fn cyfs_gateway_main() {
                     std::process::exit(1);
                 }
             }
-        },
+        }
         Some(("append_rule", sub_matches)) => {
             let id = sub_matches.get_one::<String>("id").expect("id is required");
-            let rule = sub_matches.get_one::<String>("rule").expect("rule is required");
-            let server = sub_matches.get_one::<String>("server").expect("server is required");
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let rule = sub_matches
+                .get_one::<String>("rule")
+                .expect("rule is required");
+            let server = sub_matches
+                .get_one::<String>("server")
+                .expect("server is required");
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.append_rule(id, rule).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -917,11 +963,18 @@ pub async fn cyfs_gateway_main() {
         }
         Some(("insert_rule", sub_matches)) => {
             let id = sub_matches.get_one::<String>("id").expect("id is required");
-            let pos = sub_matches.get_one::<String>("pos").expect("pos is required");
-            let rule = sub_matches.get_one::<String>("rule").expect("rule is required");
+            let pos = sub_matches
+                .get_one::<String>("pos")
+                .expect("pos is required");
+            let rule = sub_matches
+                .get_one::<String>("rule")
+                .expect("rule is required");
             let pos: i32 = pos.parse().expect("pos must be integer");
-            let server = sub_matches.get_one::<String>("server").expect("server is required");
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let server = sub_matches
+                .get_one::<String>("server")
+                .expect("server is required");
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.insert_rule(id, pos, rule).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -941,10 +994,15 @@ pub async fn cyfs_gateway_main() {
         }
         Some(("move_rule", sub_matches)) => {
             let id = sub_matches.get_one::<String>("id").expect("id is required");
-            let pos = sub_matches.get_one::<String>("new_pos").expect("new_pos is required");
+            let pos = sub_matches
+                .get_one::<String>("new_pos")
+                .expect("new_pos is required");
             let pos: i32 = pos.parse().expect("new_pos must be integer");
-            let server = sub_matches.get_one::<String>("server").expect("server is required");
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let server = sub_matches
+                .get_one::<String>("server")
+                .expect("server is required");
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.move_rule(id, pos).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -964,9 +1022,14 @@ pub async fn cyfs_gateway_main() {
         }
         Some(("set_rule", sub_matches)) => {
             let id = sub_matches.get_one::<String>("id").expect("id is required");
-            let rule = sub_matches.get_one::<String>("rule").expect("rule is required");
-            let server = sub_matches.get_one::<String>("server").expect("server is required");
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let rule = sub_matches
+                .get_one::<String>("rule")
+                .expect("rule is required");
+            let server = sub_matches
+                .get_one::<String>("server")
+                .expect("server is required");
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.set_rule(id, rule).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -985,11 +1048,20 @@ pub async fn cyfs_gateway_main() {
             }
         }
         Some(("add_dispatch", sub_matches)) => {
-            let local = sub_matches.get_one::<String>("local").expect("local is required");
-            let target = sub_matches.get_one::<String>("target").expect("target is required");
-            let protocol = sub_matches.get_one::<String>("protocol").map(|s| s.as_str());
-            let server = sub_matches.get_one::<String>("server").expect("server is required");
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let local = sub_matches
+                .get_one::<String>("local")
+                .expect("local is required");
+            let target = sub_matches
+                .get_one::<String>("target")
+                .expect("target is required");
+            let protocol = sub_matches
+                .get_one::<String>("protocol")
+                .map(|s| s.as_str());
+            let server = sub_matches
+                .get_one::<String>("server")
+                .expect("server is required");
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.add_dispatch(local, target, protocol).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -1009,10 +1081,17 @@ pub async fn cyfs_gateway_main() {
         }
         Some(("add_router", sub_matches)) => {
             let server_id = sub_matches.get_one::<String>("id").map(|s| s.as_str());
-            let uri = sub_matches.get_one::<String>("uri").expect("uri is required");
-            let target = sub_matches.get_one::<String>("target").expect("target is required");
-            let server = sub_matches.get_one::<String>("server").expect("server is required");
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let uri = sub_matches
+                .get_one::<String>("uri")
+                .expect("uri is required");
+            let target = sub_matches
+                .get_one::<String>("target")
+                .expect("target is required");
+            let server = sub_matches
+                .get_one::<String>("server")
+                .expect("server is required");
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.add_router(server_id, uri, target).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -1032,10 +1111,17 @@ pub async fn cyfs_gateway_main() {
         }
         Some(("remove_router", sub_matches)) => {
             let server_id = sub_matches.get_one::<String>("id").map(|s| s.as_str());
-            let uri = sub_matches.get_one::<String>("uri").expect("uri is required");
-            let target = sub_matches.get_one::<String>("target").expect("target is required");
-            let server = sub_matches.get_one::<String>("server").expect("server is required");
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let uri = sub_matches
+                .get_one::<String>("uri")
+                .expect("uri is required");
+            let target = sub_matches
+                .get_one::<String>("target")
+                .expect("target is required");
+            let server = sub_matches
+                .get_one::<String>("server")
+                .expect("server is required");
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.remove_router(server_id, uri, target).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -1054,10 +1140,17 @@ pub async fn cyfs_gateway_main() {
             }
         }
         Some(("remove_dispatch", sub_matches)) => {
-            let local = sub_matches.get_one::<String>("local").expect("local is required");
-            let protocol = sub_matches.get_one::<String>("protocol").map(|s| s.as_str());
-            let server = sub_matches.get_one::<String>("server").expect("server is required");
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let local = sub_matches
+                .get_one::<String>("local")
+                .expect("local is required");
+            let protocol = sub_matches
+                .get_one::<String>("protocol")
+                .map(|s| s.as_str());
+            let server = sub_matches
+                .get_one::<String>("server")
+                .expect("server is required");
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.remove_dispatch(local, protocol).await {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
@@ -1106,7 +1199,8 @@ pub async fn cyfs_gateway_main() {
         }
         Some(("reload", sub_matches)) => {
             let server = sub_matches.get_one::<String>("server").unwrap();
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.reload().await {
                 Ok(result) => {
                     println!("{}", result.to_string());
@@ -1127,7 +1221,8 @@ pub async fn cyfs_gateway_main() {
         Some(("start", sub_matches)) => {
             let server = sub_matches.get_one::<String>("server").unwrap();
             let start_args = parse_template_args("start", true);
-            let cyfs_cmd_client = GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             if start_args.template_id.is_none() {
                 match cyfs_cmd_client.get_external_cmds().await {
                     Ok(cmds) => {
@@ -1156,7 +1251,10 @@ pub async fn cyfs_gateway_main() {
 
             let template_id = start_args.template_id.unwrap();
             if start_args.help {
-                match cyfs_cmd_client.get_external_cmd_help(template_id.as_str()).await {
+                match cyfs_cmd_client
+                    .get_external_cmd_help(template_id.as_str())
+                    .await
+                {
                     Ok(help) => {
                         println!("{}", help);
                         if let Some(token) = cyfs_cmd_client.get_latest_token().await {
@@ -1174,7 +1272,10 @@ pub async fn cyfs_gateway_main() {
                 }
             }
 
-            match cyfs_cmd_client.start_template(template_id.as_str(), start_args.args).await {
+            match cyfs_cmd_client
+                .start_template(template_id.as_str(), start_args.args)
+                .await
+            {
                 Ok(result) => {
                     println!("{}", serde_json::to_string_pretty(&result).unwrap());
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {
@@ -1193,7 +1294,9 @@ pub async fn cyfs_gateway_main() {
         }
         Some(("run", _sub_matches)) => {
             let run_args = parse_template_args("run", false);
-            let template_dir = get_buckyos_system_etc_dir().join("cyfs_gateway").join("server_templates");
+            let template_dir = get_buckyos_system_etc_dir()
+                .join("cyfs_gateway")
+                .join("server_templates");
             let external_cmds = JsPkgManager::new(template_dir);
             if run_args.template_id.is_none() {
                 match external_cmds.list_pkgs().await {
@@ -1240,12 +1343,15 @@ pub async fn cyfs_gateway_main() {
             sfo_log::Logger::new("cyfs_gateway")
                 .set_log_path(log_dir.to_string_lossy().to_string().as_str())
                 .set_log_to_file(true)
-                .start().unwrap();
+                .start()
+                .unwrap();
             info!("cyfs_gateway start...");
 
             if matches.get_flag("debug") {
                 info!("Debug mode enabled");
-                unsafe { std::env::set_var("RUST_BACKTRACE", "1"); }
+                unsafe {
+                    std::env::set_var("RUST_BACKTRACE", "1");
+                }
                 console_subscriber::init();
             }
             match run_template_local(template_id.as_str(), run_args.args).await {
@@ -1276,25 +1382,27 @@ pub async fn cyfs_gateway_main() {
         }
     }
 
-    let log_dir = get_buckyos_log_dir("cyfs_gateway", true);
-    std::fs::create_dir_all(&log_dir).unwrap();
+    // let log_dir = get_buckyos_log_dir("cyfs_gateway", true);
+    // std::fs::create_dir_all(&log_dir).unwrap();
 
-    //let log_level = env::var("BUCKY_LOG").unwrap_or("info".to_string());
+    // //let log_level = env::var("BUCKY_LOG").unwrap_or("info".to_string());
 
-    sfo_log::Logger::new("cyfs_gateway")
-        .set_log_level(log_params.level.unwrap_or("info".to_string()).as_str())
-        .set_log_path(log_params.path.unwrap_or(log_dir.to_string_lossy().to_string()).as_str())
-        .set_log_to_file(true)
-        .set_log_file_count(log_params.file_count.unwrap_or(10))
-        .set_log_file_size(parse_size_bytes(log_params.file_size.unwrap_or("100MB".to_string()).as_str()).unwrap_or(20 * 1024 * 1024))
-        .start().unwrap();
+    // sfo_log::Logger::new("cyfs_gateway")
+    //     .set_log_level(log_params.level.unwrap_or("info".to_string()).as_str())
+    //     .set_log_path(log_params.path.unwrap_or(log_dir.to_string_lossy().to_string()).as_str())
+    //     .set_log_to_file(true)
+    //     .set_log_file_count(log_params.file_count.unwrap_or(10))
+    //     .set_log_file_size(parse_size_bytes(log_params.file_size.unwrap_or("100MB".to_string()).as_str()).unwrap_or(20 * 1024 * 1024))
+    //     .start().unwrap();
     // init log
-    // init_logging("cyfs_gateway",true);
+    init_logging("cyfs_gateway", true);
     info!("cyfs_gateway start...");
 
     if matches.get_flag("debug") {
         info!("Debug mode enabled");
-        unsafe { std::env::set_var("RUST_BACKTRACE", "1"); }
+        unsafe {
+            std::env::set_var("RUST_BACKTRACE", "1");
+        }
         console_subscriber::init();
     }
 
@@ -1312,5 +1420,4 @@ pub async fn cyfs_gateway_main() {
     if let Err(e) = gateway_service_main(config_file.as_path(), params).await {
         error!("Gateway run error: {}", e);
     }
-
 }
