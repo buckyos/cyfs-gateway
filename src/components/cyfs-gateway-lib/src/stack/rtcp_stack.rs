@@ -1,24 +1,7 @@
+use std::net::SocketAddr;
 use std::path::Path;
-use std::net::{SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
-use buckyos_kit::AsyncStream;
-use name_lib::{encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig};
-use sfo_io::{LimitStream, StatStream};
-use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{create_io_dump_stack_config, hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef, DumpStream, HandleConnectionController, IoDumpStackConfig, ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackRef, StackConfig, StackContext, StackErrorCode, StackFactory, StackProtocol, StackResult, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelManager, TunnelResult, StreamInfo, DatagramInfo, LimiterManagerRef, StatManagerRef, MutComposedSpeedStat, MutComposedSpeedStatRef, get_stat_info, TunnelError, has_scheme, GlobalCollectionManagerRef, get_external_commands, JsExternalsManagerRef};
-use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
-use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
-use crate::stack::limiter::Limiter;
-use crate::stack::{datagram_forward, get_limit_info, stream_forward};
-use crate::{
-    get_external_commands, get_stat_info, has_scheme, hyper_serve_http, into_stack_err, stack_err,
-    ConnectionInfo, ConnectionManagerRef, DatagramInfo, GlobalCollectionManagerRef,
-    HandleConnectionController, LimiterManagerRef, MutComposedSpeedStat, MutComposedSpeedStatRef,
-    ProcessChainConfigs, RTcp, RTcpListener, Server, ServerManagerRef, Stack, StackConfig,
-    StackContext, StackErrorCode, StackFactory, StackProtocol, StackRef, StackResult,
-    StatManagerRef, StreamInfo, TunnelBox, TunnelBuilder, TunnelEndpoint, TunnelError,
-    TunnelManager, TunnelResult,
-};
+
 use buckyos_kit::AsyncStream;
 use cyfs_process_chain::{
     CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor,
@@ -29,10 +12,22 @@ use name_lib::{
 };
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
-use std::net::SocketAddr;
-use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
 use url::Url;
+
+use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
+use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
+use crate::stack::limiter::Limiter;
+use crate::stack::{datagram_forward, get_limit_info, stream_forward};
+use crate::{
+    create_io_dump_stack_config, get_external_commands, get_stat_info, has_scheme,
+    hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef,
+    DatagramInfo, DumpStream, GlobalCollectionManagerRef, HandleConnectionController,
+    IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef, MutComposedSpeedStat,
+    MutComposedSpeedStatRef, ProcessChainConfigs, RTcp, RTcpListener, Server,
+    ServerManagerRef, Stack, StackConfig, StackContext, StackErrorCode, StackFactory,
+    StackProtocol, StackRef, StackResult, StatManagerRef, StreamInfo, TunnelBox,
+    TunnelBuilder, TunnelEndpoint, TunnelError, TunnelManager, TunnelResult,
+};
 
 #[derive(Clone)]
 pub struct RtcpStackContext {
@@ -105,6 +100,7 @@ impl RtcpConnectionHandler {
                     env.global_process_chains.clone(),
                     env.global_collection_manager.clone(),
                     Some(get_external_commands(Arc::downgrade(&env.servers))),
+                    env.js_externals.clone(),
                 )
                 .await
                 .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -144,6 +140,7 @@ impl RtcpConnectionHandler {
                     env.global_process_chains.clone(),
                     env.global_collection_manager.clone(),
                     Some(get_external_commands(Arc::downgrade(&env.servers))),
+                    env.js_externals.clone(),
                 )
                 .await
                 .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
@@ -246,10 +243,9 @@ impl RtcpConnectionHandler {
         let device_info = self
             .connection_manager
             .as_ref()
-            .and_then(|manager| {
-                manager.get_device_info_by_source(remote_ip)
-            });
+            .and_then(|manager| manager.get_device_info_by_source(remote_ip));
         let remote_addr_str = remote_addr.to_string();
+        let dest_host = dest_host.unwrap_or_default();
         let map = MemoryMapCollection::new_ref();
         map.insert("source_addr", CollectionValue::String(remote_addr_str.clone())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -263,12 +259,7 @@ impl RtcpConnectionHandler {
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("dest_port", CollectionValue::String(dest_port.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_host", CollectionValue::String(dest_host.clone().unwrap_or_default())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert(
-            "dest_host",
-            CollectionValue::String(dest_host.clone().unwrap_or_default()),
-        )
+        map.insert("dest_host", CollectionValue::String(dest_host))
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("protocol", CollectionValue::String(protocol))
@@ -441,9 +432,8 @@ impl RtcpConnectionHandler {
         let device_info = self
             .connection_manager
             .as_ref()
-            .and_then(|manager| {
-                manager.get_device_info_by_source(remote_ip)
-            });
+            .and_then(|manager| manager.get_device_info_by_source(remote_ip));
+        let dest_host = dest_host.unwrap_or_default();
         let map = MemoryMapCollection::new_ref();
         map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -457,12 +447,7 @@ impl RtcpConnectionHandler {
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("dest_port", CollectionValue::String(dest_port.to_string())).await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_host", CollectionValue::String(dest_host.unwrap_or_default())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert(
-            "dest_host",
-            CollectionValue::String(dest_host.unwrap_or_default()),
-        )
+        map.insert("dest_host", CollectionValue::String(dest_host))
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("protocol", CollectionValue::String(protocol))
@@ -656,6 +641,8 @@ impl RTcpListener for Listener {
         dest_host: Option<String>,
         dest_port: u16,
         endpoint: TunnelEndpoint,
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
     ) -> TunnelResult<()> {
         let (protocol, dest_host, dest_port, path) = if dest_port == 0 {
             if dest_host.is_none() {
@@ -722,8 +709,8 @@ impl RTcpListener for Listener {
         if let Some(manager) = &self.connection_manager {
             let controller = HandleConnectionController::new(handle);
             manager.add_connection(ConnectionInfo::new(
-                remote_addr,
-                self.bind_addr.clone(),
+                remote_addr.to_string(),
+                local_addr.to_string(),
                 StackProtocol::Rtcp,
                 speed,
                 controller,
@@ -738,6 +725,8 @@ impl RTcpListener for Listener {
         dest_host: Option<String>,
         dest_port: u16,
         endpoint: TunnelEndpoint,
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
     ) -> TunnelResult<()> {
         let (protocol, dest_host, dest_port, path) = if dest_port == 0 {
             if dest_host.is_none() {
@@ -806,6 +795,8 @@ impl RTcpListener for Listener {
                     path,
                     endpoint,
                     stat,
+                    remote_addr,
+                    local_addr,
                 )
                 .await
             {
@@ -816,8 +807,8 @@ impl RTcpListener for Listener {
         if let Some(manager) = &self.connection_manager {
             let controller = HandleConnectionController::new(handle);
             manager.add_connection(ConnectionInfo::new(
-                remote_addr,
-                self.bind_addr.clone(),
+                remote_addr.to_string(),
+                local_addr.to_string(),
                 StackProtocol::Rtcp,
                 speed,
                 controller,
@@ -969,6 +960,7 @@ impl RtcpStack {
         };
         let handler = RtcpConnectionHandler::create(
             builder.hook_point.unwrap(),
+            builder.on_new_tunnel_hook_point.take(),
             stack_context.clone(),
             connection_manager.clone(),
             builder.io_dump,
@@ -1086,6 +1078,7 @@ impl Stack for RtcpStack {
         .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
         let handler = RtcpConnectionHandler::create(
             config.hook_point.clone(),
+            config.on_new_tunnel_hook_point.clone(),
             env,
             self.connection_manager.clone(),
             io_dump,
@@ -1316,11 +1309,24 @@ impl StackFactory for RtcpStackFactory {
             .connection_manager(self.connection_manager.clone())
             .device_config(device_config)
             .private_key(private_key)
-            .hook_point(config.hook_point.clone())
+            .hook_point(config.hook_point.clone());
+        let stack = if let Some(on_new_tunnel_hook_point) = config.on_new_tunnel_hook_point.clone()
+        {
+            stack.on_new_tunnel_hook_point(on_new_tunnel_hook_point)
+        } else {
+            stack
+        };
+        let stack = if let Some(device_doc_jwt) = device_doc_jwt {
+            stack.device_doc_jwt(device_doc_jwt)
+        } else {
+            stack
+        };
+        let stack = stack
             .stack_context(stack_context.clone())
             .io_dump(io_dump)
             .reuse_address(config.reuse_address.unwrap_or(false))
-            .build().await?;
+            .build()
+            .await?;
         Ok(Arc::new(stack))
     }
 }
@@ -1330,9 +1336,12 @@ impl StackFactory for RtcpStackFactory {
 mod tests {
     use super::RtcpConnectionHandler;
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{create_io_dump_stack_config, decode_io_dump_frames, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackContext, StackProtocol, StackFactory, StreamInfo, DatagramInfo, DefaultLimiterManager, StatManager, GlobalCollectionManager, LimiterManagerRef, StatManagerRef, ServerManagerRef, RtcpStackContext};
-    use buckyos_kit::{AsyncStream};
-    use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, generate_ed25519_key_pair, DeviceConfig, EncodedDocument};
+    use crate::{create_io_dump_stack_config, decode_io_dump_frames, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackContext, StackProtocol, StackFactory, StreamInfo, DatagramInfo, DefaultLimiterManager, StatManager, GlobalCollectionManager, LimiterManagerRef, StatManagerRef, ServerManagerRef, RtcpStackContext, TunnelEndpoint};
+    use buckyos_kit::AsyncStream;
+    use jsonwebtoken::EncodingKey;
+    use name_client::{add_nameinfo_cache, init_name_lib_for_test, update_did_cache, NameInfo};
+    use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, generate_ed25519_key_pair, DeviceConfig, DIDDocumentTrait, EncodedDocument};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1484,6 +1493,8 @@ mod tests {
                 StatManager::new(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -4590,6 +4601,11 @@ mod tests {
             key_path: key_file.path().to_string_lossy().to_string(),
             device_config_path: Some(jwt_config_file.path().to_string_lossy().to_string()),
             name: Some("test".to_string()),
+            io_dump_file: None,
+            io_dump_rotate_size: None,
+            io_dump_rotate_max_files: None,
+            io_dump_max_upload_bytes_per_conn: None,
+            io_dump_max_download_bytes_per_conn: None,
             reuse_address: None,
         };
 

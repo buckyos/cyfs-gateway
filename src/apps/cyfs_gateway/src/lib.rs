@@ -2314,8 +2314,8 @@ pub async fn cyfs_gateway_main() {
         }
     }
 
-    // let log_dir = get_buckyos_log_dir("cyfs_gateway", true);
-    // std::fs::create_dir_all(&log_dir).unwrap();
+    let log_dir = get_buckyos_log_dir("cyfs_gateway", true);
+    std::fs::create_dir_all(&log_dir).unwrap();
 
     // //let log_level = env::var("BUCKY_LOG").unwrap_or("info".to_string());
 
