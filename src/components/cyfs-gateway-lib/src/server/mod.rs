@@ -1,4 +1,5 @@
 mod http_server;
+mod http_compression;
 mod dns_server;
 mod socks5_server;
 mod server;

@@ -1,13 +1,12 @@
 use super::coll::*;
 use super::mem::*;
-use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 use serde::{Deserializer, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub struct JsonFileCollection<T: Send + Sync + for<'a> Deserialize<'a> + Serialize + Default> {
     file: PathBuf,
@@ -147,14 +146,132 @@ impl SetCollection for JsonSetCollection {
     }
 }
 
+#[derive(Clone)]
+pub struct JsonListCollection {
+    data: Arc<MemoryListCollection>,
+    file: Arc<JsonFileCollection<Vec<CollectionValue>>>,
+}
+
+impl JsonListCollection {
+    pub fn new(file: PathBuf) -> Result<Self, String> {
+        let file = JsonFileCollection::new(file);
+        let list = file.load()?;
+        let data = MemoryListCollection::from_list(list);
+        Ok(Self {
+            data: Arc::new(data),
+            file: Arc::new(file),
+        })
+    }
+
+    pub async fn flush(&self) -> Result<(), String> {
+        if self.file.is_dirty() {
+            self.file.save(&*self.data.data().read().await)?;
+            self.file.clear_dirty();
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ListCollection for JsonListCollection {
+    async fn len(&self) -> Result<usize, String> {
+        self.data.len().await
+    }
+
+    async fn push(&self, value: CollectionValue) -> Result<(), String> {
+        self.data.push(value).await?;
+        self.file.mark_dirty();
+        Ok(())
+    }
+
+    async fn insert(&self, index: usize, value: CollectionValue) -> Result<(), String> {
+        self.data.insert(index, value).await?;
+        self.file.mark_dirty();
+        Ok(())
+    }
+
+    async fn set(
+        &self,
+        index: usize,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
+        let ret = self.data.set(index, value).await?;
+        self.file.mark_dirty();
+        Ok(ret)
+    }
+
+    async fn get(&self, index: usize) -> Result<Option<CollectionValue>, String> {
+        self.data.get(index).await
+    }
+
+    async fn remove(&self, index: usize) -> Result<Option<CollectionValue>, String> {
+        let ret = self.data.remove(index).await?;
+        if ret.is_some() {
+            self.file.mark_dirty();
+        }
+        Ok(ret)
+    }
+
+    async fn pop(&self) -> Result<Option<CollectionValue>, String> {
+        let ret = self.data.pop().await?;
+        if ret.is_some() {
+            self.file.mark_dirty();
+        }
+        Ok(ret)
+    }
+
+    async fn clear(&self) -> Result<(), String> {
+        self.data.clear().await?;
+        self.file.mark_dirty();
+        Ok(())
+    }
+
+    async fn get_all(&self) -> Result<Vec<CollectionValue>, String> {
+        self.data.get_all().await
+    }
+
+    async fn traverse(&self, callback: ListCollectionTraverseCallBackRef) -> Result<(), String> {
+        self.data.traverse(callback).await
+    }
+
+    async fn contains_all_strings(&self, values: &[String]) -> Result<bool, String> {
+        self.data.contains_all_strings(values).await
+    }
+
+    fn is_flushable(&self) -> bool {
+        self.file.is_dirty()
+    }
+
+    async fn flush(&self) -> Result<(), String> {
+        self.flush().await
+    }
+
+    async fn dump(&self) -> Result<Vec<CollectionValue>, String> {
+        self.data.dump().await
+    }
+}
+
 impl Serialize for CollectionValue {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         match self {
+            CollectionValue::Null => serializer.serialize_none(),
+            CollectionValue::Bool(v) => serializer.serialize_bool(*v),
+            CollectionValue::Number(NumberValue::Int(v)) => serializer.serialize_i64(*v),
+            CollectionValue::Number(NumberValue::Float(v)) => serializer.serialize_f64(*v),
             CollectionValue::String(s) => serializer.serialize_str(s),
-            _ => serializer.serialize_str(""),
+            CollectionValue::List(_)
+            | CollectionValue::Set(_)
+            | CollectionValue::Map(_)
+            | CollectionValue::MultiMap(_)
+            | CollectionValue::Visitor(_)
+            | CollectionValue::Any(_) => Err(serde::ser::Error::custom(format!(
+                "CollectionValue type '{}' is not supported for JSON persistence",
+                self.get_type()
+            ))),
         }
     }
 }
@@ -164,31 +281,44 @@ impl<'de> Deserialize<'de> for CollectionValue {
     where
         D: Deserializer<'de>,
     {
-        struct StringVisitor;
-
-        impl<'de> Visitor<'de> for StringVisitor {
-            type Value = CollectionValue;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("string")
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let ret = match value {
+            serde_json::Value::Null => CollectionValue::Null,
+            serde_json::Value::Bool(v) => CollectionValue::Bool(v),
+            serde_json::Value::Number(v) => {
+                if let Some(i) = v.as_i64() {
+                    CollectionValue::Number(NumberValue::Int(i))
+                } else if let Some(u) = v.as_u64() {
+                    if u > i64::MAX as u64 {
+                        return Err(serde::de::Error::custom(format!(
+                            "u64 value {} exceeds i64 range",
+                            u
+                        )));
+                    }
+                    CollectionValue::Number(NumberValue::Int(u as i64))
+                } else if let Some(f) = v.as_f64() {
+                    CollectionValue::Number(NumberValue::Float(f))
+                } else {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported number value: {}",
+                        v
+                    )));
+                }
             }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(CollectionValue::String(v.to_string()))
+            serde_json::Value::String(v) => CollectionValue::String(v),
+            serde_json::Value::Array(_) => {
+                return Err(serde::de::Error::custom(
+                    "JSON array is not supported for CollectionValue persistence yet",
+                ));
             }
-
-            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(CollectionValue::String(v))
+            serde_json::Value::Object(_) => {
+                return Err(serde::de::Error::custom(
+                    "JSON object is not supported for CollectionValue persistence yet",
+                ));
             }
-        }
+        };
 
-        deserializer.deserialize_string(StringVisitor)
+        Ok(ret)
     }
 }
 
@@ -242,7 +372,7 @@ impl MapCollection for JsonMapCollection {
         let new_value = value.clone();
         let ret = self.data.insert(key, value).await?;
         if let Some(prev) = &ret {
-            if let Some(false) = prev.compare_string(&new_value) {
+            if *prev != new_value {
                 self.file.mark_dirty();
             }
         }
@@ -267,10 +397,7 @@ impl MapCollection for JsonMapCollection {
         Ok(ret)
     }
 
-    async fn traverse(
-        &self,
-        callback: MapCollectionTraverseCallBackRef,
-    ) -> Result<(), String> {
+    async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String> {
         self.data.traverse(callback).await
     }
 
@@ -561,5 +688,35 @@ mod tests {
             assert!(loaded_collection.remove_all(&key).await.unwrap().is_some());
             assert!(!loaded_collection.contains_key(&key).await.unwrap());
         }
+    }
+
+    #[test]
+    fn test_collection_value_json_roundtrip_typed_values() {
+        let cases = vec![
+            CollectionValue::Null,
+            CollectionValue::Bool(true),
+            CollectionValue::Bool(false),
+            CollectionValue::Number(NumberValue::Int(123)),
+            CollectionValue::Number(NumberValue::Float(12.5)),
+            CollectionValue::String("hello".to_string()),
+        ];
+
+        for value in cases {
+            let json = serde_json::to_string(&value).unwrap();
+            let decoded: CollectionValue = serde_json::from_str(&json).unwrap();
+            assert_eq!(value, decoded);
+        }
+    }
+
+    #[test]
+    fn test_collection_value_json_rejects_unsupported_reference_types() {
+        let value = CollectionValue::List(MemoryListCollection::new_ref());
+        let err = serde_json::to_string(&value).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not supported for JSON persistence"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

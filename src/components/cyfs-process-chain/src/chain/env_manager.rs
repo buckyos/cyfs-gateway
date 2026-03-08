@@ -112,6 +112,55 @@ impl PathCollection {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MissingVarPolicy {
+    #[default]
+    Lenient,
+    Strict,
+}
+
+impl MissingVarPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MissingVarPolicy::Lenient => "lenient",
+            MissingVarPolicy::Strict => "strict",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CoercionPolicy {
+    #[default]
+    Legacy,
+    Warn,
+    Strict,
+}
+
+impl CoercionPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CoercionPolicy::Legacy => "legacy",
+            CoercionPolicy::Warn => "warn",
+            CoercionPolicy::Strict => "strict",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutionPolicy {
+    pub missing_var: MissingVarPolicy,
+    pub coercion: CoercionPolicy,
+}
+
+impl Default for ExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            missing_var: MissingVarPolicy::Lenient,
+            coercion: CoercionPolicy::Legacy,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EnvManager {
     global: EnvRef,
@@ -120,6 +169,7 @@ pub struct EnvManager {
 
     // Tracking variables current level
     var_level_tracker: Arc<RwLock<HashMap<String, EnvLevel>>>,
+    policy: Arc<RwLock<ExecutionPolicy>>,
 }
 
 impl EnvManager {
@@ -127,13 +177,12 @@ impl EnvManager {
         let global_level = self.global.log_level();
         let chain_level = self.chain.log_level();
         let block_level = self.block.log_level();
-        
+
         // Return the highest level among the three
         // Level ordering: Trace < Debug < Info < Warn < Error
         global_level.max(chain_level).max(block_level)
     }
 
-    
     pub fn new(global_env: EnvRef, chain_env: EnvRef) -> Self {
         assert!(
             global_env.level() == EnvLevel::Global,
@@ -146,12 +195,55 @@ impl EnvManager {
 
         let block = Arc::new(Env::new(EnvLevel::Block, Some(chain_env.clone())));
         let var_level_tracker = Arc::new(RwLock::new(HashMap::new()));
+        let policy = Arc::new(RwLock::new(ExecutionPolicy::default()));
 
         Self {
             global: global_env,
             chain: chain_env,
             block,
             var_level_tracker,
+            policy,
+        }
+    }
+
+    pub fn policy(&self) -> ExecutionPolicy {
+        *self.policy.read().unwrap()
+    }
+
+    pub fn set_policy(&self, policy: ExecutionPolicy) {
+        let mut guard = self.policy.write().unwrap();
+        if *guard != policy {
+            log!(
+                self.get_log_level(),
+                "Execution policy changed from '{:?}' to '{:?}'",
+                *guard,
+                policy
+            );
+            *guard = policy;
+        }
+    }
+
+    pub fn missing_var_policy(&self) -> MissingVarPolicy {
+        self.policy().missing_var
+    }
+
+    pub fn set_missing_var_policy(&self, policy: MissingVarPolicy) {
+        let mut current = self.policy();
+        if current.missing_var != policy {
+            current.missing_var = policy;
+            self.set_policy(current);
+        }
+    }
+
+    pub fn coercion_policy(&self) -> CoercionPolicy {
+        self.policy().coercion
+    }
+
+    pub fn set_coercion_policy(&self, policy: CoercionPolicy) {
+        let mut current = self.policy();
+        if current.coercion != policy {
+            current.coercion = policy;
+            self.set_policy(current);
         }
     }
 
@@ -166,9 +258,7 @@ impl EnvManager {
         external: EnvExternalRef,
     ) -> Result<(), String> {
         let env = self.get_env(level);
-        env.env_external_manager()
-            .add_external(id, external)
-            .await
+        env.env_external_manager().add_external(id, external).await
     }
 
     pub async fn remove_env_external(
@@ -197,17 +287,168 @@ impl EnvManager {
         }
     }
 
-    fn parse_var(key: &str) -> Vec<String> {
-        key.split('.')
-            .map(|part| {
-                let part = part.trim();
-                if part.len() >= 2 && part.starts_with('(') && part.ends_with(')') {
-                    part[1..part.len() - 1].trim().to_string()
-                } else {
-                    part.to_string()
+    fn normalize_path_part(part: String) -> String {
+        let part = part.trim();
+        if part.len() >= 2 && part.starts_with('(') && part.ends_with(')') {
+            part[1..part.len() - 1].trim().to_string()
+        } else {
+            part.to_string()
+        }
+    }
+
+    fn parse_bracket_part(key: &str, start: usize) -> Result<(String, usize), String> {
+        let mut i = start + '['.len_utf8();
+        if i >= key.len() {
+            return Err(format!("Unclosed bracket segment in key: {}", key));
+        }
+
+        while i < key.len() {
+            let ch = key[i..].chars().next().unwrap();
+            if ch.is_whitespace() {
+                i += ch.len_utf8();
+                continue;
+            }
+            break;
+        }
+
+        if i >= key.len() {
+            return Err(format!("Unclosed bracket segment in key: {}", key));
+        }
+
+        let first = key[i..].chars().next().unwrap();
+        if first == '"' || first == '\'' {
+            let quote = first;
+            i += quote.len_utf8();
+
+            let mut content = String::new();
+            let mut escaped = false;
+            let mut closed = false;
+
+            while i < key.len() {
+                let ch = key[i..].chars().next().unwrap();
+                i += ch.len_utf8();
+
+                if escaped {
+                    content.push(ch);
+                    escaped = false;
+                    continue;
                 }
-            })
-            .collect()
+
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+
+                if ch == quote {
+                    closed = true;
+                    break;
+                }
+
+                content.push(ch);
+            }
+
+            if !closed {
+                return Err(format!("Unclosed quoted bracket segment in key: {}", key));
+            }
+
+            while i < key.len() {
+                let ch = key[i..].chars().next().unwrap();
+                if ch.is_whitespace() {
+                    i += ch.len_utf8();
+                    continue;
+                }
+                break;
+            }
+
+            if i >= key.len() || !key[i..].starts_with(']') {
+                return Err(format!("Missing closing ']' in key: {}", key));
+            }
+
+            return Ok((content, i + ']'.len_utf8()));
+        }
+
+        let mut depth = 1usize;
+        let mut content = String::new();
+        while i < key.len() {
+            let ch = key[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+
+            if ch == '[' {
+                depth += 1;
+                content.push(ch);
+                continue;
+            }
+
+            if ch == ']' {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok((content.trim().to_string(), i));
+                }
+                content.push(ch);
+                continue;
+            }
+
+            content.push(ch);
+        }
+
+        Err(format!("Unclosed bracket segment in key: {}", key))
+    }
+
+    fn parse_var(key: &str) -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        let mut i = 0usize;
+        while i < key.len() {
+            let ch = key[i..].chars().next().unwrap();
+
+            if ch == '\\' {
+                i += ch.len_utf8();
+                if i < key.len() {
+                    let escaped = key[i..].chars().next().unwrap();
+                    current.push(escaped);
+                    i += escaped.len_utf8();
+                } else {
+                    current.push('\\');
+                }
+                continue;
+            }
+
+            if ch == '.' {
+                if !current.is_empty() {
+                    parts.push(Self::normalize_path_part(std::mem::take(&mut current)));
+                }
+                i += ch.len_utf8();
+                continue;
+            }
+
+            if ch == '[' {
+                if !current.is_empty() {
+                    parts.push(Self::normalize_path_part(std::mem::take(&mut current)));
+                }
+
+                match Self::parse_bracket_part(key, i) {
+                    Ok((part, next)) => {
+                        parts.push(Self::normalize_path_part(part));
+                        i = next;
+                    }
+                    Err(_e) => {
+                        // Keep backward compatible behavior: treat unmatched '[' as a normal character.
+                        current.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+                continue;
+            }
+
+            current.push(ch);
+            i += ch.len_utf8();
+        }
+
+        if !current.is_empty() || parts.is_empty() {
+            parts.push(Self::normalize_path_part(current));
+        }
+
+        parts
     }
 
     pub fn get_var_level(&self, key: &str) -> EnvLevel {
@@ -394,6 +635,11 @@ impl EnvManager {
         level: EnvLevel,
     ) -> Result<Option<CollectionValue>, String> {
         let value = match collection_type {
+            CollectionType::List => {
+                let collection =
+                    Arc::new(Box::new(MemoryListCollection::new()) as Box<dyn ListCollection>);
+                CollectionValue::List(collection)
+            }
             CollectionType::Set => {
                 let collection =
                     Arc::new(Box::new(MemorySetCollection::new()) as Box<dyn SetCollection>);
@@ -494,12 +740,11 @@ impl EnvManager {
         );
         let parent = self.get_parent_collection_by_path(key_list, level).await?;
         if parent.is_none() {
-            let msg = format!(
-                "Parent collection not found for key list '{:?}', please create the collection first",
+            debug!(
+                "Parent collection not found while getting key list '{:?}', returning None",
                 key_list
             );
-            warn!("{}", msg);
-            return Err(msg);
+            return Ok(None);
         }
 
         let coll = parent.unwrap();
@@ -562,6 +807,42 @@ mod tests {
         assert_eq!(
             EnvManager::parse_var("a.(b).(c)"),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("geoByIp.1\\.2\\.3\\.4.country"),
+            vec![
+                "geoByIp".to_string(),
+                "1.2.3.4".to_string(),
+                "country".to_string()
+            ]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("geoByIp[\"1.2.3.4\"].country"),
+            vec![
+                "geoByIp".to_string(),
+                "1.2.3.4".to_string(),
+                "country".to_string()
+            ]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("REQ.headers['x-forwarded-for']"),
+            vec![
+                "REQ".to_string(),
+                "headers".to_string(),
+                "x-forwarded-for".to_string()
+            ]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("geoByIp[$REQ.clientIp].country"),
+            vec![
+                "geoByIp".to_string(),
+                "$REQ.clientIp".to_string(),
+                "country".to_string()
+            ]
         );
     }
 }

@@ -13,7 +13,7 @@ use hickory_server::server::{Request, RequestHandler, RequestInfo, ResponseHandl
 use hickory_server::ServerFuture;
 use log::trace;
 use log::{debug, error, info, warn};
-use rdata::{A, AAAA, CNAME, TXT};
+use rdata::{A, AAAA, CNAME, PTR, TXT};
 use tokio::net::UdpSocket;
 
 use anyhow::Result;
@@ -95,6 +95,19 @@ fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RDat
             let mut records = Vec::new();
             for txt in name_info.txt.iter() {
                 records.push(RData::TXT(TXT::new(vec![txt.clone()])));
+            }
+            return Ok(records);
+        }
+        "PTR" => {
+            if name_info.ptr_records.is_empty() {
+                return Err(anyhow::anyhow!("PTR is none"));
+            }
+            let mut records = Vec::new();
+            for ptr in name_info.ptr_records.iter() {
+                let target = Name::from_str(ptr)
+                    .or_else(|_| Name::from_str(format!("{}.", ptr).as_str()))
+                    .map_err(|e| anyhow::anyhow!("invalid PTR target {}: {}", ptr, e))?;
+                records.push(RData::PTR(PTR(target)));
             }
             return Ok(records);
         }
@@ -245,6 +258,7 @@ impl ProcessChainDnsServer {
         global_collection_manager: Option<GlobalCollectionManagerRef>,
         hook_point: ProcessChainConfigs,
         inner_record_manager: InnerDnsRecordManagerRef,
+        js_externals: Option<JsExternalsManagerRef>,
     ) -> ServerResult<Self> {
         let resolve_cmd = CmdResolve::new(server_mgr.clone());
         let mut commands = get_external_commands(server_mgr.clone());
@@ -253,7 +267,9 @@ impl ProcessChainDnsServer {
             &hook_point,
             global_process_chains.clone(),
             global_collection_manager.clone(),
-            Some(commands)).await
+            Some(commands),
+            js_externals,
+        ).await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
 
         Ok(Self {
@@ -307,7 +323,7 @@ impl ProcessChainDnsServer {
     async fn handle_request<'a, >(
         &self,
         request: &Request,
-        src_addr: Option<String>,
+        dst_addr: Option<String>,
     ) -> ServerResult<Vec<u8>>
     {
         if request.op_code() != OpCode::Query {
@@ -340,6 +356,16 @@ impl ProcessChainDnsServer {
             .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
         map.insert("source_port", CollectionValue::String(from_ip.port().to_string())).await
             .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+        if let Some(dst_addr) = dst_addr {
+            if let Ok(socket_addr) = dst_addr.parse::<SocketAddr>() {
+                map.insert("dest_addr", CollectionValue::String(socket_addr.to_string())).await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+                map.insert("dest_ip", CollectionValue::String(socket_addr.ip().to_string())).await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+                map.insert("dest_port", CollectionValue::String(socket_addr.port().to_string())).await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+            }
+        }
 
         let executor = {
             self.executor.lock().unwrap().fork()
@@ -356,7 +382,12 @@ impl ProcessChainDnsServer {
             }
 
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret.value.as_str()) {
+                let value = if let CollectionValue::String(value) = &(ret.value) {
+                    value
+                } else {
+                    return Err(server_err!(ServerErrorCode::ProcessChainError, "invalid process chain result"));
+                };
+                if let Some(list) = shlex::split(value.as_str()) {
                     if list.is_empty() {
                         let resp = chain_env.get("RESOLVE_RESP").await.map_err(
                             |e| server_err!(ServerErrorCode::ProcessChainError, "{e}")
@@ -386,6 +417,7 @@ impl ProcessChainDnsServer {
         &self,
         message_bytes: &[u8],
         src_addr: Option<String>,
+        dst_addr: Option<String>,
     ) -> ServerResult<Vec<u8>> {
         let mut decoder = BinDecoder::new(message_bytes);
 
@@ -406,7 +438,7 @@ impl ProcessChainDnsServer {
                 };
 
                 let request = Request::new(message, addr, Protocol::Udp);
-                match self.handle_request(&request, src_addr).await {
+                match self.handle_request(&request, dst_addr).await {
                     Ok(response) => Ok(response),
                     Err(e) => {
                         let mut builder = MessageResponseBuilder::from_message_request(&request);
@@ -463,7 +495,7 @@ impl ProcessChainDnsServer {
 #[async_trait::async_trait]
 impl cyfs_gateway_lib::server::DatagramServer for ProcessChainDnsServer {
     async fn serve_datagram(&self, buf: &[u8], info: DatagramInfo) -> ServerResult<Vec<u8>> {
-        let response = self.handle(buf, info.src_addr).await?;
+        let response = self.handle(buf, info.src_addr, info.dst_addr).await?;
 
         Ok(response)
     }
@@ -479,6 +511,7 @@ pub struct ProcessChainDnsServerFactory;
 pub struct DnsServerContext {
     pub server_mgr: ServerManagerWeakRef,
     pub global_process_chains: GlobalProcessChainsRef,
+    pub js_externals: JsExternalsManagerRef,
     pub global_collection_manager: GlobalCollectionManagerRef,
     pub inner_record_manager: InnerDnsRecordManagerRef,
 }
@@ -487,12 +520,14 @@ impl DnsServerContext {
     pub fn new(
         server_mgr: ServerManagerWeakRef,
         global_process_chains: GlobalProcessChainsRef,
+        js_externals: JsExternalsManagerRef,
         global_collection_manager: GlobalCollectionManagerRef,
         inner_record_manager: InnerDnsRecordManagerRef,
     ) -> Self {
         Self {
             server_mgr,
             global_process_chains,
+            js_externals,
             global_collection_manager,
             inner_record_manager,
         }
@@ -541,6 +576,7 @@ impl ServerFactory for ProcessChainDnsServerFactory {
             Some(context.global_collection_manager.clone()),
             config.hook_point.clone(),
             context.inner_record_manager.clone(),
+            Some(context.js_externals.clone()),
         ).await?;
         Ok(vec![Server::Datagram(Arc::new(server))])
     }
@@ -578,7 +614,7 @@ mod tests {
     use hickory_proto::op::{Message, Query};
     use hickory_proto::rr::RecordType;
     use hickory_server::proto::rr::{Name, RData};
-    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager, GlobalProcessChains, Server, ServerFactory, ServerManager, StackContext, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackContext, UdpStackFactory};
+    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager, GlobalProcessChains, JsExternalsManager, Server, ServerFactory, ServerManager, StackContext, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackContext, UdpStackFactory};
     use cyfs_gateway_lib::server::DatagramServer;
     use crate::{DnsServerConfig, DnsServerContext, InnerDnsRecordManager, LocalDns, ProcessChainDnsServer, ProcessChainDnsServerFactory};
 
@@ -601,6 +637,7 @@ hook_point:
         let context = DnsServerContext::new(
             Arc::downgrade(&server_mgr),
             Arc::new(GlobalProcessChains::new()),
+            Arc::new(JsExternalsManager::new()),
             GlobalCollectionManager::create(vec![]).await.unwrap(),
             InnerDnsRecordManager::new(),
         );
@@ -664,6 +701,7 @@ hook_point:
             Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
             inner_record_manager,
+            Some(Arc::new(JsExternalsManager::new())),
         ).await;
         assert!(server.is_ok());
         let server = server.unwrap();
@@ -713,6 +751,7 @@ hook_point:
             Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
             inner_record_manager,
+            Some(Arc::new(JsExternalsManager::new())),
         ).await;
         assert!(server.is_ok());
         let server = server.unwrap();
@@ -738,6 +777,27 @@ hook_point:
         assert_eq!(resp.answers().len(), 1);
         assert_eq!(resp.answers()[0].record_type(), RecordType::A);
         assert_eq!(resp.answers()[0].data(), &RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::from_str("192.168.1.1").unwrap())));
+
+        let mut message = Message::new();
+        let name = Name::from_str("1.1.168.192.in-addr.arpa.").unwrap();
+        let query = Query::query(name, RecordType::PTR);
+        message.add_query(query);
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let msg_vec = message.to_vec();
+        assert!(msg_vec.is_ok());
+        let msg_vec = msg_vec.unwrap();
+
+        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.answers()[0].record_type(), RecordType::PTR);
+        match resp.answers()[0].data() {
+            RData::PTR(ptr) => assert_eq!(ptr.0.to_string(), "www.buckyos.com."),
+            _ => panic!("expected PTR answer"),
+        }
 
         let mut message = Message::new();
         // 添加查询
@@ -840,6 +900,7 @@ hook_point:
         let context = DnsServerContext::new(
             Arc::downgrade(&server_mgr),
             global_process_chains.clone(),
+            Arc::new(JsExternalsManager::new()),
             GlobalCollectionManager::create(vec![]).await.unwrap(),
             InnerDnsRecordManager::new(),
         );
@@ -878,6 +939,7 @@ hook_point:
             stat_manager,
             Some(global_process_chains.clone()),
             Some(collection_manager),
+            Some(Arc::new(JsExternalsManager::new())),
         ));
         let ret = stack.create(Arc::new(stack_config), stack_context).await;
         assert!(ret.is_ok());
@@ -904,6 +966,7 @@ hook_point:
             Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
             config.hook_point,
             inner_record_manager,
+            Some(Arc::new(JsExternalsManager::new())),
         ).await;
         assert!(server.is_ok());
         let server = server.unwrap();

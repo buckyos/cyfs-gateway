@@ -2,8 +2,10 @@
 resolver = "3"
 members = [
     "components/cyfs-process-chain",
+    "components/cyfs-process-chain-lint",
     "components/cyfs-dns",
     "components/cyfs-socks",
+    "components/cyfs-lookup",
     "components/cyfs-gateway-lib",
     "components/cyfs-sn",
     "components/cyfs-tun",

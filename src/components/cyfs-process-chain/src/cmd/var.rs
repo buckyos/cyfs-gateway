@@ -2,7 +2,6 @@ use super::cmd::*;
 use crate::block::{AssignKind, CommandArg, CommandArgs};
 use crate::chain::EnvLevel;
 use crate::chain::{Context, ParserContext};
-use crate::collection::CollectionValue;
 use clap::{Arg, ArgAction, Command};
 use std::sync::Arc;
 
@@ -123,16 +122,12 @@ impl CommandExecutor for AssignCommand {
 
         match self.value {
             Some(ref value) => {
-                let value = value.evaluate_string(context).await?;
+                let value = value.evaluate(context).await?;
 
                 // Handle assignment with value
                 context
                     .env()
-                    .set(
-                        self.key.as_str(),
-                        CollectionValue::String(value.clone()),
-                        Some(env_level),
-                    )
+                    .set(self.key.as_str(), value.clone(), Some(env_level))
                     .await?;
 
                 Ok(CommandResult::success_with_value(value))
@@ -290,14 +285,14 @@ impl CommandExecutor for DeleteCommand {
         let result = context.env().remove(&self.var, self.level).await;
 
         match result {
-            Ok(Some(ret)) => Ok(CommandResult::success_with_value(ret.to_string())),
+            Ok(Some(ret)) => Ok(CommandResult::success_with_value(ret)),
             Ok(None) => {
                 let msg = format!(
                     "Variable '{}' not found in scope {:?}",
                     self.var, self.level
                 );
                 warn!("{}", msg);
-                Ok(CommandResult::error_with_value(msg))
+                Ok(CommandResult::error_with_string(msg))
             }
             Err(e) => {
                 let msg = format!("Failed to delete variable '{}': {}", self.var, e);

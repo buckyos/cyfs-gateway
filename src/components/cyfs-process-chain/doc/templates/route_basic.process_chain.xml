@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Template: route_basic
+Input:
+  - REQ.host (string, required)
+  - REQ.path (string, required)
+Output:
+  - return --from lib <upstream_id>
+Error:
+  - error --from lib PC-TPL-ROUTE-0001 (missing required input)
+-->
+<process_chain_lib id="tpl_route_basic" priority="100">
+  <process_chain id="route">
+    <block id="entry">
+      <![CDATA[
+        match $REQ.host "" && error --from lib "PC-TPL-ROUTE-0001";
+        match $REQ.path "" && error --from lib "PC-TPL-ROUTE-0001";
+
+        match $REQ.host "*.internal.example.com" && match $REQ.path "/api/*" && return --from lib "upstream_api";
+        match $REQ.path "/static/*" && return --from lib "upstream_static";
+
+        return --from lib "upstream_default";
+      ]]>
+    </block>
+  </process_chain>
+</process_chain_lib>

@@ -7,7 +7,7 @@ use sfo_sql::mysql::sql_query;
 use sfo_sql::Row;
 use sfo_sql::sqlite::{SqlPool, SqliteJournalMode};
 use cyfs_gateway_lib::{into_server_err, ServerErrorCode, ServerResult};
-use crate::{into_sn_err, sn_err, SNDeviceInfo, SNUserInfo, SnDB, SnDBFactory, SnDBRef, SnErrorCode, SnResult, UserState};
+use crate::{into_sn_err, sn_err, SNDeviceInfo, SNUserInfo, SnClearStateResult, SnDB, SnDBFactory, SnDBRef, SnErrorCode, SnResult, UserState};
 
 pub struct SqliteSnDB {
     pool: SqlPool,
@@ -95,6 +95,103 @@ impl SnDB for SqliteSnDB {
             }
             Err(_) => Ok(false)
         }
+    }
+
+    async fn clear_state_by_active_code(&self, active_code: &str) -> SnResult<SnClearStateResult> {
+        let mut conn = self.pool.get_conn().await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        conn.begin_transaction().await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "begin transaction failed"))?;
+
+        let user_count: i64 = conn
+            .query_one(
+                sql_query("SELECT COUNT(*) FROM users WHERE activation_code = ?1")
+                    .bind(active_code),
+            )
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "count users failed"))?
+            .get(0);
+
+        let device_count: i64 = conn
+            .query_one(
+                sql_query(
+                    "SELECT COUNT(*) FROM devices WHERE owner IN (SELECT username FROM users WHERE activation_code = ?1)",
+                )
+                .bind(active_code),
+            )
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "count devices failed"))?
+            .get(0);
+
+        let domain_record_count: i64 = conn
+            .query_one(
+                sql_query(
+                    "SELECT COUNT(*) FROM user_dns_records WHERE owner IN (SELECT username FROM users WHERE activation_code = ?1)",
+                )
+                .bind(active_code),
+            )
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "count user_dns_records failed"))?
+            .get(0);
+
+        let did_doc_count: i64 = conn
+            .query_one(
+                sql_query(
+                    "SELECT COUNT(*) FROM did_documents WHERE owner_user IN (SELECT username FROM users WHERE activation_code = ?1)",
+                )
+                .bind(active_code),
+            )
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "count did_documents failed"))?
+            .get(0);
+
+        conn.execute_sql(
+            sql_query("DELETE FROM devices WHERE owner IN (SELECT username FROM users WHERE activation_code = ?1)")
+                .bind(active_code),
+        )
+        .await
+        .map_err(into_sn_err!(SnErrorCode::DBError, "delete devices failed"))?;
+
+        conn.execute_sql(
+            sql_query("DELETE FROM user_dns_records WHERE owner IN (SELECT username FROM users WHERE activation_code = ?1)")
+                .bind(active_code),
+        )
+        .await
+        .map_err(into_sn_err!(SnErrorCode::DBError, "delete user dns records failed"))?;
+
+        conn.execute_sql(
+            sql_query("DELETE FROM did_documents WHERE owner_user IN (SELECT username FROM users WHERE activation_code = ?1)")
+                .bind(active_code),
+        )
+        .await
+        .map_err(into_sn_err!(SnErrorCode::DBError, "delete did documents failed"))?;
+
+        conn.execute_sql(
+            sql_query("DELETE FROM users WHERE activation_code = ?1").bind(active_code),
+        )
+        .await
+        .map_err(into_sn_err!(SnErrorCode::DBError, "delete users failed"))?;
+
+        conn.execute_sql(
+            sql_query(
+                "INSERT INTO activation_codes (code, used) VALUES (?1, 0) ON CONFLICT(code) DO UPDATE SET used = 0",
+            )
+            .bind(active_code),
+        )
+        .await
+        .map_err(into_sn_err!(SnErrorCode::DBError, "reset activation code failed"))?;
+
+        conn.commit_transaction().await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "commit transaction failed"))?;
+
+        Ok(SnClearStateResult {
+            deleted_users: user_count.max(0) as u64,
+            deleted_devices: device_count.max(0) as u64,
+            deleted_domain_records: domain_record_count.max(0) as u64,
+            deleted_did_documents: did_doc_count.max(0) as u64,
+            activation_code_reset: true,
+        })
     }
 
     async fn register_user(

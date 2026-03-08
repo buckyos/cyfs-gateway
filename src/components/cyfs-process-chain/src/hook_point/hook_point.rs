@@ -1,5 +1,5 @@
 use super::loader::{ProcessChainJSONLoader, ProcessChainXMLLoader};
-use crate::chain::EnvRef;
+use crate::chain::{EnvRef, ExecutionPolicy};
 use crate::chain::{
     ProcessChainLibExecutor, ProcessChainLibRef, ProcessChainLinkedManagerRef, ProcessChainManager,
 };
@@ -68,6 +68,7 @@ pub struct HookPointExecutor {
     process_chain_manager: ProcessChainLinkedManagerRef,
     hook_point_env: EnvRef,
     pipe: CommandPipe,
+    execution_policy: ExecutionPolicy,
 }
 
 impl HookPointExecutor {
@@ -76,12 +77,14 @@ impl HookPointExecutor {
         process_chain_manager: ProcessChainLinkedManagerRef,
         hook_point_env: EnvRef,
         pipe: CommandPipe,
+        execution_policy: ExecutionPolicy,
     ) -> Self {
         Self {
             id: id.into(),
             process_chain_manager,
             hook_point_env,
             pipe,
+            execution_policy,
         }
     }
 
@@ -95,6 +98,10 @@ impl HookPointExecutor {
 
     pub fn process_chain_manager(&self) -> &ProcessChainLinkedManagerRef {
         &self.process_chain_manager
+    }
+
+    pub fn execution_policy(&self) -> ExecutionPolicy {
+        self.execution_policy
     }
 
     pub fn prepare_exec_lib(&self, lib_id: &str) -> Result<ProcessChainLibExecutor, String> {
@@ -111,6 +118,7 @@ impl HookPointExecutor {
             Some(self.hook_point_env.clone()),
             self.pipe.clone(),
         );
+        exec.context().env().set_policy(self.execution_policy);
 
         Ok(exec)
     }

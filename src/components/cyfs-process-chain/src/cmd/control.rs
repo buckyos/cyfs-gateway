@@ -1,24 +1,36 @@
 use super::cmd::*;
+use super::exec::{
+    ExecScope, InvokeArgSpec, InvokeCommandExecutor, parse_exec_scope_and_target, parse_invoke_args,
+};
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
 use std::str::FromStr;
 use std::sync::Arc;
 
-/*
-enum GotoTarget {
-    Block(String),
-    Chain(String),
+fn default_goto_from_level() -> CommandControlLevel {
+    // Keep goto default aligned with `return` / `error` default behavior.
+    CommandControlLevel::Block
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum GotoTargetLevel {
-    Block,
-    Chain,
+fn parse_goto_from_level(
+    matches: &ArgMatches,
+    option_name: &str,
+) -> Result<Option<CommandControlLevel>, String> {
+    matches
+        .get_one::<String>(option_name)
+        .map(|s| s.as_str())
+        .map(CommandControlLevel::from_str)
+        .transpose()
+        .map_err(|e| {
+            let msg = format!("Invalid goto scope for --{}: {}", option_name, e);
+            error!("{}", msg);
+            msg
+        })
 }
 
-// goto command goto [--chain|--block] <target>
-// like: goto block1; goto --chain chain1; goto --block block2;
+// goto command: tail-transfer style control command.
+// It executes a target (same resolution as invoke/exec) and then returns/errors from the caller scope.
 pub struct GotoCommandParser {
     cmd: Command,
 }
@@ -26,48 +38,86 @@ pub struct GotoCommandParser {
 impl GotoCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("goto")
-            .about("Jump to a block or another chain within the process flow.")
+            .about("Tail-transfer to a block/chain/lib and then return from a chosen scope.")
             .after_help(
                 r#"
-Arguments:
-  <target>     The name of the target block or chain.
+DESCRIPTION:
+  goto is a structured tail-transfer command. It first executes the target
+  (same semantics as invoke), then converts the result to return/error from
+  the selected caller scope(s).
 
-Options:
-  --chain      Jump to a chain by name (default).
-  --block      Jump to a block in the current chain.
+TARGET:
+  Exactly one of --block/--chain/--lib must be provided.
+  Target ID formats are the same as exec/invoke:
+    --block: block | chain:block | lib:chain:block
+    --chain: chain | lib:chain
+    --lib:   lib
 
-Behavior:
-  - Without options, defaults to jumping to a chain.
-  - When using `--chain`, execution switches to the specified chain.
-  - When using `--block`, jumps to a block inside the current chain.
-  - The next command of the current command will not be executed any more.
-  - Fails if the target block/chain does not exist.
+RETURN LEVEL:
+  --from      Optional common default for success/error mapping.
+  --ok-from   Optional success scope override.
+  --err-from  Optional error scope override.
+  If omitted, defaults to block (same as return/error without --from).
 
 Examples:
-  goto login_retry
-  goto --block validate_input
   goto --chain fallback_chain
+  goto --chain auth_flow --from lib
+  goto --chain auth_flow --from chain --err-from lib
+  goto --block helper --arg req $REQ
 "#,
             )
             .arg(
                 Arg::new("chain")
                     .long("chain")
-                    .conflicts_with("block")
-                    .help("Jump to another chain")
-                    .action(ArgAction::SetTrue),
+                    .value_name("CHAIN_ID")
+                    .help("Transfer to a process-chain by ID."),
             )
             .arg(
                 Arg::new("block")
                     .long("block")
-                    .conflicts_with("chain")
-                    .help("Jump to a block in the current chain (default)")
-                    .action(ArgAction::SetTrue),
+                    .value_name("BLOCK_ID")
+                    .help("Transfer to a block by ID."),
             )
             .arg(
-                Arg::new("target")
-                    .required(true)
-                    .help("The name of the target block or chain"),
+                Arg::new("lib")
+                    .long("lib")
+                    .value_name("LIB_ID")
+                    .help("Transfer to a library by ID."),
+            )
+            .arg(
+                Arg::new("from")
+                    .long("from")
+                    .help("Default return/error scope after target execution.")
+                    .value_name("LEVEL")
+                    .value_parser(["block", "chain", "lib"]),
+            )
+            .arg(
+                Arg::new("ok-from")
+                    .long("ok-from")
+                    .help("Success return scope override after target execution.")
+                    .value_name("LEVEL")
+                    .value_parser(["block", "chain", "lib"]),
+            )
+            .arg(
+                Arg::new("err-from")
+                    .long("err-from")
+                    .help("Error return scope override after target execution.")
+                    .value_name("LEVEL")
+                    .value_parser(["block", "chain", "lib"]),
+            )
+            .arg(
+                Arg::new("arg")
+                    .long("arg")
+                    .value_names(["KEY", "VALUE"])
+                    .num_args(2)
+                    .action(ArgAction::Append)
+                    .help("Named argument for target, can be repeated."),
             );
+        let cmd = cmd.group(
+            ArgGroup::new("target_by_id")
+                .args(["block", "chain", "lib"])
+                .required(true),
+        );
 
         Self { cmd }
     }
@@ -98,37 +148,45 @@ impl CommandParser for GotoCommandParser {
                 msg
             })?;
 
-        let target_level = if matches.get_flag("chain") {
-            GotoTargetLevel::Chain
-        } else if matches.get_flag("block") {
-            GotoTargetLevel::Block
-        } else {
-            GotoTargetLevel::Chain // Default to chain if no option is provided
-        };
+        let (scope, target) = parse_exec_scope_and_target(&matches, args, "goto")?;
+        let goto_args = parse_invoke_args(&matches, args)?;
+        let default_from_level = default_goto_from_level();
 
-        let target_index = matches.index_of("target").ok_or_else(|| {
-            let msg = "target argument is required for goto command".to_string();
-            error!("{}", msg);
-            msg
-        })?;
-        let target = args[target_index].clone();
+        let from_level = parse_goto_from_level(&matches, "from")?;
+        let ok_from_level = parse_goto_from_level(&matches, "ok-from")?
+            .or(from_level)
+            .unwrap_or(default_from_level);
+        let err_from_level = parse_goto_from_level(&matches, "err-from")?
+            .or(from_level)
+            .unwrap_or(default_from_level);
 
-        let cmd = GotoCommandExecutor::new(target, target_level);
+        let cmd = GotoCommandExecutor::new(scope, target, goto_args, ok_from_level, err_from_level);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
 
-// goto command executer
 pub struct GotoCommandExecutor {
+    scope: ExecScope,
     target: CommandArg,
-    target_level: GotoTargetLevel,
+    args: Vec<InvokeArgSpec>,
+    ok_from_level: CommandControlLevel,
+    err_from_level: CommandControlLevel,
 }
 
 impl GotoCommandExecutor {
-    fn new(target: CommandArg, target_level: GotoTargetLevel) -> Self {
+    fn new(
+        scope: ExecScope,
+        target: CommandArg,
+        args: Vec<InvokeArgSpec>,
+        ok_from_level: CommandControlLevel,
+        err_from_level: CommandControlLevel,
+    ) -> Self {
         Self {
+            scope,
             target,
-            target_level,
+            args,
+            ok_from_level,
+            err_from_level,
         }
     }
 }
@@ -136,17 +194,31 @@ impl GotoCommandExecutor {
 #[async_trait::async_trait]
 impl CommandExecutor for GotoCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
-        let target = self.target.evaluate_string(context).await?;
+        let invoke = InvokeCommandExecutor::new(self.scope, self.target.clone(), self.args.clone());
+        let invoke_ret = invoke.exec(context).await?;
 
-        let ret = match self.target_level {
-            GotoTargetLevel::Block => CommandResult::goto_block(target),
-            GotoTargetLevel::Chain => CommandResult::goto_chain(target),
-        };
+        if invoke_ret.is_success() {
+            return Ok(CommandResult::return_with_value(
+                self.ok_from_level,
+                invoke_ret.value_ref().clone(),
+            ));
+        }
 
-        Ok(ret)
+        if invoke_ret.is_error() {
+            return Ok(CommandResult::return_error_with_value(
+                self.err_from_level,
+                invoke_ret.value_ref().clone(),
+            ));
+        }
+
+        let msg = format!(
+            "Unexpected control result in goto target execution: {:?}",
+            invoke_ret
+        );
+        error!("{}", msg);
+        Err(msg)
     }
 }
-*/
 
 // Return command to invoker, return from a specified scope (block, chain, or lib).
 // Examples:
@@ -277,9 +349,9 @@ impl ReturnCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for ReturnCommandExecutor {
-    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         let value = match &self.value {
-            Some(val) => Some(val.evaluate_string(_context).await?),
+            Some(val) => Some(val.evaluate(context).await?),
             None => None,
         };
 
@@ -423,9 +495,9 @@ impl ErrorCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for ErrorCommandExecutor {
-    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         let value = match &self.value {
-            Some(val) => Some(val.evaluate_string(_context).await?),
+            Some(val) => Some(val.evaluate(context).await?),
             None => None,
         };
 
@@ -526,9 +598,9 @@ impl ExitCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for ExitCommandExecutor {
-    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         let value = match &self.value {
-            Some(val) => Some(val.evaluate_string(_context).await?),
+            Some(val) => Some(val.evaluate(context).await?),
             None => None,
         };
 
@@ -629,9 +701,9 @@ impl BreakCommandExecutor {
 
 #[async_trait::async_trait]
 impl CommandExecutor for BreakCommandExecutor {
-    async fn exec(&self, _context: &Context) -> Result<CommandResult, String> {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         let value = match &self.value {
-            Some(val) => Some(val.evaluate_string(_context).await?),
+            Some(val) => Some(val.evaluate(context).await?),
             None => None,
         };
 

@@ -1,7 +1,8 @@
 use super::linker::CommandArgEvaluator;
+use crate::chain::CoercionPolicy;
 use crate::chain::Context;
 use crate::cmd::*;
-use crate::collection::CollectionValue;
+use crate::collection::{CollectionValue, NumberValue};
 use std::fmt;
 use std::ops::Deref;
 
@@ -34,8 +35,21 @@ impl Operator {
 
 #[derive(Debug, Clone)]
 pub enum CommandArg {
-    // A simple command arg in string format
+    // Unquoted token that keeps string semantics.
+    // Typical examples: command options/keywords/identifiers like
+    // `--from`, `lib`, `map-add`, `my_key`.
+    // Note: if an unquoted token matches typed literal rules, parser emits
+    // `TypedLiteral` instead of `Literal`.
     Literal(String),
+
+    // Quoted string literal (e.g. "123", 'false', "").
+    // Always preserved as string and never auto-promoted to typed literal.
+    StringLiteral(String),
+
+    // Unquoted typed literal recognized at parse-time, preserving both raw token text
+    // and parsed runtime value.
+    // Examples: true/false/null/123/12.5
+    TypedLiteral(String, CollectionValue),
 
     // A command arg that is a variable, like $VAR_NAME ${VAR_NAME}
     Var(String), // A reference to a variable, like $VAR_NAME
@@ -45,15 +59,171 @@ pub enum CommandArg {
 }
 
 impl CommandArg {
+    fn parse_bool_literal(raw: &str) -> Option<bool> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn parse_number_literal(raw: &str) -> Option<NumberValue> {
+        let trimmed = raw.trim();
+        if let Ok(v) = trimmed.parse::<i64>() {
+            return Some(NumberValue::Int(v));
+        }
+        if let Ok(v) = trimmed.parse::<f64>() {
+            return Some(NumberValue::Float(v));
+        }
+        None
+    }
+
+    fn coerce_to_string(value: CollectionValue, policy: CoercionPolicy) -> Result<String, String> {
+        if let CollectionValue::String(s) = value {
+            return Ok(s);
+        }
+
+        match value {
+            CollectionValue::Null => match policy {
+                CoercionPolicy::Legacy => Ok(String::new()),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Null to empty string under warn coercion policy");
+                    Ok(String::new())
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected string value, found Null (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            CollectionValue::Bool(v) => match policy {
+                CoercionPolicy::Legacy => Ok(v.to_string()),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Bool to string under warn coercion policy");
+                    Ok(v.to_string())
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected string value, found Bool (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            CollectionValue::Number(v) => match policy {
+                CoercionPolicy::Legacy => Ok(v.to_string()),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Number to string under warn coercion policy");
+                    Ok(v.to_string())
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected string value, found Number (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            other => {
+                let msg = format!("Expected string value, found: {:?}", other);
+                warn!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+
+    fn coerce_to_bool(value: CollectionValue, policy: CoercionPolicy) -> Result<bool, String> {
+        match value {
+            CollectionValue::Bool(v) => Ok(v),
+            CollectionValue::String(s) => Self::parse_bool_literal(&s).ok_or_else(|| {
+                let msg = format!("Cannot convert string '{}' to bool", s);
+                warn!("{}", msg);
+                msg
+            }),
+            CollectionValue::Number(v) => match policy {
+                CoercionPolicy::Legacy => Ok(v.as_f64() != 0.0),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Number to bool under warn coercion policy");
+                    Ok(v.as_f64() != 0.0)
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected bool value, found Number (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            CollectionValue::Null => match policy {
+                CoercionPolicy::Legacy => Ok(false),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Null to bool=false under warn coercion policy");
+                    Ok(false)
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected bool value, found Null (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            other => {
+                let msg = format!("Expected bool value, found: {:?}", other);
+                warn!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+
+    fn coerce_to_number(
+        value: CollectionValue,
+        policy: CoercionPolicy,
+    ) -> Result<NumberValue, String> {
+        match value {
+            CollectionValue::Number(v) => Ok(v),
+            CollectionValue::String(s) => Self::parse_number_literal(&s).ok_or_else(|| {
+                let msg = format!("Cannot convert string '{}' to number", s);
+                warn!("{}", msg);
+                msg
+            }),
+            CollectionValue::Bool(v) => match policy {
+                CoercionPolicy::Legacy => Ok(NumberValue::Int(if v { 1 } else { 0 })),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Bool to number under warn coercion policy");
+                    Ok(NumberValue::Int(if v { 1 } else { 0 }))
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected number value, found Bool (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            CollectionValue::Null => match policy {
+                CoercionPolicy::Legacy => Ok(NumberValue::Int(0)),
+                CoercionPolicy::Warn => {
+                    warn!("Coercing Null to number=0 under warn coercion policy");
+                    Ok(NumberValue::Int(0))
+                }
+                CoercionPolicy::Strict => {
+                    let msg = "Expected number value, found Null (strict coercion)".to_string();
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            },
+            other => {
+                let msg = format!("Expected number value, found: {:?}", other);
+                warn!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+
     pub fn is_literal(&self) -> bool {
-        matches!(self, CommandArg::Literal(_))
+        matches!(
+            self,
+            CommandArg::Literal(_) | CommandArg::StringLiteral(_) | CommandArg::TypedLiteral(_, _)
+        )
     }
 
     pub fn as_literal_str(&self) -> Option<&str> {
-        if let CommandArg::Literal(s) = self {
-            Some(s.as_str())
-        } else {
-            None
+        match self {
+            CommandArg::Literal(s)
+            | CommandArg::StringLiteral(s)
+            | CommandArg::TypedLiteral(s, _) => Some(s.as_str()),
+            _ => None,
         }
     }
 
@@ -71,7 +241,9 @@ impl CommandArg {
 
     pub fn as_str(&self) -> &str {
         match self {
-            CommandArg::Literal(s) => s.as_str(),
+            CommandArg::Literal(s)
+            | CommandArg::StringLiteral(s)
+            | CommandArg::TypedLiteral(s, _) => s.as_str(),
             CommandArg::Var(s) => s.as_str(),
             CommandArg::CommandSubstitution(_) => "[command substitution]",
         }
@@ -103,12 +275,28 @@ impl CommandArg {
 
     pub async fn evaluate_string(&self, context: &Context) -> Result<String, String> {
         let value = self.evaluate(context).await?;
-        if value.is_string() {
-            Ok(value.into_string().unwrap())
+        Self::coerce_to_string(value, context.env().coercion_policy())
+    }
+
+    pub async fn evaluate_bool(&self, context: &Context) -> Result<bool, String> {
+        let value = self.evaluate(context).await?;
+        Self::coerce_to_bool(value, context.env().coercion_policy())
+    }
+
+    pub async fn evaluate_number(&self, context: &Context) -> Result<NumberValue, String> {
+        let value = self.evaluate(context).await?;
+        Self::coerce_to_number(value, context.env().coercion_policy())
+    }
+
+    pub async fn evaluate_nullable(
+        &self,
+        context: &Context,
+    ) -> Result<Option<CollectionValue>, String> {
+        let value = self.evaluate(context).await?;
+        if value.is_null() {
+            Ok(None)
         } else {
-            let msg = format!("Expected string value, found: {:?}", value);
-            warn!("{}", msg);
-            Err(msg)
+            Ok(Some(value))
         }
     }
 
@@ -124,15 +312,10 @@ impl CommandArg {
         context: &Context,
     ) -> Result<Vec<String>, String> {
         let values = Self::evaluate_list(args, context).await?;
+        let coercion = context.env().coercion_policy();
         let mut result = Vec::with_capacity(values.len());
         for value in values {
-            if value.is_string() {
-                result.push(value.into_string().unwrap());
-            } else {
-                let msg = format!("Expected string value, found: {:?}", value);
-                warn!("{}", msg);
-                return Err(msg);
-            }
+            result.push(Self::coerce_to_string(value, coercion)?);
         }
 
         Ok(result)
@@ -286,6 +469,8 @@ pub enum Expression {
     Group(Vec<(Option<Operator>, Expression, Option<Operator>)>), // Sub-expression in brackets
 }
 
+pub type ExpressionChain = Vec<(Option<Operator>, Expression, Option<Operator>)>;
+
 impl Expression {
     pub fn is_command(&self) -> bool {
         matches!(self, Expression::Command(_))
@@ -311,9 +496,39 @@ impl Expression {
         }
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct IfBranch {
+    pub condition: ExpressionChain,
+    pub lines: Vec<Line>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IfStatement {
+    pub branches: Vec<IfBranch>,
+    pub else_lines: Option<Vec<Line>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Statement {
-    pub expressions: Vec<(Option<Operator>, Expression, Option<Operator>)>,
+    pub expressions: ExpressionChain,
+    pub if_statement: Option<IfStatement>,
+}
+
+impl Statement {
+    pub fn new_expressions(expressions: ExpressionChain) -> Self {
+        Self {
+            expressions,
+            if_statement: None,
+        }
+    }
+
+    pub fn new_if(if_statement: IfStatement) -> Self {
+        Self {
+            expressions: Vec::new(),
+            if_statement: Some(if_statement),
+        }
+    }
 }
 
 // Line of commands, top level structure

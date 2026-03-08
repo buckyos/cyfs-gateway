@@ -1,8 +1,8 @@
 use super::cmd::*;
-use crate::CommandArgEvaluator;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
 use crate::collection::CollectionValue;
+use crate::CommandArgEvaluator;
 use clap::{Arg, ArgAction, Command};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -66,7 +66,6 @@ impl CommandParser for EchoCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-
     fn parse(
         &self,
         _context: &ParserContext,
@@ -116,7 +115,21 @@ impl EchoCommandExecutor {
 
     async fn print_verbose_output(&self, value: &CollectionValue) -> Result<String, String> {
         let ret = match value {
+            CollectionValue::Null => "null".to_string(),
+            CollectionValue::Bool(v) => v.to_string(),
+            CollectionValue::Number(v) => v.to_string(),
             CollectionValue::String(s) => s.clone(),
+            CollectionValue::List(list) => {
+                let values = list.dump().await?;
+                format!(
+                    "[ {} ]",
+                    values
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
             CollectionValue::Set(set) => {
                 let values = set.dump().await?;
                 format!("{{ {} }}", values.join(" "))
@@ -212,6 +225,6 @@ impl CommandExecutor for EchoCommandExecutor {
             output_str = String::new();
         }
 
-        Ok(CommandResult::success_with_value(output_str))
+        Ok(CommandResult::success_with_string(output_str))
     }
 }

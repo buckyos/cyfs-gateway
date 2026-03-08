@@ -1,7 +1,7 @@
 use super::config::SocksServerConfig;
 use crate::{Socks5Proxy, SocksDataTunnelProviderRef, SocksHookManager, SocksProxyAuth, SocksProxyConfig};
 use buckyos_kit::AsyncStream;
-use cyfs_gateway_lib::{server_err, GlobalProcessChainsRef, Server, ServerConfig, ServerContext, ServerContextRef, ServerErrorCode, ServerFactory, ServerResult, StreamServer, StreamInfo, GlobalCollectionManagerRef};
+use cyfs_gateway_lib::{server_err, GlobalProcessChainsRef, JsExternalsManagerRef, Server, ServerConfig, ServerContext, ServerContextRef, ServerErrorCode, ServerFactory, ServerResult, StreamServer, StreamInfo, GlobalCollectionManagerRef};
 use std::sync::Arc;
 
 pub struct SocksServer {
@@ -39,6 +39,7 @@ impl StreamServer for SocksServer {
 #[derive(Clone)]
 pub struct SocksServerContext {
     pub global_process_chains: GlobalProcessChainsRef,
+    pub js_externals: JsExternalsManagerRef,
     pub global_collection_manager: GlobalCollectionManagerRef,
     pub tunnel_provider: SocksDataTunnelProviderRef,
 }
@@ -46,11 +47,13 @@ pub struct SocksServerContext {
 impl SocksServerContext {
     pub fn new(
         global_process_chains: GlobalProcessChainsRef,
+        js_externals: JsExternalsManagerRef,
         global_collection_manager: GlobalCollectionManagerRef,
         tunnel_provider: SocksDataTunnelProviderRef,
     ) -> Self {
         Self {
             global_process_chains,
+            js_externals,
             global_collection_manager,
             tunnel_provider,
         }
@@ -150,7 +153,10 @@ mod tests {
     use super::*;
     use crate::{SocksDataTunnelProvider, SocksError, SocksResult};
     use buckyos_kit::AsyncStream;
-    use cyfs_gateway_lib::{BlockConfig, GlobalCollectionManager, GlobalProcessChains, ProcessChainConfig};
+    use cyfs_gateway_lib::{
+        BlockConfig, GlobalCollectionManager, GlobalProcessChains, JsExternalsManager,
+        ProcessChainConfig,
+    };
     use fast_socks5::consts;
     use fast_socks5::util::target_addr::TargetAddr;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -256,6 +262,7 @@ mod tests {
 
         let context = SocksServerContext::new(
             Arc::new(GlobalProcessChains::new()),
+            Arc::new(JsExternalsManager::new()),
             GlobalCollectionManager::create(vec![]).await.unwrap(),
             provider,
         );

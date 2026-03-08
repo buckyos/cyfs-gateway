@@ -10,6 +10,7 @@ use super::map::*;
 use super::match_::*;
 use super::string::*;
 use super::type_::*;
+use super::value::*;
 use super::var::*;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -61,8 +62,9 @@ impl CommandParserFactory {
 
     pub fn init(&self) {
         // control command
-        // self.register("goto", Arc::new(Box::new(GotoCommandParser::new())));
+        self.register("goto", Arc::new(Box::new(GotoCommandParser::new())));
         self.register("exec", Arc::new(Box::new(ExecCommandParser::new())));
+        self.register("invoke", Arc::new(Box::new(InvokeCommandParser::new())));
         self.register("return", Arc::new(Box::new(ReturnCommandParser::new())));
         self.register("error", Arc::new(Box::new(ErrorCommandParser::new())));
         self.register("exit", Arc::new(Box::new(ExitCommandParser::new())));
@@ -82,6 +84,14 @@ impl CommandParserFactory {
         self.register("assign", Arc::new(Box::new(AssignCommandParser::new())));
         self.register("delete", Arc::new(Box::new(DeleteCommandParser::new())));
         self.register("type", Arc::new(Box::new(TypeCommandParser::new())));
+        self.register("to-bool", Arc::new(Box::new(ToBoolCommandParser::new())));
+        self.register(
+            "to-number",
+            Arc::new(Box::new(ToNumberCommandParser::new())),
+        );
+        self.register("is-null", Arc::new(Box::new(create_is_null_parser())));
+        self.register("is-bool", Arc::new(Box::new(create_is_bool_parser())));
+        self.register("is-number", Arc::new(Box::new(create_is_number_parser())));
         self.register("capture", Arc::new(Box::new(CaptureCommandParser::new())));
 
         // match command
@@ -91,6 +101,11 @@ impl CommandParserFactory {
             Arc::new(Box::new(MatchRegexCommandParser::new())),
         );
         self.register("eq", Arc::new(Box::new(EQCommandParser::new())));
+        self.register("ne", Arc::new(Box::new(NECommandParser::new())));
+        self.register("gt", Arc::new(Box::new(create_gt_parser())));
+        self.register("ge", Arc::new(Box::new(create_ge_parser())));
+        self.register("lt", Arc::new(Box::new(create_lt_parser())));
+        self.register("le", Arc::new(Box::new(create_le_parser())));
         self.register("range", Arc::new(Box::new(RangeCommandParser::new())));
 
         // string command
@@ -126,6 +141,29 @@ impl CommandParserFactory {
         self.register(
             "match-include",
             Arc::new(Box::new(MatchIncludeCommandParser::new())),
+        );
+
+        self.register(
+            "list-create",
+            Arc::new(Box::new(ListCreateCommandParser::new())),
+        );
+        self.register(
+            "list-push",
+            Arc::new(Box::new(ListPushCommandParser::new())),
+        );
+        self.register(
+            "list-insert",
+            Arc::new(Box::new(ListInsertCommandParser::new())),
+        );
+        self.register("list-set", Arc::new(Box::new(ListSetCommandParser::new())));
+        self.register(
+            "list-remove",
+            Arc::new(Box::new(ListRemoveCommandParser::new())),
+        );
+        self.register("list-pop", Arc::new(Box::new(ListPopCommandParser::new())));
+        self.register(
+            "list-clear",
+            Arc::new(Box::new(ListClearCommandParser::new())),
         );
 
         self.register(

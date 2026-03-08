@@ -6,7 +6,7 @@ use crate::js::AsyncJavaScriptCommandExecutor;
 use crate::pipe::CommandPipe;
 use crate::pipe::SharedMemoryPipe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 // Options for linking a hook point
 pub struct LinkHookPointOptions {
@@ -15,6 +15,9 @@ pub struct LinkHookPointOptions {
 
     // The command pipe for the hook point, if None, the command pipe in current HookPointEnv will be used
     pub pipe: Option<CommandPipe>,
+
+    // The execution policy for the linked executor, if None, use policy in current HookPointEnv
+    pub execution_policy: Option<ExecutionPolicy>,
 }
 
 impl Default for LinkHookPointOptions {
@@ -22,10 +25,10 @@ impl Default for LinkHookPointOptions {
         Self {
             hook_point_env: None,
             pipe: None,
+            execution_policy: None,
         }
     }
 }
-
 
 pub struct HookPointEnv {
     id: String,
@@ -33,6 +36,7 @@ pub struct HookPointEnv {
     hook_point_env: EnvRef,
     pipe: SharedMemoryPipe,
     parser_context: ParserContextRef,
+    execution_policy: Arc<RwLock<ExecutionPolicy>>,
 
     // Each hook point env has its own JavaScript command executor, which is used to execute JavaScript commands in the hook point
     // This allows the hook point to execute JavaScript commands independently in its own thread
@@ -46,6 +50,7 @@ impl HookPointEnv {
         let hook_point_env = Arc::new(Env::new(EnvLevel::Global, None));
         let parser_context = ParserContext::new();
         let js_command_executor = AsyncJavaScriptCommandExecutor::new();
+        let execution_policy = Arc::new(RwLock::new(ExecutionPolicy::default()));
 
         Self {
             id: id.into(),
@@ -53,6 +58,7 @@ impl HookPointEnv {
             hook_point_env,
             pipe,
             parser_context: Arc::new(parser_context),
+            execution_policy,
             js_command_executor,
         }
     }
@@ -75,6 +81,27 @@ impl HookPointEnv {
 
     pub fn pipe(&self) -> &SharedMemoryPipe {
         &self.pipe
+    }
+
+    pub fn execution_policy(&self) -> ExecutionPolicy {
+        *self.execution_policy.read().unwrap()
+    }
+
+    pub fn set_execution_policy(&self, policy: ExecutionPolicy) {
+        let mut guard = self.execution_policy.write().unwrap();
+        *guard = policy;
+    }
+
+    pub fn set_missing_var_policy(&self, policy: MissingVarPolicy) {
+        let mut current = self.execution_policy();
+        current.missing_var = policy;
+        self.set_execution_policy(current);
+    }
+
+    pub fn set_coercion_policy(&self, policy: CoercionPolicy) {
+        let mut current = self.execution_policy();
+        current.coercion = policy;
+        self.set_execution_policy(current);
     }
 
     pub fn register_external_command(
@@ -137,6 +164,30 @@ impl HookPointEnv {
         }
 
         match collection_type {
+            CollectionType::List => {
+                let list = match collection_format {
+                    CollectionFileFormat::Json => {
+                        let list = JsonListCollection::new(file_path.clone())?;
+                        Box::new(list) as Box<dyn ListCollection>
+                    }
+                    CollectionFileFormat::Sqlite => {
+                        unimplemented!("Sqlite collection not implemented yet");
+                    }
+                };
+
+                let ret = self
+                    .hook_point_env
+                    .create(id, CollectionValue::List(Arc::new(list)))
+                    .await?;
+                if !ret {
+                    let msg = format!(
+                        "Failed to add list collection with id '{}', already exists",
+                        id
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
             CollectionType::Set => {
                 let set = match collection_format {
                     CollectionFileFormat::Json => {
@@ -246,12 +297,16 @@ impl HookPointEnv {
             Some(p) => p,
             None => self.pipe.pipe().clone(),
         };
+        let execution_policy = options
+            .execution_policy
+            .unwrap_or_else(|| self.execution_policy());
 
         let executor = HookPointExecutor::new(
             hook_point.id(),
             process_chain_manager,
             hook_point_env,
             pipe,
+            execution_policy,
         );
         let executor = Arc::new(executor);
 
@@ -263,13 +318,9 @@ impl HookPointEnv {
         &self,
         hook_point: &HookPoint,
     ) -> Result<HookPointExecutorRef, String> {
-        self.link_hook_point_opts(
-            hook_point,
-            LinkHookPointOptions::default(),
-        )
-        .await
+        self.link_hook_point_opts(hook_point, LinkHookPointOptions::default())
+            .await
     }
 }
-
 
 pub type HookPointEnvRef = Arc<HookPointEnv>;

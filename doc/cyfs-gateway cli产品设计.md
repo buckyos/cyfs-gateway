@@ -141,6 +141,11 @@ cyfs show config
 ```
 查看cyfs-gateway当前生效的配置文件内容。注意不包含通过命令行添加的临时行为。
 
+```bash
+cyfs show <id>
+```
+按 id 查看指定配置片段。
+
 #### 常见的match规则整理
 - match
 - eq 
@@ -379,6 +384,4 @@ cyfs $动词_对象类型 [$对象ID] [--$参数名1 参数值1 ...]
 ## 参考2: process-chain的所有指令
 
 ## 参考3: 在process-chain中使用js
-
-
 

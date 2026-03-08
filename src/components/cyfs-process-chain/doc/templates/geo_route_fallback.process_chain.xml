@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Template: geo_route_fallback
+Input:
+  - REQ.clientIp (string, required)
+  - geoByIp (map, required): geoByIp[ip].country
+  - geoRoute (map, required): geoRoute[country].upstream
+Output:
+  - return --from lib <upstream_id>
+Error:
+  - error --from lib PC-TPL-GEO-0001 (missing client ip)
+-->
+<process_chain_lib id="tpl_geo_route_fallback" priority="100">
+  <process_chain id="route">
+    <block id="entry">
+      <![CDATA[
+        match $REQ.clientIp "" && error --from lib "PC-TPL-GEO-0001";
+
+        local country=${geoByIp[$REQ.clientIp]?.country ?? "ZZ"};
+        local target=${geoRoute[$country]?.upstream ?? "upstream_default"};
+
+        return --from lib $target;
+      ]]>
+    </block>
+  </process_chain>
+</process_chain_lib>

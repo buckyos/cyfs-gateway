@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicU32;
 use buckyos_kit::AsyncStream;
 use tokio::sync::RwLock;
 use cyfs_process_chain::*;
-use crate::{config_err, ConfigErrorCode, ConfigResult, GlobalCollectionManagerRef, ProcessChainConfig};
+use crate::{config_err, ConfigErrorCode, ConfigResult, GlobalCollectionManagerRef, JsExternalsManagerRef, ProcessChainConfig};
 
 #[derive(Clone)]
 pub struct GlobalProcessChains {
@@ -224,6 +224,16 @@ impl MapCollection for StreamRequestMap {
                     return Err(msg);
                 }
             }
+            "source_hostname" => {
+                prev = request.source_hostname.clone().map(CollectionValue::String);
+                if let CollectionValue::String(host_name) = value {
+                    request.source_hostname = Some(host_name);
+                } else {
+                    let msg = format!("source_hostname must be a string, got {:?}", value);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
             "source_device_id" => {
                 prev = request
                     .source_device_id
@@ -314,12 +324,22 @@ impl MapCollection for StreamRequestMap {
             "dest_addr" => Ok(request
                 .dest_addr
                 .map(|addr| CollectionValue::String(addr.to_string()))),
+            "dest_ip" => Ok(request
+                .dest_addr
+                .map(|addr| CollectionValue::String(addr.ip().to_string()))),
             "app_protocol" => Ok(request.app_protocol.clone().map(CollectionValue::String)),
             "dest_url" => Ok(request.dest_url.clone().map(CollectionValue::String)),
             "source_addr" => Ok(request
                 .source_addr
                 .map(|addr| CollectionValue::String(addr.to_string()))),
+            "source_ip" => Ok(request
+                .source_addr
+                .map(|addr| CollectionValue::String(addr.ip().to_string()))),
+            "source_port" => Ok(request
+                .source_addr
+                .map(|addr| CollectionValue::String(addr.port().to_string()))),
             "source_mac" => Ok(request.source_mac.clone().map(CollectionValue::String)),
+            "source_hostname" => Ok(request.source_hostname.clone().map(CollectionValue::String)),
             "source_device_id" => Ok(request
                 .source_device_id
                 .clone()
@@ -349,10 +369,14 @@ impl MapCollection for StreamRequestMap {
             "dest_port" => Ok(true),
             "dest_host" => Ok(request.dest_host.is_some()),
             "dest_addr" => Ok(request.dest_addr.is_some()),
+            "dest_ip" => Ok(request.dest_addr.is_some()),
             "app_protocol" => Ok(request.app_protocol.is_some()),
             "dest_url" => Ok(request.dest_url.is_some()),
             "source_addr" => Ok(request.source_addr.is_some()),
+            "source_ip" => Ok(request.source_addr.is_some()),
+            "source_port" => Ok(request.source_addr.is_some()),
             "source_mac" => Ok(request.source_mac.is_some()),
+            "source_hostname" => Ok(request.source_hostname.is_some()),
             "source_device_id" => Ok(request.source_device_id.is_some()),
             "source_app_id" => Ok(request.source_app_id.is_some()),
             "source_user_id" => Ok(request.source_user_id.is_some()),
@@ -391,6 +415,7 @@ impl MapCollection for StreamRequestMap {
                 .take()
                 .map(|addr| CollectionValue::String(addr.to_string()))),
             "source_mac" => Ok(request.source_mac.take().map(CollectionValue::String)),
+            "source_hostname" => Ok(request.source_hostname.take().map(CollectionValue::String)),
             "source_device_id" => Ok(request.source_device_id.take().map(CollectionValue::String)),
             "source_app_id" => Ok(request.source_app_id.take().map(CollectionValue::String)),
             "source_user_id" => Ok(request.source_user_id.take().map(CollectionValue::String)),
@@ -422,6 +447,13 @@ impl MapCollection for StreamRequestMap {
                     .unwrap_or_default(),
             ),
             (
+                "dest_ip",
+                request
+                    .dest_addr
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
                 "app_protocol",
                 request.app_protocol.clone().unwrap_or_default(),
             ),
@@ -433,7 +465,25 @@ impl MapCollection for StreamRequestMap {
                     .map(|addr| addr.to_string())
                     .unwrap_or_default(),
             ),
+            (
+                "source_ip",
+                request
+                    .source_addr
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "source_port",
+                request
+                    .source_addr
+                    .map(|addr| addr.port().to_string())
+                    .unwrap_or_default(),
+            ),
             ("source_mac", request.source_mac.clone().unwrap_or_default()),
+            (
+                "source_hostname",
+                request.source_hostname.clone().unwrap_or_default(),
+            ),
             (
                 "source_device_id",
                 request.source_device_id.clone().unwrap_or_default(),
@@ -477,6 +527,10 @@ impl MapCollection for StreamRequestMap {
                 "dest_addr".to_string(),
                 CollectionValue::String(addr.to_string()),
             ));
+            result.push((
+                "dest_ip".to_string(),
+                CollectionValue::String(addr.ip().to_string()),
+            ));
         }
         if let Some(protocol) = &request.app_protocol {
             result.push((
@@ -492,11 +546,25 @@ impl MapCollection for StreamRequestMap {
                 "source_addr".to_string(),
                 CollectionValue::String(addr.to_string()),
             ));
+            result.push((
+                "source_ip".to_string(),
+                CollectionValue::String(addr.ip().to_string()),
+            ));
+            result.push((
+                "source_port".to_string(),
+                CollectionValue::String(addr.port().to_string()),
+            ));
         }
         if let Some(mac) = &request.source_mac {
             result.push((
                 "source_mac".to_string(),
                 CollectionValue::String(mac.clone()),
+            ));
+        }
+        if let Some(host_name) = &request.source_hostname {
+            result.push((
+                "source_hostname".to_string(),
+                CollectionValue::String(host_name.clone()),
             ));
         }
         if let Some(device_id) = &request.source_device_id {
@@ -530,6 +598,7 @@ pub async fn create_process_chain_executor(
     global_process_chains: Option<GlobalProcessChainsRef>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
     external_commands: Option<Vec<(String, ExternalCommandRef)>>,
+    js_externals: Option<JsExternalsManagerRef>,
 ) -> ConfigResult<(ProcessChainLibExecutor, HookPointEnv)> {
     let hook_point = HookPoint::new("cyfs_server_hook_point");
     let process_chain_lib = ProcessChainListLib::new_empty("main", 0);
@@ -550,6 +619,21 @@ pub async fn create_process_chain_executor(
         for (name, cmd) in external_commands {
             hook_point_env.register_external_command(name.as_str(), cmd.clone())
                 .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
+        }
+    }
+
+    if let Some(js_externals) = js_externals {
+        for (name, cmd) in js_externals.get_external_commands() {
+            hook_point_env
+                .register_external_command(name.as_str(), cmd)
+                .map_err(|e| {
+                    config_err!(
+                        ConfigErrorCode::ProcessChainError,
+                        "register js external command '{}' failed: {}",
+                        name,
+                        e
+                    )
+                })?;
         }
     }
     

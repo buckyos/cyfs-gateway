@@ -142,8 +142,8 @@ impl TypeCommandExecutor {
 impl CommandExecutor for TypeCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         match context.env().get(&self.variable_name, self.level).await? {
-            Some(value) => Ok(CommandResult::success_with_value(value.get_type())),
-            None => Ok(CommandResult::error_with_value("None")),
+            Some(value) => Ok(CommandResult::success_with_string(value.get_type())),
+            None => Ok(CommandResult::error_with_string("None")),
         }
     }
 }

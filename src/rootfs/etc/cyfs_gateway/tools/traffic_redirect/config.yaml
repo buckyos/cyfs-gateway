@@ -1,0 +1,3 @@
+platforms: ["ubuntu", "debian"]
+description: Redirect the data from the specified network port to the designated port
+script: traffic_redirect.sh

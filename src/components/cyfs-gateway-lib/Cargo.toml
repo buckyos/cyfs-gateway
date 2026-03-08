@@ -55,6 +55,7 @@ http.workspace = true
 serde_qs.workspace = true
 serde_urlencoded.workspace = true
 tokio-util = { version = "0.7", features = ["full"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "brotli"] }
 rustls-platform-verifier.workspace = true
 as-any = "0.3.2"
 libc = "0.2"
@@ -64,9 +65,12 @@ local-ip-address = "0.6"
 rcgen.workspace = true
 clap.workspace = true
 percent-encoding = "*"
+httpdate = "1.0"
 regex.workspace = true
 mini-moka = "0.10"
 callback-trait = "0.1"
+reqwest.workspace = true
+sfo-ip = "0.1"
 
 buckyos-kit.workspace = true
 kRPC.workspace = true
@@ -75,6 +79,7 @@ name-lib.workspace = true
 ndn-lib = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "ndn-lib", branch = "main"}
 cyfs-process-chain = { path = "../cyfs-process-chain" }
 cyfs-acme = { path = "../cyfs-acme" }
+cyfs-lookup = { path = "../cyfs-lookup" }
 pin-project = "1.1.10"
 #buckyos-api = { path = "../../kernel/buckyos-api" }
 

@@ -57,3 +57,4 @@ hyper = { version = "1.8", features = ["full"] }
 hyper-util.workspace = true
 http-body-util.workspace = true
 hickory-resolver = { version = "0.24", features = ["tokio"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "brotli"] }

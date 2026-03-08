@@ -140,6 +140,11 @@ cyfs show config
 ```
 View the content of the currently effective configuration file of cyfs-gateway. Note that it does not include temporary behaviors added through the command line.
 
+```bash
+cyfs show <id>
+```
+View a specified config fragment by id.
+
 #### Common Match Rules Summary
 - match
 - eq 
@@ -377,7 +382,5 @@ On the basis of conforming to basic command line semantics, wrap some common beh
 ## Reference 2: All Instructions in process-chain
 
 ## Reference 3: Using JS in process-chain
-
-
 
 

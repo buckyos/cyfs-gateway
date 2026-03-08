@@ -138,7 +138,7 @@ mod tests {
             "password": "123456"
         });
         merge(&mut config_loader.raw_config, &login);
-        let gateway = factory.create_gateway(None, config_loader).await;
+        let gateway = factory.create_gateway(None, config_loader.clone(), config_loader).await;
         assert!(gateway.is_ok());
         let gateway = gateway.unwrap();
         let params = GatewayParams {

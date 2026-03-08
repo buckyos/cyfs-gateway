@@ -174,6 +174,6 @@ impl ExternalCommand for SetLimit {
             }
         }
         context.env().create("LIMIT", CollectionValue::Map(map), EnvLevel::Global).await?;
-        Ok(CommandResult::Success("LIMIT".to_string()))
+        Ok(CommandResult::success_with_string("LIMIT"))
     }
 }

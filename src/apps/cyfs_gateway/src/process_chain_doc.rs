@@ -13,14 +13,6 @@ pub struct GatewayProcessChainDoc {
 impl GatewayProcessChainDoc {
     pub fn new() -> Result<Self, String> {
         let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("process_chain_doc");
-        if !data_dir.exists() {
-            std::fs::create_dir_all(&data_dir).map_err(|e| {
-                let msg = format!("Failed to create data directory: {}", e);
-                error!("{}", msg);
-                msg
-            })?;
-        }
-
         let env = HookPointEnv::new("gateway-process-chain-doc", data_dir);
         Self::register_gateway_external_commands(&env)?;
 

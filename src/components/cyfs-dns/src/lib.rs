@@ -7,7 +7,7 @@ mod local_dns;
 use std::net::IpAddr;
 use std::sync::Arc;
 use hickory_proto::rr::{Name, RData};
-use hickory_proto::rr::rdata::{A, AAAA, CNAME, TXT};
+use hickory_proto::rr::rdata::{A, AAAA, CNAME, PTR, TXT};
 use log::{debug, warn};
 use name_client::NameInfo;
 use name_lib::EncodedDocument;
@@ -103,6 +103,20 @@ pub(crate) async fn nameinfo_to_map_collection(record_type: &str, name_info: &Na
             }
             map.insert("txt", CollectionValue::Set(Arc::new(Box::new(txt_set)))).await
                 .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "add txt err {}", e))?;
+            return Ok(map);
+        }
+        "PTR" => {
+            if name_info.ptr_records.is_empty() {
+                return Err(server_err!(ServerErrorCode::InvalidParam, "PTR is empty"));
+            }
+
+            let ptr_set = MemorySetCollection::new();
+            for ptr in name_info.ptr_records.iter() {
+                ptr_set.insert(ptr).await
+                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "add ptr {} err {}", ptr, e))?;
+            }
+            map.insert("ptr_records", CollectionValue::Set(Arc::new(Box::new(ptr_set)))).await
+                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "add ptr err {}", e))?;
             return Ok(map);
         }
         _ => {
@@ -213,6 +227,28 @@ pub(crate) async fn map_collection_to_nameinfo(map: &MapCollectionRef) -> Server
                         }
                     },
                     _ => return Err(server_err!(ServerErrorCode::ProcessChainError, "txt is not string"))
+                }
+            }
+
+            Ok(name_info)
+        }
+        "PTR" => {
+            let mut name_info = NameInfo::new(name.as_str());
+            let ptr_records = map.get("ptr_records").await
+                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "get ptr_records err {}", e))?;
+            if let Some(ptr_records) = ptr_records {
+                match ptr_records {
+                    CollectionValue::String(s) => {
+                        name_info.ptr_records.push(s);
+                    },
+                    CollectionValue::Set(s) => {
+                        let all = s.get_all().await
+                            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "get ptr set all err {}", e))?;
+                        for item in all.iter() {
+                            name_info.ptr_records.push(item.clone());
+                        }
+                    },
+                    _ => return Err(server_err!(ServerErrorCode::ProcessChainError, "ptr_records is not string"))
                 }
             }
 

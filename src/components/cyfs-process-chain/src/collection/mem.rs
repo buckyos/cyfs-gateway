@@ -1,7 +1,7 @@
 use super::coll::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use tokio::sync::RwLock as AsyncRwLock;
 
 pub struct TraverseGuard<'a> {
@@ -21,6 +21,188 @@ impl<'a> Drop for TraverseGuard<'a> {
     }
 }
 
+pub struct MemoryListCollection {
+    data: AsyncRwLock<Vec<CollectionValue>>,
+    transverse_counter: AtomicU32, // Indicates if a traversal is currently happening
+}
+
+impl MemoryListCollection {
+    pub fn new() -> Self {
+        Self {
+            data: AsyncRwLock::new(Vec::new()),
+            transverse_counter: AtomicU32::new(0),
+        }
+    }
+
+    pub fn new_ref() -> ListCollectionRef {
+        Arc::new(Box::new(Self::new()) as Box<dyn ListCollection>)
+    }
+
+    pub(crate) fn from_list(list: Vec<CollectionValue>) -> Self {
+        Self {
+            data: AsyncRwLock::new(list),
+            transverse_counter: AtomicU32::new(0),
+        }
+    }
+
+    pub(crate) fn data(&self) -> &AsyncRwLock<Vec<CollectionValue>> {
+        &self.data
+    }
+
+    pub fn is_during_traversal(&self) -> bool {
+        self.transverse_counter.load(Ordering::SeqCst) > 0
+    }
+}
+
+#[async_trait::async_trait]
+impl ListCollection for MemoryListCollection {
+    async fn len(&self) -> Result<usize, String> {
+        let data = self.data.read().await;
+        Ok(data.len())
+    }
+
+    async fn push(&self, value: CollectionValue) -> Result<(), String> {
+        if self.is_during_traversal() {
+            let msg = "Cannot push value during traversal".to_string();
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let mut data = self.data.write().await;
+        data.push(value);
+        Ok(())
+    }
+
+    async fn insert(&self, index: usize, value: CollectionValue) -> Result<(), String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot insert at index {} during traversal", index);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let mut data = self.data.write().await;
+        if index > data.len() {
+            let msg = format!(
+                "List index out of bounds for insert: {} > {}",
+                index,
+                data.len()
+            );
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        data.insert(index, value);
+        Ok(())
+    }
+
+    async fn set(
+        &self,
+        index: usize,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot set index {} during traversal", index);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let mut data = self.data.write().await;
+        if index >= data.len() {
+            let msg = format!(
+                "List index out of bounds for set: {} >= {}",
+                index,
+                data.len()
+            );
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let prev = std::mem::replace(&mut data[index], value);
+        Ok(Some(prev))
+    }
+
+    async fn get(&self, index: usize) -> Result<Option<CollectionValue>, String> {
+        let data = self.data.read().await;
+        Ok(data.get(index).cloned())
+    }
+
+    async fn remove(&self, index: usize) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot remove index {} during traversal", index);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let mut data = self.data.write().await;
+        if index >= data.len() {
+            return Ok(None);
+        }
+
+        Ok(Some(data.remove(index)))
+    }
+
+    async fn pop(&self) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = "Cannot pop value during traversal".to_string();
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let mut data = self.data.write().await;
+        Ok(data.pop())
+    }
+
+    async fn clear(&self) -> Result<(), String> {
+        if self.is_during_traversal() {
+            let msg = "Cannot clear list during traversal".to_string();
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        let mut data = self.data.write().await;
+        data.clear();
+        Ok(())
+    }
+
+    async fn get_all(&self) -> Result<Vec<CollectionValue>, String> {
+        let data = self.data.read().await;
+        Ok(data.to_vec())
+    }
+
+    async fn traverse(&self, callback: ListCollectionTraverseCallBackRef) -> Result<(), String> {
+        let _guard = TraverseGuard::new(&self.transverse_counter);
+
+        let data = self.data.read().await;
+        for (index, value) in data.iter().enumerate() {
+            if !callback.call(index, value).await? {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn contains_all_strings(&self, values: &[String]) -> Result<bool, String> {
+        if values.is_empty() {
+            return Ok(true);
+        }
+
+        let mut remaining: HashSet<&str> = values.iter().map(|v| v.as_str()).collect();
+
+        let data = self.data.read().await;
+        for value in data.iter() {
+            if let CollectionValue::String(s) = value {
+                remaining.remove(s.as_str());
+                if remaining.is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(remaining.is_empty())
+    }
+}
+
 pub struct MemorySetCollection {
     data: AsyncRwLock<HashSet<String>>,
     transverse_counter: AtomicU32, // Indicates if a traversal is currently happening
@@ -37,7 +219,7 @@ impl MemorySetCollection {
     pub fn new_ref() -> SetCollectionRef {
         Arc::new(Box::new(Self::new()) as Box<dyn SetCollection>)
     }
-    
+
     pub(crate) fn from_set(set: HashSet<String>) -> Self {
         Self {
             data: AsyncRwLock::new(set),
@@ -258,6 +440,13 @@ impl MapCollection for MemoryMapCollection {
             // Get all collections that are flushable
             data.iter()
                 .filter_map(|(_key, item)| match item {
+                    CollectionValue::List(list) => {
+                        if list.is_flushable() {
+                            Some(CollectionValue::List(list.clone()))
+                        } else {
+                            None
+                        }
+                    }
                     CollectionValue::Set(set) => {
                         if set.is_flushable() {
                             Some(CollectionValue::Set(set.clone()))
@@ -286,6 +475,9 @@ impl MapCollection for MemoryMapCollection {
 
         for item in list {
             match item {
+                CollectionValue::List(list) => {
+                    list.flush().await?;
+                }
                 CollectionValue::Set(set) => {
                     set.flush().await?;
                 }
@@ -513,5 +705,84 @@ impl MultiMapCollection for MemoryMultiMapCollection {
             .iter()
             .map(|(k, v)| (k.clone(), v.to_owned()))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_memory_list_collection_basic_ops() {
+        let list = MemoryListCollection::new();
+
+        list.push(CollectionValue::String("a".to_string()))
+            .await
+            .unwrap();
+        list.push(CollectionValue::String("b".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(list.len().await.unwrap(), 2);
+
+        list.insert(1, CollectionValue::String("x".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(list.len().await.unwrap(), 3);
+        assert_eq!(
+            list.get(1).await.unwrap().unwrap().try_as_str().unwrap(),
+            "x"
+        );
+
+        let prev = list
+            .set(1, CollectionValue::String("y".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prev.try_as_str().unwrap(), "x");
+        assert_eq!(
+            list.get(1).await.unwrap().unwrap().try_as_str().unwrap(),
+            "y"
+        );
+
+        let removed = list.remove(0).await.unwrap().unwrap();
+        assert_eq!(removed.try_as_str().unwrap(), "a");
+
+        let popped = list.pop().await.unwrap().unwrap();
+        assert_eq!(popped.try_as_str().unwrap(), "b");
+        assert_eq!(list.len().await.unwrap(), 1);
+
+        list.clear().await.unwrap();
+        assert_eq!(list.len().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_memory_list_collection_contains_all_strings() {
+        let list = MemoryListCollection::new();
+
+        list.push(CollectionValue::String("a".to_string()))
+            .await
+            .unwrap();
+        list.push(CollectionValue::String("b".to_string()))
+            .await
+            .unwrap();
+        list.push(CollectionValue::Map(MemoryMapCollection::new_ref()))
+            .await
+            .unwrap();
+        list.push(CollectionValue::String("c".to_string()))
+            .await
+            .unwrap();
+
+        assert!(list
+            .contains_all_strings(&["a".to_string(), "c".to_string()])
+            .await
+            .unwrap());
+        assert!(!list
+            .contains_all_strings(&["a".to_string(), "x".to_string()])
+            .await
+            .unwrap());
+        assert!(list
+            .contains_all_strings(&["a".to_string(), "a".to_string()])
+            .await
+            .unwrap());
     }
 }

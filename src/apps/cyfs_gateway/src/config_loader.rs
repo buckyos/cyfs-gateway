@@ -1,8 +1,10 @@
+use buckyos_kit::get_buckyos_service_data_dir;
 use cyfs_dns::{DnsServerConfig, LocalDnsConfig};
 use cyfs_gateway_lib::{
-    config_err, AcmeHttpChallengeServerConfig, CollectionConfig, ConfigErrorCode, ConfigResult,
-    DirServerConfig, ProcessChainConfig, ProcessChainConfigs, ProcessChainHttpServerConfig,
-    QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig,
+    config_err, AcmeHttpChallengeServerConfig, BlockConfig, CollectionConfig, ConfigErrorCode,
+    ConfigResult, DirServerConfig, ProcessChainConfig, ProcessChainConfigs,
+    ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig,
+    TcpStackConfig, UdpStackConfig,
 };
 use cyfs_sn::*;
 use cyfs_socks::SocksServerConfig;
@@ -157,6 +159,54 @@ fn hook_point_value_map_to_vector<D: for<'de> Deserializer<'de> + Clone>(
     })?;
 
     hook_point_value_map_to_vector_in_value(stack_config, key_name)
+}
+
+pub fn parse_collections_from_raw_config(
+    raw_config: &serde_json::Value,
+) -> ConfigResult<Vec<CollectionConfig>> {
+    let mut collections = Vec::new();
+    let Some(collections_value) = raw_config.get("collections") else {
+        return Ok(collections);
+    };
+
+    let Some(collections_value) = collections_value.as_object() else {
+        return Ok(collections);
+    };
+
+    let geo_ip_cache_path = get_buckyos_service_data_dir("cyfs_gateway")
+        .join("geo_ip")
+        .to_string_lossy()
+        .to_string();
+
+    for (name, process_chain) in collections_value.iter() {
+        let mut chain_value = process_chain.clone();
+        chain_value["name"] = serde_json::Value::String(name.clone());
+
+        if chain_value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "ip_region_map")
+        {
+            if let Some(obj) = chain_value.as_object_mut() {
+                obj.insert(
+                    "cache_path".to_string(),
+                    serde_json::Value::String(geo_ip_cache_path.clone()),
+                );
+            }
+        }
+
+        let chain = serde_json::from_value::<CollectionConfig>(chain_value).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid collections: {:?}\n{}",
+                e,
+                serde_json::to_string_pretty(collections_value).unwrap()
+            )
+        })?;
+        collections.push(chain);
+    }
+
+    Ok(collections)
 }
 
 pub struct TcpStackConfigParser {}
@@ -549,6 +599,56 @@ pub struct GatewayConfigParser {
 }
 pub type GatewayConfigParserRef = Arc<GatewayConfigParser>;
 
+#[derive(Deserialize, Clone)]
+pub struct TimerConfig {
+    pub id: String,
+    pub timeout: u64,
+    #[serde(rename = "process-chain", alias = "process_chain")]
+    pub process_chain: String,
+}
+
+fn default_offline_timeout_seconds() -> u64 {
+    600
+}
+
+fn default_cleanup_interval_seconds() -> u64 {
+    60
+}
+
+#[derive(Deserialize, Clone, Eq, PartialEq)]
+pub struct DeviceManagerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_offline_timeout_seconds")]
+    pub offline_timeout_seconds: u64,
+    #[serde(default = "default_cleanup_interval_seconds")]
+    pub cleanup_interval_seconds: u64,
+}
+
+impl Default for DeviceManagerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            offline_timeout_seconds: default_offline_timeout_seconds(),
+            cleanup_interval_seconds: default_cleanup_interval_seconds(),
+        }
+    }
+}
+
+impl TimerConfig {
+    pub fn to_process_chains(&self) -> ProcessChainConfigs {
+        vec![ProcessChainConfig {
+            id: "main".to_string(),
+            priority: 1,
+            blocks: vec![BlockConfig {
+                id: "default".to_string(),
+                priority: 1,
+                block: self.process_chain.clone(),
+            }],
+        }]
+    }
+}
+
 impl GatewayConfigParser {
     pub fn new() -> Self {
         let cyfs_stack_parser = CyfsStackConfigParser::new();
@@ -762,25 +862,50 @@ impl GatewayConfigParser {
             None => None,
         };
 
-        let mut collections = Vec::new();
-        if let Some(collections_value) = json_value.get("collections") {
-            if let Some(collections_value) = collections_value.as_object() {
-                for (name, process_chain) in collections_value.iter() {
-                    let mut chain_value = process_chain.clone();
-                    chain_value["name"] = serde_json::Value::String(name.clone());
-                    let chain =
-                        serde_json::from_value::<CollectionConfig>(chain_value).map_err(|e| {
+        let collections = parse_collections_from_raw_config(&json_value)?;
+
+        let mut timers = Vec::new();
+        if let Some(timers_value) = json_value.get("timers") {
+            if let Some(timers_value) = timers_value.as_object() {
+                for (id, timer_value) in timers_value.iter() {
+                    let mut timer_with_id = timer_value.clone();
+                    timer_with_id["id"] = serde_json::Value::String(id.clone());
+                    let timer =
+                        serde_json::from_value::<TimerConfig>(timer_with_id).map_err(|e| {
                             config_err!(
                                 ConfigErrorCode::InvalidConfig,
-                                "invalid collections: {:?}\n{}",
+                                "invalid timer config: {:?}\n{}",
                                 e,
-                                serde_json::to_string_pretty(collections_value).unwrap()
+                                serde_json::to_string_pretty(timer_value).unwrap()
                             )
                         })?;
-                    collections.push(chain);
+                    if timer.timeout == 0 {
+                        return Err(config_err!(
+                            ConfigErrorCode::InvalidConfig,
+                            "invalid timer config {}: timeout must be greater than 0",
+                            timer.id
+                        ));
+                    }
+                    timers.push(timer);
                 }
             }
         }
+
+        let device_manager = json_value
+            .get("device_manager")
+            .map(|value| {
+                serde_json::from_value::<DeviceManagerConfig>(value.clone()).map_err(|e| {
+                    config_err!(
+                        ConfigErrorCode::InvalidConfig,
+                        "invalid device_manager config: {:?}\n{}",
+                        e,
+                        serde_json::to_string_pretty(value)
+                            .unwrap_or_else(|_| "<invalid json>".to_string())
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
 
         Ok(GatewayConfig {
             raw_config,
@@ -791,6 +916,8 @@ impl GatewayConfigParser {
             servers,
             global_process_chains,
             collections,
+            timers,
+            device_manager,
         })
     }
 }
@@ -853,6 +980,8 @@ pub struct GatewayConfig {
     pub servers: Vec<Arc<dyn ServerConfig>>,
     pub global_process_chains: ProcessChainConfigs,
     pub collections: Vec<CollectionConfig>,
+    pub timers: Vec<TimerConfig>,
+    pub device_manager: DeviceManagerConfig,
 }
 
 #[cfg(test)]
@@ -918,6 +1047,43 @@ mod tests {
         assert_eq!(config.download_speed, Some(100 * 1024));
         assert_eq!(config.upload_speed, Some(100 * 1024));
         assert_eq!(config.concurrent, None);
+    }
+
+    #[test]
+    fn test_timer_config_parser() {
+        let parser = super::GatewayConfigParser::new();
+        let json = json!({
+            "timers": {
+                "t1": {
+                    "timeout": 120,
+                    "process-chain": "echo \"test\";"
+                },
+                "t2": {
+                    "timeout": 60,
+                    "process_chain": "echo \"test2\";"
+                }
+            }
+        });
+        let config = parser.parse(json).unwrap();
+        assert_eq!(config.timers.len(), 2);
+        let t1 = config.timers.iter().find(|timer| timer.id == "t1").unwrap();
+        let t2 = config.timers.iter().find(|timer| timer.id == "t2").unwrap();
+        assert_eq!(t1.timeout, 120);
+        assert_eq!(t2.timeout, 60);
+    }
+
+    #[test]
+    fn test_timer_config_timeout_zero() {
+        let parser = super::GatewayConfigParser::new();
+        let json = json!({
+            "timers": {
+                "t1": {
+                    "timeout": 0,
+                    "process-chain": "echo \"test\";"
+                }
+            }
+        });
+        assert!(parser.parse(json).is_err());
     }
 
     #[test]

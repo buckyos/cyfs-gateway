@@ -74,6 +74,13 @@ pub struct ParserContext {
     external_commands: ExternalCommandFactory,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalCommandScope {
+    Auto,
+    Local,
+    Global,
+}
+
 impl ParserContext {
     pub fn new() -> Self {
         Self {
@@ -102,6 +109,18 @@ impl ParserContext {
     }
 
     pub fn get_external_command(&self, name: &str) -> Option<ExternalCommandRef> {
+        let (scope, name) = Self::parse_external_command_name(name);
+
+        match scope {
+            ExternalCommandScope::Local => {
+                return self.external_commands.get_command(name);
+            }
+            ExternalCommandScope::Global => {
+                return EXTERNAL_COMMAND_FACTORY.get_command(name);
+            }
+            ExternalCommandScope::Auto => {}
+        }
+
         // First lookup in local factory in current env
         if let Some(cmd) = self.external_commands.get_command(name) {
             return Some(cmd);
@@ -113,6 +132,18 @@ impl ParserContext {
 
     pub fn get_external_command_list(&self) -> Vec<String> {
         self.external_commands.get_command_list()
+    }
+
+    fn parse_external_command_name(name: &str) -> (ExternalCommandScope, &str) {
+        if let Some(rest) = name.strip_prefix("local::") {
+            return (ExternalCommandScope::Local, rest);
+        }
+
+        if let Some(rest) = name.strip_prefix("global::") {
+            return (ExternalCommandScope::Global, rest);
+        }
+
+        (ExternalCommandScope::Auto, name)
     }
 }
 

@@ -34,7 +34,7 @@ use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType};
 use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::{into_stack_err, stack_err, ProcessChainConfigs, Stack, StackContext, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SelfCertMgrRef, GlobalCollectionManagerRef};
+use crate::{create_io_dump_stack_config, into_stack_err, stack_err, DumpStream, IoDumpStackConfig, ProcessChainConfigs, Stack, StackContext, StackErrorCode, StackProtocol, StackResult, ServerManagerRef, TlsDomainConfig, Server, server_err, ServerErrorCode, ServerError, ConnectionManagerRef, ConnectionInfo, HandleConnectionController, ConnectionController, TunnelManager, StackConfig, ProcessChainConfig, StackCertConfig, load_key, load_certs, StackRef, StackFactory, StreamInfo, get_external_commands, LimiterManagerRef, StatManagerRef, get_stat_info, ComposedSpeedStat, SelfCertMgrRef, GlobalCollectionManagerRef, JsExternalsManagerRef};
 use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
 use crate::stack::limiter::Limiter;
 use crate::stack::{get_limit_info, stream_forward, TlsCertResolver};
@@ -50,6 +50,7 @@ pub struct QuicStackContext {
     pub self_cert_mgr: SelfCertMgrRef,
     pub global_process_chains: Option<GlobalProcessChainsRef>,
     pub global_collection_manager: Option<GlobalCollectionManagerRef>,
+    pub js_externals: Option<JsExternalsManagerRef>,
 }
 
 impl QuicStackContext {
@@ -62,6 +63,7 @@ impl QuicStackContext {
         self_cert_mgr: SelfCertMgrRef,
         global_process_chains: Option<GlobalProcessChainsRef>,
         global_collection_manager: Option<GlobalCollectionManagerRef>,
+        js_externals: Option<JsExternalsManagerRef>,
     ) -> Self {
         Self {
             servers,
@@ -72,6 +74,7 @@ impl QuicStackContext {
             self_cert_mgr,
             global_process_chains,
             global_collection_manager,
+            js_externals,
         }
     }
 }
@@ -86,6 +89,7 @@ struct QuicConnectionHandler {
     env: Arc<QuicStackContext>,
     executor: ProcessChainLibExecutor,
     connection_manager: Option<ConnectionManagerRef>,
+    io_dump: Option<IoDumpStackConfig>,
 }
 
 impl QuicConnectionHandler {
@@ -93,12 +97,14 @@ impl QuicConnectionHandler {
         hook_point: ProcessChainConfigs,
         env: Arc<QuicStackContext>,
         connection_manager: Option<ConnectionManagerRef>,
+        io_dump: Option<IoDumpStackConfig>,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
             env.global_process_chains.clone(),
             env.global_collection_manager.clone(),
             Some(get_external_commands(Arc::downgrade(&env.servers))),
+            env.js_externals.clone(),
         )
             .await
             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
@@ -106,6 +112,7 @@ impl QuicConnectionHandler {
             env,
             executor,
             connection_manager,
+            io_dump,
         })
     }
 
@@ -170,6 +177,31 @@ impl QuicConnectionHandler {
         let map = MemoryMapCollection::new_ref();
         map.insert("dest_host", CollectionValue::String(server_name)).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_ip", CollectionValue::String(remote_addr.ip().to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("source_port", CollectionValue::String(remote_addr.port().to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_addr", CollectionValue::String(local_addr.to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_ip", CollectionValue::String(local_addr.ip().to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_port", CollectionValue::String(local_addr.port().to_string())).await.map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        let device_info = self
+            .connection_manager
+            .as_ref()
+            .and_then(|manager| manager.get_device_info_by_source(remote_addr.ip()));
+        if let Some(device_info) = device_info.as_ref() {
+            if let Some(mac) = device_info.mac() {
+                map.insert("source_mac", CollectionValue::String(mac.to_string())).await
+                    .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+            }
+            if let Some(host_name) = device_info.hostname() {
+                map.insert("source_hostname", CollectionValue::String(host_name.to_string())).await
+                    .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+            }
+            map.insert(
+                "source_online_secs",
+                CollectionValue::String(device_info.today_online_seconds().to_string()),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        }
 
         let executor = self.executor.fork();
         let global_env = executor.global_env().clone();
@@ -186,7 +218,12 @@ impl QuicConnectionHandler {
             }
 
             if let Some(CommandControl::Return(ret)) = ret.as_control() {
-                if let Some(list) = shlex::split(ret.value.as_str()) {
+                let value = if let CollectionValue::String(value) = &(ret.value) {
+                    value
+                } else {
+                    return Ok(());
+                };
+                if let Some(list) = shlex::split(value.as_str()) {
                     if list.is_empty() {
                         return Ok(());
                     }
@@ -220,6 +257,16 @@ impl QuicConnectionHandler {
                                 let (send, recv) = connection.accept_bi().await.map_err(into_stack_err!(StackErrorCode::QuicError))?;
                                 log::info!("quic accept bi: {} -> {}", remote_addr, local_addr);
                                 let stream = sfo_split::Splittable::new(recv, send);
+                                let stream: Box<dyn AsyncStream> = if let Some(io_dump) = self.io_dump.clone() {
+                                    Box::new(DumpStream::new(
+                                        stream,
+                                        io_dump,
+                                        remote_addr.to_string(),
+                                        local_addr.to_string(),
+                                    ))
+                                } else {
+                                    Box::new(stream)
+                                };
                                 let stat_stream = StatStream::new_with_tracker(stream, speed_stat.clone());
                                 let speed = stat_stream.get_speed_stat();
                                 let target = list[1].clone();
@@ -288,6 +335,7 @@ impl QuicConnectionHandler {
                                             let limiter = limiter.clone();
                                             let server = server.clone();
                                             let speed_stat = speed_stat.clone();
+                                            let device_info = device_info.clone();
                                             let handle = tokio::spawn(async move {
                                                 let ret: StackResult<()> = async move {
                                                     let (req, stream) = resolver.unwrap().resolve_request().await
@@ -316,7 +364,14 @@ impl QuicConnectionHandler {
                                                         req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
                                                         req.uri().to_string());
                                                     let resp = server
-                                                        .serve_request(req, StreamInfo::new(remote_addr.to_string()))
+                                                        .serve_request(
+                                                            req,
+                                                            StreamInfo::new(remote_addr.to_string()).with_dst_addr(Some(local_addr.to_string())).with_device_info(
+                                                                device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
+                                                                device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                                                device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
+                                                            ),
+                                                        )
                                                         .await
                                                         .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
                                                     let (parts, mut body) = resp.into_parts();
@@ -368,6 +423,16 @@ impl QuicConnectionHandler {
                                             log::info!("quic accept bi: {} -> {}", remote_addr, local_addr);
                                             let server = server.clone();
                                             let stream = sfo_split::Splittable::new(recv, send);
+                                            let stream: Box<dyn AsyncStream> = if let Some(io_dump) = self.io_dump.clone() {
+                                                Box::new(DumpStream::new(
+                                                    stream,
+                                                    io_dump,
+                                                    remote_addr.to_string(),
+                                                    local_addr.to_string(),
+                                                ))
+                                            } else {
+                                                Box::new(stream)
+                                            };
                                             let stat_stream = StatStream::new_with_tracker(stream, speed_stat.clone());
                                             let speed = stat_stream.get_speed_stat();
                                             let stream: Box<dyn AsyncStream> = if limiter.is_some() {
@@ -377,8 +442,19 @@ impl QuicConnectionHandler {
                                             } else {
                                                 Box::new(stat_stream)
                                             };
+                                            let device_info = device_info.clone();
                                             let handle = tokio::spawn(async move {
-                                                if let Err(e) = server.serve_connection(stream, StreamInfo::new(remote_addr.to_string())).await {
+                                                if let Err(e) = server
+                                                    .serve_connection(
+                                                        stream,
+                                                        StreamInfo::new(remote_addr.to_string()).with_dst_addr(Some(local_addr.to_string())).with_device_info(
+                                                            device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
+                                                            device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                                            device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
+                                                        ),
+                                                    )
+                                                    .await
+                                                {
                                                     log::error!("server error: {}", e);
                                                 }
                                             });
@@ -1182,6 +1258,7 @@ impl QuicStack {
             builder.hook_point.take().unwrap(),
             stack_context.clone(),
             builder.connection_manager.clone(),
+            builder.io_dump,
         )
             .await?;
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
@@ -1258,6 +1335,16 @@ impl Stack for QuicStack {
             config.hook_point.clone(),
             env,
             self.inner.connection_manager.clone(),
+            create_io_dump_stack_config(
+                &config.id,
+                config.io_dump_file.as_deref(),
+                config.io_dump_rotate_size.as_deref(),
+                config.io_dump_rotate_max_files,
+                config.io_dump_max_upload_bytes_per_conn.as_deref(),
+                config.io_dump_max_download_bytes_per_conn.as_deref(),
+            )
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
         ).await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())
@@ -1284,6 +1371,7 @@ pub struct QuicStackBuilder {
     reuse_address: bool,
     connection_manager: Option<ConnectionManagerRef>,
     stack_context: Option<Arc<QuicStackContext>>,
+    io_dump: Option<IoDumpStackConfig>,
 }
 
 impl QuicStackBuilder {
@@ -1298,6 +1386,7 @@ impl QuicStackBuilder {
             reuse_address: false,
             connection_manager: None,
             stack_context: None,
+            io_dump: None,
         }
     }
 
@@ -1349,6 +1438,11 @@ impl QuicStackBuilder {
         self
     }
 
+    pub fn io_dump(mut self, io_dump: Option<IoDumpStackConfig>) -> Self {
+        self.io_dump = io_dump;
+        self
+    }
+
     pub async fn build(self) -> StackResult<QuicStack> {
         QuicStack::create(self).await
     }
@@ -1365,6 +1459,15 @@ pub struct QuicStackConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alpn_protocols: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_rotate_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_rotate_max_files: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_max_upload_bytes_per_conn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_dump_max_download_bytes_per_conn: Option<String>,
     pub reuse_address: Option<bool>,
 }
 
@@ -1414,6 +1517,16 @@ impl StackFactory for QuicStackFactory {
             .downcast_ref::<QuicStackContext>()
             .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid quic stack context"))?;
         let stack_context = Arc::new(stack_context.clone());
+        let io_dump = create_io_dump_stack_config(
+            &config.id,
+            config.io_dump_file.as_deref(),
+            config.io_dump_rotate_size.as_deref(),
+            config.io_dump_rotate_max_files,
+            config.io_dump_max_upload_bytes_per_conn.as_deref(),
+            config.io_dump_max_download_bytes_per_conn.as_deref(),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
         let stack = QuicStack::builder()
             .id(config.id.clone())
             .bind(config.bind.to_string().as_str())
@@ -1422,8 +1535,9 @@ impl StackFactory for QuicStackFactory {
             .add_certs(cert_list)
             .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec![]).iter().map(|s| s.as_bytes().to_vec()).collect())
             .concurrency(config.concurrency.unwrap_or(1024))
+            .stack_context(stack_context.clone())
+            .io_dump(io_dump)
             .reuse_address(config.reuse_address.unwrap_or(false))
-            .stack_context(stack_context)
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -1444,7 +1558,7 @@ mod tests {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use crate::{AcmeCertManager, AcmeCertManagerRef, ConnectionManager, DefaultLimiterManager, GlobalCollectionManager, GlobalCollectionManagerRef, LimiterManagerRef, ProcessChainConfigs, ProcessChainHttpServer, QuicStack, QuicStackConfig, QuicStackContext, QuicStackFactory, SelfCertMgr, SelfCertMgrRef, SelfCertConfig, Server, ServerManager, ServerManagerRef, ServerResult, Stack, StackContext, StackFactory, StackProtocol, StatManager, StatManagerRef, StreamInfo, StreamServer, TlsDomainConfig, TunnelManager, CertManagerConfig};
+    use crate::{create_io_dump_stack_config, decode_io_dump_frames, AcmeCertManager, AcmeCertManagerRef, ConnectionManager, DefaultLimiterManager, GlobalCollectionManager, GlobalCollectionManagerRef, LimiterManagerRef, ProcessChainConfigs, ProcessChainHttpServer, QuicStack, QuicStackConfig, QuicStackContext, QuicStackFactory, SelfCertMgr, SelfCertMgrRef, SelfCertConfig, Server, ServerManager, ServerManagerRef, ServerResult, Stack, StackContext, StackFactory, StackProtocol, StatManager, StatManagerRef, StreamInfo, StreamServer, TlsDomainConfig, TunnelManager, CertManagerConfig};
     use crate::global_process_chains::{GlobalProcessChains, GlobalProcessChainsRef};
 
     fn build_quic_context(
@@ -1466,7 +1580,22 @@ mod tests {
             self_cert_mgr,
             global_process_chains,
             global_collection_manager,
+            None,
         ))
+    }
+
+    async fn wait_dump_frames(file: &std::path::Path, min_frames: usize) -> Vec<crate::DecodedIoDumpFrame> {
+        for _ in 0..50 {
+            if let Ok(data) = std::fs::read(file)
+                && !data.is_empty()
+                && let Ok(frames) = decode_io_dump_frames(&data)
+                && frames.len() >= min_frames
+            {
+                return frames;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("dump frames not ready");
     }
 
     #[tokio::test]
@@ -2052,6 +2181,316 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_quic_io_dump_raw_single_roundtrip() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
+        )
+        .unwrap();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let ctx = build_quic_context(
+            server_manager,
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("quic_raw.dump");
+        let io_dump = create_io_dump_stack_config("quic_raw", Some(dump.to_string_lossy().as_ref()), None, None, None, None)
+            .await
+            .unwrap();
+        let stack = QuicStack::builder()
+            .id("quic-raw")
+            .bind("127.0.0.1:9197")
+            .hook_point(chains)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                acme_type: None,
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert_key.signing_key.serialize_der()))),
+                data: None,
+            }])
+            .stack_context(ctx)
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+
+        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        config.enable_early_data = true;
+        let client_config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+        let conn = endpoint.connect("127.0.0.1:9197".parse().unwrap(), "www.buckyos.com").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"test").await.unwrap();
+        let mut buf = [0u8; 4];
+        recv.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"recv");
+        send.finish().unwrap();
+        drop(send);
+        drop(recv);
+        conn.close(0u32.into(), b"done");
+
+        let frames = wait_dump_frames(&dump, 1).await;
+        assert!(frames.iter().any(|f| f.upload == b"test" && f.download == b"recv"));
+    }
+
+    #[tokio::test]
+    async fn test_quic_io_dump_raw_flush_on_upload_limit() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
+        )
+        .unwrap();
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        let ctx = build_quic_context(
+            server_manager,
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("quic_raw_limit.dump");
+        let io_dump = create_io_dump_stack_config(
+            "quic_raw_limit",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            Some("2B"),
+            None,
+        )
+        .await
+        .unwrap();
+        let stack = QuicStack::builder()
+            .id("quic-raw-limit")
+            .bind("127.0.0.1:9199")
+            .hook_point(chains)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                acme_type: None,
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert_key.signing_key.serialize_der()))),
+                data: None,
+            }])
+            .stack_context(ctx)
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+
+        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        config.enable_early_data = true;
+        let client_config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+        let conn = endpoint.connect("127.0.0.1:9199".parse().unwrap(), "www.buckyos.com").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"test").await.unwrap();
+        let mut buf = [0u8; 4];
+        recv.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"recv");
+
+        let frames = wait_dump_frames(&dump, 1).await;
+        assert!(frames.iter().any(|f| f.upload == b"te" && f.download.is_empty()));
+    }
+
+    struct MockHttpKeepAliveServer {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamServer for MockHttpKeepAliveServer {
+        async fn serve_connection(&self, mut stream: Box<dyn AsyncStream>, _info: StreamInfo) -> ServerResult<()> {
+            for _ in 0..2 {
+                let mut req = Vec::new();
+                let mut b = [0u8; 1];
+                loop {
+                    stream.read_exact(&mut b).await.unwrap();
+                    req.push(b[0]);
+                    if req.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = if req.windows(2).any(|w| w == b"/a") { b"A" } else { b"B" };
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n", body.len());
+                stream.write_all(resp.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+            Ok(())
+        }
+
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quic_io_dump_http_multi_requests_same_connection() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+        let server_manager = Arc::new(ServerManager::new());
+        let _ = server_manager.add_server(Server::Stream(Arc::new(MockHttpKeepAliveServer {
+            id: "www.buckyos.com".to_string(),
+        })));
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
+        )
+        .unwrap();
+        let ctx = build_quic_context(
+            server_manager,
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("quic_http.dump");
+        let io_dump = create_io_dump_stack_config("quic_http", Some(dump.to_string_lossy().as_ref()), None, None, None, None)
+            .await
+            .unwrap();
+        let stack = QuicStack::builder()
+            .id("quic-http")
+            .bind("127.0.0.1:9198")
+            .hook_point(chains)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                acme_type: None,
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert_key.signing_key.serialize_der()))),
+                data: None,
+            }])
+            .stack_context(ctx)
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+
+        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        config.enable_early_data = true;
+        let client_config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+        let conn = endpoint.connect("127.0.0.1:9198".parse().unwrap(), "www.buckyos.com").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"GET /a HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n").await.unwrap();
+        let mut tmp = [0u8; 64];
+        let n = recv.read(&mut tmp).await.unwrap();
+        assert!(matches!(n, Some(v) if v > 0));
+        send.write_all(b"GET /b HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n").await.unwrap();
+        let n = recv.read(&mut tmp).await.unwrap();
+        assert!(matches!(n, Some(v) if v > 0));
+
+        let frames = wait_dump_frames(&dump, 2).await;
+        assert!(frames.iter().any(|f| f.upload.starts_with(b"GET /a HTTP/1.1") && f.download.starts_with(b"HTTP/1.1 200 OK")));
+        assert!(frames.iter().any(|f| f.upload.starts_with(b"GET /b HTTP/1.1") && f.download.starts_with(b"HTTP/1.1 200 OK")));
+    }
+
+    #[tokio::test]
+    async fn test_quic_io_dump_http_flush_on_upload_limit() {
+        let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
+        let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
+        let server_manager = Arc::new(ServerManager::new());
+        let _ = server_manager.add_server(Server::Stream(Arc::new(MockHttpKeepAliveServer {
+            id: "www.buckyos.com".to_string(),
+        })));
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
+            "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
+        )
+        .unwrap();
+        let ctx = build_quic_context(
+            server_manager,
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+            SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("quic_http_limit.dump");
+        let io_dump = create_io_dump_stack_config(
+            "quic_http_limit",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            Some("4B"),
+            None,
+        )
+        .await
+        .unwrap();
+        let stack = QuicStack::builder()
+            .id("quic-http-limit")
+            .bind("127.0.0.1:9200")
+            .hook_point(chains)
+            .add_certs(vec![TlsDomainConfig {
+                domain: "www.buckyos.com".to_string(),
+                acme_type: None,
+                certs: Some(vec![cert_key.cert.der().clone()]),
+                key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert_key.signing_key.serialize_der()))),
+                data: None,
+            }])
+            .stack_context(ctx)
+            .io_dump(io_dump)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+
+        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifier))
+            .with_no_client_auth();
+        config.enable_early_data = true;
+        let client_config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config);
+        let conn = endpoint.connect("127.0.0.1:9200".parse().unwrap(), "www.buckyos.com").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"GET /a HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n").await.unwrap();
+        let mut tmp = [0u8; 64];
+        let n = recv.read(&mut tmp).await.unwrap();
+        assert!(matches!(n, Some(v) if v > 0));
+
+        let frames = wait_dump_frames(&dump, 1).await;
+        assert!(frames.iter().any(|f| f.upload == b"GET " && f.download.is_empty()));
+    }
+
+    #[tokio::test]
     async fn test_quic_server_forward() {
         let chains = r#"
 - id: main
@@ -2564,6 +3003,11 @@ mod tests {
             hook_point: vec![],
             certs: vec![],
             alpn_protocols: None,
+            io_dump_file: None,
+            io_dump_rotate_size: None,
+            io_dump_rotate_max_files: None,
+            io_dump_max_upload_bytes_per_conn: None,
+            io_dump_max_download_bytes_per_conn: None,
             reuse_address: None,
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(QuicStackContext::new(
@@ -2575,6 +3019,7 @@ mod tests {
             self_cert_mgr,
             Some(global_process_chains),
             Some(collection_manager),
+            None,
         ));
         let ret = factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());

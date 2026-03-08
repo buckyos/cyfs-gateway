@@ -1,6 +1,6 @@
 use super::block::*;
+use crate::collection::{CollectionValue, NumberValue};
 use nom::{
-    IResult, Parser,
     branch::alt,
     bytes::complete::tag,
     bytes::complete::{escaped_transform, is_not},
@@ -12,6 +12,7 @@ use nom::{
     multi::many0,
     multi::separated_list0,
     sequence::{delimited, pair, preceded, terminated},
+    IResult, Parser,
 };
 
 pub struct BlockParser {
@@ -19,6 +20,65 @@ pub struct BlockParser {
 }
 
 impl BlockParser {
+    fn parse_typed_number_literal(input: &str) -> Option<CollectionValue> {
+        if input.is_empty() {
+            return None;
+        }
+
+        let (sign, rest) = if let Some(stripped) = input.strip_prefix('-') {
+            ("-", stripped)
+        } else {
+            ("", input)
+        };
+
+        if rest.is_empty() {
+            return None;
+        }
+
+        if !rest.contains('.') {
+            if rest.chars().all(|c| c.is_ascii_digit()) {
+                let raw = format!("{}{}", sign, rest);
+                if let Ok(v) = raw.parse::<i64>() {
+                    return Some(CollectionValue::Number(NumberValue::Int(v)));
+                }
+            }
+
+            return None;
+        }
+
+        let mut split = rest.split('.');
+        let int_part = split.next().unwrap_or_default();
+        let frac_part = split.next().unwrap_or_default();
+
+        if split.next().is_some() {
+            return None;
+        }
+
+        if int_part.is_empty() || frac_part.is_empty() {
+            return None;
+        }
+
+        if !int_part.chars().all(|c| c.is_ascii_digit())
+            || !frac_part.chars().all(|c| c.is_ascii_digit())
+        {
+            return None;
+        }
+
+        let raw = format!("{}{}", sign, rest);
+        raw.parse::<f64>()
+            .ok()
+            .map(|v| CollectionValue::Number(NumberValue::Float(v)))
+    }
+
+    fn parse_typed_literal(input: &str) -> Option<CollectionValue> {
+        match input {
+            "true" => Some(CollectionValue::Bool(true)),
+            "false" => Some(CollectionValue::Bool(false)),
+            "null" => Some(CollectionValue::Null),
+            _ => Self::parse_typed_number_literal(input),
+        }
+    }
+
     pub fn new(id: &str) -> Self {
         Self { id: id.to_owned() }
     }
@@ -34,12 +94,17 @@ impl BlockParser {
             return Ok(block);
         }
 
-        for (i, line) in lines.iter().enumerate() {
-            debug!("Parsing line {}: {}", i, line.trim());
-            let parsed_line = Self::parse_line(line)?;
-            info!("Parsed line {}: {:?}", i, parsed_line);
-            block.lines.push(parsed_line);
+        let (parsed_lines, index) = Self::parse_lines(&lines, 0, false)?;
+        if index != lines.len() {
+            let msg = format!(
+                "Unexpected parser stop at line {}, total lines {}",
+                index + 1,
+                lines.len()
+            );
+            error!("{}", msg);
+            return Err(msg);
         }
+        block.lines = parsed_lines;
 
         Ok(block)
     }
@@ -59,6 +124,186 @@ impl BlockParser {
                 !line.starts_with('#') && !line.starts_with("//")
             }) // Filter out empty lines
             .collect()
+    }
+
+    fn parse_lines(
+        lines: &[&str],
+        mut index: usize,
+        stop_at_control_keywords: bool,
+    ) -> Result<(Vec<Line>, usize), String> {
+        let mut parsed_lines = Vec::new();
+        while index < lines.len() {
+            let line = lines[index].trim();
+            if let Some(keyword) = Self::line_control_keyword(line) {
+                if stop_at_control_keywords {
+                    break;
+                } else {
+                    let msg = format!(
+                        "Unexpected '{}' at line {} without matching 'if'",
+                        keyword,
+                        index + 1
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
+
+            debug!("Parsing line {}: {}", index, line);
+            let (parsed_line, next_index) = if Self::is_if_header(line) {
+                Self::parse_if_statement(lines, index)?
+            } else {
+                (Self::parse_line(line)?, index + 1)
+            };
+
+            info!("Parsed line {}: {:?}", index, parsed_line);
+            parsed_lines.push(parsed_line);
+            index = next_index;
+        }
+
+        Ok((parsed_lines, index))
+    }
+
+    fn line_control_keyword(line: &str) -> Option<&'static str> {
+        let line = line.trim();
+        if line == "else" {
+            return Some("else");
+        }
+        if line == "end" {
+            return Some("end");
+        }
+        if line.starts_with("elif ") && line.ends_with(" then") {
+            return Some("elif");
+        }
+
+        None
+    }
+
+    fn is_if_header(line: &str) -> bool {
+        let line = line.trim();
+        line.starts_with("if ") && line.ends_with(" then")
+    }
+
+    fn parse_if_condition(line: &str, keyword: &str) -> Result<ExpressionChain, String> {
+        let line = line.trim();
+        let condition_part = line
+            .strip_prefix(keyword)
+            .ok_or_else(|| format!("Invalid '{}' header: '{}'", keyword, line))?
+            .trim_start();
+
+        let condition_part = condition_part.strip_suffix("then").ok_or_else(|| {
+            let msg = format!("'{}' header must end with 'then': '{}'", keyword, line);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let condition_part = condition_part.trim_end();
+        if condition_part.is_empty() {
+            let msg = format!("'{}' condition must not be empty: '{}'", keyword, line);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let (rest, condition) = Self::parse_expressions(condition_part).map_err(|e| {
+            let msg = format!("Parse '{}' condition error: '{}', {:?}", keyword, line, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        if !rest.trim().is_empty() {
+            let msg = format!(
+                "Unexpected content in '{}' condition: line='{}', rest='{}'",
+                keyword, line, rest
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        if condition.is_empty() {
+            let msg = format!("'{}' condition must not be empty: '{}'", keyword, line);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        Ok(condition)
+    }
+
+    fn parse_if_statement(lines: &[&str], index: usize) -> Result<(Line, usize), String> {
+        let if_source = lines[index].trim().to_string();
+        let mut branches = Vec::new();
+        let mut else_lines = None;
+
+        let mut current_condition = Self::parse_if_condition(if_source.as_str(), "if")?;
+        let mut cursor = index + 1;
+
+        loop {
+            let (branch_lines, next_cursor) = Self::parse_lines(lines, cursor, true)?;
+            branches.push(IfBranch {
+                condition: current_condition,
+                lines: branch_lines,
+            });
+
+            if next_cursor >= lines.len() {
+                let msg = format!(
+                    "Missing 'end' for if statement starting at line {}: '{}'",
+                    index + 1,
+                    if_source
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            let control_line = lines[next_cursor].trim();
+            match Self::line_control_keyword(control_line) {
+                Some("elif") => {
+                    current_condition = Self::parse_if_condition(control_line, "elif")?;
+                    cursor = next_cursor + 1;
+                }
+                Some("else") => {
+                    let (parsed_else_lines, end_cursor) =
+                        Self::parse_lines(lines, next_cursor + 1, true)?;
+
+                    if end_cursor >= lines.len() || lines[end_cursor].trim() != "end" {
+                        let msg = format!(
+                            "Missing 'end' after else branch for if starting at line {}",
+                            index + 1
+                        );
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+
+                    else_lines = Some(parsed_else_lines);
+                    cursor = end_cursor + 1;
+                    break;
+                }
+                Some("end") => {
+                    cursor = next_cursor + 1;
+                    break;
+                }
+                Some(other) => {
+                    let msg = format!(
+                        "Unexpected control keyword '{}' in if statement at line {}",
+                        other,
+                        next_cursor + 1
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+                None => unreachable!(
+                    "parse_lines(stop_at_control_keywords=true) must stop at a control keyword"
+                ),
+            }
+        }
+
+        let statement = Statement::new_if(IfStatement {
+            branches,
+            else_lines,
+        });
+        let line = Line {
+            source: if_source,
+            statements: vec![statement],
+        };
+
+        Ok((line, cursor))
     }
 
     // Parse a single line, support label and expressions
@@ -106,7 +351,7 @@ impl BlockParser {
             let stmts = expr_groups
                 .into_iter()
                 .filter(|expressions| !expressions.is_empty())
-                .map(|expressions| Statement { expressions })
+                .map(Statement::new_expressions)
                 .collect();
             (rest, stmts)
         })
@@ -171,7 +416,13 @@ impl BlockParser {
     // Parse expression with brackets or command
     fn parse_expression(input: &str) -> IResult<&str, Expression> {
         debug!("Parsing expression: {}", input);
-        alt((Self::parse_assign, Self::parse_group, Self::parse_command)).parse(input)
+        alt((
+            Self::parse_assign,
+            Self::parse_group,
+            Self::parse_comparison_sugar,
+            Self::parse_command,
+        ))
+        .parse(input)
     }
 
     // Parse group of expressions with brackets
@@ -266,6 +517,54 @@ impl BlockParser {
         Ok((input, Expression::Command(cmd)))
     }
 
+    // Parse infix comparison sugar:
+    //   value1 == value2   -> eq --loose value1 value2
+    //   value1 === value2  -> eq value1 value2
+    //   value1 != value2   -> ne --loose value1 value2
+    //   value1 !== value2  -> ne value1 value2
+    //   value1 > value2    -> gt value1 value2
+    //   value1 >= value2   -> ge value1 value2
+    //   value1 < value2    -> lt value1 value2
+    //   value1 <= value2   -> le value1 value2
+    fn parse_comparison_sugar(input: &str) -> IResult<&str, Expression> {
+        debug!("Parsing comparison sugar: {}", input);
+        let (input, left) = Self::parse_arg(input)?;
+        let (input, op) = preceded(
+            space0,
+            alt((
+                tag("!=="),
+                tag("!="),
+                tag("==="),
+                tag("=="),
+                tag(">="),
+                tag("<="),
+                tag(">"),
+                tag("<"),
+            )),
+        )
+        .parse(input)?;
+        let (input, right) = Self::parse_arg(input)?;
+
+        let command_name = match op {
+            "==" | "===" => "eq",
+            "!=" | "!==" => "ne",
+            ">" => "gt",
+            ">=" => "ge",
+            "<" => "lt",
+            "<=" => "le",
+            _ => unreachable!("unsupported comparison operator: {}", op),
+        };
+        let mut args = vec![CommandArg::Literal(command_name.to_string())];
+        if op == "==" || op == "!=" {
+            args.push(CommandArg::Literal("--loose".to_string()));
+        }
+        args.push(left);
+        args.push(right);
+
+        let cmd = CommandItem::new(command_name.to_string(), CommandArgs::new(args));
+        Ok((input, Expression::Command(cmd)))
+    }
+
     // Parse command
     fn parse_command(input: &str) -> IResult<&str, Expression> {
         debug!("Parsing command: {}", input);
@@ -349,7 +648,7 @@ impl BlockParser {
                                 value("$", tag("$")),
                             )),
                         ),
-                        |s: String| CommandArg::Literal(s),
+                        |s: String| CommandArg::StringLiteral(s),
                     ),
                 ))),
                 |args: Vec<CommandArg>| {
@@ -359,14 +658,16 @@ impl BlockParser {
                     let args = args
                         .into_iter()
                         .filter(|arg| match arg {
-                            CommandArg::Literal(s) => !s.is_empty(),
+                            CommandArg::Literal(s)
+                            | CommandArg::StringLiteral(s)
+                            | CommandArg::TypedLiteral(s, _) => !s.is_empty(),
                             _ => true,
                         })
                         .collect::<Vec<_>>();
 
                     // If no args, return empty string
                     if args.is_empty() {
-                        CommandArg::Literal("".to_string())
+                        CommandArg::StringLiteral("".to_string())
                     }
                     // If there's only one argument, return it directly
                     else if args.len() == 1 {
@@ -390,7 +691,7 @@ impl BlockParser {
         let single_quoted = delimited(
             char('\''),
             map(opt(is_not("'")), |s: Option<&str>| {
-                CommandArg::Literal(s.unwrap_or("").to_string())
+                CommandArg::StringLiteral(s.unwrap_or("").to_string())
             }),
             char('\''),
         );
@@ -408,7 +709,13 @@ impl BlockParser {
                     tag("/"),
                 ))),
             )),
-            |s: &str| CommandArg::Literal(s.to_string()),
+            |s: &str| {
+                if let Some(value) = Self::parse_typed_literal(s) {
+                    CommandArg::TypedLiteral(s.to_string(), value)
+                } else {
+                    CommandArg::Literal(s.to_string())
+                }
+            },
         );
 
         let (input, arg) = complete(alt((double_quoted, single_quoted, unquoted))).parse(input)?;
@@ -433,7 +740,10 @@ impl BlockParser {
         }
 
         let mut i = 0usize;
-        let mut depth = 0usize;
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut quote_in_bracket: Option<char> = None;
+        let mut escaped_in_quote = false;
         let mut parsed = String::new();
 
         while i < rest.len() {
@@ -441,19 +751,58 @@ impl BlockParser {
                 nom::Err::Error(nom::error::Error::from_error_kind(rest, ErrorKind::Tag))
             })?;
 
-            // End of current arg token
-            if depth == 0 && (ch.is_whitespace() || ch == ';' || ch == ')') {
+            if let Some(quote) = quote_in_bracket {
+                parsed.push(ch);
+                i += ch.len_utf8();
+
+                if escaped_in_quote {
+                    escaped_in_quote = false;
+                    continue;
+                }
+
+                if ch == '\\' {
+                    escaped_in_quote = true;
+                    continue;
+                }
+
+                if ch == quote {
+                    quote_in_bracket = None;
+                }
+
+                continue;
+            }
+
+            // End of current arg token, only when not inside dynamic/bracket segment
+            if paren_depth == 0
+                && bracket_depth == 0
+                && (ch.is_whitespace() || ch == ';' || ch == ')')
+            {
                 break;
             }
 
-            // Dynamic nested segment: .(...)
-            if ch == '(' {
-                depth += 1;
+            if bracket_depth > 0 {
+                if ch == '"' || ch == '\'' {
+                    quote_in_bracket = Some(ch);
+                } else if ch == '[' {
+                    bracket_depth += 1;
+                } else if ch == ']' {
+                    bracket_depth -= 1;
+                }
+
+                parsed.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+
+            if ch == '[' {
+                bracket_depth += 1;
+            } else if ch == '(' {
+                paren_depth += 1;
             } else if ch == ')' {
-                if depth == 0 {
+                if paren_depth == 0 {
                     break;
                 }
-                depth -= 1;
+                paren_depth -= 1;
             }
 
             parsed.push(ch);
@@ -473,7 +822,7 @@ impl BlockParser {
         }
 
         // Validate non-dynamic plain variable syntax for compatibility
-        if !parsed.contains(".(") {
+        if !parsed.contains(".(") && !parsed.contains('[') {
             let mut chars = parsed.chars();
             let first = chars.next().unwrap();
             if !(first.is_alphabetic() || first == '_') {
@@ -484,7 +833,7 @@ impl BlockParser {
             }
 
             for c in chars {
-                if !(c.is_alphanumeric() || c == '_' || c == '.' || c == '-') {
+                if !(c.is_alphanumeric() || c == '_' || c == '.' || c == '-' || c == '?') {
                     return Err(nom::Err::Error(nom::error::Error::from_error_kind(
                         rest,
                         ErrorKind::Tag,
@@ -493,7 +842,7 @@ impl BlockParser {
             }
         }
 
-        if depth != 0 {
+        if paren_depth != 0 || bracket_depth != 0 || quote_in_bracket.is_some() {
             return Err(nom::Err::Error(nom::error::Error::from_error_kind(
                 rest,
                 ErrorKind::Tag,
@@ -508,7 +857,10 @@ impl BlockParser {
         debug!("Parsing var braced: {}", input);
         let (rest, _) = tag("${").parse(input)?;
         let mut i = 0usize;
-        let mut depth = 0usize;
+        let mut paren_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut quote_in_bracket: Option<char> = None;
+        let mut escaped_in_quote = false;
         let mut parsed = String::new();
 
         while i < rest.len() {
@@ -516,14 +868,50 @@ impl BlockParser {
                 nom::Err::Error(nom::error::Error::from_error_kind(rest, ErrorKind::Tag))
             })?;
 
-            if ch == '}' && depth == 0 {
+            if let Some(quote) = quote_in_bracket {
+                parsed.push(ch);
+                i += ch.len_utf8();
+
+                if escaped_in_quote {
+                    escaped_in_quote = false;
+                    continue;
+                }
+
+                if ch == '\\' {
+                    escaped_in_quote = true;
+                    continue;
+                }
+
+                if ch == quote {
+                    quote_in_bracket = None;
+                }
+                continue;
+            }
+
+            if ch == '}' && paren_depth == 0 && bracket_depth == 0 {
                 break;
             }
 
-            if ch == '(' {
-                depth += 1;
+            if bracket_depth > 0 {
+                if ch == '"' || ch == '\'' {
+                    quote_in_bracket = Some(ch);
+                } else if ch == '[' {
+                    bracket_depth += 1;
+                } else if ch == ']' {
+                    bracket_depth -= 1;
+                }
+
+                parsed.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+
+            if ch == '[' {
+                bracket_depth += 1;
+            } else if ch == '(' {
+                paren_depth += 1;
             } else if ch == ')' {
-                if depth == 0 {
+                if paren_depth == 0 {
                     let msg = format!("Unexpected ')' in braced variable: {}", input);
                     debug!("{}", msg);
                     return Err(nom::Err::Error(nom::error::Error::from_error_kind(
@@ -531,14 +919,20 @@ impl BlockParser {
                         ErrorKind::Tag,
                     )));
                 }
-                depth -= 1;
+                paren_depth -= 1;
             }
 
             parsed.push(ch);
             i += ch.len_utf8();
         }
 
-        if parsed.is_empty() || i >= rest.len() || !rest[i..].starts_with('}') || depth != 0 {
+        if parsed.is_empty()
+            || i >= rest.len()
+            || !rest[i..].starts_with('}')
+            || paren_depth != 0
+            || bracket_depth != 0
+            || quote_in_bracket.is_some()
+        {
             let msg = format!("Parse var braced error: {}", input);
             debug!("{}", msg);
             return Err(nom::Err::Error(nom::error::Error::from_error_kind(
@@ -636,12 +1030,9 @@ impl BlockParser {
         let mut used_dynamic = false;
 
         while i < input.len() {
-            let ch = input[i..]
-                .chars()
-                .next()
-                .ok_or_else(|| {
-                    nom::Err::Error(nom::error::Error::from_error_kind(input, ErrorKind::Tag))
-                })?;
+            let ch = input[i..].chars().next().ok_or_else(|| {
+                nom::Err::Error(nom::error::Error::from_error_kind(input, ErrorKind::Tag))
+            })?;
 
             if ch.is_whitespace() || ch == ';' {
                 break;
@@ -676,7 +1067,7 @@ impl BlockParser {
                 }
 
                 if !literal.is_empty() {
-                    parts.push(CommandArg::Literal(literal.clone()));
+                    parts.push(CommandArg::StringLiteral(literal.clone()));
                     literal.clear();
                 }
                 parts.push(inner_arg);
@@ -697,7 +1088,7 @@ impl BlockParser {
         }
 
         if !literal.is_empty() {
-            parts.push(CommandArg::Literal(literal));
+            parts.push(CommandArg::StringLiteral(literal));
         }
 
         let arg = if parts.len() == 1 {
@@ -716,17 +1107,17 @@ impl BlockParser {
         Ok((&input[i..], arg))
     }
 
-    fn parse_arg(input: &str) -> IResult<&str, CommandArg> {
+    pub(crate) fn parse_arg(input: &str) -> IResult<&str, CommandArg> {
         debug!("Parsing arg: {}", input);
         let ret = preceded(
             space0,
             alt((
-                Self::parse_command_subst, // $(...)
-                Self::parse_var_braced,    // ${VAR}
-                Self::parse_var_dollar,    // $VAR
+                Self::parse_command_subst,         // $(...)
+                Self::parse_var_braced,            // ${VAR}
+                Self::parse_var_dollar,            // $VAR
                 Self::parse_interpolated_unquoted, // a.($b).($c)
-                Self::parse_literal,       // "..." or '...' or unquoted
-                Self::parse_option,        // -o or --option
+                Self::parse_literal,               // "..." or '...' or unquoted
+                Self::parse_option,                // -o or --option
             )),
         )
         .parse(input)?;
@@ -739,16 +1130,48 @@ impl BlockParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collection::{CollectionValue, NumberValue};
 
     #[test]
     fn test_parse_literal() {
         let (input, arg) = BlockParser::parse_literal("abc").unwrap();
         assert_eq!(input, "");
         assert_eq!(arg.as_literal_str().unwrap(), "abc");
+        assert!(matches!(arg, CommandArg::Literal(_)));
+
+        let (input, arg) = BlockParser::parse_literal("true").unwrap();
+        assert_eq!(input, "");
+        assert!(matches!(
+            arg,
+            CommandArg::TypedLiteral(_, CollectionValue::Bool(true))
+        ));
+
+        let (input, arg) = BlockParser::parse_literal("123").unwrap();
+        assert_eq!(input, "");
+        assert!(matches!(
+            arg,
+            CommandArg::TypedLiteral(_, CollectionValue::Number(NumberValue::Int(123)))
+        ));
+
+        let (input, arg) = BlockParser::parse_literal("12.5").unwrap();
+        assert_eq!(input, "");
+        assert!(matches!(
+            arg,
+            CommandArg::TypedLiteral(_, CollectionValue::Number(NumberValue::Float(v)))
+            if (v - 12.5).abs() < f64::EPSILON
+        ));
+
+        let (input, arg) = BlockParser::parse_literal("null").unwrap();
+        assert_eq!(input, "");
+        assert!(matches!(
+            arg,
+            CommandArg::TypedLiteral(_, CollectionValue::Null)
+        ));
 
         let (input, arg) = BlockParser::parse_literal("\"abc def\"").unwrap();
         assert_eq!(input, "");
         assert_eq!(arg.as_literal_str().unwrap(), "abc def");
+        assert!(matches!(arg, CommandArg::StringLiteral(_)));
 
         let (input, arg) = BlockParser::parse_literal("\"line\\nbreak\"").unwrap();
         assert_eq!(input, "");
@@ -757,6 +1180,7 @@ mod tests {
         let (input, arg) = BlockParser::parse_literal("'abc def'").unwrap();
         assert_eq!(input, "");
         assert_eq!(arg.as_literal_str().unwrap(), "abc def");
+        assert!(matches!(arg, CommandArg::StringLiteral(_)));
 
         let (input, arg) = BlockParser::parse_literal("test123_").unwrap();
         assert_eq!(input, "");
@@ -789,6 +1213,54 @@ mod tests {
         assert_eq!(rest, "");
         assert!(arg.is_var());
         assert_eq!(arg.as_var_str(), Some("test1.($test1.key3)"));
+    }
+
+    #[test]
+    fn test_parse_bracket_var_dollar() {
+        let (rest, arg) = BlockParser::parse_arg("$geoByIp[$REQ.clientIp].country").unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_var());
+        assert_eq!(arg.as_var_str(), Some("geoByIp[$REQ.clientIp].country"));
+    }
+
+    #[test]
+    fn test_parse_bracket_var_braced_with_quotes() {
+        let (rest, arg) = BlockParser::parse_arg("${geoByIp[\"1.2.3.4\"].country}").unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_var());
+        assert_eq!(arg.as_var_str(), Some("geoByIp[\"1.2.3.4\"].country"));
+    }
+
+    #[test]
+    fn test_parse_braced_var_with_safe_access_and_default() {
+        let (rest, arg) =
+            BlockParser::parse_arg("${geoByIp[$REQ.clientIp]?.country ?? \"unknown\"}").unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_var());
+        assert_eq!(
+            arg.as_var_str(),
+            Some("geoByIp[$REQ.clientIp]?.country ?? \"unknown\"")
+        );
+    }
+
+    #[test]
+    fn test_parse_dollar_var_with_safe_access() {
+        let (rest, arg) = BlockParser::parse_arg("$REQ.geo?.country").unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_var());
+        assert_eq!(arg.as_var_str(), Some("REQ.geo?.country"));
+    }
+
+    #[test]
+    fn test_parse_dollar_var_with_safe_access_and_inline_default() {
+        let (rest, arg) =
+            BlockParser::parse_arg("$geoByIp[$REQ.clientIp]?.country??\"unknown\"").unwrap();
+        assert_eq!(rest, "");
+        assert!(arg.is_var());
+        assert_eq!(
+            arg.as_var_str(),
+            Some("geoByIp[$REQ.clientIp]?.country??\"unknown\"")
+        );
     }
 
     #[test]
@@ -855,5 +1327,111 @@ mod tests {
         let block = parser.parse(block_str).unwrap();
         assert_eq!(block.id, "test_block");
         assert_eq!(block.lines.len(), 5);
+    }
+
+    #[test]
+    fn test_parse_comparison_sugar_loose() {
+        let (rest, expr) = BlockParser::parse_expression("$a == \"1\"").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "eq");
+        assert_eq!(cmd.command.args.len(), 4);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("eq"));
+        assert_eq!(cmd.command.args[1].as_literal_str(), Some("--loose"));
+        assert!(matches!(cmd.command.args[2], CommandArg::Var(_)));
+        assert!(matches!(cmd.command.args[3], CommandArg::StringLiteral(_)));
+    }
+
+    #[test]
+    fn test_parse_comparison_sugar_strict() {
+        let (rest, expr) = BlockParser::parse_expression("$a === \"1\"").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "eq");
+        assert_eq!(cmd.command.args.len(), 3);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("eq"));
+        assert!(matches!(cmd.command.args[1], CommandArg::Var(_)));
+        assert!(matches!(cmd.command.args[2], CommandArg::StringLiteral(_)));
+    }
+
+    #[test]
+    fn test_parse_comparison_sugar_ne_loose() {
+        let (rest, expr) = BlockParser::parse_expression("$a != \"1\"").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "ne");
+        assert_eq!(cmd.command.args.len(), 4);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("ne"));
+        assert_eq!(cmd.command.args[1].as_literal_str(), Some("--loose"));
+        assert!(matches!(cmd.command.args[2], CommandArg::Var(_)));
+        assert!(matches!(cmd.command.args[3], CommandArg::StringLiteral(_)));
+    }
+
+    #[test]
+    fn test_parse_comparison_sugar_ne_strict() {
+        let (rest, expr) = BlockParser::parse_expression("$a !== \"1\"").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "ne");
+        assert_eq!(cmd.command.args.len(), 3);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("ne"));
+        assert!(matches!(cmd.command.args[1], CommandArg::Var(_)));
+        assert!(matches!(cmd.command.args[2], CommandArg::StringLiteral(_)));
+    }
+
+    #[test]
+    fn test_parse_comparison_sugar_gt() {
+        let (rest, expr) = BlockParser::parse_expression("$a > 1").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "gt");
+        assert_eq!(cmd.command.args.len(), 3);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("gt"));
+        assert!(matches!(cmd.command.args[1], CommandArg::Var(_)));
+        assert!(matches!(cmd.command.args[2], CommandArg::TypedLiteral(_, _)));
+    }
+
+    #[test]
+    fn test_parse_comparison_sugar_ge() {
+        let (rest, expr) = BlockParser::parse_expression("$a >= 1").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "ge");
+        assert_eq!(cmd.command.args.len(), 3);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("ge"));
+        assert!(matches!(cmd.command.args[1], CommandArg::Var(_)));
+        assert!(matches!(cmd.command.args[2], CommandArg::TypedLiteral(_, _)));
+    }
+
+    #[test]
+    fn test_parse_comparison_sugar_lt() {
+        let (rest, expr) = BlockParser::parse_expression("$a < 1").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "lt");
+        assert_eq!(cmd.command.args.len(), 3);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("lt"));
+        assert!(matches!(cmd.command.args[1], CommandArg::Var(_)));
+        assert!(matches!(cmd.command.args[2], CommandArg::TypedLiteral(_, _)));
+    }
+
+    #[test]
+    fn test_parse_comparison_sugar_le() {
+        let (rest, expr) = BlockParser::parse_expression("$a <= 1").unwrap();
+        assert_eq!(rest, "");
+
+        let cmd = expr.as_command().unwrap();
+        assert_eq!(cmd.command.name, "le");
+        assert_eq!(cmd.command.args.len(), 3);
+        assert_eq!(cmd.command.args[0].as_literal_str(), Some("le"));
+        assert!(matches!(cmd.command.args[1], CommandArg::Var(_)));
+        assert!(matches!(cmd.command.args[2], CommandArg::TypedLiteral(_, _)));
     }
 }
