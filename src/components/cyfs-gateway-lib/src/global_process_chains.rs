@@ -1,10 +1,13 @@
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicU32;
+use crate::{
+    ConfigErrorCode, ConfigResult, GlobalCollectionManagerRef, JsExternalsManagerRef,
+    ProcessChainConfig, config_err,
+};
 use buckyos_kit::AsyncStream;
-use tokio::sync::RwLock;
 use cyfs_process_chain::*;
-use crate::{config_err, ConfigErrorCode, ConfigResult, GlobalCollectionManagerRef, JsExternalsManagerRef, ProcessChainConfig};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, Mutex};
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct GlobalProcessChains {
@@ -27,8 +30,13 @@ impl GlobalProcessChains {
                 process_chain.id()
             ));
         }
-        let process_chain_lib = ProcessChainListLib::new(process_chain.id().to_string().as_str(), 0, vec![process_chain]);
-        self.process_chains.push(process_chain_lib.into_process_chain_lib());
+        let process_chain_lib = ProcessChainListLib::new(
+            process_chain.id().to_string().as_str(),
+            0,
+            vec![process_chain],
+        );
+        self.process_chains
+            .push(process_chain_lib.into_process_chain_lib());
         Ok(())
     }
 
@@ -66,7 +74,8 @@ impl GlobalProcessChains {
 
     pub fn register_global_process_chain(&self, hook_point: &HookPoint) -> ConfigResult<()> {
         for process_chain_lib in self.process_chains.iter() {
-            hook_point.add_process_chain_lib(process_chain_lib.clone())
+            hook_point
+                .add_process_chain_lib(process_chain_lib.clone())
                 .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{}", e))?;
         }
         Ok(())
@@ -603,10 +612,12 @@ pub async fn create_process_chain_executor(
     let hook_point = HookPoint::new("cyfs_server_hook_point");
     let process_chain_lib = ProcessChainListLib::new_empty("main", 0);
     for chain_config in chains.iter() {
-        process_chain_lib.add_chain(Arc::new(chain_config.create_process_chain()?))
+        process_chain_lib
+            .add_chain(Arc::new(chain_config.create_process_chain()?))
             .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{}", e))?;
     }
-    hook_point.add_process_chain_lib(process_chain_lib.into_process_chain_lib())
+    hook_point
+        .add_process_chain_lib(process_chain_lib.into_process_chain_lib())
         .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{}", e))?;
 
     if let Some(global_process_chains) = global_process_chains {
@@ -617,7 +628,8 @@ pub async fn create_process_chain_executor(
 
     if let Some(external_commands) = external_commands {
         for (name, cmd) in external_commands {
-            hook_point_env.register_external_command(name.as_str(), cmd.clone())
+            hook_point_env
+                .register_external_command(name.as_str(), cmd.clone())
                 .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
         }
     }
@@ -636,24 +648,33 @@ pub async fn create_process_chain_executor(
                 })?;
         }
     }
-    
+
     if let Some(global_collection_manager) = global_collection_manager {
-        global_collection_manager.register_collection(hook_point_env.hook_point_env()).await?;
+        global_collection_manager
+            .register_collection(hook_point_env.hook_point_env())
+            .await?;
     }
 
     let executor = hook_point_env
         .link_hook_point(&hook_point)
         .await
         .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
-    Ok((executor.prepare_exec_lib("main")
-            .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?, hook_point_env))
+    Ok((
+        executor
+            .prepare_exec_lib("main")
+            .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?,
+        hook_point_env,
+    ))
 }
 
-
-pub async fn execute_stream_chain(executor: ProcessChainLibExecutor, request: StreamRequest) -> ConfigResult<(CommandResult, Box<dyn AsyncStream>)> {
+pub async fn execute_stream_chain(
+    executor: ProcessChainLibExecutor,
+    request: StreamRequest,
+) -> ConfigResult<(CommandResult, Box<dyn AsyncStream>)> {
     let request_map = StreamRequestMap::new(request);
     let global_env = executor.global_env();
-    request_map.register(global_env)
+    request_map
+        .register(global_env)
         .await
         .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
     let ret = executor
@@ -665,17 +686,21 @@ pub async fn execute_stream_chain(executor: ProcessChainLibExecutor, request: St
     let socket = request.incoming_stream.lock().unwrap().take();
     if socket.is_none() {
         return Err(config_err!(
-                ConfigErrorCode::ProcessChainError,
-                "socket is none"
-            ));
+            ConfigErrorCode::ProcessChainError,
+            "socket is none"
+        ));
     }
     let socket = socket.unwrap();
     Ok((ret, socket))
 }
 
-pub async fn execute_chain(executor: ProcessChainLibExecutor, coll: MapCollectionRef) -> ConfigResult<CommandResult> {
+pub async fn execute_chain(
+    executor: ProcessChainLibExecutor,
+    coll: MapCollectionRef,
+) -> ConfigResult<CommandResult> {
     let global_env = executor.global_env();
-    global_env.create("REQ", CollectionValue::Map(coll))
+    global_env
+        .create("REQ", CollectionValue::Map(coll))
         .await
         .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
     let ret = executor

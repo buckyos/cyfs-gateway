@@ -1,13 +1,16 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::str::FromStr;
+use crate::nameinfo_to_map_collection;
 use clap::{Arg, Command};
+use cyfs_gateway_lib::ServerManagerWeakRef;
+use cyfs_process_chain::{
+    command_help, CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel,
+    ExternalCommand,
+};
 use hickory_proto::xfer::Protocol;
 use log::{error, warn};
 use name_client::{DnsProvider, NameInfo, NsProvider, RecordType};
 use name_lib::{EncodedDocument, DID};
-use cyfs_gateway_lib::ServerManagerWeakRef;
-use cyfs_process_chain::{command_help, CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel, ExternalCommand};
-use crate::nameinfo_to_map_collection;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::str::FromStr;
 
 //todo:implement the cmd_resolve_did
 
@@ -160,10 +163,11 @@ impl ExternalCommand for CmdResolve {
         Ok(())
     }
 
-    async fn exec(&self,
-                  context: &Context,
-                  args: &[CollectionValue],
-                  origin_args: &CommandArgs,
+    async fn exec(
+        &self,
+        context: &Context,
+        args: &[CollectionValue],
+        origin_args: &CommandArgs,
     ) -> Result<CommandResult, String> {
         let mut str_args = Vec::with_capacity(args.len());
         for arg in args.iter() {
@@ -175,7 +179,8 @@ impl ExternalCommand for CmdResolve {
             str_args.push(arg.as_str().unwrap());
         }
 
-        let matches = self.cmd
+        let matches = self
+            .cmd
             .clone()
             .try_get_matches_from(&str_args)
             .map_err(|e| {
@@ -206,7 +211,10 @@ impl ExternalCommand for CmdResolve {
         let server_address = matches.get_one::<String>("server_address");
         let name_info = if server_address.is_none() {
             let provider = DnsProvider::new(None);
-            match provider.query(query_name.as_str(), Some(record_type), None).await {
+            match provider
+                .query(query_name.as_str(), Some(record_type), None)
+                .await
+            {
                 Ok(name_info) => name_info,
                 Err(e) => {
                     return Ok(CommandResult::error_with_string(format!(
@@ -219,7 +227,10 @@ impl ExternalCommand for CmdResolve {
             let server_address = server_address.unwrap();
             if let Ok(address) = server_address.parse::<IpAddr>() {
                 let provider = DnsProvider::new(Some(server_address.to_string()));
-                match provider.query(query_name.as_str(), Some(record_type), None).await {
+                match provider
+                    .query(query_name.as_str(), Some(record_type), None)
+                    .await
+                {
                     Ok(name_info) => name_info,
                     Err(e) => {
                         return Ok(CommandResult::error_with_string(format!(
@@ -230,7 +241,10 @@ impl ExternalCommand for CmdResolve {
                 }
             } else if let Ok(address) = server_address.parse::<SocketAddr>() {
                 let provider = DnsProvider::new(Some(address.to_string()));
-                match provider.query(query_name.as_str(), Some(record_type), None).await {
+                match provider
+                    .query(query_name.as_str(), Some(record_type), None)
+                    .await
+                {
                     Ok(name_info) => name_info,
                     Err(e) => {
                         return Ok(CommandResult::error_with_string(format!(
@@ -243,13 +257,16 @@ impl ExternalCommand for CmdResolve {
                 let server_mgr = match self.server_mgr.upgrade() {
                     Some(server_mgr) => server_mgr,
                     None => {
-                        let msg = "Resolve command failed: server manager is unavailable".to_string();
+                        let msg =
+                            "Resolve command failed: server manager is unavailable".to_string();
                         error!("{}", msg);
                         return Ok(CommandResult::error_with_string(msg));
                     }
                 };
                 if let Some(dns_service) = server_mgr.get_name_server(server_address) {
-                    match dns_service.query(query_name.as_str(), Some(record_type), None).await
+                    match dns_service
+                        .query(query_name.as_str(), Some(record_type), None)
+                        .await
                         .map_err(|e| {
                             let msg = format!(
                                 "Resolve miss via {} for domain {} record_type {}: {:?}",
@@ -267,21 +284,30 @@ impl ExternalCommand for CmdResolve {
                             msg
                         }) {
                         Ok(name_info) => name_info,
-                        Err(e) => {
-                            return Ok(CommandResult::error_with_string(e))
-                        }
+                        Err(e) => return Ok(CommandResult::error_with_string(e)),
                     }
                 } else {
-                    let msg = format!("Invalid resolve command: inner service {} not found", server_address);
+                    let msg = format!(
+                        "Invalid resolve command: inner service {} not found",
+                        server_address
+                    );
                     error!("{}", msg);
-                    return Ok(CommandResult::error_with_string(msg))
+                    return Ok(CommandResult::error_with_string(msg));
                 }
             }
         };
-        let result = nameinfo_to_map_collection(record_type_str.as_str(), &name_info).await
+        let result = nameinfo_to_map_collection(record_type_str.as_str(), &name_info)
+            .await
             .map_err(|e| format!("Failed to convert name info to map collection: {:?}", e))?;
 
-        context.env().create("RESOLVE_RESP", CollectionValue::Map(result), EnvLevel::Global).await?;
+        context
+            .env()
+            .create(
+                "RESOLVE_RESP",
+                CollectionValue::Map(result),
+                EnvLevel::Global,
+            )
+            .await?;
         Ok(CommandResult::success_with_string("RESOLVE_RESP"))
     }
 }

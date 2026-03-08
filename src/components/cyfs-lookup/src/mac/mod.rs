@@ -1,13 +1,13 @@
 use std::net::IpAddr;
 
-use crate::{lookup_err, LookupResult};
+use crate::{LookupResult, lookup_err};
 
-#[cfg(target_os = "windows")]
-mod windows;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 pub async fn lookup_mac_once(ip: IpAddr) -> LookupResult<Option<String>> {
     #[cfg(target_os = "windows")]

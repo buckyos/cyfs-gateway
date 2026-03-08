@@ -1,5 +1,8 @@
 use clap::{Arg, Command};
-use cyfs_process_chain::{command_help, CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel, ExternalCommand, MemorySetCollection};
+use cyfs_process_chain::{
+    CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel,
+    ExternalCommand, MemorySetCollection, command_help,
+};
 
 pub struct SetStat {
     name: String,
@@ -15,13 +18,13 @@ impl SetStat {
 Examples:
     set-stat group1
     set-stat group1 group2
-                "#
+                "#,
             )
             .arg(
                 Arg::new("group_id")
                     .num_args(0..)
                     .help("Statistical group ID")
-                    .required(true)
+                    .required(true),
             );
         Self {
             name: "set-stat".to_string(),
@@ -42,7 +45,8 @@ impl ExternalCommand for SetStat {
     }
 
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let matches = self.cmd
+        let matches = self
+            .cmd
             .clone()
             .try_get_matches_from(args.as_str_list())
             .map_err(|e| {
@@ -58,7 +62,12 @@ impl ExternalCommand for SetStat {
         Ok(())
     }
 
-    async fn exec(&self, context: &Context, args: &[CollectionValue], _origin_args: &CommandArgs) -> Result<CommandResult, String> {
+    async fn exec(
+        &self,
+        context: &Context,
+        args: &[CollectionValue],
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandResult, String> {
         let mut str_args = Vec::with_capacity(args.len());
         for arg in args.iter() {
             if !arg.is_string() {
@@ -69,7 +78,8 @@ impl ExternalCommand for SetStat {
             str_args.push(arg.as_str().unwrap());
         }
 
-        let matches = self.cmd
+        let matches = self
+            .cmd
             .clone()
             .try_get_matches_from(&str_args)
             .map_err(|e| {
@@ -89,7 +99,10 @@ impl ExternalCommand for SetStat {
             set.insert(group_id.as_str()).await?;
         }
 
-        context.env().create("STAT", CollectionValue::Set(set), EnvLevel::Global).await?;
+        context
+            .env()
+            .create("STAT", CollectionValue::Set(set), EnvLevel::Global)
+            .await?;
         Ok(CommandResult::success_with_string("STAT"))
     }
 }

@@ -55,10 +55,7 @@ impl ProcessChain {
     pub async fn link(&mut self, context: &ParserContextRef) -> Result<(), String> {
         info!("Linking process chain: {}", self.id);
 
-        let linker = BlockCommandLinker::new(
-            context.clone(),
-            COMMAND_PARSER_FACTORY.clone(),
-        );
+        let linker = BlockCommandLinker::new(context.clone(), COMMAND_PARSER_FACTORY.clone());
         // Link each block in the chain
         for block in &mut self.blocks {
             linker.link(block).await?;
@@ -98,7 +95,7 @@ impl ParserContext {
         command: ExternalCommandRef,
     ) -> Result<(), String> {
         // First check if the command already exists in global factory
-        // Local commands should not override global commands to avoid confusion 
+        // Local commands should not override global commands to avoid confusion
         if EXTERNAL_COMMAND_FACTORY.get_command(name).is_some() {
             let msg = format!("External command '{}' already exists in global", name);
             error!("{}", msg);

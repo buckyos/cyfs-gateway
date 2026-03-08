@@ -1,4 +1,4 @@
-use crate::{lint_xml_content, LintConfig};
+use crate::{LintConfig, lint_xml_content};
 
 #[test]
 fn test_lint_undefined_var() {

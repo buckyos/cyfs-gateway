@@ -1,9 +1,7 @@
-
-
-use tokio::fs;
-use std::collections::HashMap;
-use std::net::{SocketAddr};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use tokio::fs;
 
 fn default_true() -> bool {
     true
@@ -11,35 +9,34 @@ fn default_true() -> bool {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NamedDataMgrRouteConfig {
-    pub named_data_mgr_id : String,
+    pub named_data_mgr_id: String,
     #[serde(default = "default_true")]
-    pub read_only:bool,
+    pub read_only: bool,
     #[serde(default = "default_true")]
-    pub guest_access:bool,// 是否允许zone外访问
+    pub guest_access: bool, // 是否允许zone外访问
     #[serde(default = "default_true")]
     //是否将chunkid放在路径的第一级，
     //如果为true，则使用https://ndn.$zoneid/$chunkid/index.html?ref=www.buckyos.org
     //如果为false，则将chunkid放在host的第一段https://$chunkid.ndn.$zoneid/index.html?ref=www.buckyos.org
-    pub is_object_id_in_path:bool,
+    pub is_object_id_in_path: bool,
     #[serde(default = "default_true")]
-    pub enable_mgr_file_path:bool,// 是否使用mgr路径模式
+    pub enable_mgr_file_path: bool, // 是否使用mgr路径模式
     #[serde(default = "default_true")]
-    pub enable_zone_put_chunk:bool
+    pub enable_zone_put_chunk: bool,
 }
 
 impl Default for NamedDataMgrRouteConfig {
-    fn default()->Self {
+    fn default() -> Self {
         Self {
-            named_data_mgr_id:"default".to_string(),
-            read_only:true,
-            guest_access:false,
-            is_object_id_in_path:true,
-            enable_mgr_file_path:true,
-            enable_zone_put_chunk:true,
+            named_data_mgr_id: "default".to_string(),
+            read_only: true,
+            guest_access: false,
+            is_object_id_in_path: true,
+            enable_mgr_file_path: true,
+            enable_zone_put_chunk: true,
         }
     }
 }
-
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct HostConfig {
@@ -51,7 +48,6 @@ pub struct HostConfig {
     pub tls: TlsConfig,
     pub routes: HashMap<String, RouteConfig>,
 }
-
 
 #[derive(Debug, Clone)]
 pub enum RedirectType {
@@ -85,17 +81,14 @@ impl UpstreamRouteConfig {
                 redirect = match parts[2] {
                     "permanent" => RedirectType::Permanent,
                     "temporary" => RedirectType::Temporary,
-                    _ => RedirectType::None
+                    _ => RedirectType::None,
                 };
             } else {
                 redirect = RedirectType::Temporary;
             }
         }
 
-        Self {
-            target,
-            redirect
-        }
+        Self { target, redirect }
     }
 }
 
@@ -105,7 +98,6 @@ pub struct ResponseRouteConfig {
     pub headers: Option<HashMap<String, String>>,
     pub body: Option<String>,
 }
-
 
 fn default_enable_cors() -> bool {
     true
@@ -131,7 +123,6 @@ pub struct TlsConfig {
     pub key_path: Option<String>,
 }
 
-
 impl Default for TlsConfig {
     fn default() -> Self {
         Self {
@@ -142,7 +133,6 @@ impl Default for TlsConfig {
         }
     }
 }
-
 
 fn default_tls_port() -> u16 {
     0
@@ -155,10 +145,10 @@ fn default_http_port() -> u16 {
 #[derive(Debug, Deserialize, Clone)]
 pub struct WarpServerConfig {
     #[serde(default = "default_tls_port")]
-    pub tls_port:u16,
+    pub tls_port: u16,
     #[serde(default = "default_http_port")]
-    pub http_port:u16,
-    pub bind:Option<String>,
+    pub http_port: u16,
+    pub bind: Option<String>,
     pub hosts: HashMap<String, HostConfig>,
 }
 
@@ -184,13 +174,9 @@ pub struct BlockConfig {
 impl BlockConfig {
     pub fn create_block(&self) -> ConfigResult<Block> {
         let parser = BlockParser::new(self.id.as_str());
-        parser.parse(self.block.as_str()).map_err(|e| {
-            config_err!(
-                ConfigErrorCode::InvalidConfig,
-                "{}",
-                e
-            )
-        })
+        parser
+            .parse(self.block.as_str())
+            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{}", e))
     }
 }
 
@@ -208,13 +194,9 @@ impl ProcessChainConfig {
         let mut blocks = self.blocks.clone();
         blocks.sort_by(|a, b| a.priority.cmp(&b.priority));
         for block in blocks.iter() {
-            chain.add_block(block.create_block()?).map_err(|e| {
-                config_err!(
-                    ConfigErrorCode::InvalidConfig,
-                    "{}",
-                    e
-                )
-            })?;
+            chain
+                .add_block(block.create_block()?)
+                .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "{}", e))?;
         }
         Ok(chain)
     }
@@ -225,7 +207,6 @@ pub fn get_min_priority(chain_configs: &ProcessChainConfigs) -> i32 {
     chain_configs.iter().map(|c| c.priority).min().unwrap_or(0)
 }
 
-
 #[derive(Debug, Copy, Clone)]
 pub enum ConfigErrorCode {
     InvalidConfig,
@@ -234,11 +215,11 @@ pub enum ConfigErrorCode {
 }
 pub type ConfigResult<T> = sfo_result::Result<T, ConfigErrorCode>;
 pub type ConfigError = sfo_result::Error<ConfigErrorCode>;
-pub use sfo_result::err as config_err;
-pub use sfo_result::into_err as into_config_err;
+use crate::StackProtocol;
 use cyfs_acme::ChallengeType;
 use cyfs_process_chain::{Block, BlockParser, ProcessChain};
-use crate::{StackProtocol};
+pub use sfo_result::err as config_err;
+pub use sfo_result::into_err as into_config_err;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TcpConfig {

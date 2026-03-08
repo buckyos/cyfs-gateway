@@ -1,11 +1,13 @@
 use crate::*;
 use buckyos_kit::AsyncStream;
+use clap::{Arg, Command};
+use cyfs_process_chain::{
+    CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel,
+    ExternalCommand, MapCollectionRef, command_help,
+};
 use kRPC::RPCRequest;
 use log::*;
-use clap::{Arg, Command};
-use cyfs_process_chain::{CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel, ExternalCommand, MapCollectionRef, command_help};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}};
-
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[async_trait::async_trait]
 pub trait QAServer: Send + Sync {
@@ -14,48 +16,64 @@ pub trait QAServer: Send + Sync {
 }
 
 const MAX_JSON_QUESTION_SIZE: usize = 10 * 1024 * 1024; // 10MB
-pub async fn serve_qa_from_stream(mut stream: Box<dyn AsyncStream>, server: Arc<dyn QAServer>, info: StreamInfo) -> ServerResult<()> {
+pub async fn serve_qa_from_stream(
+    mut stream: Box<dyn AsyncStream>,
+    server: Arc<dyn QAServer>,
+    info: StreamInfo,
+) -> ServerResult<()> {
     // 增量读取并解析 JSON，直到成功解析出完整的 JSON 对象
     // 这种方式可以处理网速慢、数据分片到达的情况
     let mut buffer = Vec::new();
     let mut temp_buf = [0u8; 4096]; // 每次读取 4KB
-    
+
     let request: serde_json::Value = loop {
         // 从流中读取数据块
         match stream.read(&mut temp_buf).await {
             Ok(0) => {
                 // 连接关闭，尝试解析已有的数据
                 if buffer.is_empty() {
-                    error!("Connection closed before receiving any data from {}", 
-                           info.src_addr.as_deref().unwrap_or("unknown"));
-                    return Err(server_err!(ServerErrorCode::StreamError, "Connection closed before receiving data"));
+                    error!(
+                        "Connection closed before receiving any data from {}",
+                        info.src_addr.as_deref().unwrap_or("unknown")
+                    );
+                    return Err(server_err!(
+                        ServerErrorCode::StreamError,
+                        "Connection closed before receiving data"
+                    ));
                 }
-                
+
                 // 尝试解析
                 match serde_json::from_slice::<serde_json::Value>(&buffer) {
                     Ok(req) => break req,
                     Err(e) => {
-                        error!("Failed to parse incomplete JSON from {}: {}", 
-                               info.src_addr.as_deref().unwrap_or("unknown"), e);
-                        
+                        error!(
+                            "Failed to parse incomplete JSON from {}: {}",
+                            info.src_addr.as_deref().unwrap_or("unknown"),
+                            e
+                        );
+
                         let error_response = serde_json::json!({
                             "error": "Invalid JSON",
                             "message": format!("Incomplete or invalid JSON: {}", e)
                         });
-                        
+
                         if let Ok(response_str) = serde_json::to_string(&error_response) {
                             let _ = stream.write_all(response_str.as_bytes()).await;
                             let _ = stream.flush().await;
                         }
-                        
-                        return Err(server_err!(ServerErrorCode::InvalidData, "Invalid JSON: {}", e));
+
+                        return Err(server_err!(
+                            ServerErrorCode::InvalidData,
+                            "Invalid JSON: {}",
+                            e
+                        ));
                     }
                 }
             }
             Ok(n) => {
                 // 追加读取的数据到缓冲区
                 buffer.extend_from_slice(&temp_buf[..n]);
-                
+
                 // 尝试解析当前缓冲区中的数据
                 match serde_json::from_slice::<serde_json::Value>(&buffer) {
                     Ok(req) => {
@@ -67,27 +85,33 @@ pub async fn serve_qa_from_stream(mut stream: Box<dyn AsyncStream>, server: Arc<
                         if e.is_eof() {
                             continue;
                         }
-                        
+
                         // 如果是其他错误，可能是 JSON 格式错误
                         // 但也可能只是数据还没传输完，继续尝试
                         // 设置一个合理的大小限制，防止无限读取
-                        if buffer.len() > MAX_JSON_QUESTION_SIZE {  // 10MB 限制
-                            error!("JSON data too large (>10MB) from {}", 
-                                   info.src_addr.as_deref().unwrap_or("unknown"));
-                            
+                        if buffer.len() > MAX_JSON_QUESTION_SIZE {
+                            // 10MB 限制
+                            error!(
+                                "JSON data too large (>10MB) from {}",
+                                info.src_addr.as_deref().unwrap_or("unknown")
+                            );
+
                             let error_response = serde_json::json!({
                                 "error": "Invalid JSON",
                                 "message": "JSON data too large"
                             });
-                            
+
                             if let Ok(response_str) = serde_json::to_string(&error_response) {
                                 let _ = stream.write_all(response_str.as_bytes()).await;
                                 let _ = stream.flush().await;
                             }
-                            
-                            return Err(server_err!(ServerErrorCode::InvalidData, "JSON too large"));
+
+                            return Err(server_err!(
+                                ServerErrorCode::InvalidData,
+                                "JSON too large"
+                            ));
                         }
-                        
+
                         // 继续读取更多数据
                         continue;
                     }
@@ -95,31 +119,68 @@ pub async fn serve_qa_from_stream(mut stream: Box<dyn AsyncStream>, server: Arc<
             }
             Err(e) => {
                 error!("Error reading from stream: {}", e);
-                return Err(server_err!(ServerErrorCode::StreamError, "Error reading from stream: {}", e));
+                return Err(server_err!(
+                    ServerErrorCode::StreamError,
+                    "Error reading from stream: {}",
+                    e
+                ));
             }
         }
     };
-    
+
     let response = server.serve_question(&request).await;
     match response {
         Ok(response) => {
-            let response_str = serde_json::to_string(&response).map_err(|e| server_err!(ServerErrorCode::EncodeError, "Failed to serialize response: {}", e))?;
-            stream.write_all(response_str.as_bytes()).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "Failed to write response: {}", e))?;
-            stream.flush().await.map_err(|e| server_err!(ServerErrorCode::StreamError, "Failed to flush stream: {}", e))?;
-            return Ok(())
+            let response_str = serde_json::to_string(&response).map_err(|e| {
+                server_err!(
+                    ServerErrorCode::EncodeError,
+                    "Failed to serialize response: {}",
+                    e
+                )
+            })?;
+            stream
+                .write_all(response_str.as_bytes())
+                .await
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::StreamError,
+                        "Failed to write response: {}",
+                        e
+                    )
+                })?;
+            stream.flush().await.map_err(|e| {
+                server_err!(
+                    ServerErrorCode::StreamError,
+                    "Failed to flush stream: {}",
+                    e
+                )
+            })?;
+            return Ok(());
         }
         Err(e) => {
-            stream.shutdown().await.map_err(|e| server_err!(ServerErrorCode::StreamError, "Failed to shutdown stream: {}", e))?;
-            return Err(server_err!(ServerErrorCode::StreamError, "Error serving question: {}", e));
+            stream.shutdown().await.map_err(|e| {
+                server_err!(
+                    ServerErrorCode::StreamError,
+                    "Failed to shutdown stream: {}",
+                    e
+                )
+            })?;
+            return Err(server_err!(
+                ServerErrorCode::StreamError,
+                "Error serving question: {}",
+                e
+            ));
         }
     }
-
 }
 
-
 pub fn qa_json_to_rpc_request(json_req: &serde_json::Value) -> ServerResult<RPCRequest> {
-    let method = json_req.get("method").ok_or_else(|| server_err!(ServerErrorCode::InvalidParam, "method is required"))?;
-    let method_str = method.as_str().ok_or_else(|| server_err!(ServerErrorCode::InvalidParam, "method is not a string"))?;
+    let method = json_req
+        .get("method")
+        .ok_or_else(|| server_err!(ServerErrorCode::InvalidParam, "method is required"))?;
+    let method_str = method
+        .as_str()
+        .ok_or_else(|| server_err!(ServerErrorCode::InvalidParam, "method is not a string"))?;
     let params = json_req.clone();
 
     Ok(RPCRequest::new(method_str, params))
@@ -139,10 +200,11 @@ pub struct CmdQa {
 
 impl CmdQa {
     pub fn new(server_manager: ServerManagerWeakRef) -> Self {
-        let cmd = Command::new(CMD_QA_NAME)
-            .about("Call QA Server to answer questions")
-            .after_help(
-                r#"
+        let cmd =
+            Command::new(CMD_QA_NAME)
+                .about("Call QA Server to answer questions")
+                .after_help(
+                    r#"
 Call a QA Server to answer questions based on the provided request data.
 
 Usage:
@@ -164,19 +226,20 @@ Examples:
   qa my_qa_server CUSTOM_REQ
   echo $ANSWER.result_code
 "#,
-            )
-            .arg(Arg::new("server_id")
-                .required(true)
-                .index(1)
-                .help("The ID of the QA server to call"))
-            .arg(Arg::new("map_id")
-                .required(false)
-                .index(2)
-                .help("The ID of the map collection containing the question (defaults to REQ)"));
+                )
+                .arg(
+                    Arg::new("server_id")
+                        .required(true)
+                        .index(1)
+                        .help("The ID of the QA server to call"),
+                )
+                .arg(Arg::new("map_id").required(false).index(2).help(
+                    "The ID of the map collection containing the question (defaults to REQ)",
+                ));
 
-        Self { 
+        Self {
             cmd,
-            server_manager 
+            server_manager,
         }
     }
 
@@ -212,7 +275,8 @@ impl ExternalCommand for CmdQa {
         origin_args: &CommandArgs,
     ) -> Result<CommandResult, String> {
         // Parse arguments
-        let matches = self.cmd
+        let matches = self
+            .cmd
             .clone()
             .try_get_matches_from(origin_args.as_str_list())
             .map_err(|e| {
@@ -221,21 +285,25 @@ impl ExternalCommand for CmdQa {
                 msg
             })?;
 
-        let server_id = matches.get_one::<String>("server_id")
-            .ok_or_else(|| {
-                let msg = "server_id is required".to_string();
-                error!("{}", msg);
-                msg
-            })?;
+        let server_id = matches.get_one::<String>("server_id").ok_or_else(|| {
+            let msg = "server_id is required".to_string();
+            error!("{}", msg);
+            msg
+        })?;
 
-        let map_id = matches.get_one::<String>("map_id")
+        let map_id = matches
+            .get_one::<String>("map_id")
             .map(|s| s.as_str())
             .unwrap_or("REQ");
 
-        info!("will execute qa command: server_id={}, map_id={}", server_id, map_id);
+        info!(
+            "will execute qa command: server_id={}, map_id={}",
+            server_id, map_id
+        );
 
         // Get the QA server
-        let server_manager = self.server_manager
+        let server_manager = self
+            .server_manager
             .upgrade()
             .ok_or_else(|| "qa command failed: server manager is unavailable".to_string())?;
         let server = server_manager.get_qa_server(server_id);
@@ -245,42 +313,42 @@ impl ExternalCommand for CmdQa {
         let qa_server = server.unwrap();
 
         // Get the request map from environment
-        let req_value = context.env().get(map_id, None).await?
-            .ok_or_else(|| {
-                let msg = format!("Map '{}' not found in environment", map_id);
-                error!("{}", msg);
-                msg
-            })?;
+        let req_value = context.env().get(map_id, None).await?.ok_or_else(|| {
+            let msg = format!("Map '{}' not found in environment", map_id);
+            error!("{}", msg);
+            msg
+        })?;
 
-        let req_map = req_value.as_map()
-            .ok_or_else(|| {
-                let msg = format!("'{}' is not a map collection", map_id);
-                error!("{}", msg);
-                msg
-            })?;
+        let req_map = req_value.as_map().ok_or_else(|| {
+            let msg = format!("'{}' is not a map collection", map_id);
+            error!("{}", msg);
+            msg
+        })?;
 
         // Convert map to JSON using the trait
-        let request_json = req_map.to_json().await
-            .map_err(|e| {
-                let msg = format!("Failed to convert map '{}' to JSON: {}", map_id, e);
-                error!("{}", msg);
-                msg.to_string()
-            })?;
+        let request_json = req_map.to_json().await.map_err(|e| {
+            let msg = format!("Failed to convert map '{}' to JSON: {}", map_id, e);
+            error!("{}", msg);
+            msg.to_string()
+        })?;
 
-        info!("Calling QA server '{}' with request: {}", server_id, request_json);
+        info!(
+            "Calling QA server '{}' with request: {}",
+            server_id, request_json
+        );
 
         // Call QA server
-        let response_json = qa_server.serve_question(&request_json).await
-            .map_err(|e| {
-                let msg = format!("QA server '{}' failed: {}", server_id, e);
-                error!("{}", msg);
-                msg
-            })?;
+        let response_json = qa_server.serve_question(&request_json).await.map_err(|e| {
+            let msg = format!("QA server '{}' failed: {}", server_id, e);
+            error!("{}", msg);
+            msg
+        })?;
 
         info!("QA server '{}' response: {}", server_id, response_json);
 
         // Convert response JSON to map using the trait
-        let answer_map = MapCollectionRef::from_json(&response_json).await
+        let answer_map = MapCollectionRef::from_json(&response_json)
+            .await
             .map_err(|e| {
                 let msg = format!("Failed to convert JSON response to map: {}", e);
                 error!("{}", msg);
@@ -288,7 +356,10 @@ impl ExternalCommand for CmdQa {
             })?;
 
         // Store result in ANSWER
-        context.env().create("ANSWER", CollectionValue::Map(answer_map), EnvLevel::Global).await
+        context
+            .env()
+            .create("ANSWER", CollectionValue::Map(answer_map), EnvLevel::Global)
+            .await
             .map_err(|e| {
                 let msg = format!("Failed to create ANSWER in environment: {}", e);
                 error!("{}", msg);

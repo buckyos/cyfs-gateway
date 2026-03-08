@@ -1,10 +1,13 @@
-use http::{Request, Response, Version, StatusCode};
+use crate::{
+    AcmeCertManagerRef, HttpServer, Server, ServerConfig, ServerContext, ServerContextRef,
+    ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo, server_err,
+};
+use http::{Request, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
-use hyper::body::Bytes;
-use crate::{server_err, AcmeCertManagerRef, HttpServer, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
-use std::sync::Arc;
 use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub struct AcmeHttpChallengeServer {
     id: String,
@@ -12,8 +15,7 @@ pub struct AcmeHttpChallengeServer {
 }
 
 impl AcmeHttpChallengeServer {
-    pub fn new(id: String,
-               acme_mgr: AcmeCertManagerRef) -> Self {
+    pub fn new(id: String, acme_mgr: AcmeCertManagerRef) -> Self {
         AcmeHttpChallengeServer { id, acme_mgr }
     }
 
@@ -31,7 +33,11 @@ impl AcmeHttpChallengeServer {
 
 #[async_trait::async_trait]
 impl HttpServer for AcmeHttpChallengeServer {
-    async fn serve_request(&self, req: Request<BoxBody<Bytes, ServerError>>, _info: StreamInfo) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+    async fn serve_request(
+        &self,
+        req: Request<BoxBody<Bytes, ServerError>>,
+        _info: StreamInfo,
+    ) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
         let path = req.uri().path();
 
         // 提取ACME挑战token
@@ -40,9 +46,11 @@ impl HttpServer for AcmeHttpChallengeServer {
                 let response = Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", "application/octet-stream")
-                    .body(Full::new(Bytes::from(key_auth.clone()))
-                        .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{e}"))
-                        .boxed())
+                    .body(
+                        Full::new(Bytes::from(key_auth.clone()))
+                            .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{e}"))
+                            .boxed(),
+                    )
                     .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{e}"))?;
                 return Ok(response);
             }
@@ -52,9 +60,11 @@ impl HttpServer for AcmeHttpChallengeServer {
         // 如果不是有效的ACME挑战请求，返回404
         let response = Response::builder()
             .status(StatusCode::NOT_FOUND)
-            .body(Full::new(Bytes::from("Not Found"))
-                .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{e}"))
-                .boxed())
+            .body(
+                Full::new(Bytes::from("Not Found"))
+                    .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{e}"))
+                    .boxed(),
+            )
             .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{e}"))?;
         Ok(response)
     }
@@ -125,8 +135,13 @@ impl ServerFactory for AcmeHttpChallengeServerFactory {
         config: Arc<dyn ServerConfig>,
         context: Option<ServerContextRef>,
     ) -> ServerResult<Vec<Server>> {
-        let config = config.as_any().downcast_ref::<AcmeHttpChallengeServerConfig>()
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid acme http challenge server config"))?;
+        let config = config
+            .as_any()
+            .downcast_ref::<AcmeHttpChallengeServerConfig>()
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid acme http challenge server config"
+            ))?;
         let context = context.ok_or(server_err!(
             ServerErrorCode::InvalidConfig,
             "acme response server context is required"

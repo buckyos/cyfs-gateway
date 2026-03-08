@@ -145,8 +145,7 @@ impl CommandParser for CaptureCommandParser {
             && control_kind_var.is_none()
             && from_var.is_none()
         {
-            let msg = "capture command requires at least one target option"
-                .to_string();
+            let msg = "capture command requires at least one target option".to_string();
             error!("{}", msg);
             return Err(msg);
         }
@@ -283,9 +282,7 @@ impl CommandExecutor for CaptureCommandExecutor {
 
         if let Some(control_kind_var) = &self.control_kind_var {
             let control_kind = match ret.as_control() {
-                Some(CommandControl::Return(_)) => {
-                    CollectionValue::String("return".to_string())
-                }
+                Some(CommandControl::Return(_)) => CollectionValue::String("return".to_string()),
                 Some(CommandControl::Error(_)) => CollectionValue::String("error".to_string()),
                 Some(CommandControl::Exit(_)) => CollectionValue::String("exit".to_string()),
                 Some(CommandControl::Break(_)) => CollectionValue::String("break".to_string()),

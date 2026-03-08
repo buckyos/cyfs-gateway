@@ -6,7 +6,9 @@ use std::str::FromStr;
 use async_trait::async_trait;
 
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
-use hickory_server::authority::{Catalog, MessageRequest, MessageResponse, MessageResponseBuilder, Queries};
+use hickory_server::authority::{
+    Catalog, MessageRequest, MessageResponse, MessageResponseBuilder, Queries,
+};
 use hickory_server::proto::op::*;
 use hickory_server::proto::rr::*;
 use hickory_server::server::{Request, RequestHandler, RequestInfo, ResponseHandler, ResponseInfo};
@@ -16,21 +18,23 @@ use log::{debug, error, info, warn};
 use rdata::{A, AAAA, CNAME, PTR, TXT};
 use tokio::net::UdpSocket;
 
+use crate::cmd_resolve::CmdResolve;
+use crate::map_collection_to_nameinfo;
 use anyhow::Result;
 use cyfs_gateway_lib::*;
+use cyfs_process_chain::{
+    CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor,
+};
 use futures::stream::{self, StreamExt};
-use name_client::{DnsProvider, LocalConfigDnsProvider, NameInfo, NsProvider, RecordType};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
-use hickory_proto::{ProtoError, ProtoErrorKind};
 use hickory_proto::op::message::EmitAndCount;
 use hickory_proto::xfer::{Protocol, SerialMessage};
+use hickory_proto::{ProtoError, ProtoErrorKind};
+use name_client::{DnsProvider, LocalConfigDnsProvider, NameInfo, NsProvider, RecordType};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tokio::time::timeout;
 use url::Url;
-use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor};
-use crate::map_collection_to_nameinfo;
-use crate::cmd_resolve::CmdResolve;
 
 //TODO: dns_provider is realy a demo implementation, must refactor before  used in a offical server.
 fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RData>> {
@@ -119,12 +123,13 @@ fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RDat
 
 /// Trait for handling incoming requests, and providing a message response.
 #[async_trait::async_trait]
-trait DnsRequestHandler<'q, 'a, Answers, NameServers, Soa, Additionals>: Send + Sync + Unpin + 'static
+trait DnsRequestHandler<'q, 'a, Answers, NameServers, Soa, Additionals>:
+    Send + Sync + Unpin + 'static
 where
-    Answers: Iterator<Item=&'a Record> + Send + 'a,
-    NameServers: Iterator<Item=&'a Record> + Send + 'a,
-    Soa: Iterator<Item=&'a Record> + Send + 'a,
-    Additionals: Iterator<Item=&'a Record> + Send + 'a,
+    Answers: Iterator<Item = &'a Record> + Send + 'a,
+    NameServers: Iterator<Item = &'a Record> + Send + 'a,
+    Soa: Iterator<Item = &'a Record> + Send + 'a,
+    Additionals: Iterator<Item = &'a Record> + Send + 'a,
 {
     async fn handle_request(
         &self,
@@ -132,13 +137,12 @@ where
     ) -> MessageResponse<
         '_,
         'a,
-        impl Iterator<Item=&'a Record> + Send + 'a,
-        impl Iterator<Item=&'a Record> + Send + 'a,
-        impl Iterator<Item=&'a Record> + Send + 'a,
-        impl Iterator<Item=&'a Record> + Send + 'a,
+        impl Iterator<Item = &'a Record> + Send + 'a,
+        impl Iterator<Item = &'a Record> + Send + 'a,
+        impl Iterator<Item = &'a Record> + Send + 'a,
+        impl Iterator<Item = &'a Record> + Send + 'a,
     >;
 }
-
 
 pub(crate) struct CyfsQueriesEmitAndCount {
     /// Number of queries in this segment
@@ -185,30 +189,44 @@ impl InnerDnsRecordManager {
         })
     }
 
-    pub fn add_record(&self, name: impl Into<String>, record_type: impl Into<String>, value: impl Into<String>) -> ServerResult<()> {
+    pub fn add_record(
+        &self,
+        name: impl Into<String>,
+        record_type: impl Into<String>,
+        value: impl Into<String>,
+    ) -> ServerResult<()> {
         let name = name.into();
         let record_type = record_type.into();
         let value = value.into();
         let mut records = self.records.write().unwrap();
         match record_type.as_str() {
             "A" | "AAAA" => {
-                let ip = IpAddr::from_str(value.as_str())
-                    .map_err(into_server_err!(ServerErrorCode::InvalidParam, "invalid ip {}", value))?;
+                let ip = IpAddr::from_str(value.as_str()).map_err(into_server_err!(
+                    ServerErrorCode::InvalidParam,
+                    "invalid ip {}",
+                    value
+                ))?;
                 let info = records
                     .entry(name.clone())
-                    .or_insert(HashMap::new()).entry(record_type).or_insert(NameInfo::new(name.as_str()));
+                    .or_insert(HashMap::new())
+                    .entry(record_type)
+                    .or_insert(NameInfo::new(name.as_str()));
                 info.address.push(ip);
-            },
+            }
             "TXT" => {
                 let info = records
                     .entry(name.clone())
-                    .or_insert(HashMap::new()).entry(record_type).or_insert(NameInfo::new(name.as_str()));
+                    .or_insert(HashMap::new())
+                    .entry(record_type)
+                    .or_insert(NameInfo::new(name.as_str()));
                 info.txt.push(value);
-            },
+            }
             "CNAME" => {
                 let info = records
                     .entry(name.clone())
-                    .or_insert(HashMap::new()).entry(record_type).or_insert(NameInfo::new(name.as_str()));
+                    .or_insert(HashMap::new())
+                    .entry(record_type)
+                    .or_insert(NameInfo::new(name.as_str()));
                 info.cname = Some(value);
             }
             _ => {
@@ -233,11 +251,17 @@ impl InnerDnsRecordManager {
         }
     }
 
-    pub fn get_record(&self, name: impl Into<String>, record_type: impl Into<String>) -> Option<NameInfo> {
+    pub fn get_record(
+        &self,
+        name: impl Into<String>,
+        record_type: impl Into<String>,
+    ) -> Option<NameInfo> {
         let name = name.into();
         let record_type = record_type.into();
         let records = self.records.read().unwrap();
-        records.get(name.as_str()).and_then(|record| record.get(record_type.as_str()).cloned())
+        records
+            .get(name.as_str())
+            .and_then(|record| record.get(record_type.as_str()).cloned())
     }
 }
 
@@ -262,15 +286,19 @@ impl ProcessChainDnsServer {
     ) -> ServerResult<Self> {
         let resolve_cmd = CmdResolve::new(server_mgr.clone());
         let mut commands = get_external_commands(server_mgr.clone());
-        commands.push((resolve_cmd.name().to_string(), Arc::new(Box::new(resolve_cmd))));
+        commands.push((
+            resolve_cmd.name().to_string(),
+            Arc::new(Box::new(resolve_cmd)),
+        ));
         let (executor, _) = create_process_chain_executor(
             &hook_point,
             global_process_chains.clone(),
             global_collection_manager.clone(),
             Some(commands),
             js_externals,
-        ).await
-            .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
+        )
+        .await
+        .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
 
         Ok(Self {
             id,
@@ -302,7 +330,6 @@ impl ProcessChainDnsServer {
             .collect::<Vec<_>>();
         let mut message = builder.build(header, records.iter(), &[], &[], &[]);
 
-
         let mut buffer = Vec::with_capacity(512);
         let encode_result = {
             let mut encoder = BinEncoder::new(&mut buffer);
@@ -316,60 +343,101 @@ impl ProcessChainDnsServer {
             encoder.set_max_size(max_size);
 
             message.destructive_emit(&mut encoder)
-        }.map_err(into_server_err!(ServerErrorCode::EncodeError));
+        }
+        .map_err(into_server_err!(ServerErrorCode::EncodeError));
         Ok(buffer)
     }
 
-    async fn handle_request<'a, >(
+    async fn handle_request<'a>(
         &self,
         request: &Request,
         dst_addr: Option<String>,
-    ) -> ServerResult<Vec<u8>>
-    {
+    ) -> ServerResult<Vec<u8>> {
         if request.op_code() != OpCode::Query {
-            return Err(server_err!(ServerErrorCode::InvalidDnsOpType, "{}", request.op_code()));
+            return Err(server_err!(
+                ServerErrorCode::InvalidDnsOpType,
+                "{}",
+                request.op_code()
+            ));
         }
 
         // make sure the message type is a query
         if request.message_type() != MessageType::Query {
-            return Err(server_err!(ServerErrorCode::InvalidDnsMessageType, "{}", request.message_type()));
+            return Err(server_err!(
+                ServerErrorCode::InvalidDnsMessageType,
+                "{}",
+                request.message_type()
+            ));
         }
 
         let from_ip = request.src();
 
-        let reqeust_info = request.request_info().map_err(into_server_err!(ServerErrorCode::BadRequest))?;
+        let reqeust_info = request
+            .request_info()
+            .map_err(into_server_err!(ServerErrorCode::BadRequest))?;
         let name = reqeust_info.query.name().to_string();
         let record_type_str = reqeust_info.query.query_type().to_string();
 
         // First, check if the record exists in the inner record manager
-        if let Some(name_info) = self.inner_record_manager.get_record(&name, &record_type_str) {
-            debug!("Found record in inner record manager: {} {}", name, record_type_str);
-            return self.name_info_to_buffer(request, &reqeust_info, record_type_str.as_str(), name_info).await;
+        if let Some(name_info) = self
+            .inner_record_manager
+            .get_record(&name, &record_type_str)
+        {
+            debug!(
+                "Found record in inner record manager: {} {}",
+                name, record_type_str
+            );
+            return self
+                .name_info_to_buffer(request, &reqeust_info, record_type_str.as_str(), name_info)
+                .await;
         }
 
         let map = MemoryMapCollection::new_ref();
-        map.insert("name", CollectionValue::String(name)).await
+        map.insert("name", CollectionValue::String(name))
+            .await
             .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("record_type", CollectionValue::String(record_type_str.clone())).await
-            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_addr", CollectionValue::String(from_ip.ip().to_string())).await
-            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_port", CollectionValue::String(from_ip.port().to_string())).await
-            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "record_type",
+            CollectionValue::String(record_type_str.clone()),
+        )
+        .await
+        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_addr",
+            CollectionValue::String(from_ip.ip().to_string()),
+        )
+        .await
+        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_port",
+            CollectionValue::String(from_ip.port().to_string()),
+        )
+        .await
+        .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
         if let Some(dst_addr) = dst_addr {
             if let Ok(socket_addr) = dst_addr.parse::<SocketAddr>() {
-                map.insert("dest_addr", CollectionValue::String(socket_addr.to_string())).await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
-                map.insert("dest_ip", CollectionValue::String(socket_addr.ip().to_string())).await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
-                map.insert("dest_port", CollectionValue::String(socket_addr.port().to_string())).await
-                    .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+                map.insert(
+                    "dest_addr",
+                    CollectionValue::String(socket_addr.to_string()),
+                )
+                .await
+                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+                map.insert(
+                    "dest_ip",
+                    CollectionValue::String(socket_addr.ip().to_string()),
+                )
+                .await
+                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+                map.insert(
+                    "dest_port",
+                    CollectionValue::String(socket_addr.port().to_string()),
+                )
+                .await
+                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
             }
         }
 
-        let executor = {
-            self.executor.lock().unwrap().fork()
-        };
+        let executor = { self.executor.lock().unwrap().fork() };
         let chain_env = executor.chain_env().clone();
         let ret = execute_chain(executor, map)
             .await
@@ -385,20 +453,31 @@ impl ProcessChainDnsServer {
                 let value = if let CollectionValue::String(value) = &(ret.value) {
                     value
                 } else {
-                    return Err(server_err!(ServerErrorCode::ProcessChainError, "invalid process chain result"));
+                    return Err(server_err!(
+                        ServerErrorCode::ProcessChainError,
+                        "invalid process chain result"
+                    ));
                 };
                 if let Some(list) = shlex::split(value.as_str()) {
                     if list.is_empty() {
-                        let resp = chain_env.get("RESOLVE_RESP").await.map_err(
-                            |e| server_err!(ServerErrorCode::ProcessChainError, "{e}")
-                        )?;
+                        let resp = chain_env
+                            .get("RESOLVE_RESP")
+                            .await
+                            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
                         if let Some(resp) = resp {
                             if let CollectionValue::Map(resp) = resp {
-                                let name_info = map_collection_to_nameinfo(&resp).await
-                                    .map_err(
-                                        |e| server_err!(ServerErrorCode::ProcessChainError, "{e}")
-                                    )?;
-                                return self.name_info_to_buffer(request, &reqeust_info, record_type_str.as_str(), name_info).await;
+                                let name_info =
+                                    map_collection_to_nameinfo(&resp).await.map_err(|e| {
+                                        server_err!(ServerErrorCode::ProcessChainError, "{e}")
+                                    })?;
+                                return self
+                                    .name_info_to_buffer(
+                                        request,
+                                        &reqeust_info,
+                                        record_type_str.as_str(),
+                                        name_info,
+                                    )
+                                    .await;
                             }
                         }
                     }
@@ -410,7 +489,10 @@ impl ProcessChainDnsServer {
                 }
             }
         }
-        Err(server_err!(ServerErrorCode::ProcessChainError, "invalid process chain result"))
+        Err(server_err!(
+            ServerErrorCode::ProcessChainError,
+            "invalid process chain result"
+        ))
     }
 
     async fn handle(
@@ -426,12 +508,8 @@ impl ProcessChainDnsServer {
             Ok(message) => {
                 let addr = if let Some(src_addr) = src_addr.as_ref() {
                     match src_addr.parse::<SocketAddr>() {
-                        Ok(src_addr) => {
-                            src_addr
-                        }
-                        Err(_) => {
-                            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-                        }
+                        Ok(src_addr) => src_addr,
+                        Err(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
                     }
                 } else {
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
@@ -459,9 +537,10 @@ impl ProcessChainDnsServer {
                             encoder.set_max_size(max_size);
 
                             message.destructive_emit(&mut encoder)
-                        }.map_err(into_server_err!(ServerErrorCode::EncodeError));
+                        }
+                        .map_err(into_server_err!(ServerErrorCode::EncodeError));
                         Ok(buffer)
-                    },
+                    }
                 }
             }
             Err(ProtoError { kind, .. }) if kind.as_form_error().is_some() => {
@@ -481,13 +560,12 @@ impl ProcessChainDnsServer {
                     None,
                     &vec![],
                     &mut encoder,
-                ).map_err(into_server_err!(ServerErrorCode::EncodeError))?;
+                )
+                .map_err(into_server_err!(ServerErrorCode::EncodeError))?;
 
                 Ok(buffer)
             }
-            Err(error) => {
-                Err(server_err!(ServerErrorCode::InvalidData, "request:Failed"))
-            },
+            Err(error) => Err(server_err!(ServerErrorCode::InvalidData, "request:Failed")),
         }
     }
 }
@@ -553,8 +631,13 @@ impl ServerFactory for ProcessChainDnsServerFactory {
         config: Arc<dyn ServerConfig>,
         context: Option<ServerContextRef>,
     ) -> ServerResult<Vec<Server>> {
-        let config = config.as_any().downcast_ref::<DnsServerConfig>()
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid dns server config"))?;
+        let config = config
+            .as_any()
+            .downcast_ref::<DnsServerConfig>()
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid dns server config"
+            ))?;
 
         let context = context.ok_or(server_err!(
             ServerErrorCode::InvalidConfig,
@@ -577,7 +660,8 @@ impl ServerFactory for ProcessChainDnsServerFactory {
             config.hook_point.clone(),
             context.inner_record_manager.clone(),
             Some(context.js_externals.clone()),
-        ).await?;
+        )
+        .await?;
         Ok(vec![Server::Datagram(Arc::new(server))])
     }
 }
@@ -588,7 +672,6 @@ pub struct DnsServerConfig {
     #[serde(rename = "type")]
     pub ty: String,
     pub hook_point: ProcessChainConfigs,
-
 }
 
 impl ServerConfig for DnsServerConfig {
@@ -607,16 +690,24 @@ impl ServerConfig for DnsServerConfig {
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        DnsServerConfig, DnsServerContext, InnerDnsRecordManager, LocalDns, ProcessChainDnsServer,
+        ProcessChainDnsServerFactory,
+    };
+    use cyfs_gateway_lib::server::DatagramServer;
+    use cyfs_gateway_lib::{
+        ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager,
+        GlobalProcessChains, JsExternalsManager, Server, ServerFactory, ServerManager,
+        StackContext, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackContext,
+        UdpStackFactory,
+    };
+    use hickory_proto::op::{Message, Query};
+    use hickory_proto::rr::RecordType;
+    use hickory_server::proto::rr::{Name, RData};
     use std::io::Write;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::str::FromStr;
     use std::sync::Arc;
-    use hickory_proto::op::{Message, Query};
-    use hickory_proto::rr::RecordType;
-    use hickory_server::proto::rr::{Name, RData};
-    use cyfs_gateway_lib::{ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager, GlobalProcessChains, JsExternalsManager, Server, ServerFactory, ServerManager, StackContext, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackContext, UdpStackFactory};
-    use cyfs_gateway_lib::server::DatagramServer;
-    use crate::{DnsServerConfig, DnsServerContext, InnerDnsRecordManager, LocalDns, ProcessChainDnsServer, ProcessChainDnsServerFactory};
 
     #[tokio::test]
     async fn test_process_chain_dns_server_factory() {
@@ -675,11 +766,16 @@ address = ["2600:1700:1150:9440:5cbb:f6ff:fe9e:eefa"]
         let mut local_dns = tempfile::NamedTempFile::new().unwrap();
         local_dns.write_all(local_dns_content.as_bytes()).unwrap();
         let server_mgr = Arc::new(ServerManager::new());
-        let dns_server = LocalDns::create("local_dns".to_string(), local_dns.path().to_string_lossy().to_string());
+        let dns_server = LocalDns::create(
+            "local_dns".to_string(),
+            local_dns.path().to_string_lossy().to_string(),
+        );
         assert!(dns_server.is_ok());
         let dns_server = dns_server.unwrap();
 
-        server_mgr.add_server(Server::NameServer(Arc::new(dns_server))).unwrap();
+        server_mgr
+            .add_server(Server::NameServer(Arc::new(dns_server)))
+            .unwrap();
 
         let config = r#"
 type: dns
@@ -702,7 +798,8 @@ hook_point:
             config.hook_point,
             inner_record_manager,
             Some(Arc::new(JsExternalsManager::new())),
-        ).await;
+        )
+        .await;
         assert!(server.is_ok());
         let server = server.unwrap();
 
@@ -721,12 +818,19 @@ hook_point:
         assert!(msg_vec.is_ok());
         let msg_vec = msg_vec.unwrap();
 
-        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        let data = server
+            .serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None))
+            .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 0);
 
-        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(Some("127.0.0.1:434".to_string()))).await;
+        let data = server
+            .serve_datagram(
+                msg_vec.as_slice(),
+                DatagramInfo::new(Some("127.0.0.1:434".to_string())),
+            )
+            .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 0);
@@ -752,7 +856,8 @@ hook_point:
             config.hook_point,
             inner_record_manager,
             Some(Arc::new(JsExternalsManager::new())),
-        ).await;
+        )
+        .await;
         assert!(server.is_ok());
         let server = server.unwrap();
 
@@ -771,12 +876,19 @@ hook_point:
         assert!(msg_vec.is_ok());
         let msg_vec = msg_vec.unwrap();
 
-        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        let data = server
+            .serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None))
+            .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 1);
         assert_eq!(resp.answers()[0].record_type(), RecordType::A);
-        assert_eq!(resp.answers()[0].data(), &RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::from_str("192.168.1.1").unwrap())));
+        assert_eq!(
+            resp.answers()[0].data(),
+            &RData::A(hickory_proto::rr::rdata::A(
+                Ipv4Addr::from_str("192.168.1.1").unwrap()
+            ))
+        );
 
         let mut message = Message::new();
         let name = Name::from_str("1.1.168.192.in-addr.arpa.").unwrap();
@@ -789,7 +901,9 @@ hook_point:
         assert!(msg_vec.is_ok());
         let msg_vec = msg_vec.unwrap();
 
-        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        let data = server
+            .serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None))
+            .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 1);
@@ -813,7 +927,9 @@ hook_point:
         assert!(msg_vec.is_ok());
         let msg_vec = msg_vec.unwrap();
 
-        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        let data = server
+            .serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None))
+            .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 3);
@@ -833,16 +949,24 @@ hook_point:
         assert!(msg_vec.is_ok());
         let msg_vec = msg_vec.unwrap();
 
-        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(Some("127.0.0.1:434".to_string()))).await;
+        let data = server
+            .serve_datagram(
+                msg_vec.as_slice(),
+                DatagramInfo::new(Some("127.0.0.1:434".to_string())),
+            )
+            .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 0);
 
-
-        let data = server.serve_datagram(&msg_vec[..1], DatagramInfo::new(None)).await;
+        let data = server
+            .serve_datagram(&msg_vec[..1], DatagramInfo::new(None))
+            .await;
         assert!(data.is_err());
 
-        let data = server.serve_datagram(&msg_vec[..msg_vec.len() - 1], DatagramInfo::new(None)).await;
+        let data = server
+            .serve_datagram(&msg_vec[..msg_vec.len() - 1], DatagramInfo::new(None))
+            .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 0);
@@ -878,11 +1002,16 @@ address = ["2600:1700:1150:9440:5cbb:f6ff:fe9e:eefa"]
         let mut local_dns = tempfile::NamedTempFile::new().unwrap();
         local_dns.write_all(local_dns_content.as_bytes()).unwrap();
         let server_mgr = Arc::new(ServerManager::new());
-        let dns_server = LocalDns::create("local_dns".to_string(), local_dns.path().to_string_lossy().to_string());
+        let dns_server = LocalDns::create(
+            "local_dns".to_string(),
+            local_dns.path().to_string_lossy().to_string(),
+        );
         assert!(dns_server.is_ok());
         let dns_server = dns_server.unwrap();
 
-        server_mgr.add_server(Server::NameServer(Arc::new(dns_server))).unwrap();
+        server_mgr
+            .add_server(Server::NameServer(Arc::new(dns_server)))
+            .unwrap();
 
         let config = r#"
 type: dns
@@ -905,7 +1034,9 @@ hook_point:
             InnerDnsRecordManager::new(),
         );
         let server_factory = ProcessChainDnsServerFactory::new();
-        let ret = server_factory.create(Arc::new(config), Some(Arc::new(context))).await;
+        let ret = server_factory
+            .create(Arc::new(config), Some(Arc::new(context)))
+            .await;
         assert!(ret.is_ok());
         let servers = ret.unwrap();
 
@@ -967,7 +1098,8 @@ hook_point:
             config.hook_point,
             inner_record_manager,
             Some(Arc::new(JsExternalsManager::new())),
-        ).await;
+        )
+        .await;
         assert!(server.is_ok());
         let server = server.unwrap();
 
@@ -986,13 +1118,19 @@ hook_point:
         assert!(msg_vec.is_ok());
         let msg_vec = msg_vec.unwrap();
 
-        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        let data = server
+            .serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None))
+            .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 1);
         assert_eq!(resp.answers()[0].record_type(), RecordType::A);
-        assert_eq!(resp.answers()[0].data(), &RData::A(hickory_proto::rr::rdata::A(Ipv4Addr::from_str("192.168.1.1").unwrap())));
-
+        assert_eq!(
+            resp.answers()[0].data(),
+            &RData::A(hickory_proto::rr::rdata::A(
+                Ipv4Addr::from_str("192.168.1.1").unwrap()
+            ))
+        );
 
         let mut message = Message::new();
 
@@ -1009,7 +1147,9 @@ hook_point:
         assert!(msg_vec.is_ok());
         let msg_vec = msg_vec.unwrap();
 
-        let data = server.serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None)).await;
+        let data = server
+            .serve_datagram(msg_vec.as_slice(), DatagramInfo::new(None))
+            .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 0);

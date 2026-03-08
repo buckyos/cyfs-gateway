@@ -97,11 +97,15 @@ impl ExternalCommand for ErrorResponse {
             str_args.push(arg.as_str().unwrap());
         }
 
-        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
-            let msg = format!("Invalid error command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid error command: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         let status = matches
             .get_one::<String>("status")
@@ -114,6 +118,9 @@ impl ExternalCommand for ErrorResponse {
             None => format!("error {}", status),
         };
 
-        Ok(CommandResult::return_with_string(CommandControlLevel::Lib, command))
+        Ok(CommandResult::return_with_string(
+            CommandControlLevel::Lib,
+            command,
+        ))
     }
 }

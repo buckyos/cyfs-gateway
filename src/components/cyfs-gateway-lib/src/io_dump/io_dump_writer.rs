@@ -1,7 +1,7 @@
 use super::io_dump_frame::IoDumpFrame;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -97,7 +97,10 @@ impl WriterState {
 
     async fn write_record(&mut self, encoded: &[u8]) -> std::io::Result<()> {
         let next_size = self.active_size.saturating_add(encoded.len() as u64);
-        if self.config.rotate_size > 0 && self.active_size > 0 && next_size > self.config.rotate_size {
+        if self.config.rotate_size > 0
+            && self.active_size > 0
+            && next_size > self.config.rotate_size
+        {
             self.rotate().await?;
         }
         self.file.write_all(encoded).await?;

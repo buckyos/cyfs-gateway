@@ -1,7 +1,7 @@
+use cyfs_process_chain::{SetCollection, SetCollectionTraverseCallBackRef};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::RwLock;
-use cyfs_process_chain::{SetCollection, SetCollectionTraverseCallBackRef};
 
 pub struct JsonSet {
     file_path: String,
@@ -12,11 +12,14 @@ impl JsonSet {
     pub async fn load_from(file_path: impl Into<String>) -> Result<Self, String> {
         let file_path = file_path.into();
         let set = if Path::new(file_path.as_str()).exists() {
-            let content = tokio::fs::read_to_string(file_path.as_str()).await.map_err(|e| e.to_string())?;
+            let content = tokio::fs::read_to_string(file_path.as_str())
+                .await
+                .map_err(|e| e.to_string())?;
             if content.is_empty() {
                 HashSet::new()
             } else {
-                let set = serde_json::from_str::<HashSet<String>>(&content).map_err(|e| e.to_string())?;
+                let set =
+                    serde_json::from_str::<HashSet<String>>(&content).map_err(|e| e.to_string())?;
                 set
             }
         } else {
@@ -34,7 +37,9 @@ impl JsonSet {
             let set = self.set.read().unwrap();
             serde_json::to_string_pretty(&*set).map_err(|e| e.to_string())?
         };
-        tokio::fs::write(file_path, content).await.map_err(|e| e.to_string())?;
+        tokio::fs::write(file_path, content)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 }
@@ -58,9 +63,7 @@ impl SetCollection for JsonSet {
     }
 
     async fn remove(&self, key: &str) -> Result<bool, String> {
-        let ret = {
-            self.set.write().unwrap().remove(key)
-        };
+        let ret = { self.set.write().unwrap().remove(key) };
         if ret {
             self.save().await?;
         }
@@ -72,9 +75,7 @@ impl SetCollection for JsonSet {
     }
 
     async fn traverse(&self, callback: SetCollectionTraverseCallBackRef) -> Result<(), String> {
-        let set = {
-            self.set.read().unwrap().clone()
-        };
+        let set = { self.set.read().unwrap().clone() };
         for item in set {
             callback.call(item.as_str()).await?;
         }
@@ -84,8 +85,8 @@ impl SetCollection for JsonSet {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
     use super::*;
+    use std::io::Write;
 
     #[tokio::test]
     async fn test_new_json_set() {

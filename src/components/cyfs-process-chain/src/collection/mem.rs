@@ -1,7 +1,7 @@
 use super::coll::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::RwLock as AsyncRwLock;
 
 pub struct TraverseGuard<'a> {
@@ -772,17 +772,21 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(list
-            .contains_all_strings(&["a".to_string(), "c".to_string()])
-            .await
-            .unwrap());
-        assert!(!list
-            .contains_all_strings(&["a".to_string(), "x".to_string()])
-            .await
-            .unwrap());
-        assert!(list
-            .contains_all_strings(&["a".to_string(), "a".to_string()])
-            .await
-            .unwrap());
+        assert!(
+            list.contains_all_strings(&["a".to_string(), "c".to_string()])
+                .await
+                .unwrap()
+        );
+        assert!(
+            !list
+                .contains_all_strings(&["a".to_string(), "x".to_string()])
+                .await
+                .unwrap()
+        );
+        assert!(
+            list.contains_all_strings(&["a".to_string(), "a".to_string()])
+                .await
+                .unwrap()
+        );
     }
 }

@@ -56,6 +56,7 @@
 #   json_map_example:
 #     type: json_map
 #     file_path: ./map.json
+#     only_read_file: true        # 可选。启用后 gateway 每次读取都直接访问文件，并禁用内部写入
 #   sqlite_map_example:
 #     type: sqlite_map
 #     file_path: ./map.db

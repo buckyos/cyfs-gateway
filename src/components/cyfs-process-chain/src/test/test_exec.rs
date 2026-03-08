@@ -130,7 +130,11 @@ async fn test_exec() -> Result<(), String> {
         let ret = exec.execute_lib("test_lib1").await.unwrap();
         info!("Hook point execution result: {:?}", ret);
         let value = ret.value();
-        assert!(value == "test_lib2:chain4:block8", "Expected value from execution is 'test_lib2:chain4:block8', got: {:?}", value);
+        assert!(
+            value == "test_lib2:chain4:block8",
+            "Expected value from execution is 'test_lib2:chain4:block8', got: {:?}",
+            value
+        );
 
         // Get all output into string from the pipe
         let output = hook_point_env.pipe().stdout.clone_string();
@@ -143,7 +147,11 @@ async fn test_exec() -> Result<(), String> {
         let ret = exec.execute_lib("test_return").await.unwrap();
         info!("Hook point execution result: {:?}", ret);
         let value = ret.value();
-        assert!(value == "test_lib3:chain6:block13", "Expected value from execution is 'test_lib3:chain6:block13', got: {:?}", value);
+        assert!(
+            value == "test_lib3:chain6:block13",
+            "Expected value from execution is 'test_lib3:chain6:block13', got: {:?}",
+            value
+        );
 
         // Get all output into string from the pipe
         let output = hook_point_env.pipe().stdout.clone_string();

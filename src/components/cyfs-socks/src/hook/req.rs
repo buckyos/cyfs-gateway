@@ -425,7 +425,9 @@ impl MapCollection for SocksRequestMap {
         callback.call("inbound", &self.inbound_addr_value()).await?;
         callback.call("target", &self.target_addr_value()).await?;
         callback.call("source_ip", &self.source_ip_value()).await?;
-        callback.call("source_port", &self.source_port_value()).await?;
+        callback
+            .call("source_port", &self.source_port_value())
+            .await?;
 
         Ok(())
     }

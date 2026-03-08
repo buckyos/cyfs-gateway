@@ -28,13 +28,13 @@ Examples:
     forward rtcp://remote_server/path
     forward tcp:///127.0.0.1:80 tcp:///127.0.0.1:81
     forward ip_hash tcp:///127.0.0.1:80,weight=3 tcp:///127.0.0.1:81,weight=1
-                "#
+                "#,
             )
             .arg(
                 Arg::new("dest_urls")
                     .help("Destination URLs, format: <url> or <url>,weight=<N>")
                     .required(true)
-                    .num_args(1..)
+                    .num_args(1..),
             );
         Self {
             name: "forward".to_string(),
@@ -178,7 +178,9 @@ Examples:
             "ip_hash" => {
                 let ip = Self::extract_source_ip(context).await;
                 if ip.is_none() {
-                    return Err("ip_hash requires source ip, but request has no client ip".to_string());
+                    return Err(
+                        "ip_hash requires source ip, but request has no client ip".to_string()
+                    );
                 }
 
                 let total_weight = upstreams.iter().try_fold(0usize, |acc, node| {
@@ -217,7 +219,8 @@ impl ExternalCommand for Forward {
     }
 
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        let matches = self.cmd
+        let matches = self
+            .cmd
             .clone()
             .try_get_matches_from(args.as_str_list())
             .map_err(|e| {
@@ -241,7 +244,12 @@ impl ExternalCommand for Forward {
         Ok(())
     }
 
-    async fn exec(&self, context: &Context, args: &[CollectionValue], _origin_args: &CommandArgs) -> Result<CommandResult, String> {
+    async fn exec(
+        &self,
+        context: &Context,
+        args: &[CollectionValue],
+        _origin_args: &CommandArgs,
+    ) -> Result<CommandResult, String> {
         let mut str_args = Vec::with_capacity(args.len());
         for arg in args.iter() {
             if !arg.is_string() {
@@ -252,7 +260,8 @@ impl ExternalCommand for Forward {
             str_args.push(arg.as_str().unwrap());
         }
 
-        let matches = self.cmd
+        let matches = self
+            .cmd
             .clone()
             .try_get_matches_from(&str_args)
             .map_err(|e| {
@@ -273,7 +282,8 @@ impl ExternalCommand for Forward {
             upstream_specs[0].clone()
         } else {
             let upstreams = Self::parse_upstreams(upstream_specs)?;
-            self.select_upstream(context, algo.as_str(), upstreams.as_slice()).await?
+            self.select_upstream(context, algo.as_str(), upstreams.as_slice())
+                .await?
         };
 
         Ok(CommandResult::return_with_string(

@@ -71,7 +71,9 @@ impl ProxyProtocolProbe {
     }
 }
 
-fn parse_proxy_protocol(data: &[u8]) -> Option<(usize, ProxyVersion, Option<SocketAddr>, Option<SocketAddr>)> {
+fn parse_proxy_protocol(
+    data: &[u8],
+) -> Option<(usize, ProxyVersion, Option<SocketAddr>, Option<SocketAddr>)> {
     if let Some(parsed) = parse_proxy_v2(data) {
         return Some(parsed);
     }
@@ -79,7 +81,9 @@ fn parse_proxy_protocol(data: &[u8]) -> Option<(usize, ProxyVersion, Option<Sock
     parse_proxy_v1(data)
 }
 
-fn parse_proxy_v1(data: &[u8]) -> Option<(usize, ProxyVersion, Option<SocketAddr>, Option<SocketAddr>)> {
+fn parse_proxy_v1(
+    data: &[u8],
+) -> Option<(usize, ProxyVersion, Option<SocketAddr>, Option<SocketAddr>)> {
     if !data.starts_with(b"PROXY ") {
         return None;
     }
@@ -112,7 +116,9 @@ fn parse_proxy_v1(data: &[u8]) -> Option<(usize, ProxyVersion, Option<SocketAddr
     ))
 }
 
-fn parse_proxy_v2(data: &[u8]) -> Option<(usize, ProxyVersion, Option<SocketAddr>, Option<SocketAddr>)> {
+fn parse_proxy_v2(
+    data: &[u8],
+) -> Option<(usize, ProxyVersion, Option<SocketAddr>, Option<SocketAddr>)> {
     const SIG: [u8; 12] = [
         0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
     ];

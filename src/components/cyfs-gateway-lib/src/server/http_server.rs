@@ -1,25 +1,33 @@
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use super::http_compression::{
+    CompressionRequestInfo, HttpCompressionSettings, apply_request_decompression,
+    apply_response_compression,
+};
+use super::{into_server_err, server_err};
+use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
+use crate::tunnel_connector::TunnelConnector;
+use crate::{
+    GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpResponseHeaderMap, HttpServer,
+    JsExternalsManagerRef, ProcessChainConfigs, Server, ServerConfig, ServerContext,
+    ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef,
+    ServerResult, StreamInfo, TunnelManager, get_external_commands,
+};
+use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
 use http::Version;
-use http_body_util::combinators::{BoxBody};
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes};
-use hyper::{http, StatusCode, Request};
+use hyper::body::Bytes;
+use hyper::{Request, StatusCode, http};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use regex::Regex;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
-use regex::Regex;
-use crate::{get_external_commands, GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef, ProcessChainConfigs, Server, ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager};
-use crate::global_process_chains::{create_process_chain_executor, GlobalProcessChainsRef};
-use super::{server_err,into_server_err};
-use super::http_compression::{apply_request_decompression, apply_response_compression, CompressionRequestInfo, HttpCompressionSettings};
-use crate::tunnel_connector::TunnelConnector;
 use url::Url;
 
 pub struct ProcessChainHttpServerBuilder {
@@ -83,7 +91,10 @@ impl ProcessChainHttpServerBuilder {
         self
     }
 
-    pub fn global_collection_manager(mut self, global_collection_manager: GlobalCollectionManagerRef) -> Self {
+    pub fn global_collection_manager(
+        mut self,
+        global_collection_manager: GlobalCollectionManagerRef,
+    ) -> Self {
         self.global_collection_manager = Some(global_collection_manager);
         self
     }
@@ -103,7 +114,11 @@ impl ProcessChainHttpServerBuilder {
         let gzip_http_version = parse_gzip_http_version(&config.gzip_http_version)?;
         let gzip_disable = match config.gzip_disable.as_ref() {
             Some(expr) => Some(Regex::new(expr).map_err(|e| {
-                server_err!(ServerErrorCode::InvalidConfig, "invalid gzip_disable regex: {}", e)
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "invalid gzip_disable regex: {}",
+                    e
+                )
             })?),
             None => None,
         };
@@ -211,35 +226,48 @@ impl ProcessChainHttpServer {
         }
     }
 
-    async fn create_server(builder: ProcessChainHttpServerBuilder) -> ServerResult<ProcessChainHttpServer> {
+    async fn create_server(
+        builder: ProcessChainHttpServerBuilder,
+    ) -> ServerResult<ProcessChainHttpServer> {
         if builder.id.is_none() {
             return Err(server_err!(ServerErrorCode::InvalidConfig, "id is none"));
         }
 
         if builder.hook_point.is_none() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "hook_point is none"));
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "hook_point is none"
+            ));
         }
 
-        let server_mgr = builder
-            .server_mgr
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "server_mgr is none"))?;
-        let server_mgr_ref = server_mgr
-            .upgrade()
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "server_mgr is unavailable"))?;
+        let server_mgr = builder.server_mgr.ok_or(server_err!(
+            ServerErrorCode::InvalidConfig,
+            "server_mgr is none"
+        ))?;
+        let server_mgr_ref = server_mgr.upgrade().ok_or(server_err!(
+            ServerErrorCode::InvalidConfig,
+            "server_mgr is unavailable"
+        ))?;
 
         if builder.tunnel_manager.is_none() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "tunnel_manager is none"));
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "tunnel_manager is none"
+            ));
         }
 
         let version: http::Version = match builder.version {
-            Some(ref version) => {
-                match version.as_str() {
-                    "HTTP/0.9" => http::Version::HTTP_09,
-                    "HTTP/1.0" => http::Version::HTTP_10,
-                    "HTTP/1.1" => http::Version::HTTP_11,
-                    "HTTP/2" => http::Version::HTTP_2,
-                    "HTTP/3" => http::Version::HTTP_3,
-                    _ => return Err(server_err!(ServerErrorCode::InvalidConfig, "invalid http version")),
+            Some(ref version) => match version.as_str() {
+                "HTTP/0.9" => http::Version::HTTP_09,
+                "HTTP/1.0" => http::Version::HTTP_10,
+                "HTTP/1.1" => http::Version::HTTP_11,
+                "HTTP/2" => http::Version::HTTP_2,
+                "HTTP/3" => http::Version::HTTP_3,
+                _ => {
+                    return Err(server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "invalid http version"
+                    ));
                 }
             },
             None => http::Version::HTTP_11,
@@ -283,7 +311,11 @@ impl ProcessChainHttpServer {
         })
     }
 
-    async fn handle_forward_upstream(&self, req: http::Request<BoxBody<Bytes, ServerError>>, target_url: &str) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    async fn handle_forward_upstream(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+        target_url: &str,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let org_url = req.uri().to_string();
         // Trim URL boundary slashes so we don't end up with "//" when target_url ends with '/'
         // and org_url starts with '/'.
@@ -310,24 +342,40 @@ impl ProcessChainHttpServer {
                     Client::builder(TokioExecutor::new()).build_http();
                 let header = req.headers().clone();
                 let method = req.method().clone();
-                let body = req.into_body().map_err(|e| {
-                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                }).boxed();
+                let body = req
+                    .into_body()
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                    .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
                     .uri(request_url.as_str())
-                    .body(body).map_err(|e| {
-                    server_err!(ServerErrorCode::InvalidConfig, "Failed to build request: {}", e)
-                })?;
+                    .body(body)
+                    .map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "Failed to build request: {}",
+                            e
+                        )
+                    })?;
 
                 *upstream_req.headers_mut() = header;
 
                 let resp = client.request(upstream_req).await.map_err(|e| {
-                    server_err!(ServerErrorCode::InvalidConfig, "Failed to request upstream {}: {}", request_url, e)
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Failed to request upstream {}: {}",
+                        request_url,
+                        e
+                    )
                 })?;
-                let resp = resp.map(|body| body.map_err(|e| ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))).boxed());
+                let resp = resp.map(|body| {
+                    body.map_err(|e| {
+                        ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
+                    })
+                    .boxed()
+                });
                 Ok(resp)
-            },
+            }
             "https" => {
                 let header = req.headers().clone();
                 let method = req.method().clone();
@@ -353,7 +401,10 @@ impl ProcessChainHttpServer {
                 })?;
 
                 let sni_host = {
-                    let host = header.get("host").and_then(|h| h.to_str().ok()).map(|h| h.trim());
+                    let host = header
+                        .get("host")
+                        .and_then(|h| h.to_str().ok())
+                        .map(|h| h.trim());
                     let parsed = host.and_then(|h| {
                         if h.is_empty() {
                             return None;
@@ -365,7 +416,8 @@ impl ProcessChainHttpServer {
                         Some(h.split(':').next().unwrap_or(h).to_string())
                     });
                     parsed.or_else(|| request_url.host_str().map(|h| h.to_string()))
-                }.ok_or_else(|| {
+                }
+                .ok_or_else(|| {
                     server_err!(
                         ServerErrorCode::InvalidConfig,
                         "Missing SNI host for upstream: {}",
@@ -388,11 +440,13 @@ impl ProcessChainHttpServer {
                 let tls_config = ClientConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),
                 ))
-                    .with_safe_default_protocol_versions()
-                    .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "Invalid tls config: {}", e))?
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(NoCertificateVerifier))
-                    .with_no_client_auth();
+                .with_safe_default_protocol_versions()
+                .map_err(|e| {
+                    server_err!(ServerErrorCode::InvalidConfig, "Invalid tls config: {}", e)
+                })?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertificateVerifier))
+                .with_no_client_auth();
                 let tls_connector = TlsConnector::from(Arc::new(tls_config));
                 let server_name = ServerName::try_from(sni_host.clone()).map_err(|e| {
                     server_err!(
@@ -402,35 +456,40 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
-                let tls_stream = tls_connector.connect(server_name, tcp_stream).await.map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "Failed tls handshake with upstream {} via {}:{}: {}",
-                        sni_host,
-                        connect_host,
-                        connect_port,
-                        e
-                    )
-                })?;
-
-                let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
+                let tls_stream = tls_connector
+                    .connect(server_name, tcp_stream)
                     .await
                     .map_err(|e| {
                         server_err!(
-                            ServerErrorCode::StreamError,
-                            "Failed to build https client connection: {}",
+                            ServerErrorCode::InvalidConfig,
+                            "Failed tls handshake with upstream {} via {}:{}: {}",
+                            sni_host,
+                            connect_host,
+                            connect_port,
                             e
                         )
                     })?;
+
+                let (mut sender, conn) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
+                        .await
+                        .map_err(|e| {
+                            server_err!(
+                                ServerErrorCode::StreamError,
+                                "Failed to build https client connection: {}",
+                                e
+                            )
+                        })?;
                 tokio::spawn(async move {
                     if let Err(e) = conn.await {
                         debug!("https upstream connection closed with error: {}", e);
                     }
                 });
 
-                let body = req.into_body().map_err(|e| {
-                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                }).boxed();
+                let body = req
+                    .into_body()
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                    .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
                     .uri(org_url)
@@ -455,43 +514,64 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
-                let resp = resp.map(|body| body.map_err(|e| ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))).boxed());
+                let resp = resp.map(|body| {
+                    body.map_err(|e| {
+                        ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
+                    })
+                    .boxed()
+                });
                 Ok(resp)
-            },
+            }
             _ => {
                 let tunnel_connector = TunnelConnector {
                     target_stream_url: target_url.to_string(),
                     tunnel_manager: self.tunnel_manager.clone(),
                 };
 
-
-                let client: Client<TunnelConnector, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>> = Client::builder(TokioExecutor::new())
-                    .build(tunnel_connector);
+                let client: Client<
+                    TunnelConnector,
+                    BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>,
+                > = Client::builder(TokioExecutor::new()).build(tunnel_connector);
 
                 let header = req.headers().clone();
                 let mut host_name = "localhost".to_string();
-                let hname =  req.headers().get("host");
+                let hname = req.headers().get("host");
                 if hname.is_some() {
                     host_name = hname.unwrap().to_str().unwrap().to_string();
                 }
                 let fake_url = format!("http://{}{}", host_name, org_url);
                 let method = req.method().clone();
-                let body = req.into_body().map_err(|e| {
-                    Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                }).boxed();
+                let body = req
+                    .into_body()
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                    .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
                     .uri(fake_url)
-                    .body(body).map_err(|e| {
-                        server_err!(ServerErrorCode::BadRequest, "Failed to build upstream_req: {}", e)
-                    })?;
+                    .body(body)
+                    .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::BadRequest,
+                        "Failed to build upstream_req: {}",
+                        e
+                    )
+                })?;
 
                 *upstream_req.headers_mut() = header;
                 let resp = client.request(upstream_req).await.map_err(|e| {
-                    server_err!(ServerErrorCode::TunnelError, "Failed to request upstream: {}", e)
+                    server_err!(
+                        ServerErrorCode::TunnelError,
+                        "Failed to request upstream: {}",
+                        e
+                    )
                 })?;
-                let resp = resp.map(|body| body.map_err(|e| ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))).boxed());
-                return Ok(resp)
+                let resp = resp.map(|body| {
+                    body.map_err(|e| {
+                        ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
+                    })
+                    .boxed()
+                });
+                return Ok(resp);
             }
         }
     }
@@ -500,10 +580,20 @@ impl ProcessChainHttpServer {
         let status_code = match status {
             Some(status) => {
                 let code = status.parse::<u16>().map_err(|e| {
-                    server_err!(ServerErrorCode::InvalidConfig, "invalid redirect status code: {}, {}", status, e)
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "invalid redirect status code: {}, {}",
+                        status,
+                        e
+                    )
                 })?;
                 StatusCode::from_u16(code).map_err(|e| {
-                    server_err!(ServerErrorCode::InvalidConfig, "invalid redirect status code: {}, {}", code, e)
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "invalid redirect status code: {}, {}",
+                        code,
+                        e
+                    )
                 })?
             }
             None => StatusCode::FOUND,
@@ -577,7 +667,11 @@ impl ProcessChainHttpServer {
         let response = http::Response::builder()
             .status(status)
             .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(Full::new(Bytes::from(body.to_string())).map_err(|e| match e {}).boxed())
+            .body(
+                Full::new(Bytes::from(body.to_string()))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            )
             .map_err(|e| {
                 server_err!(
                     ServerErrorCode::BadRequest,
@@ -746,7 +840,11 @@ impl ProcessChainHttpServer {
 
 #[async_trait::async_trait]
 impl HttpServer for ProcessChainHttpServer {
-    async fn serve_request(&self, req: http::Request<BoxBody<Bytes, ServerError>>, info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    async fn serve_request(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+        info: StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let req_info = CompressionRequestInfo::from_request(&req);
         let req = match apply_request_decompression(req, &self.compression) {
             Ok(req) => req,
@@ -773,15 +871,9 @@ impl HttpServer for ProcessChainHttpServer {
             .unwrap_or("none")
             .to_string();
         let req_uri = req.uri().to_string();
-        let req_remote = info
-            .src_addr
-            .as_deref()
-            .unwrap_or("unknown")
-            .to_string();
+        let req_remote = info.src_addr.as_deref().unwrap_or("unknown").to_string();
 
-        let executor = {
-            self.executor.lock().unwrap().fork()
-        };
+        let executor = { self.executor.lock().unwrap().fork() };
 
         let req_map = HttpRequestHeaderMap::new(req);
         let global_env = executor.global_env();
@@ -884,9 +976,15 @@ impl HttpServer for ProcessChainHttpServer {
                 .await
                 .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
         }
-        req_map.register_visitors(&global_env).await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+        req_map
+            .register_visitors(&global_env)
+            .await
+            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
-        let ret = executor.execute_lib().await.map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+        let ret = executor
+            .execute_lib()
+            .await
+            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
 
         if ret.is_control() {
             if ret.is_drop() {
@@ -902,13 +1000,10 @@ impl HttpServer for ProcessChainHttpServer {
             } else if ret.is_reject() {
                 debug!(
                     "process_chain_reject server={} remote={} method={} host={} uri={}",
-                    self.id,
-                    req_remote,
-                    req_method,
-                    req_host,
-                    req_uri,
+                    self.id, req_remote, req_method, req_host, req_uri,
                 );
-                let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
+                let mut response =
+                    http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 return self
                     .apply_post_chain_result(Ok(response), &req_info, Some(&info))
@@ -917,12 +1012,7 @@ impl HttpServer for ProcessChainHttpServer {
             if let Some(CommandControl::Error(ret)) = ret.as_control() {
                 debug!(
                     "process_chain_error server={} remote={} method={} host={} uri={} message={}",
-                    self.id,
-                    req_remote,
-                    req_method,
-                    req_host,
-                    req_uri,
-                    ret.value,
+                    self.id, req_remote, req_method, req_host, req_uri, ret.value,
                 );
                 let mut response = http::Response::new(
                     Full::new(Bytes::from(ret.value.to_string()))
@@ -938,8 +1028,13 @@ impl HttpServer for ProcessChainHttpServer {
                 let value = if let CollectionValue::String(value) = &(ret.value) {
                     value
                 } else {
-                    log::error!("process chain return is not string: {}", ret.value.get_type());
-                    let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
+                    log::error!(
+                        "process chain return is not string: {}",
+                        ret.value.get_type()
+                    );
+                    let mut response = http::Response::new(
+                        Full::new(Bytes::new()).map_err(|e| match e {}).boxed(),
+                    );
                     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                     return self
                         .apply_post_chain_result(Ok(response), &req_info, Some(&info))
@@ -948,7 +1043,9 @@ impl HttpServer for ProcessChainHttpServer {
                 if let Some(list) = shlex::split(value.as_str()) {
                     if list.is_empty() {
                         log::error!("process chain return is empty");
-                        let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
+                        let mut response = http::Response::new(
+                            Full::new(Bytes::new()).map_err(|e| match e {}).boxed(),
+                        );
                         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                         return self
                             .apply_post_chain_result(Ok(response), &req_info, Some(&info))
@@ -966,18 +1063,21 @@ impl HttpServer for ProcessChainHttpServer {
                             }
 
                             let server_id = list[1].as_str();
-                            let post_req= req_map.into_request()
-                                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                            let post_req = req_map.into_request().map_err(|e| {
+                                server_err!(ServerErrorCode::ProcessChainError, "{}", e)
+                            })?;
 
                             if let Some(server_mgr) = self.server_mgr.upgrade() {
                                 if let Some(service) = server_mgr.get_http_server(server_id) {
                                     let resp = service.serve_request(post_req, info.clone()).await;
-                                    return self.apply_post_chain_result(resp, &req_info, Some(&info)).await;
+                                    return self
+                                        .apply_post_chain_result(resp, &req_info, Some(&info))
+                                        .await;
                                 }
                             } else {
                                 log::error!("server manager is unavailable");
                             }
-                        },
+                        }
                         "forward" => {
                             if list.len() < 2 {
                                 return Err(server_err!(
@@ -986,11 +1086,14 @@ impl HttpServer for ProcessChainHttpServer {
                                 ));
                             }
                             let target_url = list[1].as_str();
-                            let post_req= req_map.into_request()
-                                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
+                            let post_req = req_map.into_request().map_err(|e| {
+                                server_err!(ServerErrorCode::ProcessChainError, "{}", e)
+                            })?;
                             let resp = self.handle_forward_upstream(post_req, target_url).await;
-                            return self.apply_post_chain_result(resp, &req_info, Some(&info)).await;
-                        },
+                            return self
+                                .apply_post_chain_result(resp, &req_info, Some(&info))
+                                .await;
+                        }
                         "redirect" => {
                             if list.len() < 2 || list.len() > 3 {
                                 return Err(server_err!(
@@ -1006,14 +1109,13 @@ impl HttpServer for ProcessChainHttpServer {
                                     "invalid redirect command"
                                 ));
                             }
-                            let status = Self::parse_redirect_status_code(
-                                list.get(2).map(|v| v.as_str()),
-                            )?;
+                            let status =
+                                Self::parse_redirect_status_code(list.get(2).map(|v| v.as_str()))?;
                             let resp = self.build_redirect_response(location, status)?;
                             return self
                                 .apply_post_chain_result(Ok(resp), &req_info, Some(&info))
                                 .await;
-                        },
+                        }
                         "error" => {
                             if list.len() < 2 || list.len() > 3 {
                                 return Err(server_err!(
@@ -1043,9 +1145,11 @@ impl HttpServer for ProcessChainHttpServer {
                 ret.value(),
             );
         }
-        let mut response = http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
+        let mut response =
+            http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        self.apply_post_chain_result(Ok(response), &req_info, Some(&info)).await
+        self.apply_post_chain_result(Ok(response), &req_info, Some(&info))
+            .await
     }
 
     fn id(&self) -> String {
@@ -1211,8 +1315,13 @@ impl ServerFactory for ProcessChainHttpServerFactory {
         config: Arc<dyn ServerConfig>,
         context: Option<ServerContextRef>,
     ) -> ServerResult<Vec<Server>> {
-        let config = config.as_any().downcast_ref::<ProcessChainHttpServerConfig>()
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid process chain http server config"))?;
+        let config = config
+            .as_any()
+            .downcast_ref::<ProcessChainHttpServerConfig>()
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid process chain http server config"
+            ))?;
 
         let context = context.ok_or(server_err!(
             ServerErrorCode::InvalidConfig,
@@ -1253,12 +1362,15 @@ impl ServerFactory for ProcessChainHttpServerFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        GlobalCollectionManager, GlobalProcessChains, JsExternalsManager, ServerManager,
+        StreamInfo, hyper_serve_http, hyper_serve_http1,
+    };
     use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, GzipEncoder};
-    use std::io::Cursor;
-    use std::sync::Arc;
     use buckyos_kit::init_logging;
     use hyper_util::rt::{TokioExecutor, TokioIo};
-    use crate::{GlobalCollectionManager, GlobalProcessChains, JsExternalsManager, ServerManager, StreamInfo, hyper_serve_http, hyper_serve_http1};
+    use std::io::Cursor;
+    use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
     struct FixedResponseServer {
@@ -1287,7 +1399,13 @@ mod tests {
             }
             let response = builder
                 .body(Full::new(body).map_err(|e| match e {}).boxed())
-                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?;
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::BadRequest,
+                        "Failed to build response: {}",
+                        e
+                    )
+                })?;
             Ok(response)
         }
 
@@ -1326,7 +1444,13 @@ mod tests {
                 .header("Content-Type", "application/octet-stream")
                 .header("Content-Length", len)
                 .body(Full::new(body_bytes).map_err(|e| match e {}).boxed())
-                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?;
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::BadRequest,
+                        "Failed to build response: {}",
+                        e
+                    )
+                })?;
             Ok(response)
         }
 
@@ -2020,7 +2144,9 @@ mod tests {
         let mock_server_mgr = Arc::new(ServerManager::new());
 
         let result = ProcessChainHttpServer::builder()
-            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .build()
+            .await;
         if let Err(e) = result {
             assert_eq!(e.code(), ServerErrorCode::InvalidConfig);
         }
@@ -2028,8 +2154,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_server_without_inner_services() {
-        let builder = ProcessChainHttpServer::builder()
-            .hook_point(vec![]);
+        let builder = ProcessChainHttpServer::builder().hook_point(vec![]);
         let result = ProcessChainHttpServer::create_server(builder).await;
         assert!(result.is_err());
         if let Err(e) = result {
@@ -2044,7 +2169,9 @@ mod tests {
         let result = ProcessChainHttpServer::builder()
             .version("HTTP/1.2".to_string())
             .hook_point(vec![])
-            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .build()
+            .await;
 
         assert!(result.is_err());
         if let Err(e) = result {
@@ -2061,7 +2188,9 @@ mod tests {
             .version("HTTP/1.1".to_string())
             .hook_point(vec![])
             .tunnel_manager(TunnelManager::new())
-            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .build()
+            .await;
 
         assert!(result.is_ok());
     }
@@ -2075,10 +2204,11 @@ mod tests {
             .version("HTTP/2".to_string())
             .hook_point(vec![])
             .tunnel_manager(TunnelManager::new())
-            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .build()
+            .await;
         assert!(result.is_ok());
     }
-
 
     #[tokio::test]
     async fn test_handle_http1_request_http1_server() {
@@ -2099,7 +2229,9 @@ mod tests {
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
             .tunnel_manager(TunnelManager::new())
-            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .build()
+            .await;
 
         assert!(result.is_ok());
         let http_server = Arc::new(result.unwrap());
@@ -2107,7 +2239,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http1(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http1(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2116,7 +2250,10 @@ mod tests {
             .body(Full::new(Bytes::new()))
             .unwrap();
 
-        let (mut sender, conn) = hyper::client::conn::http1::Builder::new().handshake(TokioIo::new(client)).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
         tokio::spawn(async move {
             conn.await.unwrap();
         });
@@ -2164,7 +2301,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http1(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http1(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2173,7 +2312,10 @@ mod tests {
             .body(Full::new(Bytes::new()))
             .unwrap();
 
-        let (mut sender, conn) = hyper::client::conn::http1::Builder::new().handshake(TokioIo::new(client)).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
         tokio::spawn(async move {
             conn.await.unwrap();
         });
@@ -2201,7 +2343,9 @@ mod tests {
             .version("HTTP/2".to_string())
             .hook_point(chains)
             .tunnel_manager(TunnelManager::new())
-            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .build()
+            .await;
 
         assert!(result.is_ok());
         let http_server = Arc::new(result.unwrap());
@@ -2209,7 +2353,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2218,7 +2364,10 @@ mod tests {
             .body(Full::new(Bytes::new()))
             .unwrap();
 
-        let (mut sender, conn) = hyper::client::conn::http1::Builder::new().handshake(TokioIo::new(client)).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
         tokio::spawn(async move {
             conn.await.unwrap();
         });
@@ -2246,7 +2395,9 @@ mod tests {
             .version("HTTP/2".to_string())
             .hook_point(chains)
             .tunnel_manager(TunnelManager::new())
-            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .build()
+            .await;
 
         assert!(result.is_ok());
         let http_server = Arc::new(result.unwrap());
@@ -2254,7 +2405,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2264,7 +2417,10 @@ mod tests {
             .body(Full::new(Bytes::new()))
             .unwrap();
 
-        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new()).handshake(TokioIo::new(client)).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
         tokio::spawn(async move {
             conn.await.unwrap();
         });
@@ -2292,7 +2448,9 @@ mod tests {
             .version("HTTP/1.1".to_string())
             .hook_point(chains)
             .tunnel_manager(TunnelManager::new())
-            .server_mgr(Arc::downgrade(&mock_server_mgr)).build().await;
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .build()
+            .await;
 
         assert!(result.is_ok());
         let http_server = Arc::new(result.unwrap());
@@ -2311,7 +2469,10 @@ mod tests {
             .body(Full::new(Bytes::new()))
             .unwrap();
 
-        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new()).handshake(TokioIo::new(client)).await.unwrap();
+        let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
         tokio::spawn(async move {
             let ret = conn.await;
             assert!(ret.is_err());
@@ -2331,18 +2492,34 @@ mod tests {
 
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
-                let service = hyper::service::service_fn(|req: http::Request<hyper::body::Incoming>| async move {
-                    println!("{:?}", req.headers());
-                    assert!(req.headers().get("X-Real-IP").is_some());
-                    assert_eq!(req.headers().get("X-Real-IP").map(|v| v.to_str().unwrap()), Some("127.0.0.1"));
-                    assert!(req.headers().get("X-Real-Port").is_some());
-                    assert_eq!(req.headers().get("X-Real-Port").map(|v| v.to_str().unwrap()), Some("344"));
-                    let _ = req.collect().await; // 娑堣垂璇锋眰浣�
-                    Ok::<_, ServerError>(http::Response::builder()
-                        .status(StatusCode::OK)
-                        .body(Full::new(Bytes::from("forward success")).map_err(|e| match e {}).boxed())
-                        .unwrap())
-                });
+                let service = hyper::service::service_fn(
+                    |req: http::Request<hyper::body::Incoming>| async move {
+                        println!("{:?}", req.headers());
+                        assert!(req.headers().get("X-Real-IP").is_some());
+                        assert_eq!(
+                            req.headers().get("X-Real-IP").map(|v| v.to_str().unwrap()),
+                            Some("127.0.0.1")
+                        );
+                        assert!(req.headers().get("X-Real-Port").is_some());
+                        assert_eq!(
+                            req.headers()
+                                .get("X-Real-Port")
+                                .map(|v| v.to_str().unwrap()),
+                            Some("344")
+                        );
+                        let _ = req.collect().await; // 娑堣垂璇锋眰浣�
+                        Ok::<_, ServerError>(
+                            http::Response::builder()
+                                .status(StatusCode::OK)
+                                .body(
+                                    Full::new(Bytes::from("forward success"))
+                                        .map_err(|e| match e {})
+                                        .boxed(),
+                                )
+                                .unwrap(),
+                        )
+                    },
+                );
 
                 tokio::spawn(async move {
                     let _ = hyper::server::conn::http1::Builder::new()
@@ -2382,15 +2559,21 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo {
-                src_addr: Some("127.0.0.1:344".to_string()),
-                dst_addr: None,
-                conn_src_addr: Some("127.0.0.1:344".to_string()),
-                real_src_addr: None,
-                source_mac: None,
-                source_hostname: None,
-                source_online_secs: None,
-            }).await.unwrap();
+            hyper_serve_http(
+                Box::new(server),
+                http_server,
+                StreamInfo {
+                    src_addr: Some("127.0.0.1:344".to_string()),
+                    dst_addr: None,
+                    conn_src_addr: Some("127.0.0.1:344".to_string()),
+                    real_src_addr: None,
+                    source_mac: None,
+                    source_hostname: None,
+                    source_online_secs: None,
+                },
+            )
+            .await
+            .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2425,14 +2608,22 @@ mod tests {
 
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
-                let service = hyper::service::service_fn(|req: http::Request<hyper::body::Incoming>| async move {
-                    println!("{:?}", req.headers());
-                    let _ = req.collect().await; // 娑堣垂璇锋眰浣�
-                    Ok::<_, ServerError>(http::Response::builder()
-                        .status(StatusCode::OK)
-                        .body(Full::new(Bytes::from("forward success")).map_err(|e| match e {}).boxed())
-                        .unwrap())
-                });
+                let service = hyper::service::service_fn(
+                    |req: http::Request<hyper::body::Incoming>| async move {
+                        println!("{:?}", req.headers());
+                        let _ = req.collect().await; // 娑堣垂璇锋眰浣�
+                        Ok::<_, ServerError>(
+                            http::Response::builder()
+                                .status(StatusCode::OK)
+                                .body(
+                                    Full::new(Bytes::from("forward success"))
+                                        .map_err(|e| match e {})
+                                        .boxed(),
+                                )
+                                .unwrap(),
+                        )
+                    },
+                );
 
                 tokio::spawn(async move {
                     let _ = hyper::server::conn::http1::Builder::new()
@@ -2472,7 +2663,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2527,7 +2720,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2579,7 +2774,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2600,7 +2797,9 @@ mod tests {
         let resp = sender.send_request(request).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FOUND);
         assert_eq!(
-            resp.headers().get(http::header::LOCATION).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(http::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
             Some("https://example.com/path")
         );
     }
@@ -2634,7 +2833,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2655,7 +2856,9 @@ mod tests {
         let resp = sender.send_request(request).await.unwrap();
         assert_eq!(resp.status(), StatusCode::MOVED_PERMANENTLY);
         assert_eq!(
-            resp.headers().get(http::header::LOCATION).and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get(http::header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
             Some("https://example.com/permanent")
         );
     }
@@ -2689,7 +2892,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2740,7 +2945,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2791,7 +2998,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2844,7 +3053,9 @@ mod tests {
         let (client, server) = tokio::io::duplex(128);
 
         tokio::spawn(async move {
-            hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await.unwrap();
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
         });
 
         let request = http::Request::builder()
@@ -2897,7 +3108,9 @@ mod tests {
             GlobalCollectionManager::create(vec![]).await.unwrap(),
         );
         let factory = ProcessChainHttpServerFactory::new();
-        let result = factory.create(Arc::new(config), Some(Arc::new(context))).await;
+        let result = factory
+            .create(Arc::new(config), Some(Arc::new(context)))
+            .await;
         assert!(result.is_ok());
     }
 }

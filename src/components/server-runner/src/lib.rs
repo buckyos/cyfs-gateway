@@ -5,14 +5,14 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use buckyos_kit::AsyncStream;
 use cyfs_gateway_lib::{
-    hyper_serve_http, server_err, DirServer, HttpServer, ServerErrorCode, ServerResult, StreamInfo,
-    ServerError,
+    DirServer, HttpServer, ServerError, ServerErrorCode, ServerResult, StreamInfo,
+    hyper_serve_http, server_err,
 };
 
-use http_body_util::combinators::BoxBody;
 use http_body_util::BodyExt;
+use http_body_util::combinators::BoxBody;
 use hyper::body::Bytes;
-use log::{error, info,debug};
+use log::{debug, error, info};
 use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Clone)]
@@ -45,12 +45,12 @@ impl HttpServer for Router {
         let path = req.uri().path().to_string();
         let routes = self.routes.read().unwrap().clone();
         let src_addr = info.src_addr.as_deref().unwrap_or("unknown");
-        info!("{}=>{} {}",src_addr, req.method(), path);
+        info!("{}=>{} {}", src_addr, req.method(), path);
 
         for (prefix, server) in routes {
             debug!("try match router: {}", prefix);
             if path.starts_with(&prefix) {
-                debug!(" {} match router: {}",path, prefix);
+                debug!(" {} match router: {}", path, prefix);
                 // // Calculate new path by stripping prefix
                 // let new_path = if prefix == "/" {
                 //     path.clone()
@@ -62,7 +62,6 @@ impl HttpServer for Router {
                 //         p
                 //     }.to_string()
                 // };
-                
 
                 // // Rewrite URI
                 // let mut parts = req.uri().clone().into_parts();
@@ -77,7 +76,7 @@ impl HttpServer for Router {
                 //     None => http::uri::PathAndQuery::from_static("/"),
                 // };
                 // parts.path_and_query = Some(path_and_query);
-                
+
                 // if let Ok(uri) = Uri::from_parts(parts) {
                 //     *req.uri_mut() = uri;
                 // }
@@ -144,7 +143,11 @@ impl Runner {
     }
 
     /// Register a HttpServer instance with a route prefix.
-    pub fn add_http_server(&self, router_url: String, server: Arc<dyn HttpServer>) -> ServerResult<()> {
+    pub fn add_http_server(
+        &self,
+        router_url: String,
+        server: Arc<dyn HttpServer>,
+    ) -> ServerResult<()> {
         self.router.add_route(router_url, server);
         Ok(())
     }
@@ -277,7 +280,9 @@ mod tests {
     #[tokio::test]
     async fn can_add_multiple_servers() {
         let runner = Runner::new(0);
-        runner.add_http_server("/a".to_string(), Arc::new(DummyHttpServer("a".into()))).unwrap();
+        runner
+            .add_http_server("/a".to_string(), Arc::new(DummyHttpServer("a".into())))
+            .unwrap();
         let res = runner.add_http_server("/b".to_string(), Arc::new(DummyHttpServer("b".into())));
         assert!(res.is_ok());
     }
@@ -286,7 +291,9 @@ mod tests {
     async fn serves_basic_http_request() {
         let addr = random_loopback();
         let runner = Runner::with_addr(addr);
-        runner.add_http_server("/".to_string(), Arc::new(DummyHttpServer("root".into()))).unwrap();
+        runner
+            .add_http_server("/".to_string(), Arc::new(DummyHttpServer("root".into())))
+            .unwrap();
 
         let runner_handle = runner.clone();
         let server_task = tokio::spawn(async move {
@@ -310,17 +317,20 @@ mod tests {
         server_task.abort();
         let _ = server_task.await;
     }
-    
+
     #[tokio::test]
     async fn serves_dir_request() {
         let addr = random_loopback();
         let runner = Runner::with_addr(addr);
-        
+
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("test.txt");
         tokio::fs::write(&file_path, b"file-content").await.unwrap();
-        
-        runner.add_dir_handler("/static".to_string(), temp_dir.path().to_path_buf()).await.unwrap();
+
+        runner
+            .add_dir_handler("/static".to_string(), temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
 
         let runner_handle = runner.clone();
         let server_task = tokio::spawn(async move {
@@ -338,17 +348,21 @@ mod tests {
 
         let mut buf = vec![0u8; 1024];
         let mut text = String::new();
-        
+
         // Read response until body is found or connection closed
         loop {
-             let n = client.read(&mut buf).await.unwrap();
-             if n == 0 { break; }
-             text.push_str(&String::from_utf8_lossy(&buf[..n]));
-             if text.contains("file-content") {
-                 break;
-             }
-             // Safety limit
-             if text.len() > 4096 { break; }
+            let n = client.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            text.push_str(&String::from_utf8_lossy(&buf[..n]));
+            if text.contains("file-content") {
+                break;
+            }
+            // Safety limit
+            if text.len() > 4096 {
+                break;
+            }
         }
 
         assert!(text.contains("200 OK"), "{text}");

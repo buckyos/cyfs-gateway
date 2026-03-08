@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use cyfs_gateway_lib::{serve_http_by_rpc_handler, HttpServer, ServerError, ServerResult, StreamInfo};
+use cyfs_gateway_lib::{
+    HttpServer, ServerError, ServerResult, StreamInfo, serve_http_by_rpc_handler,
+};
 use http::{Method, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -19,10 +21,13 @@ impl SimpleHttpServer {
     }
 }
 
-
 #[async_trait]
 impl RPCHandler for SimpleHttpServer {
-    async fn handle_rpc_call(&self, req: RPCRequest, _client_ip: IpAddr) -> Result<RPCResponse, RPCErrors> {
+    async fn handle_rpc_call(
+        &self,
+        req: RPCRequest,
+        _client_ip: IpAddr,
+    ) -> Result<RPCResponse, RPCErrors> {
         info!("|==>recv kRPC req: {:?}", req);
         Ok(RPCResponse::create_by_req(
             RPCResult::Success(json!({ "ok": true })),
@@ -30,7 +35,6 @@ impl RPCHandler for SimpleHttpServer {
         ))
     }
 }
-
 
 #[async_trait]
 impl HttpServer for SimpleHttpServer {
@@ -56,7 +60,11 @@ impl HttpServer for SimpleHttpServer {
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain; charset=utf-8")
-            .body(Full::new(Bytes::from(body)).map_err(|never| match never {}).boxed())
+            .body(
+                Full::new(Bytes::from(body))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
             .map_err(|e| {
                 cyfs_gateway_lib::server_err!(
                     cyfs_gateway_lib::ServerErrorCode::EncodeError,

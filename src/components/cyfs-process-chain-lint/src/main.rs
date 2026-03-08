@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use cyfs_process_chain_lint::{default_known_vars, lint_file, Diagnostic, LintConfig, LintSeverity};
+use cyfs_process_chain_lint::{
+    Diagnostic, LintConfig, LintSeverity, default_known_vars, lint_file,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -115,11 +117,7 @@ fn run_check(args: CheckArgs) -> i32 {
         FailOn::Info => LintSeverity::Info.rank(),
     };
     let has_fail = all.iter().any(|d| d.severity.rank() >= threshold);
-    if has_fail {
-        2
-    } else {
-        0
-    }
+    if has_fail { 2 } else { 0 }
 }
 
 fn print_text(all: &[Diagnostic]) {

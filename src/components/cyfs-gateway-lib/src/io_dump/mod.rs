@@ -113,7 +113,12 @@ pub struct DumpStream<S> {
 }
 
 impl<S> DumpStream<S> {
-    pub fn new(inner: S, stack_config: IoDumpStackConfig, src_addr: String, dst_addr: String) -> Self {
+    pub fn new(
+        inner: S,
+        stack_config: IoDumpStackConfig,
+        src_addr: String,
+        dst_addr: String,
+    ) -> Self {
         Self {
             inner,
             session: Arc::new(Mutex::new(IoDumpSession::new(
@@ -171,7 +176,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for DumpStream<S> {
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
@@ -389,7 +397,8 @@ impl IoDumpSession {
             || looks_like_http_response(self.raw_download.as_slice())
         {
             self.mode = SessionMode::HttpByRequest;
-            self.upload_http_buf.extend_from_slice(self.raw_upload.as_slice());
+            self.upload_http_buf
+                .extend_from_slice(self.raw_upload.as_slice());
             self.download_http_buf
                 .extend_from_slice(self.raw_download.as_slice());
             self.raw_upload.clear();
@@ -404,7 +413,9 @@ impl IoDumpSession {
             return;
         }
 
-        if !maybe_http_request(self.raw_upload.as_slice()) && !maybe_http_response(self.raw_download.as_slice()) {
+        if !maybe_http_request(self.raw_upload.as_slice())
+            && !maybe_http_response(self.raw_download.as_slice())
+        {
             self.mode = SessionMode::RawPair;
         }
     }
@@ -418,10 +429,12 @@ impl IoDumpSession {
         }
 
         if !self.upload_http_buf.is_empty() {
-            self.pending_requests.push_back(std::mem::take(&mut self.upload_http_buf));
+            self.pending_requests
+                .push_back(std::mem::take(&mut self.upload_http_buf));
         }
         if !self.download_http_buf.is_empty() {
-            self.pending_responses.push_back(std::mem::take(&mut self.download_http_buf));
+            self.pending_responses
+                .push_back(std::mem::take(&mut self.download_http_buf));
         }
 
         self.try_emit_http_pairs();
@@ -569,8 +582,10 @@ pub fn decode_io_dump_frames(mut data: &[u8]) -> Result<Vec<DecodedIoDumpFrame>,
             Ok(part)
         }
 
-        let connect_timestamp_ms = u64::from_le_bytes(take(frame, &mut offset, 8)?.try_into().unwrap());
-        let write_timestamp_ms = u64::from_le_bytes(take(frame, &mut offset, 8)?.try_into().unwrap());
+        let connect_timestamp_ms =
+            u64::from_le_bytes(take(frame, &mut offset, 8)?.try_into().unwrap());
+        let write_timestamp_ms =
+            u64::from_le_bytes(take(frame, &mut offset, 8)?.try_into().unwrap());
 
         let src_len = u16::from_le_bytes(take(frame, &mut offset, 2)?.try_into().unwrap()) as usize;
         let src_ip = String::from_utf8(take(frame, &mut offset, src_len)?.to_vec())
@@ -580,10 +595,12 @@ pub fn decode_io_dump_frames(mut data: &[u8]) -> Result<Vec<DecodedIoDumpFrame>,
         let dst_ip = String::from_utf8(take(frame, &mut offset, dst_len)?.to_vec())
             .map_err(|_| "invalid dst ip utf8".to_string())?;
 
-        let upload_len = u32::from_le_bytes(take(frame, &mut offset, 4)?.try_into().unwrap()) as usize;
+        let upload_len =
+            u32::from_le_bytes(take(frame, &mut offset, 4)?.try_into().unwrap()) as usize;
         let upload = take(frame, &mut offset, upload_len)?.to_vec();
 
-        let download_len = u32::from_le_bytes(take(frame, &mut offset, 4)?.try_into().unwrap()) as usize;
+        let download_len =
+            u32::from_le_bytes(take(frame, &mut offset, 4)?.try_into().unwrap()) as usize;
         let download = take(frame, &mut offset, download_len)?.to_vec();
 
         frames.push(DecodedIoDumpFrame {

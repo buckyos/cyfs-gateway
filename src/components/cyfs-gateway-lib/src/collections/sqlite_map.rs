@@ -1,7 +1,7 @@
+use crate::{collection_value_to_json_value, json_value_to_collection_value};
+use cyfs_process_chain::{CollectionValue, MapCollection, MapCollectionTraverseCallBackRef};
 use sfo_sql::Row;
 use sfo_sql::sqlite::sql_query;
-use cyfs_process_chain::{CollectionValue, MapCollection, MapCollectionTraverseCallBackRef};
-use crate::{collection_value_to_json_value, json_value_to_collection_value};
 
 pub struct SqliteMap {
     pub table_name: String,
@@ -24,10 +24,7 @@ impl SqliteMap {
         let table_name = if let Some(name) = table_name {
             name
         } else {
-            let mut conn = pool
-                .get_conn()
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
             // 从数据库中获取表名
             match conn
                 .query_one(sql_query(
@@ -42,8 +39,8 @@ impl SqliteMap {
                         conn.execute_sql(sql_query(
                             "CREATE TABLE map_datas (key_item TEXT PRIMARY KEY, value_item TEXT);",
                         ))
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        .await
+                        .map_err(|e| e.to_string())?;
                         "map_datas".to_string()
                     } else {
                         return Err(e.to_string());
@@ -72,14 +69,14 @@ impl SqliteMap {
                     "ALTER TABLE {} ADD COLUMN {} TEXT;",
                     table_name, key_column
                 )))
-                    .await
-                    .map_err(|e| e.to_string())?;
+                .await
+                .map_err(|e| e.to_string())?;
                 conn.execute_sql(sql_query(&format!(
                     "ALTER TABLE {} ADD COLUMN {} TEXT;",
                     table_name, value_column
                 )))
-                    .await
-                    .map_err(|e| e.to_string())?;
+                .await
+                .map_err(|e| e.to_string())?;
                 (key_column, value_column)
             } else {
                 return Err("Invalid table structure".to_string());
@@ -100,11 +97,7 @@ impl SqliteMap {
 #[async_trait::async_trait]
 impl MapCollection for SqliteMap {
     async fn len(&self) -> Result<usize, String> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
         let row = conn
             .query_one(sql_query(&format!(
                 "SELECT COUNT(*) AS count FROM {};",
@@ -116,19 +109,15 @@ impl MapCollection for SqliteMap {
     }
 
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
         let result = conn
             .execute_sql(
                 sql_query(&format!(
                     "INSERT OR IGNORE INTO {} ({}, {}) VALUES (?, ?);",
                     self.table_name, self.key_column, self.value_column
                 ))
-                    .bind(key)
-                    .bind(collection_value_to_json_value(&value).await.to_string()),
+                .bind(key)
+                .bind(collection_value_to_json_value(&value).await.to_string()),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -143,45 +132,38 @@ impl MapCollection for SqliteMap {
         // 先检查是否存在旧值
         let old_value = self.get(key).await?;
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
         conn.execute_sql(
             sql_query(&format!(
                 "INSERT OR REPLACE INTO {} ({}, {}) VALUES (?, ?);",
                 self.table_name, self.key_column, self.value_column
             ))
-                .bind(key)
-                .bind(collection_value_to_json_value(&value).await.to_string()),
+            .bind(key)
+            .bind(collection_value_to_json_value(&value).await.to_string()),
         )
-            .await
-            .map_err(|e| e.to_string())?;
+        .await
+        .map_err(|e| e.to_string())?;
 
         Ok(old_value)
     }
 
     async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
         match conn
             .query_one(
                 sql_query(&format!(
                     "SELECT {} FROM {} WHERE {} = ?;",
                     self.value_column, self.table_name, self.key_column
                 ))
-                    .bind(key),
+                .bind(key),
             )
             .await
         {
             Ok(row) => {
                 let value: String = row.get(self.value_column.as_str());
-                let value: serde_json::Value = serde_json::from_str(value.as_str()).map_err(|e| e.to_string())?;
-                Ok(Some(json_value_to_collection_value(&value)))
+                let value: serde_json::Value =
+                    serde_json::from_str(value.as_str()).map_err(|e| e.to_string())?;
+                Ok(Some(json_value_to_collection_value(&value).await))
             }
             Err(e) => {
                 if e.code() == sfo_sql::errors::SqlErrorCode::NotFound {
@@ -194,18 +176,14 @@ impl MapCollection for SqliteMap {
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
         match conn
             .query_one(
                 sql_query(&format!(
                     "SELECT 1 FROM {} WHERE {} = ?;",
                     self.table_name, self.key_column
                 ))
-                    .bind(key),
+                .bind(key),
             )
             .await
         {
@@ -224,30 +202,22 @@ impl MapCollection for SqliteMap {
         // 先获取旧值
         let old_value = self.get(key).await?;
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
         conn.execute_sql(
             sql_query(&format!(
                 "DELETE FROM {} WHERE {} = ?;",
                 self.table_name, self.key_column
             ))
-                .bind(key),
+            .bind(key),
         )
-            .await
-            .map_err(|e| e.to_string())?;
+        .await
+        .map_err(|e| e.to_string())?;
 
         Ok(old_value)
     }
 
     async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
         let rows = conn
             .query_all(sql_query(&format!(
                 "SELECT {}, {} FROM {}",
@@ -259,21 +229,16 @@ impl MapCollection for SqliteMap {
         for row in rows {
             let key: String = row.get(self.key_column.as_str());
             let value: String = row.get(self.value_column.as_str());
-            let value: serde_json::Value = serde_json::from_str(value.as_str()).map_err(|e| e.to_string())?;
-            let value = json_value_to_collection_value(&value);
-            callback
-                .call(&key, &value)
-                .await?;
+            let value: serde_json::Value =
+                serde_json::from_str(value.as_str()).map_err(|e| e.to_string())?;
+            let value = json_value_to_collection_value(&value).await;
+            callback.call(&key, &value).await?;
         }
         Ok(())
     }
 
     async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut conn = self.pool.get_conn().await.map_err(|e| e.to_string())?;
         let rows = conn
             .query_all(sql_query(&format!(
                 "SELECT {}, {} FROM {}",
@@ -286,8 +251,9 @@ impl MapCollection for SqliteMap {
         for row in rows {
             let key: String = row.get(self.key_column.as_str());
             let value: String = row.get(self.value_column.as_str());
-            let value: serde_json::Value = serde_json::from_str(value.as_str()).map_err(|e| e.to_string())?;
-            let value = json_value_to_collection_value(&value);
+            let value: serde_json::Value =
+                serde_json::from_str(value.as_str()).map_err(|e| e.to_string())?;
+            let value = json_value_to_collection_value(&value).await;
             result.push((key, value));
         }
         Ok(result)
@@ -296,9 +262,9 @@ impl MapCollection for SqliteMap {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use super::*;
     use cyfs_process_chain::MapCollection;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_new_sqlite_map() {
@@ -343,7 +309,6 @@ mod tests {
         assert!(map.contains_key("key1").await.unwrap());
         let retrieved = map.get("key1").await.unwrap().unwrap();
         assert_eq!(retrieved.to_string(), "value1");
-
 
         let value = CollectionValue::String("value2".to_string());
         assert!(!map.insert_new("key1", value).await.unwrap());

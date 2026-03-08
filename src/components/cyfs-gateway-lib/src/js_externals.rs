@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use cyfs_process_chain::{ExternalCommandFactory, ExternalCommandRef};
 
-use crate::{config_err, ConfigErrorCode, ConfigResult};
+use crate::{ConfigErrorCode, ConfigResult, config_err};
 
 #[derive(Clone)]
 pub struct JsExternalsManager {

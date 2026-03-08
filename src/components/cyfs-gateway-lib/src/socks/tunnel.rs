@@ -1,11 +1,11 @@
+use super::udp::SocksUdpClient;
+use crate::ip::UdpClient;
 use crate::tunnel::*;
 use crate::{TunnelError, TunnelResult};
 use buckyos_kit::AsyncStream;
 use std::sync::Arc;
 use tokio_socks::tcp::Socks5Stream;
 use url::Url;
-use super::udp::SocksUdpClient;
-use crate::ip::UdpClient;
 
 enum SocksAuth {
     None,
@@ -90,7 +90,10 @@ impl Tunnel for SocksTunnel {
         dest_port: u16,
         dest_host: Option<String>,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
-        debug!("socks_tunnel open_stream_by_dest: {:?}:{}", dest_host, dest_port);
+        debug!(
+            "socks_tunnel open_stream_by_dest: {:?}:{}",
+            dest_host, dest_port
+        );
         // FIXME what should we do if dest_host is None or the port is 0?
         let dest_host = dest_host.unwrap_or("127.0.0.1".to_string());
         let dest_port = if dest_port == 0 { 80 } else { dest_port };
@@ -176,22 +179,25 @@ impl Tunnel for SocksTunnel {
                 client.udp_associate("0.0.0.0", 0).await.map_err(|e| {
                     let msg = format!(
                         "Failed to establish SOCKS5 UDP tunnel: {:?}, {:?}, {}",
-                        socks_server.server(), (&dest_host, dest_port),
+                        socks_server.server(),
+                        (&dest_host, dest_port),
                         e
                     );
                     error!("{}", msg);
                     std::io::Error::new(std::io::ErrorKind::Other, msg)
                 })?;
 
-                let socket: libsocks_client::SocksUdpSocket = client.get_udp_socket("0.0.0.0:0").await.map_err(|e| {
-                    let msg = format!(
-                        "Failed to get UDP socket for SOCKS5 UDP tunnel: {:?}, {:?}, {}",
-                        socks_server.server(), (&dest_host, dest_port),
-                        e
-                    );
-                    error!("{}", msg);
-                    std::io::Error::new(std::io::ErrorKind::Other, msg)
-                })?;
+                let socket: libsocks_client::SocksUdpSocket =
+                    client.get_udp_socket("0.0.0.0:0").await.map_err(|e| {
+                        let msg = format!(
+                            "Failed to get UDP socket for SOCKS5 UDP tunnel: {:?}, {:?}, {}",
+                            socks_server.server(),
+                            (&dest_host, dest_port),
+                            e
+                        );
+                        error!("{}", msg);
+                        std::io::Error::new(std::io::ErrorKind::Other, msg)
+                    })?;
 
                 let client = SocksUdpClient::new(socket, dest_host, dest_port);
                 Ok(Box::new(client))
@@ -227,7 +233,10 @@ impl TunnelBuilder for SocksTunnelBuilder {
         &self,
         tunnel_stack_id: Option<&str>,
     ) -> TunnelResult<Box<dyn TunnelBox>> {
-        debug!("socks_tunnel_builder create_tunnel: {}", tunnel_stack_id.unwrap_or(""));
+        debug!(
+            "socks_tunnel_builder create_tunnel: {}",
+            tunnel_stack_id.unwrap_or("")
+        );
         let tunnel = SocksTunnel::new(tunnel_stack_id).await?;
         Ok(Box::new(tunnel))
     }

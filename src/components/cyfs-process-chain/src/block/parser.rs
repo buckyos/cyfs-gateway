@@ -1,6 +1,7 @@
 use super::block::*;
 use crate::collection::{CollectionValue, NumberValue};
 use nom::{
+    IResult, Parser,
     branch::alt,
     bytes::complete::tag,
     bytes::complete::{escaped_transform, is_not},
@@ -12,7 +13,6 @@ use nom::{
     multi::many0,
     multi::separated_list0,
     sequence::{delimited, pair, preceded, terminated},
-    IResult, Parser,
 };
 
 pub struct BlockParser {
@@ -1393,7 +1393,10 @@ mod tests {
         assert_eq!(cmd.command.args.len(), 3);
         assert_eq!(cmd.command.args[0].as_literal_str(), Some("gt"));
         assert!(matches!(cmd.command.args[1], CommandArg::Var(_)));
-        assert!(matches!(cmd.command.args[2], CommandArg::TypedLiteral(_, _)));
+        assert!(matches!(
+            cmd.command.args[2],
+            CommandArg::TypedLiteral(_, _)
+        ));
     }
 
     #[test]
@@ -1406,7 +1409,10 @@ mod tests {
         assert_eq!(cmd.command.args.len(), 3);
         assert_eq!(cmd.command.args[0].as_literal_str(), Some("ge"));
         assert!(matches!(cmd.command.args[1], CommandArg::Var(_)));
-        assert!(matches!(cmd.command.args[2], CommandArg::TypedLiteral(_, _)));
+        assert!(matches!(
+            cmd.command.args[2],
+            CommandArg::TypedLiteral(_, _)
+        ));
     }
 
     #[test]
@@ -1419,7 +1425,10 @@ mod tests {
         assert_eq!(cmd.command.args.len(), 3);
         assert_eq!(cmd.command.args[0].as_literal_str(), Some("lt"));
         assert!(matches!(cmd.command.args[1], CommandArg::Var(_)));
-        assert!(matches!(cmd.command.args[2], CommandArg::TypedLiteral(_, _)));
+        assert!(matches!(
+            cmd.command.args[2],
+            CommandArg::TypedLiteral(_, _)
+        ));
     }
 
     #[test]
@@ -1432,6 +1441,9 @@ mod tests {
         assert_eq!(cmd.command.args.len(), 3);
         assert_eq!(cmd.command.args[0].as_literal_str(), Some("le"));
         assert!(matches!(cmd.command.args[1], CommandArg::Var(_)));
-        assert!(matches!(cmd.command.args[2], CommandArg::TypedLiteral(_, _)));
+        assert!(matches!(
+            cmd.command.args[2],
+            CommandArg::TypedLiteral(_, _)
+        ));
     }
 }

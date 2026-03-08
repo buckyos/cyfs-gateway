@@ -1,19 +1,18 @@
 /// DirServer 使用示例
-/// 
+///
 /// 这个示例展示如何使用 DirServer 提供静态文件服务
-/// 
+///
 /// 运行方式：
 /// ```bash
 /// cd src
 /// cargo run --package cyfs-gateway-lib --example dir_server_example
 /// ```
-/// 
+///
 /// 然后在浏览器或 curl 中访问：
 /// ```bash
 /// curl http://localhost:8080/test.txt
 /// curl -H "Range: bytes=0-99" http://localhost:8080/test.txt
 /// ```
-
 use cyfs_gateway_lib::{DirServer, HttpServer, StreamInfo};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -120,20 +119,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let server = server.clone();
                 async move {
                     let stream_info = StreamInfo::default();
-                    
+
                     // 将 Incoming body 转换为 BoxBody
                     let req = req.map(|body| {
                         body.map_err(|e| {
                             cyfs_gateway_lib::ServerError::new(
                                 cyfs_gateway_lib::ServerErrorCode::StreamError,
-                                format!("{:?}", e)
+                                format!("{:?}", e),
                             )
-                        }).boxed()
+                        })
+                        .boxed()
                     });
-                    
+
                     // 调用服务器处理请求
                     let result = server.serve_request(req, stream_info).await;
-                    
+
                     match result {
                         Ok(resp) => {
                             println!("✓ {} - {}", remote_addr, resp.status());
@@ -144,22 +144,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // 返回 500 错误
                             Ok(hyper::Response::builder()
                                 .status(500)
-                                .body(Full::new(Bytes::from("Internal Server Error"))
-                                    .map_err(|e: std::convert::Infallible| match e {})
-                                    .boxed())
+                                .body(
+                                    Full::new(Bytes::from("Internal Server Error"))
+                                        .map_err(|e: std::convert::Infallible| match e {})
+                                        .boxed(),
+                                )
                                 .unwrap())
                         }
                     }
                 }
             });
 
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(io, service)
-                .await
-            {
+            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
                 eprintln!("连接错误: {:?}", err);
             }
         });
     }
 }
-

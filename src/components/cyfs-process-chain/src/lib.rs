@@ -9,9 +9,9 @@ mod cmd;
 mod collection;
 mod hook_point;
 mod http;
+mod js;
 mod pipe;
 mod tcp;
-mod js;
 
 #[cfg(test)]
 mod test;

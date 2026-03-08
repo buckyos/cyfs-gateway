@@ -1,12 +1,12 @@
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::sync::{Arc, Mutex};
-use rustls::{server, sign, Error};
+use crate::SelfCertMgrRef;
 use rustls::client::verify_server_name;
 use rustls::pki_types::{DnsName, ServerName};
 use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use crate::SelfCertMgrRef;
+use rustls::{Error, server, sign};
+use std::collections::HashMap;
+use std::fmt::Debug;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub(crate) struct ResolvesServerCertUsingSni {
@@ -39,9 +39,11 @@ impl ResolvesServerCertUsingSni {
             .and_then(ParsedCertificate::try_from)
             .and_then(|cert| verify_server_name(&cert, &server_name))?;
 
-        self.by_name.lock().unwrap()
+        self.by_name
+            .lock()
+            .unwrap()
             .insert(name.to_lowercase(), Arc::new(ck));
-        
+
         Ok(())
     }
 
@@ -64,9 +66,9 @@ impl ResolvesServerCertUsingSni {
         // 检查域名是否以通配符后缀结尾，并且前面有一个子域名部分
         if domain.len() > wildcard_domain.len() {
             let prefix_len = domain.len() - wildcard_domain.len() - 1;
-            domain.ends_with(wildcard_domain) &&
-                domain.as_bytes()[prefix_len] == b'.' &&
-                !domain[..prefix_len].contains('.')
+            domain.ends_with(wildcard_domain)
+                && domain.as_bytes()[prefix_len] == b'.'
+                && !domain[..prefix_len].contains('.')
         } else {
             false
         }
@@ -87,7 +89,9 @@ impl server::ResolvesServerCert for ResolvesServerCertUsingSni {
 
                 // 然后尝试通配符匹配
                 for (cert_name, cert) in certs.iter() {
-                    if cert_name.starts_with("*.") && Self::matches_wildcard(name.as_str(), cert_name) {
+                    if cert_name.starts_with("*.")
+                        && Self::matches_wildcard(name.as_str(), cert_name)
+                    {
                         return Some(cert.clone());
                     }
                 }
@@ -96,7 +100,10 @@ impl server::ResolvesServerCert for ResolvesServerCertUsingSni {
             if self.external_resolver.is_none() {
                 return None;
             }
-            self.external_resolver.as_ref().unwrap().resolve(client_hello)
+            self.external_resolver
+                .as_ref()
+                .unwrap()
+                .resolve(client_hello)
         } else {
             None
         }
@@ -127,11 +134,11 @@ impl TlsCertResolver {
 }
 
 impl ResolvesServerCert for TlsCertResolver {
-    fn resolve(
-        &self,
-        client_hello: rustls::server::ClientHello,
-    ) -> Option<Arc<CertifiedKey>> {
-        let server_name = client_hello.server_name().map(|v| v.to_string()).unwrap_or("".to_string());
+    fn resolve(&self, client_hello: rustls::server::ClientHello) -> Option<Arc<CertifiedKey>> {
+        let server_name = client_hello
+            .server_name()
+            .map(|v| v.to_string())
+            .unwrap_or("".to_string());
         if let Some(cert) = self.resolve.resolve(client_hello) {
             return Some(cert);
         }
@@ -147,9 +154,21 @@ impl ResolvesServerCert for TlsCertResolver {
 mod tests {
     #[test]
     fn test_matches_wildcard() {
-        assert!(!super::ResolvesServerCertUsingSni::matches_wildcard("example.com", "*.example.com"));
-        assert!(super::ResolvesServerCertUsingSni::matches_wildcard("www.example.com", "*.example.com"));
-        assert!(!super::ResolvesServerCertUsingSni::matches_wildcard("www.example1.com", "*.example.com"));
-        assert!(!super::ResolvesServerCertUsingSni::matches_wildcard("www.example1.com", "example.com"));
+        assert!(!super::ResolvesServerCertUsingSni::matches_wildcard(
+            "example.com",
+            "*.example.com"
+        ));
+        assert!(super::ResolvesServerCertUsingSni::matches_wildcard(
+            "www.example.com",
+            "*.example.com"
+        ));
+        assert!(!super::ResolvesServerCertUsingSni::matches_wildcard(
+            "www.example1.com",
+            "*.example.com"
+        ));
+        assert!(!super::ResolvesServerCertUsingSni::matches_wildcard(
+            "www.example1.com",
+            "example.com"
+        ));
     }
 }

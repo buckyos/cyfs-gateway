@@ -60,7 +60,8 @@ async fn test_process_chain() -> Result<(), String> {
     let chains = ProcessChainXMLLoader::parse(PROCESS_CHAIN_CHAIN1_ONLY)?;
     assert_eq!(chains.len(), 1);
 
-    let lib = ProcessChainConstListLib::new_raw("test_lib_chain1", 0, chains).into_process_chain_lib();
+    let lib =
+        ProcessChainConstListLib::new_raw("test_lib_chain1", 0, chains).into_process_chain_lib();
 
     let manager = Arc::new(ProcessChainManager::new());
     manager.add_lib(lib)?;
@@ -76,7 +77,11 @@ async fn test_process_chain() -> Result<(), String> {
     let exec2 = exec.fork();
     let global_env = exec2.global_env().clone();
     let ret = exec2.execute_lib().await?;
-    assert!(ret.is_accept(), "chain1 execution should accept, got: {:?}", ret);
+    assert!(
+        ret.is_accept(),
+        "chain1 execution should accept, got: {:?}",
+        ret
+    );
 
     let key1 = global_env
         .get("key1")
@@ -104,4 +109,3 @@ async fn test_process_chain_block_env() -> Result<(), String> {
     init_test_logger();
     test_process_chain().await
 }
-

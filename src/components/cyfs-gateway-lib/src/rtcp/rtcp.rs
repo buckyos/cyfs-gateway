@@ -1,19 +1,19 @@
-use std::collections::{HashMap, HashSet};
 use super::package::*;
 use super::protocol::*;
 use super::stream_helper::RTcpStreamBuildHelper;
+use std::collections::{HashMap, HashSet};
 
 use crate::rtcp::datagram::RTcpTunnelDatagramClient;
 use crate::tunnel::TunnelBox;
 use crate::{
-    get_dest_info_from_url_path, has_scheme, DatagramClientBox, EncryptedStream, Tunnel,
-    TunnelEndpoint, TunnelError, TunnelResult,
+    DatagramClientBox, EncryptedStream, Tunnel, TunnelEndpoint, TunnelError, TunnelResult,
+    get_dest_info_from_url_path, has_scheme,
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use buckyos_kit::{buckyos_get_unix_timestamp, AsyncStream};
+use buckyos_kit::{AsyncStream, buckyos_get_unix_timestamp};
 use hex::ToHex;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use log::*;
 use name_client::*;
 use name_lib::*;
@@ -28,8 +28,8 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::pin::Pin;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
@@ -458,7 +458,11 @@ impl RTcpInner {
         }
     }
 
-    fn get_resolve_candidates(&self, tunnel_stack_id: &str, target: &RTcpTargetStackEP) -> Vec<String> {
+    fn get_resolve_candidates(
+        &self,
+        tunnel_stack_id: &str,
+        target: &RTcpTargetStackEP,
+    ) -> Vec<String> {
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
 
@@ -1045,8 +1049,7 @@ impl RTcpInner {
         let resolve_candidates = self.get_resolve_candidates(tunnel_stack_id, &target);
         debug!(
             "resolve target device {} ip with candidates: {:?}",
-            target_id_str,
-            resolve_candidates
+            target_id_str, resolve_candidates
         );
 
         let mut device_ip = None;
@@ -1056,9 +1059,7 @@ impl RTcpInner {
                 Ok(ip) => {
                     info!(
                         "resolve target device {} ip by {} => {}",
-                        target_id_str,
-                        candidate,
-                        ip
+                        target_id_str, candidate, ip
                     );
                     device_ip = Some(ip);
                     break;
@@ -1067,8 +1068,7 @@ impl RTcpInner {
                     let err_msg = format!("{} => {}", candidate, err);
                     debug!(
                         "resolve target device {} failed: {}",
-                        target_id_str,
-                        err_msg
+                        target_id_str, err_msg
                     );
                     resolve_errors.push(err_msg);
                 }
@@ -1080,8 +1080,7 @@ impl RTcpInner {
                 Ok(Some(ip)) => {
                     info!(
                         "resolve target device {} ip by did-info => {}",
-                        target_id_str,
-                        ip
+                        target_id_str, ip
                     );
                     device_ip = Some(ip);
                 }
@@ -1118,17 +1117,14 @@ impl RTcpInner {
             if connect_err.kind() == std::io::ErrorKind::ConnectionRefused {
                 warn!(
                     "connect to {} refused when opening tunnel to {} (did resolved, but rtcp port {} is unreachable/refused)",
-                    remote_addr,
-                    target_id_str,
-                    port
+                    remote_addr, target_id_str, port
                 );
             } else {
                 warn!("connect to {} error: {}", remote_addr, connect_err);
             }
             return Err(TunnelError::ConnectError(format!(
                 "connect to {} error: {}",
-                remote_addr,
-                connect_err
+                remote_addr, connect_err
             )));
         }
         // create tunnel token
@@ -1415,7 +1411,14 @@ impl RTcpTunnel {
             port: self.target.stack_port,
         };
         self.listener
-            .on_new_stream(stream, dest_host, dest_port, end_point, remote_addr, local_addr)
+            .on_new_stream(
+                stream,
+                dest_host,
+                dest_port,
+                end_point,
+                remote_addr,
+                local_addr,
+            )
             .await?;
         Ok(())
     }
@@ -1433,7 +1436,14 @@ impl RTcpTunnel {
             port: self.target.stack_port,
         };
         self.listener
-            .on_new_datagram(stream, dest_host, dest_port, end_point, remote_addr, local_addr)
+            .on_new_datagram(
+                stream,
+                dest_host,
+                dest_port,
+                end_point,
+                remote_addr,
+                local_addr,
+            )
             .await?;
         Ok(())
     }
@@ -1776,21 +1786,24 @@ pub trait RTcpListener: 'static + Send + Sync {
         Ok(())
     }
 
-
-    async fn on_new_stream(&self,
-                           stream: Box<dyn AsyncStream>,
-                           dest_host: Option<String>,
-                           dest_port: u16,
-                           endpoint: TunnelEndpoint,
-                           remote_addr: SocketAddr,
-                           local_addr: SocketAddr,) -> TunnelResult<()>;
-    async fn on_new_datagram(&self,
-                             stream: Box<dyn AsyncStream>,
-                             dest_host: Option<String>,
-                             dest_port: u16,
-                             endpoint: TunnelEndpoint,
-                             remote_addr: SocketAddr,
-                             local_addr: SocketAddr,) -> TunnelResult<()>;
+    async fn on_new_stream(
+        &self,
+        stream: Box<dyn AsyncStream>,
+        dest_host: Option<String>,
+        dest_port: u16,
+        endpoint: TunnelEndpoint,
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> TunnelResult<()>;
+    async fn on_new_datagram(
+        &self,
+        stream: Box<dyn AsyncStream>,
+        dest_host: Option<String>,
+        dest_port: u16,
+        endpoint: TunnelEndpoint,
+        remote_addr: SocketAddr,
+        local_addr: SocketAddr,
+    ) -> TunnelResult<()>;
 }
 pub type RTcpListenerRef = Arc<dyn RTcpListener>;
 
@@ -1839,12 +1852,12 @@ impl RTcpTunnelMap {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-    use crate::rtcp::rtcp::RTcp;
     use crate::rtcp::AsyncStreamWithDatagram;
+    use crate::rtcp::rtcp::RTcp;
     use crate::{TunnelEndpoint, TunnelResult};
     use buckyos_kit::AsyncStream;
     use jsonwebtoken::EncodingKey;
-    use name_lib::{DIDDocumentTrait, DID};
+    use name_lib::{DID, DIDDocumentTrait};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

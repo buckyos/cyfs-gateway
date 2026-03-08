@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 
-use crate::{lookup_err, LookupResult};
+use crate::{LookupResult, lookup_err};
 
 pub async fn lookup_hostname_once(ip: IpAddr) -> LookupResult<Option<String>> {
     let result = tokio::task::spawn_blocking(move || dns_lookup::lookup_addr(&ip)).await;

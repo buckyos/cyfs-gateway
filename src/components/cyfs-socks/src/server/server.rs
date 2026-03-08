@@ -1,7 +1,13 @@
 use super::config::SocksServerConfig;
-use crate::{Socks5Proxy, SocksDataTunnelProviderRef, SocksHookManager, SocksProxyAuth, SocksProxyConfig};
+use crate::{
+    Socks5Proxy, SocksDataTunnelProviderRef, SocksHookManager, SocksProxyAuth, SocksProxyConfig,
+};
 use buckyos_kit::AsyncStream;
-use cyfs_gateway_lib::{server_err, GlobalProcessChainsRef, JsExternalsManagerRef, Server, ServerConfig, ServerContext, ServerContextRef, ServerErrorCode, ServerFactory, ServerResult, StreamServer, StreamInfo, GlobalCollectionManagerRef};
+use cyfs_gateway_lib::{
+    server_err, GlobalCollectionManagerRef, GlobalProcessChainsRef, JsExternalsManagerRef, Server,
+    ServerConfig, ServerContext, ServerContextRef, ServerErrorCode, ServerFactory, ServerResult,
+    StreamInfo, StreamServer,
+};
 use std::sync::Arc;
 
 pub struct SocksServer {
@@ -16,7 +22,11 @@ impl SocksServer {
 
 #[async_trait::async_trait]
 impl StreamServer for SocksServer {
-    async fn serve_connection(&self, stream: Box<dyn AsyncStream>, info: StreamInfo) -> ServerResult<()> {
+    async fn serve_connection(
+        &self,
+        stream: Box<dyn AsyncStream>,
+        info: StreamInfo,
+    ) -> ServerResult<()> {
         self.proxy
             .handle_new_connection(stream, info)
             .await
@@ -112,21 +122,26 @@ impl ServerFactory for SocksServerFactory {
             ))?;
 
         let global_process_chains = context.global_process_chains.get_process_chains();
-        let hook_point = SocksHookManager::create(process_chain_lib,
-                                                   global_process_chains,
-                                                   context.global_collection_manager.clone())
-            .await
-            .map_err(|e| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "create socks hook manager failed: {}",
-                    e
-                )
-            })?;
+        let hook_point = SocksHookManager::create(
+            process_chain_lib,
+            global_process_chains,
+            context.global_collection_manager.clone(),
+        )
+        .await
+        .map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "create socks hook manager failed: {}",
+                e
+            )
+        })?;
         let hook_point = Arc::new(hook_point);
 
         let auth = if config.username.is_some() && config.password.is_some() {
-            SocksProxyAuth::Password(config.username.clone().unwrap(), config.password.clone().unwrap())
+            SocksProxyAuth::Password(
+                config.username.clone().unwrap(),
+                config.password.clone().unwrap(),
+            )
         } else {
             SocksProxyAuth::None
         };
@@ -198,7 +213,9 @@ mod tests {
                 TargetAddr::Domain(domain, port) => {
                     let mut resolved = tokio::net::lookup_host((domain.as_str(), *port))
                         .await
-                        .map_err(|e| SocksError::IoError(format!("resolve domain failed: {}", e)))?;
+                        .map_err(|e| {
+                            SocksError::IoError(format!("resolve domain failed: {}", e))
+                        })?;
                     resolved.next().ok_or_else(|| {
                         SocksError::InvalidAddress(format!("resolve domain {} failed", domain))
                     })?
@@ -303,7 +320,10 @@ mod tests {
 
         let mut auth_reply = [0u8; 2];
         client.read_exact(&mut auth_reply).await.unwrap();
-        assert_eq!(auth_reply, [consts::SOCKS5_VERSION, consts::SOCKS5_AUTH_METHOD_NONE]);
+        assert_eq!(
+            auth_reply,
+            [consts::SOCKS5_VERSION, consts::SOCKS5_AUTH_METHOD_NONE]
+        );
 
         let mut req = vec![
             consts::SOCKS5_VERSION,
@@ -370,8 +390,7 @@ mod tests {
     async fn test_socks_server_accept_direct_connection() {
         let provider = MockTunnelProvider::default();
         let socks_server =
-            create_socks_stream_server("return \"DIRECT\";", provider_ref(provider.clone()))
-                .await;
+            create_socks_stream_server("return \"DIRECT\";", provider_ref(provider.clone())).await;
 
         let target_addr = start_echo_server().await;
         let (mut client, server_stream) = tokio::io::duplex(4096);
@@ -407,7 +426,7 @@ mod tests {
             "return \"PROXY socks://proxy.example:1080\";",
             provider_ref(provider.clone()),
         )
-            .await;
+        .await;
 
         let target_addr = start_echo_server().await;
         let (mut client, server_stream) = tokio::io::duplex(4096);

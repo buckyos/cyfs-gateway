@@ -4,7 +4,7 @@
 
 use super::action::RuleAction;
 use super::loader::{RuleFileLoader, RuleFileTarget};
-use super::loader::{RuleType, RuleItem};
+use super::loader::{RuleItem, RuleType};
 use super::selector::RuleInput;
 use crate::error::{RuleError, RuleResult};
 use std::path::{Path, PathBuf};
@@ -40,7 +40,7 @@ impl RuleEngine {
         let items = loader.load().await?;
 
         *self.rules.lock().await = items;
-        
+
         info!("load rules from {:?} success", self.root_dir);
 
         Ok(())
@@ -84,9 +84,19 @@ impl RuleEngine {
         let duration = end - start;
 
         if ret.is_ok() {
-            info!("rule select for {} -> {:?} in {:?} ms", url, ret, duration.num_milliseconds());
+            info!(
+                "rule select for {} -> {:?} in {:?} ms",
+                url,
+                ret,
+                duration.num_milliseconds()
+            );
         } else {
-            error!("rule select failed for {} -> {:?} in {:?} ms", url, ret, duration.num_milliseconds());
+            error!(
+                "rule select failed for {} -> {:?} in {:?} ms",
+                url,
+                ret,
+                duration.num_milliseconds()
+            );
         }
 
         ret

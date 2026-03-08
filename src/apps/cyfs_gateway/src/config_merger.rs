@@ -74,11 +74,12 @@ impl ConfigMerger {
             dir, root_file
         );
 
-        let configs = load_dir_with_root_internal(dir, root_file, modified_since, cache_dir).await?;
+        let configs =
+            load_dir_with_root_internal(dir, root_file, modified_since, cache_dir).await?;
         if configs.is_empty() {
             return Ok(json!({}));
         }
-        
+
         let merged = merge_configs(&configs)?;
 
         Ok(merged)
@@ -122,7 +123,10 @@ pub fn merge(current: &mut JsonValue, new_value: &JsonValue) {
     match (current, new_value) {
         (JsonValue::Object(current_map), JsonValue::Object(new_map)) => {
             for (key, value) in new_map {
-                merge(current_map.entry(key).or_insert_with(|| JsonValue::Null), value);
+                merge(
+                    current_map.entry(key).or_insert_with(|| JsonValue::Null),
+                    value,
+                );
             }
         }
         (JsonValue::Array(current_array), JsonValue::Array(new_array)) => {
@@ -207,11 +211,12 @@ fn parse_config_content(content: &str, ext: Option<&str>) -> Result<JsonValue> {
                 return toml_to_json(toml_value);
             }
             "yaml" | "yml" => {
-                let yaml_value: serde_yaml_ng::Value = serde_yaml_ng::from_str(content).map_err(|e| {
-                    let msg = format!("Failed to parse YAML: {:?}", e);
-                    error!("{}", msg);
-                    anyhow!(msg)
-                })?;
+                let yaml_value: serde_yaml_ng::Value =
+                    serde_yaml_ng::from_str(content).map_err(|e| {
+                        let msg = format!("Failed to parse YAML: {:?}", e);
+                        error!("{}", msg);
+                        anyhow!(msg)
+                    })?;
 
                 return yaml_to_json(yaml_value);
             }
@@ -253,7 +258,9 @@ async fn load_local_file(file: &Path) -> Result<LoadedConfig> {
 
     let ext = file.extension().and_then(|s| s.to_str());
     let value = parse_config_content(&content, ext)?;
-    let last_modified = std::fs::metadata(file).and_then(|meta| meta.modified()).ok();
+    let last_modified = std::fs::metadata(file)
+        .and_then(|meta| meta.modified())
+        .ok();
 
     Ok(LoadedConfig {
         value,
@@ -311,7 +318,10 @@ async fn load_cached_config(
         return Err(anyhow!(msg));
     }
     let content = tokio::fs::read_to_string(cache_path).await.map_err(|e| {
-        let msg = format!("Failed to read cached config: {:?}, error: {:?}", cache_path, e);
+        let msg = format!(
+            "Failed to read cached config: {:?}, error: {:?}",
+            cache_path, e
+        );
         error!("{}", msg);
         anyhow!(msg)
     })?;
@@ -323,10 +333,7 @@ async fn load_cached_config(
     })
 }
 
-async fn load_remote_file(
-    url: &Url,
-    cache_dir: &Path,
-) -> Result<LoadedConfig> {
+async fn load_remote_file(url: &Url, cache_dir: &Path) -> Result<LoadedConfig> {
     match url.scheme() {
         "http" | "https" => {}
         _ => {
@@ -340,7 +347,9 @@ async fn load_remote_file(
 
     let cache_path = remote_cache_path(url, cache_dir);
     let meta_path = remote_cache_meta_path(url, cache_dir);
-    let cache_modified = std::fs::metadata(&cache_path).and_then(|meta| meta.modified()).ok();
+    let cache_modified = std::fs::metadata(&cache_path)
+        .and_then(|meta| meta.modified())
+        .ok();
     let meta_modified = read_cached_last_modified(&meta_path).await;
     let header_since = meta_modified.or(cache_modified);
 
@@ -356,7 +365,10 @@ async fn load_remote_file(
             let msg = format!("Failed to download config file: {}, error: {:?}", url, e);
             error!("{}", msg);
             if cache_path.exists() {
-                warn!("Using cached config after download failure: {}", cache_path.to_string_lossy());
+                warn!(
+                    "Using cached config after download failure: {}",
+                    cache_path.to_string_lossy()
+                );
                 return load_cached_config(&cache_path, url, meta_modified, cache_modified).await;
             }
             return Err(anyhow!(msg));
@@ -368,10 +380,17 @@ async fn load_remote_file(
     }
 
     if !resp.status().is_success() {
-        let msg = format!("Failed to download config file: {}, status: {}", url, resp.status());
+        let msg = format!(
+            "Failed to download config file: {}, status: {}",
+            url,
+            resp.status()
+        );
         error!("{}", msg);
         if cache_path.exists() {
-            warn!("Using cached config after bad status: {}", cache_path.to_string_lossy());
+            warn!(
+                "Using cached config after bad status: {}",
+                cache_path.to_string_lossy()
+            );
             return load_cached_config(&cache_path, url, meta_modified, cache_modified).await;
         }
         return Err(anyhow!(msg));
@@ -384,7 +403,10 @@ async fn load_remote_file(
             let msg = format!("Failed to read config body: {}, error: {:?}", url, e);
             error!("{}", msg);
             if cache_path.exists() {
-                warn!("Using cached config after read failure: {}", cache_path.to_string_lossy());
+                warn!(
+                    "Using cached config after read failure: {}",
+                    cache_path.to_string_lossy()
+                );
                 return load_cached_config(&cache_path, url, meta_modified, cache_modified).await;
             }
             return Err(anyhow!(msg));
@@ -392,15 +414,24 @@ async fn load_remote_file(
     };
 
     if let Err(e) = std::fs::create_dir_all(cache_dir) {
-        warn!("Failed to create cache dir: {:?}, error: {:?}", cache_dir, e);
+        warn!(
+            "Failed to create cache dir: {:?}, error: {:?}",
+            cache_dir, e
+        );
     }
     if let Err(e) = tokio::fs::write(&cache_path, &content).await {
-        warn!("Failed to write cache file: {:?}, error: {:?}", cache_path, e);
+        warn!(
+            "Failed to write cache file: {:?}, error: {:?}",
+            cache_path, e
+        );
     }
     if let Some(last_modified) = last_modified {
         let text = fmt_http_date(last_modified);
         if let Err(e) = tokio::fs::write(&meta_path, text).await {
-            warn!("Failed to write cache meta file: {:?}, error: {:?}", meta_path, e);
+            warn!(
+                "Failed to write cache meta file: {:?}, error: {:?}",
+                meta_path, e
+            );
         }
     }
 
@@ -424,7 +455,10 @@ fn should_load_file(file: &Path, modified_since: Option<SystemTime>) -> bool {
     }
 }
 
-fn should_load_remote(last_modified: Option<SystemTime>, modified_since: Option<SystemTime>) -> bool {
+fn should_load_remote(
+    last_modified: Option<SystemTime>,
+    modified_since: Option<SystemTime>,
+) -> bool {
     let Some(modified_since) = modified_since else {
         return true;
     };
@@ -455,7 +489,10 @@ fn parse_remote_url(path: &str) -> Result<Url> {
 fn include_base_for_source(source: &ConfigSource) -> IncludeBase {
     match source {
         ConfigSource::Local(path) => {
-            let base = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+            let base = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
             IncludeBase::Local(base)
         }
         ConfigSource::Remote(url) => IncludeBase::Remote(remote_base_url(url)),
@@ -496,7 +533,10 @@ fn resolve_include_source(base: &IncludeBase, include_path: &str) -> Result<Conf
                 return Ok(ConfigSource::Remote(parse_remote_url(include_path)?));
             }
             let url = base_url.join(include_path).map_err(|e| {
-                let msg = format!("Failed to resolve include url: {}, error: {:?}", include_path, e);
+                let msg = format!(
+                    "Failed to resolve include url: {}, error: {:?}",
+                    include_path, e
+                );
                 error!("{}", msg);
                 anyhow!(msg)
             })?;
@@ -551,12 +591,19 @@ async fn load_config_source(
                         let items = load_dir_internal(&path, modified_since, cache_dir).await?;
                         configs.extend(items);
                     } else {
-                        let items = load_config_source(&ConfigSource::Local(path), modified_since, cache_dir).await?;
+                        let items = load_config_source(
+                            &ConfigSource::Local(path),
+                            modified_since,
+                            cache_dir,
+                        )
+                        .await?;
                         configs.extend(items);
                     }
                 }
                 ConfigSource::Remote(url) => {
-                    let items = load_config_source(&ConfigSource::Remote(url), modified_since, cache_dir).await?;
+                    let items =
+                        load_config_source(&ConfigSource::Remote(url), modified_since, cache_dir)
+                            .await?;
                     configs.extend(items);
                 }
             }
@@ -649,7 +696,9 @@ async fn load_dir_without_root(
     let mut config = Vec::new();
     for file in indexed_files {
         if file.path.is_file() {
-            let items = load_config_source(&ConfigSource::Local(file.path), modified_since, cache_dir).await?;
+            let items =
+                load_config_source(&ConfigSource::Local(file.path), modified_since, cache_dir)
+                    .await?;
             config.extend(items);
         } else {
             let items = load_dir_internal(&file.path, modified_since, cache_dir).await?;
@@ -669,7 +718,9 @@ async fn load_dir_internal(
     let root_file = get_root_file(dir);
 
     match root_file {
-        Some(root_file) => load_dir_with_root_internal(dir, &root_file, modified_since, cache_dir).await,
+        Some(root_file) => {
+            load_dir_with_root_internal(dir, &root_file, modified_since, cache_dir).await
+        }
         None => load_dir_without_root(dir, modified_since, cache_dir).await,
     }
 }

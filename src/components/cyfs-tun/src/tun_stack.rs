@@ -1,14 +1,16 @@
-use std::io::Error;
-use std::net::IpAddr;
-use std::sync::{Arc, Mutex, RwLock};
 use buckyos_kit::AsyncStream;
+use cyfs_gateway_lib::*;
+use cyfs_process_chain::{
+    CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor, StreamRequest,
+};
 use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitDatagramRecv, LimitDatagramSend, LimitStream, StatStream};
+use std::io::Error;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::task::JoinHandle;
-use cyfs_gateway_lib::*;
-use cyfs_process_chain::{CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor, StreamRequest};
 
 pub const DEFAULT_MTU: u16 = 1500;
 
@@ -70,8 +72,8 @@ impl TunConnectionHandler {
             Some(get_external_commands(Arc::downgrade(&env.servers))),
             env.js_externals.clone(),
         )
-            .await
-            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        .await
+        .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
             env,
             executor,
@@ -124,7 +126,8 @@ impl TunConnectionHandler {
                         return Ok(());
                     }
 
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
+                    let (limiter_id, down_speed, up_speed) =
+                        get_limit_info(chain_env.clone()).await?;
                     let upper = if limiter_id.is_some() {
                         self.env.limiter_manager.get_limiter(limiter_id.unwrap())
                     } else {
@@ -161,7 +164,8 @@ impl TunConnectionHandler {
                             let stream = if limiter.is_some() {
                                 let (read_limit, write_limit) =
                                     limiter.as_ref().unwrap().new_limit_session();
-                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                let limit_stream =
+                                    LimitStream::new(stream, read_limit, write_limit);
                                 Box::new(limit_stream)
                             } else {
                                 stream
@@ -178,7 +182,8 @@ impl TunConnectionHandler {
                             let stream = if limiter.is_some() {
                                 let (read_limit, write_limit) =
                                     limiter.as_ref().unwrap().new_limit_session();
-                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                let limit_stream =
+                                    LimitStream::new(stream, read_limit, write_limit);
                                 Box::new(limit_stream)
                             } else {
                                 stream
@@ -194,11 +199,13 @@ impl TunConnectionHandler {
                                             StreamInfo::new(remote_addr.to_string())
                                                 .with_dst_addr(Some(dest_addr.to_string())),
                                         )
-                                            .await
-                                            .map_err(into_stack_err!(
+                                        .await
+                                        .map_err(
+                                            into_stack_err!(
                                                 StackErrorCode::ServerError,
                                                 "server {server_name}"
-                                            ))?;
+                                            ),
+                                        )?;
                                     }
                                     Server::Stream(server) => {
                                         server
@@ -220,11 +227,13 @@ impl TunConnectionHandler {
                                             StreamInfo::new(remote_addr.to_string())
                                                 .with_dst_addr(Some(dest_addr.to_string())),
                                         )
-                                            .await
-                                            .map_err(into_stack_err!(
+                                        .await
+                                        .map_err(
+                                            into_stack_err!(
                                                 StackErrorCode::ServerError,
                                                 "server {server_name}"
-                                            ))?;
+                                            ),
+                                        )?;
                                     }
                                     _ => {
                                         return Err(stack_err!(
@@ -259,21 +268,36 @@ impl TunConnectionHandler {
         map.insert("dest_addr", CollectionValue::String(dest_addr.to_string()))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_port", CollectionValue::String(dest_addr.port().to_string()))
-            .await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_addr", CollectionValue::String(remote_addr.to_string()))
-            .await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_ip", CollectionValue::String(remote_addr.ip().to_string()))
-            .await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_port", CollectionValue::String(remote_addr.port().to_string()))
-            .await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_ip", CollectionValue::String(dest_addr.ip().to_string()))
-            .await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "dest_port",
+            CollectionValue::String(dest_addr.port().to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_addr",
+            CollectionValue::String(remote_addr.to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_ip",
+            CollectionValue::String(remote_addr.ip().to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_port",
+            CollectionValue::String(remote_addr.port().to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "dest_ip",
+            CollectionValue::String(dest_addr.ip().to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("app_protocol", CollectionValue::String("udp".to_string()))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -301,7 +325,8 @@ impl TunConnectionHandler {
                         return Ok(());
                     }
 
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(chain_env.clone()).await?;
+                    let (limiter_id, down_speed, up_speed) =
+                        get_limit_info(chain_env.clone()).await?;
                     let upper = if limiter_id.is_some() {
                         self.env.limiter_manager.get_limiter(limiter_id.unwrap())
                     } else {
@@ -388,7 +413,9 @@ impl TunConnectionHandler {
                                                 .serve_datagram(
                                                     &buf[..len],
                                                     DatagramInfo::new(Some(dest_addr.to_string()))
-                                                        .with_dst_addr(Some(remote_addr.to_string())),
+                                                        .with_dst_addr(Some(
+                                                            remote_addr.to_string(),
+                                                        )),
                                                 )
                                                 .await
                                                 .map_err(into_stack_err!(
@@ -430,9 +457,7 @@ pub struct TunDatagramSend {
 
 impl TunDatagramSend {
     fn new(send: WriteHalf<Box<dyn AsyncStream>>) -> Self {
-        Self {
-            send,
-        }
+        Self { send }
     }
 }
 
@@ -451,9 +476,7 @@ pub struct TunDatagramRecv {
 
 impl TunDatagramRecv {
     fn new(recv: ReadHalf<Box<dyn AsyncStream>>) -> Self {
-        Self {
-            recv,
-        }
+        Self { recv }
     }
 }
 
@@ -490,7 +513,9 @@ impl<R: sfo_io::DatagramRecv, S: sfo_io::DatagramSend> TunDatagramClient<R, S> {
 }
 
 #[async_trait::async_trait]
-impl<R: sfo_io::DatagramRecv<Error=Error>, S: sfo_io::DatagramSend<Error=Error>> DatagramClient for TunDatagramClient<R, S> {
+impl<R: sfo_io::DatagramRecv<Error = Error>, S: sfo_io::DatagramSend<Error = Error>> DatagramClient
+    for TunDatagramClient<R, S>
+{
     async fn recv_datagram(&self, buffer: &mut [u8]) -> Result<usize, Error> {
         let mut recv = self.recv.lock().await;
         let n = recv.recv_from(buffer).await?;
@@ -602,7 +627,8 @@ impl Stack for TunStack {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
-        let new_handler = TunConnectionHandler::create(config.hook_point.clone(), env, io_dump).await?;
+        let new_handler =
+            TunConnectionHandler::create(config.hook_point.clone(), env, io_dump).await?;
         *self.inner.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())
     }
@@ -633,16 +659,10 @@ struct TunStackInner {
 impl TunStackInner {
     async fn create(builder: TunStackBuilder) -> StackResult<Self> {
         if builder.id.is_none() {
-            return Err(stack_err!(
-                StackErrorCode::InvalidConfig,
-                "id is required"
-            ));
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "id is required"));
         }
         if builder.ip.is_none() {
-            return Err(stack_err!(
-                StackErrorCode::InvalidConfig,
-                "ip is required"
-            ));
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "ip is required"));
         }
         if builder.mask.is_none() {
             return Err(stack_err!(
@@ -657,7 +677,10 @@ impl TunStackInner {
             ));
         }
         if builder.stack_context.is_none() {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "stack_context is required"));
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "stack_context is required"
+            ));
         }
 
         let env = builder.stack_context.unwrap();
@@ -666,7 +689,7 @@ impl TunStackInner {
             env,
             builder.io_dump,
         )
-            .await?;
+        .await?;
 
         Ok(Self {
             id: builder.id.unwrap(),
@@ -711,14 +734,16 @@ impl TunStackInner {
             cfg.ensure_root_privileges(true);
         });
 
-
         #[cfg(any(target_os = "ios", target_os = "macos"))]
         config.platform_config(|cfg| {
             cfg.packet_information(true);
         });
 
-        let dev = tun::create_as_async(&config)
-            .map_err(into_stack_err!(StackErrorCode::Failed, "create tun device {} failed", self.id))?;
+        let dev = tun::create_as_async(&config).map_err(into_stack_err!(
+            StackErrorCode::Failed,
+            "create tun device {} failed",
+            self.id
+        ))?;
 
         let mut ipstack_config = ipstack::IpStackConfig::default();
         ipstack_config.mtu(self.mtu);
@@ -732,73 +757,83 @@ impl TunStackInner {
         let handle = tokio::spawn(async move {
             loop {
                 match ip_stack.accept().await {
-                    Ok(stream) => {
-                        match stream {
-                            IpStackStream::Tcp(stream) => {
-                                let dest_addr = stream.peer_addr();
-                                let src_addr = stream.local_addr();
-                                let compose_stat = MutComposedSpeedStat::new();
-                                let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
-                                let speed = stat_stream.get_speed_stat();
-                                let handler_snapshot = {
-                                    let handler = this.handler.read().unwrap();
-                                    handler.clone()
-                                };
-                                let handle = tokio::spawn(async move {
-                                    if let Err(e) = handler_snapshot
-                                        .handle_tcp_stream(stat_stream, compose_stat)
-                                        .await
-                                    {
-                                        log::error!("handle tcp stream error: {}", e);
-                                    }
-                                });
-
-                                if let Some(manager) = &this.connection_manager {
-                                    let controller = HandleConnectionController::new(handle);
-                                    manager.add_connection(ConnectionInfo::new(dest_addr.to_string(),
-                                                                               src_addr.to_string(),
-                                                                               StackProtocol::Tcp,
-                                                                               speed, controller));
+                    Ok(stream) => match stream {
+                        IpStackStream::Tcp(stream) => {
+                            let dest_addr = stream.peer_addr();
+                            let src_addr = stream.local_addr();
+                            let compose_stat = MutComposedSpeedStat::new();
+                            let stat_stream =
+                                StatStream::new_with_tracker(stream, compose_stat.clone());
+                            let speed = stat_stream.get_speed_stat();
+                            let handler_snapshot = {
+                                let handler = this.handler.read().unwrap();
+                                handler.clone()
+                            };
+                            let handle = tokio::spawn(async move {
+                                if let Err(e) = handler_snapshot
+                                    .handle_tcp_stream(stat_stream, compose_stat)
+                                    .await
+                                {
+                                    log::error!("handle tcp stream error: {}", e);
                                 }
-                            }
-                            IpStackStream::Udp(stream) => {
-                                let dest_addr = stream.peer_addr();
-                                let src_addr = stream.local_addr();
-                                let compose_stat = MutComposedSpeedStat::new();
-                                let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
-                                let speed = stat_stream.get_speed_stat();
-                                let handler_snapshot = {
-                                    let handler = this.handler.read().unwrap();
-                                    handler.clone()
-                                };
-                                let handle = tokio::spawn(async move {
-                                    if let Err(e) = handler_snapshot
-                                        .handle_udp_stream(stat_stream, compose_stat)
-                                        .await
-                                    {
-                                        log::error!("handle udp stream error: {}", e);
-                                    }
-                                });
+                            });
 
-                                if let Some(manager) = &this.connection_manager {
-                                    let controller = HandleConnectionController::new(handle);
-                                    manager.add_connection(ConnectionInfo::new(dest_addr.to_string(),
-                                                                               src_addr.to_string(),
-                                                                               StackProtocol::Udp,
-                                                                               speed, controller));
-                                }
-                            }
-                            IpStackStream::UnknownTransport(u) => {
-                                let len = u.payload().len();
-                                log::info!("#0 unhandled transport - Ip Protocol {:?}, length {}", u.ip_protocol(), len);
-                                continue;
-                            }
-                            IpStackStream::UnknownNetwork(pkt) => {
-                                log::info!("#0 unknown transport - {} bytes", pkt.len());
-                                continue;
+                            if let Some(manager) = &this.connection_manager {
+                                let controller = HandleConnectionController::new(handle);
+                                manager.add_connection(ConnectionInfo::new(
+                                    dest_addr.to_string(),
+                                    src_addr.to_string(),
+                                    StackProtocol::Tcp,
+                                    speed,
+                                    controller,
+                                ));
                             }
                         }
-                    }
+                        IpStackStream::Udp(stream) => {
+                            let dest_addr = stream.peer_addr();
+                            let src_addr = stream.local_addr();
+                            let compose_stat = MutComposedSpeedStat::new();
+                            let stat_stream =
+                                StatStream::new_with_tracker(stream, compose_stat.clone());
+                            let speed = stat_stream.get_speed_stat();
+                            let handler_snapshot = {
+                                let handler = this.handler.read().unwrap();
+                                handler.clone()
+                            };
+                            let handle = tokio::spawn(async move {
+                                if let Err(e) = handler_snapshot
+                                    .handle_udp_stream(stat_stream, compose_stat)
+                                    .await
+                                {
+                                    log::error!("handle udp stream error: {}", e);
+                                }
+                            });
+
+                            if let Some(manager) = &this.connection_manager {
+                                let controller = HandleConnectionController::new(handle);
+                                manager.add_connection(ConnectionInfo::new(
+                                    dest_addr.to_string(),
+                                    src_addr.to_string(),
+                                    StackProtocol::Udp,
+                                    speed,
+                                    controller,
+                                ));
+                            }
+                        }
+                        IpStackStream::UnknownTransport(u) => {
+                            let len = u.payload().len();
+                            log::info!(
+                                "#0 unhandled transport - Ip Protocol {:?}, length {}",
+                                u.ip_protocol(),
+                                len
+                            );
+                            continue;
+                        }
+                        IpStackStream::UnknownNetwork(pkt) => {
+                            log::info!("#0 unknown transport - {} bytes", pkt.len());
+                            continue;
+                        }
+                    },
                     Err(err) => {
                         log::error!("accept error: {}", err);
                         break;
@@ -808,7 +843,6 @@ impl TunStackInner {
         });
         Ok(handle)
     }
-
 }
 
 pub struct TunStackBuilder {
@@ -889,7 +923,7 @@ impl TunStackBuilder {
         self.io_dump = io_dump;
         self
     }
-    
+
     pub async fn build(self) -> StackResult<TunStack> {
         TunStack::create(self).await
     }
@@ -939,12 +973,8 @@ pub struct TunStackFactory {
 }
 
 impl TunStackFactory {
-    pub fn new(
-        connection_manager: ConnectionManagerRef,
-    ) -> Self {
-        TunStackFactory {
-            connection_manager,
-        }
+    pub fn new(connection_manager: ConnectionManagerRef) -> Self {
+        TunStackFactory { connection_manager }
     }
 }
 
@@ -958,13 +988,19 @@ impl StackFactory for TunStackFactory {
         let config = config
             .as_any()
             .downcast_ref::<TunStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tun stack config"))?;
+            .ok_or(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid tun stack config"
+            ))?;
 
         let stack_context = context
             .as_ref()
             .as_any()
             .downcast_ref::<TunStackContext>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tun stack context"))?;
+            .ok_or(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid tun stack context"
+            ))?;
         let stack_context = Arc::new(stack_context.clone());
         let io_dump = create_io_dump_stack_config(
             &config.id,
@@ -988,7 +1024,8 @@ impl StackFactory for TunStackFactory {
             .connection_manager(self.connection_manager.clone())
             .stack_context(stack_context.clone())
             .io_dump(io_dump)
-            .build().await?;
+            .build()
+            .await?;
         Ok(Arc::new(stack))
     }
 }

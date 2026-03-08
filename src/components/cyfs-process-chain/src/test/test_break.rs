@@ -68,11 +68,7 @@ async fn test_break_outside_map_returns_error() -> Result<(), String> {
 
     let hook_point = HookPoint::new("test_break_outside_map");
     hook_point
-        .load_process_chain_lib(
-            "break_outside_map_lib",
-            0,
-            PROCESS_CHAIN_BREAK_OUTSIDE_MAP,
-        )
+        .load_process_chain_lib("break_outside_map_lib", 0, PROCESS_CHAIN_BREAK_OUTSIDE_MAP)
         .await?;
 
     let data_dir = new_test_data_dir("test-break-outside-map")?;

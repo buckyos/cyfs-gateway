@@ -167,7 +167,8 @@ async fn run_gateway_with_config(
                 .cleanup_interval_seconds
                 .max(1),
         );
-        let device_online_db_path = get_buckyos_service_data_dir("cyfs_gateway").join("device_online.db");
+        let device_online_db_path =
+            get_buckyos_service_data_dir("cyfs_gateway").join("device_online.db");
         let store = SqliteDeviceOnlineStore::new(device_online_db_path)
             .await
             .map_err(|e| anyhow::anyhow!("create sqlite device online store failed: {}", e))?;
@@ -456,7 +457,7 @@ fn load_local_tools() -> Vec<LocalToolCommand> {
         Ok(entries) => entries,
         Err(_) => {
             return tools;
-        },
+        }
     };
 
     for entry in entries.flatten() {
@@ -646,7 +647,9 @@ fn run_local_tool(tool: &LocalToolCommand, args: &[String]) -> Result<i32> {
                     .args(args)
                     .current_dir(&tool.tool_dir)
                     .status()
-                    .map_err(|e| anyhow!("run tool failed {}: {}", tool.script_path.display(), e))?;
+                    .map_err(|e| {
+                        anyhow!("run tool failed {}: {}", tool.script_path.display(), e)
+                    })?;
                 return Ok(status.code().unwrap_or(1));
             }
         }
@@ -1295,10 +1298,7 @@ pub async fn cyfs_gateway_main() {
         if subcommand_path.is_empty() {
             if let Some((candidate_cmd, cmd_index)) = infer_top_level_command_from_args(&raw_args) {
                 if !is_builtin_subcommand(&command, candidate_cmd.as_str()) {
-                    if let Some(tool) = local_tools
-                        .iter()
-                        .find(|tool| tool.name == candidate_cmd)
-                    {
+                    if let Some(tool) = local_tools.iter().find(|tool| tool.name == candidate_cmd) {
                         let tool_args = raw_args.get(cmd_index + 1..).unwrap_or(&[]).to_vec();
                         match run_local_tool(tool, &tool_args) {
                             Ok(code) => std::process::exit(code),
@@ -1385,10 +1385,7 @@ pub async fn cyfs_gateway_main() {
 
     if let Some((candidate_cmd, cmd_index)) = infer_top_level_command_from_args(&raw_args) {
         if !is_builtin_subcommand(&command, candidate_cmd.as_str()) {
-            if let Some(tool) = local_tools
-                .iter()
-                .find(|tool| tool.name == candidate_cmd)
-            {
+            if let Some(tool) = local_tools.iter().find(|tool| tool.name == candidate_cmd) {
                 let tool_args = raw_args.get(cmd_index + 1..).unwrap_or(&[]).to_vec();
                 match run_local_tool(tool, &tool_args) {
                     Ok(code) => std::process::exit(code),
@@ -1410,7 +1407,8 @@ pub async fn cyfs_gateway_main() {
                     sub_cmd.print_help().unwrap();
                     println!();
                 } else {
-                    let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                    let cyfs_cmd_client =
+                        GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
                     if let Ok(help) = cyfs_cmd_client.get_external_cmd_help(sub_name).await {
                         println!("{}", help);
                     } else {

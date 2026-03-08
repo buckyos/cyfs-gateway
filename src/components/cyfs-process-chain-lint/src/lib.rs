@@ -1,6 +1,6 @@
 use cyfs_process_chain::{
-    Block, CommandArg, Expression, ExpressionChain, IfStatement, ProcessChain, ProcessChainJSONLoader,
-    ProcessChainXMLLoader, Statement,
+    Block, CommandArg, Expression, ExpressionChain, IfStatement, ProcessChain,
+    ProcessChainJSONLoader, ProcessChainXMLLoader, Statement,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -654,7 +654,10 @@ impl Analyzer {
             return;
         }
 
-        if block_scope.mark_used(name) || chain_scope.mark_used(name) || self.global_scope.mark_used(name) {
+        if block_scope.mark_used(name)
+            || chain_scope.mark_used(name)
+            || self.global_scope.mark_used(name)
+        {
             return;
         }
 

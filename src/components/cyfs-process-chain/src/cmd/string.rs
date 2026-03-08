@@ -207,7 +207,9 @@ impl CommandExecutor for RewriteCommand {
                     )
                     .await?;
 
-                Ok(CommandResult::success_with_string(template_value.to_owned()))
+                Ok(CommandResult::success_with_string(
+                    template_value.to_owned(),
+                ))
             }
         } else {
             info!(
@@ -1144,15 +1146,25 @@ impl CommandExecutor for StringStartsWithCommand {
         // predicate at INFO is noisy. Keep a single INFO line only on matches,
         // and leave the full trace at DEBUG when needed.
         if starts_with {
-            info!("starts-with matched str='{}' prefix='{}'", string_value, prefix);
+            info!(
+                "starts-with matched str='{}' prefix='{}'",
+                string_value, prefix
+            );
         } else {
-            debug!("starts-with not-matched str='{}' prefix='{}'", string_value, prefix);
+            debug!(
+                "starts-with not-matched str='{}' prefix='{}'",
+                string_value, prefix
+            );
         }
 
         if starts_with {
-            Ok(super::CommandResult::success_with_value(CollectionValue::Bool(true)))
+            Ok(super::CommandResult::success_with_value(
+                CollectionValue::Bool(true),
+            ))
         } else {
-            Ok(super::CommandResult::error_with_value(CollectionValue::Bool(false)))
+            Ok(super::CommandResult::error_with_value(
+                CollectionValue::Bool(false),
+            ))
         }
     }
 }
@@ -1289,15 +1301,25 @@ impl CommandExecutor for StringEndsWithCommand {
         };
 
         if ends_with {
-            info!("ends-with matched str='{}' suffix='{}'", string_value, suffix);
+            info!(
+                "ends-with matched str='{}' suffix='{}'",
+                string_value, suffix
+            );
         } else {
-            debug!("ends-with not-matched str='{}' suffix='{}'", string_value, suffix);
+            debug!(
+                "ends-with not-matched str='{}' suffix='{}'",
+                string_value, suffix
+            );
         }
 
         if ends_with {
-            Ok(super::CommandResult::success_with_value(CollectionValue::Bool(true)))
+            Ok(super::CommandResult::success_with_value(
+                CollectionValue::Bool(true),
+            ))
         } else {
-            Ok(super::CommandResult::error_with_value(CollectionValue::Bool(false)))
+            Ok(super::CommandResult::error_with_value(
+                CollectionValue::Bool(false),
+            ))
         }
     }
 }

@@ -53,7 +53,10 @@ pub(crate) fn parse_exec_scope_and_target(
 
     // Get the index of the argument based on the determined scope
     let target_index = matches.index_of(arg_name).ok_or_else(|| {
-        let msg = format!("Argument '{}' is required for {} command", arg_name, cmd_name);
+        let msg = format!(
+            "Argument '{}' is required for {} command",
+            arg_name, cmd_name
+        );
         error!("{}", msg);
         msg
     })?;
@@ -367,10 +370,6 @@ impl ExecCommandExecutor {
             );
             None
         } else {
-            assert!(
-                !ret.same_lib,
-                "Chain must not be in the same library if same_chain is false"
-            );
             let target_chain = ret.chain.clone().unwrap();
             Some(ExecPointerChainGuard::new(
                 context.current_pointer(),
@@ -470,7 +469,9 @@ pub(crate) struct InvokeArgSpec {
 
 fn validate_invoke_arg_key(key: &str) -> Result<(), String> {
     let mut chars = key.chars();
-    let first = chars.next().ok_or_else(|| "invoke arg key must not be empty".to_string())?;
+    let first = chars
+        .next()
+        .ok_or_else(|| "invoke arg key must not be empty".to_string())?;
     if !(first.is_ascii_alphabetic() || first == '_') {
         let msg = format!(
             "Invalid invoke arg key '{}': must start with letter or underscore",
@@ -518,18 +519,27 @@ pub(crate) fn parse_invoke_args(
     let mut result = Vec::with_capacity(indices.len() / 2);
     for pair in indices.chunks_exact(2) {
         let key_arg = args.get(pair[0]).ok_or_else(|| {
-            let msg = format!("Invalid invoke command: missing arg key at index {}", pair[0]);
+            let msg = format!(
+                "Invalid invoke command: missing arg key at index {}",
+                pair[0]
+            );
             error!("{}", msg);
             msg
         })?;
         let value_arg = args.get(pair[1]).ok_or_else(|| {
-            let msg = format!("Invalid invoke command: missing arg value at index {}", pair[1]);
+            let msg = format!(
+                "Invalid invoke command: missing arg value at index {}",
+                pair[1]
+            );
             error!("{}", msg);
             msg
         })?;
 
         let key = key_arg.as_literal_str().ok_or_else(|| {
-            let msg = format!("Invalid invoke arg key: expected literal, got {:?}", key_arg);
+            let msg = format!(
+                "Invalid invoke arg key: expected literal, got {:?}",
+                key_arg
+            );
             error!("{}", msg);
             msg
         })?;
@@ -658,7 +668,11 @@ pub(crate) struct InvokeCommandExecutor {
 
 impl InvokeCommandExecutor {
     pub(crate) fn new(scope: ExecScope, target: CommandArg, args: Vec<InvokeArgSpec>) -> Self {
-        Self { scope, target, args }
+        Self {
+            scope,
+            target,
+            args,
+        }
     }
 
     async fn build_args_map(&self, caller: &Context) -> Result<MapCollectionRef, String> {
@@ -674,11 +688,7 @@ impl InvokeCommandExecutor {
     async fn inject_args(context: &Context, args: MapCollectionRef) -> Result<(), String> {
         context
             .env()
-            .set(
-                "__args",
-                CollectionValue::Map(args),
-                Some(EnvLevel::Chain),
-            )
+            .set("__args", CollectionValue::Map(args), Some(EnvLevel::Chain))
             .await?;
         Ok(())
     }

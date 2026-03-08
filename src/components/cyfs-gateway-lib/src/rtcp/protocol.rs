@@ -1,4 +1,3 @@
-
 /*
 tunnel的控制协议
 二进制头：2+1+4=7字节
@@ -50,23 +49,22 @@ result:u32
 
 */
 
-use name_lib::DID;
 use anyhow::Result;
+use name_lib::DID;
 
 pub const DEFAULT_RTCP_STACK_PORT: u16 = 2980;
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RTcpTargetStackEP {
     pub did: DID,
-    pub stack_port: u16
+    pub stack_port: u16,
 }
 
 impl RTcpTargetStackEP {
     pub fn new(target_did: DID, stack_port: u16) -> Result<Self> {
         Ok(RTcpTargetStackEP {
             did: target_did,
-            stack_port
+            stack_port,
         })
     }
 }

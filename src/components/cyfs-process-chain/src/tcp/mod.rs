@@ -1,12 +1,12 @@
+mod http;
 mod req;
 mod sni;
 mod stream;
-mod http;
 
+pub use http::*;
+pub use req::*;
 pub use sni::*;
 pub use stream::*;
-pub use req::*;
-pub use http::*;
 
 #[cfg(test)]
 mod example;

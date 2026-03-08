@@ -1,33 +1,21 @@
-
-use crate::cmd::*;
-use clap::{Arg, Command};
-use crate::collection::{CollectionValue, NumberValue};
-use crate::chain::Context;
 use crate::block::CommandArgs;
+use crate::chain::Context;
+use crate::cmd::*;
+use crate::collection::{CollectionValue, NumberValue};
+use clap::{Arg, Command};
 
 pub struct AddCommand {
     name: String,
     cmd: Command,
 }
 
-
 impl AddCommand {
     pub fn new() -> Self {
         let name = "add".to_string();
         let cmd = Command::new(&name)
             .about("Add two numbers")
-            .arg(
-                Arg::new("a")
-                    .help("First number")
-                    .required(true)
-                    .index(1),
-            )
-            .arg(
-                Arg::new("b")
-                    .help("Second number")
-                    .required(true)
-                    .index(2),
-            );
+            .arg(Arg::new("a").help("First number").required(true).index(1))
+            .arg(Arg::new("b").help("Second number").required(true).index(2));
 
         Self { cmd, name }
     }
@@ -45,7 +33,8 @@ impl ExternalCommand for AddCommand {
     }
 
     fn check(&self, args: &CommandArgs) -> Result<(), String> {
-        self.cmd.clone()
+        self.cmd
+            .clone()
             .try_get_matches_from(args.as_str_list())
             .map_err(|e| {
                 let msg = format!("Invalid add command: {:?}, {}", args, e);
@@ -90,7 +79,9 @@ impl ExternalCommand for AddCommand {
 
         let result = a + b;
         let ret = if result.fract() == 0.0 {
-            CommandResult::success_with_value(CollectionValue::Number(NumberValue::Int(result as i64)))
+            CommandResult::success_with_value(CollectionValue::Number(NumberValue::Int(
+                result as i64,
+            )))
         } else {
             CommandResult::success_with_value(CollectionValue::Number(NumberValue::Float(result)))
         };

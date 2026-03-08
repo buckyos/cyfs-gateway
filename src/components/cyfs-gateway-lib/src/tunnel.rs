@@ -49,9 +49,7 @@ pub trait Tunnel: Send + Sync {
         dest_host: Option<String>,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error>;
 
-    async fn open_stream(&self,
-        stream_id:&str,
-    ) -> Result<Box<dyn AsyncStream>, std::io::Error>;
+    async fn open_stream(&self, stream_id: &str) -> Result<Box<dyn AsyncStream>, std::io::Error>;
 
     async fn create_datagram_client_by_dest(
         &self,
@@ -61,9 +59,8 @@ pub trait Tunnel: Send + Sync {
 
     async fn create_datagram_client(
         &self,
-        session_id:&str,
+        session_id: &str,
     ) -> Result<Box<dyn DatagramClientBox>, std::io::Error>;
-
 }
 
 pub trait TunnelBox: Tunnel {
@@ -85,7 +82,10 @@ impl Clone for Box<dyn TunnelBox> {
 
 #[async_trait]
 pub trait TunnelBuilder: Send + Sync + 'static {
-    async fn create_tunnel(&self, tunnel_stack_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>>;
+    async fn create_tunnel(
+        &self,
+        tunnel_stack_id: Option<&str>,
+    ) -> TunnelResult<Box<dyn TunnelBox>>;
 }
 
 #[async_trait]
@@ -98,9 +98,9 @@ pub trait TunnelSelector {
 }
 
 pub fn is_ipv4_addr_str(addr: &str) -> Result<bool, std::io::Error> {
-    let ip_addr = addr.parse::<IpAddr>().map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-    })?;
+    let ip_addr = addr
+        .parse::<IpAddr>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     Ok(ip_addr.is_ipv4())
 }
 
@@ -109,12 +109,8 @@ pub fn get_dest_info_from_url_path(path: &str) -> Result<(Option<String>, u16), 
     let path = std::path::Path::new(path);
 
     let first_component = path.iter().next().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Invalid path: empty path",
-        )
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path: empty path")
     })?;
-
 
     let addr_str = first_component.to_str().ok_or_else(|| {
         std::io::Error::new(
@@ -125,32 +121,33 @@ pub fn get_dest_info_from_url_path(path: &str) -> Result<(Option<String>, u16), 
 
     // 处理以冒号开头的情况（如 ":8000"）和 host:port 的情况
     if addr_str.starts_with(':') {
-
-        let dest_port = addr_str[1..].parse::<u16>().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-        })?;
+        let dest_port = addr_str[1..]
+            .parse::<u16>()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         Ok((None, dest_port))
     } else {
         if let Ok(sock_addr) = addr_str.parse::<SocketAddr>() {
             let dest_host = sock_addr.ip().to_string();
             let dest_port = sock_addr.port();
-            return Ok((Some(dest_host), dest_port))
+            return Ok((Some(dest_host), dest_port));
         }
 
         let parts = addr_str.split(':').collect::<Vec<&str>>();
         if parts.len() != 2 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid address format"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Invalid address format",
+            ));
         }
 
         let dest_host = parts[0];
-        let dest_port = parts[1].parse::<u16>().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
-        })?;
+        let dest_port = parts[1]
+            .parse::<u16>()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
         Ok((Some(dest_host.to_string()), dest_port))
     }
 }
-
 
 pub fn has_scheme(s: &str) -> bool {
     let re = regex::Regex::new(r"^[a-zA-Z][a-zA-Z0-9+.-]*://").unwrap();
@@ -167,17 +164,24 @@ mod tests {
         unsafe {
             std::env::set_var("BUCKY_LOG", "debug");
         }
-        buckyos_kit::init_logging("test_get_dest_info_from_url_path",false);
+        buckyos_kit::init_logging("test_get_dest_info_from_url_path", false);
         let (host, port) = get_dest_info_from_url_path("127.0.0.1:8080").unwrap();
         assert_eq!(host, Some("127.0.0.1".to_string()));
         assert_eq!(port, 8080);
 
-        let (host, port) = get_dest_info_from_url_path("xba.dev.did:8080/krpc/api_test?a=1&b=2").unwrap();
+        let (host, port) =
+            get_dest_info_from_url_path("xba.dev.did:8080/krpc/api_test?a=1&b=2").unwrap();
         assert_eq!(host, Some("xba.dev.did".to_string()));
         assert_eq!(port, 8080);
 
-        let (host, port) = get_dest_info_from_url_path("/[2600:1700:1150:9440:f65:adec:9b77:cb2]:8080/krpc/api_test").unwrap();
-        assert_eq!(host, Some("2600:1700:1150:9440:f65:adec:9b77:cb2".to_string()));
+        let (host, port) = get_dest_info_from_url_path(
+            "/[2600:1700:1150:9440:f65:adec:9b77:cb2]:8080/krpc/api_test",
+        )
+        .unwrap();
+        assert_eq!(
+            host,
+            Some("2600:1700:1150:9440:f65:adec:9b77:cb2".to_string())
+        );
         assert_eq!(port, 8080);
 
         let (host, port) = get_dest_info_from_url_path(":8080").unwrap();
@@ -189,11 +193,18 @@ mod tests {
         let ipv6_addr = is_ipv4_addr_str("::1").unwrap();
         assert_eq!(ipv6_addr, false);
 
-        let upstream_url = Url::parse("rtcp://TeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did/:80").unwrap();
-        assert_eq!(upstream_url.host_str().unwrap(), "TeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did");
+        let upstream_url =
+            Url::parse("rtcp://TeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did/:80").unwrap();
+        assert_eq!(
+            upstream_url.host_str().unwrap(),
+            "TeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did"
+        );
 
         let upstream_url = Url::parse("rtcp://TeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did/rtcp%3A%2F%2FTeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did%2F%3A443").unwrap();
-        assert_eq!(upstream_url.host_str().unwrap(), "TeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did");
+        assert_eq!(
+            upstream_url.host_str().unwrap(),
+            "TeVOLYpilvPwXNVh4dSRH4VQ6y-4t-sawmn3thKOqJM.dev.did"
+        );
         let path = upstream_url.path();
         // Use percent_encoding instead of urlencoding and fix str_as_str lint
 

@@ -1,16 +1,14 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use crate::ip::{IPTunnelBuilder, ProxyTcpTunnelBuilder};
 use crate::DatagramClientBox;
-use crate::{
-    TunnelBox, TunnelBuilder, TunnelError, TunnelResult,
-};
-use buckyos_kit::AsyncStream;
-use log::*;
-use url::Url;
+use crate::ip::{IPTunnelBuilder, ProxyTcpTunnelBuilder};
 use crate::quic_tunnel::QuicTunnelBuilder;
 use crate::socks::SocksTunnelBuilder;
 use crate::tls_tunnel::TlsTunnelBuilder;
+use crate::{TunnelBox, TunnelBuilder, TunnelError, TunnelResult};
+use buckyos_kit::AsyncStream;
+use log::*;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use url::Url;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProtocolCategory {
@@ -65,7 +63,10 @@ impl TunnelManager {
     }
 
     pub fn register_tunnel_builder(&self, protocol: &str, builder: Arc<dyn TunnelBuilder>) {
-        self.tunnel_builder_manager.lock().unwrap().insert(protocol.to_string(), builder);
+        self.tunnel_builder_manager
+            .lock()
+            .unwrap()
+            .insert(protocol.to_string(), builder);
     }
 
     pub fn remove_tunnel_builder(&self, protocol: &str) {
@@ -93,21 +94,17 @@ impl TunnelManager {
     ) -> TunnelResult<Box<dyn TunnelBox>> {
         let builder = self
             .get_tunnel_builder_by_protocol(target_url.scheme())
-            .await.map_err(|e| {
+            .await
+            .map_err(|e| {
                 error!("Get tunnel builder by protocol failed: {:?}", e);
                 e
             })?;
-            let auth = target_url.authority();
-        let tunnel_stack_id = if auth.is_empty() {
-                None
-            } else {
-                Some(auth)
-        };
-        let tunnel = builder.create_tunnel(tunnel_stack_id)
-            .await.map_err(|e| {
-                error!("create_tunnel to {} failed: {:?}", target_url, e);
-                e
-            })?;
+        let auth = target_url.authority();
+        let tunnel_stack_id = if auth.is_empty() { None } else { Some(auth) };
+        let tunnel = builder.create_tunnel(tunnel_stack_id).await.map_err(|e| {
+            error!("create_tunnel to {} failed: {:?}", target_url, e);
+            e
+        })?;
 
         info!("Get tunnel for {} success", target_url);
         return Ok(tunnel);
@@ -159,7 +156,6 @@ impl TunnelManager {
     }
 }
 
-
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -167,8 +163,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
-    struct MockTunnel {
-    }
+    struct MockTunnel {}
 
     #[async_trait]
     impl crate::Tunnel for MockTunnel {
@@ -181,11 +176,17 @@ mod tests {
             _dest_port: u16,
             _dest_host: Option<String>,
         ) -> Result<Box<dyn AsyncStream>, io::Error> {
-            Err(io::Error::new(io::ErrorKind::Unsupported, "not used in test"))
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "not used in test",
+            ))
         }
 
         async fn open_stream(&self, _stream_id: &str) -> Result<Box<dyn AsyncStream>, io::Error> {
-            Err(io::Error::new(io::ErrorKind::Unsupported, "not used in test"))
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "not used in test",
+            ))
         }
 
         async fn create_datagram_client_by_dest(
@@ -193,14 +194,20 @@ mod tests {
             _dest_port: u16,
             _dest_host: Option<String>,
         ) -> Result<Box<dyn crate::DatagramClientBox>, io::Error> {
-            Err(io::Error::new(io::ErrorKind::Unsupported, "not used in test"))
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "not used in test",
+            ))
         }
 
         async fn create_datagram_client(
             &self,
             _session_id: &str,
         ) -> Result<Box<dyn crate::DatagramClientBox>, io::Error> {
-            Err(io::Error::new(io::ErrorKind::Unsupported, "not used in test"))
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "not used in test",
+            ))
         }
     }
 
@@ -211,19 +218,20 @@ mod tests {
 
     #[async_trait]
     impl TunnelBuilder for MockTunnelBuilder {
-        async fn create_tunnel(&self, tunnel_stack_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>> {
+        async fn create_tunnel(
+            &self,
+            tunnel_stack_id: Option<&str>,
+        ) -> TunnelResult<Box<dyn TunnelBox>> {
             *self.captured.lock().unwrap() = tunnel_stack_id.map(|s| s.to_string());
             Ok(Box::new(MockTunnel::default()))
         }
     }
 
-
-
     #[tokio::test]
     async fn test_tunnel_url_in_stream_id() {
+        use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
         use url::Url;
-        use percent_encoding::{utf8_percent_encode, percent_decode_str, NON_ALPHANUMERIC};
-        
+
         let tunnel_url = "rtcp://sn.buckyos.ai/google.com:443";
         let url = Url::parse(tunnel_url).unwrap();
         let stream_id = url.path();
@@ -234,23 +242,22 @@ mod tests {
         // 因为嵌入的 URL 包含特殊字符（://、/ 等），必须编码以避免破坏外层 URL 结构
         let embedded_url = "rtcp://sn.buckyos.io/google.com:443/";
         let encoded_url = utf8_percent_encode(embedded_url, NON_ALPHANUMERIC).to_string();
-        
+
         let mut url2 = url.clone();
         let new_path = format!("/{}", encoded_url);
         url2.set_path(&new_path);
         let url2_str = url2.to_string();
-        
+
         println!("embedded_url: {}", embedded_url);
         println!("encoded in path: {}", encoded_url);
         println!("final url: {}", url2_str);
-        
+
         // 验证可以正确解码回原始 URL
         let decoded_path = percent_decode_str(url2.path().trim_start_matches('/'))
             .decode_utf8()
             .unwrap();
         println!("decoded_path: {}", decoded_path);
         assert_eq!(decoded_path, embedded_url);
-
     }
 
     #[tokio::test]

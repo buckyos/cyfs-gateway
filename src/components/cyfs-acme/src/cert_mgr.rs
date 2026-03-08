@@ -1,33 +1,37 @@
-use rand::Rng;
-use tokio::fs;
+use crate::acme_client::{AcmeAccount, AcmeChallengeResponderRef, AcmeClient, AcmeOrderSession};
+use crate::default_challenge_responder::DefaultChallengeResponder;
+use crate::{Challenge, ChallengeData, ChallengeType};
 use anyhow::Result;
-use std::collections::HashMap;
-use std::fmt::{Debug, Formatter};
-use std::path::{Path, PathBuf};
-use rustls::server::{ResolvesServerCert, ClientHello};
-use rustls::sign::CertifiedKey;
-use std::sync::{Arc, Weak};
-use std::sync::RwLock;
-use tokio::task;
 use log::*;
-use crate::acme_client::{AcmeClient, AcmeOrderSession, AcmeAccount, AcmeChallengeResponderRef};
 use openssl::x509::X509;
-use std::sync::Mutex;
-use std::time::Duration;
+use rand::Rng;
 use rustls::crypto::ring::sign::any_supported_type;
-use rustls::pki_types::{PrivateKeyDer};
+use rustls::pki_types::PrivateKeyDer;
+use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign;
+use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sfo_js::{JsPkgManager, JsPkgManagerRef, JsString, JsValue};
+use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::RwLock;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+use tokio::fs;
+use tokio::task;
 use tokio::task::JoinHandle;
-use crate::{Challenge, ChallengeData, ChallengeType};
-use crate::default_challenge_responder::DefaultChallengeResponder;
 
 pub const ACME_TLS_ALPN_NAME: &[u8] = b"acme-tls/1";
 
 pub fn is_tls_alpn_challenge(client_hello: &ClientHello) -> bool {
-    client_hello.alpn().into_iter().flatten().eq([ACME_TLS_ALPN_NAME])
+    client_hello
+        .alpn()
+        .into_iter()
+        .flatten()
+        .eq([ACME_TLS_ALPN_NAME])
 }
 
 #[derive(Clone)]
@@ -68,7 +72,7 @@ impl Drop for CertStubInner {
     }
 }
 pub struct CertStub {
-    inner: Arc<CertStubInner>
+    inner: Arc<CertStubInner>,
 }
 
 impl Clone for CertStub {
@@ -79,13 +83,11 @@ impl Clone for CertStub {
     }
 }
 
-
 impl std::fmt::Display for CertStub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "CertStub domains: {:?}", self.inner.acme_item)
     }
 }
-
 
 impl CertStub {
     fn new(
@@ -105,7 +107,7 @@ impl CertStub {
                     order: None,
                 }),
                 handle: Mutex::new(None),
-            })
+            }),
         }
     }
 
@@ -126,8 +128,8 @@ impl CertStub {
 
         let key = PrivateKeyDer::Pkcs8(keys.remove(0));
 
-        let signing_key = any_supported_type(&key)
-            .map_err(|e| anyhow::anyhow!("Invalid private key: {}", e))?;
+        let signing_key =
+            any_supported_type(&key).map_err(|e| anyhow::anyhow!("Invalid private key: {}", e))?;
 
         Ok(CertifiedKey::new(cert_chain, signing_key))
     }
@@ -138,12 +140,16 @@ impl CertStub {
         // info!("cert expiry raw: {}", not_after);
 
         // 移除最后的时区名称，因为证书时间总是 UTC
-        let datetime_str = not_after.rsplitn(2, ' ')
+        let datetime_str = not_after
+            .rsplitn(2, ' ')
             .nth(1)
             .ok_or_else(|| anyhow::anyhow!("Invalid datetime format"))?;
 
         let expires = chrono::NaiveDateTime::parse_from_str(datetime_str, "%b %e %H:%M:%S %Y")?;
-        Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(expires, chrono::Utc))
+        Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            expires,
+            chrono::Utc,
+        ))
     }
 
     pub fn get_cert(&self) -> Option<Arc<CertifiedKey>> {
@@ -155,7 +161,6 @@ impl CertStub {
             CertState::None => None,
         }
     }
-
 
     pub fn load_cert(&self) {
         let mut handle = self.inner.handle.lock().unwrap();
@@ -173,8 +178,16 @@ impl CertStub {
 
     async fn load_cert_inner(&self) -> Result<()> {
         // 尝试从 keystore_path 加载最新的证书
-        let dir = tokio::fs::read_dir(&self.inner.keystore_path).await
-            .map_err(|e| anyhow::anyhow!("read keystore dir failed, stub: {}, path: {}, {}", self, self.inner.keystore_path, e))?;
+        let dir = tokio::fs::read_dir(&self.inner.keystore_path)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "read keystore dir failed, stub: {}, path: {}, {}",
+                    self,
+                    self.inner.keystore_path,
+                    e
+                )
+            })?;
 
         let mut entries = Vec::new();
         tokio::pin!(dir);
@@ -186,7 +199,10 @@ impl CertStub {
 
         if entries.is_empty() {
             // 如果没有找到证书，启动证书申请流程
-            info!("no cert found in keystore, start ordering new cert, stub: {}", self);
+            info!(
+                "no cert found in keystore, start ordering new cert, stub: {}",
+                self
+            );
             self.start_order().await?;
             return Ok(());
         }
@@ -198,34 +214,67 @@ impl CertStub {
         info!("load cert, stub: {}, cert_path: {}", self, cert_path);
         let key_path = cert_path.replace(".cert", ".key");
 
-        let cert_data = fs::read(&cert_path).await
-            .map_err(|e| {
-                error!("load cert failed, stub: {}, cert_path: {}, {}", self, cert_path, e);
-                anyhow::anyhow!("load cert failed, stub: {}, cert_path: {}, {}", self, cert_path, e)
-            })?;
-        let key_data = fs::read(&key_path).await
-            .map_err(|e| {
-                error!("load cert failed, stub: {}, key_path: {}, {}", self, key_path, e);
-                anyhow::anyhow!("load cert failed, stub: {}, key_path: {}, {}", self, key_path, e)
-            })?;
+        let cert_data = fs::read(&cert_path).await.map_err(|e| {
+            error!(
+                "load cert failed, stub: {}, cert_path: {}, {}",
+                self, cert_path, e
+            );
+            anyhow::anyhow!(
+                "load cert failed, stub: {}, cert_path: {}, {}",
+                self,
+                cert_path,
+                e
+            )
+        })?;
+        let key_data = fs::read(&key_path).await.map_err(|e| {
+            error!(
+                "load cert failed, stub: {}, key_path: {}, {}",
+                self, key_path, e
+            );
+            anyhow::anyhow!(
+                "load cert failed, stub: {}, key_path: {}, {}",
+                self,
+                key_path,
+                e
+            )
+        })?;
 
-        let certified_key = Self::create_certified_key(&cert_data, &key_data)
-            .map_err(|e| {
-                error!("create certified key failed, stub: {}, cert_path: {}, key_path: {}, {}", self, cert_path, key_path, e);
-                anyhow::anyhow!("create certified key failed, stub: {}, cert_path: {}, key_path: {}, {}", self, cert_path, key_path, e)
-            })?;
-        let expires = Self::get_cert_expiry(&cert_data)
-            .map_err(|e| {
-                error!("get cert expiry failed, stub: {}, cert_path: {}, key_path: {}, {}", self, cert_path, key_path, e);
-                anyhow::anyhow!("get cert expiry failed, stub: {}, cert_path: {}, key_path: {}, {}", self, cert_path, key_path, e)
-            })?;
+        let certified_key = Self::create_certified_key(&cert_data, &key_data).map_err(|e| {
+            error!(
+                "create certified key failed, stub: {}, cert_path: {}, key_path: {}, {}",
+                self, cert_path, key_path, e
+            );
+            anyhow::anyhow!(
+                "create certified key failed, stub: {}, cert_path: {}, key_path: {}, {}",
+                self,
+                cert_path,
+                key_path,
+                e
+            )
+        })?;
+        let expires = Self::get_cert_expiry(&cert_data).map_err(|e| {
+            error!(
+                "get cert expiry failed, stub: {}, cert_path: {}, key_path: {}, {}",
+                self, cert_path, key_path, e
+            );
+            anyhow::anyhow!(
+                "get cert expiry failed, stub: {}, cert_path: {}, key_path: {}, {}",
+                self,
+                cert_path,
+                key_path,
+                e
+            )
+        })?;
 
-        info!("load cert success, stub: {}, cert_path: {}, key_path: {}, expires: {}", self, cert_path, key_path, expires);
+        info!(
+            "load cert success, stub: {}, cert_path: {}, key_path: {}, expires: {}",
+            self, cert_path, key_path, expires
+        );
 
         let mut mut_part = self.inner.mut_part.lock().unwrap();
         mut_part.state = CertState::Ready(CertInfo {
             key: Arc::new(certified_key),
-            expires
+            expires,
         });
 
         Ok(())
@@ -259,7 +308,7 @@ impl CertStub {
                     }
                 }
                 CertState::Renewing(_) => true,
-                CertState::Expired(_) => true
+                CertState::Expired(_) => true,
             }
         };
 
@@ -274,7 +323,7 @@ impl CertStub {
         let mut order = AcmeOrderSession::new(
             self.inner.acme_item.domain.clone(),
             self.inner.acme_client.clone(),
-            self.inner.responder.clone()
+            self.inner.responder.clone(),
         );
         let (cert_data, key_data) = order.start().await?;
 
@@ -288,8 +337,10 @@ impl CertStub {
         let certified_key = Self::create_certified_key(&cert_data, &key_data)?;
         let expires = Self::get_cert_expiry(&cert_data)?;
 
-        info!("save cert success, stub: {}, cert_path: {}, key_path: {}, expires: {}",
-            self, cert_path, key_path, expires);
+        info!(
+            "save cert success, stub: {}, cert_path: {}, key_path: {}, expires: {}",
+            self, cert_path, key_path, expires
+        );
 
         {
             let mut mut_part = self.inner.mut_part.lock().unwrap();
@@ -346,7 +397,11 @@ pub struct AcmeItem {
 }
 
 impl AcmeItem {
-    pub fn new(domain: String, challenge_type: ChallengeType, data: Option<serde_json::Value>) -> Self {
+    pub fn new(
+        domain: String,
+        challenge_type: ChallengeType,
+        data: Option<serde_json::Value>,
+    ) -> Self {
         Self {
             domain,
             challenge_type,
@@ -368,8 +423,11 @@ pub struct ExternalDnsProvider {
 }
 
 impl ExternalDnsProvider {
-    pub fn new(js_pkg_manager: JsPkgManagerRef, name: impl Into<String>, provider_params: Value) -> Arc<Self> {
-
+    pub fn new(
+        js_pkg_manager: JsPkgManagerRef,
+        name: impl Into<String>,
+        provider_params: Value,
+    ) -> Arc<Self> {
         Arc::new(Self {
             name: name.into(),
             provider_params,
@@ -381,17 +439,30 @@ impl ExternalDnsProvider {
 #[async_trait::async_trait]
 impl DnsProvider for ExternalDnsProvider {
     async fn call(&self, op: String, domain: String, key_hash: String) -> Result<()> {
-        let pkg = self.js_pkg_manager.get_pkg(self.name.clone()).await
+        let pkg = self
+            .js_pkg_manager
+            .get_pkg(self.name.clone())
+            .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        pkg.run_with_json(vec![Value::String(op), self.provider_params.clone(), Value::String(domain), Value::String(key_hash)]).await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        pkg.run_with_json(vec![
+            Value::String(op),
+            self.provider_params.clone(),
+            Value::String(domain),
+            Value::String(key_hash),
+        ])
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
 pub trait DnsProviderFactory: Send + Sync + 'static {
-    async fn create(&self, acme_mgr: Weak<AcmeCertManager>, params: serde_json::Value) -> Result<DnsProviderRef>;
+    async fn create(
+        &self,
+        acme_mgr: Weak<AcmeCertManager>,
+        params: serde_json::Value,
+    ) -> Result<DnsProviderRef>;
 }
 pub type DnsProviderFactoryRef = Arc<dyn DnsProviderFactory>;
 
@@ -425,17 +496,17 @@ pub struct CertManagerConfig {
     pub keystore_path: String,
     pub dns_provider_path: Option<String>,
     #[serde(default = "default_check_interval")]
-    pub check_interval: chrono::Duration,     // 检查证书的时间间隔
+    pub check_interval: chrono::Duration, // 检查证书的时间间隔
     #[serde(default = "default_renew_before_expiry")]
     pub renew_before_expiry: chrono::Duration, // 过期前多久开始续期
 }
 
 fn default_check_interval() -> chrono::Duration {
-    chrono::Duration::hours(12)  // 默认每12小时检查一次
+    chrono::Duration::hours(12) // 默认每12小时检查一次
 }
 
 fn default_renew_before_expiry() -> chrono::Duration {
-    chrono::Duration::days(30)   // 默认过期前30天续期
+    chrono::Duration::days(30) // 默认过期前30天续期
 }
 
 impl Default for CertManagerConfig {
@@ -469,27 +540,32 @@ impl Drop for AcmeCertManager {
 }
 
 impl AcmeCertManager {
-    pub fn register_dns_provider_factory(
-        name: impl Into<String>,
-        factory: DnsProviderFactoryRef,
-    ) {
-        DNS_PROVIDER_FACTORYS.write().unwrap().insert(name.into(), factory);
+    pub fn register_dns_provider_factory(name: impl Into<String>, factory: DnsProviderFactoryRef) {
+        DNS_PROVIDER_FACTORYS
+            .write()
+            .unwrap()
+            .insert(name.into(), factory);
     }
 
     pub async fn create(config: CertManagerConfig) -> Result<AcmeCertManagerRef> {
         info!("create cert manager, config: {:?}", config);
 
         if !Path::new(config.keystore_path.as_str()).exists() {
-            tokio::fs::create_dir_all(config.keystore_path.as_str()).await.map_err(|e| {
-                error!("Failed to create keystore path: {}", e);
-                e
-            })?;
+            tokio::fs::create_dir_all(config.keystore_path.as_str())
+                .await
+                .map_err(|e| {
+                    error!("Failed to create keystore path: {}", e);
+                    e
+                })?;
         }
 
         let account_path = buckyos_kit::path_join(&config.keystore_path, "acme_account.json");
         let account = match AcmeAccount::from_file(&*account_path).await {
             Ok(account) => {
-                info!("Loading ACME account from {}", account_path.to_str().unwrap());
+                info!(
+                    "Loading ACME account from {}",
+                    account_path.to_str().unwrap()
+                );
                 match config.account.clone() {
                     Some(account_name) => {
                         if account_name.as_str() != account.email() {
@@ -502,16 +578,12 @@ impl AcmeCertManager {
                             account
                         }
                     }
-                    None => {
-                        account
-                    }
+                    None => account,
                 }
             }
             Err(_) => {
                 let account = match config.account.clone() {
-                    Some(account_name) => {
-                        AcmeAccount::new(account_name)
-                    }
+                    Some(account_name) => AcmeAccount::new(account_name),
                     None => {
                         // 生成随机邮箱并创建新账号
                         let random_str = rand::rng().random_range(0..1000000);
@@ -546,25 +618,27 @@ impl AcmeCertManager {
 
         if let Some(dns_providers_config) = &config.dns_providers {
             let provider_manager = if config.dns_provider_path.is_some() {
-                let dns_provider_path = Path::new(config.dns_provider_path.as_ref().unwrap()).to_path_buf();
+                let dns_provider_path =
+                    Path::new(config.dns_provider_path.as_ref().unwrap()).to_path_buf();
                 let js_pkg_manager = JsPkgManager::new(dns_provider_path);
                 Some(js_pkg_manager)
             } else {
                 None
             };
             for (name, provider_config) in dns_providers_config.iter() {
-                let factory = {
-                    DNS_PROVIDER_FACTORYS.read().unwrap().get(name).cloned()
-                };
+                let factory = { DNS_PROVIDER_FACTORYS.read().unwrap().get(name).cloned() };
                 if let Some(factory) = factory {
-                    let provider = factory.create(Arc::downgrade(&manager), provider_config.clone()).await?;
+                    let provider = factory
+                        .create(Arc::downgrade(&manager), provider_config.clone())
+                        .await?;
                     dns_providers.insert(name.clone(), provider);
                 } else {
                     if provider_manager.is_some() {
                         let provider = ExternalDnsProvider::new(
                             provider_manager.as_ref().unwrap().clone(),
                             name.as_str(),
-                            provider_config.clone());
+                            provider_config.clone(),
+                        );
                         dns_providers.insert(name.clone(), provider);
                     }
                 }
@@ -574,7 +648,6 @@ impl AcmeCertManager {
             manager.dns_providers.write().unwrap().extend(dns_providers);
         }
 
-
         {
             let mut responder = manager.responder.lock().unwrap();
             *responder = Some(Arc::new(DefaultChallengeResponder::new(manager.clone())));
@@ -583,9 +656,8 @@ impl AcmeCertManager {
         {
             let weak_manager = Arc::downgrade(&manager);
             let handle: JoinHandle<()> = tokio::spawn(async move {
-                let check_interval = tokio::time::Duration::from_secs(
-                    config.check_interval.num_seconds() as u64
-                );
+                let check_interval =
+                    tokio::time::Duration::from_secs(config.check_interval.num_seconds() as u64);
                 let mut interval = tokio::time::interval(check_interval);
                 loop {
                     interval.tick().await;
@@ -603,21 +675,32 @@ impl AcmeCertManager {
     }
 
     pub fn register_dns_provider(&self, name: impl Into<String>, provider: impl DnsProvider) {
-        self.dns_providers.write().unwrap().insert(name.into(), Arc::new(provider));
+        self.dns_providers
+            .write()
+            .unwrap()
+            .insert(name.into(), Arc::new(provider));
     }
 
     pub fn add_acme_item(&self, item: AcmeItem) -> Result<()> {
-        let keystore_path = buckyos_kit::path_join(&self.config.keystore_path, &sanitize_path_component(&item.domain));
+        let keystore_path = buckyos_kit::path_join(
+            &self.config.keystore_path,
+            &sanitize_path_component(&item.domain),
+        );
         if !keystore_path.exists() {
             if let Err(e) = std::fs::create_dir_all(&keystore_path) {
-                error!("Failed to create certificate storage directory: {} {}", e, keystore_path.to_str().unwrap());
-                return Err(anyhow::anyhow!("Failed to create certificate storage directory: {}", e));
+                error!(
+                    "Failed to create certificate storage directory: {} {}",
+                    e,
+                    keystore_path.to_str().unwrap()
+                );
+                return Err(anyhow::anyhow!(
+                    "Failed to create certificate storage directory: {}",
+                    e
+                ));
             }
         }
 
-        let responder = {
-            self.responder.lock().unwrap().clone().unwrap()
-        };
+        let responder = { self.responder.lock().unwrap().clone().unwrap() };
         let mut certs = self.certs.write().unwrap();
         if certs.contains_key(&item.domain) {
             return Ok(());
@@ -642,10 +725,10 @@ impl AcmeCertManager {
             return Some(cert.unwrap().clone());
         }
 
-        for (key,value) in certs.iter() {
+        for (key, value) in certs.iter() {
             if key.starts_with("*.") {
                 if host.ends_with(&key[2..]) {
-                    info!("find tls config for host: {} ==> key:{}",host,key);
+                    info!("find tls config for host: {} ==> key:{}", host, key);
                     return Some(value.clone());
                 }
             }
@@ -655,7 +738,13 @@ impl AcmeCertManager {
     }
 
     fn check_all_certs(&self) -> Result<()> {
-        let certs = self.certs.read().unwrap().values().cloned().collect::<Vec<_>>();
+        let certs = self
+            .certs
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
 
         for cert in certs {
             if let Err(e) = cert.check_cert(self.config.renew_before_expiry) {
@@ -665,7 +754,10 @@ impl AcmeCertManager {
         Ok(())
     }
 
-    pub(crate) async fn respond_challenge<'a>(&self, challenges: &'a [Challenge]) -> anyhow::Result<&'a Challenge> {
+    pub(crate) async fn respond_challenge<'a>(
+        &self,
+        challenges: &'a [Challenge],
+    ) -> anyhow::Result<&'a Challenge> {
         for challenge in challenges {
             let cert_stub = {
                 let certs = self.certs.read().unwrap();
@@ -685,16 +777,23 @@ impl AcmeCertManager {
                     } else {
                         continue;
                     }
-                },
-                ChallengeData::Dns01 { token: _, ref key_hash } => {
+                }
+                ChallengeData::Dns01 {
+                    token: _,
+                    ref key_hash,
+                } => {
                     if cert_stub.inner.acme_item.challenge_type == ChallengeType::Dns01 {
-                        self.call_dns_provider(&cert_stub, key_hash.as_str(), "add_challenge").await?;
+                        self.call_dns_provider(&cert_stub, key_hash.as_str(), "add_challenge")
+                            .await?;
                         return Ok(challenge);
                     } else {
                         continue;
                     }
-                },
-                ChallengeData::Http01 { ref token, ref key_auth } => {
+                }
+                ChallengeData::Http01 {
+                    ref token,
+                    ref key_auth,
+                } => {
                     if cert_stub.inner.acme_item.challenge_type == ChallengeType::Http01 {
                         let mut http_challenges = self.http_challenges.lock().unwrap();
                         http_challenges.insert(token.clone(), key_auth.clone());
@@ -718,8 +817,11 @@ impl AcmeCertManager {
             ChallengeData::TlsAlpn01 { cert: _ } => {
                 let mut challenge_certs = self.challenge_certs.lock().unwrap();
                 challenge_certs.remove(&challenge.domain);
-            },
-            ChallengeData::Dns01 { token: _, ref key_hash } => {
+            }
+            ChallengeData::Dns01 {
+                token: _,
+                ref key_hash,
+            } => {
                 let cert_stub = {
                     let certs = self.certs.read().unwrap();
                     certs.get(challenge.domain.as_str()).cloned()
@@ -731,12 +833,18 @@ impl AcmeCertManager {
                 let key_hash = key_hash.to_string();
                 let this = self.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = this.call_dns_provider(&cert_stub, key_hash.as_str(), "del_challenge").await {
+                    if let Err(e) = this
+                        .call_dns_provider(&cert_stub, key_hash.as_str(), "del_challenge")
+                        .await
+                    {
                         error!("revert challenge failed: {}", e);
                     }
                 });
-            },
-            ChallengeData::Http01 { token: _, key_auth: _ } => {
+            }
+            ChallengeData::Http01 {
+                token: _,
+                key_auth: _,
+            } => {
                 let mut http_challenges = self.http_challenges.lock().unwrap();
                 http_challenges.remove(&challenge.domain);
             }
@@ -748,18 +856,32 @@ impl AcmeCertManager {
         providers.get(provider_name).cloned()
     }
 
-    async fn call_dns_provider(&self, cert_stub: &CertStub, key_hash: &str, op: &str) -> Result<()> {
+    async fn call_dns_provider(
+        &self,
+        cert_stub: &CertStub,
+        key_hash: &str,
+        op: &str,
+    ) -> Result<()> {
         if cert_stub.inner.acme_item.data.is_none() {
             return Err(anyhow::anyhow!("dns challenge provider params is empty"));
         }
 
         let provider_data = cert_stub.inner.acme_item.data.clone().unwrap();
         let provider_info: DnsProviderInfo = serde_json::from_value(provider_data.clone())
-            .map_err(|e| anyhow::anyhow!("parse plugin data {} failed: {}", serde_json::to_string(&provider_data).unwrap_or("".to_string()), e))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "parse plugin data {} failed: {}",
+                    serde_json::to_string(&provider_data).unwrap_or("".to_string()),
+                    e
+                )
+            })?;
 
         let provider = self.get_provider(provider_info.dns_provider.as_str());
         if provider.is_none() {
-            return Err(anyhow::anyhow!("dns challenge provider {} not exists", provider_info.dns_provider));
+            return Err(anyhow::anyhow!(
+                "dns challenge provider {} not exists",
+                provider_info.dns_provider
+            ));
         }
         let provider = provider.unwrap().clone();
 
@@ -769,7 +891,9 @@ impl AcmeCertManager {
             format!("_acme-challenge.{}", cert_stub.inner.acme_item.domain)
         };
 
-        provider.call(op.to_string(), domain, key_hash.to_string()).await
+        provider
+            .call(op.to_string(), domain, key_hash.to_string())
+            .await
     }
 }
 

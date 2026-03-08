@@ -7,26 +7,27 @@ use cyfs_process_chain::{
     CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor,
 };
 use name_lib::{
-    encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DIDDocumentTrait,
-    DeviceConfig, EncodedDocument,
+    DIDDocumentTrait, DeviceConfig, EncodedDocument, encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk,
+    load_raw_private_key,
 };
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
 use url::Url;
 
-use crate::global_process_chains::{create_process_chain_executor, execute_chain, GlobalProcessChainsRef};
+use crate::global_process_chains::{
+    GlobalProcessChainsRef, create_process_chain_executor, execute_chain,
+};
 use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
 use crate::stack::{datagram_forward, get_limit_info, stream_forward};
 use crate::{
-    create_io_dump_stack_config, get_external_commands, get_stat_info, has_scheme,
-    hyper_serve_http, into_stack_err, stack_err, ConnectionInfo, ConnectionManagerRef,
-    DatagramInfo, DumpStream, GlobalCollectionManagerRef, HandleConnectionController,
-    IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef, MutComposedSpeedStat,
-    MutComposedSpeedStatRef, ProcessChainConfigs, RTcp, RTcpListener, Server,
+    ConnectionInfo, ConnectionManagerRef, DatagramInfo, DumpStream, GlobalCollectionManagerRef,
+    HandleConnectionController, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
+    MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs, RTcp, RTcpListener, Server,
     ServerManagerRef, Stack, StackConfig, StackContext, StackErrorCode, StackFactory,
-    StackProtocol, StackRef, StackResult, StatManagerRef, StreamInfo, TunnelBox,
-    TunnelBuilder, TunnelEndpoint, TunnelError, TunnelManager, TunnelResult,
+    StackProtocol, StackRef, StackResult, StatManagerRef, StreamInfo, TunnelBox, TunnelBuilder,
+    TunnelEndpoint, TunnelError, TunnelManager, TunnelResult, create_io_dump_stack_config,
+    get_external_commands, get_stat_info, has_scheme, hyper_serve_http, into_stack_err, stack_err,
 };
 
 #[derive(Clone)]
@@ -235,7 +236,7 @@ impl RtcpConnectionHandler {
         _endpoint: TunnelEndpoint,
         stat: MutComposedSpeedStatRef,
         remote_addr: SocketAddr,
-        local_addr: SocketAddr
+        local_addr: SocketAddr,
     ) -> StackResult<()> {
         let executor = self.executor.fork();
         let servers = self.env.servers.clone();
@@ -247,21 +248,39 @@ impl RtcpConnectionHandler {
         let remote_addr_str = remote_addr.to_string();
         let dest_host = dest_host.unwrap_or_default();
         let map = MemoryMapCollection::new_ref();
-        map.insert("source_addr", CollectionValue::String(remote_addr_str.clone())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_ip", CollectionValue::String(remote_addr.ip().to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_port", CollectionValue::String(remote_addr.port().to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_addr", CollectionValue::String(local_addr.to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_ip", CollectionValue::String(local_addr.ip().to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_port", CollectionValue::String(dest_port.to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_host", CollectionValue::String(dest_host))
+        map.insert(
+            "source_addr",
+            CollectionValue::String(remote_addr_str.clone()),
+        )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_ip",
+            CollectionValue::String(remote_addr.ip().to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_port",
+            CollectionValue::String(remote_addr.port().to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_addr", CollectionValue::String(local_addr.to_string()))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "dest_ip",
+            CollectionValue::String(local_addr.ip().to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_port", CollectionValue::String(dest_port.to_string()))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_host", CollectionValue::String(dest_host))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("protocol", CollectionValue::String(protocol))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -270,12 +289,17 @@ impl RtcpConnectionHandler {
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         if let Some(device_info) = device_info.as_ref() {
             if let Some(mac) = device_info.mac() {
-                map.insert("source_mac", CollectionValue::String(mac.to_string())).await
+                map.insert("source_mac", CollectionValue::String(mac.to_string()))
+                    .await
                     .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
             }
             if let Some(host_name) = device_info.hostname() {
-                map.insert("source_hostname", CollectionValue::String(host_name.to_string())).await
-                    .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+                map.insert(
+                    "source_hostname",
+                    CollectionValue::String(host_name.to_string()),
+                )
+                .await
+                .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
             }
             map.insert(
                 "source_online_secs",
@@ -373,20 +397,40 @@ impl RtcpConnectionHandler {
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
                                     Server::Http(server) => {
-                                        let stream_info = StreamInfo::new(remote_addr_str.clone()).with_dst_addr(Some(local_addr.to_string())).with_device_info(
-                                            device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
-                                            device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
-                                            device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
-                                        );
-                                        hyper_serve_http(stream, server, stream_info).await
-                                            .map_err(into_stack_err!(StackErrorCode::ServerError, "server {server_name}"))?;
+                                        let stream_info = StreamInfo::new(remote_addr_str.clone())
+                                            .with_dst_addr(Some(local_addr.to_string()))
+                                            .with_device_info(
+                                                device_info
+                                                    .as_ref()
+                                                    .and_then(|v| v.mac().map(|m| m.to_string())),
+                                                device_info.as_ref().and_then(|v| {
+                                                    v.hostname().map(|h| h.to_string())
+                                                }),
+                                                device_info
+                                                    .as_ref()
+                                                    .map(|v| v.today_online_seconds().to_string()),
+                                            );
+                                        hyper_serve_http(stream, server, stream_info)
+                                            .await
+                                            .map_err(into_stack_err!(
+                                                StackErrorCode::ServerError,
+                                                "server {server_name}"
+                                            ))?;
                                     }
                                     Server::Stream(server) => {
-                                        let stream_info = StreamInfo::new(remote_addr_str.clone()).with_dst_addr(Some(local_addr.to_string())).with_device_info(
-                                            device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
-                                            device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
-                                            device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
-                                        );
+                                        let stream_info = StreamInfo::new(remote_addr_str.clone())
+                                            .with_dst_addr(Some(local_addr.to_string()))
+                                            .with_device_info(
+                                                device_info
+                                                    .as_ref()
+                                                    .and_then(|v| v.mac().map(|m| m.to_string())),
+                                                device_info.as_ref().and_then(|v| {
+                                                    v.hostname().map(|h| h.to_string())
+                                                }),
+                                                device_info
+                                                    .as_ref()
+                                                    .map(|v| v.today_online_seconds().to_string()),
+                                            );
                                         server
                                             .serve_connection(stream, stream_info)
                                             .await
@@ -424,7 +468,7 @@ impl RtcpConnectionHandler {
         _endpoint: TunnelEndpoint,
         stat: MutComposedSpeedStatRef,
         remote_addr: SocketAddr,
-        local_addr: SocketAddr
+        local_addr: SocketAddr,
     ) -> StackResult<()> {
         let executor = self.executor.fork();
         let servers = self.env.servers.clone();
@@ -435,21 +479,39 @@ impl RtcpConnectionHandler {
             .and_then(|manager| manager.get_device_info_by_source(remote_ip));
         let dest_host = dest_host.unwrap_or_default();
         let map = MemoryMapCollection::new_ref();
-        map.insert("source_addr", CollectionValue::String(remote_addr.to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_ip", CollectionValue::String(remote_addr.ip().to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("source_port", CollectionValue::String(remote_addr.port().to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_addr", CollectionValue::String(local_addr.to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_ip", CollectionValue::String(local_addr.ip().to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_port", CollectionValue::String(dest_port.to_string())).await
-            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
-        map.insert("dest_host", CollectionValue::String(dest_host))
+        map.insert(
+            "source_addr",
+            CollectionValue::String(remote_addr.to_string()),
+        )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_ip",
+            CollectionValue::String(remote_addr.ip().to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "source_port",
+            CollectionValue::String(remote_addr.port().to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_addr", CollectionValue::String(local_addr.to_string()))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert(
+            "dest_ip",
+            CollectionValue::String(local_addr.ip().to_string()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_port", CollectionValue::String(dest_port.to_string()))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        map.insert("dest_host", CollectionValue::String(dest_host))
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert("protocol", CollectionValue::String(protocol))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -458,12 +520,17 @@ impl RtcpConnectionHandler {
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         if let Some(device_info) = device_info.as_ref() {
             if let Some(mac) = device_info.mac() {
-                map.insert("source_mac", CollectionValue::String(mac.to_string())).await
+                map.insert("source_mac", CollectionValue::String(mac.to_string()))
+                    .await
                     .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
             }
             if let Some(host_name) = device_info.hostname() {
-                map.insert("source_hostname", CollectionValue::String(host_name.to_string())).await
-                    .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+                map.insert(
+                    "source_hostname",
+                    CollectionValue::String(host_name.to_string()),
+                )
+                .await
+                .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
             }
             map.insert(
                 "source_online_secs",
@@ -565,16 +632,44 @@ impl RtcpConnectionHandler {
                                         let datagram_stream = AsyncStreamWithDatagram::new(stream);
                                         let mut buf = vec![0; 4096];
                                         loop {
-                                            let len = datagram_stream.recv_datagram(&mut buf).await
-                                                .map_err(into_stack_err!(StackErrorCode::IoError, "recv datagram error"))?;
-                                            let resp = server.serve_datagram(&buf[..len], DatagramInfo::new(Some(remote_addr.to_string())).with_dst_addr(Some(local_addr.to_string())).with_device_info(
-                                                device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
-                                                device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
-                                                device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
-                                            )).await
-                                                .map_err(into_stack_err!(StackErrorCode::ServerError, "serve datagram error"))?;
-                                            datagram_stream.send_datagram(resp.as_slice()).await
-                                                .map_err(into_stack_err!(StackErrorCode::IoError, "send datagram error"))?;
+                                            let len = datagram_stream
+                                                .recv_datagram(&mut buf)
+                                                .await
+                                                .map_err(into_stack_err!(
+                                                    StackErrorCode::IoError,
+                                                    "recv datagram error"
+                                                ))?;
+                                            let resp = server
+                                                .serve_datagram(
+                                                    &buf[..len],
+                                                    DatagramInfo::new(Some(
+                                                        remote_addr.to_string(),
+                                                    ))
+                                                    .with_dst_addr(Some(local_addr.to_string()))
+                                                    .with_device_info(
+                                                        device_info.as_ref().and_then(|v| {
+                                                            v.mac().map(|m| m.to_string())
+                                                        }),
+                                                        device_info.as_ref().and_then(|v| {
+                                                            v.hostname().map(|h| h.to_string())
+                                                        }),
+                                                        device_info.as_ref().map(|v| {
+                                                            v.today_online_seconds().to_string()
+                                                        }),
+                                                    ),
+                                                )
+                                                .await
+                                                .map_err(into_stack_err!(
+                                                    StackErrorCode::ServerError,
+                                                    "serve datagram error"
+                                                ))?;
+                                            datagram_stream
+                                                .send_datagram(resp.as_slice())
+                                                .await
+                                                .map_err(into_stack_err!(
+                                                    StackErrorCode::IoError,
+                                                    "send datagram error"
+                                                ))?;
                                         }
                                     }
                                     _ => {
@@ -702,7 +797,20 @@ impl RTcpListener for Listener {
 
         let speed = stat_stream.get_speed_stat();
         let handle = tokio::spawn(async move {
-            if let Err(e) = handler_snapshot.handle_stream(stat_stream, protocol, dest_host, dest_port, path, endpoint, stat, remote_addr, local_addr).await {
+            if let Err(e) = handler_snapshot
+                .handle_stream(
+                    stat_stream,
+                    protocol,
+                    dest_host,
+                    dest_port,
+                    path,
+                    endpoint,
+                    stat,
+                    remote_addr,
+                    local_addr,
+                )
+                .await
+            {
                 error!("on_new_stream error: {}", e);
             }
         });
@@ -1082,7 +1190,8 @@ impl Stack for RtcpStack {
             env,
             self.connection_manager.clone(),
             io_dump,
-        ).await?;
+        )
+        .await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(handler));
         Ok(())
     }
@@ -1181,7 +1290,7 @@ impl RtcpStackBuilder {
         self.io_dump = io_dump;
         self
     }
-    
+
     pub fn reuse_address(mut self, reuse_address: bool) -> Self {
         self.reuse_address = reuse_address;
         self
@@ -1336,11 +1445,21 @@ impl StackFactory for RtcpStackFactory {
 mod tests {
     use super::RtcpConnectionHandler;
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{create_io_dump_stack_config, decode_io_dump_frames, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ConnectionManager, Stack, RtcpStack, RtcpStackFactory, RtcpStackConfig, StackContext, StackProtocol, StackFactory, StreamInfo, DatagramInfo, DefaultLimiterManager, StatManager, GlobalCollectionManager, LimiterManagerRef, StatManagerRef, ServerManagerRef, RtcpStackContext, TunnelEndpoint};
+    use crate::{
+        ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager,
+        LimiterManagerRef, ProcessChainConfigs, RtcpStack, RtcpStackConfig, RtcpStackContext,
+        RtcpStackFactory, Server, ServerManager, ServerManagerRef, ServerResult, Stack,
+        StackContext, StackFactory, StackProtocol, StatManager, StatManagerRef, StreamInfo,
+        StreamServer, TunnelEndpoint, TunnelManager, create_io_dump_stack_config,
+        decode_io_dump_frames,
+    };
     use buckyos_kit::AsyncStream;
     use jsonwebtoken::EncodingKey;
-    use name_client::{add_nameinfo_cache, init_name_lib_for_test, update_did_cache, NameInfo};
-    use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, generate_ed25519_key_pair, DeviceConfig, DIDDocumentTrait, EncodedDocument};
+    use name_client::{NameInfo, add_nameinfo_cache, init_name_lib_for_test, update_did_cache};
+    use name_lib::{
+        DIDDocumentTrait, DeviceConfig, EncodedDocument, encode_ed25519_sk_to_pk_jwk,
+        generate_ed25519_key, generate_ed25519_key_pair,
+    };
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -1348,7 +1467,10 @@ mod tests {
     use tokio::net::{TcpListener, UdpSocket};
     use url::Url;
 
-    async fn wait_dump_frames(file: &std::path::Path, min_frames: usize) -> Vec<crate::DecodedIoDumpFrame> {
+    async fn wait_dump_frames(
+        file: &std::path::Path,
+        min_frames: usize,
+    ) -> Vec<crate::DecodedIoDumpFrame> {
         for _ in 0..60 {
             if let Ok(data) = std::fs::read(file)
                 && !data.is_empty()
@@ -2241,10 +2363,24 @@ mod tests {
     async fn test_rtcp_io_dump_raw_single_roundtrip() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (s1, k1) = generate_ed25519_key();
-        let d1 = DeviceConfig::new_by_jwk("test1", serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap());
+        let d1 = DeviceConfig::new_by_jwk(
+            "test1",
+            serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap(),
+        );
         let id1 = d1.id.clone();
-        update_did_cache(d1.id.clone(), None, EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap())).await.unwrap();
-        add_nameinfo_cache(d1.id.to_string().as_str(), NameInfo::from_address(d1.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).await.unwrap();
+        update_did_cache(
+            d1.id.clone(),
+            None,
+            EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+        )
+        .await
+        .unwrap();
+        add_nameinfo_cache(
+            d1.id.to_string().as_str(),
+            NameInfo::from_address(d1.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
             "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
@@ -2252,14 +2388,30 @@ mod tests {
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let dump = dir.path().join("rtcp_raw.dump");
-        let io_dump = create_io_dump_stack_config("rtcp_raw", Some(dump.to_string_lossy().as_ref()), None, None, None, None)
-            .await
-            .unwrap();
+        let io_dump = create_io_dump_stack_config(
+            "rtcp_raw",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let sm1 = Arc::new(ServerManager::new());
-        sm1.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        sm1.add_server(Server::Stream(Arc::new(MockServer::new(
+            "www.buckyos.com".to_string(),
+        ))))
+        .unwrap();
         let tm1 = TunnelManager::new();
         let cm = ConnectionManager::new();
-        let ctx1 = build_stack_context(sm1, tm1.clone(), Arc::new(DefaultLimiterManager::new()), StatManager::new(), Some(Arc::new(GlobalProcessChains::new())));
+        let ctx1 = build_stack_context(
+            sm1,
+            tm1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let stack1 = RtcpStack::builder()
             .id("rtcp-dump-1")
             .bind("127.0.0.1:3010".to_string())
@@ -2275,12 +2427,32 @@ mod tests {
         stack1.start().await.unwrap();
 
         let (s2, k2) = generate_ed25519_key();
-        let d2 = DeviceConfig::new_by_jwk("test2", serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap());
-        update_did_cache(d2.id.clone(), None, EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap())).await.unwrap();
-        add_nameinfo_cache(d2.id.to_string().as_str(), NameInfo::from_address(d2.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).await.unwrap();
+        let d2 = DeviceConfig::new_by_jwk(
+            "test2",
+            serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap(),
+        );
+        update_did_cache(
+            d2.id.clone(),
+            None,
+            EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+        )
+        .await
+        .unwrap();
+        add_nameinfo_cache(
+            d2.id.to_string().as_str(),
+            NameInfo::from_address(d2.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
         let sm2 = Arc::new(ServerManager::new());
         let tm2 = TunnelManager::new();
-        let ctx2 = build_stack_context(sm2, tm2.clone(), Arc::new(DefaultLimiterManager::new()), StatManager::new(), Some(Arc::new(GlobalProcessChains::new())));
+        let ctx2 = build_stack_context(
+            sm2,
+            tm2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let stack2 = RtcpStack::builder()
             .id("rtcp-dump-2")
             .bind("127.0.0.1:3011".to_string())
@@ -2295,7 +2467,8 @@ mod tests {
         stack2.start().await.unwrap();
 
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let url = Url::parse(format!("rtcp://{}:3010/test:80", id1.to_host_name()).as_str()).unwrap();
+        let url =
+            Url::parse(format!("rtcp://{}:3010/test:80", id1.to_host_name()).as_str()).unwrap();
         let mut stream = tm2.open_stream_by_url(&url).await.unwrap();
         stream.write_all(b"test").await.unwrap();
         let mut buf = [0u8; 4];
@@ -2304,17 +2477,35 @@ mod tests {
         drop(stream);
 
         let frames = wait_dump_frames(&dump, 1).await;
-        assert!(frames.iter().any(|f| f.upload == b"test" && f.download == b"recv"));
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.upload == b"test" && f.download == b"recv")
+        );
     }
 
     #[tokio::test]
     async fn test_rtcp_io_dump_raw_flush_on_upload_limit() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (s1, k1) = generate_ed25519_key();
-        let d1 = DeviceConfig::new_by_jwk("test1", serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap());
+        let d1 = DeviceConfig::new_by_jwk(
+            "test1",
+            serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap(),
+        );
         let id1 = d1.id.clone();
-        update_did_cache(d1.id.clone(), None, EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap())).await.unwrap();
-        add_nameinfo_cache(d1.id.to_string().as_str(), NameInfo::from_address(d1.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).await.unwrap();
+        update_did_cache(
+            d1.id.clone(),
+            None,
+            EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+        )
+        .await
+        .unwrap();
+        add_nameinfo_cache(
+            d1.id.to_string().as_str(),
+            NameInfo::from_address(d1.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
             "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
@@ -2333,10 +2524,19 @@ mod tests {
         .await
         .unwrap();
         let sm1 = Arc::new(ServerManager::new());
-        sm1.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        sm1.add_server(Server::Stream(Arc::new(MockServer::new(
+            "www.buckyos.com".to_string(),
+        ))))
+        .unwrap();
         let tm1 = TunnelManager::new();
         let cm = ConnectionManager::new();
-        let ctx1 = build_stack_context(sm1, tm1.clone(), Arc::new(DefaultLimiterManager::new()), StatManager::new(), Some(Arc::new(GlobalProcessChains::new())));
+        let ctx1 = build_stack_context(
+            sm1,
+            tm1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let stack1 = RtcpStack::builder()
             .id("rtcp-limit-1")
             .bind("127.0.0.1:3014".to_string())
@@ -2352,12 +2552,32 @@ mod tests {
         stack1.start().await.unwrap();
 
         let (s2, k2) = generate_ed25519_key();
-        let d2 = DeviceConfig::new_by_jwk("test2", serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap());
-        update_did_cache(d2.id.clone(), None, EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap())).await.unwrap();
-        add_nameinfo_cache(d2.id.to_string().as_str(), NameInfo::from_address(d2.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).await.unwrap();
+        let d2 = DeviceConfig::new_by_jwk(
+            "test2",
+            serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap(),
+        );
+        update_did_cache(
+            d2.id.clone(),
+            None,
+            EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+        )
+        .await
+        .unwrap();
+        add_nameinfo_cache(
+            d2.id.to_string().as_str(),
+            NameInfo::from_address(d2.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
         let sm2 = Arc::new(ServerManager::new());
         let tm2 = TunnelManager::new();
-        let ctx2 = build_stack_context(sm2, tm2.clone(), Arc::new(DefaultLimiterManager::new()), StatManager::new(), Some(Arc::new(GlobalProcessChains::new())));
+        let ctx2 = build_stack_context(
+            sm2,
+            tm2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let stack2 = RtcpStack::builder()
             .id("rtcp-limit-2")
             .bind("127.0.0.1:3015".to_string())
@@ -2372,7 +2592,8 @@ mod tests {
         stack2.start().await.unwrap();
 
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let url = Url::parse(format!("rtcp://{}:3014/test:80", id1.to_host_name()).as_str()).unwrap();
+        let url =
+            Url::parse(format!("rtcp://{}:3014/test:80", id1.to_host_name()).as_str()).unwrap();
         let mut stream = tm2.open_stream_by_url(&url).await.unwrap();
         stream.write_all(b"test").await.unwrap();
         let mut buf = [0u8; 4];
@@ -2380,7 +2601,11 @@ mod tests {
         assert_eq!(&buf, b"recv");
 
         let frames = wait_dump_frames(&dump, 1).await;
-        assert!(frames.iter().any(|f| f.upload == b"te" && f.download.is_empty()));
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.upload == b"te" && f.download.is_empty())
+        );
     }
 
     struct MockHttpKeepAliveServer {
@@ -2389,7 +2614,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StreamServer for MockHttpKeepAliveServer {
-        async fn serve_connection(&self, mut stream: Box<dyn AsyncStream>, _info: StreamInfo) -> ServerResult<()> {
+        async fn serve_connection(
+            &self,
+            mut stream: Box<dyn AsyncStream>,
+            _info: StreamInfo,
+        ) -> ServerResult<()> {
             for _ in 0..2 {
                 let mut req = Vec::new();
                 let mut b = [0u8; 1];
@@ -2400,8 +2629,15 @@ mod tests {
                         break;
                     }
                 }
-                let body = if req.windows(2).any(|w| w == b"/a") { b"A" } else { b"B" };
-                let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n", body.len());
+                let body = if req.windows(2).any(|w| w == b"/a") {
+                    b"A"
+                } else {
+                    b"B"
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                    body.len()
+                );
                 stream.write_all(resp.as_bytes()).await.unwrap();
                 stream.write_all(body).await.unwrap();
             }
@@ -2417,24 +2653,54 @@ mod tests {
     async fn test_rtcp_io_dump_http_multi_requests_same_connection() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (s1, k1) = generate_ed25519_key();
-        let d1 = DeviceConfig::new_by_jwk("test1", serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap());
+        let d1 = DeviceConfig::new_by_jwk(
+            "test1",
+            serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap(),
+        );
         let id1 = d1.id.clone();
-        update_did_cache(d1.id.clone(), None, EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap())).await.unwrap();
-        add_nameinfo_cache(d1.id.to_string().as_str(), NameInfo::from_address(d1.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).await.unwrap();
+        update_did_cache(
+            d1.id.clone(),
+            None,
+            EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+        )
+        .await
+        .unwrap();
+        add_nameinfo_cache(
+            d1.id.to_string().as_str(),
+            NameInfo::from_address(d1.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
             "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
         )
         .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let dump = dir.path().join("rtcp_http.dump");
-        let io_dump = create_io_dump_stack_config("rtcp_http", Some(dump.to_string_lossy().as_ref()), None, None, None, None)
-            .await
-            .unwrap();
+        let io_dump = create_io_dump_stack_config(
+            "rtcp_http",
+            Some(dump.to_string_lossy().as_ref()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let sm1 = Arc::new(ServerManager::new());
-        sm1.add_server(Server::Stream(Arc::new(MockHttpKeepAliveServer { id: "www.buckyos.com".to_string() }))).unwrap();
+        sm1.add_server(Server::Stream(Arc::new(MockHttpKeepAliveServer {
+            id: "www.buckyos.com".to_string(),
+        })))
+        .unwrap();
         let tm1 = TunnelManager::new();
         let cm = ConnectionManager::new();
-        let ctx1 = build_stack_context(sm1, tm1.clone(), Arc::new(DefaultLimiterManager::new()), StatManager::new(), Some(Arc::new(GlobalProcessChains::new())));
+        let ctx1 = build_stack_context(
+            sm1,
+            tm1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let stack1 = RtcpStack::builder()
             .id("rtcp-http-1")
             .bind("127.0.0.1:3012".to_string())
@@ -2450,12 +2716,32 @@ mod tests {
         stack1.start().await.unwrap();
 
         let (s2, k2) = generate_ed25519_key();
-        let d2 = DeviceConfig::new_by_jwk("test2", serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap());
-        update_did_cache(d2.id.clone(), None, EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap())).await.unwrap();
-        add_nameinfo_cache(d2.id.to_string().as_str(), NameInfo::from_address(d2.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).await.unwrap();
+        let d2 = DeviceConfig::new_by_jwk(
+            "test2",
+            serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap(),
+        );
+        update_did_cache(
+            d2.id.clone(),
+            None,
+            EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+        )
+        .await
+        .unwrap();
+        add_nameinfo_cache(
+            d2.id.to_string().as_str(),
+            NameInfo::from_address(d2.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
         let sm2 = Arc::new(ServerManager::new());
         let tm2 = TunnelManager::new();
-        let ctx2 = build_stack_context(sm2, tm2.clone(), Arc::new(DefaultLimiterManager::new()), StatManager::new(), Some(Arc::new(GlobalProcessChains::new())));
+        let ctx2 = build_stack_context(
+            sm2,
+            tm2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let stack2 = RtcpStack::builder()
             .id("rtcp-http-2")
             .bind("127.0.0.1:3013".to_string())
@@ -2470,27 +2756,58 @@ mod tests {
         stack2.start().await.unwrap();
 
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let url = Url::parse(format!("rtcp://{}:3012/test:80", id1.to_host_name()).as_str()).unwrap();
+        let url =
+            Url::parse(format!("rtcp://{}:3012/test:80", id1.to_host_name()).as_str()).unwrap();
         let mut stream = tm2.open_stream_by_url(&url).await.unwrap();
-        stream.write_all(b"GET /a HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n").await.unwrap();
+        stream
+            .write_all(b"GET /a HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n")
+            .await
+            .unwrap();
         let mut tmp = [0u8; 64];
         let _ = stream.read(&mut tmp).await.unwrap();
-        stream.write_all(b"GET /b HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n").await.unwrap();
+        stream
+            .write_all(b"GET /b HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n")
+            .await
+            .unwrap();
         let _ = stream.read(&mut tmp).await.unwrap();
 
         let frames = wait_dump_frames(&dump, 2).await;
-        assert!(frames.iter().any(|f| f.upload.starts_with(b"GET /a HTTP/1.1") && f.download.starts_with(b"HTTP/1.1 200 OK")));
-        assert!(frames.iter().any(|f| f.upload.starts_with(b"GET /b HTTP/1.1") && f.download.starts_with(b"HTTP/1.1 200 OK")));
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.upload.starts_with(b"GET /a HTTP/1.1")
+                    && f.download.starts_with(b"HTTP/1.1 200 OK"))
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.upload.starts_with(b"GET /b HTTP/1.1")
+                    && f.download.starts_with(b"HTTP/1.1 200 OK"))
+        );
     }
 
     #[tokio::test]
     async fn test_rtcp_io_dump_http_flush_on_upload_limit() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (s1, k1) = generate_ed25519_key();
-        let d1 = DeviceConfig::new_by_jwk("test1", serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap());
+        let d1 = DeviceConfig::new_by_jwk(
+            "test1",
+            serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s1)).unwrap(),
+        );
         let id1 = d1.id.clone();
-        update_did_cache(d1.id.clone(), None, EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap())).await.unwrap();
-        add_nameinfo_cache(d1.id.to_string().as_str(), NameInfo::from_address(d1.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).await.unwrap();
+        update_did_cache(
+            d1.id.clone(),
+            None,
+            EncodedDocument::JsonLd(serde_json::to_value(&d1).unwrap()),
+        )
+        .await
+        .unwrap();
+        add_nameinfo_cache(
+            d1.id.to_string().as_str(),
+            NameInfo::from_address(d1.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(
             "- id: main\n  priority: 1\n  blocks:\n    - id: main\n      block: |\n        return \"server www.buckyos.com\";\n",
         )
@@ -2508,10 +2825,19 @@ mod tests {
         .await
         .unwrap();
         let sm1 = Arc::new(ServerManager::new());
-        sm1.add_server(Server::Stream(Arc::new(MockHttpKeepAliveServer { id: "www.buckyos.com".to_string() }))).unwrap();
+        sm1.add_server(Server::Stream(Arc::new(MockHttpKeepAliveServer {
+            id: "www.buckyos.com".to_string(),
+        })))
+        .unwrap();
         let tm1 = TunnelManager::new();
         let cm = ConnectionManager::new();
-        let ctx1 = build_stack_context(sm1, tm1.clone(), Arc::new(DefaultLimiterManager::new()), StatManager::new(), Some(Arc::new(GlobalProcessChains::new())));
+        let ctx1 = build_stack_context(
+            sm1,
+            tm1.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let stack1 = RtcpStack::builder()
             .id("rtcp-http-limit-1")
             .bind("127.0.0.1:3016".to_string())
@@ -2527,12 +2853,32 @@ mod tests {
         stack1.start().await.unwrap();
 
         let (s2, k2) = generate_ed25519_key();
-        let d2 = DeviceConfig::new_by_jwk("test2", serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap());
-        update_did_cache(d2.id.clone(), None, EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap())).await.unwrap();
-        add_nameinfo_cache(d2.id.to_string().as_str(), NameInfo::from_address(d2.id.to_string().as_str(), "127.0.0.1".parse().unwrap())).await.unwrap();
+        let d2 = DeviceConfig::new_by_jwk(
+            "test2",
+            serde_json::from_value(encode_ed25519_sk_to_pk_jwk(&s2)).unwrap(),
+        );
+        update_did_cache(
+            d2.id.clone(),
+            None,
+            EncodedDocument::JsonLd(serde_json::to_value(&d2).unwrap()),
+        )
+        .await
+        .unwrap();
+        add_nameinfo_cache(
+            d2.id.to_string().as_str(),
+            NameInfo::from_address(d2.id.to_string().as_str(), "127.0.0.1".parse().unwrap()),
+        )
+        .await
+        .unwrap();
         let sm2 = Arc::new(ServerManager::new());
         let tm2 = TunnelManager::new();
-        let ctx2 = build_stack_context(sm2, tm2.clone(), Arc::new(DefaultLimiterManager::new()), StatManager::new(), Some(Arc::new(GlobalProcessChains::new())));
+        let ctx2 = build_stack_context(
+            sm2,
+            tm2.clone(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
         let stack2 = RtcpStack::builder()
             .id("rtcp-http-limit-2")
             .bind("127.0.0.1:3017".to_string())
@@ -2547,16 +2893,23 @@ mod tests {
         stack2.start().await.unwrap();
 
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let url = Url::parse(format!("rtcp://{}:3016/test:80", id1.to_host_name()).as_str()).unwrap();
+        let url =
+            Url::parse(format!("rtcp://{}:3016/test:80", id1.to_host_name()).as_str()).unwrap();
         let mut stream = tm2.open_stream_by_url(&url).await.unwrap();
-        stream.write_all(b"GET /a HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n").await.unwrap();
+        stream
+            .write_all(b"GET /a HTTP/1.1\r\nHost: www.buckyos.com\r\n\r\n")
+            .await
+            .unwrap();
         let mut tmp = [0u8; 64];
         let _ = stream.read(&mut tmp).await.unwrap();
 
         let frames = wait_dump_frames(&dump, 1).await;
-        assert!(frames.iter().any(|f| f.upload == b"GET " && f.download.is_empty()));
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.upload == b"GET " && f.download.is_empty())
+        );
     }
-
 
     #[tokio::test]
     async fn test_rudp_stack_reject() {

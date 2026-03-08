@@ -1,4 +1,4 @@
-use log::{log, Level};
+use log::{Level, log};
 
 use super::env::{Env, EnvLevel, EnvRef};
 use super::external::EnvExternalRef;

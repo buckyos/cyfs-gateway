@@ -188,15 +188,8 @@ impl BlockExecuter {
                 Ok(result)
             }
             Expression::Group(exprs) => {
-                Self::execute_expression_chain(
-                    exprs,
-                    context,
-                    line_no,
-                    source.as_deref(),
-                    true,
-                    "",
-                )
-                .await
+                Self::execute_expression_chain(exprs, context, line_no, source.as_deref(), true, "")
+                    .await
             }
         }
     }

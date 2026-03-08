@@ -1,6 +1,6 @@
 use crate::error::RuleResult;
-use std::{net::SocketAddr, sync::Arc};
 use fast_socks5::util::target_addr::TargetAddr;
+use std::{net::SocketAddr, sync::Arc};
 use url::Url;
 
 use super::action::RuleAction;

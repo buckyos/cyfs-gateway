@@ -1,17 +1,16 @@
 #![allow(dead_code)]
 
 mod error;
-mod rule;
-mod socks;
 mod hook;
+mod rule;
 mod server;
+mod socks;
 
-pub use rule::*;
 pub use error::*;
-pub use socks::*;
 pub use hook::*;
+pub use rule::*;
 pub use server::*;
-
+pub use socks::*;
 
 #[macro_use]
 extern crate log;

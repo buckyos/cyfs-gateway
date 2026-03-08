@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::ptr;
 
 use super::normalize_mac;
-use crate::{lookup_err, LookupResult};
+use crate::{LookupResult, lookup_err};
 
 pub async fn lookup_mac_once(ip: IpAddr) -> LookupResult<Option<String>> {
     let target = match ip {
@@ -69,7 +69,8 @@ fn lookup_mac_sync(target: Ipv4Addr) -> LookupResult<Option<String>> {
                 break;
             }
 
-            let mut sa_ptr = (buf.as_ptr().add(offset) as *const u8).add(mem::size_of::<libc::rt_msghdr>());
+            let mut sa_ptr =
+                (buf.as_ptr().add(offset) as *const u8).add(mem::size_of::<libc::rt_msghdr>());
             let mut dst_ip: Option<Ipv4Addr> = None;
             let mut mac: Option<String> = None;
 
@@ -79,7 +80,11 @@ fn lookup_mac_sync(target: Ipv4Addr) -> LookupResult<Option<String>> {
                 }
 
                 let sa = &*(sa_ptr as *const libc::sockaddr);
-                let sa_len = if sa.sa_len == 0 { mem::size_of::<libc::sockaddr>() } else { sa.sa_len as usize };
+                let sa_len = if sa.sa_len == 0 {
+                    mem::size_of::<libc::sockaddr>()
+                } else {
+                    sa.sa_len as usize
+                };
                 if sa_len == 0 {
                     break;
                 }
@@ -101,7 +106,8 @@ fn lookup_mac_sync(target: Ipv4Addr) -> LookupResult<Option<String>> {
                     }
                 }
 
-                sa_ptr = sa_ptr.add((sa_len + (mem::size_of::<usize>() - 1)) & !(mem::size_of::<usize>() - 1));
+                sa_ptr = sa_ptr
+                    .add((sa_len + (mem::size_of::<usize>() - 1)) & !(mem::size_of::<usize>() - 1));
             }
 
             if dst_ip == Some(target) {

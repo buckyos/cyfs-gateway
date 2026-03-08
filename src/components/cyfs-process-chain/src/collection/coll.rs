@@ -217,10 +217,7 @@ impl TypedValue {
         if let TypedValue::String(s) = self {
             Ok(s)
         } else {
-            let msg = format!(
-                "Expected TypedValue::String, found {}",
-                self.get_type(),
-            );
+            let msg = format!("Expected TypedValue::String, found {}", self.get_type(),);
             warn!("{}", msg);
             Err(msg)
         }
@@ -347,10 +344,7 @@ impl TypedValue {
         if let TypedValue::MultiMap(mm) = self {
             Ok(mm)
         } else {
-            let msg = format!(
-                "Expected TypedValue::MultiMap, found {}",
-                self.get_type(),
-            );
+            let msg = format!("Expected TypedValue::MultiMap, found {}", self.get_type(),);
             warn!("{}", msg);
             Err(msg)
         }
@@ -367,10 +361,7 @@ impl TypedValue {
     pub fn is_collection(&self) -> bool {
         matches!(
             self,
-            TypedValue::List(_)
-                | TypedValue::Set(_)
-                | TypedValue::Map(_)
-                | TypedValue::MultiMap(_)
+            TypedValue::List(_) | TypedValue::Set(_) | TypedValue::Map(_) | TypedValue::MultiMap(_)
         )
     }
 
@@ -495,11 +486,7 @@ pub trait ListCollection: Send + Sync {
 
     /// Sets the value at the specified index.
     /// Returns previous value if index already existed.
-    async fn set(
-        &self,
-        index: usize,
-        value: TypedValue,
-    ) -> Result<Option<TypedValue>, String>;
+    async fn set(&self, index: usize, value: TypedValue) -> Result<Option<TypedValue>, String>;
 
     /// Gets the value at the specified index.
     async fn get(&self, index: usize) -> Result<Option<TypedValue>, String>;
@@ -560,11 +547,7 @@ pub trait MapCollection: Send + Sync {
     async fn insert_new(&self, key: &str, value: TypedValue) -> Result<bool, String>;
 
     /// Sets the value for the given key in the collection.
-    async fn insert(
-        &self,
-        key: &str,
-        value: TypedValue,
-    ) -> Result<Option<TypedValue>, String>;
+    async fn insert(&self, key: &str, value: TypedValue) -> Result<Option<TypedValue>, String>;
 
     /// Gets the value for the given key from the collection.
     async fn get(&self, key: &str) -> Result<Option<TypedValue>, String>;
@@ -648,7 +631,7 @@ pub trait MultiMapCollection: Send + Sync {
 
     /// Traverses the collection and applies the callback to each key-value pair.
     async fn traverse(&self, callback: MultiMapCollectionTraverseCallBackRef)
-        -> Result<(), String>;
+    -> Result<(), String>;
 
     /// Checks if the collection is flushable.
     fn is_flushable(&self) -> bool {

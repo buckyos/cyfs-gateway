@@ -1,5 +1,5 @@
-use crate::tunnel::{DatagramClient};
-use std::net::{IpAddr};
+use crate::tunnel::DatagramClient;
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -12,7 +12,11 @@ pub struct UdpClient {
 }
 
 impl UdpClient {
-    pub async fn new(dest_addr: String, dest_port: u16,bind_addr:Option<String>) -> Result<UdpClient, std::io::Error> {
+    pub async fn new(
+        dest_addr: String,
+        dest_port: u16,
+        bind_addr: Option<String>,
+    ) -> Result<UdpClient, std::io::Error> {
         let client;
         if bind_addr.is_some() {
             client = UdpSocket::bind(bind_addr.unwrap().as_str()).await?;

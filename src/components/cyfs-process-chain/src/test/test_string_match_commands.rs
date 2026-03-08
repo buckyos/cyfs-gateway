@@ -284,11 +284,7 @@ async fn test_range_command_parse_rejects_invalid_begin_literal() -> Result<(), 
 
     let hook_point = HookPoint::new("test_range_parse_error");
     hook_point
-        .load_process_chain_lib(
-            "range_parse_error_lib",
-            0,
-            PROCESS_CHAIN_RANGE_PARSE_ERROR,
-        )
+        .load_process_chain_lib("range_parse_error_lib", 0, PROCESS_CHAIN_RANGE_PARSE_ERROR)
         .await?;
 
     let data_dir = new_test_data_dir("test-range-parse-error")?;

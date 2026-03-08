@@ -100,11 +100,15 @@ impl ExternalCommand for Redirect {
             str_args.push(arg.as_str().unwrap());
         }
 
-        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
-            let msg = format!("Invalid redirect command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid redirect command: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         let location = matches.get_one::<String>("location").map(|s| s.to_string());
         if location.is_none() {
@@ -118,6 +122,9 @@ impl ExternalCommand for Redirect {
             None => format!(r#"redirect "{}""#, location),
         };
 
-        Ok(CommandResult::return_with_string(CommandControlLevel::Lib, command))
+        Ok(CommandResult::return_with_string(
+            CommandControlLevel::Lib,
+            command,
+        ))
     }
 }

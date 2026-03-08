@@ -1,24 +1,32 @@
+use crate::{StackErrorCode, StackResult, stack_err};
+use cyfs_process_chain::*;
+use sfo_io::{SpeedLimitSession, SpeedLimiter, SpeedLimiterRef};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::{Arc};
-use sfo_io::{SpeedLimitSession, SpeedLimiter, SpeedLimiterRef};
-use cyfs_process_chain::*;
-use crate::{stack_err, StackErrorCode, StackResult};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Limiter {
     id: Option<String>,
     upper_limiter: Option<Box<Limiter>>,
     read_limiter: SpeedLimiterRef,
-    write_limiter: SpeedLimiterRef
+    write_limiter: SpeedLimiterRef,
 }
 
 impl Limiter {
-    pub fn new(upper: Option<Limiter>, concurrent: Option<u32>, read_speed: Option<u32>, write_speed: Option<u32>) -> Self {
+    pub fn new(
+        upper: Option<Limiter>,
+        concurrent: Option<u32>,
+        read_speed: Option<u32>,
+        write_speed: Option<u32>,
+    ) -> Self {
         let (read_rate, read_weight) = Self::get_limit_info(concurrent, read_speed);
         let (write_rate, write_weight) = Self::get_limit_info(concurrent, write_speed);
         let (upper_read_limiter, upper_write_limiter) = match upper.clone() {
-            Some(upper) => (Some(upper.read_limiter.clone()), Some(upper.write_limiter.clone())),
+            Some(upper) => (
+                Some(upper.read_limiter.clone()),
+                Some(upper.write_limiter.clone()),
+            ),
             None => (None, None),
         };
 
@@ -30,11 +38,20 @@ impl Limiter {
         }
     }
 
-    fn new_named(id: impl Into<String>, upper: Option<Limiter>, concurrent: Option<u32>, read_speed: Option<u32>, write_speed: Option<u32>) -> Self {
+    fn new_named(
+        id: impl Into<String>,
+        upper: Option<Limiter>,
+        concurrent: Option<u32>,
+        read_speed: Option<u32>,
+        write_speed: Option<u32>,
+    ) -> Self {
         let (read_rate, read_weight) = Self::get_limit_info(concurrent, read_speed);
         let (write_rate, write_weight) = Self::get_limit_info(concurrent, write_speed);
         let (upper_read_limiter, upper_write_limiter) = match upper.clone() {
-            Some(upper) => (Some(upper.read_limiter.clone()), Some(upper.write_limiter.clone())),
+            Some(upper) => (
+                Some(upper.read_limiter.clone()),
+                Some(upper.write_limiter.clone()),
+            ),
             None => (None, None),
         };
 
@@ -54,25 +71,42 @@ impl Limiter {
         self.upper_limiter.as_ref().map(|v| v.as_ref().clone())
     }
 
-    fn get_limit_info(concurrent: Option<u32>, speed: Option<u32>) -> (Option<NonZeroU32>, Option<NonZeroU32>) {
+    fn get_limit_info(
+        concurrent: Option<u32>,
+        speed: Option<u32>,
+    ) -> (Option<NonZeroU32>, Option<NonZeroU32>) {
         match speed {
             Some(speed) => {
                 let concurrent = concurrent.unwrap_or(1);
                 let rate = concurrent * 100;
                 if rate > speed {
-                    (Some(NonZeroU32::new(speed).unwrap()), Some(NonZeroU32::new(1).unwrap()))
+                    (
+                        Some(NonZeroU32::new(speed).unwrap()),
+                        Some(NonZeroU32::new(1).unwrap()),
+                    )
                 } else {
                     if speed % rate > ((rate as f64) * 0.4f64) as u32 {
-                        (Some(NonZeroU32::new(rate).unwrap()), Some(NonZeroU32::new(speed / rate + 1).unwrap()))
+                        (
+                            Some(NonZeroU32::new(rate).unwrap()),
+                            Some(NonZeroU32::new(speed / rate + 1).unwrap()),
+                        )
                     } else {
-                        (Some(NonZeroU32::new(rate).unwrap()), Some(NonZeroU32::new(speed / rate).unwrap()))
+                        (
+                            Some(NonZeroU32::new(rate).unwrap()),
+                            Some(NonZeroU32::new(speed / rate).unwrap()),
+                        )
                     }
                 }
-            },
+            }
             None => (None, None),
         }
     }
-    pub fn set_speed(&self, concurrent: Option<u32>, read_speed: Option<u32>, write_speed: Option<u32>) {
+    pub fn set_speed(
+        &self,
+        concurrent: Option<u32>,
+        read_speed: Option<u32>,
+        write_speed: Option<u32>,
+    ) {
         let (read_rate, read_weight) = Self::get_limit_info(concurrent, read_speed);
         let (write_rate, write_weight) = Self::get_limit_info(concurrent, write_speed);
         self.read_limiter.set_limit(read_rate, read_weight);
@@ -80,22 +114,26 @@ impl Limiter {
     }
 
     pub fn new_limit_session(&self) -> (SpeedLimitSession, SpeedLimitSession) {
-        (self.read_limiter.new_limit_session(), self.write_limiter.new_limit_session())
+        (
+            self.read_limiter.new_limit_session(),
+            self.write_limiter.new_limit_session(),
+        )
     }
 }
 
 pub trait LimiterManager: Send + Sync {
-    fn new_limiter(&mut self,
-                   id: String,
-                   upper: Option<String>,
-                   concurrent: Option<u32>,
-                   read_speed: Option<u32>,
-                   write_speed: Option<u32>) -> Limiter;
+    fn new_limiter(
+        &mut self,
+        id: String,
+        upper: Option<String>,
+        concurrent: Option<u32>,
+        read_speed: Option<u32>,
+        write_speed: Option<u32>,
+    ) -> Limiter;
     fn get_limiter(&self, id: String) -> Option<Limiter>;
     fn clone_manager(&self) -> Box<dyn LimiterManager>;
     fn retain(&mut self, f: Box<dyn FnMut(&String, &mut Limiter) -> bool>);
     fn remove_limiter(&mut self, id: String);
-
 }
 pub type LimiterManagerRef = Arc<Box<dyn LimiterManager>>;
 
@@ -112,12 +150,14 @@ impl DefaultLimiterManager {
 }
 
 impl LimiterManager for DefaultLimiterManager {
-    fn new_limiter(&mut self,
-                   id: String,
-                   upper: Option<String>,
-                   concurrent: Option<u32>,
-                   read_speed: Option<u32>,
-                   write_speed: Option<u32>) -> Limiter {
+    fn new_limiter(
+        &mut self,
+        id: String,
+        upper: Option<String>,
+        concurrent: Option<u32>,
+        read_speed: Option<u32>,
+        write_speed: Option<u32>,
+    ) -> Limiter {
         let upper = match upper {
             Some(id) => self.get_limiter(id.clone()),
             None => None,
@@ -132,11 +172,11 @@ impl LimiterManager for DefaultLimiterManager {
         self.limiters.get(&id).cloned()
     }
     fn clone_manager(&self) -> Box<dyn LimiterManager> {
-        let mut new =
-            Box::new(Self {
-                limiters: HashMap::new(),
-            });
-        new.limiters.extend(self.limiters.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let mut new = Box::new(Self {
+            limiters: HashMap::new(),
+        });
+        new.limiters
+            .extend(self.limiters.iter().map(|(k, v)| (k.clone(), v.clone())));
         new
     }
 
@@ -159,15 +199,20 @@ pub(crate) fn is_valid_speed(speed: &str) -> bool {
 pub fn parse_speed(speed: &str) -> Result<u64, String> {
     let re = regex::Regex::new(r"^(\d+(\.\d+)?)\s*(B|KB|MB|GB)/s$").unwrap();
     if let Some(captures) = re.captures(speed) {
-        let num = captures.get(1).ok_or_else(|| {
-            let msg = format!("Invalid speed number: {}", speed);
-            error!("{}", msg);
-            msg
-        })?.as_str().parse::<f64>().map_err(|e| {
-            let msg = format!("Invalid speed number: {}. Error: {}", speed, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let num = captures
+            .get(1)
+            .ok_or_else(|| {
+                let msg = format!("Invalid speed number: {}", speed);
+                error!("{}", msg);
+                msg
+            })?
+            .as_str()
+            .parse::<f64>()
+            .map_err(|e| {
+                let msg = format!("Invalid speed number: {}. Error: {}", speed, e);
+                error!("{}", msg);
+                msg
+            })?;
         let unit = captures.get(3).unwrap().as_str();
         match unit {
             "B" => Ok(num as u64),
@@ -181,28 +226,38 @@ pub fn parse_speed(speed: &str) -> Result<u64, String> {
     }
 }
 
-pub async fn get_limit_info(chain_env: EnvRef) -> StackResult<(Option<String>, Option<u64>, Option<u64>)> {
-    let limit_info = chain_env.get("LIMIT").await.map_err(
-        |e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+pub async fn get_limit_info(
+    chain_env: EnvRef,
+) -> StackResult<(Option<String>, Option<u64>, Option<u64>)> {
+    let limit_info = chain_env
+        .get("LIMIT")
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
 
     let mut limiter_id = None;
     let mut down_speed = None;
     let mut upload_speed = None;
     if let Some(limit_info) = limit_info {
         if let CollectionValue::Map(map) = limit_info {
-            limiter_id = if let Ok(Some(CollectionValue::String(limiter_id))) = map.get("limiter_id").await {
+            limiter_id = if let Ok(Some(CollectionValue::String(limiter_id))) =
+                map.get("limiter_id").await
+            {
                 Some(limiter_id)
             } else {
                 None
             };
 
-            down_speed = if let Ok(Some(CollectionValue::String(down_speed))) = map.get("down_speed").await {
+            down_speed = if let Ok(Some(CollectionValue::String(down_speed))) =
+                map.get("down_speed").await
+            {
                 down_speed.parse::<u64>().ok()
             } else {
                 None
             };
 
-            upload_speed = if let Ok(Some(CollectionValue::String(upload_speed))) = map.get("upload_speed").await {
+            upload_speed = if let Ok(Some(CollectionValue::String(upload_speed))) =
+                map.get("upload_speed").await
+            {
                 upload_speed.parse::<u64>().ok()
             } else {
                 None

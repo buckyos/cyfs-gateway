@@ -7,4 +7,3 @@ pub const HTTP_REQUEST_HEADER_VARS: &[(&str, &str, bool)] = &[
     ("REQ_content_type", "content-type", true),
     ("REQ_user_agent", "user-agent", true),
 ];
-

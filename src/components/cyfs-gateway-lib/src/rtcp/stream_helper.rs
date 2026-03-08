@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
-use tokio::time::{timeout, Duration};
-use tokio::io::AsyncWriteExt;
-
+use tokio::time::{Duration, timeout};
 
 pub(crate) enum WaitStream {
     Waiting,
@@ -35,7 +34,7 @@ impl RTcpStreamBuildHelper {
     }
 
     pub async fn notify_ropen_stream(&self, mut stream: TcpStream, key: &str) {
-        let mut wait_streams= self.wait_ropen_stream_map.lock().await;
+        let mut wait_streams = self.wait_ropen_stream_map.lock().await;
         let wait_session = wait_streams.get_mut(key);
         if wait_session.is_none() {
             let clone_map: Vec<String> = wait_streams.keys().cloned().collect();
@@ -64,7 +63,7 @@ impl RTcpStreamBuildHelper {
     pub async fn wait_ropen_stream(&self, key: &str) -> Result<TcpStream, std::io::Error> {
         let timeout_duration = Duration::from_secs(30);
         let start_time = std::time::Instant::now();
-        
+
         loop {
             // 检查是否超时
             if start_time.elapsed() >= timeout_duration {
@@ -74,7 +73,7 @@ impl RTcpStreamBuildHelper {
                 );
                 return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout"));
             }
-            
+
             // 检查 map 中是否有对应的 stream
             {
                 let mut map = self.wait_ropen_stream_map.lock().await;
@@ -90,11 +89,11 @@ impl RTcpStreamBuildHelper {
                     }
                 }
             }
-            
+
             // 等待一小段时间后再次检查，避免过度占用 CPU
             let remaining_time = timeout_duration - start_time.elapsed();
             let check_interval = std::cmp::min(Duration::from_millis(100), remaining_time);
-            
+
             if let Err(_) = timeout(check_interval, self.notify_ropen_stream.notified()).await {
                 // 超时继续循环检查
                 continue;
