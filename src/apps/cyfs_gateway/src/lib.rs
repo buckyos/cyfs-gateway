@@ -19,7 +19,7 @@ pub use gateway::*;
 pub use gateway_control_client::*;
 pub use gateway_control_server::*;
 
-use clap::{Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
 use cyfs_dns::{InnerDnsRecordManager, LocalDnsFactory, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
@@ -28,6 +28,7 @@ use std::collections::HashSet;
 
 use anyhow::anyhow;
 use anyhow::Result;
+use buckyos_kit::init_logging;
 use buckyos_kit::{get_buckyos_log_dir, get_buckyos_service_data_dir, get_buckyos_system_etc_dir};
 use cyfs_sn::{SnServerFactory, SqliteDBFactory};
 use cyfs_socks::SocksServerFactory;
@@ -2313,10 +2314,10 @@ pub async fn cyfs_gateway_main() {
         }
     }
 
-    let log_dir = get_buckyos_log_dir("cyfs_gateway", true);
-    std::fs::create_dir_all(&log_dir).unwrap();
+    // let log_dir = get_buckyos_log_dir("cyfs_gateway", true);
+    // std::fs::create_dir_all(&log_dir).unwrap();
 
-    //let log_level = env::var("BUCKY_LOG").unwrap_or("info".to_string());
+    // //let log_level = env::var("BUCKY_LOG").unwrap_or("info".to_string());
 
     sfo_log::Logger::new("cyfs_gateway")
         .set_log_level(log_params.level.unwrap_or("info".to_string()).as_str())
@@ -2335,7 +2336,7 @@ pub async fn cyfs_gateway_main() {
         .start()
         .unwrap();
     // init log
-    // init_logging("cyfs_gateway",true);
+    //init_logging("cyfs_gateway", true);
     info!("cyfs_gateway start...");
 
     if matches.get_flag("debug") {

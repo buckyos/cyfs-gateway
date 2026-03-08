@@ -1,10 +1,10 @@
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::convert::TryInto;
 use std::fmt::Debug;
 use std::pin::Pin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use anyhow::Result;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CmdType {
@@ -67,6 +67,8 @@ pub(crate) struct RTcpHelloBody {
     pub to_id: String,
     pub my_port: u16,
     pub tunnel_token: Option<String>, //jwt token ,payload is TunnelTokenPayload
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_doc_jwt: Option<String>,
 }
 
 pub(crate) type RTcpHelloPackage = RTcpTunnelPackageImpl<RTcpHelloBody>;
@@ -77,6 +79,7 @@ impl RTcpHelloPackage {
         to_id: String,
         my_port: u16,
         tunnel_token: Option<String>,
+        device_doc_jwt: Option<String>,
     ) -> Self {
         RTcpHelloPackage {
             len: 0,
@@ -88,6 +91,7 @@ impl RTcpHelloPackage {
                 to_id,
                 my_port,
                 tunnel_token,
+                device_doc_jwt,
             },
         }
     }
@@ -250,7 +254,13 @@ pub(crate) struct RTcpROpenBody {
 pub(crate) type RTcpROpenPackage = RTcpTunnelPackageImpl<RTcpROpenBody>;
 
 impl RTcpROpenPackage {
-    pub fn new(seq: u32, session_key: String, purpose: Option<StreamPurpose>, dest_port: u16, dest_host: Option<String>) -> Self {
+    pub fn new(
+        seq: u32,
+        session_key: String,
+        purpose: Option<StreamPurpose>,
+        dest_port: u16,
+        dest_host: Option<String>,
+    ) -> Self {
         RTcpROpenPackage {
             len: 0,
             json_pos: 0,
@@ -322,7 +332,6 @@ impl RTcpROpenRespPackage {
     }
 }
 
-
 // Same as RTcpROpenBody
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct RTcpOpenBody {
@@ -341,7 +350,13 @@ pub(crate) struct RTcpOpenBody {
 pub(crate) type RTcpOpenPackage = RTcpTunnelPackageImpl<RTcpOpenBody>;
 
 impl RTcpOpenPackage {
-    pub fn new(seq: u32, session_key: String, purpose: Option<StreamPurpose>, dest_port: u16, dest_host: Option<String>) -> Self {
+    pub fn new(
+        seq: u32,
+        session_key: String,
+        purpose: Option<StreamPurpose>,
+        dest_port: u16,
+        dest_host: Option<String>,
+    ) -> Self {
         Self {
             len: 0,
             json_pos: 0,
@@ -375,7 +390,6 @@ impl RTcpOpenPackage {
         Ok(package)
     }
 }
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct RTcpOpenRespBody {
@@ -413,7 +427,6 @@ impl RTcpOpenRespPackage {
         Ok(package)
     }
 }
-
 
 #[derive(Clone, Debug)]
 pub(crate) enum RTcpTunnelPackage {
@@ -479,10 +492,7 @@ impl RTcpTunnelPackage {
             if json_pos < 6 {
                 let msg = format!("json_pos is invalid: {}", json_pos);
                 error!("{}", msg);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    msg,
-                ));
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
             }
             pos = pos + 1;
 
@@ -502,12 +512,13 @@ impl RTcpTunnelPackage {
             //info!("read json:{}",json_str);
             let package_value = serde_json::from_str(json_str.as_ref());
             if package_value.is_err() {
-                let msg = format!("Parse package error: {}, {}", json_str, package_value.err().unwrap());
+                let msg = format!(
+                    "Parse package error: {}, {}",
+                    json_str,
+                    package_value.err().unwrap()
+                );
                 error!("{}", msg);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    msg,
-                ));
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
             }
             let package_value = package_value.unwrap();
 
@@ -549,10 +560,7 @@ impl RTcpTunnelPackage {
                 v @ _ => {
                     let msg = format!("Unsupported package type {:?}", v);
                     error!("{}", msg);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        msg,
-                    ));
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
                 }
             }
         }

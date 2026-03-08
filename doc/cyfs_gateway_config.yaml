@@ -129,7 +129,7 @@ stacks:
   #   protocol: rtcp
   #   bind: 0.0.0.0:2980
   #   key_path: ./sn_private_key.pem
-  #   device_config_path: ./sn_device_config.json
+  #   device_config_path: ./device.doc.jwt  # 也支持 JSON；只有配置 JWT 时，Hello 才会自动携带 device_doc_jwt
   #   name: optional_name
   #   hook_point: { }
 
@@ -156,6 +156,14 @@ servers:
             priority: 1
             block: |
               call-server http_dir;
+    # post_hook_point:            # 可选：在拿到 Response 后、写回客户端前执行
+    #   main:
+    #     priority: 1
+    #     blocks:
+    #       add_header:
+    #         priority: 1
+    #         block: |
+    #           map-add RESP x-gateway "cyfs";
 
   http_dir:
     type: dir
@@ -205,4 +213,3 @@ servers:
   #           priority: 1
   #           block: |
   #             reject;
-

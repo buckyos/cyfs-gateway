@@ -161,7 +161,7 @@ stacks:
     #   protocol: rtcp
     #   bind: 0.0.0.0:2980
     #   key_path: ./sn_private_key.pem
-    #   device_config_path: ./sn_device_config.json
+    #   device_config_path: ./device.doc.jwt  # 也支持 JSON；只有配置 JWT 时，Hello 才会自动携带 device_doc_jwt
     #   name: optional_name
     #   reuse_address: false
     #   io_dump_file: rtcp.dump
