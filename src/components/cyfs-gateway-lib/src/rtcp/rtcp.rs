@@ -344,6 +344,7 @@ impl RTcpInner {
             .map_err(|e| {
                 TunnelError::DocumentError(format!("verify device_doc_jwt failed:{}", e))
             })?;
+            //注意:此时不能使用did:dev:xxx的形式，必须用name did的形式
             if verified_doc.id.to_string() != hello_body.from_id {
                 return Err(TunnelError::DocumentError(format!(
                     "hello from_id {} not match device_doc_jwt id {}",
@@ -613,6 +614,7 @@ impl RTcpInner {
             self.listener.clone(),
         );
 
+        //TODO:这里是否应该归一化成，必须使用devcie公钥来做key？
         let tunnel_key = format!(
             "{}_{}",
             self.this_device_did.to_string(),

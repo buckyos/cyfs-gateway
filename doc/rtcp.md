@@ -11,6 +11,8 @@ rtcp是强身份的，A和B之间都必须互相先信任对方的公钥
 
 配置 `on_new_tunnel_hook_point` 控制 tunnel 来源的示例见：[rtcp_on_new_tunnel_hook_point_example.md](/Users/liuzhicong/project/cyfs-gateway/doc/rtcp_on_new_tunnel_hook_point_example.md)
 
+通过固定 SOCKS5 端口把客户端接入 RTCP 网络的示例见：[rtcp_socks_proxy_example.md](/Users/liuzhicong/project/cyfs-gateway/doc/rtcp_socks_proxy_example.md)
+
 ## Tunnel Hello 认证
 
 `Hello` 包现在包含以下字段：

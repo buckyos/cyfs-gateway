@@ -156,6 +156,14 @@ servers:
             priority: 1
             block: |
               call-server http_dir;
+    # post_hook_point:            # 可选：在拿到 Response 后、写回客户端前执行
+    #   main:
+    #     priority: 1
+    #     blocks:
+    #       add_header:
+    #         priority: 1
+    #         block: |
+    #           map-add RESP x-gateway "cyfs";
 
   http_dir:
     type: dir

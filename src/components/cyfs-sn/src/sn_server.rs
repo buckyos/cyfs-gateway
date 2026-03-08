@@ -2083,8 +2083,18 @@ impl NameServer for SNServer {
             //返回当前服务器的地址
             match record_type {
                 RecordType::A => {
-                    let result_name_info = NameInfo::from_address(name, self.server_ip);
-                    return Ok(result_name_info);
+                    if self.server_ip.is_ipv4() {
+                        let result_name_info = NameInfo::from_address(name, self.server_ip);
+                        return Ok(result_name_info);
+                    }
+                    return Ok(NameInfo::from_address_vec(name, vec![]));
+                }
+                RecordType::AAAA => {
+                    if self.server_ip.is_ipv6() {
+                        let result_name_info = NameInfo::from_address(name, self.server_ip);
+                        return Ok(result_name_info);
+                    }
+                    return Ok(NameInfo::from_address_vec(name, vec![]));
                 }
                 RecordType::TXT => {
                     let device_jwt = self.device_jwt.get(0);
