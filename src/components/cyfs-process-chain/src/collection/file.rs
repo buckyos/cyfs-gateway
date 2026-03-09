@@ -401,6 +401,17 @@ impl MapCollection for JsonMapCollection {
         self.data.traverse(callback).await
     }
 
+    async fn cursor_owned(&self) -> Result<Box<dyn MapCollectionCursor>, String> {
+        self.data.cursor_owned().await
+    }
+
+    async fn traverse_owned(
+        &self,
+        callback: MapCollectionTraverseOwnedCallBackRef,
+    ) -> Result<(), String> {
+        self.data.traverse_owned(callback).await
+    }
+
     async fn keys_snapshot(&self) -> Result<Vec<String>, String> {
         self.data.keys_snapshot().await
     }
@@ -521,6 +532,17 @@ impl MultiMapCollection for JsonMultiMapCollection {
         callback: MultiMapCollectionTraverseCallBackRef,
     ) -> Result<(), String> {
         self.data.traverse(callback).await
+    }
+
+    async fn cursor_owned(&self) -> Result<Box<dyn MultiMapCollectionCursor>, String> {
+        self.data.cursor_owned().await
+    }
+
+    async fn traverse_owned(
+        &self,
+        callback: MultiMapCollectionTraverseOwnedCallBackRef,
+    ) -> Result<(), String> {
+        self.data.traverse_owned(callback).await
     }
 
     async fn keys_snapshot(&self) -> Result<Vec<String>, String> {

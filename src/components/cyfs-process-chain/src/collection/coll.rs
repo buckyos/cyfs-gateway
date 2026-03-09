@@ -528,6 +528,12 @@ pub trait ListCollection: Send + Sync {
 
 pub type ListCollectionRef = Arc<Box<dyn ListCollection>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraverseControl {
+    Continue,
+    Break,
+}
+
 #[async_trait::async_trait]
 pub trait MapCollectionTraverseCallBack: Send + Sync {
     /// Traverse the collection and apply the callback to each key-value pair.
@@ -536,6 +542,32 @@ pub trait MapCollectionTraverseCallBack: Send + Sync {
 }
 
 pub type MapCollectionTraverseCallBackRef = Arc<Box<dyn MapCollectionTraverseCallBack>>;
+
+#[async_trait::async_trait]
+pub trait MapCollectionTraverseOwnedCallBack: Send + Sync {
+    /// Traverse the collection and apply the callback to each owned key-value pair.
+    /// Return `TraverseControl::Break` to stop traversal.
+    async fn call(&self, key: String, value: TypedValue) -> Result<TraverseControl, String>;
+}
+
+pub type MapCollectionTraverseOwnedCallBackRef = Arc<Box<dyn MapCollectionTraverseOwnedCallBack>>;
+
+#[async_trait::async_trait]
+pub trait MapCollectionCursor: Send {
+    /// Returns next owned key-value pair, or None when cursor reaches the end.
+    async fn next(&mut self) -> Result<Option<(String, TypedValue)>, String>;
+}
+
+struct DumpMapCollectionCursor {
+    iter: std::vec::IntoIter<(String, TypedValue)>,
+}
+
+#[async_trait::async_trait]
+impl MapCollectionCursor for DumpMapCollectionCursor {
+    async fn next(&mut self) -> Result<Option<(String, TypedValue)>, String> {
+        Ok(self.iter.next())
+    }
+}
 
 #[async_trait::async_trait]
 pub trait MapCollection: Send + Sync {
@@ -560,6 +592,30 @@ pub trait MapCollection: Send + Sync {
 
     // Traverses the collection and applies the callback to each key-value pair.
     async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String>;
+
+    /// Returns an owned cursor for this collection.
+    /// Default implementation uses `dump()`, and can be overridden by concrete collections
+    /// for better performance.
+    async fn cursor_owned(&self) -> Result<Box<dyn MapCollectionCursor>, String> {
+        let entries = self.dump().await?;
+        Ok(Box::new(DumpMapCollectionCursor {
+            iter: entries.into_iter(),
+        }))
+    }
+
+    /// Traverses the collection using owned key-value pairs and explicit control flow.
+    async fn traverse_owned(
+        &self,
+        callback: MapCollectionTraverseOwnedCallBackRef,
+    ) -> Result<(), String> {
+        let mut cursor = self.cursor_owned().await?;
+        while let Some((key, value)) = cursor.next().await? {
+            if callback.call(key, value).await? == TraverseControl::Break {
+                break;
+            }
+        }
+        Ok(())
+    }
 
     /// Returns a key snapshot for traversal-oriented read paths.
     /// Implementations should prefer cloning only keys (not values) to reduce copy overhead.
@@ -594,6 +650,33 @@ pub trait MultiMapCollectionTraverseCallBack: Send + Sync {
 }
 
 pub type MultiMapCollectionTraverseCallBackRef = Arc<Box<dyn MultiMapCollectionTraverseCallBack>>;
+
+#[async_trait::async_trait]
+pub trait MultiMapCollectionTraverseOwnedCallBack: Send + Sync {
+    /// Traverse the collection and apply the callback to each owned key-values pair.
+    /// Return `TraverseControl::Break` to stop traversal.
+    async fn call(&self, key: String, values: HashSet<String>) -> Result<TraverseControl, String>;
+}
+
+pub type MultiMapCollectionTraverseOwnedCallBackRef =
+    Arc<Box<dyn MultiMapCollectionTraverseOwnedCallBack>>;
+
+#[async_trait::async_trait]
+pub trait MultiMapCollectionCursor: Send {
+    /// Returns next owned key-values pair, or None when cursor reaches the end.
+    async fn next(&mut self) -> Result<Option<(String, HashSet<String>)>, String>;
+}
+
+struct DumpMultiMapCollectionCursor {
+    iter: std::vec::IntoIter<(String, HashSet<String>)>,
+}
+
+#[async_trait::async_trait]
+impl MultiMapCollectionCursor for DumpMultiMapCollectionCursor {
+    async fn next(&mut self) -> Result<Option<(String, HashSet<String>)>, String> {
+        Ok(self.iter.next())
+    }
+}
 
 #[async_trait::async_trait]
 pub trait MultiMapCollection: Send + Sync {
@@ -639,6 +722,30 @@ pub trait MultiMapCollection: Send + Sync {
     /// Traverses the collection and applies the callback to each key-value pair.
     async fn traverse(&self, callback: MultiMapCollectionTraverseCallBackRef)
     -> Result<(), String>;
+
+    /// Returns an owned cursor for this collection.
+    /// Default implementation uses `dump()`, and can be overridden by concrete collections
+    /// for better performance.
+    async fn cursor_owned(&self) -> Result<Box<dyn MultiMapCollectionCursor>, String> {
+        let entries = self.dump().await?;
+        Ok(Box::new(DumpMultiMapCollectionCursor {
+            iter: entries.into_iter(),
+        }))
+    }
+
+    /// Traverses the collection using owned key-values pairs and explicit control flow.
+    async fn traverse_owned(
+        &self,
+        callback: MultiMapCollectionTraverseOwnedCallBackRef,
+    ) -> Result<(), String> {
+        let mut cursor = self.cursor_owned().await?;
+        while let Some((key, values)) = cursor.next().await? {
+            if callback.call(key, values).await? == TraverseControl::Break {
+                break;
+            }
+        }
+        Ok(())
+    }
 
     /// Returns a key snapshot for traversal-oriented read paths.
     /// Implementations should prefer cloning only keys to reduce copy overhead.
