@@ -151,6 +151,8 @@ impl BlockParser {
             debug!("Parsing line {}: {}", index, line);
             let (parsed_line, next_index) = if Self::is_if_header(line) {
                 Self::parse_if_statement(lines, index)?
+            } else if Self::is_for_header(line) {
+                Self::parse_for_statement(lines, index)?
             } else {
                 (Self::parse_line(line)?, index + 1)
             };
@@ -181,6 +183,110 @@ impl BlockParser {
     fn is_if_header(line: &str) -> bool {
         let line = line.trim();
         line.starts_with("if ") && line.ends_with(" then")
+    }
+
+    fn is_for_header(line: &str) -> bool {
+        let line = line.trim();
+        line.starts_with("for ") && line.ends_with(" then")
+    }
+
+    fn is_valid_loop_var_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+
+        if !(first.is_ascii_alphabetic() || first == '_') {
+            return false;
+        }
+
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    fn parse_for_header(line: &str) -> Result<(String, Option<String>, CommandArg), String> {
+        let line = line.trim();
+        let body = line
+            .strip_prefix("for")
+            .ok_or_else(|| format!("Invalid 'for' header: '{}'", line))?
+            .trim_start();
+        let body = body.strip_suffix("then").ok_or_else(|| {
+            let msg = format!("'for' header must end with 'then': '{}'", line);
+            error!("{}", msg);
+            msg
+        })?;
+        let body = body.trim_end();
+        if body.is_empty() {
+            let msg = format!("'for' header must not be empty: '{}'", line);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let in_pos = body.find(" in ").ok_or_else(|| {
+            let msg = format!("'for' header must contain 'in': '{}'", line);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let vars_part = body[..in_pos].trim();
+        let iterable_part = body[in_pos + " in ".len()..].trim();
+        if vars_part.is_empty() || iterable_part.is_empty() {
+            let msg = format!("Invalid 'for' header: '{}'", line);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let vars = vars_part.split(',').map(|s| s.trim()).collect::<Vec<_>>();
+        if vars.is_empty() || vars.len() > 2 || vars.iter().any(|v| v.is_empty()) {
+            let msg = format!(
+                "Invalid loop variable list '{}', expected 'key' or 'key, value'",
+                vars_part
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let key_var = vars[0].to_string();
+        if !Self::is_valid_loop_var_name(&key_var) {
+            let msg = format!("Invalid loop variable name '{}'", key_var);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let value_var = if vars.len() == 2 {
+            let value_var = vars[1].to_string();
+            if !Self::is_valid_loop_var_name(&value_var) {
+                let msg = format!("Invalid loop variable name '{}'", value_var);
+                error!("{}", msg);
+                return Err(msg);
+            }
+            if value_var == key_var {
+                let msg = format!(
+                    "Loop variable names must be different, found duplicate '{}'",
+                    value_var
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+            Some(value_var)
+        } else {
+            None
+        };
+
+        let (rest, iterable) = Self::parse_arg(iterable_part).map_err(|e| {
+            let msg = format!("Parse iterable in 'for' header error: '{}', {:?}", line, e);
+            error!("{}", msg);
+            msg
+        })?;
+        if !rest.trim().is_empty() {
+            let msg = format!(
+                "Unexpected content in 'for' header iterable: line='{}', rest='{}'",
+                line, rest
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        Ok((key_var, value_var, iterable))
     }
 
     fn parse_if_condition(line: &str, keyword: &str) -> Result<ExpressionChain, String> {
@@ -304,6 +410,35 @@ impl BlockParser {
         };
 
         Ok((line, cursor))
+    }
+
+    fn parse_for_statement(lines: &[&str], index: usize) -> Result<(Line, usize), String> {
+        let for_source = lines[index].trim().to_string();
+        let (key_var, value_var, iterable) = Self::parse_for_header(for_source.as_str())?;
+
+        let (for_lines, end_cursor) = Self::parse_lines(lines, index + 1, true)?;
+        if end_cursor >= lines.len() || lines[end_cursor].trim() != "end" {
+            let msg = format!(
+                "Missing 'end' for for statement starting at line {}: '{}'",
+                index + 1,
+                for_source
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let statement = Statement::new_for(ForStatement {
+            key_var,
+            value_var,
+            iterable,
+            lines: for_lines,
+        });
+        let line = Line {
+            source: for_source,
+            statements: vec![statement],
+        };
+
+        Ok((line, end_cursor + 1))
     }
 
     // Parse a single line, support label and expressions
@@ -1327,6 +1462,59 @@ mod tests {
         let block = parser.parse(block_str).unwrap();
         assert_eq!(block.id, "test_block");
         assert_eq!(block.lines.len(), 5);
+    }
+
+    #[test]
+    fn test_parse_for_statement_single_var() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            for item in $items then
+                echo $item;
+            end
+        "#;
+
+        let block = parser.parse(block_str).unwrap();
+        assert_eq!(block.lines.len(), 1);
+        let statement = &block.lines[0].statements[0];
+        assert!(statement.for_statement.is_some());
+        let for_statement = statement.for_statement.as_ref().unwrap();
+        assert_eq!(for_statement.key_var, "item");
+        assert!(for_statement.value_var.is_none());
+        assert_eq!(for_statement.lines.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_for_statement_key_value() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            for key, value in $routes then
+                echo $key $value;
+            end
+        "#;
+
+        let block = parser.parse(block_str).unwrap();
+        assert_eq!(block.lines.len(), 1);
+        let statement = &block.lines[0].statements[0];
+        let for_statement = statement.for_statement.as_ref().unwrap();
+        assert_eq!(for_statement.key_var, "key");
+        assert_eq!(for_statement.value_var.as_deref(), Some("value"));
+        assert_eq!(for_statement.lines.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_for_statement_missing_end() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            for item in $items then
+                echo $item;
+        "#;
+
+        let err = parser.parse(block_str).unwrap_err();
+        assert!(
+            err.contains("Missing 'end' for for statement"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]

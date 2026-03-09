@@ -1,5 +1,5 @@
 use cyfs_process_chain::{
-    Block, CommandArg, Expression, ExpressionChain, IfStatement, ProcessChain,
+    Block, CommandArg, Expression, ExpressionChain, ForStatement, IfStatement, ProcessChain,
     ProcessChainJSONLoader, ProcessChainXMLLoader, Statement,
 };
 use serde::Serialize;
@@ -90,7 +90,8 @@ pub fn lint_file(path: &Path, config: &LintConfig) -> Result<Vec<Diagnostic>, St
 pub fn classify_parse_error(err: &str) -> Option<(String, String)> {
     let normalized = err.replace('\n', " ");
     let has_command_subst = normalized.contains("$(");
-    let has_operator = normalized.contains("&&") || normalized.contains("||") || normalized.contains(';');
+    let has_operator =
+        normalized.contains("&&") || normalized.contains("||") || normalized.contains(';');
     if has_command_subst && has_operator {
         return Some((
             "PC-LINT-4103".to_string(),
@@ -267,6 +268,16 @@ impl Analyzer {
                 chain_scope,
                 block_scope,
             );
+        } else if let Some(for_stmt) = statement.for_statement.as_ref() {
+            self.analyze_for_statement(
+                chain_id,
+                block_id,
+                line,
+                source,
+                for_stmt,
+                chain_scope,
+                block_scope,
+            );
         } else {
             self.analyze_expression_chain(
                 chain_id,
@@ -330,6 +341,73 @@ impl Analyzer {
                         block_scope,
                     );
                 }
+            }
+        }
+    }
+
+    fn analyze_for_statement(
+        &mut self,
+        chain_id: &str,
+        block_id: &str,
+        line: usize,
+        source: &str,
+        for_stmt: &ForStatement,
+        chain_scope: &mut ScopeTable,
+        block_scope: &mut ScopeTable,
+    ) {
+        self.analyze_arg_reads(
+            chain_id,
+            block_id,
+            line,
+            source,
+            &for_stmt.iterable,
+            chain_scope,
+            block_scope,
+        );
+
+        let mut loop_scope = block_scope.clone();
+        let key_location = VarLocation {
+            chain: chain_id.to_string(),
+            block: block_id.to_string(),
+            line,
+            source: source.to_string(),
+        };
+        self.define_var(
+            VarScope::Block,
+            for_stmt.key_var.clone(),
+            key_location,
+            chain_scope,
+            &mut loop_scope,
+        );
+
+        if let Some(value_var) = for_stmt.value_var.as_ref() {
+            let value_location = VarLocation {
+                chain: chain_id.to_string(),
+                block: block_id.to_string(),
+                line,
+                source: source.to_string(),
+            };
+            self.define_var(
+                VarScope::Block,
+                value_var.clone(),
+                value_location,
+                chain_scope,
+                &mut loop_scope,
+            );
+        }
+
+        for (idx, nested_line) in for_stmt.lines.iter().enumerate() {
+            let nested_line_no = line + idx + 1;
+            for statement in &nested_line.statements {
+                self.analyze_statement(
+                    chain_id,
+                    block_id,
+                    nested_line_no,
+                    nested_line.source.as_str(),
+                    statement,
+                    chain_scope,
+                    &mut loop_scope,
+                );
             }
         }
     }

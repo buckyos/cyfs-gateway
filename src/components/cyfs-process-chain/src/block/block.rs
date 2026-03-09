@@ -510,9 +510,18 @@ pub struct IfStatement {
 }
 
 #[derive(Debug, Clone)]
+pub struct ForStatement {
+    pub key_var: String,
+    pub value_var: Option<String>,
+    pub iterable: CommandArg,
+    pub lines: Vec<Line>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Statement {
     pub expressions: ExpressionChain,
     pub if_statement: Option<IfStatement>,
+    pub for_statement: Option<ForStatement>,
 }
 
 impl Statement {
@@ -520,6 +529,7 @@ impl Statement {
         Self {
             expressions,
             if_statement: None,
+            for_statement: None,
         }
     }
 
@@ -527,6 +537,15 @@ impl Statement {
         Self {
             expressions: Vec::new(),
             if_statement: Some(if_statement),
+            for_statement: None,
+        }
+    }
+
+    pub fn new_for(for_statement: ForStatement) -> Self {
+        Self {
+            expressions: Vec::new(),
+            if_statement: None,
+            for_statement: Some(for_statement),
         }
     }
 }

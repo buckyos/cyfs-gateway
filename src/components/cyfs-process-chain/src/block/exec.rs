@@ -1,9 +1,12 @@
 use super::block::{
-    Block, CommandItem, Expression, ExpressionChain, IfStatement, Line, Operator, Statement,
+    Block, CommandItem, Expression, ExpressionChain, ForStatement, IfStatement, Line, Operator,
+    Statement,
 };
-use crate::chain::{Context, ProcessChainError, ProcessChainErrorCode};
+use crate::chain::{Context, EnvLevel, ProcessChainError, ProcessChainErrorCode};
 use crate::cmd::CommandResult;
+use crate::collection::{CollectionValue, MemorySetCollection, SetCollection};
 use log::log;
+use std::sync::Arc;
 
 pub const MAX_GOTO_COUNT_IN_BLOCK: u32 = 128;
 
@@ -12,6 +15,14 @@ pub enum BlockResult {
     Ok,
     Drop,
     Pass,
+}
+
+type ForLoopEntry = (CollectionValue, Option<CollectionValue>);
+
+struct LoopVarSnapshot {
+    name: String,
+    value: Option<CollectionValue>,
+    tracker_level: Option<EnvLevel>,
 }
 
 pub struct BlockExecuter {
@@ -141,6 +152,9 @@ impl BlockExecuter {
     ) -> Result<CommandResult, String> {
         if let Some(if_statement) = statement.if_statement.as_ref() {
             return Self::execute_if_statement(if_statement, line_no, source, context).await;
+        }
+        if let Some(for_statement) = statement.for_statement.as_ref() {
+            return Self::execute_for_statement(for_statement, line_no, source, context).await;
         }
 
         Self::execute_expression_chain(
@@ -313,6 +327,222 @@ impl BlockExecuter {
         }
 
         Ok(CommandResult::success())
+    }
+
+    async fn snapshot_loop_var(
+        var_name: &str,
+        context: &Context,
+    ) -> Result<LoopVarSnapshot, String> {
+        let exists_in_block = context.env().get_block().contains(var_name).await?;
+        let value = if exists_in_block {
+            context.env().get(var_name, Some(EnvLevel::Block)).await?
+        } else {
+            None
+        };
+        let tracker_level = context.env().var_level_entry(var_name);
+
+        Ok(LoopVarSnapshot {
+            name: var_name.to_string(),
+            value,
+            tracker_level,
+        })
+    }
+
+    async fn restore_loop_vars(
+        snapshots: &[LoopVarSnapshot],
+        context: &Context,
+    ) -> Result<(), String> {
+        for snapshot in snapshots {
+            if let Some(value) = snapshot.value.as_ref() {
+                context
+                    .env()
+                    .set(&snapshot.name, value.clone(), Some(EnvLevel::Block))
+                    .await?;
+            } else {
+                let _ = context
+                    .env()
+                    .remove(&snapshot.name, Some(EnvLevel::Block))
+                    .await?;
+            }
+
+            context
+                .env()
+                .restore_var_level_entry(&snapshot.name, snapshot.tracker_level);
+        }
+
+        Ok(())
+    }
+
+    async fn collect_for_loop_entries(
+        for_statement: &ForStatement,
+        context: &Context,
+    ) -> Result<Vec<ForLoopEntry>, String> {
+        let iterable = for_statement.iterable.evaluate(context).await?;
+        let want_value_var = for_statement.value_var.is_some();
+
+        match iterable {
+            CollectionValue::List(list) => {
+                let values = list.dump().await?;
+                let entries = if want_value_var {
+                    values
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, value)| {
+                            (
+                                CollectionValue::Number(crate::collection::NumberValue::Int(
+                                    idx as i64,
+                                )),
+                                Some(value),
+                            )
+                        })
+                        .collect()
+                } else {
+                    values.into_iter().map(|value| (value, None)).collect()
+                };
+                Ok(entries)
+            }
+            CollectionValue::Set(set) => {
+                let values = set.dump().await?;
+                let entries = values
+                    .into_iter()
+                    .map(|value| {
+                        let value = CollectionValue::String(value);
+                        if want_value_var {
+                            (value.clone(), Some(value))
+                        } else {
+                            (value, None)
+                        }
+                    })
+                    .collect();
+                Ok(entries)
+            }
+            CollectionValue::Map(map) => {
+                let values = map.dump().await?;
+                let entries = values
+                    .into_iter()
+                    .map(|(key, value)| {
+                        if want_value_var {
+                            (CollectionValue::String(key), Some(value))
+                        } else {
+                            (CollectionValue::String(key), None)
+                        }
+                    })
+                    .collect();
+                Ok(entries)
+            }
+            CollectionValue::MultiMap(multi_map) => {
+                let values = multi_map.dump().await?;
+                let entries = values
+                    .into_iter()
+                    .map(|(key, set)| {
+                        let value = if want_value_var {
+                            let set = Arc::new(Box::new(MemorySetCollection::from_set(set))
+                                as Box<dyn SetCollection>);
+                            Some(CollectionValue::Set(set))
+                        } else {
+                            None
+                        };
+                        (CollectionValue::String(key), value)
+                    })
+                    .collect();
+                Ok(entries)
+            }
+            other => {
+                let msg = format!(
+                    "For-loop iterable must be List/Set/Map/MultiMap, got {}",
+                    other.get_type()
+                );
+                Err(msg)
+            }
+        }
+    }
+
+    async fn execute_for_statement(
+        for_statement: &ForStatement,
+        line_no: usize,
+        source: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let mut snapshots = Vec::with_capacity(if for_statement.value_var.is_some() {
+            2
+        } else {
+            1
+        });
+
+        snapshots.push(Self::snapshot_loop_var(&for_statement.key_var, context).await?);
+        if let Some(value_var) = for_statement.value_var.as_ref() {
+            snapshots.push(Self::snapshot_loop_var(value_var, context).await?);
+        }
+
+        let execute_result: Result<CommandResult, String> = async {
+            let entries = Self::collect_for_loop_entries(for_statement, context).await?;
+            let mut result = CommandResult::success();
+
+            for (key, value) in entries {
+                context
+                    .env()
+                    .set(&for_statement.key_var, key, Some(EnvLevel::Block))
+                    .await?;
+
+                if let Some(value_var) = for_statement.value_var.as_ref() {
+                    let value = value.unwrap_or(CollectionValue::Null);
+                    context
+                        .env()
+                        .set(value_var, value, Some(EnvLevel::Block))
+                        .await?;
+                }
+
+                let loop_result =
+                    Self::execute_nested_lines(&for_statement.lines, line_no, context).await?;
+                if !loop_result.is_control() {
+                    result = loop_result;
+                    continue;
+                }
+
+                let control = loop_result.as_control().unwrap();
+                if control.is_break() {
+                    result = CommandResult::success_with_value(control.value().clone());
+                    break;
+                }
+
+                return Ok(loop_result);
+            }
+
+            Ok(result)
+        }
+        .await;
+
+        let restore_result = Self::restore_loop_vars(&snapshots, context).await;
+        match (execute_result, restore_result) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(exec_err), Ok(())) => Err(Self::wrap_runtime_error(
+                context,
+                ProcessChainErrorCode::RuntimeExpressionExecute,
+                "Failed to execute for statement",
+                Some(line_no),
+                Some(source),
+                None,
+                exec_err,
+            )),
+            (Ok(_), Err(restore_err)) => Err(Self::wrap_runtime_error(
+                context,
+                ProcessChainErrorCode::RuntimeExpressionExecute,
+                "Failed to restore loop variable scope",
+                Some(line_no),
+                Some(source),
+                None,
+                restore_err,
+            )),
+            (Err(exec_err), Err(restore_err)) => Err(Self::wrap_runtime_error(
+                context,
+                ProcessChainErrorCode::RuntimeExpressionExecute,
+                "Failed to execute for statement and restore loop variable scope",
+                Some(line_no),
+                Some(source),
+                None,
+                format!("exec_error={}, restore_error={}", exec_err, restore_err),
+            )),
+        }
     }
 
     async fn execute_command(

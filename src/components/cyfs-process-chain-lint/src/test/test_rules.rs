@@ -1,4 +1,4 @@
-use crate::{classify_parse_error, lint_xml_content, LintConfig};
+use crate::{LintConfig, classify_parse_error, lint_xml_content};
 
 #[test]
 fn test_lint_undefined_var() {
@@ -185,4 +185,51 @@ fn test_classify_parse_error_for_composite_command_substitution() {
     let (code, message) = classified.unwrap();
     assert_eq!(code, "PC-LINT-4103");
     assert!(message.contains("$(...)"));
+}
+
+#[test]
+fn test_lint_for_loop_vars_are_visible_inside_loop() {
+    let xml = r#"
+<root>
+  <process_chain id="main">
+    <block id="entry"><![CDATA[
+      for idx, item in $REQ.items then
+        echo $idx $item;
+      end
+      return --from lib "ok";
+    ]]></block>
+  </process_chain>
+</root>
+"#;
+    let config = LintConfig::default();
+    let ret = lint_xml_content(xml, "test.xml", "test_lib", &config).unwrap();
+    assert!(
+        !ret.iter().any(|d| d.code == "PC-LINT-1001"),
+        "for-loop vars should be visible inside loop body: {:?}",
+        ret
+    );
+}
+
+#[test]
+fn test_lint_for_loop_vars_are_not_visible_outside_loop() {
+    let xml = r#"
+<root>
+  <process_chain id="main">
+    <block id="entry"><![CDATA[
+      for item in $REQ.items then
+        echo $item;
+      end
+      echo $item;
+    ]]></block>
+  </process_chain>
+</root>
+"#;
+    let config = LintConfig::default();
+    let ret = lint_xml_content(xml, "test.xml", "test_lib", &config).unwrap();
+    assert!(
+        ret.iter()
+            .any(|d| d.code == "PC-LINT-1001" && d.message.contains("item")),
+        "loop var should be reported undefined outside loop: {:?}",
+        ret
+    );
 }
