@@ -1,0 +1,10 @@
+{
+  "input": {
+    "REQ": {
+      "path": "/kapi/system_config",
+      "host": "node.test.buckyos.io"
+    }
+  },
+  "id": "server:node_gateway:main",
+  "output": []
+}

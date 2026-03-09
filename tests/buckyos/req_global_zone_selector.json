@@ -1,0 +1,10 @@
+{
+  "input": {
+    "REQ": {
+      "path": "/",
+      "host": "filebrowser.test.buckyos.io"
+    }
+  },
+  "id": "zone_http_selector",
+  "output": ["APP_ID"]
+}

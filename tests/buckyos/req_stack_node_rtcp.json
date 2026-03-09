@@ -1,0 +1,11 @@
+{
+  "input": {
+    "REQ": {
+      "protocol": "tcp",
+      "dest_host": "192.168.1.100",
+      "dest_port": "8080"
+    }
+  },
+  "id": "stack:node_rtcp:main",
+  "output": []
+}

@@ -69,7 +69,6 @@ stacks:
     protocol: rtcp
     key_path: ./sn_private_key.pem
     device_config_path: ./sn_device_config.json
-    # TODO:添加on_new_tunnel_hook_point配置,只允许认证设备keep-tunnel
     hook_point:
       main:
         id: main
@@ -79,6 +78,21 @@ stacks:
             id: default
             priority: 1
             # REQ里已经有了很多信息，所以直接设置 method 为 query_by_did 并调用 qa 来查询是否是认证设备
+            block: |
+              map-add "REQ" "method" "query_by_did"
+              call qa "web3_sn" "REQ" && eq ${ANSWER.state} "active" && accept;
+              reject;
+
+    on_new_tunnel_hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            # 隧道建立时校验 source_device_id 是否为认证设备，只允许认证设备 keep-tunnel
+            # 从转发的角度，也支持所有device.owner是合法用户的连接
             block: |
               map-add "REQ" "method" "query_by_did"
               call qa "web3_sn" "REQ" && eq ${ANSWER.state} "active" && accept;

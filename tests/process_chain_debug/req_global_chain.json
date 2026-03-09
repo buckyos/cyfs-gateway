@@ -1,0 +1,10 @@
+{
+  "input": {
+    "REQ": {
+      "target_host": "www.buckyos.com",
+      "path": "/index.html"
+    }
+  },
+  "id": "global_chain",
+  "output": ["REQ"]
+}

@@ -1,0 +1,12 @@
+{
+  "input": {
+    "REQ": {
+      "path": "/files",
+      "host": "fb2.test.buckyos.io",
+      "url": "https://fb2.test.buckyos.io/files",
+      "Cookie": "test=123; session_token=abcdefg"
+    }
+  },
+  "id": "stack:zone_gateway_http:main",
+  "output": []
+}

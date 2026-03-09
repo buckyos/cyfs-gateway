@@ -1,0 +1,148 @@
+collections:
+  APP_INFO:
+    type: json_map
+    file_path: ./app_info.json
+    only_read_file: true
+  SERVICE_INFO:
+    type: json_map
+    file_path: ./service_info.json
+    only_read_file: true
+  NODE_ROUTE_MAP:
+    type: json_map
+    file_path: ./node_route_map.json
+    only_read_file: true
+
+stacks:
+  node_rtcp:
+    id: node_rtcp
+    protocol: rtcp
+    bind: 0.0.0.0:2980
+    key_path: ./node_private_key.pem
+    device_config_path: ./node_device_config.json
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "forward ${REQ.protocol}:///${REQ.dest_host}:${REQ.dest_port}";
+              
+  zone_gateway_http:
+    id: zone_gateway_http
+    protocol: tcp
+    bind: 0.0.0.0:80
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          main:
+            priority: 1
+            block: |
+              global CONTROL_PANEL_URL="https://sys.test.buckyos.io/";
+              global THIS_NODE_ID="ood1";
+              exec zone_http_selector:get_service_info_from_req;
+              exec zone_http_selector:get_app_infp_from_req;
+              echo "APP_ID: ${APP_ID}";
+              echo "SERVICE_ID: ${SERVICE_ID}";
+
+              if !eq $SERVICE_ID "" then
+                exec zone_http_selector:permit_check || echo "permit check failed" && reject;
+                exit $(exec zone_http_selector:forward_to_service);
+              elif !eq $APP_ID "" then
+                exec zone_http_selector:check_oauth || echo "oauth check skipped";
+                exit $(exec zone_http_selector:forward_to_app);
+              end
+
+              reject;
+
+
+
+global_process_chains:
+  zone_http_selector:
+    priority: 1
+    blocks:
+      default:
+        priority: 1
+        block: |
+          echo "unreachable";
+          reject;
+
+      check_block_list:
+        # 通过请求信息判断是否允许访问本zone
+        priority: 110
+        block: |
+          echo "check_block_list block";     
+      
+      get_app_infp_from_req: 
+        # 尝试通过域名解析得到appid
+        # 找到会设置APP_ID和TARGET_APP_INFO
+        priority: 120
+        
+        # 匹配REQ.host,app_info_map, 返回appid, 匹配模式是 appprefix.*, appprefix-*.*
+        block: |
+          map-create hp;
+          match-reg --capture hp $REQ.host "^([a-zA-Z0-9_]+)[-.]" || return false;
+          match-include $APP_INFO $hp[1] || return false;
+          global TARGET_APP_INFO=$APP_INFO[$hp[1]];
+          global APP_ID=$TARGET_APP_INFO.appid;
+          return $APP_ID;
+
+      get_service_info_from_req:
+          # 尝试通过匹配REQ.path 得到 service_id,/kapi/$service_id 或 /kapi/$service_id/*
+          # 找到会设置SERVICE_ID和TARGET_SERVICE_INFO
+          priority: 130
+          block: |
+            map-create hp;
+            match-reg --capture hp $REQ.path "^/kapi/([a-zA-Z0-9_-]+)(/.*)?" || return false;
+            match-include $SERVICE_INFO $hp[1] || return false;
+            global TARGET_SERVICE_INFO=$SERVICE_INFO[$hp[1]];
+            global SERVICE_ID=$hp[1];
+            return $hp[1];
+
+
+      check_oauth:
+        # 判断是否需要在网关做OAuth2.0认证
+        # 如果app的sdk_version>=10，表示app自己处理认证，网关不需要介入
+        priority: 135
+        block: |
+          echo "check_oauth block for app ${APP_ID}";
+          eq $TARGET_APP_INFO.sdk_version "0" || return true;
+          local cookies=$(parse-cookie $REQ.Cookie);
+          eq $cookies.session_token "" && redirect "${CONTROL_PANEL_URL}/oauth/login?redirect_url=${REQ.url}";
+          #local payload=$(verify-jwt $cookies.session_token $TRUST_KEY);
+          #eq $payload false && redirect "${CONTROL_PANEL_URL}/oauth/login?redirect_url=${REQ.url}";
+          #eq $payload.appid $APP_ID || redirect "${CONTROL_PANEL_URL}/oauth/login?redirect_url=${REQ.url}";
+          return true;
+
+      permit_check: 
+        # 判断 来源 是否有访问权限
+        # 判断 应用是否有权限访问service
+        priority: 140
+        block: |
+          eq $APP_ID "" && return true;
+          match-include $TARGET_APP_INFO.block_services $SERVICE_ID && return false;
+          return true;
+
+
+      forward_to_service:
+          priority: 150
+          block: |
+            echo "forward_to_service block";
+            if eq $TARGET_SERVICE_INFO.selector $THIS_NODE_ID then
+              local port=$SERVICE_INFO.selector[$THIS_NODE_ID].port;
+              forward "http://127.0.0.1:${port}";
+            else
+              forward round_robin --map $TARGET_SERVICE_INFO.selector;
+            end
+
+      forward_to_app:
+          id: forward_to_app
+          priority: 160
+          block: |
+            echo "forward_to_app block";
+            eq $TARGET_APP_INFO.nodeid $THIS_NODE_ID && forward "http://127.0.0.1:${TARGET_APP_INFO.port}";
+            forward "${NODE_ROUTE_MAP[$TARGET_APP_INFO.nodeid]}:${TARGET_APP_INFO.port}";
+

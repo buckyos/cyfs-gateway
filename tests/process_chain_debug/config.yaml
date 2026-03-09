@@ -1,0 +1,22 @@
+# Minimal config for process chain debug mode.
+# No stacks/servers - only global_process_chains and optional collections.
+# Used by run_debug_tests.py to test process chain rules in isolation.
+
+global_process_chains:
+  global_chain:
+    priority: 1
+    blocks:
+      default:
+        priority: 1
+        block: |
+          echo "hello from global_chain";
+          map-add REQ debug_ran "true";
+
+  echo_and_return:
+    priority: 1
+    blocks:
+      default:
+        priority: 1
+        block: |
+          echo ${REQ.target_host};
+          return "accept";
