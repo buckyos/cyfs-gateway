@@ -233,7 +233,7 @@ impl RtcpConnectionHandler {
         dest_host: Option<String>,
         dest_port: u16,
         path: String,
-        _endpoint: TunnelEndpoint,
+        endpoint: TunnelEndpoint,
         stat: MutComposedSpeedStatRef,
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
@@ -248,6 +248,12 @@ impl RtcpConnectionHandler {
         let remote_addr_str = remote_addr.to_string();
         let dest_host = dest_host.unwrap_or_default();
         let map = MemoryMapCollection::new_ref();
+        map.insert(
+            "source_device_id",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert(
             "source_addr",
             CollectionValue::String(remote_addr_str.clone()),
@@ -465,7 +471,7 @@ impl RtcpConnectionHandler {
         dest_host: Option<String>,
         dest_port: u16,
         path: String,
-        _endpoint: TunnelEndpoint,
+        endpoint: TunnelEndpoint,
         stat: MutComposedSpeedStatRef,
         remote_addr: SocketAddr,
         local_addr: SocketAddr,
@@ -479,6 +485,12 @@ impl RtcpConnectionHandler {
             .and_then(|manager| manager.get_device_info_by_source(remote_ip));
         let dest_host = dest_host.unwrap_or_default();
         let map = MemoryMapCollection::new_ref();
+        map.insert(
+            "source_device_id",
+            CollectionValue::String(endpoint.device_id.clone()),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert(
             "source_addr",
             CollectionValue::String(remote_addr.to_string()),

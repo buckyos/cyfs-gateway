@@ -2,11 +2,13 @@ mod error;
 mod forward;
 mod in_time_range;
 mod num_cmp;
+mod parse_cookie;
 mod proxy_protocol_probe;
 mod redirect;
 mod server;
 mod set_limit;
 mod set_stat;
+mod verify_jwt;
 
 use crate::{CmdQa, ServerManagerWeakRef};
 use cyfs_process_chain::{
@@ -16,12 +18,14 @@ pub use error::*;
 pub use forward::*;
 pub use in_time_range::*;
 pub use num_cmp::*;
+pub use parse_cookie::*;
 pub use proxy_protocol_probe::*;
 pub use redirect::*;
 pub use server::*;
 pub use set_limit::*;
 pub use set_stat::*;
 use std::sync::Arc;
+pub use verify_jwt::*;
 
 pub fn get_external_commands(
     server_manager: ServerManagerWeakRef,
@@ -98,6 +102,20 @@ pub fn get_external_commands(
         Arc::new(Box::new(num_cmp_command) as Box<dyn ExternalCommand>),
     ));
 
+    let verify_jwt_command = VerifyJwt::new();
+    let name = verify_jwt_command.name().to_owned();
+    cmds.push((
+        name,
+        Arc::new(Box::new(verify_jwt_command) as Box<dyn ExternalCommand>),
+    ));
+
+    let parse_cookie_command = ParseCookie::new();
+    let name = parse_cookie_command.name().to_owned();
+    cmds.push((
+        name,
+        Arc::new(Box::new(parse_cookie_command) as Box<dyn ExternalCommand>),
+    ));
+
     let server_command = CallServer::new();
     let name = server_command.name().to_owned();
     cmds.push((
@@ -113,4 +131,22 @@ pub fn get_external_commands(
     ));
 
     cmds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Weak;
+
+    #[test]
+    fn test_default_commands_include_verify_jwt_and_parse_cookie() {
+        let commands = get_external_commands(Weak::new());
+        let names = commands
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "verify-jwt"));
+        assert!(names.iter().any(|name| name == "parse-cookie"));
+    }
 }

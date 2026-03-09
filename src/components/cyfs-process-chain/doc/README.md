@@ -9,6 +9,9 @@
 - [COMMAND_REFERENCE.md](./COMMAND_REFERENCE.md)
   - 由 REPL `help doc` 自动导出的命令帮助（含内置命令和已注册外部命令）。
   - 注意：当前文件中的 external 命令来自 REPL 默认初始化（例如 `http-probe`、`https-sni-probe`），网关运行时可注册更多命令。
+- [Gateway Runtime External Commands](../../../../doc/process_chain_gateway_external_commands.md)
+  - `cyfs_gateway` 运行时默认注册的 external command 补充说明。
+  - 当前包含 `verify-jwt`、`parse-cookie` 等网关命令，以及通过 `cyfs_gateway process_chain --all` 导出完整帮助的方式。
 - [RFC_LIGHTWEIGHT_TYPE_SYSTEM.md](./RFC_LIGHTWEIGHT_TYPE_SYSTEM.md)
   - 轻量类型系统演进草案（policy 设计、JSON 持久化策略、分阶段落地方案）。
 - [RFC_SCRIPT_MODULARIZATION.md](./RFC_SCRIPT_MODULARIZATION.md)
@@ -48,4 +51,11 @@ EOT
 
 ```bash
 src/components/cyfs-process-chain/doc/COMMAND_REFERENCE.md
+```
+
+如果要导出包含 `cyfs_gateway` 默认 external command 的完整文档，可以执行：
+
+```bash
+cd src
+cargo run -p cyfs_gateway -- process_chain --all --file /tmp/cyfs-gateway-process-chain-command-ref.md
 ```

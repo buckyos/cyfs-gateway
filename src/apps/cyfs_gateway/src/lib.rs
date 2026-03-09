@@ -1272,7 +1272,13 @@ pub async fn cyfs_gateway_main() {
             .arg(Arg::new("id")
                 .long("id")
                 .help("rule id to debug; if omitted, use id field from req_file")
-                .required(false)))
+                .required(false))
+            .arg(Arg::new("repeat")
+                .long("repeat")
+                .help("execute the same debug request multiple times in one process")
+                .required(false)
+                .value_parser(clap::value_parser!(usize))
+                .default_value("1")))
         .subcommand(Command::new("reload")
             .about("reload config")
             .arg(Arg::new("server")
@@ -2117,7 +2123,8 @@ pub async fn cyfs_gateway_main() {
                 .get_one::<String>("config_file")
                 .map(|s| s.as_str());
             let id = sub_matches.get_one::<String>("id").map(|s| s.as_str());
-            match run_debug_command(req_file.as_str(), config_file, id).await {
+            let repeat = *sub_matches.get_one::<usize>("repeat").unwrap_or(&1usize);
+            match run_debug_command(req_file.as_str(), config_file, id, repeat).await {
                 Ok(_) => {
                     std::process::exit(0);
                 }
