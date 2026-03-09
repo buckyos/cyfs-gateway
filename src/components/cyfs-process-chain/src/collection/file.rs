@@ -2,7 +2,6 @@ use super::coll::*;
 use super::mem::*;
 use serde::{Deserialize, Serialize};
 use serde::{Deserializer, Serializer};
-use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,7 +76,7 @@ impl<T: Send + Sync + for<'a> Deserialize<'a> + Serialize + Default> JsonFileCol
 #[derive(Clone)]
 pub struct JsonSetCollection {
     data: Arc<MemorySetCollection>,
-    file: Arc<JsonFileCollection<HashSet<String>>>,
+    file: Arc<JsonFileCollection<OrderedStringSet>>,
 }
 
 impl JsonSetCollection {
@@ -325,7 +324,7 @@ impl<'de> Deserialize<'de> for CollectionValue {
 #[derive(Clone)]
 pub struct JsonMapCollection {
     data: Arc<MemoryMapCollection>,
-    file: Arc<JsonFileCollection<HashMap<String, CollectionValue>>>,
+    file: Arc<JsonFileCollection<OrderedStringMap<CollectionValue>>>,
 }
 
 impl JsonMapCollection {
@@ -432,7 +431,7 @@ impl MapCollection for JsonMapCollection {
 #[derive(Clone)]
 pub struct JsonMultiMapCollection {
     data: Arc<MemoryMultiMapCollection>,
-    file: Arc<JsonFileCollection<HashMap<String, HashSet<String>>>>,
+    file: Arc<JsonFileCollection<OrderedStringMap<OrderedStringSet>>>,
 }
 
 impl JsonMultiMapCollection {
@@ -564,7 +563,7 @@ impl MultiMapCollection for JsonMultiMapCollection {
         self.flush().await
     }
 
-    async fn dump(&self) -> Result<Vec<(String, HashSet<String>)>, String> {
+    async fn dump(&self) -> Result<Vec<(String, OrderedStringSet)>, String> {
         self.data.dump().await
     }
 }
@@ -597,6 +596,12 @@ mod tests {
         let loaded_collection = JsonSetCollection::new(file_path).unwrap();
         assert!(loaded_collection.contains("value5").await.unwrap());
         assert!(!loaded_collection.contains("non_existent").await.unwrap());
+        assert_eq!(
+            loaded_collection.get_all().await.unwrap(),
+            (0..10)
+                .map(|i| format!("value{}", i))
+                .collect::<Vec<String>>()
+        );
     }
 
     #[tokio::test]
@@ -651,6 +656,12 @@ mod tests {
             Some(CollectionValue::String("value5".to_string()))
         );
         assert_eq!(loaded_collection.get("non_existent").await.unwrap(), None);
+        assert_eq!(
+            loaded_collection.keys_snapshot().await.unwrap(),
+            (0..10)
+                .map(|i| format!("key{}", i))
+                .collect::<Vec<String>>()
+        );
     }
 
     #[tokio::test]
@@ -708,7 +719,16 @@ mod tests {
 
         // Test loading from file
         let loaded_collection = JsonMultiMapCollection::new(file_path).unwrap();
-        assert!(loaded_collection.get("key1").await.unwrap().is_some());
+        assert_eq!(
+            loaded_collection.get("key1").await.unwrap(),
+            Some("value2".to_string())
+        );
+        assert_eq!(
+            loaded_collection.keys_snapshot().await.unwrap(),
+            (1..10)
+                .map(|i| format!("key{}", i))
+                .collect::<Vec<String>>()
+        );
 
         for i in 1..10 {
             let key = format!("key{}", i);

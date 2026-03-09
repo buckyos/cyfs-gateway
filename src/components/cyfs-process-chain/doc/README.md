@@ -30,7 +30,7 @@
 
 - crate: `cyfs-process-chain`
 - version: `0.5.1`
-- generated at: `2026-03-02`
+- generated at: `2026-03-09`
 
 ## 如何重新生成命令参考
 

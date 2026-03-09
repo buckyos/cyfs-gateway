@@ -7,11 +7,10 @@ use crate::cmd::CommandResult;
 use crate::collection::{
     CollectionValue, ListCollectionTraverseCallBack, MapCollectionTraverseCallBack,
     MemorySetCollection, MultiMapCollectionKeyTraverseCallBack,
-    MultiMapCollectionTraverseOwnedCallBack, NumberValue, SetCollection,
+    MultiMapCollectionTraverseOwnedCallBack, NumberValue, OrderedStringSet, SetCollection,
     SetCollectionTraverseCallBack, TraverseControl,
 };
 use log::log;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -178,7 +177,7 @@ impl MultiMapCollectionKeyTraverseCallBack for ForMultiMapKeyTraverseCallback {
 
 #[async_trait::async_trait]
 impl MultiMapCollectionTraverseOwnedCallBack for ForMultiMapOwnedTraverseCallback {
-    async fn call(&self, key: String, values: HashSet<String>) -> Result<TraverseControl, String> {
+    async fn call(&self, key: String, values: OrderedStringSet) -> Result<TraverseControl, String> {
         let set =
             Arc::new(Box::new(MemorySetCollection::from_set(values)) as Box<dyn SetCollection>);
         let outcome = BlockExecuter::execute_for_iteration(

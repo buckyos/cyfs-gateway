@@ -1,9 +1,11 @@
 use super::var::VariableVisitorRef;
+use indexmap::{IndexMap, IndexSet};
 use std::any::Any;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 pub type AnyRef = Arc<dyn Any + Send + Sync>;
+pub type OrderedStringSet = IndexSet<String>;
+pub type OrderedStringMap<V> = IndexMap<String, V>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum NumberValue {
@@ -665,7 +667,7 @@ pub type MultiMapCollectionKeyTraverseCallBackRef =
 pub trait MultiMapCollectionTraverseOwnedCallBack: Send + Sync {
     /// Traverse the collection and apply the callback to each owned key-values pair.
     /// Return `TraverseControl::Break` to stop traversal.
-    async fn call(&self, key: String, values: HashSet<String>) -> Result<TraverseControl, String>;
+    async fn call(&self, key: String, values: OrderedStringSet) -> Result<TraverseControl, String>;
 }
 
 pub type MultiMapCollectionTraverseOwnedCallBackRef =
@@ -674,16 +676,16 @@ pub type MultiMapCollectionTraverseOwnedCallBackRef =
 #[async_trait::async_trait]
 pub trait MultiMapCollectionCursor: Send {
     /// Returns next owned key-values pair, or None when cursor reaches the end.
-    async fn next(&mut self) -> Result<Option<(String, HashSet<String>)>, String>;
+    async fn next(&mut self) -> Result<Option<(String, OrderedStringSet)>, String>;
 }
 
 struct DumpMultiMapCollectionCursor {
-    iter: std::vec::IntoIter<(String, HashSet<String>)>,
+    iter: std::vec::IntoIter<(String, OrderedStringSet)>,
 }
 
 #[async_trait::async_trait]
 impl MultiMapCollectionCursor for DumpMultiMapCollectionCursor {
-    async fn next(&mut self) -> Result<Option<(String, HashSet<String>)>, String> {
+    async fn next(&mut self) -> Result<Option<(String, OrderedStringSet)>, String> {
         Ok(self.iter.next())
     }
 }
@@ -791,7 +793,7 @@ pub trait MultiMapCollection: Send + Sync {
     }
 
     /// Dumps the collection to a vector of key-value pairs.
-    async fn dump(&self) -> Result<Vec<(String, HashSet<String>)>, String>;
+    async fn dump(&self) -> Result<Vec<(String, OrderedStringSet)>, String>;
 }
 
 pub type MultiMapCollectionRef = Arc<Box<dyn MultiMapCollection>>;

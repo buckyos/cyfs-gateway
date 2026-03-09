@@ -24,7 +24,7 @@
 ### 2.2 非目标（V1 不做）
 
 - 不引入 Python/JS 风格表达式推导。
-- 不改变 `Map` 底层顺序语义（`HashMap` 仍可能无序）。
+- 不引入自定义排序器 / comparator 语法。
 - 不做循环并行执行。
 
 ## 3. 语法提案
@@ -122,10 +122,9 @@ end
 
 `for` 可以表达“模式表遍历 + 命中停止”，但需注意：
 
-- 当前 `Map` 可能无序，`for key, value in $map` 的迭代顺序不保证稳定。
-- 对“严格首命中优先级”场景，建议：
-  - 使用 `List` 维护规则顺序 + `Map` 存值；或
-  - 后续配合 ordered map 能力。
+- 当前 `Map/MultiMap` 的迭代顺序采用插入顺序，`for key, value in $map` / `for key in $multi_map`
+  在同一份数据上可稳定复现“首命中优先级”。
+- 若业务需要“显式优先级字段排序”（而不是插入顺序），仍建议在脚本层通过 `List` 维护规则顺序。
 
 ## 7. 静态检查（pc-lint）建议
 
@@ -153,7 +152,7 @@ end
 ### P3（可选）
 
 - 语法糖 `{}` 风格（仅 parser sugar）。
-- 与 ordered map / route-match 方案联动。
+- 与 `route-match` 等高层命令方案联动。
 
 ## 9. 开放问题
 
