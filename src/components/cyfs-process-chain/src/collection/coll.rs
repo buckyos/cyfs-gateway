@@ -561,6 +561,13 @@ pub trait MapCollection: Send + Sync {
     // Traverses the collection and applies the callback to each key-value pair.
     async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String>;
 
+    /// Returns a key snapshot for traversal-oriented read paths.
+    /// Implementations should prefer cloning only keys (not values) to reduce copy overhead.
+    async fn keys_snapshot(&self) -> Result<Vec<String>, String> {
+        let entries = self.dump().await?;
+        Ok(entries.into_iter().map(|(key, _)| key).collect())
+    }
+
     /// Checks if the collection is flushable.
     fn is_flushable(&self) -> bool {
         // Default implementation returns false, can be overridden by specific collections
@@ -632,6 +639,13 @@ pub trait MultiMapCollection: Send + Sync {
     /// Traverses the collection and applies the callback to each key-value pair.
     async fn traverse(&self, callback: MultiMapCollectionTraverseCallBackRef)
     -> Result<(), String>;
+
+    /// Returns a key snapshot for traversal-oriented read paths.
+    /// Implementations should prefer cloning only keys to reduce copy overhead.
+    async fn keys_snapshot(&self) -> Result<Vec<String>, String> {
+        let entries = self.dump().await?;
+        Ok(entries.into_iter().map(|(key, _)| key).collect())
+    }
 
     /// Checks if the collection is flushable.
     fn is_flushable(&self) -> bool {

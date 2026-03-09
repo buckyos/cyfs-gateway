@@ -4,9 +4,8 @@ use super::block::{
 };
 use crate::chain::{Context, EnvLevel, ProcessChainError, ProcessChainErrorCode};
 use crate::cmd::CommandResult;
-use crate::collection::{CollectionValue, MemorySetCollection, SetCollection};
+use crate::collection::CollectionValue;
 use log::log;
-use std::sync::Arc;
 
 pub const MAX_GOTO_COUNT_IN_BLOCK: u32 = 128;
 
@@ -417,34 +416,38 @@ impl BlockExecuter {
                 Ok(entries)
             }
             CollectionValue::Map(map) => {
-                let values = map.dump().await?;
-                let entries = values
-                    .into_iter()
-                    .map(|(key, value)| {
-                        if want_value_var {
-                            (CollectionValue::String(key), Some(value))
-                        } else {
-                            (CollectionValue::String(key), None)
-                        }
-                    })
-                    .collect();
+                // Snapshot only keys, then read each value on demand to avoid full map value copy.
+                let keys = map.keys_snapshot().await?;
+                let mut entries = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let value = if want_value_var {
+                        Some(
+                            map.get(&key)
+                                .await?
+                                .unwrap_or(CollectionValue::Null),
+                        )
+                    } else {
+                        None
+                    };
+                    entries.push((CollectionValue::String(key), value));
+                }
                 Ok(entries)
             }
             CollectionValue::MultiMap(multi_map) => {
-                let values = multi_map.dump().await?;
-                let entries = values
-                    .into_iter()
-                    .map(|(key, set)| {
-                        let value = if want_value_var {
-                            let set = Arc::new(Box::new(MemorySetCollection::from_set(set))
-                                as Box<dyn SetCollection>);
-                            Some(CollectionValue::Set(set))
-                        } else {
-                            None
-                        };
-                        (CollectionValue::String(key), value)
-                    })
-                    .collect();
+                // Snapshot only keys, then read each key's set on demand to avoid full multimap copy.
+                let keys = multi_map.keys_snapshot().await?;
+                let mut entries = Vec::with_capacity(keys.len());
+                for key in keys {
+                    let value = if want_value_var {
+                        Some(match multi_map.get_many(&key).await? {
+                            Some(set) => CollectionValue::Set(set),
+                            None => CollectionValue::Null,
+                        })
+                    } else {
+                        None
+                    };
+                    entries.push((CollectionValue::String(key), value));
+                }
                 Ok(entries)
             }
             other => {

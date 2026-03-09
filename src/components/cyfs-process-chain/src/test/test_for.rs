@@ -117,6 +117,53 @@ async fn test_for_map_key_value_iteration() -> Result<(), String> {
 }
 
 #[tokio::test]
+async fn test_for_multimap_key_value_iteration() -> Result<(), String> {
+    init_test_logger();
+
+    let script = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            map-create --multi --global tags;
+            map-add tags "svc1" "tag1" "tag2";
+            map-add tags "svc2" "tag3";
+
+            set-create --global seen_keys;
+            set-create --global seen_values;
+
+            for key, value in $tags then
+                set-add seen_keys $key;
+                match-include $value "tag1" && set-add seen_values "tag1";
+                match-include $value "tag3" && set-add seen_values "tag3";
+            end
+
+            match-include seen_keys "svc1" || error --from lib "missing_svc1";
+            match-include seen_keys "svc2" || error --from lib "missing_svc2";
+            match-include seen_values "tag1" || error --from lib "missing_tag1";
+            match-include seen_values "tag3" || error --from lib "missing_tag3";
+            return --from lib "ok";
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+    let hook_point = HookPoint::new("test_for_multimap_kv");
+    hook_point
+        .load_process_chain_lib("test_for_multimap_kv_lib", 0, script)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-for-multimap-kv")?;
+    let hook_point_env = HookPointEnv::new("test-for-multimap-kv", data_dir);
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("test_for_multimap_kv_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_for_loop_var_shadow_restored() -> Result<(), String> {
     init_test_logger();
 

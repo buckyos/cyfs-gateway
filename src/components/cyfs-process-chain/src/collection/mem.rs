@@ -417,6 +417,12 @@ impl MapCollection for MemoryMapCollection {
     }
 
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot remove key '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
         let mut data = self.data.write().await;
         Ok(data.remove(key))
     }
@@ -432,6 +438,11 @@ impl MapCollection for MemoryMapCollection {
         }
 
         Ok(())
+    }
+
+    async fn keys_snapshot(&self) -> Result<Vec<String>, String> {
+        let data = self.data.read().await;
+        Ok(data.keys().cloned().collect())
     }
 
     async fn flush(&self) -> Result<(), String> {
@@ -688,15 +699,20 @@ impl MultiMapCollection for MemoryMultiMapCollection {
         let _guard = TraverseGuard::new(&self.transverse_counter);
 
         let data = self.data.read().await;
-        for (key, set) in data.iter() {
+        'outer: for (key, set) in data.iter() {
             for value in set.iter() {
                 if !callback.call(key, value.as_str()).await? {
-                    break;
+                    break 'outer;
                 }
             }
         }
 
         Ok(())
+    }
+
+    async fn keys_snapshot(&self) -> Result<Vec<String>, String> {
+        let data = self.data.read().await;
+        Ok(data.keys().cloned().collect())
     }
 
     async fn dump(&self) -> Result<Vec<(String, HashSet<String>)>, String> {
@@ -711,6 +727,8 @@ impl MultiMapCollection for MemoryMultiMapCollection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn test_memory_list_collection_basic_ops() {
@@ -787,6 +805,76 @@ mod tests {
             list.contains_all_strings(&["a".to_string(), "a".to_string()])
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_multimap_traverse_stops_globally_on_false() {
+        struct StopAfterFirstCall {
+            count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl MultiMapCollectionTraverseCallBack for StopAfterFirstCall {
+            async fn call(&self, _key: &str, _value: &str) -> Result<bool, String> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            }
+        }
+
+        let mm = MemoryMultiMapCollection::new();
+        mm.insert_many("k1", &["a", "b"]).await.unwrap();
+        mm.insert_many("k2", &["c"]).await.unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let callback = Arc::new(Box::new(StopAfterFirstCall { count: count.clone() })
+            as Box<dyn MultiMapCollectionTraverseCallBack>);
+
+        mm.traverse(callback).await.unwrap();
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "traverse should stop entirely after callback returns false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_map_remove_during_traversal_returns_error() {
+        struct RemoveDuringTraverse {
+            map: Arc<MemoryMapCollection>,
+            got_err: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl MapCollectionTraverseCallBack for RemoveDuringTraverse {
+            async fn call(&self, key: &str, _value: &CollectionValue) -> Result<bool, String> {
+                match self.map.remove(key).await {
+                    Ok(_) => Err("remove should fail during traversal".to_string()),
+                    Err(_) => {
+                        self.got_err.store(true, Ordering::SeqCst);
+                        Ok(false)
+                    }
+                }
+            }
+        }
+
+        let map = Arc::new(MemoryMapCollection::new());
+        map.insert("k1", CollectionValue::String("v1".to_string()))
+            .await
+            .unwrap();
+
+        let got_err = Arc::new(AtomicBool::new(false));
+        let callback = Arc::new(Box::new(RemoveDuringTraverse {
+            map: map.clone(),
+            got_err: got_err.clone(),
+        }) as Box<dyn MapCollectionTraverseCallBack>);
+
+        let ret = tokio::time::timeout(Duration::from_secs(2), map.traverse(callback)).await;
+        assert!(ret.is_ok(), "traverse should not deadlock");
+        ret.unwrap().unwrap();
+        assert!(
+            got_err.load(Ordering::SeqCst),
+            "callback should observe remove error during traversal"
         );
     }
 }

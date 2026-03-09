@@ -401,6 +401,10 @@ impl MapCollection for JsonMapCollection {
         self.data.traverse(callback).await
     }
 
+    async fn keys_snapshot(&self) -> Result<Vec<String>, String> {
+        self.data.keys_snapshot().await
+    }
+
     fn is_flushable(&self) -> bool {
         self.file.is_dirty()
     }
@@ -517,6 +521,10 @@ impl MultiMapCollection for JsonMultiMapCollection {
         callback: MultiMapCollectionTraverseCallBackRef,
     ) -> Result<(), String> {
         self.data.traverse(callback).await
+    }
+
+    async fn keys_snapshot(&self) -> Result<Vec<String>, String> {
+        self.data.keys_snapshot().await
     }
 
     fn is_flushable(&self) -> bool {
