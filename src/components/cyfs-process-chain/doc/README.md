@@ -24,6 +24,8 @@
   - `match-result` 结果分支语句草案（按 `CommandResult` 分支、`Control` 透传规则、与 `capture` 的关系）。
 - [COLLECTION_BACKEND_ASSESSMENT.md](./COLLECTION_BACKEND_ASSESSMENT.md)
   - collection 后端现状评估（memory/json/sqlite 边界、当前结论与未来演进方向）。
+- [RFC_COLLECTION_SEMANTICS.md](./RFC_COLLECTION_SEMANTICS.md)
+  - collection 语义与 backend 能力模型草案（引用、顺序、持久化、遍历约束与可移植性）。
 - [RFC_TEMPLATE_LIBRARY.md](./RFC_TEMPLATE_LIBRARY.md)
   - 标准库与最佳实践模板草案（模板契约、错误码规范、分层落地路线）。
 - [MIGRATION_TYPED_LITERAL_BREAKING.md](./MIGRATION_TYPED_LITERAL_BREAKING.md)
