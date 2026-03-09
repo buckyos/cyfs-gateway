@@ -12,6 +12,8 @@
 - [Gateway Runtime External Commands](../../../../doc/process_chain_gateway_external_commands.md)
   - `cyfs_gateway` 运行时默认注册的 external command 补充说明。
   - 当前包含 `verify-jwt`、`parse-cookie` 等网关命令，以及通过 `cyfs_gateway process_chain --all` 导出完整帮助的方式。
+- [Gateway-Oriented Core Model Overview](../../../../doc/process_chain_core_model.md)
+  - 从 gateway 场景出发整理 `process_chain` 的语言核心模型、宿主边界与设计原则。
 - [RFC_LIGHTWEIGHT_TYPE_SYSTEM.md](./RFC_LIGHTWEIGHT_TYPE_SYSTEM.md)
   - 轻量类型系统演进草案（policy 设计、JSON 持久化策略、分阶段落地方案）。
 - [RFC_SCRIPT_MODULARIZATION.md](./RFC_SCRIPT_MODULARIZATION.md)
