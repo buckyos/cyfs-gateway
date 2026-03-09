@@ -182,7 +182,11 @@ async fn test_collection_basic_semantics() -> Result<(), String> {
 
     let hook_point = HookPoint::new("test_collection_basic");
     hook_point
-        .load_process_chain_lib("test_collection_basic_lib", 0, PROCESS_CHAIN_COLLECTION_BASIC)
+        .load_process_chain_lib(
+            "test_collection_basic_lib",
+            0,
+            PROCESS_CHAIN_COLLECTION_BASIC,
+        )
         .await?;
 
     let data_dir = new_test_data_dir("test-collection-basic")?;
@@ -244,7 +248,9 @@ async fn test_collection_json_persistence_order() -> Result<(), String> {
         .await?;
 
     let write_exec = write_env.link_hook_point(&write_hook_point).await?;
-    let write_ret = write_exec.execute_lib("test_collection_persist_write_lib").await?;
+    let write_ret = write_exec
+        .execute_lib("test_collection_persist_write_lib")
+        .await?;
     assert_eq!(write_ret.value(), "write_ok");
     write_env.flush_collections().await?;
 
@@ -292,8 +298,39 @@ async fn test_collection_json_persistence_order() -> Result<(), String> {
         .await?;
 
     let read_exec = read_env.link_hook_point(&read_hook_point).await?;
-    let read_ret = read_exec.execute_lib("test_collection_persist_read_lib").await?;
+    let read_ret = read_exec
+        .execute_lib("test_collection_persist_read_lib")
+        .await?;
     assert_eq!(read_ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_collection_sqlite_returns_explicit_error() -> Result<(), String> {
+    init_test_logger();
+
+    let data_dir = new_test_data_dir("test-collection-sqlite-unsupported")?;
+    let hook_point_env = HookPointEnv::new("test-collection-sqlite-unsupported", data_dir);
+
+    let cases = [
+        ("sqlite_list", CollectionType::List),
+        ("sqlite_set", CollectionType::Set),
+        ("sqlite_map", CollectionType::Map),
+        ("sqlite_mm", CollectionType::MultiMap),
+    ];
+
+    for (id, collection_type) in cases {
+        let err = hook_point_env
+            .load_collection(id, collection_type, CollectionFileFormat::Sqlite, true)
+            .await
+            .expect_err("sqlite collection should return explicit unsupported error");
+        assert!(
+            err.contains("Sqlite collection format is not supported yet"),
+            "unexpected error: {}",
+            err
+        );
+    }
 
     Ok(())
 }
