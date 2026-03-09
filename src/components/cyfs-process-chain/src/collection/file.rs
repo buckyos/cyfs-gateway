@@ -370,10 +370,10 @@ impl MapCollection for JsonMapCollection {
     ) -> Result<Option<CollectionValue>, String> {
         let new_value = value.clone();
         let ret = self.data.insert(key, value).await?;
-        if let Some(prev) = &ret {
-            if *prev != new_value {
-                self.file.mark_dirty();
-            }
+        match &ret {
+            None => self.file.mark_dirty(),
+            Some(prev) if *prev != new_value => self.file.mark_dirty(),
+            _ => {}
         }
 
         Ok(ret)
@@ -661,6 +661,37 @@ mod tests {
             (0..10)
                 .map(|i| format!("key{}", i))
                 .collect::<Vec<String>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_map_collection_insert_only_flush_persists_and_keeps_order() {
+        let temp_dir = std::env::temp_dir().join("test_json_collection");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let file_path = temp_dir.join("test_map_insert_only.json");
+        std::fs::remove_file(&file_path).ok();
+
+        let collection = JsonMapCollection::new(file_path.clone()).unwrap();
+        assert_eq!(
+            collection
+                .insert("k2", CollectionValue::String("v2".to_string()))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            collection
+                .insert("k1", CollectionValue::String("v1".to_string()))
+                .await
+                .unwrap(),
+            None
+        );
+        collection.flush().await.unwrap();
+
+        let loaded_collection = JsonMapCollection::new(file_path).unwrap();
+        assert_eq!(
+            loaded_collection.keys_snapshot().await.unwrap(),
+            vec!["k2".to_string(), "k1".to_string()]
         );
     }
 
