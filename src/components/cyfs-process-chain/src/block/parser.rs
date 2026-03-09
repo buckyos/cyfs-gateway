@@ -19,6 +19,16 @@ pub struct BlockParser {
     id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineControlKeyword {
+    Else,
+    Elif,
+    End,
+    Ok,
+    Err,
+    Control,
+}
+
 impl BlockParser {
     fn parse_typed_number_literal(input: &str) -> Option<CollectionValue> {
         if input.is_empty() {
@@ -139,8 +149,8 @@ impl BlockParser {
                     break;
                 } else {
                     let msg = format!(
-                        "Unexpected '{}' at line {} without matching 'if'",
-                        keyword,
+                        "Unexpected '{}' at line {} without matching block statement",
+                        Self::line_control_keyword_name(keyword),
                         index + 1
                     );
                     error!("{}", msg);
@@ -153,6 +163,8 @@ impl BlockParser {
                 Self::parse_if_statement(lines, index)?
             } else if Self::is_for_header(line) {
                 Self::parse_for_statement(lines, index)?
+            } else if Self::is_match_result_header(line) {
+                Self::parse_match_result_statement(lines, index)?
             } else {
                 (Self::parse_line(line)?, index + 1)
             };
@@ -165,16 +177,25 @@ impl BlockParser {
         Ok((parsed_lines, index))
     }
 
-    fn line_control_keyword(line: &str) -> Option<&'static str> {
+    fn line_control_keyword(line: &str) -> Option<LineControlKeyword> {
         let line = line.trim();
         if line == "else" {
-            return Some("else");
+            return Some(LineControlKeyword::Else);
         }
         if line == "end" {
-            return Some("end");
+            return Some(LineControlKeyword::End);
         }
         if line.starts_with("elif ") && line.ends_with(" then") {
-            return Some("elif");
+            return Some(LineControlKeyword::Elif);
+        }
+        if line.starts_with("ok(") && line.ends_with(')') {
+            return Some(LineControlKeyword::Ok);
+        }
+        if line.starts_with("err(") && line.ends_with(')') {
+            return Some(LineControlKeyword::Err);
+        }
+        if line.starts_with("control(") && line.ends_with(')') {
+            return Some(LineControlKeyword::Control);
         }
 
         None
@@ -188,6 +209,11 @@ impl BlockParser {
     fn is_for_header(line: &str) -> bool {
         let line = line.trim();
         line.starts_with("for ") && line.ends_with(" then")
+    }
+
+    fn is_match_result_header(line: &str) -> bool {
+        let line = line.trim();
+        line.starts_with("match-result ")
     }
 
     fn is_valid_loop_var_name(name: &str) -> bool {
@@ -360,11 +386,11 @@ impl BlockParser {
 
             let control_line = lines[next_cursor].trim();
             match Self::line_control_keyword(control_line) {
-                Some("elif") => {
+                Some(LineControlKeyword::Elif) => {
                     current_condition = Self::parse_if_condition(control_line, "elif")?;
                     cursor = next_cursor + 1;
                 }
-                Some("else") => {
+                Some(LineControlKeyword::Else) => {
                     let (parsed_else_lines, end_cursor) =
                         Self::parse_lines(lines, next_cursor + 1, true)?;
 
@@ -381,14 +407,14 @@ impl BlockParser {
                     cursor = end_cursor + 1;
                     break;
                 }
-                Some("end") => {
+                Some(LineControlKeyword::End) => {
                     cursor = next_cursor + 1;
                     break;
                 }
                 Some(other) => {
                     let msg = format!(
                         "Unexpected control keyword '{}' in if statement at line {}",
-                        other,
+                        Self::line_control_keyword_name(other),
                         next_cursor + 1
                     );
                     error!("{}", msg);
@@ -410,6 +436,247 @@ impl BlockParser {
         };
 
         Ok((line, cursor))
+    }
+
+    fn parse_match_result_command(line: &str) -> Result<Box<Expression>, String> {
+        let line = line.trim();
+        let body = line
+            .strip_prefix("match-result")
+            .ok_or_else(|| format!("Invalid 'match-result' header: '{}'", line))?
+            .trim_start();
+
+        if body.is_empty() {
+            let msg = format!("'match-result' header must not be empty: '{}'", line);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        if !body.starts_with("$(") {
+            let msg = format!(
+                "'match-result' requires command substitution syntax '$(...)': '{}'",
+                line
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let (rest, arg) = Self::parse_arg(body).map_err(|e| {
+            let msg = format!("Parse 'match-result' command error: '{}', {:?}", line, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        if !rest.trim().is_empty() {
+            let msg = format!(
+                "Unexpected content in 'match-result' header: line='{}', rest='{}'",
+                line, rest
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        match arg {
+            CommandArg::CommandSubstitution(command) => Ok(command),
+            _ => {
+                let msg = format!(
+                    "'match-result' requires command substitution syntax '$(...)': '{}'",
+                    line
+                );
+                error!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+
+    fn parse_match_result_branch_binding(line: &str, keyword: &str) -> Result<String, String> {
+        let line = line.trim();
+        let body = line
+            .strip_prefix(keyword)
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .ok_or_else(|| format!("Invalid '{}' branch header: '{}'", keyword, line))?
+            .trim();
+
+        if !Self::is_valid_loop_var_name(body) {
+            let msg = format!("Invalid '{}' binding variable '{}'", keyword, body);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        Ok(body.to_string())
+    }
+
+    fn parse_match_result_control_binding(line: &str) -> Result<(String, String, String), String> {
+        let line = line.trim();
+        let body = line
+            .strip_prefix("control")
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.strip_suffix(')'))
+            .ok_or_else(|| format!("Invalid 'control' branch header: '{}'", line))?
+            .trim();
+
+        let vars = body.split(',').map(|item| item.trim()).collect::<Vec<_>>();
+        if vars.len() != 3 {
+            let msg = format!(
+                "'control' branch must declare three variables 'action, from, value': '{}'",
+                line
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        for var in &vars {
+            if !Self::is_valid_loop_var_name(var) {
+                let msg = format!("Invalid 'control' binding variable '{}'", var);
+                error!("{}", msg);
+                return Err(msg);
+            }
+        }
+
+        if vars[0] == vars[1] || vars[0] == vars[2] || vars[1] == vars[2] {
+            let msg = format!("'control' binding variables must be distinct: '{}'", line);
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        Ok((
+            vars[0].to_string(),
+            vars[1].to_string(),
+            vars[2].to_string(),
+        ))
+    }
+
+    fn parse_match_result_statement(lines: &[&str], index: usize) -> Result<(Line, usize), String> {
+        let source = lines[index].trim().to_string();
+        let command = Self::parse_match_result_command(source.as_str())?;
+        let mut ok_branch = None;
+        let mut err_branch = None;
+        let mut control_branch = None;
+        let mut saw_branch = false;
+        let mut cursor = index + 1;
+
+        loop {
+            if cursor >= lines.len() {
+                let msg = format!(
+                    "Missing 'end' for match-result statement starting at line {}: '{}'",
+                    index + 1,
+                    source
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            let control_line = lines[cursor].trim();
+            match Self::line_control_keyword(control_line) {
+                Some(LineControlKeyword::Ok) => {
+                    if ok_branch.is_some() {
+                        let msg = format!(
+                            "Duplicate 'ok' branch in match-result starting at line {}",
+                            index + 1
+                        );
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+                    let binding_var = Self::parse_match_result_branch_binding(control_line, "ok")?;
+                    let (branch_lines, next_cursor) = Self::parse_lines(lines, cursor + 1, true)?;
+                    ok_branch = Some(MatchResultBranch {
+                        binding_var,
+                        lines: branch_lines,
+                    });
+                    saw_branch = true;
+                    cursor = next_cursor;
+                }
+                Some(LineControlKeyword::Err) => {
+                    if err_branch.is_some() {
+                        let msg = format!(
+                            "Duplicate 'err' branch in match-result starting at line {}",
+                            index + 1
+                        );
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+                    let binding_var = Self::parse_match_result_branch_binding(control_line, "err")?;
+                    let (branch_lines, next_cursor) = Self::parse_lines(lines, cursor + 1, true)?;
+                    err_branch = Some(MatchResultBranch {
+                        binding_var,
+                        lines: branch_lines,
+                    });
+                    saw_branch = true;
+                    cursor = next_cursor;
+                }
+                Some(LineControlKeyword::Control) => {
+                    if control_branch.is_some() {
+                        let msg = format!(
+                            "Duplicate 'control' branch in match-result starting at line {}",
+                            index + 1
+                        );
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+                    let (action_var, from_var, value_var) =
+                        Self::parse_match_result_control_binding(control_line)?;
+                    let (branch_lines, next_cursor) = Self::parse_lines(lines, cursor + 1, true)?;
+                    control_branch = Some(MatchResultControlBranch {
+                        action_var,
+                        from_var,
+                        value_var,
+                        lines: branch_lines,
+                    });
+                    saw_branch = true;
+                    cursor = next_cursor;
+                }
+                Some(LineControlKeyword::End) => {
+                    if !saw_branch {
+                        let msg = format!(
+                            "'match-result' must contain at least one branch at line {}",
+                            index + 1
+                        );
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+
+                    let line = Line {
+                        source,
+                        statements: vec![Statement::new_match_result(MatchResultStatement {
+                            command,
+                            ok_branch,
+                            err_branch,
+                            control_branch,
+                        })],
+                    };
+
+                    return Ok((line, cursor + 1));
+                }
+                Some(other) => {
+                    let msg = format!(
+                        "Unexpected control keyword '{}' in match-result statement at line {}",
+                        Self::line_control_keyword_name(other),
+                        cursor + 1
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+                None => {
+                    let msg = format!(
+                        "Expected 'ok(...)', 'err(...)', 'control(...)' or 'end' in match-result at line {}",
+                        cursor + 1
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
+        }
+    }
+
+    fn line_control_keyword_name(keyword: LineControlKeyword) -> &'static str {
+        match keyword {
+            LineControlKeyword::Else => "else",
+            LineControlKeyword::Elif => "elif",
+            LineControlKeyword::End => "end",
+            LineControlKeyword::Ok => "ok",
+            LineControlKeyword::Err => "err",
+            LineControlKeyword::Control => "control",
+        }
     }
 
     fn parse_for_statement(lines: &[&str], index: usize) -> Result<(Line, usize), String> {
@@ -1512,6 +1779,79 @@ mod tests {
         let err = parser.parse(block_str).unwrap_err();
         assert!(
             err.contains("Missing 'end' for for statement"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_match_result_statement() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            match-result $(invoke --chain auth_flow)
+            ok(value)
+                echo $value;
+            err(err_value)
+                echo $err_value;
+            control(action, from, control_value)
+                echo $action $from $control_value;
+            end
+        "#;
+
+        let block = parser.parse(block_str).unwrap();
+        assert_eq!(block.lines.len(), 1);
+
+        let statement = &block.lines[0].statements[0];
+        let match_result = statement.match_result_statement.as_ref().unwrap();
+        assert!(match_result.command.as_command().is_some());
+        assert_eq!(
+            match_result.ok_branch.as_ref().unwrap().binding_var,
+            "value"
+        );
+        assert_eq!(
+            match_result.err_branch.as_ref().unwrap().binding_var,
+            "err_value"
+        );
+
+        let control_branch = match_result.control_branch.as_ref().unwrap();
+        assert_eq!(control_branch.action_var, "action");
+        assert_eq!(control_branch.from_var, "from");
+        assert_eq!(control_branch.value_var, "control_value");
+    }
+
+    #[test]
+    fn test_parse_match_result_requires_command_substitution() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            match-result invoke --chain auth_flow
+            ok(value)
+                echo $value;
+            end
+        "#;
+
+        let err = parser.parse(block_str).unwrap_err();
+        assert!(
+            err.contains("requires command substitution syntax '$(...)'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_match_result_duplicate_branch() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            match-result $(invoke --chain auth_flow)
+            ok(value)
+                echo $value;
+            ok(other)
+                echo $other;
+            end
+        "#;
+
+        let err = parser.parse(block_str).unwrap_err();
+        assert!(
+            err.contains("Duplicate 'ok' branch in match-result"),
             "unexpected error: {}",
             err
         );

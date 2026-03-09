@@ -1,5 +1,6 @@
 use super::block::{
-    Block, CommandArg, CommandItem, Expression, ForStatement, IfStatement, Line, Statement,
+    Block, CommandArg, CommandItem, Expression, ForStatement, IfStatement, Line,
+    MatchResultStatement, Statement,
 };
 use super::exec::BlockExecuter;
 use super::parser::BlockParser;
@@ -42,6 +43,10 @@ impl BlockCommandLinker {
             self.link_for_statement(for_statement)?;
             return Ok(());
         }
+        if let Some(match_result_statement) = statement.match_result_statement.as_mut() {
+            self.link_match_result_statement(match_result_statement)?;
+            return Ok(());
+        }
 
         // For each statement, we need to link the expressions
         for (_, expr, _) in &mut statement.expressions {
@@ -77,6 +82,33 @@ impl BlockCommandLinker {
 
         for line in &mut for_statement.lines {
             self.link_line(line)?;
+        }
+
+        Ok(())
+    }
+
+    fn link_match_result_statement(
+        &self,
+        match_result_statement: &mut MatchResultStatement,
+    ) -> Result<(), String> {
+        self.link_expression(match_result_statement.command.as_mut())?;
+
+        if let Some(ok_branch) = match_result_statement.ok_branch.as_mut() {
+            for line in &mut ok_branch.lines {
+                self.link_line(line)?;
+            }
+        }
+
+        if let Some(err_branch) = match_result_statement.err_branch.as_mut() {
+            for line in &mut err_branch.lines {
+                self.link_line(line)?;
+            }
+        }
+
+        if let Some(control_branch) = match_result_statement.control_branch.as_mut() {
+            for line in &mut control_branch.lines {
+                self.link_line(line)?;
+            }
         }
 
         Ok(())

@@ -105,6 +105,8 @@ end
 
 - `$(some-command)` 必须是命令替换，保证子命令只执行一次。
 - 第一版只接受 `$(...)` 形式，不接受裸命令形式如 `match-result exec --chain foo`。
+- `ok(...)` / `err(...)` / `control(...)` 都不是必填全套；V1 只要求至少声明一个分支。
+- 因此如果脚本只关心成功路径，可以只写 `ok(value)`；如果只关心 control，也可以只写 `control(action, from, value)`。
 - `ok(value)` 匹配 `CommandResult::Success(value)`。
 - `err(err_value)` 匹配 `CommandResult::Error(err_value)`。
 - `control(action, from, value)` 匹配 `CommandResult::Control(...)`。
@@ -146,11 +148,17 @@ match-result exec --chain auth_flow
 执行流程如下：
 
 1. 先执行一次子命令，得到 `CommandResult`。
-2. 若结果为 `Success(value)`，进入 `ok(...)` 分支。
-3. 若结果为 `Error(value)`，进入 `err(...)` 分支。
+2. 若结果为 `Success(value)`：
+    - 若存在 `ok(...)` 分支，则进入该分支。
+    - 若不存在 `ok(...)` 分支，则返回原始 `Success(value)`。
+3. 若结果为 `Error(value)`：
+    - 若存在 `err(...)` 分支，则进入该分支。
+    - 若不存在 `err(...)` 分支，则返回原始 `Error(value)`。
 4. 若结果为 `Control(control)`：
    - 若存在 `control(...)` 分支，则进入该分支。
    - 若不存在 `control(...)` 分支，则原样向外传播，不消费该结果。
+
+这意味着 `match-result` 不是强制穷尽匹配结构；未声明的结果类型会保持默认行为继续向外传递。
 
 ### 5.2 分支变量绑定
 
@@ -187,6 +195,7 @@ match-result exec --chain auth_flow
 
 - 若 `ok` 分支最后执行了某个普通命令，则返回该命令结果。
 - 若 `err` 分支内部执行了 `return --from block ...`，则该 control 继续传播。
+- 若未声明 `err` 分支且子命令返回了 `Error(value)`，则整个 `match-result` 返回原始 `Error(value)`。
 - 若未声明 `control` 分支且子命令直接返回了 `Control`，则整个 `match-result` 不消费，直接原样返回。
 
 ## 6. 与 `capture` 的关系
@@ -252,6 +261,53 @@ end
 ```
 
 若 `other_chain` 返回 `return --from lib ...`，则该 `Control` 不会被 `match-result` 吃掉，而是继续向外传播。
+
+### 7.4 只声明 ok 分支
+
+```process-chain
+match-result $(some-command)
+ok(value)
+    echo "success:" $value;
+end
+```
+
+这类写法是合法的。
+
+- 若 `some-command` 返回 `Success(value)`，则进入 `ok` 分支。
+- 若 `some-command` 返回 `Error(value)`，则整个语句返回原始 `Error(value)`。
+- 若 `some-command` 返回 `Control(...)`，则整个语句返回原始 `Control(...)`，除非显式声明了 `control(...)` 分支。
+
+### 7.5 只声明 err 分支
+
+```process-chain
+match-result $(match $REQ.host "*.example.com")
+err(err_value)
+    echo "not matched:" $err_value;
+    return --from block "fallback";
+end
+```
+
+这类写法同样合法。
+
+- 若子命令返回 `Error(value)`，则进入 `err` 分支。
+- 若子命令返回 `Success(value)`，则整个语句返回原始 `Success(value)`。
+- 若子命令返回 `Control(...)`，则整个语句返回原始 `Control(...)`，除非显式声明了 `control(...)` 分支。
+
+### 7.6 只声明 control 分支
+
+```process-chain
+match-result $(invoke --chain auth_flow --arg req $REQ)
+control(action, from, value)
+    echo "callee control:" $action $from $value;
+    return --from block $value;
+end
+```
+
+这种写法适合“只想拦截调用方 control，其余 success/error 保持默认行为”的场景。
+
+- 若子命令返回 `Control(...)`，则进入 `control` 分支。
+- 若子命令返回 `Success(value)`，则整个语句返回原始 `Success(value)`。
+- 若子命令返回 `Error(value)`，则整个语句返回原始 `Error(value)`。
 
 ## 8. 解析与 AST 建议
 

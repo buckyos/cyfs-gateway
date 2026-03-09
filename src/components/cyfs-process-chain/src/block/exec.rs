@@ -1,9 +1,9 @@
 use super::block::{
-    Block, CommandItem, Expression, ExpressionChain, ForStatement, IfStatement, Line, Operator,
-    Statement,
+    Block, CommandItem, Expression, ExpressionChain, ForStatement, IfStatement, Line,
+    MatchResultBranch, MatchResultControlBranch, MatchResultStatement, Operator, Statement,
 };
 use crate::chain::{Context, EnvLevel, ProcessChainError, ProcessChainErrorCode};
-use crate::cmd::CommandResult;
+use crate::cmd::{CommandControl, CommandResult};
 use crate::collection::{
     CollectionValue, ListCollectionTraverseCallBack, MapCollectionTraverseCallBack,
     MemorySetCollection, MultiMapCollectionKeyTraverseCallBack,
@@ -324,6 +324,15 @@ impl BlockExecuter {
         if let Some(for_statement) = statement.for_statement.as_ref() {
             return Self::execute_for_statement(for_statement, line_no, source, context).await;
         }
+        if let Some(match_result_statement) = statement.match_result_statement.as_ref() {
+            return Self::execute_match_result_statement(
+                match_result_statement,
+                line_no,
+                source,
+                context,
+            )
+            .await;
+        }
 
         Self::execute_expression_chain(
             &statement.expressions,
@@ -497,7 +506,7 @@ impl BlockExecuter {
         Ok(CommandResult::success())
     }
 
-    async fn snapshot_loop_var(
+    async fn snapshot_block_var(
         var_name: &str,
         context: &Context,
     ) -> Result<LoopVarSnapshot, String> {
@@ -508,7 +517,6 @@ impl BlockExecuter {
             None
         };
         let tracker_level = context.env().var_level_entry(var_name);
-
         Ok(LoopVarSnapshot {
             name: var_name.to_string(),
             value,
@@ -516,7 +524,154 @@ impl BlockExecuter {
         })
     }
 
-    async fn restore_loop_vars(
+    async fn execute_match_result_value_branch(
+        branch: &MatchResultBranch,
+        value: CollectionValue,
+        line_no: usize,
+        source: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let binding = vec![(branch.binding_var.as_str(), value)];
+        Self::execute_match_result_branch_lines(&binding, &branch.lines, line_no, source, context)
+            .await
+    }
+
+    async fn execute_match_result_control_branch(
+        branch: &MatchResultControlBranch,
+        control: CommandControl,
+        line_no: usize,
+        source: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let action = match &control {
+            CommandControl::Return(_) => CollectionValue::String("return".to_string()),
+            CommandControl::Error(_) => CollectionValue::String("error".to_string()),
+            CommandControl::Exit(_) => CollectionValue::String("exit".to_string()),
+            CommandControl::Break(_) => CollectionValue::String("break".to_string()),
+        };
+        let from = match &control {
+            CommandControl::Return(v) | CommandControl::Error(v) => {
+                CollectionValue::String(v.level.as_str().to_string())
+            }
+            CommandControl::Exit(_) | CommandControl::Break(_) => CollectionValue::Null,
+        };
+        let value = control.value().clone();
+
+        let bindings = vec![
+            (branch.action_var.as_str(), action),
+            (branch.from_var.as_str(), from),
+            (branch.value_var.as_str(), value),
+        ];
+        Self::execute_match_result_branch_lines(&bindings, &branch.lines, line_no, source, context)
+            .await
+    }
+
+    async fn execute_match_result_branch_lines(
+        bindings: &[(&str, CollectionValue)],
+        lines: &[Line],
+        line_no: usize,
+        source: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let mut snapshots = Vec::with_capacity(bindings.len());
+        for (var_name, _) in bindings {
+            snapshots.push(Self::snapshot_block_var(var_name, context).await?);
+        }
+
+        let execute_result: Result<CommandResult, String> = async {
+            for (var_name, value) in bindings {
+                context
+                    .env()
+                    .set(var_name, value.clone(), Some(EnvLevel::Block))
+                    .await?;
+            }
+
+            Self::execute_nested_lines(lines, line_no, context).await
+        }
+        .await;
+
+        let restore_result = Self::restore_block_vars(&snapshots, context).await;
+        match (execute_result, restore_result) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(exec_err), Ok(())) => Err(Self::wrap_runtime_error(
+                context,
+                ProcessChainErrorCode::RuntimeExpressionExecute,
+                "Failed to execute match-result branch",
+                Some(line_no),
+                Some(source),
+                None,
+                exec_err,
+            )),
+            (Ok(_), Err(restore_err)) => Err(Self::wrap_runtime_error(
+                context,
+                ProcessChainErrorCode::RuntimeExpressionExecute,
+                "Failed to restore match-result branch scope",
+                Some(line_no),
+                Some(source),
+                None,
+                restore_err,
+            )),
+            (Err(exec_err), Err(restore_err)) => Err(Self::wrap_runtime_error(
+                context,
+                ProcessChainErrorCode::RuntimeExpressionExecute,
+                "Failed to execute match-result branch and restore scope",
+                Some(line_no),
+                Some(source),
+                None,
+                format!("exec_error={}, restore_error={}", exec_err, restore_err),
+            )),
+        }
+    }
+
+    async fn execute_match_result_statement(
+        match_result_statement: &MatchResultStatement,
+        line_no: usize,
+        source: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let result = Self::execute_expression_with_location(
+            match_result_statement.command.as_ref(),
+            context,
+            Some(line_no),
+            Some(source.to_string()),
+        )
+        .await?;
+
+        match result {
+            CommandResult::Success(value) => {
+                if let Some(branch) = match_result_statement.ok_branch.as_ref() {
+                    return Self::execute_match_result_value_branch(
+                        branch, value, line_no, source, context,
+                    )
+                    .await;
+                }
+
+                Ok(CommandResult::Success(value))
+            }
+            CommandResult::Error(value) => {
+                if let Some(branch) = match_result_statement.err_branch.as_ref() {
+                    return Self::execute_match_result_value_branch(
+                        branch, value, line_no, source, context,
+                    )
+                    .await;
+                }
+
+                Ok(CommandResult::Error(value))
+            }
+            CommandResult::Control(control) => {
+                if let Some(branch) = match_result_statement.control_branch.as_ref() {
+                    return Self::execute_match_result_control_branch(
+                        branch, control, line_no, source, context,
+                    )
+                    .await;
+                }
+
+                Ok(CommandResult::Control(control))
+            }
+        }
+    }
+
+    async fn restore_block_vars(
         snapshots: &[LoopVarSnapshot],
         context: &Context,
     ) -> Result<(), String> {
@@ -639,9 +794,9 @@ impl BlockExecuter {
             1
         });
 
-        snapshots.push(Self::snapshot_loop_var(&for_statement.key_var, context).await?);
+        snapshots.push(Self::snapshot_block_var(&for_statement.key_var, context).await?);
         if let Some(value_var) = for_statement.value_var.as_ref() {
-            snapshots.push(Self::snapshot_loop_var(value_var, context).await?);
+            snapshots.push(Self::snapshot_block_var(value_var, context).await?);
         }
 
         let execute_result: Result<CommandResult, String> = async {
@@ -719,7 +874,7 @@ impl BlockExecuter {
         }
         .await;
 
-        let restore_result = Self::restore_loop_vars(&snapshots, context).await;
+        let restore_result = Self::restore_block_vars(&snapshots, context).await;
         match (execute_result, restore_result) {
             (Ok(result), Ok(())) => Ok(result),
             (Err(exec_err), Ok(())) => Err(Self::wrap_runtime_error(

@@ -518,10 +518,33 @@ pub struct ForStatement {
 }
 
 #[derive(Debug, Clone)]
+pub struct MatchResultBranch {
+    pub binding_var: String,
+    pub lines: Vec<Line>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchResultControlBranch {
+    pub action_var: String,
+    pub from_var: String,
+    pub value_var: String,
+    pub lines: Vec<Line>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MatchResultStatement {
+    pub command: Box<Expression>,
+    pub ok_branch: Option<MatchResultBranch>,
+    pub err_branch: Option<MatchResultBranch>,
+    pub control_branch: Option<MatchResultControlBranch>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Statement {
     pub expressions: ExpressionChain,
     pub if_statement: Option<IfStatement>,
     pub for_statement: Option<ForStatement>,
+    pub match_result_statement: Option<MatchResultStatement>,
 }
 
 impl Statement {
@@ -530,6 +553,7 @@ impl Statement {
             expressions,
             if_statement: None,
             for_statement: None,
+            match_result_statement: None,
         }
     }
 
@@ -538,6 +562,7 @@ impl Statement {
             expressions: Vec::new(),
             if_statement: Some(if_statement),
             for_statement: None,
+            match_result_statement: None,
         }
     }
 
@@ -546,6 +571,16 @@ impl Statement {
             expressions: Vec::new(),
             if_statement: None,
             for_statement: Some(for_statement),
+            match_result_statement: None,
+        }
+    }
+
+    pub fn new_match_result(match_result_statement: MatchResultStatement) -> Self {
+        Self {
+            expressions: Vec::new(),
+            if_statement: None,
+            for_statement: None,
+            match_result_statement: Some(match_result_statement),
         }
     }
 }
