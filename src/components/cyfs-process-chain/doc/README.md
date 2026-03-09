@@ -18,6 +18,8 @@
   - 脚本模块化能力草案（基于 `invoke` 的参数签名、调用边界与命名空间设计）。
 - [RFC_FOR_LOOP_STATEMENT.md](./RFC_FOR_LOOP_STATEMENT.md)
   - 结构化 `for ... in ...` 循环语句草案（容器遍历、break/continue、与 map-reduce 的关系）。
+- [RFC_MATCH_RESULT_STATEMENT.md](./RFC_MATCH_RESULT_STATEMENT.md)
+  - `match-result` 结果分支语句草案（按 `CommandResult` 分支、`Control` 透传规则、与 `capture` 的关系）。
 - [RFC_TEMPLATE_LIBRARY.md](./RFC_TEMPLATE_LIBRARY.md)
   - 标准库与最佳实践模板草案（模板契约、错误码规范、分层落地路线）。
 - [MIGRATION_TYPED_LITERAL_BREAKING.md](./MIGRATION_TYPED_LITERAL_BREAKING.md)
