@@ -652,6 +652,16 @@ pub trait MultiMapCollectionTraverseCallBack: Send + Sync {
 pub type MultiMapCollectionTraverseCallBackRef = Arc<Box<dyn MultiMapCollectionTraverseCallBack>>;
 
 #[async_trait::async_trait]
+pub trait MultiMapCollectionKeyTraverseCallBack: Send + Sync {
+    /// Traverse the collection and apply the callback to each key.
+    /// If the callback returns false, the traversal stops.
+    async fn call(&self, key: &str) -> Result<bool, String>;
+}
+
+pub type MultiMapCollectionKeyTraverseCallBackRef =
+    Arc<Box<dyn MultiMapCollectionKeyTraverseCallBack>>;
+
+#[async_trait::async_trait]
 pub trait MultiMapCollectionTraverseOwnedCallBack: Send + Sync {
     /// Traverse the collection and apply the callback to each owned key-values pair.
     /// Return `TraverseControl::Break` to stop traversal.
@@ -722,6 +732,20 @@ pub trait MultiMapCollection: Send + Sync {
     /// Traverses the collection and applies the callback to each key-value pair.
     async fn traverse(&self, callback: MultiMapCollectionTraverseCallBackRef)
     -> Result<(), String>;
+
+    /// Traverses the collection and applies the callback to each key.
+    async fn traverse_keys(
+        &self,
+        callback: MultiMapCollectionKeyTraverseCallBackRef,
+    ) -> Result<(), String> {
+        let keys = self.keys_snapshot().await?;
+        for key in keys {
+            if !callback.call(&key).await? {
+                break;
+            }
+        }
+        Ok(())
+    }
 
     /// Returns an owned cursor for this collection.
     /// Default implementation uses `dump()`, and can be overridden by concrete collections

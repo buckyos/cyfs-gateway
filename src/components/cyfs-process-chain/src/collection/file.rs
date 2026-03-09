@@ -534,6 +534,13 @@ impl MultiMapCollection for JsonMultiMapCollection {
         self.data.traverse(callback).await
     }
 
+    async fn traverse_keys(
+        &self,
+        callback: MultiMapCollectionKeyTraverseCallBackRef,
+    ) -> Result<(), String> {
+        self.data.traverse_keys(callback).await
+    }
+
     async fn cursor_owned(&self) -> Result<Box<dyn MultiMapCollectionCursor>, String> {
         self.data.cursor_owned().await
     }

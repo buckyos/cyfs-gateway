@@ -244,6 +244,12 @@ impl SetCollection for MemorySetCollection {
     }
 
     async fn insert(&self, value: &str) -> Result<bool, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot insert key '{}' during traversal", value);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
         let mut data = self.data.write().await;
         Ok(data.insert(value.to_string()))
     }
@@ -475,13 +481,9 @@ impl MapCollection for MemoryMapCollection {
         callback: MapCollectionTraverseOwnedCallBackRef,
     ) -> Result<(), String> {
         let _guard = TraverseGuard::new(&self.transverse_counter);
-        let keys = self.keys_snapshot().await?;
-        for key in keys {
-            let value = {
-                let data = self.data.read().await;
-                data.get(&key).cloned().unwrap_or(TypedValue::Null)
-            };
-            if callback.call(key, value).await? == TraverseControl::Break {
+        let data = self.data.read().await;
+        for (key, value) in data.iter() {
+            if callback.call(key.clone(), value.clone()).await? == TraverseControl::Break {
                 break;
             }
         }
@@ -780,6 +782,22 @@ impl MultiMapCollection for MemoryMultiMapCollection {
         Ok(())
     }
 
+    async fn traverse_keys(
+        &self,
+        callback: MultiMapCollectionKeyTraverseCallBackRef,
+    ) -> Result<(), String> {
+        let _guard = TraverseGuard::new(&self.transverse_counter);
+
+        let data = self.data.read().await;
+        for key in data.keys() {
+            if !callback.call(key.as_str()).await? {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn cursor_owned(&self) -> Result<Box<dyn MultiMapCollectionCursor>, String> {
         let keys = self.keys_snapshot().await?;
         Ok(Box::new(MemoryMultiMapCollectionCursor {
@@ -793,13 +811,9 @@ impl MultiMapCollection for MemoryMultiMapCollection {
         callback: MultiMapCollectionTraverseOwnedCallBackRef,
     ) -> Result<(), String> {
         let _guard = TraverseGuard::new(&self.transverse_counter);
-        let keys = self.keys_snapshot().await?;
-        for key in keys {
-            let values = {
-                let data = self.data.read().await;
-                data.get(&key).cloned().unwrap_or_default()
-            };
-            if callback.call(key, values).await? == TraverseControl::Break {
+        let data = self.data.read().await;
+        for (key, values) in data.iter() {
+            if callback.call(key.clone(), values.clone()).await? == TraverseControl::Break {
                 break;
             }
         }

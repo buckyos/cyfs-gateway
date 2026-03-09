@@ -246,3 +246,181 @@ async fn test_for_loop_vars_are_local_only() -> Result<(), String> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_for_map_disallow_write_during_iteration() -> Result<(), String> {
+    init_test_logger();
+
+    let script = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            map-create --global routes;
+            map-add routes "k1" "v1";
+            map-add routes "k2" "v2";
+
+            for key, value in $routes then
+                map-remove routes $key;
+            end
+
+            return --from lib "ok";
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+    let hook_point = HookPoint::new("test_for_map_write_guard");
+    hook_point
+        .load_process_chain_lib("test_for_map_write_guard_lib", 0, script)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-for-map-write-guard")?;
+    let hook_point_env = HookPointEnv::new("test-for-map-write-guard", data_dir);
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = match exec.execute_lib("test_for_map_write_guard_lib").await {
+        Ok(ret) => return Err(format!("execute should fail, got: {:?}", ret)),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("during traversal"),
+        "unexpected error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_for_multimap_disallow_write_during_iteration() -> Result<(), String> {
+    init_test_logger();
+
+    let script = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            map-create --multi --global tags;
+            map-add tags "svc1" "tag1";
+            map-add tags "svc2" "tag2";
+
+            for key in $tags then
+                map-remove tags $key "tag1";
+            end
+
+            return --from lib "ok";
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+    let hook_point = HookPoint::new("test_for_multimap_write_guard");
+    hook_point
+        .load_process_chain_lib("test_for_multimap_write_guard_lib", 0, script)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-for-multimap-write-guard")?;
+    let hook_point_env = HookPointEnv::new("test-for-multimap-write-guard", data_dir);
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = match exec.execute_lib("test_for_multimap_write_guard_lib").await {
+        Ok(ret) => return Err(format!("execute should fail, got: {:?}", ret)),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("during traversal"),
+        "unexpected error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_for_list_disallow_write_during_iteration() -> Result<(), String> {
+    init_test_logger();
+
+    let script = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            list-create --global values;
+            list-push values "a" "b";
+
+            for idx, item in $values then
+                list-push values "x";
+            end
+
+            return --from lib "ok";
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+    let hook_point = HookPoint::new("test_for_list_write_guard");
+    hook_point
+        .load_process_chain_lib("test_for_list_write_guard_lib", 0, script)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-for-list-write-guard")?;
+    let hook_point_env = HookPointEnv::new("test-for-list-write-guard", data_dir);
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = match exec.execute_lib("test_for_list_write_guard_lib").await {
+        Ok(ret) => return Err(format!("execute should fail, got: {:?}", ret)),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("during traversal"),
+        "unexpected error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_for_set_disallow_write_during_iteration() -> Result<(), String> {
+    init_test_logger();
+
+    let script = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            set-create --global tags;
+            set-add tags "a" "b";
+
+            for tag in $tags then
+                set-add tags "x";
+            end
+
+            return --from lib "ok";
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+    let hook_point = HookPoint::new("test_for_set_write_guard");
+    hook_point
+        .load_process_chain_lib("test_for_set_write_guard_lib", 0, script)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-for-set-write-guard")?;
+    let hook_point_env = HookPointEnv::new("test-for-set-write-guard", data_dir);
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = match exec.execute_lib("test_for_set_write_guard_lib").await {
+        Ok(ret) => return Err(format!("execute should fail, got: {:?}", ret)),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("during traversal"),
+        "unexpected error: {}",
+        err
+    );
+
+    Ok(())
+}

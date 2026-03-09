@@ -4,8 +4,16 @@ use super::block::{
 };
 use crate::chain::{Context, EnvLevel, ProcessChainError, ProcessChainErrorCode};
 use crate::cmd::CommandResult;
-use crate::collection::CollectionValue;
+use crate::collection::{
+    CollectionValue, ListCollectionTraverseCallBack, MapCollectionTraverseCallBack,
+    MemorySetCollection, MultiMapCollectionKeyTraverseCallBack,
+    MultiMapCollectionTraverseOwnedCallBack, NumberValue, SetCollection,
+    SetCollectionTraverseCallBack, TraverseControl,
+};
 use log::log;
+use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub const MAX_GOTO_COUNT_IN_BLOCK: u32 = 128;
 
@@ -16,12 +24,174 @@ pub enum BlockResult {
     Pass,
 }
 
-type ForLoopEntry = (CollectionValue, Option<CollectionValue>);
-
 struct LoopVarSnapshot {
     name: String,
     value: Option<CollectionValue>,
     tracker_level: Option<EnvLevel>,
+}
+
+enum ForIterationOutcome {
+    Continue(CommandResult),
+    Break(CommandResult),
+    Propagate(CommandResult),
+}
+
+struct ForTraverseState {
+    result: CommandResult,
+    terminal: Option<CommandResult>,
+}
+
+impl ForTraverseState {
+    fn new() -> Self {
+        Self {
+            result: CommandResult::success(),
+            terminal: None,
+        }
+    }
+}
+
+type ForTraverseStateRef = Arc<Mutex<ForTraverseState>>;
+
+struct ForMapTraverseCallback {
+    for_statement: ForStatement,
+    line_no: usize,
+    context: Context,
+    state: ForTraverseStateRef,
+}
+
+struct ForListTraverseCallback {
+    for_statement: ForStatement,
+    line_no: usize,
+    context: Context,
+    state: ForTraverseStateRef,
+}
+
+struct ForSetTraverseCallback {
+    for_statement: ForStatement,
+    line_no: usize,
+    context: Context,
+    state: ForTraverseStateRef,
+}
+
+struct ForMultiMapKeyTraverseCallback {
+    for_statement: ForStatement,
+    line_no: usize,
+    context: Context,
+    state: ForTraverseStateRef,
+}
+
+struct ForMultiMapOwnedTraverseCallback {
+    for_statement: ForStatement,
+    line_no: usize,
+    context: Context,
+    state: ForTraverseStateRef,
+}
+
+#[async_trait::async_trait]
+impl MapCollectionTraverseCallBack for ForMapTraverseCallback {
+    async fn call(&self, key: &str, value: &CollectionValue) -> Result<bool, String> {
+        let loop_value = if self.for_statement.value_var.is_some() {
+            Some(value.clone())
+        } else {
+            None
+        };
+
+        let outcome = BlockExecuter::execute_for_iteration(
+            &self.for_statement,
+            self.line_no,
+            &self.context,
+            CollectionValue::String(key.to_string()),
+            loop_value,
+        )
+        .await?;
+
+        BlockExecuter::apply_iteration_outcome_bool(&self.state, outcome).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ListCollectionTraverseCallBack for ForListTraverseCallback {
+    async fn call(&self, index: usize, value: &CollectionValue) -> Result<bool, String> {
+        let key = if self.for_statement.value_var.is_some() {
+            CollectionValue::Number(NumberValue::Int(index as i64))
+        } else {
+            value.clone()
+        };
+        let loop_value = if self.for_statement.value_var.is_some() {
+            Some(value.clone())
+        } else {
+            None
+        };
+
+        let outcome = BlockExecuter::execute_for_iteration(
+            &self.for_statement,
+            self.line_no,
+            &self.context,
+            key,
+            loop_value,
+        )
+        .await?;
+
+        BlockExecuter::apply_iteration_outcome_bool(&self.state, outcome).await
+    }
+}
+
+#[async_trait::async_trait]
+impl SetCollectionTraverseCallBack for ForSetTraverseCallback {
+    async fn call(&self, item: &str) -> Result<bool, String> {
+        let item = CollectionValue::String(item.to_string());
+        let key = item.clone();
+        let loop_value = if self.for_statement.value_var.is_some() {
+            Some(item)
+        } else {
+            None
+        };
+
+        let outcome = BlockExecuter::execute_for_iteration(
+            &self.for_statement,
+            self.line_no,
+            &self.context,
+            key,
+            loop_value,
+        )
+        .await?;
+
+        BlockExecuter::apply_iteration_outcome_bool(&self.state, outcome).await
+    }
+}
+
+#[async_trait::async_trait]
+impl MultiMapCollectionKeyTraverseCallBack for ForMultiMapKeyTraverseCallback {
+    async fn call(&self, key: &str) -> Result<bool, String> {
+        let outcome = BlockExecuter::execute_for_iteration(
+            &self.for_statement,
+            self.line_no,
+            &self.context,
+            CollectionValue::String(key.to_string()),
+            None,
+        )
+        .await?;
+
+        BlockExecuter::apply_iteration_outcome_bool(&self.state, outcome).await
+    }
+}
+
+#[async_trait::async_trait]
+impl MultiMapCollectionTraverseOwnedCallBack for ForMultiMapOwnedTraverseCallback {
+    async fn call(&self, key: String, values: HashSet<String>) -> Result<TraverseControl, String> {
+        let set =
+            Arc::new(Box::new(MemorySetCollection::from_set(values)) as Box<dyn SetCollection>);
+        let outcome = BlockExecuter::execute_for_iteration(
+            &self.for_statement,
+            self.line_no,
+            &self.context,
+            CollectionValue::String(key),
+            Some(CollectionValue::Set(set)),
+        )
+        .await?;
+
+        BlockExecuter::apply_iteration_outcome_control(&self.state, outcome).await
+    }
 }
 
 pub struct BlockExecuter {
@@ -372,92 +542,90 @@ impl BlockExecuter {
         Ok(())
     }
 
-    async fn collect_for_loop_entries(
+    async fn execute_for_iteration(
         for_statement: &ForStatement,
+        line_no: usize,
         context: &Context,
-    ) -> Result<Vec<ForLoopEntry>, String> {
-        let iterable = for_statement.iterable.evaluate(context).await?;
-        let want_value_var = for_statement.value_var.is_some();
+        key: CollectionValue,
+        value: Option<CollectionValue>,
+    ) -> Result<ForIterationOutcome, String> {
+        context
+            .env()
+            .set(&for_statement.key_var, key, Some(EnvLevel::Block))
+            .await?;
 
-        match iterable {
-            CollectionValue::List(list) => {
-                let values = list.dump().await?;
-                let entries = if want_value_var {
-                    values
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, value)| {
-                            (
-                                CollectionValue::Number(crate::collection::NumberValue::Int(
-                                    idx as i64,
-                                )),
-                                Some(value),
-                            )
-                        })
-                        .collect()
-                } else {
-                    values.into_iter().map(|value| (value, None)).collect()
-                };
-                Ok(entries)
+        if let Some(value_var) = for_statement.value_var.as_ref() {
+            let value = value.unwrap_or(CollectionValue::Null);
+            context
+                .env()
+                .set(value_var, value, Some(EnvLevel::Block))
+                .await?;
+        }
+
+        let loop_result =
+            Self::execute_nested_lines(&for_statement.lines, line_no, context).await?;
+        if !loop_result.is_control() {
+            return Ok(ForIterationOutcome::Continue(loop_result));
+        }
+
+        let control = loop_result.as_control().unwrap();
+        if control.is_break() {
+            return Ok(ForIterationOutcome::Break(
+                CommandResult::success_with_value(control.value().clone()),
+            ));
+        }
+
+        Ok(ForIterationOutcome::Propagate(loop_result))
+    }
+
+    async fn apply_iteration_outcome_bool(
+        state: &ForTraverseStateRef,
+        outcome: ForIterationOutcome,
+    ) -> Result<bool, String> {
+        let mut state = state.lock().await;
+        match outcome {
+            ForIterationOutcome::Continue(result) => {
+                state.result = result;
+                Ok(true)
             }
-            CollectionValue::Set(set) => {
-                let values = set.dump().await?;
-                let entries = values
-                    .into_iter()
-                    .map(|value| {
-                        let value = CollectionValue::String(value);
-                        if want_value_var {
-                            (value.clone(), Some(value))
-                        } else {
-                            (value, None)
-                        }
-                    })
-                    .collect();
-                Ok(entries)
+            ForIterationOutcome::Break(result) => {
+                state.result = result;
+                Ok(false)
             }
-            CollectionValue::Map(map) => {
-                // Snapshot only keys, then read each value on demand to avoid full map value copy.
-                let keys = map.keys_snapshot().await?;
-                let mut entries = Vec::with_capacity(keys.len());
-                for key in keys {
-                    let value = if want_value_var {
-                        Some(
-                            map.get(&key)
-                                .await?
-                                .unwrap_or(CollectionValue::Null),
-                        )
-                    } else {
-                        None
-                    };
-                    entries.push((CollectionValue::String(key), value));
-                }
-                Ok(entries)
-            }
-            CollectionValue::MultiMap(multi_map) => {
-                // Snapshot only keys, then read each key's set on demand to avoid full multimap copy.
-                let keys = multi_map.keys_snapshot().await?;
-                let mut entries = Vec::with_capacity(keys.len());
-                for key in keys {
-                    let value = if want_value_var {
-                        Some(match multi_map.get_many(&key).await? {
-                            Some(set) => CollectionValue::Set(set),
-                            None => CollectionValue::Null,
-                        })
-                    } else {
-                        None
-                    };
-                    entries.push((CollectionValue::String(key), value));
-                }
-                Ok(entries)
-            }
-            other => {
-                let msg = format!(
-                    "For-loop iterable must be List/Set/Map/MultiMap, got {}",
-                    other.get_type()
-                );
-                Err(msg)
+            ForIterationOutcome::Propagate(result) => {
+                state.terminal = Some(result);
+                Ok(false)
             }
         }
+    }
+
+    async fn apply_iteration_outcome_control(
+        state: &ForTraverseStateRef,
+        outcome: ForIterationOutcome,
+    ) -> Result<TraverseControl, String> {
+        let mut state = state.lock().await;
+        match outcome {
+            ForIterationOutcome::Continue(result) => {
+                state.result = result;
+                Ok(TraverseControl::Continue)
+            }
+            ForIterationOutcome::Break(result) => {
+                state.result = result;
+                Ok(TraverseControl::Break)
+            }
+            ForIterationOutcome::Propagate(result) => {
+                state.terminal = Some(result);
+                Ok(TraverseControl::Break)
+            }
+        }
+    }
+
+    async fn finalize_for_traverse_state(state: &ForTraverseStateRef) -> CommandResult {
+        let state = state.lock().await;
+        if let Some(result) = state.terminal.as_ref() {
+            return result.clone();
+        }
+        state.result.clone()
     }
 
     async fn execute_for_statement(
@@ -478,38 +646,75 @@ impl BlockExecuter {
         }
 
         let execute_result: Result<CommandResult, String> = async {
-            let entries = Self::collect_for_loop_entries(for_statement, context).await?;
-            let mut result = CommandResult::success();
-
-            for (key, value) in entries {
-                context
-                    .env()
-                    .set(&for_statement.key_var, key, Some(EnvLevel::Block))
-                    .await?;
-
-                if let Some(value_var) = for_statement.value_var.as_ref() {
-                    let value = value.unwrap_or(CollectionValue::Null);
-                    context
-                        .env()
-                        .set(value_var, value, Some(EnvLevel::Block))
-                        .await?;
+            let iterable = for_statement.iterable.evaluate(context).await?;
+            let result = match iterable {
+                CollectionValue::List(list) => {
+                    let state = Arc::new(Mutex::new(ForTraverseState::new()));
+                    let callback = Arc::new(Box::new(ForListTraverseCallback {
+                        for_statement: for_statement.clone(),
+                        line_no,
+                        context: context.clone(),
+                        state: state.clone(),
+                    })
+                        as Box<dyn ListCollectionTraverseCallBack>);
+                    list.traverse(callback).await?;
+                    Self::finalize_for_traverse_state(&state).await
                 }
-
-                let loop_result =
-                    Self::execute_nested_lines(&for_statement.lines, line_no, context).await?;
-                if !loop_result.is_control() {
-                    result = loop_result;
-                    continue;
+                CollectionValue::Set(set) => {
+                    let state = Arc::new(Mutex::new(ForTraverseState::new()));
+                    let callback = Arc::new(Box::new(ForSetTraverseCallback {
+                        for_statement: for_statement.clone(),
+                        line_no,
+                        context: context.clone(),
+                        state: state.clone(),
+                    })
+                        as Box<dyn SetCollectionTraverseCallBack>);
+                    set.traverse(callback).await?;
+                    Self::finalize_for_traverse_state(&state).await
                 }
-
-                let control = loop_result.as_control().unwrap();
-                if control.is_break() {
-                    result = CommandResult::success_with_value(control.value().clone());
-                    break;
+                CollectionValue::Map(map) => {
+                    let state = Arc::new(Mutex::new(ForTraverseState::new()));
+                    let callback = Arc::new(Box::new(ForMapTraverseCallback {
+                        for_statement: for_statement.clone(),
+                        line_no,
+                        context: context.clone(),
+                        state: state.clone(),
+                    })
+                        as Box<dyn MapCollectionTraverseCallBack>);
+                    map.traverse(callback).await?;
+                    Self::finalize_for_traverse_state(&state).await
                 }
-
-                return Ok(loop_result);
-            }
+                CollectionValue::MultiMap(multi_map) => {
+                    let state = Arc::new(Mutex::new(ForTraverseState::new()));
+                    if for_statement.value_var.is_some() {
+                        let callback = Arc::new(Box::new(ForMultiMapOwnedTraverseCallback {
+                            for_statement: for_statement.clone(),
+                            line_no,
+                            context: context.clone(),
+                            state: state.clone(),
+                        })
+                            as Box<dyn MultiMapCollectionTraverseOwnedCallBack>);
+                        multi_map.traverse_owned(callback).await?;
+                    } else {
+                        let callback = Arc::new(Box::new(ForMultiMapKeyTraverseCallback {
+                            for_statement: for_statement.clone(),
+                            line_no,
+                            context: context.clone(),
+                            state: state.clone(),
+                        })
+                            as Box<dyn MultiMapCollectionKeyTraverseCallBack>);
+                        multi_map.traverse_keys(callback).await?;
+                    }
+                    Self::finalize_for_traverse_state(&state).await
+                }
+                other => {
+                    let msg = format!(
+                        "For-loop iterable must be List/Set/Map/MultiMap, got {}",
+                        other.get_type()
+                    );
+                    return Err(msg);
+                }
+            };
 
             Ok(result)
         }
