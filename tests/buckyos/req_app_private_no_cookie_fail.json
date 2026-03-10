@@ -1,0 +1,12 @@
+{
+  "input": {
+    "REQ": {
+      "path": "/index.html",
+      "host": "filebrowser.test.buckyos.io",
+      "url": "https://filebrowser.test.buckyos.io/index.html",
+      "Cookie": ""
+    }
+  },
+  "id": "server:node_gateway:main",
+  "output": ["REQ", "RESP"]
+}

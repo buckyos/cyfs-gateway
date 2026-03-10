@@ -1,4 +1,3 @@
-
 stacks:
   zone_gateway_https:
     bind: 0.0.0.0:443
@@ -12,11 +11,9 @@ stacks:
         key_path: ./zone_cert_key.pem
     hook_point:
       main:
-        id: main
         priority: 1
         blocks:
           default:
-            id: default
             priority: 1
             block: |
               return "server node_gateway";

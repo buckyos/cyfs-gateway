@@ -116,6 +116,23 @@ def main():
         name = req_file.stem
         assertions = None
 
+        def control_matches(action_set, expected_substring=None, exact_value=None):
+            def _check(result):
+                ctrl = result.get("control_result", {})
+                if ctrl.get("type") != "control":
+                    return False, f"expected control result, got {ctrl}"
+                action = ctrl.get("action", "")
+                value = str(ctrl.get("value", ""))
+                if action not in action_set:
+                    return False, f"expected action in {sorted(action_set)}, got {ctrl}"
+                if expected_substring is not None and expected_substring not in value:
+                    return False, f"expected value containing '{expected_substring}', got {ctrl}"
+                if exact_value is not None and value != exact_value:
+                    return False, f"expected value '{exact_value}', got {ctrl}"
+                return True, ""
+
+            return _check
+
         if name == "req_stack_node_rtcp":
             def check_forward_return(result):
                 ctrl = result.get("control_result", {})
@@ -131,30 +148,39 @@ def main():
 
             assertions = [check_forward_return]
 
-        elif name == "req_server_node_gateway":
-            def check_forward_system_config(result):
-                ctrl = result.get("control_result", {})
-                if ctrl.get("type") != "control":
-                    return False, f"expected control result, got {ctrl}"
-                val = ctrl.get("value", "")
-                action = ctrl.get("action", "")
-                if action == "return" and "127.0.0.1:3200" in val:
-                    return True, ""
-                if action == "return" and val == "":
-                    return True, ""
-                return False, f"expected forward to 3200 or passthrough, got {ctrl}"
+        elif name == "req_app_public_ok":
+            assertions = [control_matches({"return", "exit"}, expected_substring="127.0.0.1:10161")]
 
-            assertions = [check_forward_system_config]
+        elif name == "req_app_private_no_cookie_fail":
+            assertions = [control_matches({"return"}, expected_substring="/oauth/login?redirect_url=")]
+
+        elif name == "req_app_private_cookie_wrong_appid_fail":
+            assertions = [control_matches({"return"}, expected_substring="/oauth/login?redirect_url=")]
+
+        elif name == "req_server_node_gateway":
+            assertions = [control_matches({"return", "exit"}, expected_substring="127.0.0.1:10160")]
+
+        elif name == "req_service_by_kapi_ok":
+            assertions = [control_matches({"return", "exit"}, expected_substring="127.0.0.1:10165")]
+
+        elif name == "req_service_by_host_prefix_ok":
+            assertions = [control_matches({"return", "exit"}, expected_substring="127.0.0.1:10262")]
+
+        elif name == "req_service_by_root_host_ok":
+            assertions = [control_matches({"return", "exit"}, expected_substring="127.0.0.1:10262")]
+
+        elif name == "req_service_blocked_by_app_fail":
+            assertions = [control_matches({"exit"}, exact_value="reject")]
 
         elif name == "req_stack_zone_gateway_http":
             def check_forward_to_service(result):
                 ctrl = result.get("control_result", {})
-                if ctrl.get("type") != "control" or ctrl.get("action") != "exit":
-                    return False, f"expected control exit, got {ctrl}"
+                if ctrl.get("type") != "control" or ctrl.get("action") != "return":
+                    return False, f"expected control return, got {ctrl}"
                 val = str(ctrl.get("value", ""))
-                if "forward" in val and ("127.0.0.1:10162" in val or "127.0.0.1:10163" in val):
+                if val == "server node_gateway":
                     return True, ""
-                return False, f"expected forward to service upstream, got {val}"
+                return False, f"expected return server node_gateway, got {val}"
 
             assertions = [check_forward_to_service]
 
