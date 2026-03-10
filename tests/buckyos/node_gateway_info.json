@@ -1,6 +1,8 @@
 {
-    "THIS_NODE_ID": "ood1",
-    "THIS_ZONE_HOST":"test.buckyos.io",
+    "node_info": {
+        "this_node_id": "ood1",
+        "this_zone_host": "test.buckyos.io"
+    },
     "app_info": {
         "publicview" : {
             "app_id":"publicview",
