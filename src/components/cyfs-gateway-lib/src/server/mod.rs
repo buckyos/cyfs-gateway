@@ -98,6 +98,22 @@ pub fn normalize_config_file_path(path: PathBuf, base_dir: &Path) -> PathBuf {
     path
 }
 
+fn normalize_config_path_value(value_str: &str, base_dir: &Path) -> String {
+    let (path_str, fragment) = if let Some((path_str, fragment)) = value_str.split_once('#') {
+        (path_str, Some(fragment))
+    } else {
+        (value_str, None)
+    };
+
+    let value_path = normalize_config_file_path(PathBuf::from(path_str), base_dir);
+    let value_path = value_path.to_string_lossy().to_string();
+    if let Some(fragment) = fragment {
+        format!("{}#{}", value_path, fragment)
+    } else {
+        value_path
+    }
+}
+
 //will move to buckyos_kit
 pub fn normalize_all_path_value_config(config: &mut serde_json::Value, base_dir: &Path) {
     if config.is_object() {
@@ -105,14 +121,12 @@ pub fn normalize_all_path_value_config(config: &mut serde_json::Value, base_dir:
             if value.is_string() {
                 if key.ends_with("_path") || key == "path" {
                     let value_str = value.as_str().unwrap();
-                    let value_path = normalize_config_file_path(PathBuf::from(value_str), base_dir);
+                    let value_path = normalize_config_path_value(value_str, base_dir);
                     info!(
                         "normalize_all_path_value_config: key: {}, value: {} -> {}",
-                        key,
-                        value_str,
-                        value_path.to_string_lossy()
+                        key, value_str, value_path
                     );
-                    *value = serde_json::Value::String(value_path.to_string_lossy().to_string());
+                    *value = serde_json::Value::String(value_path);
                 }
             } else {
                 normalize_all_path_value_config(value, base_dir);
@@ -231,6 +245,7 @@ mod test {
 
     #[test]
     fn test_normalize_all_path_value_config() {
+        use super::normalize_config_path_value;
         use crate::normalize_all_path_value_config;
         use buckyos_kit::init_logging;
         use std::path::PathBuf;
@@ -266,6 +281,10 @@ mod test {
                 .unwrap()
                 .replace("\\", "/"),
             "/opt/buckyos/etc/cyfs_gateway.yaml"
+        );
+        assert_eq!(
+            normalize_config_path_value("./all_info.json#app_info", &base_dir).replace("\\", "/"),
+            "/opt/buckyos/etc/all_info.json#app_info"
         );
         assert_eq!(
             config

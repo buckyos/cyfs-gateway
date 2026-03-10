@@ -1,3 +1,4 @@
+use buckyos_kit::get_by_json_path;
 use cyfs_process_chain::{
     CollectionValue, MapCollection, MapCollectionRef, MapCollectionTraverseCallBackRef,
     MemoryListCollection, MemoryMapCollection,
@@ -280,6 +281,8 @@ pub async fn map_to_json_simple(
 
 pub struct JsonMap {
     file_path: String,
+    source_file_path: String,
+    json_path: Option<String>,
     only_read_file: bool,
     map: RwLock<HashMap<String, serde_json::Value>>,
 }
@@ -291,9 +294,18 @@ impl JsonMap {
 
     pub async fn open(file_path: impl Into<String>, only_read_file: bool) -> Result<Self, String> {
         let file_path = file_path.into();
-        let map = Self::load_map_from_path(file_path.as_str()).await?;
+        let (source_file_path, json_path) = Self::parse_file_spec(file_path.as_str());
+        if json_path.is_some() && !only_read_file {
+            return Err(format!(
+                "json_map {} with #json_path requires only_read_file=true",
+                file_path
+            ));
+        }
+        let map = Self::load_map_from_path(source_file_path.as_str(), json_path.as_deref()).await?;
         Ok(JsonMap {
             file_path,
+            source_file_path,
+            json_path,
             only_read_file,
             map: RwLock::new(map),
         })
@@ -301,6 +313,7 @@ impl JsonMap {
 
     async fn load_map_from_path(
         file_path: &str,
+        json_path: Option<&str>,
     ) -> Result<HashMap<String, serde_json::Value>, String> {
         if Path::new(file_path).exists() {
             let content = tokio::fs::read_to_string(file_path)
@@ -309,17 +322,50 @@ impl JsonMap {
             if content.is_empty() {
                 Ok(HashMap::new())
             } else {
-                serde_json::from_str::<HashMap<String, serde_json::Value>>(&content)
-                    .map_err(|e| e.to_string())
+                let root = serde_json::from_str::<serde_json::Value>(&content)
+                    .map_err(|e| e.to_string())?;
+                let target = if let Some(json_path) = json_path {
+                    get_by_json_path(&root, json_path).ok_or_else(|| {
+                        format!("json_map {} cannot find json_path {}", file_path, json_path)
+                    })?
+                } else {
+                    root
+                };
+
+                match target {
+                    serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
+                    _ => Err(format!(
+                        "json_map {} target is not a JSON object",
+                        if let Some(json_path) = json_path {
+                            format!("{}#{}", file_path, json_path)
+                        } else {
+                            file_path.to_string()
+                        }
+                    )),
+                }
             }
         } else {
             Ok(HashMap::new())
         }
     }
 
+    fn parse_file_spec(file_path: &str) -> (String, Option<String>) {
+        if let Some((source_file_path, json_path)) = file_path.split_once('#') {
+            let json_path = json_path.trim();
+            if json_path.is_empty() {
+                (source_file_path.to_string(), None)
+            } else {
+                (source_file_path.to_string(), Some(json_path.to_string()))
+            }
+        } else {
+            (file_path.to_string(), None)
+        }
+    }
+
     async fn read_snapshot(&self) -> Result<HashMap<String, serde_json::Value>, String> {
         if self.only_read_file {
-            Self::load_map_from_path(self.file_path.as_str()).await
+            Self::load_map_from_path(self.source_file_path.as_str(), self.json_path.as_deref())
+                .await
         } else {
             Ok(self.map.read().unwrap().clone())
         }
@@ -340,7 +386,7 @@ impl JsonMap {
             let map = self.map.read().unwrap();
             serde_json::to_string(map.deref()).map_err(|e| e.to_string())?
         };
-        tokio::fs::write(self.file_path.as_str(), content)
+        tokio::fs::write(self.source_file_path.as_str(), content)
             .await
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -730,5 +776,32 @@ mod tests {
         assert_eq!(appid.to_string(), "filebrowser");
         let url = app.get("url").await.unwrap().unwrap();
         assert_eq!(url.to_string(), "http://127.0.0.1:10160");
+    }
+
+    #[tokio::test]
+    async fn test_json_map_reads_object_from_json_path() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"{"app_info":{"appid":"filebrowser","url":"http://127.0.0.1:10160"},"other":{"k":"v"}}"#,
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let path = format!("{}#app_info", file.path().to_string_lossy());
+
+        let map = JsonMap::open(path.as_str(), true).await.unwrap();
+        let appid = map.get("appid").await.unwrap().unwrap();
+        assert_eq!(appid.to_string(), "filebrowser");
+        let url = map.get("url").await.unwrap().unwrap();
+        assert_eq!(url.to_string(), "http://127.0.0.1:10160");
+        assert!(!map.contains_key("other").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_json_map_json_path_requires_only_read_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = format!("{}#app_info", file.path().to_string_lossy());
+
+        let err = JsonMap::open(path.as_str(), false).await.err().unwrap();
+        assert!(err.contains("only_read_file=true"));
     }
 }

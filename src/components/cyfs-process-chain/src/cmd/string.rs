@@ -729,6 +729,241 @@ impl CommandExecutor for StringAppendCommand {
     }
 }
 
+fn percent_encode_url_component(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{:02X}", byte));
+        }
+    }
+
+    encoded
+}
+
+fn decode_hex_digit(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(format!(
+            "Invalid percent-encoded byte: '{}'",
+            char::from(byte)
+        )),
+    }
+}
+
+fn percent_decode_url_component(input: &str) -> Result<String, String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                if index + 2 >= bytes.len() {
+                    let msg = format!("Incomplete percent-encoded sequence in '{}'", input);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+
+                let high = decode_hex_digit(bytes[index + 1])?;
+                let low = decode_hex_digit(bytes[index + 2])?;
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8(decoded).map_err(|e| {
+        let msg = format!("Decoded URL string is not valid UTF-8: {}", e);
+        error!("{}", msg);
+        msg
+    })
+}
+
+pub struct UrlEncodeCommandParser {
+    cmd: Command,
+}
+
+impl UrlEncodeCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("url_encode")
+            .about("Percent-encode a string so it can be safely embedded in a URL.")
+            .after_help(
+                r#"
+Arguments:
+  <string>     The input string or variable to encode.
+
+Behavior:
+  - Encodes reserved URL characters using percent-encoding.
+  - Leaves RFC 3986 unreserved characters unchanged.
+  - Does not modify environment or variables.
+
+Examples:
+  url_encode "https://example.com/callback?a=1&b=2"
+  url_encode $REQ.url
+"#,
+            )
+            .arg(
+                Arg::new("string")
+                    .required(true)
+                    .help("Input string to percent-encode"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for UrlEncodeCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid url_encode command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let string_index = matches.index_of("string").ok_or_else(|| {
+            let msg = format!("String value is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let string_value = args[string_index].clone();
+        Ok(Arc::new(Box::new(UrlEncodeCommand::new(string_value))))
+    }
+}
+
+pub struct UrlEncodeCommand {
+    string: CommandArg,
+}
+
+impl UrlEncodeCommand {
+    pub fn new(string: CommandArg) -> Self {
+        Self { string }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for UrlEncodeCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let string_value = self.string.evaluate_string(context).await?;
+        let encoded = percent_encode_url_component(&string_value);
+        Ok(super::CommandResult::success_with_string(encoded))
+    }
+}
+
+pub struct UrlDecodeCommandParser {
+    cmd: Command,
+}
+
+impl UrlDecodeCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("url_decode")
+            .about("Decode a percent-encoded URL string.")
+            .after_help(
+                r#"
+Arguments:
+  <string>     The input string or variable to decode.
+
+Behavior:
+  - Decodes `%XX` escape sequences.
+  - Returns a runtime error for malformed escape sequences or invalid UTF-8.
+  - Does not modify environment or variables.
+
+Examples:
+  url_decode "https%3A%2F%2Fexample.com%2Fcallback%3Fa%3D1%26b%3D2"
+  url_decode $encoded_url
+"#,
+            )
+            .arg(
+                Arg::new("string")
+                    .required(true)
+                    .help("Input string to percent-decode"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for UrlDecodeCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid url_decode command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let string_index = matches.index_of("string").ok_or_else(|| {
+            let msg = format!("String value is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let string_value = args[string_index].clone();
+        Ok(Arc::new(Box::new(UrlDecodeCommand::new(string_value))))
+    }
+}
+
+pub struct UrlDecodeCommand {
+    string: CommandArg,
+}
+
+impl UrlDecodeCommand {
+    pub fn new(string: CommandArg) -> Self {
+        Self { string }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for UrlDecodeCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let string_value = self.string.evaluate_string(context).await?;
+        let decoded = percent_decode_url_component(&string_value)?;
+        Ok(super::CommandResult::success_with_string(decoded))
+    }
+}
+
 pub struct StringConstCommand {
     result: String,
 }

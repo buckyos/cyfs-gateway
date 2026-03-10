@@ -111,10 +111,11 @@ global_process_chains:
           echo "check_oauth block for app ${APP_ID}";
           eq $TARGET_APP_INFO.sdk_version "0" || return true;
           local cookies=$(parse-cookie $REQ.Cookie);
-          eq $cookies.session_token "" && redirect "${CONTROL_PANEL_URL}/oauth/login?redirect_url=${REQ.url}";
+          local oauth_login_url=$(append "${CONTROL_PANEL_URL}/oauth/login?redirect_url=" $(url_encode $REQ.url));
+          eq $cookies.session_token "" && redirect $oauth_login_url;
           #local payload=$(verify-jwt $cookies.session_token $TRUST_KEY);
-          #eq $payload false && redirect "${CONTROL_PANEL_URL}/oauth/login?redirect_url=${REQ.url}";
-          #eq $payload.appid $APP_ID || redirect "${CONTROL_PANEL_URL}/oauth/login?redirect_url=${REQ.url}";
+          #eq $payload false && redirect $oauth_login_url;
+          #eq $payload.appid $APP_ID || redirect $oauth_login_url;
           return true;
 
       permit_check: 
@@ -145,4 +146,3 @@ global_process_chains:
             echo "forward_to_app block";
             eq $TARGET_APP_INFO.nodeid $THIS_NODE_ID && forward "http://127.0.0.1:${TARGET_APP_INFO.port}";
             forward "${NODE_ROUTE_MAP[$TARGET_APP_INFO.nodeid]}:${TARGET_APP_INFO.port}";
-

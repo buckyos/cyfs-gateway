@@ -77,6 +77,10 @@
 #     type: json_map
 #     file_path: ./map.json
 #     only_read_file: true        # 可选。启用后 gateway 每次读取都直接访问文件，并禁用内部写入
+#   app_info:
+#     type: json_map
+#     file_path: ./all_info.json#app_info
+#     only_read_file: true        # 使用 #json_path 读取文件中的一个子对象；当前仅支持只读模式
 #   sqlite_map_example:
 #     type: sqlite_map
 #     file_path: ./map.db
