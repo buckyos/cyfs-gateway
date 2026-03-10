@@ -301,4 +301,5 @@ workspace 内以下组件直接依赖本 crate：
 ## 13. 参考文档
 
 - 命令级帮助请看 [COMMAND_REFERENCE.md](./COMMAND_REFERENCE.md)。
+- 中文对照版请看 [COMMAND_REFERENCE.zh-CN.md](./COMMAND_REFERENCE.zh-CN.md)。
 - 该文件中的 external 命令基于 REPL 默认注册集合；实际网关运行时以业务注册为准。

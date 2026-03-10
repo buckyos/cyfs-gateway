@@ -9,6 +9,9 @@
 - [COMMAND_REFERENCE.md](./COMMAND_REFERENCE.md)
   - 由 REPL `help doc` 自动导出的命令帮助（含内置命令和已注册外部命令）。
   - 注意：当前文件中的 external 命令来自 REPL 默认初始化（例如 `http-probe`、`https-sni-probe`），网关运行时可注册更多命令。
+- [COMMAND_REFERENCE.zh-CN.md](./COMMAND_REFERENCE.zh-CN.md)
+  - `COMMAND_REFERENCE.md` 的中文对照版，便于中文读者查阅。
+  - 命令名、选项名与脚本关键字保持英文，说明文字提供中文化描述。
 - [Gateway Runtime External Commands](../../../../doc/process_chain_gateway_external_commands.md)
   - `cyfs_gateway` 运行时默认注册的 external command 补充说明。
   - 当前包含 `verify-jwt`、`parse-cookie` 等网关命令，以及通过 `cyfs_gateway process_chain --all` 导出完整帮助的方式。
@@ -59,6 +62,12 @@ EOT
 
 ```bash
 src/components/cyfs-process-chain/doc/COMMAND_REFERENCE.md
+```
+
+中文版本当前为基于英文版整理的并行文档；当英文版命令参考更新后，应同步校准：
+
+```bash
+src/components/cyfs-process-chain/doc/COMMAND_REFERENCE.zh-CN.md
 ```
 
 如果要导出包含 `cyfs_gateway` 默认 external command 的完整文档，可以执行：

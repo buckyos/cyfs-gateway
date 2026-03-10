@@ -488,6 +488,81 @@ Examples:
   delete $REQ.header1;
 ```
 
+### `is-bool`
+```
+Check whether a value is Bool.
+
+Usage: is-bool <value>
+
+Arguments:
+  <value>
+          Value to inspect
+
+Options:
+  -h, --help
+          Print help
+```
+
+### `is-null`
+```
+Check whether a value is Null.
+
+Usage: is-null <value>
+
+Arguments:
+  <value>
+          Value to inspect
+
+Options:
+  -h, --help
+          Print help
+```
+
+### `is-number`
+```
+Check whether a value is Number.
+
+Usage: is-number <value>
+
+Arguments:
+  <value>
+          Value to inspect
+
+Options:
+  -h, --help
+          Print help
+```
+
+### `to-bool`
+```
+Convert a value to bool according to execution coercion policy.
+
+Usage: to-bool <value>
+
+Arguments:
+  <value>
+          Value to convert
+
+Options:
+  -h, --help
+          Print help
+```
+
+### `to-number`
+```
+Convert a value to number according to execution coercion policy.
+
+Usage: to-number <value>
+
+Arguments:
+  <value>
+          Value to convert
+
+Options:
+  -h, --help
+          Print help
+```
+
 ### `type`
 ```
 Determine and display the type of the provided argument(s).
@@ -564,6 +639,210 @@ Examples:
 ```
 
 ## collection
+
+### `list-clear`
+```
+Clear all values from a list collection.
+
+Usage: list-clear <list_id>
+
+Arguments:
+  <list_id>
+          The ID of the target list
+
+Options:
+  -h, --help
+          Print help
+
+
+Arguments:
+  <list_id>   The identifier of the target list.
+
+Examples:
+  list-clear request_history
+```
+
+### `list-create`
+```
+Create a new list collection with a given identifier and scope.
+
+Usage: list-create [OPTIONS] <list_id>
+
+Arguments:
+  <list_id>
+          The ID of the list to create
+
+Options:
+      --global
+          Use global scope
+          
+          [aliases: --export]
+
+      --chain
+          Use chain scope (default)
+
+      --block
+          Use block scope
+          
+          [aliases: --local]
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <list_id>   The identifier of the list collection to create.
+
+Scope Options:
+  -global, -export    Create the list in the global scope.
+  -chain              Create the list in the current process chain scope (default).
+  -block, -local      Create the list in the current execution block (local) scope.
+
+Notes:
+  - If no scope is specified, the default is chain-level.
+
+Examples:
+  list-create -global request_history
+  list-create session_steps
+  list-create -block temp_values
+```
+
+### `list-insert`
+```
+Insert a value into a list collection at a specific index.
+
+Usage: list-insert <list_id> <index> <value>
+
+Arguments:
+  <list_id>
+          The ID of the target list
+
+  <index>
+          Zero-based index
+
+  <value>
+          The value to insert
+
+Options:
+  -h, --help
+          Print help
+
+
+Arguments:
+  <list_id>   The identifier of the target list.
+  <index>     Zero-based index to insert at.
+  <value>     Value to insert.
+
+Examples:
+  list-insert request_history 0 "begin"
+  list-insert records 1 $REQ
+```
+
+### `list-pop`
+```
+Pop the last value from a list collection.
+
+Usage: list-pop <list_id>
+
+Arguments:
+  <list_id>
+          The ID of the target list
+
+Options:
+  -h, --help
+          Print help
+
+
+Arguments:
+  <list_id>   The identifier of the target list.
+
+Examples:
+  list-pop request_history
+```
+
+### `list-push`
+```
+Append one or more values to a list collection.
+
+Usage: list-push <list_id> <value>...
+
+Arguments:
+  <list_id>
+          The ID of the target list
+
+  <value>...
+          One or more values to append to the list
+
+Options:
+  -h, --help
+          Print help
+
+
+Arguments:
+  <list_id>   The identifier of the target list.
+  <value>...  One or more values to append.
+
+Examples:
+  list-push request_history "step1" "step2"
+  list-push records $REQ
+```
+
+### `list-remove`
+```
+Remove a value from a list collection at a specific index.
+
+Usage: list-remove <list_id> <index>
+
+Arguments:
+  <list_id>
+          The ID of the target list
+
+  <index>
+          Zero-based index
+
+Options:
+  -h, --help
+          Print help
+
+
+Arguments:
+  <list_id>   The identifier of the target list.
+  <index>     Zero-based index to remove.
+
+Examples:
+  list-remove request_history 0
+```
+
+### `list-set`
+```
+Set a value in a list collection at a specific index.
+
+Usage: list-set <list_id> <index> <value>
+
+Arguments:
+  <list_id>
+          The ID of the target list
+
+  <index>
+          Zero-based index
+
+  <value>
+          The value to set
+
+Options:
+  -h, --help
+          Print help
+
+
+Arguments:
+  <list_id>   The identifier of the target list.
+  <index>     Zero-based index to replace.
+  <value>     New value.
+
+Examples:
+  list-set request_history 0 "start"
+  list-set records 2 $REQ
+```
 
 ### `map-add`
 ```
@@ -1640,4 +1919,138 @@ Requirements:
 
 Examples:
   https-sni-probe && accept
+```
+
+## statements
+
+### Structured Statement Overview
+```
+These are DSL syntax forms, not standalone commands. They are parsed at the
+statement level, so they do not appear in the command registry.
+```
+
+### `if` / `elif` / `else` / `end`
+```
+Branch on a boolean/predicate condition.
+
+Syntax:
+  if <condition> then
+      ...
+  elif <condition> then
+      ...
+  else
+      ...
+  end
+
+Supported condition styles:
+  - Predicate command:
+      if eq $REQ.role "admin" then
+  - Negated predicate command:
+      if !eq $REQ.protocol "https" then
+  - Infix comparison sugar:
+      if $one == "1" then
+      if $one === "1" then
+      if $one != "1" then
+      if $one !== "1" then
+      if $one > 0 then
+      if $one >= 1 then
+      if $one < 2 then
+      if $one <= 1 then
+
+Notes:
+  - `==` / `!=` use loose comparison semantics.
+  - `===` / `!==` use strict typed comparison semantics.
+  - Missing `end` is a parse/link error.
+```
+
+### `for ... in ... then ... end`
+```
+Traverse a collection with structured loop semantics.
+
+Syntax:
+  for item in $list then
+      ...
+  end
+
+  for idx, item in $list then
+      ...
+  end
+
+  for item in $set then
+      ...
+  end
+
+  for key, value in $map then
+      ...
+  end
+
+  for key, values in $multi_map then
+      ...
+  end
+
+Behavior:
+  - Loop variables are local to the for-block.
+  - Outer variables with the same name are restored after the loop ends.
+  - `break [value]` exits only the current loop.
+  - `return` / `error` / `exit` / `goto` continue to propagate normally.
+
+Traversal safety:
+  - Mutating the same collection while it is being traversed is rejected.
+  - This applies to list/set/map/multi-map traversal.
+
+Examples:
+  for item in $values then
+      eq $item "b" && break "stop";
+  end
+
+  for key, value in $routes then
+      map-add copied $key $value;
+  end
+
+  for key, values in $tags then
+      for item in $values then
+          echo $key $item;
+      end
+  end
+```
+
+### `match-result`
+```
+Execute one command substitution once, then branch by CommandResult kind.
+
+Syntax:
+  match-result $(<command>)
+  ok(value)
+      ...
+  err(err_value)
+      ...
+  control(action, from, value)
+      ...
+  end
+
+Rules:
+  - The input must be a single command substitution: `$(...)`.
+  - `ok(...)` handles Success(value).
+  - `err(...)` handles Error(value).
+  - `control(action, from, value)` handles Control results.
+  - Unhandled result kinds propagate unchanged.
+
+Examples:
+  match-result $(append "hello" "_ok")
+  ok(value)
+      return --from lib $(append "handled:" $value);
+  end
+
+  match-result $(match "abc" "z*")
+  err(err_value)
+      eq $err_value false || return --from lib "bad_err_value";
+      return --from lib "handled_error";
+  end
+
+  match-result $(return --from chain "chain_value")
+  control(action, from, value)
+      eq $action "return" || return --from lib "bad_action";
+      eq $from "chain" || return --from lib "bad_from";
+      return --from lib "handled_control";
+  end
 ```
