@@ -950,7 +950,7 @@ impl Gateway {
         self.global_collection_manager.read().unwrap().clone()
     }
 
-    pub async fn start(&self, params: GatewayParams) -> Result<()> {
+    pub async fn start(&self, _params: GatewayParams) -> Result<()> {
         let mut real_machine_config = BuckyOSMachineConfig::default();
         let machine_config = BuckyOSMachineConfig::load_machine_config();
         if machine_config.is_some() {
@@ -971,54 +971,7 @@ impl Gateway {
             error!("start stack manager failed, err:{}", e);
             return Err(anyhow!("start stack manager failed, err:{}", e));
         }
-
-        if !params.keep_tunnel.is_empty() {
-            self.keep_tunnels(params.keep_tunnel).await;
-        }
         Ok(())
-    }
-    async fn keep_tunnels(&self, keep_tunnel: Vec<String>) {
-        for tunnel in keep_tunnel {
-            self.keep_tunnel(tunnel.as_str()).await;
-        }
-    }
-
-    async fn keep_tunnel(&self, tunnel: &str) {
-        let tunnel_url = format!("rtcp://{}", tunnel);
-        info!("Will keep tunnel: {}", tunnel_url);
-        let tunnel_url = Url::parse(tunnel_url.as_str());
-        if tunnel_url.is_err() {
-            warn!("Invalid tunnel url: {}", tunnel_url.err().unwrap());
-            return;
-        }
-
-        let tunnel_manager = self.tunnel_manager().clone();
-        tokio::task::spawn(async move {
-            let tunnel_url = tunnel_url.unwrap();
-            loop {
-                let last_ok;
-                let tunnel = tunnel_manager.get_tunnel(&tunnel_url, None).await;
-                if tunnel.is_err() {
-                    warn!("Error getting tunnel: {}", tunnel.err().unwrap());
-                    last_ok = false;
-                } else {
-                    let tunnel = tunnel.unwrap();
-                    let ping_result = tunnel.ping().await;
-                    if ping_result.is_err() {
-                        warn!("Error pinging tunnel: {}", ping_result.err().unwrap());
-                        last_ok = false;
-                    } else {
-                        last_ok = true;
-                    }
-                }
-
-                if last_ok {
-                    tokio::time::sleep(std::time::Duration::from_secs(60 * 2)).await;
-                } else {
-                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                }
-            }
-        });
     }
 
     pub fn get_all_config(&self) -> Result<Value> {

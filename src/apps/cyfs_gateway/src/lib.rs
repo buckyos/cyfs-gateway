@@ -117,6 +117,7 @@ async fn run_gateway_with_config(
     config_file: Option<&Path>,
     params: GatewayParams,
 ) -> Result<()> {
+    let config_json = merge_keep_tunnel_into_rtcp_stack_config(config_json, &params.keep_tunnel);
     let parser = Arc::new(GatewayConfigParser::new());
     parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
     parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
@@ -250,6 +251,68 @@ async fn run_gateway_with_config(
     let _ = tokio::signal::ctrl_c().await;
 
     Ok(())
+}
+
+fn merge_keep_tunnel_into_rtcp_stack_config(
+    mut config_json: Value,
+    keep_tunnels: &[String],
+) -> Value {
+    if keep_tunnels.is_empty() {
+        return config_json;
+    }
+
+    let Some(stacks) = config_json.get_mut("stacks").and_then(Value::as_object_mut) else {
+        return config_json;
+    };
+
+    let mut found_rtcp_stack = false;
+    for (stack_id, stack_value) in stacks.iter_mut() {
+        let Some(stack_obj) = stack_value.as_object_mut() else {
+            continue;
+        };
+        let Some(protocol) = stack_obj.get("protocol").and_then(Value::as_str) else {
+            continue;
+        };
+        if !protocol.eq_ignore_ascii_case("rtcp") {
+            continue;
+        }
+
+        found_rtcp_stack = true;
+        let keep_tunnel_key = if stack_obj.contains_key("keep-tunnel") {
+            "keep-tunnel"
+        } else {
+            "keep_tunnel"
+        };
+        let keep_tunnel_value = stack_obj
+            .entry(keep_tunnel_key.to_string())
+            .or_insert_with(|| Value::Array(vec![]));
+        let Some(keep_tunnel_array) = keep_tunnel_value.as_array_mut() else {
+            warn!(
+                "skip merging keep_tunnel into rtcp stack {}: {} must be an array",
+                stack_id, keep_tunnel_key
+            );
+            continue;
+        };
+        for keep_tunnel in keep_tunnels {
+            let keep_tunnel = keep_tunnel.trim();
+            if keep_tunnel.is_empty() {
+                continue;
+            }
+            let keep_tunnel_value = Value::String(keep_tunnel.to_string());
+            if !keep_tunnel_array
+                .iter()
+                .any(|existing| existing == &keep_tunnel_value)
+            {
+                keep_tunnel_array.push(keep_tunnel_value);
+            }
+        }
+    }
+
+    if !found_rtcp_stack {
+        warn!("keep_tunnel specified but no rtcp stack found in config");
+    }
+
+    config_json
 }
 
 fn get_config_file_path(matches: &clap::ArgMatches) -> PathBuf {
@@ -2365,5 +2428,61 @@ pub async fn cyfs_gateway_main() {
 
     if let Err(e) = gateway_service_main(config_file.as_path(), params).await {
         error!("Gateway run error: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_keep_tunnel_into_rtcp_stack_config;
+    use serde_json::json;
+
+    #[test]
+    fn test_merge_keep_tunnel_into_rtcp_stack_config() {
+        let config = json!({
+            "stacks": {
+                "rtcp1": {
+                    "protocol": "rtcp",
+                    "keep_tunnel": ["did:old", "did:dup"]
+                },
+                "tcp1": {
+                    "protocol": "tcp"
+                }
+            }
+        });
+
+        let merged = merge_keep_tunnel_into_rtcp_stack_config(
+            config,
+            &[
+                "did:dup".to_string(),
+                "did:new".to_string(),
+                " ".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            merged["stacks"]["rtcp1"]["keep_tunnel"],
+            json!(["did:old", "did:dup", "did:new"])
+        );
+        assert!(merged["stacks"]["tcp1"].get("keep_tunnel").is_none());
+    }
+
+    #[test]
+    fn test_merge_keep_tunnel_preserves_hyphenated_key() {
+        let config = json!({
+            "stacks": {
+                "rtcp1": {
+                    "protocol": "rtcp",
+                    "keep-tunnel": ["did:old"]
+                }
+            }
+        });
+
+        let merged = merge_keep_tunnel_into_rtcp_stack_config(config, &["did:new".to_string()]);
+
+        assert_eq!(
+            merged["stacks"]["rtcp1"]["keep-tunnel"],
+            json!(["did:old", "did:new"])
+        );
+        assert!(merged["stacks"]["rtcp1"].get("keep_tunnel").is_none());
     }
 }

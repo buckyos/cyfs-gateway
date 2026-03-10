@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
@@ -961,6 +962,7 @@ impl TunnelBuilder for RtcpTunnelBuilder {
 pub struct RtcpStack {
     id: String,
     bind_addr: String,
+    keep_tunnel: Vec<String>,
     reuse_address: bool,
     rtcp: Mutex<Option<RTcp>>,
     rtcp_ref: Mutex<Option<Arc<RTcp>>>,
@@ -1035,6 +1037,52 @@ impl RtcpStack {
         RtcpStackBuilder::new()
     }
 
+    fn start_keep_tunnels(&self) {
+        for tunnel in self.keep_tunnel.iter().cloned() {
+            self.start_keep_tunnel(tunnel);
+        }
+    }
+
+    fn start_keep_tunnel(&self, tunnel: String) {
+        let tunnel_url = format!("rtcp://{}", tunnel);
+        info!("Will keep tunnel: {}", tunnel_url);
+        let tunnel_url = match Url::parse(tunnel_url.as_str()) {
+            Ok(url) => url,
+            Err(err) => {
+                warn!("Invalid tunnel url: {}", err);
+                return;
+            }
+        };
+
+        let tunnel_manager = self.tunnel_manager.clone();
+        tokio::task::spawn(async move {
+            loop {
+                let last_ok;
+                match tunnel_manager.get_tunnel(&tunnel_url, None).await {
+                    Err(err) => {
+                        warn!("Error getting tunnel: {}", err);
+                        last_ok = false;
+                    }
+                    Ok(tunnel) => match tunnel.ping().await {
+                        Err(err) => {
+                            warn!("Error pinging tunnel: {}", err);
+                            last_ok = false;
+                        }
+                        Ok(_) => {
+                            last_ok = true;
+                        }
+                    },
+                }
+
+                if last_ok {
+                    tokio::time::sleep(std::time::Duration::from_secs(60 * 2)).await;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                }
+            }
+        });
+    }
+
     async fn create(mut builder: RtcpStackBuilder) -> StackResult<Self> {
         if builder.id.is_none() {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id is required"));
@@ -1066,6 +1114,7 @@ impl RtcpStack {
 
         let id = builder.id.take().unwrap();
         let bind_addr = builder.bind_addr.clone().unwrap();
+        let keep_tunnel = sanitize_keep_tunnels(&builder.keep_tunnel);
         let device_config = builder.device_config.take().unwrap();
         let device_doc_jwt = builder.device_doc_jwt.take();
         let private_key = builder.private_key.take();
@@ -1103,6 +1152,7 @@ impl RtcpStack {
         Ok(Self {
             id,
             bind_addr,
+            keep_tunnel,
             reuse_address: builder.reuse_address,
             rtcp: Mutex::new(Some(rtcp)),
             rtcp_ref: Mutex::new(None),
@@ -1140,6 +1190,7 @@ impl Stack for RtcpStack {
         self.tunnel_manager
             .register_tunnel_builder("rudp", tunnel_builder);
         *self.rtcp_ref.lock().unwrap() = Some(rtcp);
+        self.start_keep_tunnels();
         Ok(())
     }
 
@@ -1222,6 +1273,7 @@ impl Stack for RtcpStack {
 pub struct RtcpStackBuilder {
     id: Option<String>,
     bind_addr: Option<String>,
+    keep_tunnel: Vec<String>,
     device_config: Option<DeviceConfig>,
     device_doc_jwt: Option<String>,
     private_key: Option<[u8; 48]>,
@@ -1238,6 +1290,7 @@ impl RtcpStackBuilder {
         Self {
             id: None,
             bind_addr: None,
+            keep_tunnel: vec![],
             device_config: None,
             device_doc_jwt: None,
             private_key: None,
@@ -1257,6 +1310,11 @@ impl RtcpStackBuilder {
 
     pub fn bind(mut self, bind_addr: String) -> Self {
         self.bind_addr = Some(bind_addr);
+        self
+    }
+
+    pub fn keep_tunnel(mut self, keep_tunnel: Vec<String>) -> Self {
+        self.keep_tunnel = keep_tunnel;
         self
     }
 
@@ -1319,6 +1377,8 @@ pub struct RtcpStackConfig {
     pub protocol: StackProtocol,
     pub bind: String,
     pub hook_point: Vec<crate::ProcessChainConfig>,
+    #[serde(default, alias = "keep-tunnel", skip_serializing_if = "Vec::is_empty")]
+    pub keep_tunnel: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_new_tunnel_hook_point: Option<Vec<crate::ProcessChainConfig>>,
     pub key_path: String,
@@ -1427,6 +1487,7 @@ impl StackFactory for RtcpStackFactory {
         let stack = RtcpStack::builder()
             .id(config.id.clone())
             .bind(config.bind.clone())
+            .keep_tunnel(config.keep_tunnel.clone())
             .connection_manager(self.connection_manager.clone())
             .device_config(device_config)
             .private_key(private_key)
@@ -1452,10 +1513,25 @@ impl StackFactory for RtcpStackFactory {
     }
 }
 
+fn sanitize_keep_tunnels(keep_tunnels: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut dedup = HashSet::new();
+    for keep_tunnel in keep_tunnels {
+        let keep_tunnel = keep_tunnel.trim();
+        if keep_tunnel.is_empty() {
+            continue;
+        }
+        if dedup.insert(keep_tunnel.to_string()) {
+            result.push(keep_tunnel.to_string());
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::RtcpConnectionHandler;
+    use super::{RtcpConnectionHandler, sanitize_keep_tunnels};
     use crate::global_process_chains::GlobalProcessChains;
     use crate::{
         ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager,
@@ -4894,6 +4970,7 @@ mod tests {
             protocol: StackProtocol::Rtcp,
             bind: "127.0.0.1:394".to_string(),
             hook_point: vec![],
+            keep_tunnel: vec![],
             on_new_tunnel_hook_point: None,
             key_path: key_file.path().to_string_lossy().to_string(),
             device_config_path: None,
@@ -4925,6 +5002,7 @@ mod tests {
             protocol: StackProtocol::Rtcp,
             bind: "127.0.0.1:394".to_string(),
             hook_point: vec![],
+            keep_tunnel: vec![],
             on_new_tunnel_hook_point: None,
             key_path: key_file.path().to_string_lossy().to_string(),
             device_config_path: Some(config_file.path().to_string_lossy().to_string()),
@@ -4962,6 +5040,7 @@ mod tests {
             protocol: StackProtocol::Rtcp,
             bind: "127.0.0.1:394".to_string(),
             hook_point: vec![],
+            keep_tunnel: vec![],
             on_new_tunnel_hook_point: None,
             key_path: key_file.path().to_string_lossy().to_string(),
             device_config_path: Some(jwt_config_file.path().to_string_lossy().to_string()),
@@ -4976,5 +5055,18 @@ mod tests {
 
         let ret = factory.create(Arc::new(config), stack_context).await;
         assert!(ret.is_ok());
+    }
+
+    #[test]
+    fn test_sanitize_keep_tunnels() {
+        assert_eq!(
+            sanitize_keep_tunnels(&[
+                "did:1".to_string(),
+                " did:2 ".to_string(),
+                "".to_string(),
+                "did:1".to_string(),
+            ]),
+            vec!["did:1".to_string(), "did:2".to_string()]
+        );
     }
 }

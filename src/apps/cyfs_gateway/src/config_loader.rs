@@ -987,7 +987,9 @@ pub struct GatewayConfig {
 #[cfg(test)]
 mod tests {
     use crate::merge;
+    use cyfs_gateway_lib::RtcpStackConfig;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn test_limiter_config_parser() {
@@ -1084,6 +1086,63 @@ mod tests {
             }
         });
         assert!(parser.parse(json).is_err());
+    }
+
+    #[test]
+    fn test_rtcp_keep_tunnel_config_parser() {
+        let parser = super::GatewayConfigParser::new();
+        parser.register_stack_config_parser("rtcp", Arc::new(super::RtcpStackConfigParser::new()));
+
+        let config = parser
+            .parse(json!({
+                "stacks": {
+                    "rtcp1": {
+                        "protocol": "rtcp",
+                        "bind": "127.0.0.1:0",
+                        "key_path": "/tmp/test.pem",
+                        "name": "test",
+                        "keep_tunnel": ["did:1"],
+                        "hook_point": {}
+                    }
+                }
+            }))
+            .unwrap();
+
+        let rtcp_config = config.stacks[0]
+            .as_any()
+            .downcast_ref::<RtcpStackConfig>()
+            .unwrap();
+        assert_eq!(rtcp_config.keep_tunnel, vec!["did:1".to_string()]);
+    }
+
+    #[test]
+    fn test_rtcp_keep_tunnel_hyphenated_alias_parser() {
+        let parser = super::GatewayConfigParser::new();
+        parser.register_stack_config_parser("rtcp", Arc::new(super::RtcpStackConfigParser::new()));
+
+        let config = parser
+            .parse(json!({
+                "stacks": {
+                    "rtcp1": {
+                        "protocol": "rtcp",
+                        "bind": "127.0.0.1:0",
+                        "key_path": "/tmp/test.pem",
+                        "name": "test",
+                        "keep-tunnel": ["did:1", "did:2"],
+                        "hook_point": {}
+                    }
+                }
+            }))
+            .unwrap();
+
+        let rtcp_config = config.stacks[0]
+            .as_any()
+            .downcast_ref::<RtcpStackConfig>()
+            .unwrap();
+        assert_eq!(
+            rtcp_config.keep_tunnel,
+            vec!["did:1".to_string(), "did:2".to_string()]
+        );
     }
 
     #[test]

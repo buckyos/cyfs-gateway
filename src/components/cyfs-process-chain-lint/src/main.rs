@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use cyfs_process_chain_lint::{
-    classify_parse_error, default_known_vars, lint_file, Diagnostic, LintConfig, LintSeverity,
+    Diagnostic, LintConfig, LintSeverity, classify_parse_error, default_known_vars, lint_file,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
