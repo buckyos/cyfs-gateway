@@ -130,6 +130,17 @@ servers:
             # 找到会设置SERVICE_ID和TARGET_SERVICE_INFO
             priority: 130
             block: |
+              if match $REQ.path "/1.0/identifiers/*" then
+                global SERVICE_ID="system_config";
+              end
+              if match $REQ.path "/.well-known/*" then
+                global SERVICE_ID="system_config";
+              end
+              if !eq $SERVICE_ID "" then
+                global TARGET_SERVICE_INFO=$SERVICE_INFO[$SERVICE_ID];
+                return true;
+              end
+
               map-create hp;
               match-reg --capture hp $REQ.path "^/kapi/([a-zA-Z0-9_-]+)(/.*)?" || return false;
               match-include $SERVICE_INFO $hp[1] || return false;

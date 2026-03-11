@@ -20,7 +20,7 @@
             "block_services": ["kevent"]
         },
         "www" : {
-            "service_id":"control_panel",
+            "service_id":"control-panel",
             "selector" : {
                 "ood1" : {
                     "port": 10262,
@@ -33,7 +33,7 @@
             }
         },
         "_" : {
-            "service_id":"control_panel",
+            "service_id":"control-panel",
             "selector" : {
                 "ood1" : {
                     "port": 10262,
@@ -63,6 +63,26 @@
             "selector" : {
                 "ood1" : {
                     "port": 10165,
+                    "weight": 10
+                }
+            }
+        },
+        "control-panel" : {
+            "selector" : {
+                "ood1" : {
+                    "port": 10262,
+                    "weight": 10
+                },
+                "ood2" : {
+                    "port": 10263,
+                    "weight":10
+                }
+            }
+        },
+        "system_config" : {
+            "selector" : {
+                "ood1" : {
+                    "port": 3200,
                     "weight": 10
                 }
             }

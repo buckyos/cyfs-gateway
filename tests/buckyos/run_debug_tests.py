@@ -172,6 +172,12 @@ def main():
         elif name == "req_service_blocked_by_app_fail":
             assertions = [control_matches({"exit"}, exact_value="reject")]
 
+        elif name == "req_service_system_config_identifiers_ok":
+            assertions = [control_matches({"return", "exit"}, expected_substring="127.0.0.1:3200")]
+
+        elif name == "req_service_system_config_well_known_ok":
+            assertions = [control_matches({"return", "exit"}, expected_substring="127.0.0.1:3200")]
+
         elif name == "req_stack_zone_gateway_http":
             def check_forward_to_service(result):
                 ctrl = result.get("control_result", {})

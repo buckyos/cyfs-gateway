@@ -9,3 +9,5 @@
 6.测试通过host-perfix访问service成功: `req_service_by_host_prefix_ok.json`
 7.测试通过无前缀的的域名(appid="_")访问service成功: `req_service_by_root_host_ok.json`
 8.测试service在app的block list中的情况，访问service失败: `req_service_blocked_by_app_fail.json`
+9.测试 `/1.0/identifiers/*` 特例命中 `system_config`: `req_service_system_config_identifiers_ok.json`
+10.测试 `/.well-known/*` 特例命中 `system_config`: `req_service_system_config_well_known_ok.json`

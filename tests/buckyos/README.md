@@ -36,5 +36,7 @@ python run_debug_single.py req_stack_zone_gateway_http.json --repeat 3
 | req_service_by_host_prefix_ok.json | server:node_gateway:main | host prefix service success, forward to 127.0.0.1:10262 |
 | req_service_by_root_host_ok.json | server:node_gateway:main | root host service success, forward to 127.0.0.1:10262 |
 | req_service_blocked_by_app_fail.json | server:node_gateway:main | service blocked by app, reject |
+| req_service_system_config_identifiers_ok.json | server:node_gateway:main | `/1.0/identifiers/*` special case, forward to 127.0.0.1:3200 |
+| req_service_system_config_well_known_ok.json | server:node_gateway:main | `/.well-known/*` special case, forward to 127.0.0.1:3200 |
 | req_stack_node_rtcp.json | stack:node_rtcp:main | forward tcp:///host:port |
 | req_stack_zone_gateway_http.json | stack:zone_gateway_http:main | return server node_gateway |
