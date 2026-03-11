@@ -26,6 +26,16 @@ stacks:
     bind: 0.0.0.0:2980
     key_path: ./node_private_key.pem
     device_config_path: ./node_device_config.json
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "forward ${REQ.protocol}:///${REQ.dest_host}:${REQ.dest_port}";
     # 基于RTCP（包括中转)的身份验证
     # 1） new_http_stream的时候，可以把来源did写入到REQ中供后续使用，但rtcp中转后，只能看到中转节点的did(可以简单的要求中转节点)
     # 2） new_rtcp_stream的时候，是中转，默认只允许zone内中转(来源必须是zone内的设备)
@@ -81,16 +91,15 @@ servers:
               exec get_app_info_from_req;
               exec get_service_info_from_req;
               if !eq $SERVICE_ID "" then
-                echo "access service";
                 exec permit_check || echo "access service permit check failed" && reject;
                 return --from chain $(exec forward_to_service);
               elif !eq $APP_ID "" then
-                echo "access app";
                 if eq $(exec check_oauth) true then
                   return --from chain $(exec forward_to_app);
                 else
                   echo "oauth failed";
-                  local oauth_login_url=$(append "${CONTROL_PANEL_URL}/oauth/login?redirect_url=" $(url_encode $REQ.url));
+                  local full_url = "https://${REQ.host}/${REQ.uri}";
+                  local oauth_login_url=$(append "${CONTROL_PANEL_URL}login?redirect_url=" $(url_encode $full_url));
                   redirect $oauth_login_url;
                 end
               end

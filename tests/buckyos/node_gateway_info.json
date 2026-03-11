@@ -7,7 +7,7 @@
         "publicview" : {
             "app_id":"publicview",
             "sdk_version":10,
-            "access_mode":"public",
+            "access_mode":"private",
             "node_id":"ood1",
             "port": 10161
         },
