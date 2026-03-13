@@ -12,6 +12,7 @@ use log::*;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::sync::{Arc, Weak};
+use serde_json::{Map, Number, Value};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ControlErrorCode {
@@ -398,6 +399,48 @@ impl HttpServer for GatewayControlServer {
                         })
                         .boxed(),
                 ));
+            }
+
+            if req.method == "get_system_info" {
+                if req.sys.is_empty() {
+                    let resp = http::Response::builder()
+                        .status(http::StatusCode::BAD_REQUEST)
+                        .body(Full::new(Bytes::from("invalid sys param"))
+                            .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
+                    return Ok(resp)
+                }
+                let seq = req.sys[0].clone();
+                if let Some(handler) = self.handler.upgrade() {
+                    let mut call_params = Map::new();
+                    if let Some(dst_addr) = info.dst_addr.as_ref() {
+                        if let Ok(socket_addr) = dst_addr.parse::<std::net::SocketAddr>() {
+                            call_params.insert(
+                                "dashboard_port".to_string(),
+                                Value::Number(Number::from(socket_addr.port())),
+                            );
+                        }
+                    }
+                    let result = handler
+                        .handle(req.method.as_str(), Value::Object(call_params))
+                        .await;
+                    let resp = match result {
+                        Ok(result) => CmdResp::<Value> {
+                            sys: vec![seq],
+                            result: Some(result),
+                            error: None,
+                        },
+                        Err(e) => CmdResp::<Value> {
+                            sys: vec![seq],
+                            result: None,
+                            error: Some(e.msg().to_string()),
+                        },
+                    };
+                    let data = serde_json::to_vec(&resp)
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                    return Ok(http::Response::new(Full::new(Bytes::from(data)).map_err(|e| ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))).boxed()));
+                } else {
+                    return Err(cmd_err!(ControlErrorCode::Failed, "{}", "cmd handler has released"));
+                }
             }
 
             if req.sys.len() != 2 {

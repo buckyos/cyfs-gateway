@@ -92,6 +92,10 @@ impl GatewayControlClient {
         self.call("get_init_config", Value::Null).await
     }
 
+    pub async fn get_system_info(&self) -> ControlResult<Value> {
+        self.call("get_system_info", Value::Null).await
+    }
+
     pub async fn remove_rule(&self, id: &str) -> ControlResult<Value> {
         let mut params = HashMap::new();
         params.insert("id", id);

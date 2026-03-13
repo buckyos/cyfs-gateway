@@ -175,6 +175,18 @@ mod tests {
         gateway.start(params).await.unwrap();
 
         let cmd_client = GatewayControlClient::new("http://127.0.0.1:13451".to_string(), None);
+        let ret = cmd_client.get_system_info().await;
+        assert!(ret.is_ok());
+        let system_info = ret.unwrap();
+        assert_eq!(
+            system_info.get("ui_mode").and_then(Value::as_str),
+            Some("developer")
+        );
+        assert!(system_info
+            .get("uptime_sec")
+            .and_then(Value::as_u64)
+            .is_some());
+
         let ret = cmd_client.get_config_by_id(None).await;
         assert!(ret.is_err());
 

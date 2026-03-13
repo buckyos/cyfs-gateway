@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::Instant;
 
 use crate::acme_sn_provider::AcmeSnProviderFactory;
 use crate::config_loader::GatewayConfigParserRef;
@@ -2989,6 +2990,7 @@ pub struct GatewayCmdHandler {
     gateway: Mutex<Option<Weak<Gateway>>>,
     config_file: Option<PathBuf>,
     parser: GatewayConfigParserRef,
+    started_at: Instant,
 }
 
 impl GatewayCmdHandler {
@@ -2997,6 +2999,7 @@ impl GatewayCmdHandler {
             gateway: Mutex::new(None),
             config_file,
             parser,
+            started_at: Instant::now(),
         })
     }
 
@@ -3190,6 +3193,66 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
             "get_init_config" => gateway
                 .get_init_config()
                 .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e)),
+            "get_system_info" => {
+                let params = params.as_object();
+                let dashboard_port = params
+                    .and_then(|obj| obj.get("dashboard_port"))
+                    .and_then(Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+                    .unwrap_or(13451);
+
+                let hostname = std::env::var("HOSTNAME")
+                    .or_else(|_| std::env::var("COMPUTERNAME"))
+                    .unwrap_or_else(|_| "unknown".to_string());
+
+                let ui_mode = gateway
+                    .config
+                    .lock()
+                    .unwrap()
+                    .raw_config
+                    .get("ui_mode")
+                    .and_then(Value::as_str)
+                    .filter(|mode| matches!(*mode, "router" | "ops" | "developer"))
+                    .unwrap_or("developer")
+                    .to_string();
+
+                let mut system_info = Map::new();
+                system_info.insert("version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+                if let Some(build) = option_env!("CYFS_GATEWAY_BUILD")
+                    .or(option_env!("BUILD_TIME"))
+                    .or(option_env!("VERGEN_BUILD_TIMESTAMP"))
+                {
+                    system_info.insert("build".to_string(), json!(build));
+                }
+                if let Some(git_sha) = option_env!("GIT_SHA")
+                    .or(option_env!("CYFS_GIT_SHA"))
+                    .or(option_env!("VERGEN_GIT_SHA"))
+                {
+                    system_info.insert("git_sha".to_string(), json!(git_sha));
+                }
+                system_info.insert(
+                    "uptime_sec".to_string(),
+                    json!(self.started_at.elapsed().as_secs()),
+                );
+                system_info.insert("ui_mode".to_string(), json!(ui_mode));
+                system_info.insert(
+                    "host".to_string(),
+                    json!({
+                        "hostname": hostname,
+                        "os": std::env::consts::OS,
+                        "arch": std::env::consts::ARCH,
+                    }),
+                );
+                system_info.insert(
+                    "dashboard".to_string(),
+                    json!({
+                        "port": dashboard_port,
+                        "loopback_trusted": true,
+                    }),
+                );
+
+                Ok(Value::Object(system_info))
+            }
             "collection_list" => {
                 let collections = gateway.global_collection_manager().list();
                 Ok(serde_json::to_value(collections)
