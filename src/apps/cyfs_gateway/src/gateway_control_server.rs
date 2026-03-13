@@ -10,7 +10,6 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use log::*;
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
 use std::sync::{Arc, Weak};
 use serde_json::{Map, Number, Value};
 
@@ -239,7 +238,7 @@ impl HttpServer for GatewayControlServer {
     async fn serve_request(
         &self,
         request: http::Request<BoxBody<Bytes, ServerError>>,
-        _info: StreamInfo,
+        info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         if request.method() != http::Method::POST {
             return Ok(http::Response::builder()
