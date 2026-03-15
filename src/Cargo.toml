@@ -15,6 +15,9 @@ members = [
     "apps/test_server",
 ]
 
+[workspace.package]
+version = "0.6.0"
+
 [workspace.dependencies]
 # 基础异步运行时
 tokio = { version = "1.49.0", features = ["full"] }

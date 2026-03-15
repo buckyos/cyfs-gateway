@@ -1,6 +1,6 @@
 [package]
 name = "server-runner"
-version = "0.5.1"
+version.workspace = true
 edition = "2024"
 authors = ["BuckyOS DAO", "@waterflier"]
 
@@ -17,4 +17,3 @@ bytes.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-
