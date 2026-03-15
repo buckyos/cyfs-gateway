@@ -152,10 +152,13 @@ def main():
             assertions = [control_matches({"return", "exit"}, expected_substring="127.0.0.1:10161")]
 
         elif name == "req_app_private_no_cookie_fail":
-            assertions = [control_matches({"return"}, expected_substring="/oauth/login?redirect_url=")]
+            assertions = [control_matches({"return"}, expected_substring="/login?redirect_url=")]
 
         elif name == "req_app_private_cookie_wrong_appid_fail":
-            assertions = [control_matches({"return"}, expected_substring="/oauth/login?redirect_url=")]
+            assertions = [control_matches({"return"}, expected_substring="/login?redirect_url=")]
+
+        elif name == "req_app_static_dir_ok":
+            assertions = [control_matches({"return"}, exact_value="server bob_testweb")]
 
         elif name == "req_server_node_gateway":
             assertions = [control_matches({"return", "exit"}, expected_substring="127.0.0.1:10160")]
