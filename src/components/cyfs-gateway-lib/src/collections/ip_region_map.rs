@@ -8,8 +8,8 @@ use cyfs_process_chain::{
     CollectionValue, MapCollection, MapCollectionRef, MapCollectionTraverseCallBackRef,
     MemoryMapCollection,
 };
-use sfo_ip::{CachePolicy, Searcher};
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+use sfo_ip::{CachePolicy, Searcher};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval_at};
@@ -86,7 +86,7 @@ impl IpRegionMap {
             ipv4_sha256,
             &cache_dir,
         )
-            .await?;
+        .await?;
 
         let ipv6 = if let Some(path) = ipv6_file_path {
             Some(
@@ -98,7 +98,7 @@ impl IpRegionMap {
                     ipv6_sha256,
                     &cache_dir,
                 )
-                    .await?,
+                .await?,
             )
         } else {
             None
@@ -264,7 +264,8 @@ impl DbHandle {
 
         match source.clone() {
             DbSource::Local { path } => {
-                let searcher = Searcher::new(path.clone(), cache_policy).map_err(|e| e.to_string())?;
+                let searcher =
+                    Searcher::new(path.clone(), cache_policy).map_err(|e| e.to_string())?;
                 Ok(Self {
                     label,
                     source,
@@ -285,7 +286,9 @@ impl DbHandle {
                 if active_file.exists() {
                     match Searcher::new(active_file.to_string_lossy().to_string(), cache_policy) {
                         Ok(searcher) => {
-                            if let Err(err) = write_current_cache_pointer(&current_file, &active_file).await {
+                            if let Err(err) =
+                                write_current_cache_pointer(&current_file, &active_file).await
+                            {
                                 warn!(
                                     "write {} xdb pointer file {} failed: {}",
                                     label,
@@ -362,14 +365,17 @@ impl DbHandle {
             self.request_timeout_secs,
             self.expected_sha256.as_deref(),
         )
-            .await?;
+        .await?;
 
         let Some(new_cache_file) = changed else {
             return Ok(false);
         };
 
-        let searcher = Searcher::new(new_cache_file.to_string_lossy().to_string(), self.cache_policy)
-            .map_err(|e| e.to_string())?;
+        let searcher = Searcher::new(
+            new_cache_file.to_string_lossy().to_string(),
+            self.cache_policy,
+        )
+        .map_err(|e| e.to_string())?;
 
         let previous_file = {
             let mut searcher_lock = self.searcher.write().unwrap();
@@ -389,8 +395,12 @@ impl DbHandle {
             );
         }
 
-        cleanup_old_versioned_cache_files(cache_file, &new_cache_file, KEEP_OLD_VERSIONED_XDB_FILES)
-            .await;
+        cleanup_old_versioned_cache_files(
+            cache_file,
+            &new_cache_file,
+            KEEP_OLD_VERSIONED_XDB_FILES,
+        )
+        .await;
 
         if previous_file != *cache_file {
             let _ = tokio::fs::remove_file(&previous_file).await;
@@ -432,7 +442,11 @@ fn is_remote_path(path: &str) -> bool {
     path.starts_with("http://") || path.starts_with("https://")
 }
 
-fn build_source(label: &'static str, path_or_url: String, cache_dir: &Path) -> Result<DbSource, String> {
+fn build_source(
+    label: &'static str,
+    path_or_url: String,
+    cache_dir: &Path,
+) -> Result<DbSource, String> {
     if !is_remote_path(path_or_url.as_str()) {
         return Ok(DbSource::Local { path: path_or_url });
     }
@@ -491,10 +505,18 @@ async fn resolve_active_cache_file(cache_file: &Path, current_file: &Path) -> Pa
     cache_file.to_path_buf()
 }
 
-async fn write_current_cache_pointer(current_file: &Path, active_file: &Path) -> Result<(), String> {
+async fn write_current_cache_pointer(
+    current_file: &Path,
+    active_file: &Path,
+) -> Result<(), String> {
     let file_name = active_file
         .file_name()
-        .ok_or_else(|| format!("invalid active xdb path '{}': missing file name", active_file.display()))?
+        .ok_or_else(|| {
+            format!(
+                "invalid active xdb path '{}': missing file name",
+                active_file.display()
+            )
+        })?
         .to_string_lossy()
         .to_string();
 
@@ -512,7 +534,12 @@ fn make_versioned_cache_file(cache_file: &Path) -> Result<PathBuf, String> {
     let stem = cache_file
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("invalid xdb cache file '{}': missing file stem", cache_file.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "invalid xdb cache file '{}': missing file stem",
+                cache_file.display()
+            )
+        })?;
     let ext = cache_file
         .extension()
         .and_then(|s| s.to_str())

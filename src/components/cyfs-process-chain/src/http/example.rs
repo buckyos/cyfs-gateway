@@ -42,7 +42,9 @@ impl HttpHookManager {
     pub async fn create(process_chain: &str) -> Result<Self, String> {
         // Create a hook point
         let hook_point = HookPoint::new("http-hook-point");
-        hook_point.load_process_chain_lib("main", 0, process_chain).await?;
+        hook_point
+            .load_process_chain_lib("main", 0, process_chain)
+            .await?;
 
         let data_dir = std::env::temp_dir().join("cyfs-process-chain-test");
         std::fs::create_dir_all(&data_dir).unwrap();

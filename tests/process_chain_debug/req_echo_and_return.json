@@ -1,0 +1,10 @@
+{
+  "input": {
+    "REQ": {
+      "target_host": "example.com",
+      "path": "/api/test"
+    }
+  },
+  "id": "echo_and_return",
+  "output": ["REQ"]
+}

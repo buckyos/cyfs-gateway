@@ -1,8 +1,8 @@
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::UdpSocket;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
-use crate::{lookup_err, LookupResult};
+use crate::{LookupResult, lookup_err};
 
 pub async fn active_probe(ip: IpAddr) -> LookupResult<()> {
     let ports = [7u16, 9u16, 5353u16];

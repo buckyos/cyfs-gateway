@@ -1,5 +1,5 @@
-mod pipe;
 mod mem;
+mod pipe;
 
-pub use pipe::*;
 pub use mem::*;
+pub use pipe::*;

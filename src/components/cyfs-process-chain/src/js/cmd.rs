@@ -230,7 +230,10 @@ impl AsyncJavaScriptCommandExecutor {
         #[cfg(debug_assertions)]
         {
             // Ingore the thread handle in debug mode
-            info!("AsyncJavaScriptCommandExecutor thread started, but not waiting for it in debug mode {}", thread.thread().name().unwrap_or("unknown"));
+            info!(
+                "AsyncJavaScriptCommandExecutor thread started, but not waiting for it in debug mode {}",
+                thread.thread().name().unwrap_or("unknown")
+            );
         }
     }
 

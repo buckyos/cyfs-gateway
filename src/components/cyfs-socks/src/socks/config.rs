@@ -1,10 +1,7 @@
-use crate::{
-    rule::RuleEngine,
-    RuleResult,
-};
+use crate::{rule::RuleEngine, RuleResult};
 use buckyos_kit::get_buckyos_system_etc_dir;
-use url::Url;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SocksProxyAuth {

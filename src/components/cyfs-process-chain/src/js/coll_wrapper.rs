@@ -278,9 +278,7 @@ impl SetCollectionWrapper {
         let rt = context.get_data::<RuntimeHandleWrapper>().unwrap();
         match rt.block_on(collection.get_all()) {
             Ok(values) => {
-                let values_iter = values
-                    .into_iter()
-                    .map(|x| JsValue::new(JsString::from(x)));
+                let values_iter = values.into_iter().map(|x| JsValue::new(JsString::from(x)));
                 let array = JsArray::from_iter(values_iter, context);
                 Ok(JsValue::from(array))
             }
@@ -493,7 +491,11 @@ impl MapCollectionWrapper {
         }
     }
 
-    fn contains_key(this: &JsValue, args: &[JsValue], context: &mut JsContext) -> JsResult<JsValue> {
+    fn contains_key(
+        this: &JsValue,
+        args: &[JsValue],
+        context: &mut JsContext,
+    ) -> JsResult<JsValue> {
         let obj = this.as_object().ok_or_else(|| {
             let msg = "Expected this to be an object".to_string();
             error!("{}", msg);
@@ -901,7 +903,10 @@ impl MultiMapCollectionWrapper {
         match rt.block_on(collection.contains_value(&key, &value)) {
             Ok(contains) => Ok(JsValue::from(contains)),
             Err(e) => {
-                let msg = format!("Failed to check if multi-map contains value '{:?}': {}", value, e);
+                let msg = format!(
+                    "Failed to check if multi-map contains value '{:?}': {}",
+                    value, e
+                );
                 error!("{}", msg);
                 Err(JsNativeError::error().with_message(msg).into())
             }

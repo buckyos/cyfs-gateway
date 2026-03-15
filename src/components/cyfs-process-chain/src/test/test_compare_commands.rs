@@ -111,7 +111,12 @@ async fn test_number_compare_commands() -> Result<(), String> {
 #[tokio::test]
 async fn test_ne_command() -> Result<(), String> {
     init_test_logger();
-    let ret = execute_lib(PROCESS_CHAIN_NE_COMPARE, "ne_compare_lib", "test-ne-compare").await?;
+    let ret = execute_lib(
+        PROCESS_CHAIN_NE_COMPARE,
+        "ne_compare_lib",
+        "test-ne-compare",
+    )
+    .await?;
     assert_eq!(ret, "ok");
     Ok(())
 }

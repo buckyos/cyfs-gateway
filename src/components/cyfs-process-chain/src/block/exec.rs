@@ -1,9 +1,18 @@
 use super::block::{
-    Block, CommandItem, Expression, ExpressionChain, IfStatement, Line, Operator, Statement,
+    Block, CommandItem, Expression, ExpressionChain, ForStatement, IfStatement, Line,
+    MatchResultBranch, MatchResultControlBranch, MatchResultStatement, Operator, Statement,
 };
-use crate::chain::{Context, ProcessChainError, ProcessChainErrorCode};
-use crate::cmd::CommandResult;
+use crate::chain::{Context, EnvLevel, ProcessChainError, ProcessChainErrorCode};
+use crate::cmd::{CommandControl, CommandResult};
+use crate::collection::{
+    CollectionValue, ListCollectionTraverseCallBack, MapCollectionTraverseCallBack,
+    MemorySetCollection, MultiMapCollectionKeyTraverseCallBack,
+    MultiMapCollectionTraverseOwnedCallBack, NumberValue, OrderedStringSet, SetCollection,
+    SetCollectionTraverseCallBack, TraverseControl,
+};
 use log::log;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub const MAX_GOTO_COUNT_IN_BLOCK: u32 = 128;
 
@@ -12,6 +21,176 @@ pub enum BlockResult {
     Ok,
     Drop,
     Pass,
+}
+
+struct LoopVarSnapshot {
+    name: String,
+    value: Option<CollectionValue>,
+    tracker_level: Option<EnvLevel>,
+}
+
+enum ForIterationOutcome {
+    Continue(CommandResult),
+    Break(CommandResult),
+    Propagate(CommandResult),
+}
+
+struct ForTraverseState {
+    result: CommandResult,
+    terminal: Option<CommandResult>,
+}
+
+impl ForTraverseState {
+    fn new() -> Self {
+        Self {
+            result: CommandResult::success(),
+            terminal: None,
+        }
+    }
+}
+
+type ForTraverseStateRef = Arc<Mutex<ForTraverseState>>;
+
+struct ForMapTraverseCallback {
+    for_statement: ForStatement,
+    line_no: usize,
+    context: Context,
+    state: ForTraverseStateRef,
+}
+
+struct ForListTraverseCallback {
+    for_statement: ForStatement,
+    line_no: usize,
+    context: Context,
+    state: ForTraverseStateRef,
+}
+
+struct ForSetTraverseCallback {
+    for_statement: ForStatement,
+    line_no: usize,
+    context: Context,
+    state: ForTraverseStateRef,
+}
+
+struct ForMultiMapKeyTraverseCallback {
+    for_statement: ForStatement,
+    line_no: usize,
+    context: Context,
+    state: ForTraverseStateRef,
+}
+
+struct ForMultiMapOwnedTraverseCallback {
+    for_statement: ForStatement,
+    line_no: usize,
+    context: Context,
+    state: ForTraverseStateRef,
+}
+
+#[async_trait::async_trait]
+impl MapCollectionTraverseCallBack for ForMapTraverseCallback {
+    async fn call(&self, key: &str, value: &CollectionValue) -> Result<bool, String> {
+        let loop_value = if self.for_statement.value_var.is_some() {
+            Some(value.clone())
+        } else {
+            None
+        };
+
+        let outcome = BlockExecuter::execute_for_iteration(
+            &self.for_statement,
+            self.line_no,
+            &self.context,
+            CollectionValue::String(key.to_string()),
+            loop_value,
+        )
+        .await?;
+
+        BlockExecuter::apply_iteration_outcome_bool(&self.state, outcome).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ListCollectionTraverseCallBack for ForListTraverseCallback {
+    async fn call(&self, index: usize, value: &CollectionValue) -> Result<bool, String> {
+        let key = if self.for_statement.value_var.is_some() {
+            CollectionValue::Number(NumberValue::Int(index as i64))
+        } else {
+            value.clone()
+        };
+        let loop_value = if self.for_statement.value_var.is_some() {
+            Some(value.clone())
+        } else {
+            None
+        };
+
+        let outcome = BlockExecuter::execute_for_iteration(
+            &self.for_statement,
+            self.line_no,
+            &self.context,
+            key,
+            loop_value,
+        )
+        .await?;
+
+        BlockExecuter::apply_iteration_outcome_bool(&self.state, outcome).await
+    }
+}
+
+#[async_trait::async_trait]
+impl SetCollectionTraverseCallBack for ForSetTraverseCallback {
+    async fn call(&self, item: &str) -> Result<bool, String> {
+        let item = CollectionValue::String(item.to_string());
+        let key = item.clone();
+        let loop_value = if self.for_statement.value_var.is_some() {
+            Some(item)
+        } else {
+            None
+        };
+
+        let outcome = BlockExecuter::execute_for_iteration(
+            &self.for_statement,
+            self.line_no,
+            &self.context,
+            key,
+            loop_value,
+        )
+        .await?;
+
+        BlockExecuter::apply_iteration_outcome_bool(&self.state, outcome).await
+    }
+}
+
+#[async_trait::async_trait]
+impl MultiMapCollectionKeyTraverseCallBack for ForMultiMapKeyTraverseCallback {
+    async fn call(&self, key: &str) -> Result<bool, String> {
+        let outcome = BlockExecuter::execute_for_iteration(
+            &self.for_statement,
+            self.line_no,
+            &self.context,
+            CollectionValue::String(key.to_string()),
+            None,
+        )
+        .await?;
+
+        BlockExecuter::apply_iteration_outcome_bool(&self.state, outcome).await
+    }
+}
+
+#[async_trait::async_trait]
+impl MultiMapCollectionTraverseOwnedCallBack for ForMultiMapOwnedTraverseCallback {
+    async fn call(&self, key: String, values: OrderedStringSet) -> Result<TraverseControl, String> {
+        let set =
+            Arc::new(Box::new(MemorySetCollection::from_set(values)) as Box<dyn SetCollection>);
+        let outcome = BlockExecuter::execute_for_iteration(
+            &self.for_statement,
+            self.line_no,
+            &self.context,
+            CollectionValue::String(key),
+            Some(CollectionValue::Set(set)),
+        )
+        .await?;
+
+        BlockExecuter::apply_iteration_outcome_control(&self.state, outcome).await
+    }
 }
 
 pub struct BlockExecuter {
@@ -142,6 +321,18 @@ impl BlockExecuter {
         if let Some(if_statement) = statement.if_statement.as_ref() {
             return Self::execute_if_statement(if_statement, line_no, source, context).await;
         }
+        if let Some(for_statement) = statement.for_statement.as_ref() {
+            return Self::execute_for_statement(for_statement, line_no, source, context).await;
+        }
+        if let Some(match_result_statement) = statement.match_result_statement.as_ref() {
+            return Self::execute_match_result_statement(
+                match_result_statement,
+                line_no,
+                source,
+                context,
+            )
+            .await;
+        }
 
         Self::execute_expression_chain(
             &statement.expressions,
@@ -188,15 +379,8 @@ impl BlockExecuter {
                 Ok(result)
             }
             Expression::Group(exprs) => {
-                Self::execute_expression_chain(
-                    exprs,
-                    context,
-                    line_no,
-                    source.as_deref(),
-                    true,
-                    "",
-                )
-                .await
+                Self::execute_expression_chain(exprs, context, line_no, source.as_deref(), true, "")
+                    .await
             }
         }
     }
@@ -320,6 +504,407 @@ impl BlockExecuter {
         }
 
         Ok(CommandResult::success())
+    }
+
+    async fn snapshot_block_var(
+        var_name: &str,
+        context: &Context,
+    ) -> Result<LoopVarSnapshot, String> {
+        let exists_in_block = context.env().get_block().contains(var_name).await?;
+        let value = if exists_in_block {
+            context.env().get(var_name, Some(EnvLevel::Block)).await?
+        } else {
+            None
+        };
+        let tracker_level = context.env().var_level_entry(var_name);
+        Ok(LoopVarSnapshot {
+            name: var_name.to_string(),
+            value,
+            tracker_level,
+        })
+    }
+
+    async fn execute_match_result_value_branch(
+        branch: &MatchResultBranch,
+        value: CollectionValue,
+        line_no: usize,
+        source: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let binding = vec![(branch.binding_var.as_str(), value)];
+        Self::execute_match_result_branch_lines(&binding, &branch.lines, line_no, source, context)
+            .await
+    }
+
+    async fn execute_match_result_control_branch(
+        branch: &MatchResultControlBranch,
+        control: CommandControl,
+        line_no: usize,
+        source: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let action = match &control {
+            CommandControl::Return(_) => CollectionValue::String("return".to_string()),
+            CommandControl::Error(_) => CollectionValue::String("error".to_string()),
+            CommandControl::Exit(_) => CollectionValue::String("exit".to_string()),
+            CommandControl::Break(_) => CollectionValue::String("break".to_string()),
+        };
+        let from = match &control {
+            CommandControl::Return(v) | CommandControl::Error(v) => {
+                CollectionValue::String(v.level.as_str().to_string())
+            }
+            CommandControl::Exit(_) | CommandControl::Break(_) => CollectionValue::Null,
+        };
+        let value = control.value().clone();
+
+        let bindings = vec![
+            (branch.action_var.as_str(), action),
+            (branch.from_var.as_str(), from),
+            (branch.value_var.as_str(), value),
+        ];
+        Self::execute_match_result_branch_lines(&bindings, &branch.lines, line_no, source, context)
+            .await
+    }
+
+    async fn execute_match_result_branch_lines(
+        bindings: &[(&str, CollectionValue)],
+        lines: &[Line],
+        line_no: usize,
+        source: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let mut snapshots = Vec::with_capacity(bindings.len());
+        for (var_name, _) in bindings {
+            snapshots.push(Self::snapshot_block_var(var_name, context).await?);
+        }
+
+        let execute_result: Result<CommandResult, String> = async {
+            for (var_name, value) in bindings {
+                context
+                    .env()
+                    .set(var_name, value.clone(), Some(EnvLevel::Block))
+                    .await?;
+            }
+
+            Self::execute_nested_lines(lines, line_no, context).await
+        }
+        .await;
+
+        let restore_result = Self::restore_block_vars(&snapshots, context).await;
+        match (execute_result, restore_result) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(exec_err), Ok(())) => Err(Self::wrap_runtime_error(
+                context,
+                ProcessChainErrorCode::RuntimeExpressionExecute,
+                "Failed to execute match-result branch",
+                Some(line_no),
+                Some(source),
+                None,
+                exec_err,
+            )),
+            (Ok(_), Err(restore_err)) => Err(Self::wrap_runtime_error(
+                context,
+                ProcessChainErrorCode::RuntimeExpressionExecute,
+                "Failed to restore match-result branch scope",
+                Some(line_no),
+                Some(source),
+                None,
+                restore_err,
+            )),
+            (Err(exec_err), Err(restore_err)) => Err(Self::wrap_runtime_error(
+                context,
+                ProcessChainErrorCode::RuntimeExpressionExecute,
+                "Failed to execute match-result branch and restore scope",
+                Some(line_no),
+                Some(source),
+                None,
+                format!("exec_error={}, restore_error={}", exec_err, restore_err),
+            )),
+        }
+    }
+
+    async fn execute_match_result_statement(
+        match_result_statement: &MatchResultStatement,
+        line_no: usize,
+        source: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let result = Self::execute_expression_with_location(
+            match_result_statement.command.as_ref(),
+            context,
+            Some(line_no),
+            Some(source.to_string()),
+        )
+        .await?;
+
+        match result {
+            CommandResult::Success(value) => {
+                if let Some(branch) = match_result_statement.ok_branch.as_ref() {
+                    return Self::execute_match_result_value_branch(
+                        branch, value, line_no, source, context,
+                    )
+                    .await;
+                }
+
+                Ok(CommandResult::Success(value))
+            }
+            CommandResult::Error(value) => {
+                if let Some(branch) = match_result_statement.err_branch.as_ref() {
+                    return Self::execute_match_result_value_branch(
+                        branch, value, line_no, source, context,
+                    )
+                    .await;
+                }
+
+                Ok(CommandResult::Error(value))
+            }
+            CommandResult::Control(control) => {
+                if let Some(branch) = match_result_statement.control_branch.as_ref() {
+                    return Self::execute_match_result_control_branch(
+                        branch, control, line_no, source, context,
+                    )
+                    .await;
+                }
+
+                Ok(CommandResult::Control(control))
+            }
+        }
+    }
+
+    async fn restore_block_vars(
+        snapshots: &[LoopVarSnapshot],
+        context: &Context,
+    ) -> Result<(), String> {
+        for snapshot in snapshots {
+            if let Some(value) = snapshot.value.as_ref() {
+                context
+                    .env()
+                    .set(&snapshot.name, value.clone(), Some(EnvLevel::Block))
+                    .await?;
+            } else {
+                let _ = context
+                    .env()
+                    .remove(&snapshot.name, Some(EnvLevel::Block))
+                    .await?;
+            }
+
+            context
+                .env()
+                .restore_var_level_entry(&snapshot.name, snapshot.tracker_level);
+        }
+
+        Ok(())
+    }
+
+    async fn execute_for_iteration(
+        for_statement: &ForStatement,
+        line_no: usize,
+        context: &Context,
+        key: CollectionValue,
+        value: Option<CollectionValue>,
+    ) -> Result<ForIterationOutcome, String> {
+        context
+            .env()
+            .set(&for_statement.key_var, key, Some(EnvLevel::Block))
+            .await?;
+
+        if let Some(value_var) = for_statement.value_var.as_ref() {
+            let value = value.unwrap_or(CollectionValue::Null);
+            context
+                .env()
+                .set(value_var, value, Some(EnvLevel::Block))
+                .await?;
+        }
+
+        let loop_result =
+            Self::execute_nested_lines(&for_statement.lines, line_no, context).await?;
+        if !loop_result.is_control() {
+            return Ok(ForIterationOutcome::Continue(loop_result));
+        }
+
+        let control = loop_result.as_control().unwrap();
+        if control.is_break() {
+            return Ok(ForIterationOutcome::Break(
+                CommandResult::success_with_value(control.value().clone()),
+            ));
+        }
+
+        Ok(ForIterationOutcome::Propagate(loop_result))
+    }
+
+    async fn apply_iteration_outcome_bool(
+        state: &ForTraverseStateRef,
+        outcome: ForIterationOutcome,
+    ) -> Result<bool, String> {
+        let mut state = state.lock().await;
+        match outcome {
+            ForIterationOutcome::Continue(result) => {
+                state.result = result;
+                Ok(true)
+            }
+            ForIterationOutcome::Break(result) => {
+                state.result = result;
+                Ok(false)
+            }
+            ForIterationOutcome::Propagate(result) => {
+                state.terminal = Some(result);
+                Ok(false)
+            }
+        }
+    }
+
+    async fn apply_iteration_outcome_control(
+        state: &ForTraverseStateRef,
+        outcome: ForIterationOutcome,
+    ) -> Result<TraverseControl, String> {
+        let mut state = state.lock().await;
+        match outcome {
+            ForIterationOutcome::Continue(result) => {
+                state.result = result;
+                Ok(TraverseControl::Continue)
+            }
+            ForIterationOutcome::Break(result) => {
+                state.result = result;
+                Ok(TraverseControl::Break)
+            }
+            ForIterationOutcome::Propagate(result) => {
+                state.terminal = Some(result);
+                Ok(TraverseControl::Break)
+            }
+        }
+    }
+
+    async fn finalize_for_traverse_state(state: &ForTraverseStateRef) -> CommandResult {
+        let state = state.lock().await;
+        if let Some(result) = state.terminal.as_ref() {
+            return result.clone();
+        }
+        state.result.clone()
+    }
+
+    async fn execute_for_statement(
+        for_statement: &ForStatement,
+        line_no: usize,
+        source: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
+        let mut snapshots = Vec::with_capacity(if for_statement.value_var.is_some() {
+            2
+        } else {
+            1
+        });
+
+        snapshots.push(Self::snapshot_block_var(&for_statement.key_var, context).await?);
+        if let Some(value_var) = for_statement.value_var.as_ref() {
+            snapshots.push(Self::snapshot_block_var(value_var, context).await?);
+        }
+
+        let execute_result: Result<CommandResult, String> = async {
+            let iterable = for_statement.iterable.evaluate(context).await?;
+            let result = match iterable {
+                CollectionValue::List(list) => {
+                    let state = Arc::new(Mutex::new(ForTraverseState::new()));
+                    let callback = Arc::new(Box::new(ForListTraverseCallback {
+                        for_statement: for_statement.clone(),
+                        line_no,
+                        context: context.clone(),
+                        state: state.clone(),
+                    })
+                        as Box<dyn ListCollectionTraverseCallBack>);
+                    list.traverse(callback).await?;
+                    Self::finalize_for_traverse_state(&state).await
+                }
+                CollectionValue::Set(set) => {
+                    let state = Arc::new(Mutex::new(ForTraverseState::new()));
+                    let callback = Arc::new(Box::new(ForSetTraverseCallback {
+                        for_statement: for_statement.clone(),
+                        line_no,
+                        context: context.clone(),
+                        state: state.clone(),
+                    })
+                        as Box<dyn SetCollectionTraverseCallBack>);
+                    set.traverse(callback).await?;
+                    Self::finalize_for_traverse_state(&state).await
+                }
+                CollectionValue::Map(map) => {
+                    let state = Arc::new(Mutex::new(ForTraverseState::new()));
+                    let callback = Arc::new(Box::new(ForMapTraverseCallback {
+                        for_statement: for_statement.clone(),
+                        line_no,
+                        context: context.clone(),
+                        state: state.clone(),
+                    })
+                        as Box<dyn MapCollectionTraverseCallBack>);
+                    map.traverse(callback).await?;
+                    Self::finalize_for_traverse_state(&state).await
+                }
+                CollectionValue::MultiMap(multi_map) => {
+                    let state = Arc::new(Mutex::new(ForTraverseState::new()));
+                    if for_statement.value_var.is_some() {
+                        let callback = Arc::new(Box::new(ForMultiMapOwnedTraverseCallback {
+                            for_statement: for_statement.clone(),
+                            line_no,
+                            context: context.clone(),
+                            state: state.clone(),
+                        })
+                            as Box<dyn MultiMapCollectionTraverseOwnedCallBack>);
+                        multi_map.traverse_owned(callback).await?;
+                    } else {
+                        let callback = Arc::new(Box::new(ForMultiMapKeyTraverseCallback {
+                            for_statement: for_statement.clone(),
+                            line_no,
+                            context: context.clone(),
+                            state: state.clone(),
+                        })
+                            as Box<dyn MultiMapCollectionKeyTraverseCallBack>);
+                        multi_map.traverse_keys(callback).await?;
+                    }
+                    Self::finalize_for_traverse_state(&state).await
+                }
+                other => {
+                    let msg = format!(
+                        "For-loop iterable must be List/Set/Map/MultiMap, got {}",
+                        other.get_type()
+                    );
+                    return Err(msg);
+                }
+            };
+
+            Ok(result)
+        }
+        .await;
+
+        let restore_result = Self::restore_block_vars(&snapshots, context).await;
+        match (execute_result, restore_result) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(exec_err), Ok(())) => Err(Self::wrap_runtime_error(
+                context,
+                ProcessChainErrorCode::RuntimeExpressionExecute,
+                "Failed to execute for statement",
+                Some(line_no),
+                Some(source),
+                None,
+                exec_err,
+            )),
+            (Ok(_), Err(restore_err)) => Err(Self::wrap_runtime_error(
+                context,
+                ProcessChainErrorCode::RuntimeExpressionExecute,
+                "Failed to restore loop variable scope",
+                Some(line_no),
+                Some(source),
+                None,
+                restore_err,
+            )),
+            (Err(exec_err), Err(restore_err)) => Err(Self::wrap_runtime_error(
+                context,
+                ProcessChainErrorCode::RuntimeExpressionExecute,
+                "Failed to execute for statement and restore loop variable scope",
+                Some(line_no),
+                Some(source),
+                None,
+                format!("exec_error={}, restore_error={}", exec_err, restore_err),
+            )),
+        }
     }
 
     async fn execute_command(

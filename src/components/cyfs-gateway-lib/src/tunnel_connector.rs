@@ -1,18 +1,18 @@
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use url::Url;
-use std::error::Error as StdError;
-use std::task::{Context, Poll};
-use tower_service::Service;
-use hyper::rt::{Read, Write};
-use buckyos_kit::AsyncStream;
-use std::pin::Pin;
-use std::future::Future;
-use hyper::Uri;
-use log::*;
 use crate::TunnelManager;
+use buckyos_kit::AsyncStream;
+use hyper::Uri;
+use hyper::rt::{Read, Write};
+use log::*;
+use std::error::Error as StdError;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tower_service::Service;
+use url::Url;
 
 pub struct TunnelStreamConnection {
-    inner: Box<dyn AsyncStream>
+    inner: Box<dyn AsyncStream>,
 }
 
 impl TunnelStreamConnection {
@@ -33,7 +33,6 @@ impl AsyncRead for TunnelStreamConnection {
     }
 }
 
-
 impl AsyncWrite for TunnelStreamConnection {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -44,18 +43,12 @@ impl AsyncWrite for TunnelStreamConnection {
         Pin::new(&mut *self.get_mut().inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         //info!("TunnelStreamConnection poll_flush");
         Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         //info!("TunnelStreamConnection poll_shutdown");
         Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
     }
@@ -97,7 +90,10 @@ impl Write for TunnelStreamConnection {
         AsyncWrite::poll_flush(self, cx)
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
         AsyncWrite::poll_shutdown(self, cx)
     }
 }
@@ -108,7 +104,6 @@ impl hyper_util::client::legacy::connect::Connection for TunnelStreamConnection 
         hyper_util::client::legacy::connect::Connected::new()
     }
 }
-
 
 #[derive(Clone)]
 pub struct TunnelConnector {
@@ -133,10 +128,16 @@ impl Service<Uri> for TunnelConnector {
             debug!("TunnelConnector call uri: {}", target_stream_url.as_str());
             let stream_url = Url::parse(&target_stream_url.to_string()).unwrap();
 
-            let target_stream = tunnel_manager.open_stream_by_url(&stream_url).await.map_err(|e| {
-                warn!("TunnelConnector open_stream_by_url {} failed! {}", stream_url, e);
-                Box::new(e) as Box<dyn StdError + Send + Sync>
-            })?;
+            let target_stream = tunnel_manager
+                .open_stream_by_url(&stream_url)
+                .await
+                .map_err(|e| {
+                    warn!(
+                        "TunnelConnector open_stream_by_url {} failed! {}",
+                        stream_url, e
+                    );
+                    Box::new(e) as Box<dyn StdError + Send + Sync>
+                })?;
 
             Ok(TunnelStreamConnection::new(target_stream))
         })

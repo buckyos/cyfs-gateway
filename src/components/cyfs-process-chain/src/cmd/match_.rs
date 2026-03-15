@@ -1,5 +1,5 @@
 use super::cmd::*;
-use crate::block::{CommandArgs, CommandArg};
+use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
 use crate::collection::CollectionValue;
 use clap::{Arg, ArgAction, Command};
@@ -69,18 +69,21 @@ impl CommandParser for MatchCommandParser {
         command_help(help_type, &self.cmd)
     }
 
-
     fn parse(
         &self,
         _context: &ParserContext,
         str_args: Vec<&str>,
         args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
-            let msg = format!("Invalid match command: {:?}, {}", str_args, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid match command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         let value_index = matches.index_of("value").ok_or_else(|| {
             let msg = "Value argument is required for match command".to_string();
@@ -95,13 +98,14 @@ impl CommandParser for MatchCommandParser {
             msg
         })?;
 
-        let pattern_str = args[pattern_index]
-            .as_literal_str()
-            .ok_or_else(|| {
-                let msg = format!("Pattern argument must be a literal string: {:?}", args[pattern_index]);
-                error!("{}", msg);
-                msg
-            })?;
+        let pattern_str = args[pattern_index].as_literal_str().ok_or_else(|| {
+            let msg = format!(
+                "Pattern argument must be a literal string: {:?}",
+                args[pattern_index]
+            );
+            error!("{}", msg);
+            msg
+        })?;
 
         let no_ignore_case = matches.get_flag("no_ignore_case");
         let pattern = GlobBuilder::new(pattern_str)
@@ -138,9 +142,13 @@ impl CommandExecutor for MatchCommandExecutor {
         let value = self.value.evaluate_string(context).await?;
 
         if self.pattern.is_match(&value) {
-            Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))
+            Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                true,
+            )))
         } else {
-            Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
+            Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                false,
+            )))
         }
     }
 }
@@ -224,11 +232,15 @@ impl CommandParser for MatchRegexCommandParser {
         str_args: Vec<&str>,
         args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
-            let msg = format!("Invalid match-reg command: {:?}, {}", str_args, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid match-reg command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         let capture = match matches.index_of("capture") {
             Some(index) => {
@@ -254,13 +266,14 @@ impl CommandParser for MatchRegexCommandParser {
             error!("{}", msg);
             msg
         })?;
-        let pattern_str = args[pattern_index]
-            .as_literal_str()
-            .ok_or_else(|| {
-                let msg = format!("Pattern argument must be a literal string: {:?}", args[pattern_index]);
-                error!("{}", msg);
-                msg
-            })?;
+        let pattern_str = args[pattern_index].as_literal_str().ok_or_else(|| {
+            let msg = format!(
+                "Pattern argument must be a literal string: {:?}",
+                args[pattern_index]
+            );
+            error!("{}", msg);
+            msg
+        })?;
 
         let no_ignore_case = matches.get_flag("no_ignore_case");
         let pattern = RegexBuilder::new(pattern_str)
@@ -319,9 +332,13 @@ impl CommandExecutor for MatchRegexCommandExecutor {
                 }
             }
 
-            Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))
+            Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                true,
+            )))
         } else {
-            Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
+            Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                false,
+            )))
         }
     }
 }
@@ -334,9 +351,9 @@ pub struct EQCommandParser {
 impl EQCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("eq")
-        .about("Compare two values for equality (strict typed by default).")
-        .after_help(
-            r#"
+            .about("Compare two values for equality (strict typed by default).")
+            .after_help(
+                r#"
 Compare two values for equality.
 
 Arguments:
@@ -358,31 +375,31 @@ Examples:
   eq "host" "host"
   eq --ignore-case "Host" "HOST"
 "#,
-        )
-        .arg(
-            Arg::new("ignore_case")
-                .long("ignore-case")
-                .short('i')
-                .action(ArgAction::SetTrue)
-                .help("Enable case-insensitive comparison"),
-        )
-        .arg(
-            Arg::new("loose")
-                .long("loose")
-                .short('l')
-                .action(ArgAction::SetTrue)
-                .help("Enable loose comparison for string/number"),
-        )
-        .arg(
-            Arg::new("value1")
-                .required(true)
-                .help("The first value to compare"),
-        )
-        .arg(
-            Arg::new("value2")
-                .required(true)
-                .help("The second value to compare"),
-        );
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .short('i')
+                    .action(ArgAction::SetTrue)
+                    .help("Enable case-insensitive comparison"),
+            )
+            .arg(
+                Arg::new("loose")
+                    .long("loose")
+                    .short('l')
+                    .action(ArgAction::SetTrue)
+                    .help("Enable loose comparison for string/number"),
+            )
+            .arg(
+                Arg::new("value1")
+                    .required(true)
+                    .help("The first value to compare"),
+            )
+            .arg(
+                Arg::new("value2")
+                    .required(true)
+                    .help("The second value to compare"),
+            );
 
         Self { cmd }
     }
@@ -403,11 +420,15 @@ impl CommandParser for EQCommandParser {
         str_args: Vec<&str>,
         args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
-            let msg = format!("Invalid eq command: {:?}, {}", str_args, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid eq command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         let ignore_case = matches.get_flag("ignore_case");
         let loose = matches.get_flag("loose");
@@ -497,9 +518,11 @@ impl EQCommandExecutor {
         }
 
         if let (CollectionValue::String(_), CollectionValue::Number(_))
-            | (CollectionValue::Number(_), CollectionValue::String(_)) = (left, right)
+        | (CollectionValue::Number(_), CollectionValue::String(_)) = (left, right)
         {
-            if let (Some(lhs), Some(rhs)) = (Self::as_loose_number(left), Self::as_loose_number(right)) {
+            if let (Some(lhs), Some(rhs)) =
+                (Self::as_loose_number(left), Self::as_loose_number(right))
+            {
                 return lhs == rhs;
             }
         }
@@ -528,9 +551,13 @@ impl CommandExecutor for EQCommandExecutor {
         );
         */
         if is_eq {
-            Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))
+            Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                true,
+            )))
         } else {
-            Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
+            Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                false,
+            )))
         }
     }
 }
@@ -543,9 +570,9 @@ pub struct NECommandParser {
 impl NECommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("ne")
-        .about("Compare two values for inequality (strict typed by default).")
-        .after_help(
-            r#"
+            .about("Compare two values for inequality (strict typed by default).")
+            .after_help(
+                r#"
 Compare two values for inequality.
 
 Arguments:
@@ -559,31 +586,31 @@ Options:
 By default, ne uses strict typed comparison.
 Use --loose to enable string/number loose comparison.
 "#,
-        )
-        .arg(
-            Arg::new("ignore_case")
-                .long("ignore-case")
-                .short('i')
-                .action(ArgAction::SetTrue)
-                .help("Enable case-insensitive comparison"),
-        )
-        .arg(
-            Arg::new("loose")
-                .long("loose")
-                .short('l')
-                .action(ArgAction::SetTrue)
-                .help("Enable loose comparison for string/number"),
-        )
-        .arg(
-            Arg::new("value1")
-                .required(true)
-                .help("The first value to compare"),
-        )
-        .arg(
-            Arg::new("value2")
-                .required(true)
-                .help("The second value to compare"),
-        );
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .short('i')
+                    .action(ArgAction::SetTrue)
+                    .help("Enable case-insensitive comparison"),
+            )
+            .arg(
+                Arg::new("loose")
+                    .long("loose")
+                    .short('l')
+                    .action(ArgAction::SetTrue)
+                    .help("Enable loose comparison for string/number"),
+            )
+            .arg(
+                Arg::new("value1")
+                    .required(true)
+                    .help("The first value to compare"),
+            )
+            .arg(
+                Arg::new("value2")
+                    .required(true)
+                    .help("The second value to compare"),
+            );
 
         Self { cmd }
     }
@@ -604,11 +631,15 @@ impl CommandParser for NECommandParser {
         str_args: Vec<&str>,
         args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
-            let msg = format!("Invalid ne command: {:?}, {}", str_args, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid ne command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         let ignore_case = matches.get_flag("ignore_case");
         let loose = matches.get_flag("loose");
@@ -670,9 +701,13 @@ impl CommandExecutor for NECommandExecutor {
         };
 
         if !eq {
-            Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))
+            Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                true,
+            )))
         } else {
-            Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
+            Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                false,
+            )))
         }
     }
 }
@@ -712,16 +747,8 @@ impl NumberCompareCommandParser {
                     .action(ArgAction::SetTrue)
                     .help("Enable loose number parsing for string/number"),
             )
-            .arg(
-                Arg::new("value1")
-                    .required(true)
-                    .help("The left value"),
-            )
-            .arg(
-                Arg::new("value2")
-                    .required(true)
-                    .help("The right value"),
-            );
+            .arg(Arg::new("value1").required(true).help("The left value"))
+            .arg(Arg::new("value2").required(true).help("The right value"));
         Self { cmd, op }
     }
 }
@@ -741,16 +768,20 @@ impl CommandParser for NumberCompareCommandParser {
         str_args: Vec<&str>,
         args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
-            let msg = format!(
-                "Invalid {} command: {:?}, {}",
-                self.cmd.get_name(),
-                str_args,
-                e
-            );
-            error!("{}", msg);
-            msg
-        })?;
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!(
+                    "Invalid {} command: {:?}, {}",
+                    self.cmd.get_name(),
+                    str_args,
+                    e
+                );
+                error!("{}", msg);
+                msg
+            })?;
 
         let loose = matches.get_flag("loose");
 
@@ -811,19 +842,22 @@ impl CommandExecutor for NumberCompareCommandExecutor {
         let value1 = self.value1.evaluate(context).await?;
         let value2 = self.value2.evaluate(context).await?;
 
-        let matched =
-            match (
-                Self::parse_number(&value1, self.loose),
-                Self::parse_number(&value2, self.loose),
-            ) {
-                (Some(left), Some(right)) => self.op.compare(left, right),
-                _ => false,
-            };
+        let matched = match (
+            Self::parse_number(&value1, self.loose),
+            Self::parse_number(&value2, self.loose),
+        ) {
+            (Some(left), Some(right)) => self.op.compare(left, right),
+            _ => false,
+        };
 
         if matched {
-            Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))
+            Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                true,
+            )))
         } else {
-            Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
+            Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                false,
+            )))
         }
     }
 }
@@ -902,11 +936,15 @@ impl CommandParser for RangeCommandParser {
         str_args: Vec<&str>,
         args: &CommandArgs,
     ) -> Result<CommandExecutorRef, String> {
-        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
-            let msg = format!("Invalid range command: {:?}, {}", str_args, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid range command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         let value_index = matches.index_of("value").ok_or_else(|| {
             let msg = "Value argument is required for range command".to_string();
@@ -921,7 +959,7 @@ impl CommandParser for RangeCommandParser {
                 return Err(msg);
             }
         }
-       
+
         // Get the range bounds and check they are valid numbers if is literal
         let begin_index = matches.index_of("begin").ok_or_else(|| {
             let msg = "Begin argument is required for range command".to_string();
@@ -949,13 +987,9 @@ impl CommandParser for RangeCommandParser {
                 error!("{}", msg);
                 return Err(msg);
             }
-        }   
+        }
 
-        let cmd = RangeCommandExecutor::new(
-            value,
-            begin,
-            end,
-        );
+        let cmd = RangeCommandExecutor::new(value, begin, end);
         Ok(Arc::new(Box::new(cmd)))
     }
 }
@@ -982,9 +1016,13 @@ impl CommandExecutor for RangeCommandExecutor {
         let max = self.max.evaluate_number(_context).await?.as_f64();
 
         if value >= min && value <= max {
-            Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))
+            Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                true,
+            )))
         } else {
-            Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
+            Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                false,
+            )))
         }
     }
 }

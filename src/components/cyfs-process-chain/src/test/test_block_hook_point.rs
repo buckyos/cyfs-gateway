@@ -104,14 +104,16 @@ fn new_test_data_dir(scope: &str) -> Result<PathBuf, String> {
         .map_err(|e| format!("system time error: {}", e))?
         .as_nanos();
     let pid = std::process::id();
-    let data_dir = std::env::temp_dir().join(format!("cyfs-process-chain-{}-{}-{}", scope, pid, ts));
+    let data_dir =
+        std::env::temp_dir().join(format!("cyfs-process-chain-{}-{}-{}", scope, pid, ts));
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("create test data dir {:?} failed: {}", data_dir, e))?;
     Ok(data_dir)
 }
 
 fn register_local_external_commands(hook_point_env: &HookPointEnv) -> Result<(), String> {
-    hook_point_env.register_external_command(LOCAL_ADD_COMMAND, Arc::new(Box::new(AddCommand::new())))?;
+    hook_point_env
+        .register_external_command(LOCAL_ADD_COMMAND, Arc::new(Box::new(AddCommand::new())))?;
     Ok(())
 }
 
@@ -194,7 +196,12 @@ async fn test_hook_point() -> Result<(), String> {
         )
         .await?;
     hook_point_env
-        .load_collection("ip", CollectionType::MultiMap, CollectionFileFormat::Json, true)
+        .load_collection(
+            "ip",
+            CollectionType::MultiMap,
+            CollectionFileFormat::Json,
+            true,
+        )
         .await?;
 
     register_local_external_commands(&hook_point_env)?;

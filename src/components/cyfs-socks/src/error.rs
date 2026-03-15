@@ -4,7 +4,7 @@ use thiserror::Error;
 pub enum RuleError {
     #[error("Invalid config: {0}")]
     InternalError(String),
-    
+
     #[error("Invalid format: {0}")]
     InvalidFormat(String),
 
@@ -25,7 +25,6 @@ pub enum RuleError {
 }
 
 pub type RuleResult<T> = std::result::Result<T, RuleError>;
-
 
 #[derive(Error, Debug)]
 pub enum SocksError {

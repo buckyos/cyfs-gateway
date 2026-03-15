@@ -1,8 +1,8 @@
 use crate::tunnel::DatagramClient;
 use buckyos_kit::AsyncStream;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, ReadHalf, WriteHalf};
 use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, ReadHalf, WriteHalf};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
@@ -105,7 +105,11 @@ pub struct DatagramForwarder {
 }
 
 impl DatagramForwarder {
-    pub async fn new(target_addr: &str, bind: &str, stream: Box<dyn AsyncStream>) -> std::io::Result<Self> {
+    pub async fn new(
+        target_addr: &str,
+        bind: &str,
+        stream: Box<dyn AsyncStream>,
+    ) -> std::io::Result<Self> {
         let client = UdpSocket::bind(bind).await.map_err(|e| {
             let msg = format!("UDP socket bind to {} failed: {:?}", bind, e);
             error!("{}", msg);

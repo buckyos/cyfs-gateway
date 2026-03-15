@@ -84,7 +84,7 @@ impl JavaScriptExecutor {
 
         // Register collection wrappers
         CollectionWrapperHelper::register_all(&mut context)?;
-        
+
         // Register ContextWrapper
         ContextWrapper::register(&mut context)?;
         EnvManagerWrapper::register(&mut context)?;
@@ -284,9 +284,13 @@ impl JavaScriptFunctionCaller {
         // Check if the result is boolean
         if let Some(boolean) = result.as_boolean() {
             if boolean {
-                return Ok(CommandResult::success_with_value(CollectionValue::Bool(true)));
+                return Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                    true,
+                )));
             } else {
-                return Ok(CommandResult::error_with_value(CollectionValue::Bool(false)));
+                return Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                    false,
+                )));
             }
         }
 

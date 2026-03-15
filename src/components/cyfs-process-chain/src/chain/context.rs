@@ -55,15 +55,16 @@ impl Context {
 
     pub fn search_lib(&self, lib_id: &str) -> Result<Option<SearchResult>, String> {
         // If current pointer is same as the requested lib_id, return it
-        let current_lib = self.current_pointer.get_lib().unwrap();
-        if current_lib.get_id() == lib_id {
-            let ret = SearchResult {
-                lib: Some(current_lib),
-                same_lib: true,
-                chain: None,
-                same_chain: false,
-            };
-            return Ok(Some(ret));
+        if let Some(current_lib) = self.current_pointer.get_lib() {
+            if current_lib.get_id() == lib_id {
+                let ret = SearchResult {
+                    lib: Some(current_lib),
+                    same_lib: true,
+                    chain: None,
+                    same_chain: false,
+                };
+                return Ok(Some(ret));
+            }
         }
 
         // Otherwise, check the process chain manager for the lib
@@ -87,46 +88,44 @@ impl Context {
         lib_id: Option<&str>,
         chain_id: &str,
     ) -> Result<Option<SearchResult>, String> {
-        // If lib_id is not specified, or is same as the current pointer's lib, then just get the chain from the current pointer
-        let current_lib = self.current_pointer.get_lib().unwrap();
-        if lib_id.is_none() || current_lib.get_id() == lib_id.unwrap() {
-            // If chain_id is same as the current pointer's chain, return it
-            let current_chain = self.current_pointer.get_chain().unwrap();
-            if current_chain.id() == chain_id {
-                let ret = SearchResult {
-                    lib: Some(current_lib),
-                    same_lib: true,
-                    chain: Some(current_chain),
-                    same_chain: true,
-                };
-                return Ok(Some(ret));
-            }
+        // If lib_id is not specified, or is same as the current pointer's lib, then first try the current pointer.
+        if let Some(current_lib) = self.current_pointer.get_lib() {
+            if lib_id.is_none() || current_lib.get_id() == lib_id.unwrap() {
+                // If chain_id is same as the current pointer's chain, return it
+                if let Some(current_chain) = self.current_pointer.get_chain() {
+                    if current_chain.id() == chain_id {
+                        let ret = SearchResult {
+                            lib: Some(current_lib.clone()),
+                            same_lib: true,
+                            chain: Some(current_chain),
+                            same_chain: true,
+                        };
+                        return Ok(Some(ret));
+                    }
+                }
 
-            // If current pointer has a lib set, check if it contains the chain
-            if let Some(chain) = current_lib.get_chain(chain_id)? {
-                let ret = SearchResult {
-                    lib: Some(current_lib),
-                    same_lib: true,
-                    chain: Some(chain),
-                    same_chain: false,
-                };
-                return Ok(Some(ret));
-            }
+                // If current pointer has a lib set, check if it contains the chain
+                if let Some(chain) = current_lib.get_chain(chain_id)? {
+                    let ret = SearchResult {
+                        lib: Some(current_lib.clone()),
+                        same_lib: true,
+                        chain: Some(chain),
+                        same_chain: false,
+                    };
+                    return Ok(Some(ret));
+                }
 
-            // If no chain found, return None
-            warn!(
-                "Process chain '{}' not found in current pointer's lib '{}'",
-                chain_id,
-                current_lib.get_id()
-            );
-            return Ok(None);
+                if lib_id.is_some() {
+                    warn!(
+                        "Process chain '{}' not found in current pointer's lib '{}'",
+                        chain_id,
+                        current_lib.get_id()
+                    );
+                    return Ok(None);
+                }
+            }
         }
 
-        // Search in the specified library from the process chain manager
-        assert!(
-            lib_id.is_some(),
-            "lib_id must be specified when searching for a chain"
-        );
         let ret = self.process_chain_manager.get_chain(lib_id, chain_id)?;
         match ret {
             Some((lib, chain)) => Ok(Some(SearchResult {
@@ -152,74 +151,85 @@ impl Context {
         chain_id: Option<&str>,
         block_id: &str,
     ) -> Result<Option<SearchResult>, String> {
-        let current_lib = self.current_pointer.get_lib().unwrap();
+        // If lib_id is not specified, or is same as the current pointer's lib, then first try the current pointer.
+        if let Some(current_lib) = self.current_pointer.get_lib() {
+            if lib_id.is_none() || current_lib.get_id() == lib_id.unwrap() {
+                if let Some(current_chain) = self.current_pointer.get_chain() {
+                    // If chain_id is same as the current pointer's chain, or if chain_id is None, check the current chain for the block
+                    if chain_id.is_none() || current_chain.id() == chain_id.unwrap() {
+                        if let Some(_block) = current_chain.get_block(block_id) {
+                            return Ok(Some(SearchResult {
+                                lib: Some(current_lib.clone()),
+                                same_lib: true,
+                                chain: Some(current_chain),
+                                same_chain: true,
+                            }));
+                        }
 
-        // If lib_id is not specified, or is same as the current pointer's lib, then just get the block from the current pointer
-        if lib_id.is_none() || current_lib.get_id() == lib_id.unwrap() {
-            let current_chain = self.current_pointer.get_chain().unwrap();
-            // If chain_id is same as the current pointer's chain, or if chain_id is None, check the current chain for the block
-            if chain_id.is_none() || current_chain.id() == chain_id.unwrap() {
-                // If the current pointer has a block set, check if it matches the requested block_id
-                if let Some(_block) = current_chain.get_block(block_id) {
-                    return Ok(Some(SearchResult {
-                        lib: Some(current_lib),
-                        same_lib: true,
-                        chain: Some(current_chain),
-                        same_chain: true,
-                    }));
-                } else {
-                    warn!(
-                        "Block '{}' not found in current chain '{}'",
-                        block_id,
-                        current_chain.id()
-                    );
-                    return Ok(None);
-                }
-            }
-
-            let chain_id = chain_id.unwrap();
-            let ret = current_lib.get_chain(chain_id)?;
-            match ret {
-                Some(chain) => {
-                    if let Some(_block) = chain.get_block(block_id) {
-                        return Ok(Some(SearchResult {
-                            lib: Some(current_lib),
-                            same_lib: true,
-                            chain: Some(chain),
-                            same_chain: false,
-                        }));
-                    } else {
-                        warn!(
-                            "Block '{}' not found in chain '{}' of current pointer's lib '{}'",
-                            block_id,
-                            chain_id,
-                            current_lib.get_id()
-                        );
-                        return Ok(None);
+                        if chain_id.is_none() {
+                            warn!(
+                                "Block '{}' not found in current chain '{}'",
+                                block_id,
+                                current_chain.id()
+                            );
+                            return Ok(None);
+                        }
                     }
-                }
-                None => {
+                } else if chain_id.is_none() {
                     warn!(
-                        "Chain '{}' not found in current pointer's lib '{}'",
-                        chain_id,
-                        current_lib.get_id()
+                        "Block '{}' lookup requires a current chain when chain_id is not specified",
+                        block_id
                     );
                     return Ok(None);
+                }
+
+                if let Some(chain_id) = chain_id {
+                    let ret = current_lib.get_chain(chain_id)?;
+                    match ret {
+                        Some(chain) => {
+                            if let Some(_block) = chain.get_block(block_id) {
+                                return Ok(Some(SearchResult {
+                                    lib: Some(current_lib.clone()),
+                                    same_lib: true,
+                                    chain: Some(chain),
+                                    same_chain: false,
+                                }));
+                            }
+
+                            if lib_id.is_some() {
+                                warn!(
+                                    "Block '{}' not found in chain '{}' of current pointer's lib '{}'",
+                                    block_id,
+                                    chain_id,
+                                    current_lib.get_id()
+                                );
+                                return Ok(None);
+                            }
+                        }
+                        None => {
+                            if lib_id.is_some() {
+                                warn!(
+                                    "Chain '{}' not found in current pointer's lib '{}'",
+                                    chain_id,
+                                    current_lib.get_id()
+                                );
+                                return Ok(None);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        assert!(
-            lib_id.is_some(),
-            "lib_id must be specified when searching for a block"
-        );
-        assert!(
-            chain_id.is_some(),
-            "chain_id must be specified when searching for a block"
-        );
+        let Some(chain_id) = chain_id else {
+            warn!(
+                "Block '{}' lookup requires chain_id when no current chain is available",
+                block_id
+            );
+            return Ok(None);
+        };
 
         // Get the block from the process chain manager
-        let chain_id = chain_id.unwrap();
         let ret = self
             .process_chain_manager
             .get_block(lib_id, chain_id, block_id)?;
@@ -294,5 +304,83 @@ impl Context {
             goto_counter: self.goto_counter.clone(), // Use the same goto counter for the chain context
             pipe: self.pipe.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::ParserContext;
+    use crate::hook_point::HookPoint;
+
+    const SIMPLE_LIB: &str = r#"
+<process_chain_lib id="test_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+    async fn build_context() -> Result<Context, String> {
+        let hook_point = HookPoint::new("context-search-test");
+        hook_point
+            .load_process_chain_lib("test_lib", 0, SIMPLE_LIB)
+            .await?;
+
+        let parser_context = Arc::new(ParserContext::new());
+        let manager = hook_point
+            .process_chain_manager()
+            .link(&parser_context)
+            .await?;
+
+        let global_env = Arc::new(Env::new(EnvLevel::Global, None));
+        Ok(Context::new(
+            manager,
+            global_env,
+            Arc::new(GotoCounter::new()),
+            CommandPipe::default(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn search_without_current_pointer_uses_global_resolution() {
+        let context = build_context().await.expect("context should build");
+
+        let lib = context
+            .search_lib("test_lib")
+            .expect("lib lookup should succeed")
+            .expect("lib should exist");
+        assert!(!lib.same_lib);
+        assert_eq!(lib.lib.expect("lib result").get_id(), "test_lib");
+
+        let chain = context
+            .search_chain(None, "main")
+            .expect("chain lookup should succeed")
+            .expect("chain should exist");
+        assert!(!chain.same_lib);
+        assert!(!chain.same_chain);
+        assert_eq!(chain.chain.expect("chain result").id(), "main");
+
+        let block = context
+            .search_block(None, Some("main"), "entry")
+            .expect("block lookup should succeed")
+            .expect("block should exist");
+        assert!(!block.same_lib);
+        assert!(!block.same_chain);
+        assert_eq!(block.chain.expect("block chain result").id(), "main");
+    }
+
+    #[tokio::test]
+    async fn search_block_without_current_chain_returns_none() {
+        let context = build_context().await.expect("context should build");
+
+        let block = context
+            .search_block(None, None, "entry")
+            .expect("block lookup should not fail");
+        assert!(block.is_none());
     }
 }

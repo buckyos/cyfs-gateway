@@ -1,24 +1,24 @@
-mod tcp_stack;
-mod rtcp_stack;
-mod udp_stack;
-mod stack;
-mod tls_stack;
-mod quic_stack;
 mod limiter;
+mod quic_stack;
+mod rtcp_stack;
+mod stack;
+mod tcp_stack;
 mod tls_cert_resolver;
+mod tls_stack;
+mod udp_stack;
 
-#[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
 use buckyos_kit::AsyncStream;
 use cyfs_process_chain::CollectionValue;
-pub use tcp_stack::*;
-pub use rtcp_stack::*;
-pub use udp_stack::*;
-pub use quic_stack::*;
-pub use stack::*;
-pub use tls_stack::*;
-pub(crate) use tls_cert_resolver::*;
 pub use limiter::*;
+pub use quic_stack::*;
+pub use rtcp_stack::*;
+pub use stack::*;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+pub use tcp_stack::*;
+pub(crate) use tls_cert_resolver::*;
+pub use tls_stack::*;
+pub use udp_stack::*;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum StackErrorCode {
@@ -42,12 +42,14 @@ pub enum StackErrorCode {
 }
 pub type StackResult<T> = sfo_result::Result<T, StackErrorCode>;
 pub type StackError = sfo_result::Error<StackErrorCode>;
-pub use sfo_result::into_err as into_stack_err;
-pub use sfo_result::err as stack_err;
-use url::Url;
 use crate::{DatagramClientBox, TunnelManager};
+pub use sfo_result::err as stack_err;
+pub use sfo_result::into_err as into_stack_err;
+use url::Url;
 
-pub async fn get_source_addr_from_req_env(global_env: &cyfs_process_chain::EnvRef) -> Option<String> {
+pub async fn get_source_addr_from_req_env(
+    global_env: &cyfs_process_chain::EnvRef,
+) -> Option<String> {
     let req = match global_env.get("REQ").await {
         Ok(Some(req)) => req,
         _ => return None,
@@ -73,12 +75,16 @@ pub async fn get_source_addr_from_req_env(global_env: &cyfs_process_chain::EnvRe
     }
 }
 
-pub async fn stream_forward(mut stream: Box<dyn AsyncStream>, target: &str, tunnel_manager: &TunnelManager) -> StackResult<()> {
+pub async fn stream_forward(
+    mut stream: Box<dyn AsyncStream>,
+    target: &str,
+    tunnel_manager: &TunnelManager,
+) -> StackResult<()> {
     let url = Url::parse(target).map_err(into_stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid forward url {}",
-                                    target
-                                ))?;
+        StackErrorCode::InvalidConfig,
+        "invalid forward url {}",
+        target
+    ))?;
     let mut forward_stream = tunnel_manager
         .open_stream_by_url(&url)
         .await
@@ -86,26 +92,39 @@ pub async fn stream_forward(mut stream: Box<dyn AsyncStream>, target: &str, tunn
 
     tokio::io::copy_bidirectional(&mut stream, forward_stream.as_mut())
         .await
-        .map_err(into_stack_err!(StackErrorCode::StreamError, "target {target}"))?;
+        .map_err(into_stack_err!(
+            StackErrorCode::StreamError,
+            "target {target}"
+        ))?;
     Ok(())
 }
 
-pub async fn datagram_forward(datagram: Box<dyn DatagramClientBox>, target: &str, tunnel_manager: &TunnelManager) -> StackResult<()> {
+pub async fn datagram_forward(
+    datagram: Box<dyn DatagramClientBox>,
+    target: &str,
+    tunnel_manager: &TunnelManager,
+) -> StackResult<()> {
     let url = Url::parse(&target).map_err(into_stack_err!(
-                                    StackErrorCode::InvalidConfig,
-                                    "invalid forward url {}",
-                                    target
-                                ))?;
-    let forward_datagram = tunnel_manager.create_datagram_client_by_url(&url).await
+        StackErrorCode::InvalidConfig,
+        "invalid forward url {}",
+        target
+    ))?;
+    let forward_datagram = tunnel_manager
+        .create_datagram_client_by_url(&url)
+        .await
         .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
 
-    copy_datagram_bidirectional(datagram, forward_datagram).await
+    copy_datagram_bidirectional(datagram, forward_datagram)
+        .await
         .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
     Ok(())
 }
 
 #[allow(unreachable_code)]
-pub async fn copy_datagram_bidirectional(a: Box<dyn DatagramClientBox>, b: Box<dyn DatagramClientBox>) -> Result<(), std::io::Error> {
+pub async fn copy_datagram_bidirectional(
+    a: Box<dyn DatagramClientBox>,
+    b: Box<dyn DatagramClientBox>,
+) -> Result<(), std::io::Error> {
     let recv = {
         let a = a.clone();
         let b = b.clone();
@@ -134,31 +153,43 @@ pub async fn copy_datagram_bidirectional(a: Box<dyn DatagramClientBox>, b: Box<d
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn sockaddr_to_socket_addr(addr: &libc::sockaddr_storage) -> std::io::Result<std::net::SocketAddr> {
+pub(crate) fn sockaddr_to_socket_addr(
+    addr: &libc::sockaddr_storage,
+) -> std::io::Result<std::net::SocketAddr> {
     unsafe {
         match (*addr).ss_family as i32 {
             libc::AF_INET => {
-                let addr_in: *const libc::sockaddr_in = addr as *const _ as *const libc::sockaddr_in;
+                let addr_in: *const libc::sockaddr_in =
+                    addr as *const _ as *const libc::sockaddr_in;
                 // 转换端口：网络字节序 -> 主机字节序
                 let port = u16::from_be((*addr_in).sin_port);
                 // 转换 IPv4 地址：网络字节序的 u32 -> Ipv4Addr
                 // Ipv4Addr::from 直接接收一个 u32，并按网络字节序解释
                 let ip_addr = std::net::Ipv4Addr::from((*addr_in).sin_addr.s_addr.to_le_bytes());
-                Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip_addr, port)))
+                Ok(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                    ip_addr, port,
+                )))
             }
             libc::AF_INET6 => {
-                let addr_in6: *const libc::sockaddr_in6 = addr as *const _ as *const libc::sockaddr_in6;
+                let addr_in6: *const libc::sockaddr_in6 =
+                    addr as *const _ as *const libc::sockaddr_in6;
                 // 转换端口：网络字节序 -> 主机字节序
                 let port = u16::from_be((*addr_in6).sin6_port);
                 // 转换 IPv6 地址：直接使用 libc::sockaddr_in6 中的 sin6_addr 字段
                 // sin6_addr 是一个包含 16 个 u8 的数组，表示 IPv6 地址的 128 位
                 let segments = (*addr_in6).sin6_addr.s6_addr;
                 let ipv6_addr = std::net::Ipv6Addr::from(segments);
-                Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(ipv6_addr, port, (*addr_in6).sin6_flowinfo, (*addr_in6).sin6_scope_id)))
+                Ok(std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                    ipv6_addr,
+                    port,
+                    (*addr_in6).sin6_flowinfo,
+                    (*addr_in6).sin6_scope_id,
+                )))
             }
-            _ => {
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "addr family must be either AF_INET or AF_INET6"))
-            }, // 未知地址族
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "addr family must be either AF_INET or AF_INET6",
+            )), // 未知地址族
         }
     }
 }
@@ -180,9 +211,10 @@ pub(crate) fn set_socket_opt<T: AsRawFd, V>(
         );
         if ret != 0 {
             return Err(stack_err!(
-                            StackErrorCode::IoError,
-                            "setsockopt error {}", std::io::Error::last_os_error()
-                        ));
+                StackErrorCode::IoError,
+                "setsockopt error {}",
+                std::io::Error::last_os_error()
+            ));
         }
         Ok(())
     }
@@ -206,9 +238,10 @@ pub(crate) fn get_socket_opt<T: AsRawFd, V>(
         );
         if ret != 0 {
             return Err(stack_err!(
-                            StackErrorCode::IoError,
-                            "getsockopt error {}", std::io::Error::last_os_error()
-                        ));
+                StackErrorCode::IoError,
+                "getsockopt error {}",
+                std::io::Error::last_os_error()
+            ));
         }
         Ok(len)
     }
@@ -255,7 +288,7 @@ fn get_destination_addr(msg: &libc::msghdr) -> Option<libc::sockaddr_storage> {
 #[cfg(target_os = "linux")]
 pub(crate) fn recv_from<T: AsRawFd>(
     socket: &T,
-    buf: &mut [u8]
+    buf: &mut [u8],
 ) -> std::io::Result<(usize, std::net::SocketAddr, std::net::SocketAddr)> {
     unsafe {
         let mut control_buf = [0u8; 64];
@@ -284,7 +317,10 @@ pub(crate) fn recv_from<T: AsRawFd>(
 
         let dst_addr = match get_destination_addr(&msg) {
             None => {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "missing destination address in msghdr"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing destination address in msghdr",
+                ));
             }
             Some(d) => d,
         };

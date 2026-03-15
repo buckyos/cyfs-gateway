@@ -1,18 +1,21 @@
-use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use http::{Version, StatusCode};
-use http_body_util::combinators::{BoxBody};
+use super::server_err;
+use crate::{
+    HttpServer, Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode,
+    ServerFactory, ServerResult, StreamInfo,
+};
+use chrono::{DateTime, Local};
+use futures_util::TryStreamExt;
+use http::{StatusCode, Version};
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
 use hyper::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Local};
-use crate::{HttpServer, Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo};
-use super::server_err;
-use futures_util::TryStreamExt;
-use tokio::io::AsyncReadExt;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::AsyncReadExt;
 
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -139,37 +142,56 @@ impl DirServer {
 
     async fn create_server(builder: DirServerBuilder) -> ServerResult<DirServer> {
         if builder.id.is_none() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "id is required"));
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "id is required"
+            ));
         }
 
         if builder.root_path.is_none() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "root_path is required"));
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "root_path is required"
+            ));
         }
 
         let root_path = builder.root_path.unwrap();
         if !root_path.exists() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "root_path does not exist: {:?}", root_path));
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "root_path does not exist: {:?}",
+                root_path
+            ));
         }
 
         if !root_path.is_dir() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "root_path is not a directory: {:?}", root_path));
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "root_path is not a directory: {:?}",
+                root_path
+            ));
         }
 
         let version: http::Version = match builder.version {
-            Some(ref version) => {
-                match version.as_str() {
-                    "HTTP/0.9" => http::Version::HTTP_09,
-                    "HTTP/1.0" => http::Version::HTTP_10,
-                    "HTTP/1.1" => http::Version::HTTP_11,
-                    "HTTP/2" => http::Version::HTTP_2,
-                    "HTTP/3" => http::Version::HTTP_3,
-                    _ => return Err(server_err!(ServerErrorCode::InvalidConfig, "invalid http version")),
+            Some(ref version) => match version.as_str() {
+                "HTTP/0.9" => http::Version::HTTP_09,
+                "HTTP/1.0" => http::Version::HTTP_10,
+                "HTTP/1.1" => http::Version::HTTP_11,
+                "HTTP/2" => http::Version::HTTP_2,
+                "HTTP/3" => http::Version::HTTP_3,
+                _ => {
+                    return Err(server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "invalid http version"
+                    ));
                 }
             },
             None => http::Version::HTTP_11,
         };
 
-        let index_file = builder.index_file.unwrap_or_else(|| "index.html".to_string());
+        let index_file = builder
+            .index_file
+            .unwrap_or_else(|| "index.html".to_string());
         let etag = builder.etag.unwrap_or(true);
         let if_modified_since = match builder.if_modified_since {
             Some(mode) => IfModifiedSinceMode::parse(mode.as_str()).ok_or_else(|| {
@@ -203,7 +225,11 @@ impl DirServer {
             None
         };
         let new_root_dir = root_path.canonicalize().map_err(|e| {
-            server_err!(ServerErrorCode::IOError, "Failed to canonicalize path: {}", e)
+            server_err!(
+                ServerErrorCode::IOError,
+                "Failed to canonicalize path: {}",
+                e
+            )
         })?;
         info!("after normalize,root_dir is : {:?}", new_root_dir);
         Ok(DirServer {
@@ -245,7 +271,11 @@ impl DirServer {
             .any(|item| item == "*" || Self::normalize_etag_tag(item) == target)
     }
 
-    fn compare_if_modified_since(&self, last_modified: SystemTime, if_modified_since: &str) -> bool {
+    fn compare_if_modified_since(
+        &self,
+        last_modified: SystemTime,
+        if_modified_since: &str,
+    ) -> bool {
         let since = match httpdate::parse_http_date(if_modified_since) {
             Ok(t) => t,
             Err(_) => return false,
@@ -297,7 +327,12 @@ impl DirServer {
     fn build_etag(file_meta: &std::fs::Metadata) -> Option<String> {
         let modified = file_meta.modified().ok()?;
         let dur = modified.duration_since(UNIX_EPOCH).ok()?;
-        Some(format!("\"{:x}-{:x}-{:x}\"", file_meta.len(), dur.as_secs(), dur.subsec_nanos()))
+        Some(format!(
+            "\"{:x}-{:x}-{:x}\"",
+            file_meta.len(),
+            dur.as_secs(),
+            dur.subsec_nanos()
+        ))
     }
 
     /// Parse Range header (e.g., "bytes=start-end")
@@ -305,11 +340,13 @@ impl DirServer {
         let range = range.trim_start_matches("bytes=");
         let mut parts = range.split('-');
 
-        let start = parts.next()
+        let start = parts
+            .next()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
 
-        let end = parts.next()
+        let end = parts
+            .next()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(file_size - 1);
 
@@ -334,7 +371,11 @@ impl DirServer {
 
         let file_meta = file.metadata().await.map_err(|e| {
             warn!("Failed to get file metadata: {:?}, error: {}", file_path, e);
-            server_err!(ServerErrorCode::IOError, "Failed to get file metadata: {}", e)
+            server_err!(
+                ServerErrorCode::IOError,
+                "Failed to get file metadata: {}",
+                e
+            )
         })?;
 
         let file_size = file_meta.len();
@@ -389,7 +430,10 @@ impl DirServer {
                         .status(StatusCode::PARTIAL_CONTENT)
                         .header("Content-Type", mime_type.as_ref())
                         .header("Content-Length", content_length)
-                        .header("Content-Range", format!("bytes {}-{}/{}", start, end, file_size))
+                        .header(
+                            "Content-Range",
+                            format!("bytes {}-{}/{}", start, end, file_size),
+                        )
                         .header("Accept-Ranges", "bytes");
 
                     if let Some(etag) = etag.as_ref() {
@@ -403,7 +447,10 @@ impl DirServer {
                     return Ok(response_builder
                         .body(
                             BodyExt::map_err(stream_body, |e| {
-                                ServerError::new(ServerErrorCode::StreamError, format!("Stream error: {}", e))
+                                ServerError::new(
+                                    ServerErrorCode::StreamError,
+                                    format!("Stream error: {}", e),
+                                )
                             })
                             .boxed(),
                         )
@@ -417,7 +464,7 @@ impl DirServer {
         // Non-Range request: return full file
         let stream = tokio_util::io::ReaderStream::with_capacity(file, file_size as usize);
         let stream_body = StreamBody::new(stream.map_ok(Frame::data));
-        
+
         let mut response_builder = http::Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", mime_type.as_ref())
@@ -491,7 +538,11 @@ impl DirServer {
 
     fn ensure_path_in_root(&self, path: &Path) -> ServerResult<PathBuf> {
         let canonical_path = path.canonicalize().map_err(|e| {
-            server_err!(ServerErrorCode::IOError, "Failed to canonicalize path: {}", e)
+            server_err!(
+                ServerErrorCode::IOError,
+                "Failed to canonicalize path: {}",
+                e
+            )
         })?;
         if !canonical_path.starts_with(&self.root_dir) {
             return Err(server_err!(
@@ -547,7 +598,11 @@ impl DirServer {
         };
 
         while let Some(entry) = read_dir.next_entry().await.map_err(|e| {
-            server_err!(ServerErrorCode::IOError, "Failed to read directory entry: {}", e)
+            server_err!(
+                ServerErrorCode::IOError,
+                "Failed to read directory entry: {}",
+                e
+            )
         })? {
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy().to_string();
@@ -616,11 +671,7 @@ impl DirServer {
             let spaces = " ".repeat(pad);
             html.push_str(&format!(
                 "<a href=\"{}\">{}</a>{} {} {:>19}\r\n",
-                escaped_href,
-                escaped_name,
-                spaces,
-                entry.modified,
-                entry.size
+                escaped_href, escaped_name, spaces, entry.modified, entry.size
             ));
         }
 
@@ -644,7 +695,9 @@ impl HttpServer for DirServer {
         // Only support GET and HEAD methods
         if req_method != hyper::Method::GET && req_method != hyper::Method::HEAD {
             warn!("Method not allowed: {}", req_method);
-            return Ok(self.build_text_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed"));
+            return Ok(
+                self.build_text_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed")
+            );
         }
 
         let mut file_path = match self.resolve_path(req_path) {
@@ -699,7 +752,10 @@ impl HttpServer for DirServer {
                         warn!("Fallback file not found: {:?}", fallback_path);
                     }
                     Err(e) => {
-                        warn!("Failed to resolve fallback file: {:?}, error: {}", fallback_path, e);
+                        warn!(
+                            "Failed to resolve fallback file: {:?}, error: {}",
+                            fallback_path, e
+                        );
                     }
                 }
             }
@@ -783,7 +839,10 @@ impl ServerFactory for DirServerFactory {
         let config = config
             .as_any()
             .downcast_ref::<DirServerConfig>()
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid dir server config"))?;
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid dir server config"
+            ))?;
 
         let mut builder = DirServer::builder()
             .id(config.id.clone())
@@ -816,10 +875,10 @@ impl ServerFactory for DirServerFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use crate::{StreamInfo, hyper_serve_http1};
     use http_body_util::Full;
-    use crate::{hyper_serve_http1, StreamInfo};
     use hyper_util::rt::TokioIo;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_dir_server_builder_creation() {
@@ -865,13 +924,13 @@ mod tests {
     async fn test_create_server_with_valid_config() {
         // Create a temporary directory
         let temp_dir = tempfile::tempdir().unwrap();
-        
+
         let result = DirServer::builder()
             .id("test")
             .root_path(temp_dir.path().to_path_buf())
             .build()
             .await;
-        
+
         assert!(result.is_ok());
     }
 
@@ -880,10 +939,12 @@ mod tests {
         // Create a temporary directory
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("test.txt");
-        
+
         // Write test content
-        tokio::fs::write(&file_path, b"Hello, World!").await.unwrap();
-        
+        tokio::fs::write(&file_path, b"Hello, World!")
+            .await
+            .unwrap();
+
         let server = Arc::new(
             DirServer::builder()
                 .id("test")
@@ -911,14 +972,14 @@ mod tests {
             .handshake(TokioIo::new(client))
             .await
             .unwrap();
-        
+
         tokio::spawn(async move {
             conn.await.unwrap();
         });
 
         let resp = sender.send_request(request).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        
+
         let body_bytes = resp.collect().await.unwrap().to_bytes();
         assert_eq!(body_bytes.as_ref(), b"Hello, World!");
     }
@@ -926,7 +987,7 @@ mod tests {
     #[tokio::test]
     async fn test_serve_non_existent_file() {
         let temp_dir = tempfile::tempdir().unwrap();
-        
+
         let server = Arc::new(
             DirServer::builder()
                 .id("test")
@@ -954,7 +1015,7 @@ mod tests {
             .handshake(TokioIo::new(client))
             .await
             .unwrap();
-        
+
         tokio::spawn(async move {
             conn.await.unwrap();
         });
@@ -966,7 +1027,7 @@ mod tests {
     #[tokio::test]
     async fn test_factory() {
         let temp_dir = tempfile::tempdir().unwrap();
-        
+
         let config = DirServerConfig {
             id: "test".to_string(),
             ty: "dir".to_string(),
@@ -978,7 +1039,7 @@ mod tests {
             etag: true,
             if_modified_since: None,
         };
-        
+
         let factory = DirServerFactory::new();
         let result = factory.create(Arc::new(config), None).await;
         assert!(result.is_ok());
@@ -1199,7 +1260,9 @@ mod tests {
     async fn test_if_none_match_precedence_over_if_modified_since() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("precedence.txt");
-        tokio::fs::write(&file_path, b"precedence-body").await.unwrap();
+        tokio::fs::write(&file_path, b"precedence-body")
+            .await
+            .unwrap();
 
         let metadata = tokio::fs::metadata(&file_path).await.unwrap();
         let modified = metadata.modified().unwrap();

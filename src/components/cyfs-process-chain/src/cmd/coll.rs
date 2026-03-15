@@ -298,9 +298,13 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                 );
 
                 if all_included {
-                    Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))
+                    Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                        true,
+                    )))
                 } else {
-                    Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
+                    Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                        false,
+                    )))
                 }
             }
             CollectionValue::Set(collection) => {
@@ -314,9 +318,13 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                     contains
                 );
                 if contains {
-                    Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))
+                    Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                        true,
+                    )))
                 } else {
-                    Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
+                    Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                        false,
+                    )))
                 }
             }
             CollectionValue::Map(collection) => {
@@ -331,7 +339,9 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                             self.collection,
                             value
                         );
-                        return Ok(CommandResult::success_with_value(CollectionValue::Bool(true)));
+                        return Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                            true,
+                        )));
                     } else {
                         if values.len() > 1 {
                             warn!(
@@ -352,7 +362,9 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                                         self.collection,
                                         v
                                     );
-                                    return Ok(CommandResult::success_with_value(CollectionValue::Bool(true)));
+                                    return Ok(CommandResult::success_with_value(
+                                        CollectionValue::Bool(true),
+                                    ));
                                 } else {
                                     // value is string but not match
                                 }
@@ -376,7 +388,9 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                     self.collection
                 );
 
-                Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
+                Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                    false,
+                )))
             }
 
             CollectionValue::MultiMap(collection) => {
@@ -396,7 +410,9 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                         self.collection
                     );
 
-                    Ok(CommandResult::success_with_value(CollectionValue::Bool(true)))
+                    Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                        true,
+                    )))
                 } else {
                     log!(
                         context.env().get_log_level(),
@@ -405,7 +421,9 @@ impl CommandExecutor for MatchIncludeCommandExecutor {
                         self.collection
                     );
 
-                    Ok(CommandResult::error_with_value(CollectionValue::Bool(false)))
+                    Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                        false,
+                    )))
                 }
             }
 
@@ -2429,11 +2447,7 @@ impl CommandExecutor for MapRemoveCommandExecutor {
                     }
                 } else if values.len() == 1 {
                     let ret = collection.remove(&key, &values[0]).await?;
-                    if ret {
-                        Some(values[0].clone())
-                    } else {
-                        None
-                    }
+                    if ret { Some(values[0].clone()) } else { None }
                 } else {
                     let values = self
                         .values

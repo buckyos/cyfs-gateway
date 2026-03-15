@@ -1,20 +1,24 @@
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex, Weak};
-use std::sync::atomic::AtomicU32;
+use crate::server::dns_server::NameServer;
+use crate::{QAServer, ServerError, ServerErrorCode, ServerResult, server_err};
 use ::kRPC::{RPCHandler, RPCRequest, RPCResponse};
 use as_any::AsAny;
 use buckyos_kit::AsyncStream;
-use http::{HeaderName, Method, Request, Response, StatusCode, Uri};
+use cyfs_process_chain::{
+    CollectionValue, EnvRef, HTTP_REQUEST_HEADER_VARS, MapCollection,
+    MapCollectionTraverseCallBackRef, TraverseGuard, VariableVisitor,
+    VariableVisitorWrapperForMapCollection,
+};
 use http::uri::{Parts, PathAndQuery};
+use http::{HeaderName, Method, Request, Response, StatusCode, Uri};
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use http_body_util::combinators::{BoxBody};
-use hyper::body::{Bytes};
+use hyper::body::Bytes;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::RwLock;
-use cyfs_process_chain::{CollectionValue, EnvRef, MapCollection, MapCollectionTraverseCallBackRef, TraverseGuard, VariableVisitor, VariableVisitorWrapperForMapCollection, HTTP_REQUEST_HEADER_VARS};
-use crate::server::dns_server::NameServer;
-use crate::{server_err, ServerError, ServerErrorCode, ServerResult, QAServer};
 
 pub trait ServerConfig: AsAny + Send + Sync {
     fn id(&self) -> String;
@@ -30,7 +34,11 @@ pub type ServerContextRef = Arc<dyn ServerContext>;
 #[async_trait::async_trait]
 #[callback_trait::callback_trait]
 pub trait ServerFactory: Send + Sync {
-    async fn create(&self, config: Arc<dyn ServerConfig>, context: Option<ServerContextRef>) -> ServerResult<Vec<Server>>;
+    async fn create(
+        &self,
+        config: Arc<dyn ServerConfig>,
+        context: Option<ServerContextRef>,
+    ) -> ServerResult<Vec<Server>>;
 }
 
 pub struct CyfsServerFactory {
@@ -51,7 +59,10 @@ impl CyfsServerFactory {
         }
     }
     pub fn register(&self, server_type: String, factory: Arc<dyn ServerFactory>) {
-        self.server_factory.lock().unwrap().insert(server_type, factory);
+        self.server_factory
+            .lock()
+            .unwrap()
+            .insert(server_type, factory);
     }
 }
 
@@ -63,11 +74,19 @@ impl ServerFactory for CyfsServerFactory {
         context: Option<ServerContextRef>,
     ) -> ServerResult<Vec<Server>> {
         let factory = {
-            self.server_factory.lock().unwrap().get(config.server_type().as_str()).cloned()
+            self.server_factory
+                .lock()
+                .unwrap()
+                .get(config.server_type().as_str())
+                .cloned()
         };
         match factory {
             Some(factory) => factory.create(config, context).await,
-            None => Err(server_err!(ServerErrorCode::UnknownServerType, "unknown server type {}", config.server_type())),
+            None => Err(server_err!(
+                ServerErrorCode::UnknownServerType,
+                "unknown server type {}",
+                config.server_type()
+            )),
         }
     }
 }
@@ -116,7 +135,6 @@ impl Server {
         format!("{}.{}", id, trait_type)
     }
 }
-
 
 #[derive(Default, Debug, Clone)]
 pub struct StreamInfo {
@@ -176,7 +194,11 @@ impl StreamInfo {
 // 流处理服务
 #[async_trait::async_trait]
 pub trait StreamServer: Send + Sync {
-    async fn serve_connection(&self, stream: Box<dyn AsyncStream>, info: StreamInfo) -> ServerResult<()>;
+    async fn serve_connection(
+        &self,
+        stream: Box<dyn AsyncStream>,
+        info: StreamInfo,
+    ) -> ServerResult<()>;
     fn id(&self) -> String;
 }
 
@@ -243,8 +265,7 @@ impl HttpRequestHeaderMap {
         env.create("REQ_url", CollectionValue::Visitor(visitor))
             .await?;
 
-        env.create("REQ", CollectionValue::Map(coll))
-            .await?;
+        env.create("REQ", CollectionValue::Map(coll)).await?;
 
         Ok(())
     }
@@ -341,11 +362,16 @@ impl MapCollection for HttpRequestHeaderMap {
             } else {
                 let query = parts.path_and_query.as_ref().unwrap().query();
                 if let Some(query) = query {
-                    Some(PathAndQuery::from_str(format!("{}?{}", value.try_as_str()?, query).as_str()).map_err(|e| {
-                        let msg = format!("Invalid path '{}': {}", value, e);
-                        warn!("{}", msg);
-                        msg.to_string()
-                    })?)
+                    Some(
+                        PathAndQuery::from_str(
+                            format!("{}?{}", value.try_as_str()?, query).as_str(),
+                        )
+                        .map_err(|e| {
+                            let msg = format!("Invalid path '{}': {}", value, e);
+                            warn!("{}", msg);
+                            msg.to_string()
+                        })?,
+                    )
                 } else {
                     Some(PathAndQuery::from_str(value.try_as_str()?).map_err(|e| {
                         let msg = format!("Invalid path '{}': {}", value, e);
@@ -388,19 +414,23 @@ impl MapCollection for HttpRequestHeaderMap {
                 Ok(None)
             }
         }
-
     }
 
     async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         let request = self.request.read().await;
         if key == "path" {
-            Ok(Some(CollectionValue::String(request.uri().path().to_string())))
+            Ok(Some(CollectionValue::String(
+                request.uri().path().to_string(),
+            )))
         } else if key == "method" {
             Ok(Some(CollectionValue::String(request.method().to_string())))
         } else if key == "uri" {
             Ok(Some(CollectionValue::String(request.uri().to_string())))
         } else if key == "version" {
-            Ok(Some(CollectionValue::String(format!("{:?}", request.version()))))
+            Ok(Some(CollectionValue::String(format!(
+                "{:?}",
+                request.version()
+            ))))
         } else {
             let ret = request.headers().get(key);
             if let Some(value) = ret {
@@ -453,16 +483,37 @@ impl MapCollection for HttpRequestHeaderMap {
         let _guard = TraverseGuard::new(&self.transverse_counter);
 
         let request = self.request.read().await;
-        if !callback.call("path", &CollectionValue::String(request.uri().path().to_string())).await? {
+        if !callback
+            .call(
+                "path",
+                &CollectionValue::String(request.uri().path().to_string()),
+            )
+            .await?
+        {
             return Ok(());
         }
-        if !callback.call("method", &CollectionValue::String(request.method().to_string())).await? {
+        if !callback
+            .call(
+                "method",
+                &CollectionValue::String(request.method().to_string()),
+            )
+            .await?
+        {
             return Ok(());
         }
-        if !callback.call("uri", &CollectionValue::String(request.uri().to_string())).await? {
+        if !callback
+            .call("uri", &CollectionValue::String(request.uri().to_string()))
+            .await?
+        {
             return Ok(());
         }
-        if !callback.call("version", &CollectionValue::String(format!("{:?}", request.version()))).await? {
+        if !callback
+            .call(
+                "version",
+                &CollectionValue::String(format!("{:?}", request.version())),
+            )
+            .await?
+        {
             return Ok(());
         }
         for (key, value) in request.headers().iter() {
@@ -483,10 +534,22 @@ impl MapCollection for HttpRequestHeaderMap {
     async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
         let request = self.request.read().await;
         let mut result = Vec::new();
-        result.push(("path".to_string(), CollectionValue::String(request.uri().path().to_string())));
-        result.push(("method".to_string(), CollectionValue::String(request.method().to_string())));
-        result.push(("uri".to_string(), CollectionValue::String(request.uri().to_string())));
-        result.push(("version".to_string(), CollectionValue::String(format!("{:?}", request.version()))));
+        result.push((
+            "path".to_string(),
+            CollectionValue::String(request.uri().path().to_string()),
+        ));
+        result.push((
+            "method".to_string(),
+            CollectionValue::String(request.method().to_string()),
+        ));
+        result.push((
+            "uri".to_string(),
+            CollectionValue::String(request.uri().to_string()),
+        ));
+        result.push((
+            "version".to_string(),
+            CollectionValue::String(format!("{:?}", request.version())),
+        ));
         for (key, value) in request.headers().iter() {
             if let Ok(value_str) = value.to_str() {
                 result.push((
@@ -706,7 +769,10 @@ pub struct HttpRequestUrlVisitor {
 }
 
 impl HttpRequestUrlVisitor {
-    pub fn new(request: Arc<RwLock<http::Request<BoxBody<Bytes, ServerError>>>>, read_only: bool) -> Self {
+    pub fn new(
+        request: Arc<RwLock<http::Request<BoxBody<Bytes, ServerError>>>>,
+        read_only: bool,
+    ) -> Self {
         Self { request, read_only }
     }
 }
@@ -748,7 +814,11 @@ impl VariableVisitor for HttpRequestUrlVisitor {
 
 #[async_trait::async_trait]
 pub trait HttpServer: Send + Sync + 'static {
-    async fn serve_request(&self, req: http::Request<BoxBody<Bytes, ServerError>>, info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>>;
+    async fn serve_request(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+        info: StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>>;
     fn id(&self) -> String;
     fn http_version(&self) -> http::Version;
     fn http3_port(&self) -> Option<u16>;
@@ -767,7 +837,13 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
                     .map_err(|never| match never {})
                     .boxed(),
             ))
-            .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?);
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::BadRequest,
+                    "Failed to build response: {}",
+                    e
+                )
+            })?);
     }
 
     let client_ip = match info.src_addr.as_ref() {
@@ -782,7 +858,13 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
                             .map_err(|never| match never {})
                             .boxed(),
                     ))
-                    .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?);
+                    .map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::BadRequest,
+                            "Failed to build response: {}",
+                            e
+                        )
+                    })?);
             }
         },
         None => {
@@ -794,7 +876,13 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
                         .map_err(|never| match never {})
                         .boxed(),
                 ))
-                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?);
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::BadRequest,
+                        "Failed to build response: {}",
+                        e
+                    )
+                })?);
         }
     };
 
@@ -808,7 +896,13 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
                         .map_err(|never| match never {})
                         .boxed(),
                 ))
-                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?);
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::BadRequest,
+                        "Failed to build response: {}",
+                        e
+                    )
+                })?);
         }
     };
 
@@ -818,11 +912,20 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
             return Ok(http::Response::builder()
                 .status(hyper::StatusCode::BAD_REQUEST)
                 .body(BoxBody::new(
-                    http_body_util::Full::new(Bytes::from(format!("Failed to convert body to string: {}", e)))
-                        .map_err(|never| match never {})
-                        .boxed(),
+                    http_body_util::Full::new(Bytes::from(format!(
+                        "Failed to convert body to string: {}",
+                        e
+                    )))
+                    .map_err(|never| match never {})
+                    .boxed(),
                 ))
-                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?);
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::BadRequest,
+                        "Failed to build response: {}",
+                        e
+                    )
+                })?);
         }
     };
 
@@ -841,7 +944,13 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
                     .map_err(|never| match never {})
                     .boxed(),
                 ))
-                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to build response: {}", e))?);
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::BadRequest,
+                        "Failed to build response: {}",
+                        e
+                    )
+                })?);
         }
     };
 
@@ -851,16 +960,30 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
             return Ok(http::Response::builder()
                 .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
                 .body(BoxBody::new(
-                    http_body_util::Full::new(Bytes::from(format!("Failed to handle rpc call: {}", e)))
-                        .map_err(|never| match never {})
-                        .boxed(),
+                    http_body_util::Full::new(Bytes::from(format!(
+                        "Failed to handle rpc call: {}",
+                        e
+                    )))
+                    .map_err(|never| match never {})
+                    .boxed(),
                 ))
-                .map_err(|e| server_err!(ServerErrorCode::InvalidData, "Failed to build response: {}", e))?);
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidData,
+                        "Failed to build response: {}",
+                        e
+                    )
+                })?);
         }
     };
 
-    let body_json = serde_json::to_string(&resp)
-        .map_err(|e| server_err!(ServerErrorCode::EncodeError, "Failed to convert response to string: {}", e))?;
+    let body_json = serde_json::to_string(&resp).map_err(|e| {
+        server_err!(
+            ServerErrorCode::EncodeError,
+            "Failed to convert response to string: {}",
+            e
+        )
+    })?;
 
     Ok(http::Response::builder()
         .body(BoxBody::new(
@@ -868,7 +991,13 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
                 .map_err(|never| match never {})
                 .boxed(),
         ))
-        .map_err(|e| server_err!(ServerErrorCode::InvalidData, "Failed to build response: {}", e))?)
+        .map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidData,
+                "Failed to build response: {}",
+                e
+            )
+        })?)
 }
 
 pub struct DatagramInfo {
@@ -916,7 +1045,7 @@ pub trait DatagramServer: Send + Sync + 'static {
 
 pub struct ServerManager {
     // key 格式: "$id.$trait_type", 例如 "my-server.http", "my-server.stream"
-    servers: Mutex<HashMap<String, Server>>
+    servers: Mutex<HashMap<String, Server>>,
 }
 
 impl Drop for ServerManager {
@@ -936,9 +1065,12 @@ impl ServerManager {
         let new = ServerManager {
             servers: Mutex::new(HashMap::new()),
         };
-        
+
         for (key, server) in self.servers.lock().unwrap().iter() {
-            new.servers.lock().unwrap().insert(key.clone(), server.clone());
+            new.servers
+                .lock()
+                .unwrap()
+                .insert(key.clone(), server.clone());
         }
         new
     }
@@ -1055,7 +1187,8 @@ impl ServerManager {
         }
 
         // 再尝试前缀匹配
-        servers.iter()
+        servers
+            .iter()
             .find(|(key, _)| key.starts_with(&prefix))
             .map(|(_, server)| server.clone())
     }
@@ -1065,7 +1198,8 @@ impl ServerManager {
         let servers = self.servers.lock().unwrap();
         let prefix = format!("{}.", id);
 
-        servers.iter()
+        servers
+            .iter()
             .filter(|(key, _)| key.starts_with(&prefix) || key.as_str() == id)
             .map(|(_, server)| server.clone())
             .collect()
@@ -1090,21 +1224,29 @@ impl ServerManager {
     /// 删除某个 id 的所有 server
     pub fn remove_servers_by_id(&self, id: &str) {
         let prefix = format!("{}.", id);
-        self.servers.lock().unwrap().retain(|key, _| {
-            !key.starts_with(&prefix) && key.as_str() != id
-        });
+        self.servers
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix) && key.as_str() != id);
     }
 
     /// 保留满足条件的 server (key 为完整的 full_key)
     pub fn retain(&self, f: impl Fn(&str) -> bool) {
-        self.servers.lock().unwrap().retain(|key, _| f(key.as_str()));
+        self.servers
+            .lock()
+            .unwrap()
+            .retain(|key, _| f(key.as_str()));
     }
 }
 
 pub type ServerManagerRef = Arc<ServerManager>;
 pub type ServerManagerWeakRef = Weak<ServerManager>;
 
-pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn HttpServer>, info: StreamInfo) -> ServerResult<()> {
+pub async fn hyper_serve_http(
+    stream: Box<dyn AsyncStream>,
+    server: Arc<dyn HttpServer>,
+    info: StreamInfo,
+) -> ServerResult<()> {
     if server.http_version() <= http::Version::HTTP_11 {
         hyper::server::conn::http1::Builder::new()
             .serve_connection(TokioIo::new(stream), hyper::service::service_fn(|req| {
@@ -1303,7 +1445,11 @@ pub async fn hyper_serve_http(stream: Box<dyn AsyncStream>, server: Arc<dyn Http
     Ok(())
 }
 
-pub async fn hyper_serve_http1(stream: Box<dyn AsyncStream>, server: Arc<dyn HttpServer>, info: StreamInfo) -> ServerResult<()> {
+pub async fn hyper_serve_http1(
+    stream: Box<dyn AsyncStream>,
+    server: Arc<dyn HttpServer>,
+    info: StreamInfo,
+) -> ServerResult<()> {
     hyper::server::conn::http1::Builder::new()
         .serve_connection(TokioIo::new(stream), hyper::service::service_fn(|req| {
             let server = server.clone();

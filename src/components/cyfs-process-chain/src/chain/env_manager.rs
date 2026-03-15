@@ -1,4 +1,4 @@
-use log::{log, Level};
+use log::{Level, log};
 
 use super::env::{Env, EnvLevel, EnvRef};
 use super::external::EnvExternalRef;
@@ -458,6 +458,50 @@ impl EnvManager {
 
         let tracker = self.var_level_tracker.read().unwrap();
         tracker.get(key).cloned().unwrap_or_default()
+    }
+
+    // Get the exact tracked level entry for a variable.
+    // Returns None when there is no tracker entry (different from get_var_level defaulting).
+    pub fn var_level_entry(&self, key: &str) -> Option<EnvLevel> {
+        let key_list = Self::parse_var(key);
+        let key = key_list[0].as_str();
+
+        let tracker = self.var_level_tracker.read().unwrap();
+        tracker.get(key).cloned()
+    }
+
+    // Restore tracked level entry precisely.
+    // Some(level) => set entry, None => remove entry.
+    pub fn restore_var_level_entry(&self, key: &str, level: Option<EnvLevel>) {
+        let key_list = Self::parse_var(key);
+        let key = key_list[0].as_str();
+
+        let mut tracker = self.var_level_tracker.write().unwrap();
+        match level {
+            Some(level) => {
+                let prev = tracker.insert(key.to_string(), level);
+                if prev != Some(level) {
+                    log!(
+                        self.get_log_level(),
+                        "Variable '{}' tracker restored from '{:?}' to '{}'",
+                        key,
+                        prev,
+                        level.as_str()
+                    );
+                }
+            }
+            None => {
+                let prev = tracker.remove(key);
+                if prev.is_some() {
+                    log!(
+                        self.get_log_level(),
+                        "Variable '{}' tracker entry removed (previous: '{:?}')",
+                        key,
+                        prev
+                    );
+                }
+            }
+        }
     }
 
     pub fn change_var_level(&self, key: &str, level: Option<EnvLevel>) {

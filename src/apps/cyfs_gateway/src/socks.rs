@@ -3,8 +3,8 @@ use cyfs_gateway_lib::TunnelManager;
 use cyfs_socks::{
     SocksDataTunnelProvider, SocksDataTunnelProviderRef, SocksError, SocksResult, TargetAddr,
 };
-use std::sync::Arc;
 use log::{error, info};
+use std::sync::Arc;
 use url::Url;
 
 pub struct SocksTunnelBuilder {
@@ -13,9 +13,7 @@ pub struct SocksTunnelBuilder {
 
 impl SocksTunnelBuilder {
     pub fn new_ref(tunnel_manager: TunnelManager) -> SocksDataTunnelProviderRef {
-        Arc::new(Box::new(Self {
-            tunnel_manager,
-        }))
+        Arc::new(Box::new(Self { tunnel_manager }))
     }
 }
 
@@ -31,7 +29,9 @@ impl SocksDataTunnelProvider for SocksTunnelBuilder {
             "Will build tunnel for request: {:?}, {:?}",
             request_target, proxy_target
         );
-        let target_tunnel = self.tunnel_manager.get_tunnel(proxy_target, enable_tunnel.clone())
+        let target_tunnel = self
+            .tunnel_manager
+            .get_tunnel(proxy_target, enable_tunnel.clone())
             .await
             .map_err(|e| {
                 let msg = format!(

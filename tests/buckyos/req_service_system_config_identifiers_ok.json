@@ -1,0 +1,11 @@
+{
+  "input": {
+    "REQ": {
+      "path": "/1.0/identifiers/did:example:alice",
+      "host": "test.buckyos.io",
+      "url": "https://test.buckyos.io/1.0/identifiers/did:example:alice"
+    }
+  },
+  "id": "server:node_gateway:main",
+  "output": ["REQ", "RESP"]
+}

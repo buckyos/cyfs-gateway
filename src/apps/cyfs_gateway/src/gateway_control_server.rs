@@ -1,15 +1,17 @@
-use log::*;
-use http_body_util::{BodyExt, Full};
-use http_body_util::combinators::BoxBody;
-use std::sync::{Arc, Weak};
-use bytes::Bytes;
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
-use cyfs_gateway_lib::{ConfigErrorCode, ConfigResult, Server, ServerConfig, StreamInfo, config_err, ServerError};
-use cyfs_gateway_lib::{ServerContext, ServerContextRef, ServerFactory, HttpServer};
-use crate::config_loader::{ServerConfigParser};
+use crate::config_loader::ServerConfigParser;
 use crate::gateway_control_client::cmd_err;
+use bytes::Bytes;
+use cyfs_gateway_lib::{
+    config_err, ConfigErrorCode, ConfigResult, Server, ServerConfig, ServerError, StreamInfo,
+};
 use cyfs_gateway_lib::{server_err, ServerErrorCode, ServerResult};
+use cyfs_gateway_lib::{HttpServer, ServerContext, ServerContextRef, ServerFactory};
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full};
+use log::*;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::sync::{Arc, Weak};
+use serde_json::{Map, Number, Value};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ControlErrorCode {
@@ -59,7 +61,6 @@ impl ServerConfig for GatewayControlServerConfig {
     }
 }
 
-
 #[derive(Clone)]
 pub struct GatewayControlServerContext {
     pub handler: Weak<dyn GatewayControlCmdHandler>,
@@ -102,8 +103,14 @@ impl ServerFactory for GatewayControlServerFactory {
         config: Arc<dyn ServerConfig>,
         context: Option<ServerContextRef>,
     ) -> ServerResult<Vec<Server>> {
-        let config = config.as_any().downcast_ref::<GatewayControlServerConfig>()
-            .ok_or(server_err!(ServerErrorCode::InvalidConfig, "invalid CyfsCmdServer config {}", config.server_type()))?;
+        let config = config
+            .as_any()
+            .downcast_ref::<GatewayControlServerConfig>()
+            .ok_or(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid CyfsCmdServer config {}",
+                config.server_type()
+            ))?;
         let context = context.ok_or(server_err!(
             ServerErrorCode::InvalidConfig,
             "control server context is required"
@@ -116,16 +123,16 @@ impl ServerFactory for GatewayControlServerFactory {
                 ServerErrorCode::InvalidConfig,
                 "invalid control server context"
             ))?;
-        Ok(vec![Server::Http(Arc::new(GatewayControlServer::new(config.clone(),
-                                                           context.handler.clone(),
-                                                           context.token_factory.clone(),
-                                                                context.token_verifier.clone())))])
+        Ok(vec![Server::Http(Arc::new(GatewayControlServer::new(
+            config.clone(),
+            context.handler.clone(),
+            context.token_factory.clone(),
+            context.token_verifier.clone(),
+        )))])
     }
 }
 
-pub struct GatewayControlServerConfigParser {
-
-}
+pub struct GatewayControlServerConfigParser {}
 
 impl GatewayControlServerConfigParser {
     pub fn new() -> Self {
@@ -141,8 +148,13 @@ impl Default for GatewayControlServerConfigParser {
 
 impl<D: for<'de> Deserializer<'de>> ServerConfigParser<D> for GatewayControlServerConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = GatewayControlServerConfig::deserialize(de)
-            .map_err(|e| config_err!(ConfigErrorCode::InvalidConfig, "invalid CyfsCmdServer config {:?}", e))?;
+        let config = GatewayControlServerConfig::deserialize(de).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid CyfsCmdServer config {:?}",
+                e
+            )
+        })?;
         Ok(Arc::new(config))
     }
 }
@@ -154,7 +166,8 @@ pub trait GatewayControlCmdHandler: Send + Sync + 'static {
 
 #[async_trait::async_trait]
 pub trait CyfsTokenFactory: Send + Sync + 'static {
-    async fn create(&self, use_name: &str, password: &str, timestamp: u64) -> ControlResult<String>;
+    async fn create(&self, use_name: &str, password: &str, timestamp: u64)
+        -> ControlResult<String>;
 }
 
 #[async_trait::async_trait]
@@ -170,10 +183,12 @@ pub struct GatewayControlServer {
 }
 
 impl GatewayControlServer {
-    pub fn new(config: GatewayControlServerConfig,
-               handler: Weak<dyn GatewayControlCmdHandler>,
-               token_factory: Arc<dyn CyfsTokenFactory>,
-               token_verifier: Arc<dyn CyfsTokenVerifier>, ) -> Self {
+    pub fn new(
+        config: GatewayControlServerConfig,
+        handler: Weak<dyn GatewayControlCmdHandler>,
+        token_factory: Arc<dyn CyfsTokenFactory>,
+        token_verifier: Arc<dyn CyfsTokenVerifier>,
+    ) -> Self {
         GatewayControlServer {
             config,
             handler,
@@ -220,15 +235,28 @@ impl HttpServer for GatewayControlServer {
         None
     }
 
-    async fn serve_request(&self, request: http::Request<BoxBody<Bytes, ServerError>>, _info: StreamInfo) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    async fn serve_request(
+        &self,
+        request: http::Request<BoxBody<Bytes, ServerError>>,
+        info: StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         if request.method() != http::Method::POST {
             return Ok(http::Response::builder()
                 .status(http::StatusCode::FORBIDDEN)
-                .body(Full::new(Bytes::new()).map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap());
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|e| {
+                            ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))
+                        })
+                        .boxed(),
+                )
+                .unwrap());
         }
         let body = request.into_body();
         let ret: ControlResult<http::Response<BoxBody<Bytes, ServerError>>> = async move {
-            let data = body.collect().await
+            let data = body
+                .collect()
+                .await
                 .map(|chunk| chunk.to_bytes())
                 .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{:?}", e))?;
 
@@ -239,9 +267,18 @@ impl HttpServer for GatewayControlServer {
                 if req.sys.len() != 1 {
                     let resp = http::Response::builder()
                         .status(http::StatusCode::BAD_REQUEST)
-                        .body(Full::new(Bytes::from("invalid sys param"))
-                            .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
-                    return Ok(resp)
+                        .body(
+                            Full::new(Bytes::from("invalid sys param"))
+                                .map_err(|e| {
+                                    ServerError::new(
+                                        ServerErrorCode::BadRequest,
+                                        format!("{:?}", e),
+                                    )
+                                })
+                                .boxed(),
+                        )
+                        .unwrap();
+                    return Ok(resp);
                 }
                 let seq = req.sys[0].clone();
 
@@ -250,16 +287,30 @@ impl HttpServer for GatewayControlServer {
                     Err(_e) => {
                         let resp = http::Response::builder()
                             .status(http::StatusCode::BAD_REQUEST)
-                            .body(Full::new(Bytes::from("invalid login param"))
-                                .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
-                        return Ok(resp)
+                            .body(
+                                Full::new(Bytes::from("invalid login param"))
+                                    .map_err(|e| {
+                                        ServerError::new(
+                                            ServerErrorCode::BadRequest,
+                                            format!("{:?}", e),
+                                        )
+                                    })
+                                    .boxed(),
+                            )
+                            .unwrap();
+                        return Ok(resp);
                     }
                 };
 
-                let resp = match self.token_factory.create(
-                    login_req.user_name.as_str(),
-                    login_req.password.as_str(),
-                    login_req.timestamp).await {
+                let resp = match self
+                    .token_factory
+                    .create(
+                        login_req.user_name.as_str(),
+                        login_req.password.as_str(),
+                        login_req.timestamp,
+                    )
+                    .await
+                {
                     Ok(token) => {
                         let sys = vec![seq, Value::String(token.clone())];
                         let resp = CmdResp::<Value> {
@@ -280,29 +331,55 @@ impl HttpServer for GatewayControlServer {
                 };
                 let data = serde_json::to_vec(&resp)
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
-                return Ok(http::Response::new(Full::new(Bytes::from(data)).map_err(|e| ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))).boxed()));
+                return Ok(http::Response::new(
+                    Full::new(Bytes::from(data))
+                        .map_err(|e| {
+                            ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))
+                        })
+                        .boxed(),
+                ));
             }
 
             if req.method == "refresh_token" {
                 if req.sys.len() != 2 {
                     let resp = http::Response::builder()
                         .status(http::StatusCode::UNAUTHORIZED)
-                        .body(Full::new(Bytes::new())
-                            .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
-                    return Ok(resp)
+                        .body(
+                            Full::new(Bytes::new())
+                                .map_err(|e| {
+                                    ServerError::new(
+                                        ServerErrorCode::BadRequest,
+                                        format!("{:?}", e),
+                                    )
+                                })
+                                .boxed(),
+                        )
+                        .unwrap();
+                    return Ok(resp);
                 }
                 let seq = req.sys[0].clone();
                 let token = req.sys[1].clone();
                 let token_str = token.as_str().unwrap_or("").to_string();
-                let new_token = match self.token_verifier.verify_and_renew(token_str.as_str()).await {
-                    Ok(token) => {
-                        token
-                    },
+                let new_token = match self
+                    .token_verifier
+                    .verify_and_renew(token_str.as_str())
+                    .await
+                {
+                    Ok(token) => token,
                     Err(e) => {
                         let resp = http::Response::builder()
                             .status(http::StatusCode::UNAUTHORIZED)
-                            .body(Full::new(Bytes::from(e.msg().to_string()))
-                                .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
+                            .body(
+                                Full::new(Bytes::from(e.msg().to_string()))
+                                    .map_err(|e| {
+                                        ServerError::new(
+                                            ServerErrorCode::BadRequest,
+                                            format!("{:?}", e),
+                                        )
+                                    })
+                                    .boxed(),
+                            )
+                            .unwrap();
                         return Ok(resp);
                     }
                 };
@@ -314,27 +391,92 @@ impl HttpServer for GatewayControlServer {
                 };
                 let data = serde_json::to_vec(&resp)
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
-                return Ok(http::Response::new(Full::new(Bytes::from(data)).map_err(|e| ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))).boxed()));
+                return Ok(http::Response::new(
+                    Full::new(Bytes::from(data))
+                        .map_err(|e| {
+                            ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))
+                        })
+                        .boxed(),
+                ));
+            }
+
+            if req.method == "get_system_info" {
+                if req.sys.is_empty() {
+                    let resp = http::Response::builder()
+                        .status(http::StatusCode::BAD_REQUEST)
+                        .body(Full::new(Bytes::from("invalid sys param"))
+                            .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
+                    return Ok(resp)
+                }
+                let seq = req.sys[0].clone();
+                if let Some(handler) = self.handler.upgrade() {
+                    let mut call_params = Map::new();
+                    if let Some(dst_addr) = info.dst_addr.as_ref() {
+                        if let Ok(socket_addr) = dst_addr.parse::<std::net::SocketAddr>() {
+                            call_params.insert(
+                                "dashboard_port".to_string(),
+                                Value::Number(Number::from(socket_addr.port())),
+                            );
+                        }
+                    }
+                    let result = handler
+                        .handle(req.method.as_str(), Value::Object(call_params))
+                        .await;
+                    let resp = match result {
+                        Ok(result) => CmdResp::<Value> {
+                            sys: vec![seq],
+                            result: Some(result),
+                            error: None,
+                        },
+                        Err(e) => CmdResp::<Value> {
+                            sys: vec![seq],
+                            result: None,
+                            error: Some(e.msg().to_string()),
+                        },
+                    };
+                    let data = serde_json::to_vec(&resp)
+                        .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                    return Ok(http::Response::new(Full::new(Bytes::from(data)).map_err(|e| ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))).boxed()));
+                } else {
+                    return Err(cmd_err!(ControlErrorCode::Failed, "{}", "cmd handler has released"));
+                }
             }
 
             if req.sys.len() != 2 {
                 let resp = http::Response::builder()
                     .status(http::StatusCode::UNAUTHORIZED)
-                    .body(Full::new(Bytes::new())
-                        .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
-                return Ok(resp)
+                    .body(
+                        Full::new(Bytes::new())
+                            .map_err(|e| {
+                                ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))
+                            })
+                            .boxed(),
+                    )
+                    .unwrap();
+                return Ok(resp);
             }
             let seq = req.sys[0].clone();
             let token = req.sys[1].clone();
-            let new_token = match self.token_verifier.verify_and_renew(token.as_str().unwrap_or("")).await {
-                Ok(token) => {
-                    token
-                },
+            let new_token = match self
+                .token_verifier
+                .verify_and_renew(token.as_str().unwrap_or(""))
+                .await
+            {
+                Ok(token) => token,
                 Err(e) => {
                     let resp = http::Response::builder()
                         .status(http::StatusCode::UNAUTHORIZED)
-                        .body(Full::new(Bytes::from(e.msg().to_string()))
-                            .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
+                        .body(
+                            Full::new(Bytes::from(e.msg().to_string()))
+                                .map_err(|e| {
+                                    ServerError::new(
+                                        ServerErrorCode::BadRequest,
+                                        format!("{:?}", e),
+                                    )
+                                })
+                                .boxed(),
+                        )
+                        .unwrap();
                     return Ok(resp);
                 }
             };
@@ -347,36 +489,47 @@ impl HttpServer for GatewayControlServer {
                     vec![seq]
                 };
                 let resp = match result {
-                    Ok(result) => {
-                        CmdResp::<Value> {
-                            sys,
-                            result: Some(result),
-                            error: None,
-                        }
-                    }
-                    Err(e) => {
-                        CmdResp::<Value> {
-                            sys,
-                            result: None,
-                            error: Some(e.msg().to_string()),
-                        }
-                    }
+                    Ok(result) => CmdResp::<Value> {
+                        sys,
+                        result: Some(result),
+                        error: None,
+                    },
+                    Err(e) => CmdResp::<Value> {
+                        sys,
+                        result: None,
+                        error: Some(e.msg().to_string()),
+                    },
                 };
                 let data = serde_json::to_vec(&resp)
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
-                Ok(http::Response::new(Full::new(Bytes::from(data)).map_err(|e| ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))).boxed()))
+                Ok(http::Response::new(
+                    Full::new(Bytes::from(data))
+                        .map_err(|e| {
+                            ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))
+                        })
+                        .boxed(),
+                ))
             } else {
-                Err(cmd_err!(ControlErrorCode::Failed, "{}", "cmd handler has released"))
+                Err(cmd_err!(
+                    ControlErrorCode::Failed,
+                    "{}",
+                    "cmd handler has released"
+                ))
             }
-        }.await;
+        }
+        .await;
 
         Ok(ret.unwrap_or_else(|e| {
             let msg = format!("{}", e);
             log::error!("control server err {}", msg);
             http::Response::builder()
                 .status(http::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::from(msg.as_bytes().to_vec()))
-                    .map_err(|e| ServerError::new(ServerErrorCode::IOError, format!("{:?}", e))).boxed()).unwrap()
+                .body(
+                    Full::new(Bytes::from(msg.as_bytes().to_vec()))
+                        .map_err(|e| ServerError::new(ServerErrorCode::IOError, format!("{:?}", e)))
+                        .boxed(),
+                )
+                .unwrap()
         }))
     }
 }

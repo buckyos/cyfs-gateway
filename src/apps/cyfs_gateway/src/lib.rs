@@ -19,7 +19,7 @@ pub use gateway::*;
 pub use gateway_control_client::*;
 pub use gateway_control_server::*;
 
-use clap::{Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
 use cyfs_dns::{InnerDnsRecordManager, LocalDnsFactory, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
@@ -28,6 +28,7 @@ use std::collections::HashSet;
 
 use anyhow::anyhow;
 use anyhow::Result;
+use buckyos_kit::init_logging;
 use buckyos_kit::{get_buckyos_log_dir, get_buckyos_service_data_dir, get_buckyos_system_etc_dir};
 use cyfs_sn::{SnServerFactory, SqliteDBFactory};
 use cyfs_socks::SocksServerFactory;
@@ -116,6 +117,7 @@ async fn run_gateway_with_config(
     config_file: Option<&Path>,
     params: GatewayParams,
 ) -> Result<()> {
+    let config_json = merge_keep_tunnel_into_rtcp_stack_config(config_json, &params.keep_tunnel);
     let parser = Arc::new(GatewayConfigParser::new());
     parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
     parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
@@ -166,7 +168,8 @@ async fn run_gateway_with_config(
                 .cleanup_interval_seconds
                 .max(1),
         );
-        let device_online_db_path = get_buckyos_service_data_dir("cyfs_gateway").join("device_online.db");
+        let device_online_db_path =
+            get_buckyos_service_data_dir("cyfs_gateway").join("device_online.db");
         let store = SqliteDeviceOnlineStore::new(device_online_db_path)
             .await
             .map_err(|e| anyhow::anyhow!("create sqlite device online store failed: {}", e))?;
@@ -248,6 +251,68 @@ async fn run_gateway_with_config(
     let _ = tokio::signal::ctrl_c().await;
 
     Ok(())
+}
+
+fn merge_keep_tunnel_into_rtcp_stack_config(
+    mut config_json: Value,
+    keep_tunnels: &[String],
+) -> Value {
+    if keep_tunnels.is_empty() {
+        return config_json;
+    }
+
+    let Some(stacks) = config_json.get_mut("stacks").and_then(Value::as_object_mut) else {
+        return config_json;
+    };
+
+    let mut found_rtcp_stack = false;
+    for (stack_id, stack_value) in stacks.iter_mut() {
+        let Some(stack_obj) = stack_value.as_object_mut() else {
+            continue;
+        };
+        let Some(protocol) = stack_obj.get("protocol").and_then(Value::as_str) else {
+            continue;
+        };
+        if !protocol.eq_ignore_ascii_case("rtcp") {
+            continue;
+        }
+
+        found_rtcp_stack = true;
+        let keep_tunnel_key = if stack_obj.contains_key("keep-tunnel") {
+            "keep-tunnel"
+        } else {
+            "keep_tunnel"
+        };
+        let keep_tunnel_value = stack_obj
+            .entry(keep_tunnel_key.to_string())
+            .or_insert_with(|| Value::Array(vec![]));
+        let Some(keep_tunnel_array) = keep_tunnel_value.as_array_mut() else {
+            warn!(
+                "skip merging keep_tunnel into rtcp stack {}: {} must be an array",
+                stack_id, keep_tunnel_key
+            );
+            continue;
+        };
+        for keep_tunnel in keep_tunnels {
+            let keep_tunnel = keep_tunnel.trim();
+            if keep_tunnel.is_empty() {
+                continue;
+            }
+            let keep_tunnel_value = Value::String(keep_tunnel.to_string());
+            if !keep_tunnel_array
+                .iter()
+                .any(|existing| existing == &keep_tunnel_value)
+            {
+                keep_tunnel_array.push(keep_tunnel_value);
+            }
+        }
+    }
+
+    if !found_rtcp_stack {
+        warn!("keep_tunnel specified but no rtcp stack found in config");
+    }
+
+    config_json
 }
 
 fn get_config_file_path(matches: &clap::ArgMatches) -> PathBuf {
@@ -455,7 +520,7 @@ fn load_local_tools() -> Vec<LocalToolCommand> {
         Ok(entries) => entries,
         Err(_) => {
             return tools;
-        },
+        }
     };
 
     for entry in entries.flatten() {
@@ -645,7 +710,9 @@ fn run_local_tool(tool: &LocalToolCommand, args: &[String]) -> Result<i32> {
                     .args(args)
                     .current_dir(&tool.tool_dir)
                     .status()
-                    .map_err(|e| anyhow!("run tool failed {}: {}", tool.script_path.display(), e))?;
+                    .map_err(|e| {
+                        anyhow!("run tool failed {}: {}", tool.script_path.display(), e)
+                    })?;
                 return Ok(status.code().unwrap_or(1));
             }
         }
@@ -1268,7 +1335,13 @@ pub async fn cyfs_gateway_main() {
             .arg(Arg::new("id")
                 .long("id")
                 .help("rule id to debug; if omitted, use id field from req_file")
-                .required(false)))
+                .required(false))
+            .arg(Arg::new("repeat")
+                .long("repeat")
+                .help("execute the same debug request multiple times in one process")
+                .required(false)
+                .value_parser(clap::value_parser!(usize))
+                .default_value("1")))
         .subcommand(Command::new("reload")
             .about("reload config")
             .arg(Arg::new("server")
@@ -1294,10 +1367,7 @@ pub async fn cyfs_gateway_main() {
         if subcommand_path.is_empty() {
             if let Some((candidate_cmd, cmd_index)) = infer_top_level_command_from_args(&raw_args) {
                 if !is_builtin_subcommand(&command, candidate_cmd.as_str()) {
-                    if let Some(tool) = local_tools
-                        .iter()
-                        .find(|tool| tool.name == candidate_cmd)
-                    {
+                    if let Some(tool) = local_tools.iter().find(|tool| tool.name == candidate_cmd) {
                         let tool_args = raw_args.get(cmd_index + 1..).unwrap_or(&[]).to_vec();
                         match run_local_tool(tool, &tool_args) {
                             Ok(code) => std::process::exit(code),
@@ -1384,10 +1454,7 @@ pub async fn cyfs_gateway_main() {
 
     if let Some((candidate_cmd, cmd_index)) = infer_top_level_command_from_args(&raw_args) {
         if !is_builtin_subcommand(&command, candidate_cmd.as_str()) {
-            if let Some(tool) = local_tools
-                .iter()
-                .find(|tool| tool.name == candidate_cmd)
-            {
+            if let Some(tool) = local_tools.iter().find(|tool| tool.name == candidate_cmd) {
                 let tool_args = raw_args.get(cmd_index + 1..).unwrap_or(&[]).to_vec();
                 match run_local_tool(tool, &tool_args) {
                     Ok(code) => std::process::exit(code),
@@ -1409,7 +1476,8 @@ pub async fn cyfs_gateway_main() {
                     sub_cmd.print_help().unwrap();
                     println!();
                 } else {
-                    let cyfs_cmd_client = GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                    let cyfs_cmd_client =
+                        GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
                     if let Ok(help) = cyfs_cmd_client.get_external_cmd_help(sub_name).await {
                         println!("{}", help);
                     } else {
@@ -2118,7 +2186,8 @@ pub async fn cyfs_gateway_main() {
                 .get_one::<String>("config_file")
                 .map(|s| s.as_str());
             let id = sub_matches.get_one::<String>("id").map(|s| s.as_str());
-            match run_debug_command(req_file.as_str(), config_file, id).await {
+            let repeat = *sub_matches.get_one::<usize>("repeat").unwrap_or(&1usize);
+            match run_debug_command(req_file.as_str(), config_file, id, repeat).await {
                 Ok(_) => {
                     std::process::exit(0);
                 }
@@ -2316,7 +2385,7 @@ pub async fn cyfs_gateway_main() {
     let log_dir = get_buckyos_log_dir("cyfs_gateway", true);
     std::fs::create_dir_all(&log_dir).unwrap();
 
-    //let log_level = env::var("BUCKY_LOG").unwrap_or("info".to_string());
+    // //let log_level = env::var("BUCKY_LOG").unwrap_or("info".to_string());
 
     sfo_log::Logger::new("cyfs_gateway")
         .set_log_level(log_params.level.unwrap_or("info".to_string()).as_str())
@@ -2335,7 +2404,7 @@ pub async fn cyfs_gateway_main() {
         .start()
         .unwrap();
     // init log
-    // init_logging("cyfs_gateway",true);
+    //init_logging("cyfs_gateway", true);
     info!("cyfs_gateway start...");
 
     if matches.get_flag("debug") {
@@ -2359,5 +2428,61 @@ pub async fn cyfs_gateway_main() {
 
     if let Err(e) = gateway_service_main(config_file.as_path(), params).await {
         error!("Gateway run error: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_keep_tunnel_into_rtcp_stack_config;
+    use serde_json::json;
+
+    #[test]
+    fn test_merge_keep_tunnel_into_rtcp_stack_config() {
+        let config = json!({
+            "stacks": {
+                "rtcp1": {
+                    "protocol": "rtcp",
+                    "keep_tunnel": ["did:old", "did:dup"]
+                },
+                "tcp1": {
+                    "protocol": "tcp"
+                }
+            }
+        });
+
+        let merged = merge_keep_tunnel_into_rtcp_stack_config(
+            config,
+            &[
+                "did:dup".to_string(),
+                "did:new".to_string(),
+                " ".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            merged["stacks"]["rtcp1"]["keep_tunnel"],
+            json!(["did:old", "did:dup", "did:new"])
+        );
+        assert!(merged["stacks"]["tcp1"].get("keep_tunnel").is_none());
+    }
+
+    #[test]
+    fn test_merge_keep_tunnel_preserves_hyphenated_key() {
+        let config = json!({
+            "stacks": {
+                "rtcp1": {
+                    "protocol": "rtcp",
+                    "keep-tunnel": ["did:old"]
+                }
+            }
+        });
+
+        let merged = merge_keep_tunnel_into_rtcp_stack_config(config, &["did:new".to_string()]);
+
+        assert_eq!(
+            merged["stacks"]["rtcp1"]["keep-tunnel"],
+            json!(["did:old", "did:new"])
+        );
+        assert!(merged["stacks"]["rtcp1"].get("keep_tunnel").is_none());
     }
 }

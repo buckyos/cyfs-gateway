@@ -1,7 +1,8 @@
 use super::coll::*;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use indexmap::{IndexMap, IndexSet};
+use std::collections::HashSet as StdHashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::RwLock as AsyncRwLock;
 
 pub struct TraverseGuard<'a> {
@@ -187,7 +188,7 @@ impl ListCollection for MemoryListCollection {
             return Ok(true);
         }
 
-        let mut remaining: HashSet<&str> = values.iter().map(|v| v.as_str()).collect();
+        let mut remaining: StdHashSet<&str> = values.iter().map(|v| v.as_str()).collect();
 
         let data = self.data.read().await;
         for value in data.iter() {
@@ -204,14 +205,14 @@ impl ListCollection for MemoryListCollection {
 }
 
 pub struct MemorySetCollection {
-    data: AsyncRwLock<HashSet<String>>,
+    data: AsyncRwLock<OrderedStringSet>,
     transverse_counter: AtomicU32, // Indicates if a traversal is currently happening
 }
 
 impl MemorySetCollection {
     pub fn new() -> Self {
         Self {
-            data: AsyncRwLock::new(HashSet::new()),
+            data: AsyncRwLock::new(IndexSet::new()),
             transverse_counter: AtomicU32::new(0),
         }
     }
@@ -220,14 +221,14 @@ impl MemorySetCollection {
         Arc::new(Box::new(Self::new()) as Box<dyn SetCollection>)
     }
 
-    pub(crate) fn from_set(set: HashSet<String>) -> Self {
+    pub(crate) fn from_set(set: OrderedStringSet) -> Self {
         Self {
             data: AsyncRwLock::new(set),
             transverse_counter: AtomicU32::new(0),
         }
     }
 
-    pub(crate) fn data(&self) -> &AsyncRwLock<HashSet<String>> {
+    pub(crate) fn data(&self) -> &AsyncRwLock<OrderedStringSet> {
         &self.data
     }
 
@@ -244,6 +245,12 @@ impl SetCollection for MemorySetCollection {
     }
 
     async fn insert(&self, value: &str) -> Result<bool, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot insert key '{}' during traversal", value);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
         let mut data = self.data.write().await;
         Ok(data.insert(value.to_string()))
     }
@@ -261,7 +268,7 @@ impl SetCollection for MemorySetCollection {
         }
 
         let mut data = self.data.write().await;
-        Ok(data.remove(key))
+        Ok(data.shift_remove(key))
     }
 
     async fn get_all(&self) -> Result<Vec<String>, String> {
@@ -283,16 +290,17 @@ impl SetCollection for MemorySetCollection {
     }
 }
 
+#[derive(Clone)]
 pub struct MemoryMapCollection {
-    data: AsyncRwLock<HashMap<String, CollectionValue>>,
-    transverse_counter: AtomicU32, // Indicates if a traversal is currently happening
+    data: Arc<AsyncRwLock<OrderedStringMap<CollectionValue>>>,
+    transverse_counter: Arc<AtomicU32>, // Indicates if a traversal is currently happening
 }
 
 impl MemoryMapCollection {
     pub fn new() -> Self {
         Self {
-            data: AsyncRwLock::new(HashMap::new()),
-            transverse_counter: AtomicU32::new(0),
+            data: Arc::new(AsyncRwLock::new(IndexMap::new())),
+            transverse_counter: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -300,19 +308,40 @@ impl MemoryMapCollection {
         Arc::new(Box::new(Self::new()) as Box<dyn MapCollection>)
     }
 
-    pub(crate) fn from_map(map: HashMap<String, CollectionValue>) -> Self {
+    pub(crate) fn from_map(map: OrderedStringMap<CollectionValue>) -> Self {
         Self {
-            data: AsyncRwLock::new(map),
-            transverse_counter: AtomicU32::new(0),
+            data: Arc::new(AsyncRwLock::new(map)),
+            transverse_counter: Arc::new(AtomicU32::new(0)),
         }
     }
 
-    pub(crate) fn data(&self) -> &AsyncRwLock<HashMap<String, CollectionValue>> {
+    pub(crate) fn data(&self) -> &AsyncRwLock<OrderedStringMap<CollectionValue>> {
         &self.data
     }
 
     pub fn is_during_traversal(&self) -> bool {
         self.transverse_counter.load(Ordering::SeqCst) > 0
+    }
+}
+
+struct MemoryMapCollectionCursor {
+    map: MemoryMapCollection,
+    keys: std::vec::IntoIter<String>,
+}
+
+#[async_trait::async_trait]
+impl MapCollectionCursor for MemoryMapCollectionCursor {
+    async fn next(&mut self) -> Result<Option<(String, TypedValue)>, String> {
+        let Some(key) = self.keys.next() else {
+            return Ok(None);
+        };
+
+        let value = {
+            let data = self.map.data.read().await;
+            data.get(&key).cloned().unwrap_or(TypedValue::Null)
+        };
+
+        Ok(Some((key, value)))
     }
 }
 
@@ -332,12 +361,12 @@ impl MapCollection for MemoryMapCollection {
 
         let mut data = self.data.write().await;
         match data.entry(key.to_string()) {
-            std::collections::hash_map::Entry::Occupied(_) => {
+            indexmap::map::Entry::Occupied(_) => {
                 let msg = format!("Key '{}' already exists in the collection", key);
                 warn!("{}", msg);
                 Ok(false)
             }
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            indexmap::map::Entry::Vacant(entry) => {
                 entry.insert(value);
                 Ok(true)
             }
@@ -359,7 +388,7 @@ impl MapCollection for MemoryMapCollection {
         {
             let mut data = self.data.write().await;
             match data.entry(key.to_string()) {
-                std::collections::hash_map::Entry::Occupied(mut entry) => match entry.get() {
+                indexmap::map::Entry::Occupied(mut entry) => match entry.get() {
                     CollectionValue::Visitor(v) => {
                         visitor = Some(v.clone());
                     }
@@ -368,7 +397,7 @@ impl MapCollection for MemoryMapCollection {
                         return Ok(Some(prev));
                     }
                 },
-                std::collections::hash_map::Entry::Vacant(entry) => {
+                indexmap::map::Entry::Vacant(entry) => {
                     entry.insert(value);
                     return Ok(None);
                 }
@@ -417,8 +446,14 @@ impl MapCollection for MemoryMapCollection {
     }
 
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        if self.is_during_traversal() {
+            let msg = format!("Cannot remove key '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
         let mut data = self.data.write().await;
-        Ok(data.remove(key))
+        Ok(data.shift_remove(key))
     }
 
     async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String> {
@@ -432,6 +467,33 @@ impl MapCollection for MemoryMapCollection {
         }
 
         Ok(())
+    }
+
+    async fn cursor_owned(&self) -> Result<Box<dyn MapCollectionCursor>, String> {
+        let keys = self.keys_snapshot().await?;
+        Ok(Box::new(MemoryMapCollectionCursor {
+            map: self.clone(),
+            keys: keys.into_iter(),
+        }))
+    }
+
+    async fn traverse_owned(
+        &self,
+        callback: MapCollectionTraverseOwnedCallBackRef,
+    ) -> Result<(), String> {
+        let _guard = TraverseGuard::new(&self.transverse_counter);
+        let data = self.data.read().await;
+        for (key, value) in data.iter() {
+            if callback.call(key.clone(), value.clone()).await? == TraverseControl::Break {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn keys_snapshot(&self) -> Result<Vec<String>, String> {
+        let data = self.data.read().await;
+        Ok(data.keys().cloned().collect())
     }
 
     async fn flush(&self) -> Result<(), String> {
@@ -500,32 +562,54 @@ impl MapCollection for MemoryMapCollection {
     }
 }
 
+#[derive(Clone)]
 pub struct MemoryMultiMapCollection {
-    data: AsyncRwLock<HashMap<String, HashSet<String>>>,
-    transverse_counter: AtomicU32, // Indicates if a traversal is currently happening
+    data: Arc<AsyncRwLock<OrderedStringMap<OrderedStringSet>>>,
+    transverse_counter: Arc<AtomicU32>, // Indicates if a traversal is currently happening
 }
 
 impl MemoryMultiMapCollection {
     pub fn new() -> Self {
         Self {
-            data: AsyncRwLock::new(HashMap::new()),
-            transverse_counter: AtomicU32::new(0),
+            data: Arc::new(AsyncRwLock::new(IndexMap::new())),
+            transverse_counter: Arc::new(AtomicU32::new(0)),
         }
     }
 
-    pub(crate) fn from_map(map: HashMap<String, HashSet<String>>) -> Self {
+    pub(crate) fn from_map(map: OrderedStringMap<OrderedStringSet>) -> Self {
         Self {
-            data: AsyncRwLock::new(map),
-            transverse_counter: AtomicU32::new(0),
+            data: Arc::new(AsyncRwLock::new(map)),
+            transverse_counter: Arc::new(AtomicU32::new(0)),
         }
     }
 
-    pub(crate) fn data(&self) -> &AsyncRwLock<HashMap<String, HashSet<String>>> {
+    pub(crate) fn data(&self) -> &AsyncRwLock<OrderedStringMap<OrderedStringSet>> {
         &self.data
     }
 
     pub fn is_during_traversal(&self) -> bool {
         self.transverse_counter.load(Ordering::SeqCst) > 0
+    }
+}
+
+struct MemoryMultiMapCollectionCursor {
+    map: MemoryMultiMapCollection,
+    keys: std::vec::IntoIter<String>,
+}
+
+#[async_trait::async_trait]
+impl MultiMapCollectionCursor for MemoryMultiMapCollectionCursor {
+    async fn next(&mut self) -> Result<Option<(String, OrderedStringSet)>, String> {
+        let Some(key) = self.keys.next() else {
+            return Ok(None);
+        };
+
+        let values = {
+            let data = self.map.data.read().await;
+            data.get(&key).cloned().unwrap_or_default()
+        };
+
+        Ok(Some((key, values)))
     }
 }
 
@@ -544,7 +628,7 @@ impl MultiMapCollection for MemoryMultiMapCollection {
         }
 
         let mut data = self.data.write().await;
-        let entry = data.entry(key.to_string()).or_insert_with(HashSet::new);
+        let entry = data.entry(key.to_string()).or_insert_with(IndexSet::new);
         Ok(entry.insert(value.to_string()))
     }
 
@@ -556,7 +640,7 @@ impl MultiMapCollection for MemoryMultiMapCollection {
         }
 
         let mut data = self.data.write().await;
-        let entry = data.entry(key.to_string()).or_insert_with(HashSet::new);
+        let entry = data.entry(key.to_string()).or_insert_with(IndexSet::new);
         let initial_len = entry.len();
         for value in values {
             entry.insert(value.to_string());
@@ -620,10 +704,10 @@ impl MultiMapCollection for MemoryMultiMapCollection {
 
         let mut data = self.data.write().await;
         if let Some(set) = data.get_mut(key) {
-            let ret = set.remove(value);
+            let ret = set.shift_remove(value);
 
             if set.is_empty() {
-                data.remove(key);
+                data.shift_remove(key);
             }
 
             return Ok(ret);
@@ -645,15 +729,15 @@ impl MultiMapCollection for MemoryMultiMapCollection {
 
         let mut data = self.data.write().await;
         if let Some(set) = data.get_mut(key) {
-            let mut removed_set = HashSet::new();
+            let mut removed_set = IndexSet::new();
             for value in values {
-                if set.remove(*value) {
+                if set.shift_remove(*value) {
                     removed_set.insert(value.to_string());
                 }
             }
 
             if set.is_empty() {
-                data.remove(key);
+                data.shift_remove(key);
             }
 
             let coll = MemorySetCollection::from_set(removed_set);
@@ -672,7 +756,7 @@ impl MultiMapCollection for MemoryMultiMapCollection {
         }
 
         let mut data = self.data.write().await;
-        if let Some(set) = data.remove(key) {
+        if let Some(set) = data.shift_remove(key) {
             let coll = MemorySetCollection::from_set(set);
             let coll = Arc::new(Box::new(coll) as Box<dyn SetCollection>);
             Ok(Some(coll))
@@ -688,10 +772,10 @@ impl MultiMapCollection for MemoryMultiMapCollection {
         let _guard = TraverseGuard::new(&self.transverse_counter);
 
         let data = self.data.read().await;
-        for (key, set) in data.iter() {
+        'outer: for (key, set) in data.iter() {
             for value in set.iter() {
                 if !callback.call(key, value.as_str()).await? {
-                    break;
+                    break 'outer;
                 }
             }
         }
@@ -699,7 +783,50 @@ impl MultiMapCollection for MemoryMultiMapCollection {
         Ok(())
     }
 
-    async fn dump(&self) -> Result<Vec<(String, HashSet<String>)>, String> {
+    async fn traverse_keys(
+        &self,
+        callback: MultiMapCollectionKeyTraverseCallBackRef,
+    ) -> Result<(), String> {
+        let _guard = TraverseGuard::new(&self.transverse_counter);
+
+        let data = self.data.read().await;
+        for key in data.keys() {
+            if !callback.call(key.as_str()).await? {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cursor_owned(&self) -> Result<Box<dyn MultiMapCollectionCursor>, String> {
+        let keys = self.keys_snapshot().await?;
+        Ok(Box::new(MemoryMultiMapCollectionCursor {
+            map: self.clone(),
+            keys: keys.into_iter(),
+        }))
+    }
+
+    async fn traverse_owned(
+        &self,
+        callback: MultiMapCollectionTraverseOwnedCallBackRef,
+    ) -> Result<(), String> {
+        let _guard = TraverseGuard::new(&self.transverse_counter);
+        let data = self.data.read().await;
+        for (key, values) in data.iter() {
+            if callback.call(key.clone(), values.clone()).await? == TraverseControl::Break {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn keys_snapshot(&self) -> Result<Vec<String>, String> {
+        let data = self.data.read().await;
+        Ok(data.keys().cloned().collect())
+    }
+
+    async fn dump(&self) -> Result<Vec<(String, OrderedStringSet)>, String> {
         let data = self.data.read().await;
         Ok(data
             .iter()
@@ -711,6 +838,8 @@ impl MultiMapCollection for MemoryMultiMapCollection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn test_memory_list_collection_basic_ops() {
@@ -772,17 +901,253 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(list
-            .contains_all_strings(&["a".to_string(), "c".to_string()])
+        assert!(
+            list.contains_all_strings(&["a".to_string(), "c".to_string()])
+                .await
+                .unwrap()
+        );
+        assert!(
+            !list
+                .contains_all_strings(&["a".to_string(), "x".to_string()])
+                .await
+                .unwrap()
+        );
+        assert!(
+            list.contains_all_strings(&["a".to_string(), "a".to_string()])
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_set_preserves_insertion_order() {
+        let set = MemorySetCollection::new();
+        assert!(set.insert("b").await.unwrap());
+        assert!(set.insert("a").await.unwrap());
+        assert!(set.insert("c").await.unwrap());
+        assert!(!set.insert("a").await.unwrap());
+
+        assert_eq!(
+            set.get_all().await.unwrap(),
+            vec!["b".to_string(), "a".to_string(), "c".to_string()]
+        );
+
+        assert!(set.remove("a").await.unwrap());
+        assert!(set.insert("d").await.unwrap());
+        assert_eq!(
+            set.get_all().await.unwrap(),
+            vec!["b".to_string(), "c".to_string(), "d".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_map_preserves_insertion_order() {
+        let map = MemoryMapCollection::new();
+        map.insert("k2", CollectionValue::String("v2".to_string()))
             .await
-            .unwrap());
-        assert!(!list
-            .contains_all_strings(&["a".to_string(), "x".to_string()])
+            .unwrap();
+        map.insert("k1", CollectionValue::String("v1".to_string()))
             .await
-            .unwrap());
-        assert!(list
-            .contains_all_strings(&["a".to_string(), "a".to_string()])
+            .unwrap();
+        map.insert("k3", CollectionValue::String("v3".to_string()))
             .await
-            .unwrap());
+            .unwrap();
+
+        assert_eq!(
+            map.keys_snapshot().await.unwrap(),
+            vec!["k2".to_string(), "k1".to_string(), "k3".to_string()]
+        );
+
+        map.insert("k1", CollectionValue::String("v1b".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            map.keys_snapshot().await.unwrap(),
+            vec!["k2".to_string(), "k1".to_string(), "k3".to_string()]
+        );
+
+        map.remove("k2").await.unwrap();
+        map.insert("k4", CollectionValue::String("v4".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            map.keys_snapshot().await.unwrap(),
+            vec!["k1".to_string(), "k3".to_string(), "k4".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_multimap_preserves_key_and_value_order() {
+        let mm = MemoryMultiMapCollection::new();
+        assert!(mm.insert("svc2", "b").await.unwrap());
+        assert!(mm.insert("svc2", "a").await.unwrap());
+        assert!(mm.insert("svc1", "x").await.unwrap());
+        assert!(mm.insert("svc2", "c").await.unwrap());
+        assert!(!mm.insert("svc2", "a").await.unwrap());
+
+        assert_eq!(
+            mm.keys_snapshot().await.unwrap(),
+            vec!["svc2".to_string(), "svc1".to_string()]
+        );
+        assert_eq!(mm.get("svc2").await.unwrap(), Some("b".to_string()));
+
+        let values = mm.get_many("svc2").await.unwrap().unwrap();
+        assert_eq!(
+            values.get_all().await.unwrap(),
+            vec!["b".to_string(), "a".to_string(), "c".to_string()]
+        );
+
+        assert!(mm.remove("svc2", "a").await.unwrap());
+        let values = mm.get_many("svc2").await.unwrap().unwrap();
+        assert_eq!(
+            values.get_all().await.unwrap(),
+            vec!["b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_multimap_traverse_stops_globally_on_false() {
+        struct StopAfterFirstCall {
+            count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl MultiMapCollectionTraverseCallBack for StopAfterFirstCall {
+            async fn call(&self, _key: &str, _value: &str) -> Result<bool, String> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            }
+        }
+
+        let mm = MemoryMultiMapCollection::new();
+        mm.insert_many("k1", &["a", "b"]).await.unwrap();
+        mm.insert_many("k2", &["c"]).await.unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let callback = Arc::new(Box::new(StopAfterFirstCall {
+            count: count.clone(),
+        }) as Box<dyn MultiMapCollectionTraverseCallBack>);
+
+        mm.traverse(callback).await.unwrap();
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "traverse should stop entirely after callback returns false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_map_remove_during_traversal_returns_error() {
+        struct RemoveDuringTraverse {
+            map: Arc<MemoryMapCollection>,
+            got_err: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl MapCollectionTraverseCallBack for RemoveDuringTraverse {
+            async fn call(&self, key: &str, _value: &CollectionValue) -> Result<bool, String> {
+                match self.map.remove(key).await {
+                    Ok(_) => Err("remove should fail during traversal".to_string()),
+                    Err(_) => {
+                        self.got_err.store(true, Ordering::SeqCst);
+                        Ok(false)
+                    }
+                }
+            }
+        }
+
+        let map = Arc::new(MemoryMapCollection::new());
+        map.insert("k1", CollectionValue::String("v1".to_string()))
+            .await
+            .unwrap();
+
+        let got_err = Arc::new(AtomicBool::new(false));
+        let callback = Arc::new(Box::new(RemoveDuringTraverse {
+            map: map.clone(),
+            got_err: got_err.clone(),
+        }) as Box<dyn MapCollectionTraverseCallBack>);
+
+        let ret = tokio::time::timeout(Duration::from_secs(2), map.traverse(callback)).await;
+        assert!(ret.is_ok(), "traverse should not deadlock");
+        ret.unwrap().unwrap();
+        assert!(
+            got_err.load(Ordering::SeqCst),
+            "callback should observe remove error during traversal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_map_traverse_owned_breaks() {
+        struct BreakOnFirst {
+            count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl MapCollectionTraverseOwnedCallBack for BreakOnFirst {
+            async fn call(
+                &self,
+                _key: String,
+                _value: CollectionValue,
+            ) -> Result<TraverseControl, String> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(TraverseControl::Break)
+            }
+        }
+
+        let map = MemoryMapCollection::new();
+        map.insert("k1", CollectionValue::String("v1".to_owned()))
+            .await
+            .unwrap();
+        map.insert("k2", CollectionValue::String("v2".to_owned()))
+            .await
+            .unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let callback = Arc::new(Box::new(BreakOnFirst {
+            count: count.clone(),
+        }) as Box<dyn MapCollectionTraverseOwnedCallBack>);
+
+        map.traverse_owned(callback).await.unwrap();
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "traverse_owned should stop at first Break"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_memory_multimap_traverse_owned_breaks() {
+        struct BreakOnFirst {
+            count: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl MultiMapCollectionTraverseOwnedCallBack for BreakOnFirst {
+            async fn call(
+                &self,
+                _key: String,
+                _values: OrderedStringSet,
+            ) -> Result<TraverseControl, String> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(TraverseControl::Break)
+            }
+        }
+
+        let mm = MemoryMultiMapCollection::new();
+        mm.insert_many("k1", &["a", "b"]).await.unwrap();
+        mm.insert_many("k2", &["c"]).await.unwrap();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let callback = Arc::new(Box::new(BreakOnFirst {
+            count: count.clone(),
+        })
+            as Box<dyn MultiMapCollectionTraverseOwnedCallBack>);
+
+        mm.traverse_owned(callback).await.unwrap();
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "traverse_owned should stop at first Break"
+        );
     }
 }

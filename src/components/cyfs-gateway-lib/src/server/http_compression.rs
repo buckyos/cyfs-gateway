@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::io;
 
+use async_compression::Level;
 use async_compression::tokio::bufread::{
     BrotliDecoder, BrotliEncoder, DeflateDecoder, DeflateEncoder, GzipDecoder, GzipEncoder,
 };
-use async_compression::Level;
 use futures_util::TryStreamExt;
-use http::{header, HeaderMap, HeaderValue, Method, StatusCode, Version};
+use http::{HeaderMap, HeaderValue, Method, StatusCode, Version, header};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Bytes, Frame};
@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, BufReader, ReadBuf};
 use tokio_util::io::{ReaderStream, StreamReader};
 
-use super::{server_err, ServerError, ServerErrorCode, ServerResult};
+use super::{ServerError, ServerErrorCode, ServerResult, server_err};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Encoding {
@@ -104,7 +104,7 @@ impl<R: AsyncRead + Unpin + Send> AsyncRead for SyncRead<R> {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::Other,
                     "Reader mutex poisoned",
-                )))
+                )));
             }
         };
         Pin::new(&mut *guard).poll_read(cx, buf)
@@ -167,7 +167,7 @@ pub fn apply_request_decompression(
                     ServerErrorCode::BadRequest,
                     "Unsupported Content-Encoding: {}",
                     encoding
-                ))
+                ));
             }
         }
     }

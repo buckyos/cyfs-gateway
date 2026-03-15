@@ -1,25 +1,25 @@
-mod http_server;
-mod http_compression;
-mod dns_server;
-mod socks5_server;
-mod server;
-mod qa_server;
-mod dir_server;
-mod ndn_server;
 mod acme_http_challenge_server;
+mod dir_server;
+mod dns_server;
+mod http_compression;
+mod http_server;
+mod ndn_server;
+mod qa_server;
+mod server;
+mod socks5_server;
 mod welcome_server;
 
 use std::path::Path;
 use std::path::PathBuf;
 
-pub use http_server::*;
-pub use socks5_server::*;
-pub use server::*;
-pub use qa_server::*;
-pub use dns_server::*;
-pub use dir_server::*;
-pub use ndn_server::*;
 pub use acme_http_challenge_server::*;
+pub use dir_server::*;
+pub use dns_server::*;
+pub use http_server::*;
+pub use ndn_server::*;
+pub use qa_server::*;
+pub use server::*;
+pub use socks5_server::*;
 pub use welcome_server::*;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -43,7 +43,7 @@ pub enum ServerErrorCode {
     InvalidDnsMessageType,
     InvalidDnsRecordType,
     Rejected,
-    AlreadyExists
+    AlreadyExists,
 }
 pub type ServerResult<T> = sfo_result::Result<T, ServerErrorCode>;
 pub type ServerError = sfo_result::Error<ServerErrorCode>;
@@ -55,7 +55,7 @@ pub fn get_gateway_main_config_dir() -> PathBuf {
     let config_path_str = std::env::var("CYFS_GATEWAY_CONFIG_PATH");
     if config_path_str.is_ok() {
         return PathBuf::from(config_path_str.unwrap());
-    } else  {
+    } else {
         return buckyos_kit::get_buckyos_system_etc_dir();
     }
 }
@@ -89,7 +89,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 //will move to buckyos_kit
-pub fn normalize_config_file_path(path: PathBuf,base_dir:&Path) -> PathBuf {
+pub fn normalize_config_file_path(path: PathBuf, base_dir: &Path) -> PathBuf {
     if path.is_relative() {
         let result_path = base_dir.join(path.clone());
         let ret = normalize_path(result_path.as_path());
@@ -98,30 +98,47 @@ pub fn normalize_config_file_path(path: PathBuf,base_dir:&Path) -> PathBuf {
     path
 }
 
+fn normalize_config_path_value(value_str: &str, base_dir: &Path) -> String {
+    let (path_str, fragment) = if let Some((path_str, fragment)) = value_str.split_once('#') {
+        (path_str, Some(fragment))
+    } else {
+        (value_str, None)
+    };
+
+    let value_path = normalize_config_file_path(PathBuf::from(path_str), base_dir);
+    let value_path = value_path.to_string_lossy().to_string();
+    if let Some(fragment) = fragment {
+        format!("{}#{}", value_path, fragment)
+    } else {
+        value_path
+    }
+}
+
 //will move to buckyos_kit
-pub fn normalize_all_path_value_config(config:&mut serde_json::Value,base_dir:&Path)  {
+pub fn normalize_all_path_value_config(config: &mut serde_json::Value, base_dir: &Path) {
     if config.is_object() {
         for (key, value) in config.as_object_mut().unwrap() {
             if value.is_string() {
                 if key.ends_with("_path") || key == "path" {
                     let value_str = value.as_str().unwrap();
-                    let value_path = normalize_config_file_path(PathBuf::from(value_str),base_dir);
-                    info!("normalize_all_path_value_config: key: {}, value: {} -> {}", key, value_str, value_path.to_string_lossy());
-                    *value = serde_json::Value::String(value_path.to_string_lossy().to_string());
+                    let value_path = normalize_config_path_value(value_str, base_dir);
+                    info!(
+                        "normalize_all_path_value_config: key: {}, value: {} -> {}",
+                        key, value_str, value_path
+                    );
+                    *value = serde_json::Value::String(value_path);
                 }
             } else {
-                normalize_all_path_value_config(value,base_dir);
+                normalize_all_path_value_config(value, base_dir);
             }
-
         }
     }
 
     if config.is_array() {
         for value in config.as_array_mut().unwrap() {
-            normalize_all_path_value_config(value,base_dir);
+            normalize_all_path_value_config(value, base_dir);
         }
     }
-
 }
 
 // normalize_all_path_value_config test case
@@ -194,7 +211,11 @@ mod test {
         let normalized = normalize_path(path);
         // The result should still contain a, b, c but may have a leading ..
         let normalized_str = normalized.to_string_lossy().to_string();
-        assert!(normalized_str.contains("a") && normalized_str.contains("b") && normalized_str.contains("c"));
+        assert!(
+            normalized_str.contains("a")
+                && normalized_str.contains("b")
+                && normalized_str.contains("c")
+        );
 
         // Test complex path with multiple parent directories
         let path = Path::new("a/b/c/d/../../../e/f/g/../../h");
@@ -224,13 +245,14 @@ mod test {
 
     #[test]
     fn test_normalize_all_path_value_config() {
+        use super::normalize_config_path_value;
+        use crate::normalize_all_path_value_config;
         use buckyos_kit::init_logging;
         use std::path::PathBuf;
-        use crate::normalize_all_path_value_config;
         unsafe {
             std::env::set_var("BUCKY_LOG", "debug");
         }
-        init_logging("test_normalize_all_path_value_config",false);
+        init_logging("test_normalize_all_path_value_config", false);
         let config_str = r#"
         {
             "servers":[
@@ -250,8 +272,40 @@ mod test {
         "#;
         let mut config: serde_json::Value = serde_json::from_str(config_str).unwrap();
         let base_dir = PathBuf::from("/opt/buckyos/etc");
-        normalize_all_path_value_config(&mut config,&base_dir);
-        assert_eq!(config.get("path").unwrap().as_str().unwrap().replace("\\","/"), "/opt/buckyos/etc/cyfs_gateway.yaml");
-        assert_eq!(config.get("servers").unwrap().as_array().unwrap().get(0).unwrap().as_object().unwrap().get("tls").unwrap().as_object().unwrap().get("cert_path").unwrap().as_str().unwrap().replace("\\","/"), "/opt/buckyos/etc/cyfs_gateway.yaml");
+        normalize_all_path_value_config(&mut config, &base_dir);
+        assert_eq!(
+            config
+                .get("path")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .replace("\\", "/"),
+            "/opt/buckyos/etc/cyfs_gateway.yaml"
+        );
+        assert_eq!(
+            normalize_config_path_value("./all_info.json#app_info", &base_dir).replace("\\", "/"),
+            "/opt/buckyos/etc/all_info.json#app_info"
+        );
+        assert_eq!(
+            config
+                .get("servers")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .get("tls")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .get("cert_path")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .replace("\\", "/"),
+            "/opt/buckyos/etc/cyfs_gateway.yaml"
+        );
     }
 }

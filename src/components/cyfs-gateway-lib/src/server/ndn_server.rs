@@ -1,16 +1,19 @@
-use std::io::SeekFrom;
-use std::sync::Arc;
-use http::{Version, StatusCode};
-use http_body_util::combinators::{BoxBody};
+use super::server_err;
+use crate::{
+    HttpServer, NamedDataMgrRouteConfig, Server, ServerConfig, ServerContextRef, ServerError,
+    ServerErrorCode, ServerFactory, ServerResult, StreamInfo,
+};
+use buckyos_kit::get_by_json_path;
+use futures_util::TryStreamExt;
+use http::{StatusCode, Version};
+use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
+use ndn_lib::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use futures_util::TryStreamExt;
-use buckyos_kit::get_by_json_path;
-use ndn_lib::*;
-use crate::{HttpServer, Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo, NamedDataMgrRouteConfig};
-use super::server_err;
+use std::io::SeekFrom;
+use std::sync::Arc;
 
 /// Wrapper for ChunkReader to make it Sync
 struct SyncChunkReader {
@@ -45,9 +48,9 @@ impl tokio::io::AsyncRead for SyncChunkReader {
 
 /// Loaded object body types
 enum LoadedObjBody {
-    NamedObj(Value),                  // JSON value, embedded obj_string
-    Reader(SyncChunkReader, u64),     // reader, chunk_size, embedded obj_string
-    TextRecord(String),               // text_record, verify_obj path
+    NamedObj(Value),              // JSON value, embedded obj_string
+    Reader(SyncChunkReader, u64), // reader, chunk_size, embedded obj_string
+    TextRecord(String),           // text_record, verify_obj path
 }
 
 /// Loaded object with metadata
@@ -113,7 +116,11 @@ async fn load_obj(
                 warn!("get chunk reader by objid failed: {}", e);
                 match e {
                     NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
-                    _ => server_err!(ServerErrorCode::IOError, "get chunk reader by objid failed: {}", e),
+                    _ => server_err!(
+                        ServerErrorCode::IOError,
+                        "get chunk reader by objid failed: {}",
+                        e
+                    ),
                 }
             })?;
 
@@ -141,7 +148,11 @@ async fn load_obj(
             warn!("get chunk list reader by objid failed: {}", e);
             match e {
                 NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
-                _ => server_err!(ServerErrorCode::IOError, "get chunk list reader by objid failed: {}", e),
+                _ => server_err!(
+                    ServerErrorCode::IOError,
+                    "get chunk list reader by objid failed: {}",
+                    e
+                ),
             }
         })?;
 
@@ -161,7 +172,11 @@ async fn load_obj(
             warn!("get object by objid failed: {}", e);
             match e {
                 NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
-                _ => server_err!(ServerErrorCode::IOError, "get object by objid failed: {}", e),
+                _ => server_err!(
+                    ServerErrorCode::IOError,
+                    "get object by objid failed: {}",
+                    e
+                ),
             }
         })?;
         debug!("ndn server -> obj {}", obj_body.to_string());
@@ -209,11 +224,15 @@ async fn build_response_by_obj_get_result(
                 .status(StatusCode::OK);
             body_result = result
                 .body(
-                    Full::new(Bytes::from(
-                        serde_json::to_string(&json_value).map_err(|e| {
-                            server_err!(ServerErrorCode::EncodeError, "Failed to convert json value to string: {}", e)
-                        })?,
-                    ))
+                    Full::new(Bytes::from(serde_json::to_string(&json_value).map_err(
+                        |e| {
+                            server_err!(
+                                ServerErrorCode::EncodeError,
+                                "Failed to convert json value to string: {}",
+                                e
+                            )
+                        },
+                    )?))
                     .map_err(|never| match never {})
                     .boxed(),
                 )
@@ -254,7 +273,10 @@ async fn build_response_by_obj_get_result(
             body_result = result
                 .body(
                     BodyExt::map_err(stream_body, |e| {
-                        ServerError::new(ServerErrorCode::StreamError, format!("Stream error: {}", e))
+                        ServerError::new(
+                            ServerErrorCode::StreamError,
+                            format!("Stream error: {}", e),
+                        )
                     })
                     .boxed(),
                 )
@@ -280,30 +302,36 @@ async fn build_response_by_obj_get_result(
 fn parse_range(range_str: &str, max_size: u64) -> ServerResult<(u64, u64)> {
     let range_str = range_str.trim();
     if !range_str.starts_with("bytes=") {
-        return Err(server_err!(ServerErrorCode::BadRequest, "Invalid range header"));
+        return Err(server_err!(
+            ServerErrorCode::BadRequest,
+            "Invalid range header"
+        ));
     }
 
     let range_str = &range_str[6..];
     let parts: Vec<&str> = range_str.split('-').collect();
 
     if parts.len() != 2 {
-        return Err(server_err!(ServerErrorCode::BadRequest, "Invalid range format"));
+        return Err(server_err!(
+            ServerErrorCode::BadRequest,
+            "Invalid range format"
+        ));
     }
 
     let start = if parts[0].is_empty() {
         0
     } else {
-        parts[0].parse::<u64>().map_err(|_| {
-            server_err!(ServerErrorCode::BadRequest, "Invalid range start")
-        })?
+        parts[0]
+            .parse::<u64>()
+            .map_err(|_| server_err!(ServerErrorCode::BadRequest, "Invalid range start"))?
     };
 
     let end = if parts[1].is_empty() {
         max_size
     } else {
-        parts[1].parse::<u64>().map_err(|_| {
-            server_err!(ServerErrorCode::BadRequest, "Invalid range end")
-        })?
+        parts[1]
+            .parse::<u64>()
+            .map_err(|_| server_err!(ServerErrorCode::BadRequest, "Invalid range end"))?
     };
 
     Ok((start, end))
@@ -355,11 +383,17 @@ impl NdnServer {
 
     async fn create_server(builder: NdnServerBuilder) -> ServerResult<NdnServer> {
         if builder.id.is_none() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "id is required"));
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "id is required"
+            ));
         }
 
         if builder.config.is_none() {
-            return Err(server_err!(ServerErrorCode::InvalidConfig, "config is required"));
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "config is required"
+            ));
         }
 
         let version: http::Version = match builder.version {
@@ -370,7 +404,10 @@ impl NdnServer {
                 "HTTP/2" => http::Version::HTTP_2,
                 "HTTP/3" => http::Version::HTTP_3,
                 _ => {
-                    return Err(server_err!(ServerErrorCode::InvalidConfig, "invalid http version"))
+                    return Err(server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "invalid http version"
+                    ));
                 }
             },
             None => http::Version::HTTP_11,
@@ -390,26 +427,41 @@ impl NdnServer {
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         if self.config.read_only {
             error!("Named manager is read only, can't process put");
-            return Err(server_err!(ServerErrorCode::Rejected, "Named manager is read only"));
+            return Err(server_err!(
+                ServerErrorCode::Rejected,
+                "Named manager is read only"
+            ));
         }
 
         if !self.config.enable_zone_put_chunk {
             error!("Named manager is not enable zone put chunk");
-            return Err(server_err!(ServerErrorCode::Rejected, "Named manager is not enable zone put chunk"));
+            return Err(server_err!(
+                ServerErrorCode::Rejected,
+                "Named manager is not enable zone put chunk"
+            ));
         }
 
         let path = req.uri().path();
         let obj_id = match ObjId::from_path(path) {
             Ok((id, _)) => id,
             Err(_) => {
-                return Err(server_err!(ServerErrorCode::BadRequest, "Invalid object ID in path"))
+                return Err(server_err!(
+                    ServerErrorCode::BadRequest,
+                    "Invalid object ID in path"
+                ));
             }
         };
 
         let named_mgr_id = self.config.named_data_mgr_id.clone();
         let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(Some(named_mgr_id.as_str()))
             .await
-            .ok_or_else(|| server_err!(ServerErrorCode::NotFound, "Named manager not found: {}", named_mgr_id))?;
+            .ok_or_else(|| {
+                server_err!(
+                    ServerErrorCode::NotFound,
+                    "Named manager not found: {}",
+                    named_mgr_id
+                )
+            })?;
 
         let named_mgr_lock = named_mgr.lock().await;
         let chunk_id = ChunkId::from_obj_id(&obj_id);
@@ -430,7 +482,11 @@ impl NdnServer {
                 warn!("Failed to open chunk writer: {}", e);
                 match e {
                     NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
-                    _ => server_err!(ServerErrorCode::IOError, "Failed to open chunk writer: {}", e),
+                    _ => server_err!(
+                        ServerErrorCode::IOError,
+                        "Failed to open chunk writer: {}",
+                        e
+                    ),
                 }
             })?;
         drop(named_mgr_lock);
@@ -439,26 +495,27 @@ impl NdnServer {
         let body_bytes = req
             .collect()
             .await
-            .map_err(|e| server_err!(ServerErrorCode::BadRequest, "Failed to read request body: {}", e))?
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::BadRequest,
+                    "Failed to read request body: {}",
+                    e
+                )
+            })?
             .to_bytes();
 
         // Create a memory reader
         let chunk_reader = std::io::Cursor::new(body_bytes);
-        let write_result = ndn_lib::copy_chunk(
-            chunk_id.clone(),
-            chunk_reader,
-            chunk_writer,
-            None,
-            None,
-        )
-        .await
-        .map_err(|e| {
-            warn!("Failed to copy chunk: {}", e);
-            match e {
-                NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
-                _ => server_err!(ServerErrorCode::IOError, "Failed to copy chunk: {}", e),
-            }
-        })?;
+        let write_result =
+            ndn_lib::copy_chunk(chunk_id.clone(), chunk_reader, chunk_writer, None, None)
+                .await
+                .map_err(|e| {
+                    warn!("Failed to copy chunk: {}", e);
+                    match e {
+                        NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
+                        _ => server_err!(ServerErrorCode::IOError, "Failed to copy chunk: {}", e),
+                    }
+                })?;
 
         if write_result == total_size {
             let named_mgr_lock = named_mgr.lock().await;
@@ -471,12 +528,20 @@ impl NdnServer {
                 })?;
         } else {
             warn!("Failed to complete chunk: {}", write_result);
-            return Err(server_err!(ServerErrorCode::IOError, "Failed to complete chunk: {}", write_result));
+            return Err(server_err!(
+                ServerErrorCode::IOError,
+                "Failed to complete chunk: {}",
+                write_result
+            ));
         }
 
         return Ok(http::Response::builder()
             .status(StatusCode::OK)
-            .body(Full::new(Bytes::new()).map_err(|never| match never {}).boxed())
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
             .unwrap());
     }
 
@@ -489,22 +554,31 @@ impl NdnServer {
         let obj_id = match ObjId::from_path(path) {
             Ok((id, _)) => id,
             Err(_) => {
-                return Err(server_err!(ServerErrorCode::BadRequest, "Invalid object ID in path"))
+                return Err(server_err!(
+                    ServerErrorCode::BadRequest,
+                    "Invalid object ID in path"
+                ));
             }
         };
 
         let chunk_id = ChunkId::from_obj_id(&obj_id);
 
-        let (chunk_state, chunk_size, progress) =
-            NamedDataMgr::query_chunk_state(Some(self.config.named_data_mgr_id.as_str()), &chunk_id)
-                .await
-                .map_err(|e| {
-                    warn!("Failed to query chunk state: {}", e);
-                    match e {
-                        NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
-                        _ => server_err!(ServerErrorCode::IOError, "Failed to query chunk state: {}", e),
-                    }
-                })?;
+        let (chunk_state, chunk_size, progress) = NamedDataMgr::query_chunk_state(
+            Some(self.config.named_data_mgr_id.as_str()),
+            &chunk_id,
+        )
+        .await
+        .map_err(|e| {
+            warn!("Failed to query chunk state: {}", e);
+            match e {
+                NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
+                _ => server_err!(
+                    ServerErrorCode::IOError,
+                    "Failed to query chunk state: {}",
+                    e
+                ),
+            }
+        })?;
 
         let status_code = match chunk_state {
             ChunkState::New => StatusCode::CREATED,
@@ -520,7 +594,11 @@ impl NdnServer {
             .header("Content-Length", chunk_size.to_string())
             .header("cyfs-chunk-status", chunk_state.to_str())
             .header("cyfs-chunk-progress", progress)
-            .body(Full::new(Bytes::new()).map_err(|never| match never {}).boxed())
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
             .unwrap());
     }
 
@@ -533,7 +611,13 @@ impl NdnServer {
         let named_mgr_id = self.config.named_data_mgr_id.clone();
         let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(Some(named_mgr_id.as_str()))
             .await
-            .ok_or_else(|| server_err!(ServerErrorCode::NotFound, "Named manager not found: {}", named_mgr_id))?;
+            .ok_or_else(|| {
+                server_err!(
+                    ServerErrorCode::NotFound,
+                    "Named manager not found: {}",
+                    named_mgr_id
+                )
+            })?;
 
         debug!("named manager founded!");
         let named_mgr2 = named_mgr.clone();
@@ -581,16 +665,23 @@ impl NdnServer {
             let real_named_mgr = named_mgr.lock().await;
             let target_obj_result = real_named_mgr.get_obj_id_by_path_impl(&sub_path).await;
             if target_obj_result.is_ok() {
-                info!("ndn_server: get_obj_id_by_path success, ndn_path: {}", sub_path);
+                info!(
+                    "ndn_server: get_obj_id_by_path success, ndn_path: {}",
+                    sub_path
+                );
                 let (target_obj_id, the_path_obj_jwt) = target_obj_result.unwrap();
                 path_obj_jwt = the_path_obj_jwt;
                 obj_id = Some(target_obj_id);
             } else {
                 let root_obj_id_result = real_named_mgr.select_obj_id_by_path_impl(&sub_path).await;
                 if root_obj_id_result.is_ok() {
-                    let (the_root_obj_id, _the_path_obj_jwt, the_inner_path) = root_obj_id_result.unwrap();
+                    let (the_root_obj_id, _the_path_obj_jwt, the_inner_path) =
+                        root_obj_id_result.unwrap();
                     if the_inner_path.is_none() {
-                        return Err(server_err!(ServerErrorCode::NotFound, "ndn_server: can't found target object, inner_obj_path is not found"));
+                        return Err(server_err!(
+                            ServerErrorCode::NotFound,
+                            "ndn_server: can't found target object, inner_obj_path is not found"
+                        ));
                     }
                     _inner_obj_path = the_inner_path.clone();
                     info!(
@@ -599,11 +690,17 @@ impl NdnServer {
                         the_inner_path.clone().unwrap_or("None".to_string())
                     );
                     if the_root_obj_id.is_chunk() {
-                        return Err(server_err!(ServerErrorCode::BadRequest, "ndn_server: chunk is not supported to be root obj"));
+                        return Err(server_err!(
+                            ServerErrorCode::BadRequest,
+                            "ndn_server: chunk is not supported to be root obj"
+                        ));
                     }
                     if the_root_obj_id.is_big_container() {
                         warn!("ndn_server: big container is not supported to be root obj");
-                        return Err(server_err!(ServerErrorCode::BadRequest, "ndn_server: big container is not supported to be root obj"));
+                        return Err(server_err!(
+                            ServerErrorCode::BadRequest,
+                            "ndn_server: big container is not supported to be root obj"
+                        ));
                     }
                     root_obj_id = Some(the_root_obj_id);
                 }
@@ -611,8 +708,15 @@ impl NdnServer {
         }
 
         if obj_id.is_none() && root_obj_id.is_none() {
-            warn!("ndn_server: can't get obj id from request!, request.uri(): {}", req.uri());
-            return Err(server_err!(ServerErrorCode::NotFound, "NotFound! failed to get obj id from request!, request.uri(): {}", req.uri()));
+            warn!(
+                "ndn_server: can't get obj id from request!, request.uri(): {}",
+                req.uri()
+            );
+            return Err(server_err!(
+                ServerErrorCode::NotFound,
+                "NotFound! failed to get obj id from request!, request.uri(): {}",
+                req.uri()
+            ));
         }
 
         debug!(
@@ -642,7 +746,10 @@ impl NdnServer {
                     "ndn_server: can't found target object, inner_obj_path {} is not valid",
                     &inner_obj_path
                 );
-                return Err(server_err!(ServerErrorCode::BadRequest, "ndn_server: can't found target object, inner_obj_path is not valid"));
+                return Err(server_err!(
+                    ServerErrorCode::BadRequest,
+                    "ndn_server: can't found target object, inner_obj_path is not valid"
+                ));
             }
 
             // This is the target content or target obj_id
@@ -665,7 +772,8 @@ impl NdnServer {
                 // Return root_obj's field
                 let mut load_result = LoadedObj::new_value_result(None, obj_filed);
                 load_result.path_obj_jwt = path_obj_jwt;
-                let response = build_response_by_obj_get_result(load_result, start, inner_path_info).await?;
+                let response =
+                    build_response_by_obj_get_result(load_result, start, inner_path_info).await?;
                 return Ok(response);
             }
         } else {
@@ -704,7 +812,10 @@ impl HttpServer for NdnServer {
             .unwrap_or("localhost")
             .to_string();
 
-        info!("NdnServer[{}] {} {} from {:?}", self.id, req_method, req_path, info.src_addr);
+        info!(
+            "NdnServer[{}] {} {} from {:?}",
+            self.id, req_method, req_path, info.src_addr
+        );
 
         if req_method == hyper::Method::PUT || req_method == hyper::Method::PATCH {
             return self.handle_chunk_put(req).await;
@@ -779,7 +890,11 @@ impl ServerFactory for NdnServerFactory {
     ) -> ServerResult<Vec<Server>> {
         let config_json = config.get_config_json();
         let ndn_config: NdnServerConfig = serde_json::from_str(&config_json).map_err(|e| {
-            server_err!(ServerErrorCode::InvalidConfig, "Failed to parse NdnServerConfig: {}", e)
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "Failed to parse NdnServerConfig: {}",
+                e
+            )
         })?;
 
         let server = NdnServer::builder()
@@ -831,10 +946,7 @@ mod tests {
     async fn test_create_server_without_id() {
         let (_temp_dir, mgr_config) = create_test_named_data_mgr();
 
-        let result = NdnServer::builder()
-            .config(mgr_config)
-            .build()
-            .await;
+        let result = NdnServer::builder().config(mgr_config).build().await;
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(e.code(), ServerErrorCode::InvalidConfig);
@@ -843,10 +955,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_server_without_config() {
-        let result = NdnServer::builder()
-            .id("test")
-            .build()
-            .await;
+        let result = NdnServer::builder().id("test").build().await;
         assert!(result.is_err());
         if let Err(e) = result {
             assert_eq!(e.code(), ServerErrorCode::InvalidConfig);

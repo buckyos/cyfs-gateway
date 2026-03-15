@@ -1,19 +1,19 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use buckyos_kit::AsyncStream;
 use cyfs_gateway_lib::{
+    create_process_chain_executor, get_external_commands, normalize_config_file_path,
     GlobalCollectionManager, GlobalCollectionManagerRef, GlobalProcessChains,
     GlobalProcessChainsRef, JsExternalsManager, JsExternalsManagerRef, ProcessChainConfig,
-    ProcessChainConfigs, create_process_chain_executor, get_external_commands,
-    normalize_config_file_path,
+    ProcessChainConfigs,
 };
 use cyfs_process_chain::{
     CollectionValue, CommandControl, CommandResult, MemoryMapCollection, MemorySetCollection,
 };
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use crate::config_loader::parse_collections_from_raw_config;
 use crate::{get_default_config_path, load_config_from_file, set_gateway_main_config_dir};
@@ -378,6 +378,20 @@ fn build_debug_chain_configs(config: &Value, target: &DebugTarget) -> Result<Pro
     }
 }
 
+fn merge_debug_chains(
+    selected_chains: ProcessChainConfigs,
+    global_process_chains: &ProcessChainConfigs,
+) -> ProcessChainConfigs {
+    let mut merged = selected_chains;
+    for global_chain in global_process_chains {
+        if merged.iter().any(|chain| chain.id == global_chain.id) {
+            continue;
+        }
+        merged.push(global_chain.clone());
+    }
+    merged
+}
+
 fn resolve_debug_config_file_path(config_file: Option<&str>) -> PathBuf {
     let requested_path = config_file
         .map(PathBuf::from)
@@ -417,7 +431,10 @@ fn resolve_req_file_base_dir(req_file: &str) -> PathBuf {
 }
 
 #[async_recursion::async_recursion]
-async fn json_to_collection_value(value: &Value, config_base_dir: &Path) -> Result<CollectionValue> {
+async fn json_to_collection_value(
+    value: &Value,
+    config_base_dir: &Path,
+) -> Result<CollectionValue> {
     match value {
         Value::Object(map) => {
             let target = MemoryMapCollection::new_ref();
@@ -512,7 +529,9 @@ async fn collection_value_to_json(value: CollectionValue) -> Result<Value> {
                 .dump()
                 .await
                 .map_err(|e| anyhow!("dump set failed: {}", e))?;
-            Ok(Value::Array(values.into_iter().map(Value::String).collect()))
+            Ok(Value::Array(
+                values.into_iter().map(Value::String).collect(),
+            ))
         }
         CollectionValue::Map(map) => {
             let mut output = Map::new();
@@ -581,18 +600,75 @@ fn command_result_to_json(result: &CommandResult) -> Value {
     }
 }
 
-pub async fn run_debug_command(
+async fn execute_debug_once(
+    executor: &cyfs_process_chain::ProcessChainLibExecutor,
+    hook_point_env: &cyfs_process_chain::HookPointEnv,
+    request: &DebugRequestFile,
+    req_base_dir: &Path,
+) -> Result<Value> {
+    let exec = executor.fork();
+    let global_env = exec.global_env().clone();
+
+    for (key, value) in &request.input {
+        let coll_value = json_to_collection_value(value, req_base_dir).await?;
+        global_env
+            .create(key.as_str(), coll_value)
+            .await
+            .map_err(|e| anyhow!("inject input {} failed: {}", key, e))?;
+    }
+
+    hook_point_env.pipe().stdout.reset_buffer();
+    hook_point_env.pipe().stderr.reset_buffer();
+
+    let run_result = exec
+        .execute_lib()
+        .await
+        .map_err(|e| anyhow!("execute process chain failed: {}", e))?;
+
+    let stdout = hook_point_env.pipe().stdout.clone_string();
+    let stderr = hook_point_env.pipe().stderr.clone_string();
+
+    let mut output = Map::new();
+    for key in &request.output {
+        let value = global_env
+            .get(key.as_str())
+            .await
+            .map_err(|e| anyhow!("read output {} failed: {}", key, e))?;
+        match value {
+            Some(value) => {
+                output.insert(key.clone(), collection_value_to_json(value).await?);
+            }
+            None => {
+                output.insert(key.clone(), Value::Null);
+            }
+        }
+    }
+
+    Ok(json!({
+        "control_result": command_result_to_json(&run_result),
+        "stdout": stdout,
+        "stderr": stderr,
+        "output": output,
+    }))
+}
+
+async fn build_debug_result(
     req_file: &str,
     config_file: Option<&str>,
     id: Option<&str>,
-) -> Result<()> {
+    repeat: usize,
+) -> Result<Value> {
+    if repeat == 0 {
+        return Err(anyhow!("repeat must be greater than 0"));
+    }
+
     let req_content = tokio::fs::read_to_string(req_file).await?;
     let request = serde_json::from_str::<DebugRequestFile>(&req_content)
         .map_err(|e| anyhow!("invalid req_file {}: {}", req_file, e))?;
 
     let id = id
         .map(|s| s.to_string())
-        .or(request.id)
+        .or_else(|| request.id.clone())
         .ok_or_else(|| anyhow!("id is required, provide --id or req_file.id"))?;
 
     let req_base_dir = resolve_req_file_base_dir(req_file);
@@ -614,6 +690,7 @@ pub async fn run_debug_command(
 
     let target = parse_debug_target(id.as_str())?;
     let chains = build_debug_chain_configs(&config_json, &target)?;
+    let chains = merge_debug_chains(chains, &global_process_chain_configs);
     if chains.is_empty() {
         return Err(anyhow!("no process chain selected for id {}", id));
     }
@@ -628,52 +705,47 @@ pub async fn run_debug_command(
     .await
     .map_err(|e| anyhow!("create process chain executor failed: {}", e.msg()))?;
 
-    let global_env = executor.global_env().clone();
-
-    for (key, value) in &request.input {
-        let coll_value = json_to_collection_value(value, req_base_dir.as_path()).await?;
-        global_env
-            .create(key.as_str(), coll_value)
-            .await
-            .map_err(|e| anyhow!("inject input {} failed: {}", key, e))?;
+    if repeat == 1 {
+        return execute_debug_once(&executor, &hook_point_env, &request, req_base_dir.as_path())
+            .await;
     }
 
-    let run_result = executor
-        .execute_lib()
-        .await
-        .map_err(|e| anyhow!("execute process chain failed: {}", e))?;
-
-    let stdout = hook_point_env.pipe().stdout.clone_string();
-    let stderr = hook_point_env.pipe().stderr.clone_string();
-    if !stdout.is_empty() {
-        print!("{}", stdout);
-    }
-    if !stderr.is_empty() {
-        eprint!("{}", stderr);
+    let mut results = Vec::with_capacity(repeat);
+    for iteration in 0..repeat {
+        let mut result =
+            execute_debug_once(&executor, &hook_point_env, &request, req_base_dir.as_path())
+                .await?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert("iteration".to_string(), json!(iteration + 1));
+        }
+        results.push(result);
     }
 
-    let mut output = Map::new();
-    for key in &request.output {
-        let value = global_env
-            .get(key.as_str())
-            .await
-            .map_err(|e| anyhow!("read output {} failed: {}", key, e))?;
-        match value {
-            Some(value) => {
-                output.insert(key.clone(), collection_value_to_json(value).await?);
+    Ok(json!({
+        "repeat": repeat,
+        "results": results,
+    }))
+}
+
+pub async fn run_debug_command(
+    req_file: &str,
+    config_file: Option<&str>,
+    id: Option<&str>,
+    repeat: usize,
+) -> Result<()> {
+    let result = build_debug_result(req_file, config_file, id, repeat).await?;
+    if repeat == 1 {
+        if let Some(stdout) = result.get("stdout").and_then(|value| value.as_str()) {
+            if !stdout.is_empty() {
+                print!("{}", stdout);
             }
-            None => {
-                output.insert(key.clone(), Value::Null);
+        }
+        if let Some(stderr) = result.get("stderr").and_then(|value| value.as_str()) {
+            if !stderr.is_empty() {
+                eprint!("{}", stderr);
             }
         }
     }
-
-    let result = json!({
-        "control_result": command_result_to_json(&run_result),
-        "stdout": stdout,
-        "stderr": stderr,
-        "output": output,
-    });
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
@@ -688,7 +760,9 @@ mod tests {
     use serde_json::json;
     use tokio::io::AsyncReadExt;
 
-    use super::{json_to_collection_value, resolve_req_file_base_dir, run_debug_command};
+    use super::{
+        build_debug_result, json_to_collection_value, resolve_req_file_base_dir, run_debug_command,
+    };
 
     fn write_json_temp(value: &serde_json::Value) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -804,21 +878,42 @@ mod tests {
         for id in success_ids {
             let req = build_req(None, vec!["RESP", "NOT_EXIST"]);
             let req_file = write_json_temp(&req);
-            let ret = run_debug_command(req_file.path().to_str().unwrap(), Some(config_path), Some(id)).await;
+            let ret = run_debug_command(
+                req_file.path().to_str().unwrap(),
+                Some(config_path),
+                Some(id),
+                1,
+            )
+            .await;
             assert!(ret.is_ok(), "id={} should succeed, got {:?}", id, ret.err());
         }
 
         let req_with_id = build_req(Some("global_chain"), vec!["RESP"]);
         let req_with_id_file = write_json_temp(&req_with_id);
-        let ret = run_debug_command(req_with_id_file.path().to_str().unwrap(), Some(config_path), None).await;
-        assert!(ret.is_ok(), "req_file.id fallback should succeed: {:?}", ret.err());
+        let ret = run_debug_command(
+            req_with_id_file.path().to_str().unwrap(),
+            Some(config_path),
+            None,
+            1,
+        )
+        .await;
+        assert!(
+            ret.is_ok(),
+            "req_file.id fallback should succeed: {:?}",
+            ret.err()
+        );
 
         let req_missing_id = build_req(None, vec!["RESP"]);
         let req_missing_id_file = write_json_temp(&req_missing_id);
-        let err = run_debug_command(req_missing_id_file.path().to_str().unwrap(), Some(config_path), None)
-            .await
-            .unwrap_err()
-            .to_string();
+        let err = run_debug_command(
+            req_missing_id_file.path().to_str().unwrap(),
+            Some(config_path),
+            None,
+            1,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("id is required"), "unexpected error: {}", err);
 
         let req_empty_output = build_req(Some("global_chain"), vec![]);
@@ -827,9 +922,14 @@ mod tests {
             req_empty_output_file.path().to_str().unwrap(),
             Some(config_path),
             None,
+            1,
         )
         .await;
-        assert!(ret.is_ok(), "empty output should be allowed: {:?}", ret.err());
+        assert!(
+            ret.is_ok(),
+            "empty output should be allowed: {:?}",
+            ret.err()
+        );
 
         let req_no_output = json!({
             "input": {
@@ -845,9 +945,14 @@ mod tests {
             req_no_output_file.path().to_str().unwrap(),
             Some(config_path),
             None,
+            1,
         )
         .await;
-        assert!(ret.is_ok(), "missing output should be allowed: {:?}", ret.err());
+        assert!(
+            ret.is_ok(),
+            "missing output should be allowed: {:?}",
+            ret.err()
+        );
 
         let req_line_oob = build_req(None, vec!["RESP"]);
         let req_line_oob_file = write_json_temp(&req_line_oob);
@@ -855,6 +960,7 @@ mod tests {
             req_line_oob_file.path().to_str().unwrap(),
             Some(config_path),
             Some("stack:s1:main:blocks:b1:1:999"),
+            1,
         )
         .await
         .unwrap_err()
@@ -864,6 +970,114 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[tokio::test]
+    async fn test_run_debug_command_loads_all_global_chains_for_cross_chain_exec() {
+        let js_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(js_file.path(), "function test_ext() { return true; }").unwrap();
+
+        let config = json!({
+            "collections": [],
+            "js_externals": {
+                "test_ext": js_file.path().to_str().unwrap()
+            },
+            "global_process_chains": {
+                "global_chain": {
+                    "priority": 1,
+                    "blocks": {
+                        "b1": {
+                            "priority": 1,
+                            "block": "exec --block helper_chain:helper;\necho \"done\";"
+                        }
+                    }
+                },
+                "helper_chain": {
+                    "priority": 2,
+                    "blocks": {
+                        "helper": {
+                            "priority": 1,
+                            "block": "echo \"helper\";"
+                        }
+                    }
+                }
+            }
+        });
+        let config_file = write_json_temp(&config);
+        let req = json!({
+            "id": "global_chain",
+            "input": {},
+            "output": []
+        });
+        let req_file = write_json_temp(&req);
+
+        let ret = run_debug_command(
+            req_file.path().to_str().unwrap(),
+            Some(config_file.path().to_str().unwrap()),
+            None,
+            1,
+        )
+        .await;
+
+        assert!(
+            ret.is_ok(),
+            "cross-global exec should succeed in debug mode: {:?}",
+            ret.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_debug_result_repeat_rotates_round_robin_within_same_process() {
+        let config = json!({
+            "collections": [],
+            "global_process_chains": {
+                "global_chain": {
+                    "priority": 1,
+                    "blocks": {
+                        "b1": {
+                            "priority": 1,
+                            "block": "forward round_robin http://127.0.0.1:10162 http://127.0.0.1:10163;"
+                        }
+                    }
+                }
+            }
+        });
+        let config_file = write_json_temp(&config);
+        let req = json!({
+            "id": "global_chain",
+            "input": {},
+            "output": []
+        });
+        let req_file = write_json_temp(&req);
+
+        let result = build_debug_result(
+            req_file.path().to_str().unwrap(),
+            Some(config_file.path().to_str().unwrap()),
+            None,
+            3,
+        )
+        .await
+        .unwrap();
+
+        let results = result
+            .get("results")
+            .and_then(|value| value.as_array())
+            .expect("repeat result must contain results array");
+        assert_eq!(results.len(), 3);
+
+        let selected: Vec<&str> = results
+            .iter()
+            .map(|item| {
+                item.get("control_result")
+                    .and_then(|value| value.get("value"))
+                    .and_then(|value| value.as_str())
+                    .expect("control result should contain selected forward target")
+            })
+            .collect();
+
+        assert_eq!(selected[0], "forward \"http://127.0.0.1:10162\"");
+        assert_eq!(selected[1], "forward \"http://127.0.0.1:10163\"");
+        assert_eq!(selected[2], "forward \"http://127.0.0.1:10162\"");
     }
 
     #[tokio::test]

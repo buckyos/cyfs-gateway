@@ -56,6 +56,11 @@
 #   json_map_example:
 #     type: json_map
 #     file_path: ./map.json
+#     only_read_file: true        # 可选。启用后 gateway 每次读取都直接访问文件，并禁用内部写入
+#   app_info:
+#     type: json_map
+#     file_path: ./all_info.json#app_info
+#     only_read_file: true        # 使用 #json_path 读取文件中的一个子对象；当前仅支持只读模式
 #   sqlite_map_example:
 #     type: sqlite_map
 #     file_path: ./map.db
@@ -129,7 +134,7 @@ stacks:
   #   protocol: rtcp
   #   bind: 0.0.0.0:2980
   #   key_path: ./sn_private_key.pem
-  #   device_config_path: ./sn_device_config.json
+  #   device_config_path: ./device.doc.jwt  # 也支持 JSON；只有配置 JWT 时，Hello 才会自动携带 device_doc_jwt
   #   name: optional_name
   #   hook_point: { }
 
@@ -156,6 +161,14 @@ servers:
             priority: 1
             block: |
               call-server http_dir;
+    # post_hook_point:            # 可选：在拿到 Response 后、写回客户端前执行
+    #   main:
+    #     priority: 1
+    #     blocks:
+    #       add_header:
+    #         priority: 1
+    #         block: |
+    #           map-add RESP x-gateway "cyfs";
 
   http_dir:
     type: dir
@@ -205,4 +218,3 @@ servers:
   #           priority: 1
   #           block: |
   #             reject;
-

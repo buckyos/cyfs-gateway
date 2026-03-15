@@ -393,7 +393,6 @@ impl ProcessChainLinkedManager {
         chain_id: &str,
         block_id: &str,
     ) -> Result<Option<(ProcessChainLibRef, ProcessChainRef)>, String> {
-
         // If a specific library is provided, search only in that library
         if let Some(lib_id) = lib_id {
             if let Some(lib) = self.get_lib(lib_id) {

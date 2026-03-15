@@ -1,4 +1,4 @@
-mod repl;
 mod complete;
+mod repl;
 
 pub use repl::*;

@@ -368,11 +368,15 @@ impl ExternalCommand for InTimeRange {
             str_args.push(arg.as_str().unwrap());
         }
 
-        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
-            let msg = format!("Invalid in-time-range command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid in-time-range command: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         if !Self::has_any_condition(&matches) {
             return Err(

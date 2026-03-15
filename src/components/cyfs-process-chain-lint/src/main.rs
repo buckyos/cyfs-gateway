@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use cyfs_process_chain_lint::{default_known_vars, lint_file, Diagnostic, LintConfig, LintSeverity};
+use cyfs_process_chain_lint::{
+    Diagnostic, LintConfig, LintSeverity, classify_parse_error, default_known_vars, lint_file,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -84,17 +86,23 @@ fn run_check(args: CheckArgs) -> i32 {
     for file in files {
         match lint_file(file.as_path(), &config) {
             Ok(mut diagnostics) => all.append(&mut diagnostics),
-            Err(err) => all.push(Diagnostic {
-                code: "PC-LINT-0001".to_string(),
-                severity: LintSeverity::Error,
-                message: format!("Failed to lint file: {}", err),
-                file: file.display().to_string(),
-                lib: "-".to_string(),
-                chain: "-".to_string(),
-                block: "-".to_string(),
-                line: 0,
-                source: "-".to_string(),
-            }),
+            Err(err) => {
+                let (code, message) = classify_parse_error(&err).unwrap_or((
+                    "PC-LINT-0001".to_string(),
+                    format!("Failed to lint file: {}", err),
+                ));
+                all.push(Diagnostic {
+                    code,
+                    severity: LintSeverity::Error,
+                    message,
+                    file: file.display().to_string(),
+                    lib: "-".to_string(),
+                    chain: "-".to_string(),
+                    block: "-".to_string(),
+                    line: 0,
+                    source: "-".to_string(),
+                })
+            }
         }
     }
 
@@ -115,11 +123,7 @@ fn run_check(args: CheckArgs) -> i32 {
         FailOn::Info => LintSeverity::Info.rank(),
     };
     let has_fail = all.iter().any(|d| d.severity.rank() >= threshold);
-    if has_fail {
-        2
-    } else {
-        0
-    }
+    if has_fail { 2 } else { 0 }
 }
 
 fn print_text(all: &[Diagnostic]) {

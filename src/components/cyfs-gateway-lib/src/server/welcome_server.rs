@@ -1,8 +1,8 @@
+use crate::{HttpServer, ServerError, ServerResult, StreamInfo};
 use http::{StatusCode, Version};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use crate::{HttpServer, ServerError, ServerResult, StreamInfo};
 
 const WELCOME_HTML: &[u8] = br#"<!DOCTYPE html>
 <html lang="en">

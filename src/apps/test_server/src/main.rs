@@ -25,7 +25,9 @@ async fn main() -> ServerResult<()> {
 
     // Add a dir handler for demo
     let current_dir = std::path::PathBuf::from(".");
-    runner.add_dir_handler("/files/".to_string(), current_dir).await?;
+    runner
+        .add_dir_handler("/files/".to_string(), current_dir)
+        .await?;
 
     info!("test_server listening on http://127.0.0.1:{port}");
     runner.run().await

@@ -136,6 +136,14 @@ impl CommandParserFactory {
             "ends-with",
             Arc::new(Box::new(StringEndsWithCommandParser::new())),
         );
+        self.register(
+            "url_encode",
+            Arc::new(Box::new(UrlEncodeCommandParser::new())),
+        );
+        self.register(
+            "url_decode",
+            Arc::new(Box::new(UrlDecodeCommandParser::new())),
+        );
 
         // collection commands
         self.register(

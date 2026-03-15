@@ -1,9 +1,9 @@
 use super::cmd::ResolveDNSCommand;
 use crate::error::{SocksError, SocksResult};
 use buckyos_kit::get_buckyos_service_data_dir;
+use cyfs_gateway_lib::GlobalCollectionManagerRef;
 use cyfs_process_chain::*;
 use std::sync::Arc;
-use cyfs_gateway_lib::GlobalCollectionManagerRef;
 
 pub struct SocksHookManager {
     hook_point: HookPoint,
@@ -12,9 +12,11 @@ pub struct SocksHookManager {
 }
 
 impl SocksHookManager {
-    pub async fn create(process_chain: ProcessChainLibRef,
-                        global_process_chains: Vec<ProcessChainLibRef>,
-                        global_collection_manager: GlobalCollectionManagerRef) -> Result<Self, String> {
+    pub async fn create(
+        process_chain: ProcessChainLibRef,
+        global_process_chains: Vec<ProcessChainLibRef>,
+        global_collection_manager: GlobalCollectionManagerRef,
+    ) -> Result<Self, String> {
         // Create a hook point
         let hook_point = HookPoint::new("socks-hook-point");
         hook_point
@@ -51,12 +53,15 @@ impl SocksHookManager {
         // Create env to execute the hook point
         let hook_point_env = HookPointEnv::new("socks-hook-point", data_dir);
 
-        global_collection_manager.register_collection(hook_point_env.hook_point_env()).await.map_err(|e| {
-            let msg = format!("Register collection failed! err={}", e);
-            error!("{}", msg);
-            msg
-        })?;
-        
+        global_collection_manager
+            .register_collection(hook_point_env.hook_point_env())
+            .await
+            .map_err(|e| {
+                let msg = format!("Register collection failed! err={}", e);
+                error!("{}", msg);
+                msg
+            })?;
+
         // Register external commands
         let cmd = Box::new(ResolveDNSCommand::new());
         let name = cmd.name().to_owned();

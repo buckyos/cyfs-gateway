@@ -53,7 +53,10 @@ pub(crate) fn parse_exec_scope_and_target(
 
     // Get the index of the argument based on the determined scope
     let target_index = matches.index_of(arg_name).ok_or_else(|| {
-        let msg = format!("Argument '{}' is required for {} command", arg_name, cmd_name);
+        let msg = format!(
+            "Argument '{}' is required for {} command",
+            arg_name, cmd_name
+        );
         error!("{}", msg);
         msg
     })?;
@@ -196,10 +199,10 @@ impl ExecTarget {
 
 // exec command, exec a block/chain/lib by its identifier
 // exec --block lib_id:chain_id:block_id // Full id, will get the block from the specified chain in the library in process chain manager in global
-// exec --block chain_id:block_id // First try to get the block from the current lib, then from the process chain manager in global
+// exec --block chain_id:block_id // Get the block from the specified chain in the current lib only
 // exec --block block_id // Get the block from the current process chain in context
 // exec --chain lib_id:chain_id  // Full id, will get the chain from the specified library in process chain manager in global
-// exec --chain chain_id // First try to get the chain from the current lib, then from the process chain manager in global
+// exec --chain chain_id // Get the chain from the current lib only
 // exec --lib lib_id // Full id, will get the library from the process chain manager in global
 pub struct ExecCommandParser {
     cmd: Command,
@@ -253,16 +256,16 @@ IDENTIFIER RESOLUTION:
   For --block <ID>:
     - `lib:chain:block`:  Fully qualified. Searches globally for the library,
                           then the chain, then the block.
-    - `chain:block`:      Partially qualified. Searches for the chain within the
-                          *current library* first, then searches globally.
+        - `chain:block`:      Library-local. Searches for the chain and block within
+                                                    the *current library* only.
     - `block`:            Local. Searches for the block within the *current
                           process-chain*.
 
   For --chain <ID>:
     - `lib:chain`:        Fully qualified. Searches globally for the library,
                           then the chain.
-    - `chain`:            Local. Searches for the chain within the *current
-                          library* first, then searches globally.
+        - `chain`:            Library-local. Searches for the chain within the
+                                                    *current library* only.
 
   For --lib <ID>:
     - `lib`:              Global. Searches for the library globally.
@@ -271,13 +274,13 @@ EXAMPLES:
   # Execute a block within the current process-chain
   exec --block verify_token
 
-  # Execute a block from a specific chain (searched in the current lib first)
+    # Execute a block from a specific chain in the current library
   exec --block auth_flow:get_user_info
 
   # Execute a block using a fully qualified global ID
   exec --block security_lib:sso_flow:validate_jwt
 
-  # Execute a chain (searched in the current lib first)
+    # Execute a chain from the current library
   exec --chain user_login_flow
 
   # Execute a globally unique library
@@ -367,10 +370,6 @@ impl ExecCommandExecutor {
             );
             None
         } else {
-            assert!(
-                !ret.same_lib,
-                "Chain must not be in the same library if same_chain is false"
-            );
             let target_chain = ret.chain.clone().unwrap();
             Some(ExecPointerChainGuard::new(
                 context.current_pointer(),
@@ -470,7 +469,9 @@ pub(crate) struct InvokeArgSpec {
 
 fn validate_invoke_arg_key(key: &str) -> Result<(), String> {
     let mut chars = key.chars();
-    let first = chars.next().ok_or_else(|| "invoke arg key must not be empty".to_string())?;
+    let first = chars
+        .next()
+        .ok_or_else(|| "invoke arg key must not be empty".to_string())?;
     if !(first.is_ascii_alphabetic() || first == '_') {
         let msg = format!(
             "Invalid invoke arg key '{}': must start with letter or underscore",
@@ -518,18 +519,27 @@ pub(crate) fn parse_invoke_args(
     let mut result = Vec::with_capacity(indices.len() / 2);
     for pair in indices.chunks_exact(2) {
         let key_arg = args.get(pair[0]).ok_or_else(|| {
-            let msg = format!("Invalid invoke command: missing arg key at index {}", pair[0]);
+            let msg = format!(
+                "Invalid invoke command: missing arg key at index {}",
+                pair[0]
+            );
             error!("{}", msg);
             msg
         })?;
         let value_arg = args.get(pair[1]).ok_or_else(|| {
-            let msg = format!("Invalid invoke command: missing arg value at index {}", pair[1]);
+            let msg = format!(
+                "Invalid invoke command: missing arg value at index {}",
+                pair[1]
+            );
             error!("{}", msg);
             msg
         })?;
 
         let key = key_arg.as_literal_str().ok_or_else(|| {
-            let msg = format!("Invalid invoke arg key: expected literal, got {:?}", key_arg);
+            let msg = format!(
+                "Invalid invoke arg key: expected literal, got {:?}",
+                key_arg
+            );
             error!("{}", msg);
             msg
         })?;
@@ -602,6 +612,26 @@ DESCRIPTION:
   invoke is similar to exec, but it passes named arguments to the callee
   through $__args.<key>.
 
+IDENTIFIER RESOLUTION:
+    invoke uses the same target resolution rules as exec.
+
+    For --block <ID>:
+        - `lib:chain:block`:  Fully qualified. Searches globally for the library,
+                                                    then the chain, then the block.
+        - `chain:block`:      Library-local. Searches for the chain and block within
+                                                    the *current library* only.
+        - `block`:            Local. Searches for the block within the *current
+                                                    process-chain*.
+
+    For --chain <ID>:
+        - `lib:chain`:        Fully qualified. Searches globally for the library,
+                                                    then the chain.
+        - `chain`:            Library-local. Searches for the chain within the
+                                                    *current library* only.
+
+    For --lib <ID>:
+        - `lib`:              Global. Searches for the library globally.
+
 ARGUMENT PASSING:
   --arg <key> <value> can be repeated.
   <value> can be literal, variable, command substitution, or collection reference.
@@ -658,7 +688,11 @@ pub(crate) struct InvokeCommandExecutor {
 
 impl InvokeCommandExecutor {
     pub(crate) fn new(scope: ExecScope, target: CommandArg, args: Vec<InvokeArgSpec>) -> Self {
-        Self { scope, target, args }
+        Self {
+            scope,
+            target,
+            args,
+        }
     }
 
     async fn build_args_map(&self, caller: &Context) -> Result<MapCollectionRef, String> {
@@ -674,11 +708,7 @@ impl InvokeCommandExecutor {
     async fn inject_args(context: &Context, args: MapCollectionRef) -> Result<(), String> {
         context
             .env()
-            .set(
-                "__args",
-                CollectionValue::Map(args),
-                Some(EnvLevel::Chain),
-            )
+            .set("__args", CollectionValue::Map(args), Some(EnvLevel::Chain))
             .await?;
         Ok(())
     }

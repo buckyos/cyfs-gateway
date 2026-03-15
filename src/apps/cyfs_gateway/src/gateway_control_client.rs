@@ -1,13 +1,13 @@
-use log::*;
-use std::collections::HashMap;
-use std::sync::Mutex;
+use crate::gateway_control_server::{ControlErrorCode, ControlResult, LoginReq};
+use crate::ExternalCmd;
 use chrono::Utc;
+use log::*;
 use serde_json::{json, Value};
 pub use sfo_result::err as cmd_err;
 pub use sfo_result::into_err as into_cmd_err;
 use sha2::Digest;
-use crate::ExternalCmd;
-use crate::gateway_control_server::{ControlErrorCode, ControlResult, LoginReq};
+use std::collections::HashMap;
+use std::sync::Mutex;
 //TODO： CmdClient / CmdServer 的名字太通用了，叫gateway_control_panel_client / gateway_control_panel 更好一些？
 pub const CONTROL_SERVER: &str = "http://127.0.0.1:13451";
 
@@ -37,7 +37,9 @@ impl GatewayControlClient {
 
     async fn call(&self, method: &str, params: Value) -> ControlResult<Value> {
         let krpc = self.build_krpc();
-        let result = krpc.call(method, params).await
+        let result = krpc
+            .call(method, params)
+            .await
             .map_err(|e| cmd_err!(ControlErrorCode::RpcError, "{:?}", e))?;
         Ok(result)
     }
@@ -64,8 +66,13 @@ impl GatewayControlClient {
             password,
             timestamp,
         };
-        let result = self.call("login", serde_json::to_value(&req).unwrap()).await?;
-        let token = result.as_str().ok_or_else(|| cmd_err!(ControlErrorCode::Failed))?.to_string();
+        let result = self
+            .call("login", serde_json::to_value(&req).unwrap())
+            .await?;
+        let token = result
+            .as_str()
+            .ok_or_else(|| cmd_err!(ControlErrorCode::Failed))?
+            .to_string();
         self.update_token(Some(token.clone()));
         Ok(token)
     }
@@ -85,24 +92,31 @@ impl GatewayControlClient {
         self.call("get_init_config", Value::Null).await
     }
 
+    pub async fn get_system_info(&self) -> ControlResult<Value> {
+        self.call("get_system_info", Value::Null).await
+    }
+
     pub async fn remove_rule(&self, id: &str) -> ControlResult<Value> {
         let mut params = HashMap::new();
         params.insert("id", id);
-        self.call("remove_rule", serde_json::to_value(&params).unwrap()).await
+        self.call("remove_rule", serde_json::to_value(&params).unwrap())
+            .await
     }
 
     pub async fn add_rule(&self, id: &str, rule: &str) -> ControlResult<Value> {
         let mut params = HashMap::new();
         params.insert("id", id);
         params.insert("rule", rule);
-        self.call("add_rule", serde_json::to_value(&params).unwrap()).await
+        self.call("add_rule", serde_json::to_value(&params).unwrap())
+            .await
     }
 
     pub async fn append_rule(&self, id: &str, rule: &str) -> ControlResult<Value> {
         let mut params = HashMap::new();
         params.insert("id", id);
         params.insert("rule", rule);
-        self.call("append_rule", serde_json::to_value(&params).unwrap()).await
+        self.call("append_rule", serde_json::to_value(&params).unwrap())
+            .await
     }
 
     pub async fn insert_rule(&self, id: &str, pos: i32, rule: &str) -> ControlResult<Value> {
@@ -111,7 +125,8 @@ impl GatewayControlClient {
         params.insert("rule", rule);
         let pos = format!("{}", pos);
         params.insert("pos", pos.as_str());
-        self.call("insert_rule", serde_json::to_value(&params).unwrap()).await
+        self.call("insert_rule", serde_json::to_value(&params).unwrap())
+            .await
     }
 
     pub async fn move_rule(&self, id: &str, new_pos: i32) -> ControlResult<Value> {
@@ -119,53 +134,78 @@ impl GatewayControlClient {
         params.insert("id", id);
         let pos = format!("{}", new_pos);
         params.insert("new_pos", pos.as_str());
-        self.call("move_rule", serde_json::to_value(&params).unwrap()).await
+        self.call("move_rule", serde_json::to_value(&params).unwrap())
+            .await
     }
 
     pub async fn set_rule(&self, id: &str, rule: &str) -> ControlResult<Value> {
         let mut params = HashMap::new();
         params.insert("id", id);
         params.insert("rule", rule);
-        self.call("set_rule", serde_json::to_value(&params).unwrap()).await
+        self.call("set_rule", serde_json::to_value(&params).unwrap())
+            .await
     }
 
-    pub async fn add_dispatch(&self, local: &str, target: &str, protocol: Option<&str>) -> ControlResult<Value> {
+    pub async fn add_dispatch(
+        &self,
+        local: &str,
+        target: &str,
+        protocol: Option<&str>,
+    ) -> ControlResult<Value> {
         let mut params = HashMap::new();
         params.insert("local", local);
         params.insert("target", target);
         if let Some(protocol) = protocol {
             params.insert("protocol", protocol);
         }
-        self.call("add_dispatch", serde_json::to_value(&params).unwrap()).await
+        self.call("add_dispatch", serde_json::to_value(&params).unwrap())
+            .await
     }
 
-    pub async fn remove_dispatch(&self, local: &str, protocol: Option<&str>) -> ControlResult<Value> {
+    pub async fn remove_dispatch(
+        &self,
+        local: &str,
+        protocol: Option<&str>,
+    ) -> ControlResult<Value> {
         let mut params = HashMap::new();
         params.insert("local", local);
         if let Some(protocol) = protocol {
             params.insert("protocol", protocol);
         }
-        self.call("remove_dispatch", serde_json::to_value(&params).unwrap()).await
+        self.call("remove_dispatch", serde_json::to_value(&params).unwrap())
+            .await
     }
 
-    pub async fn add_router(&self, server_id: Option<&str>, uri: &str, target: &str) -> ControlResult<Value> {
+    pub async fn add_router(
+        &self,
+        server_id: Option<&str>,
+        uri: &str,
+        target: &str,
+    ) -> ControlResult<Value> {
         let mut params = HashMap::new();
         if let Some(id) = server_id {
             params.insert("id", id);
         }
         params.insert("uri", uri);
         params.insert("target", target);
-        self.call("add_router", serde_json::to_value(&params).unwrap()).await
+        self.call("add_router", serde_json::to_value(&params).unwrap())
+            .await
     }
 
-    pub async fn remove_router(&self, server_id: Option<&str>, uri: &str, target: &str) -> ControlResult<Value> {
+    pub async fn remove_router(
+        &self,
+        server_id: Option<&str>,
+        uri: &str,
+        target: &str,
+    ) -> ControlResult<Value> {
         let mut params = HashMap::new();
         if let Some(id) = server_id {
             params.insert("id", id);
         }
         params.insert("uri", uri);
         params.insert("target", target);
-        self.call("remove_router", serde_json::to_value(&params).unwrap()).await
+        self.call("remove_router", serde_json::to_value(&params).unwrap())
+            .await
     }
 
     pub async fn get_connections(&self) -> ControlResult<Value> {
@@ -173,13 +213,17 @@ impl GatewayControlClient {
     }
 
     pub async fn get_connection_devices(&self) -> ControlResult<Value> {
-        let result = self.call("get_connection_devices", Value::Null).await
+        let result = self
+            .call("get_connection_devices", Value::Null)
+            .await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
 
     pub async fn collection_list(&self) -> ControlResult<Value> {
-        let result = self.call("collection_list", Value::Null).await
+        let result = self
+            .call("collection_list", Value::Null)
+            .await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
@@ -190,7 +234,9 @@ impl GatewayControlClient {
         if let Some(key) = key {
             params.insert("key", key);
         }
-        let result = self.call("collection_get", serde_json::to_value(&params).unwrap()).await
+        let result = self
+            .call("collection_get", serde_json::to_value(&params).unwrap())
+            .await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
@@ -199,7 +245,9 @@ impl GatewayControlClient {
         let mut params = HashMap::new();
         params.insert("name", name);
         params.insert("value", value);
-        let result = self.call("collection_set_add", serde_json::to_value(&params).unwrap()).await
+        let result = self
+            .call("collection_set_add", serde_json::to_value(&params).unwrap())
+            .await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
@@ -208,17 +256,26 @@ impl GatewayControlClient {
         let mut params = HashMap::new();
         params.insert("name", name);
         params.insert("value", value);
-        let result = self.call("collection_set_del", serde_json::to_value(&params).unwrap()).await
+        let result = self
+            .call("collection_set_del", serde_json::to_value(&params).unwrap())
+            .await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
 
-    pub async fn collection_map_put(&self, name: &str, key: &str, value: &str) -> ControlResult<Value> {
+    pub async fn collection_map_put(
+        &self,
+        name: &str,
+        key: &str,
+        value: &str,
+    ) -> ControlResult<Value> {
         let mut params = HashMap::new();
         params.insert("name", name);
         params.insert("key", key);
         params.insert("value", value);
-        let result = self.call("collection_map_put", serde_json::to_value(&params).unwrap()).await
+        let result = self
+            .call("collection_map_put", serde_json::to_value(&params).unwrap())
+            .await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
@@ -227,7 +284,9 @@ impl GatewayControlClient {
         let mut params = HashMap::new();
         params.insert("name", name);
         params.insert("key", key);
-        let result = self.call("collection_map_del", serde_json::to_value(&params).unwrap()).await
+        let result = self
+            .call("collection_map_del", serde_json::to_value(&params).unwrap())
+            .await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
     }
@@ -246,20 +305,26 @@ impl GatewayControlClient {
         };
         self.call("save_config", params).await
     }
-    
+
     pub async fn get_external_cmds(&self) -> ControlResult<Vec<ExternalCmd>> {
         let result = self.call("external_cmds", Value::Null).await?;
         Ok(serde_json::from_value(result).map_err(into_cmd_err!(ControlErrorCode::InvalidData))?)
     }
-    
+
     pub async fn get_external_cmd_help(&self, cmd: &str) -> ControlResult<String> {
         let mut params = HashMap::new();
         params.insert("cmd", cmd);
-        let result = self.call("cmd_help", serde_json::to_value(&params).unwrap()).await?;
+        let result = self
+            .call("cmd_help", serde_json::to_value(&params).unwrap())
+            .await?;
         Ok(serde_json::from_value(result).map_err(into_cmd_err!(ControlErrorCode::InvalidData))?)
     }
 
-    pub async fn start_template(&self, template_id: &str, args: Vec<String>) -> ControlResult<Value> {
+    pub async fn start_template(
+        &self,
+        template_id: &str,
+        args: Vec<String>,
+    ) -> ControlResult<Value> {
         let params = json!({
             "template_id": template_id,
             "args": args,

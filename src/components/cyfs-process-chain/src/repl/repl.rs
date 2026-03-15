@@ -33,6 +33,7 @@ impl ProcessChainREPL {
         let process_chain_manager = ProcessChainManager::new()
             .link(env.parser_context())
             .await?;
+        let parser_context = env.parser_context().clone();
 
         let pipe = SharedMemoryPipe::new_empty();
         let counter = Arc::new(GotoCounter::new());
@@ -49,7 +50,7 @@ impl ProcessChainREPL {
             line_index: AtomicUsize::new(0),
             pipe,
             context,
-            parser_context: Arc::new(ParserContext::new()),
+            parser_context,
         })
     }
 
@@ -331,5 +332,30 @@ impl ProcessChainREPL {
         }
 
         doc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn repl_init_registers_external_commands_in_parser_context() {
+        let repl = ProcessChainREPL::new()
+            .await
+            .expect("repl should initialize");
+        repl.init().await.expect("repl init should succeed");
+
+        assert!(Arc::ptr_eq(&repl.parser_context, repl.env.parser_context()));
+        assert!(
+            repl.parser_context
+                .get_external_command("http-probe")
+                .is_some()
+        );
+        assert!(
+            repl.parser_context
+                .get_external_command("https-sni-probe")
+                .is_some()
+        );
     }
 }

@@ -324,19 +324,17 @@ impl RtcpStackConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for RtcpStackConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
-        let rtcp_config =
-            RtcpStackConfig::deserialize(hook_point_value_map_to_vector(de.clone(), "hook_point")?)
-                .map_err(|e| {
-                    config_err!(
-                        ConfigErrorCode::InvalidConfig,
-                        "invalid rtcp stack config: {}\n{}",
-                        e,
-                        serde_json::to_string_pretty(
-                            &serde_json::Value::deserialize(de.clone()).unwrap()
-                        )
-                        .unwrap()
-                    )
-                })?;
+        let mut value = hook_point_value_map_to_vector(de.clone(), "hook_point")?;
+        value = hook_point_value_map_to_vector_in_value(value, "on_new_tunnel_hook_point")?;
+        let rtcp_config = RtcpStackConfig::deserialize(value).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid rtcp stack config: {}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
+                    .unwrap()
+            )
+        })?;
         Ok(Arc::new(rtcp_config))
     }
 }
@@ -989,7 +987,9 @@ pub struct GatewayConfig {
 #[cfg(test)]
 mod tests {
     use crate::merge;
+    use cyfs_gateway_lib::RtcpStackConfig;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn test_limiter_config_parser() {
@@ -1086,6 +1086,63 @@ mod tests {
             }
         });
         assert!(parser.parse(json).is_err());
+    }
+
+    #[test]
+    fn test_rtcp_keep_tunnel_config_parser() {
+        let parser = super::GatewayConfigParser::new();
+        parser.register_stack_config_parser("rtcp", Arc::new(super::RtcpStackConfigParser::new()));
+
+        let config = parser
+            .parse(json!({
+                "stacks": {
+                    "rtcp1": {
+                        "protocol": "rtcp",
+                        "bind": "127.0.0.1:0",
+                        "key_path": "/tmp/test.pem",
+                        "name": "test",
+                        "keep_tunnel": ["did:1"],
+                        "hook_point": {}
+                    }
+                }
+            }))
+            .unwrap();
+
+        let rtcp_config = config.stacks[0]
+            .as_any()
+            .downcast_ref::<RtcpStackConfig>()
+            .unwrap();
+        assert_eq!(rtcp_config.keep_tunnel, vec!["did:1".to_string()]);
+    }
+
+    #[test]
+    fn test_rtcp_keep_tunnel_hyphenated_alias_parser() {
+        let parser = super::GatewayConfigParser::new();
+        parser.register_stack_config_parser("rtcp", Arc::new(super::RtcpStackConfigParser::new()));
+
+        let config = parser
+            .parse(json!({
+                "stacks": {
+                    "rtcp1": {
+                        "protocol": "rtcp",
+                        "bind": "127.0.0.1:0",
+                        "key_path": "/tmp/test.pem",
+                        "name": "test",
+                        "keep-tunnel": ["did:1", "did:2"],
+                        "hook_point": {}
+                    }
+                }
+            }))
+            .unwrap();
+
+        let rtcp_config = config.stacks[0]
+            .as_any()
+            .downcast_ref::<RtcpStackConfig>()
+            .unwrap();
+        assert_eq!(
+            rtcp_config.keep_tunnel,
+            vec!["did:1".to_string(), "did:2".to_string()]
+        );
     }
 
     #[test]

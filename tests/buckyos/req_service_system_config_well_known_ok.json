@@ -1,0 +1,11 @@
+{
+  "input": {
+    "REQ": {
+      "path": "/.well-known/openid-configuration",
+      "host": "test.buckyos.io",
+      "url": "https://test.buckyos.io/.well-known/openid-configuration"
+    }
+  },
+  "id": "server:node_gateway:main",
+  "output": ["REQ", "RESP"]
+}

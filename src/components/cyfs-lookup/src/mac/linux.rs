@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::parse_mac_text;
-use crate::{lookup_err, LookupResult};
+use crate::{LookupResult, lookup_err};
 
 pub async fn lookup_mac_once(ip: IpAddr) -> LookupResult<Option<String>> {
     let target = match ip {

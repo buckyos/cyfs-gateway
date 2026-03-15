@@ -233,7 +233,10 @@ impl MapCollection for StreamRequestMap {
                 }
             }
             "source_online_secs" => {
-                prev = request.source_online_secs.clone().map(CollectionValue::String);
+                prev = request
+                    .source_online_secs
+                    .clone()
+                    .map(CollectionValue::String);
                 if let CollectionValue::String(source_online_secs) = value {
                     request.source_online_secs = Some(source_online_secs);
                 } else {
@@ -339,7 +342,10 @@ impl MapCollection for StreamRequestMap {
                 .map(|addr| CollectionValue::String(addr.to_string()))),
             "source_mac" => Ok(request.source_mac.clone().map(CollectionValue::String)),
             "source_hostname" => Ok(request.source_hostname.clone().map(CollectionValue::String)),
-            "source_online_secs" => Ok(request.source_online_secs.clone().map(CollectionValue::String)),
+            "source_online_secs" => Ok(request
+                .source_online_secs
+                .clone()
+                .map(CollectionValue::String)),
             "source_device_id" => Ok(request
                 .source_device_id
                 .clone()
@@ -414,7 +420,10 @@ impl MapCollection for StreamRequestMap {
                 .map(|addr| CollectionValue::String(addr.to_string()))),
             "source_mac" => Ok(request.source_mac.take().map(CollectionValue::String)),
             "source_hostname" => Ok(request.source_hostname.take().map(CollectionValue::String)),
-            "source_online_secs" => Ok(request.source_online_secs.take().map(CollectionValue::String)),
+            "source_online_secs" => Ok(request
+                .source_online_secs
+                .take()
+                .map(CollectionValue::String)),
             "source_device_id" => Ok(request.source_device_id.take().map(CollectionValue::String)),
             "source_app_id" => Ok(request.source_app_id.take().map(CollectionValue::String)),
             "source_user_id" => Ok(request.source_user_id.take().map(CollectionValue::String)),

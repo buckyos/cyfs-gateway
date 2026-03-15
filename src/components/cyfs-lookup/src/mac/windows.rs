@@ -1,12 +1,10 @@
 use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr};
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
-use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetIpNetTable, SendARP, MIB_IPNETTABLE,
-};
+use windows_sys::Win32::NetworkManagement::IpHelper::{GetIpNetTable, MIB_IPNETTABLE, SendARP};
 
 use super::normalize_mac;
-use crate::{lookup_err, LookupResult};
+use crate::{LookupResult, lookup_err};
 
 pub async fn lookup_mac_once(ip: IpAddr) -> LookupResult<Option<String>> {
     let target = match ip {
@@ -33,7 +31,11 @@ pub async fn active_probe(ip: IpAddr) -> LookupResult<()> {
         if status == NO_ERROR {
             Ok(())
         } else {
-            Err(lookup_err!("SendARP for {} failed with code {}", target, status))
+            Err(lookup_err!(
+                "SendARP for {} failed with code {}",
+                target,
+                status
+            ))
         }
     })
     .await

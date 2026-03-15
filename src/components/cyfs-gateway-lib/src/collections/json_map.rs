@@ -1,10 +1,14 @@
-use std::collections::{HashMap};
+use buckyos_kit::get_by_json_path;
+use cyfs_process_chain::{
+    CollectionValue, MapCollection, MapCollectionRef, MapCollectionTraverseCallBackRef,
+    MemoryListCollection, MemoryMapCollection,
+};
+use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Deref;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::RwLock;
-use cyfs_process_chain::{CollectionValue, MapCollection, MapCollectionRef, MapCollectionTraverseCallBackRef, MemoryMapCollection};
 
 /// JSON 到 MapCollection 的转换错误
 #[derive(Debug)]
@@ -51,14 +55,14 @@ pub trait JsonMapCollection {
 #[async_trait::async_trait]
 impl JsonMapCollection for MapCollectionRef {
     async fn from_json(json: &serde_json::Value) -> Result<MapCollectionRef, JsonCollectionError> {
-        let obj = json.as_object()
-            .ok_or(JsonCollectionError::NotObject)?;
+        let obj = json.as_object().ok_or(JsonCollectionError::NotObject)?;
 
         let map = MemoryMapCollection::new_ref();
 
         for (key, value) in obj {
-            let coll_value = json_value_to_collection_value(value);
-            map.insert(key, coll_value).await
+            let coll_value = json_value_to_collection_value(value).await;
+            map.insert(key, coll_value)
+                .await
                 .map_err(|e| JsonCollectionError::InsertFailed(e))?;
         }
 
@@ -66,7 +70,9 @@ impl JsonMapCollection for MapCollectionRef {
     }
 
     async fn to_json(&self) -> Result<serde_json::Value, JsonCollectionError> {
-        let map_dump = self.dump().await
+        let map_dump = self
+            .dump()
+            .await
             .map_err(|e| JsonCollectionError::DumpFailed(e))?;
 
         let mut json_obj = serde_json::Map::new();
@@ -86,15 +92,39 @@ impl JsonMapCollection for MapCollectionRef {
 /// - Number -> CollectionValue::String (保留精度)
 /// - Bool -> CollectionValue::String
 /// - Null -> CollectionValue::String ("null")
-/// - Object/Array -> CollectionValue::String (JSON 字符串表示)
-pub fn json_value_to_collection_value(value: &serde_json::Value) -> CollectionValue {
-    match value {
-        serde_json::Value::String(s) => CollectionValue::String(s.clone()),
-        serde_json::Value::Number(n) => CollectionValue::String(n.to_string()),
-        serde_json::Value::Bool(b) => CollectionValue::String(b.to_string()),
-        serde_json::Value::Null => CollectionValue::String("null".to_string()),
-        _ => CollectionValue::String(value.to_string()),
-    }
+/// - Object -> CollectionValue::Map
+/// - Array -> CollectionValue::List
+pub fn json_value_to_collection_value<'a>(
+    value: &'a serde_json::Value,
+) -> Pin<Box<dyn Future<Output = CollectionValue> + Send + 'a>> {
+    Box::pin(async move {
+        match value {
+            serde_json::Value::String(s) => CollectionValue::String(s.clone()),
+            serde_json::Value::Number(n) => CollectionValue::String(n.to_string()),
+            serde_json::Value::Bool(b) => CollectionValue::String(b.to_string()),
+            serde_json::Value::Null => CollectionValue::String("null".to_string()),
+            serde_json::Value::Array(items) => {
+                let list = MemoryListCollection::new_ref();
+                for item in items {
+                    let value = json_value_to_collection_value(item).await;
+                    list.push(value).await.expect(
+                        "MemoryListCollection::push should not fail during json conversion",
+                    );
+                }
+                CollectionValue::List(list)
+            }
+            serde_json::Value::Object(entries) => {
+                let map = MemoryMapCollection::new_ref();
+                for (key, item) in entries {
+                    let value = json_value_to_collection_value(item).await;
+                    map.insert(key, value).await.expect(
+                        "MemoryMapCollection::insert should not fail during json conversion",
+                    );
+                }
+                CollectionValue::Map(map)
+            }
+        }
+    })
 }
 
 /// 将 CollectionValue 转换为 JSON Value
@@ -104,7 +134,9 @@ pub fn json_value_to_collection_value(value: &serde_json::Value) -> CollectionVa
 /// - 尝试解析字符串为布尔值
 /// - 尝试解析字符串为 JSON（如果是对象或数组）
 /// - 其他情况保持为字符串
-pub fn collection_value_to_json_value<'a>(value: &'a CollectionValue) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send + 'a>> {
+pub fn collection_value_to_json_value<'a>(
+    value: &'a CollectionValue,
+) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send + 'a>> {
     Box::pin(async move {
         match value {
             CollectionValue::Null => serde_json::Value::Null,
@@ -150,7 +182,9 @@ pub fn collection_value_to_json_value<'a>(value: &'a CollectionValue) -> Pin<Box
                 serde_json::Value::String(s.clone())
             }
             CollectionValue::Set(set) => match set.dump().await {
-                Ok(values) => serde_json::Value::Array(values.into_iter().map(serde_json::Value::String).collect()),
+                Ok(values) => serde_json::Value::Array(
+                    values.into_iter().map(serde_json::Value::String).collect(),
+                ),
                 Err(e) => {
                     warn!("Failed to dump set for json conversion: {}", e);
                     serde_json::Value::String("[Set]".to_string())
@@ -189,10 +223,7 @@ pub fn collection_value_to_json_value<'a>(value: &'a CollectionValue) -> Pin<Box
                         obj.insert(
                             key,
                             serde_json::Value::Array(
-                                values
-                                    .into_iter()
-                                    .map(serde_json::Value::String)
-                                    .collect(),
+                                values.into_iter().map(serde_json::Value::String).collect(),
                             ),
                         );
                     }
@@ -210,15 +241,17 @@ pub fn collection_value_to_json_value<'a>(value: &'a CollectionValue) -> Pin<Box
 }
 
 /// 简化版本：只将 JSON 转为 MapCollection，不尝试智能类型转换
-pub async fn json_to_map_simple(json: &serde_json::Value) -> Result<MapCollectionRef, JsonCollectionError> {
-    let obj = json.as_object()
-        .ok_or(JsonCollectionError::NotObject)?;
+pub async fn json_to_map_simple(
+    json: &serde_json::Value,
+) -> Result<MapCollectionRef, JsonCollectionError> {
+    let obj = json.as_object().ok_or(JsonCollectionError::NotObject)?;
 
     let map = MemoryMapCollection::new_ref();
 
     for (key, value) in obj {
         let coll_value = CollectionValue::String(value.to_string());
-        map.insert(key, coll_value).await
+        map.insert(key, coll_value)
+            .await
             .map_err(|e| JsonCollectionError::InsertFailed(e))?;
     }
 
@@ -226,8 +259,12 @@ pub async fn json_to_map_simple(json: &serde_json::Value) -> Result<MapCollectio
 }
 
 /// 简化版本：只将 MapCollection 转为 JSON，不尝试智能类型转换
-pub async fn map_to_json_simple(map: &MapCollectionRef) -> Result<serde_json::Value, JsonCollectionError> {
-    let map_dump = map.dump().await
+pub async fn map_to_json_simple(
+    map: &MapCollectionRef,
+) -> Result<serde_json::Value, JsonCollectionError> {
+    let map_dump = map
+        .dump()
+        .await
         .map_err(|e| JsonCollectionError::DumpFailed(e))?;
 
     let mut json_obj = serde_json::Map::new();
@@ -244,45 +281,127 @@ pub async fn map_to_json_simple(map: &MapCollectionRef) -> Result<serde_json::Va
 
 pub struct JsonMap {
     file_path: String,
+    source_file_path: String,
+    json_path: Option<String>,
+    only_read_file: bool,
     map: RwLock<HashMap<String, serde_json::Value>>,
 }
 
 impl JsonMap {
     pub async fn load_from(file_path: impl Into<String>) -> Result<Self, String> {
+        Self::open(file_path, false).await
+    }
+
+    pub async fn open(file_path: impl Into<String>, only_read_file: bool) -> Result<Self, String> {
         let file_path = file_path.into();
-        let map = if Path::new(file_path.as_str()).exists() {
-            let content = tokio::fs::read_to_string(file_path.as_str()).await.map_err(|e| e.to_string())?;
-            if content.is_empty() {
-                HashMap::new()
-            } else {
-                let map = serde_json::from_str::<HashMap<String, serde_json::Value>>(&content).map_err(|e| e.to_string())?;
-                map
-            }
-        } else {
-            HashMap::new()
-        };
+        let (source_file_path, json_path) = Self::parse_file_spec(file_path.as_str());
+        if json_path.is_some() && !only_read_file {
+            return Err(format!(
+                "json_map {} with #json_path requires only_read_file=true",
+                file_path
+            ));
+        }
+        let map = Self::load_map_from_path(source_file_path.as_str(), json_path.as_deref()).await?;
         Ok(JsonMap {
             file_path,
+            source_file_path,
+            json_path,
+            only_read_file,
             map: RwLock::new(map),
         })
     }
 
+    async fn load_map_from_path(
+        file_path: &str,
+        json_path: Option<&str>,
+    ) -> Result<HashMap<String, serde_json::Value>, String> {
+        if Path::new(file_path).exists() {
+            let content = tokio::fs::read_to_string(file_path)
+                .await
+                .map_err(|e| e.to_string())?;
+            if content.is_empty() {
+                Ok(HashMap::new())
+            } else {
+                let root = serde_json::from_str::<serde_json::Value>(&content)
+                    .map_err(|e| e.to_string())?;
+                let target = if let Some(json_path) = json_path {
+                    get_by_json_path(&root, json_path).ok_or_else(|| {
+                        format!("json_map {} cannot find json_path {}", file_path, json_path)
+                    })?
+                } else {
+                    root
+                };
+
+                match target {
+                    serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
+                    _ => Err(format!(
+                        "json_map {} target is not a JSON object",
+                        if let Some(json_path) = json_path {
+                            format!("{}#{}", file_path, json_path)
+                        } else {
+                            file_path.to_string()
+                        }
+                    )),
+                }
+            }
+        } else {
+            Ok(HashMap::new())
+        }
+    }
+
+    fn parse_file_spec(file_path: &str) -> (String, Option<String>) {
+        if let Some((source_file_path, json_path)) = file_path.split_once('#') {
+            let json_path = json_path.trim();
+            if json_path.is_empty() {
+                (source_file_path.to_string(), None)
+            } else {
+                (source_file_path.to_string(), Some(json_path.to_string()))
+            }
+        } else {
+            (file_path.to_string(), None)
+        }
+    }
+
+    async fn read_snapshot(&self) -> Result<HashMap<String, serde_json::Value>, String> {
+        if self.only_read_file {
+            Self::load_map_from_path(self.source_file_path.as_str(), self.json_path.as_deref())
+                .await
+        } else {
+            Ok(self.map.read().unwrap().clone())
+        }
+    }
+
+    fn read_only_err(&self) -> String {
+        format!(
+            "json_map {} is read-only because only_read_file is enabled",
+            self.file_path
+        )
+    }
+
     pub async fn save(&self) -> Result<(), String> {
+        if self.only_read_file {
+            return Err(self.read_only_err());
+        }
         let content = {
             let map = self.map.read().unwrap();
             serde_json::to_string(map.deref()).map_err(|e| e.to_string())?
         };
-        tokio::fs::write(self.file_path.as_str(), content).await.map_err(|e| e.to_string())?;
+        tokio::fs::write(self.source_file_path.as_str(), content)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 }
 #[async_trait::async_trait]
 impl MapCollection for JsonMap {
     async fn len(&self) -> Result<usize, String> {
-        Ok(self.map.read().unwrap().len())
+        Ok(self.read_snapshot().await?.len())
     }
 
     async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
+        if self.only_read_file {
+            return Err(self.read_only_err());
+        }
         let json_value = collection_value_to_json_value(&value).await;
         {
             let mut map = self.map.write().unwrap();
@@ -295,26 +414,43 @@ impl MapCollection for JsonMap {
         Ok(true)
     }
 
-    async fn insert(&self, key: &str, value: CollectionValue) -> Result<Option<CollectionValue>, String> {
+    async fn insert(
+        &self,
+        key: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
+        if self.only_read_file {
+            return Err(self.read_only_err());
+        }
         let json_value = collection_value_to_json_value(&value).await;
         let old = {
             let mut map = self.map.write().unwrap();
             map.insert(key.to_string(), json_value)
         };
         self.save().await?;
-        Ok(old.map(|v| json_value_to_collection_value(&v)))
+        Ok(match old {
+            Some(v) => Some(json_value_to_collection_value(&v).await),
+            None => None,
+        })
     }
 
     async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
-        let map = self.map.read().unwrap();
-        Ok(map.get(key).map(|v| json_value_to_collection_value(v)))
+        let map = self.read_snapshot().await?;
+        if let Some(value) = map.get(key) {
+            Ok(Some(json_value_to_collection_value(value).await))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
-        Ok(self.map.read().unwrap().contains_key(key))
+        Ok(self.read_snapshot().await?.contains_key(key))
     }
 
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        if self.only_read_file {
+            return Err(self.read_only_err());
+        }
         let value = {
             let mut map = self.map.write().unwrap();
             if !map.contains_key(key) {
@@ -323,38 +459,38 @@ impl MapCollection for JsonMap {
             map.remove(key)
         };
         self.save().await?;
-        Ok(value.map(|v| json_value_to_collection_value(&v)))
+        Ok(match value {
+            Some(v) => Some(json_value_to_collection_value(&v).await),
+            None => None,
+        })
     }
 
     async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String> {
-        let map = {
-            let map = self.map.read().unwrap();
-            map.clone()
-        };
+        let map = self.read_snapshot().await?;
         for (key, value) in map {
-            let value = json_value_to_collection_value(&value);
+            let value = json_value_to_collection_value(&value).await;
             callback.call(key.as_str(), &value).await?;
         }
         Ok(())
     }
 
     async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
-        let map = {
-            let map = self.map.read().unwrap();
-            map.clone()
-        };
+        let map = self.read_snapshot().await?;
+        let mut result = Vec::with_capacity(map.len());
+        for (key, value) in map {
+            result.push((key, json_value_to_collection_value(&value).await));
+        }
 
-        Ok(map.into_iter().map(|(key, value)| (key, json_value_to_collection_value(&value))).collect())
+        Ok(result)
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
     use super::*;
-    use serde_json::json;
     use cyfs_process_chain::MemorySetCollection;
+    use serde_json::json;
+    use std::io::Write;
 
     #[tokio::test]
     async fn test_json_to_map() {
@@ -380,9 +516,15 @@ mod tests {
     #[tokio::test]
     async fn test_map_to_json() {
         let map = MemoryMapCollection::new_ref();
-        map.insert("name", CollectionValue::String("test".to_string())).await.unwrap();
-        map.insert("count", CollectionValue::String("42".to_string())).await.unwrap();
-        map.insert("enabled", CollectionValue::String("true".to_string())).await.unwrap();
+        map.insert("name", CollectionValue::String("test".to_string()))
+            .await
+            .unwrap();
+        map.insert("count", CollectionValue::String("42".to_string()))
+            .await
+            .unwrap();
+        map.insert("enabled", CollectionValue::String("true".to_string()))
+            .await
+            .unwrap();
 
         let json = map.to_json().await.unwrap();
 
@@ -404,7 +546,26 @@ mod tests {
         let map = MapCollectionRef::from_json(&json).await.unwrap();
 
         let user = map.get("user").await.unwrap().unwrap();
-        assert!(user.to_string().contains("Alice"));
+        let user = match user {
+            CollectionValue::Map(user) => user,
+            other => panic!("expected map, got {}", other.get_type()),
+        };
+        assert_eq!(
+            user.get("name").await.unwrap().unwrap().to_string(),
+            "Alice"
+        );
+        assert_eq!(user.get("age").await.unwrap().unwrap().to_string(), "30");
+
+        let tags = map.get("tags").await.unwrap().unwrap();
+        let tags = match tags {
+            CollectionValue::List(tags) => tags,
+            other => panic!("expected list, got {}", other.get_type()),
+        };
+        assert_eq!(tags.get(0).await.unwrap().unwrap().to_string(), "rust");
+        assert_eq!(
+            tags.get(1).await.unwrap().unwrap().to_string(),
+            "programming"
+        );
     }
 
     #[tokio::test]
@@ -430,7 +591,10 @@ mod tests {
         set.insert("b").await.unwrap();
 
         let nested_map = MemoryMapCollection::new_ref();
-        nested_map.insert("k", CollectionValue::String("1".to_string())).await.unwrap();
+        nested_map
+            .insert("k", CollectionValue::String("1".to_string()))
+            .await
+            .unwrap();
 
         let set_json = collection_value_to_json_value(&CollectionValue::Set(set)).await;
         assert!(set_json.as_array().is_some());
@@ -542,5 +706,102 @@ mod tests {
         }
         assert_eq!(entries_map.get("key1"), Some(&"updated".to_string()));
         assert_eq!(entries_map.get("key2"), Some(&"second".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_json_map_only_read_file_reload_on_every_read() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(br#"{"test": "value1"}"#).unwrap();
+        file.flush().unwrap();
+        let path = file.path().to_string_lossy().to_string();
+
+        let map = JsonMap::open(path.as_str(), true).await.unwrap();
+        let value = map.get("test").await.unwrap().unwrap();
+        assert_eq!(value.to_string(), "value1");
+
+        std::fs::write(path.as_str(), br#"{"test": "value2", "new_key": 1}"#).unwrap();
+
+        let value = map.get("test").await.unwrap().unwrap();
+        assert_eq!(value.to_string(), "value2");
+        assert!(map.contains_key("new_key").await.unwrap());
+        assert_eq!(map.len().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_json_map_only_read_file_rejects_write_operations() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(br#"{"test": "value"}"#).unwrap();
+        file.flush().unwrap();
+        let path = file.path().to_string_lossy().to_string();
+
+        let map = JsonMap::open(path.as_str(), true).await.unwrap();
+
+        let err = map
+            .insert("test", CollectionValue::String("changed".to_string()))
+            .await
+            .unwrap_err();
+        assert!(err.contains("only_read_file"));
+
+        let err = map
+            .insert_new("new_key", CollectionValue::String("value".to_string()))
+            .await
+            .unwrap_err();
+        assert!(err.contains("only_read_file"));
+
+        let err = map.remove("test").await.unwrap_err();
+        assert!(err.contains("only_read_file"));
+
+        let content = std::fs::read_to_string(path).unwrap();
+        assert_eq!(content, r#"{"test": "value"}"#);
+    }
+
+    #[tokio::test]
+    async fn test_json_map_reads_object_as_map() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(br#"{"app":{"appid":"filebrowser","url":"http://127.0.0.1:10160"}}"#)
+            .unwrap();
+        file.flush().unwrap();
+        let path = file.path().to_string_lossy().to_string();
+
+        let map = JsonMap::open(path.as_str(), true).await.unwrap();
+        let app = map.get("app").await.unwrap().unwrap();
+        assert_eq!(app.get_type(), "Map");
+
+        let app = match app {
+            CollectionValue::Map(app) => app,
+            other => panic!("expected map, got {}", other.get_type()),
+        };
+
+        let appid = app.get("appid").await.unwrap().unwrap();
+        assert_eq!(appid.to_string(), "filebrowser");
+        let url = app.get("url").await.unwrap().unwrap();
+        assert_eq!(url.to_string(), "http://127.0.0.1:10160");
+    }
+
+    #[tokio::test]
+    async fn test_json_map_reads_object_from_json_path() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"{"app_info":{"appid":"filebrowser","url":"http://127.0.0.1:10160"},"other":{"k":"v"}}"#,
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let path = format!("{}#app_info", file.path().to_string_lossy());
+
+        let map = JsonMap::open(path.as_str(), true).await.unwrap();
+        let appid = map.get("appid").await.unwrap().unwrap();
+        assert_eq!(appid.to_string(), "filebrowser");
+        let url = map.get("url").await.unwrap().unwrap();
+        assert_eq!(url.to_string(), "http://127.0.0.1:10160");
+        assert!(!map.contains_key("other").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_json_map_json_path_requires_only_read_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = format!("{}#app_info", file.path().to_string_lossy());
+
+        let err = JsonMap::open(path.as_str(), false).await.err().unwrap();
+        assert!(err.contains("only_read_file=true"));
     }
 }

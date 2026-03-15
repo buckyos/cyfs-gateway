@@ -1,9 +1,11 @@
 use super::var::VariableVisitorRef;
+use indexmap::{IndexMap, IndexSet};
 use std::any::Any;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 pub type AnyRef = Arc<dyn Any + Send + Sync>;
+pub type OrderedStringSet = IndexSet<String>;
+pub type OrderedStringMap<V> = IndexMap<String, V>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum NumberValue {
@@ -217,10 +219,7 @@ impl TypedValue {
         if let TypedValue::String(s) = self {
             Ok(s)
         } else {
-            let msg = format!(
-                "Expected TypedValue::String, found {}",
-                self.get_type(),
-            );
+            let msg = format!("Expected TypedValue::String, found {}", self.get_type(),);
             warn!("{}", msg);
             Err(msg)
         }
@@ -347,10 +346,7 @@ impl TypedValue {
         if let TypedValue::MultiMap(mm) = self {
             Ok(mm)
         } else {
-            let msg = format!(
-                "Expected TypedValue::MultiMap, found {}",
-                self.get_type(),
-            );
+            let msg = format!("Expected TypedValue::MultiMap, found {}", self.get_type(),);
             warn!("{}", msg);
             Err(msg)
         }
@@ -367,10 +363,7 @@ impl TypedValue {
     pub fn is_collection(&self) -> bool {
         matches!(
             self,
-            TypedValue::List(_)
-                | TypedValue::Set(_)
-                | TypedValue::Map(_)
-                | TypedValue::MultiMap(_)
+            TypedValue::List(_) | TypedValue::Set(_) | TypedValue::Map(_) | TypedValue::MultiMap(_)
         )
     }
 
@@ -495,11 +488,7 @@ pub trait ListCollection: Send + Sync {
 
     /// Sets the value at the specified index.
     /// Returns previous value if index already existed.
-    async fn set(
-        &self,
-        index: usize,
-        value: TypedValue,
-    ) -> Result<Option<TypedValue>, String>;
+    async fn set(&self, index: usize, value: TypedValue) -> Result<Option<TypedValue>, String>;
 
     /// Gets the value at the specified index.
     async fn get(&self, index: usize) -> Result<Option<TypedValue>, String>;
@@ -541,6 +530,12 @@ pub trait ListCollection: Send + Sync {
 
 pub type ListCollectionRef = Arc<Box<dyn ListCollection>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraverseControl {
+    Continue,
+    Break,
+}
+
 #[async_trait::async_trait]
 pub trait MapCollectionTraverseCallBack: Send + Sync {
     /// Traverse the collection and apply the callback to each key-value pair.
@@ -549,6 +544,32 @@ pub trait MapCollectionTraverseCallBack: Send + Sync {
 }
 
 pub type MapCollectionTraverseCallBackRef = Arc<Box<dyn MapCollectionTraverseCallBack>>;
+
+#[async_trait::async_trait]
+pub trait MapCollectionTraverseOwnedCallBack: Send + Sync {
+    /// Traverse the collection and apply the callback to each owned key-value pair.
+    /// Return `TraverseControl::Break` to stop traversal.
+    async fn call(&self, key: String, value: TypedValue) -> Result<TraverseControl, String>;
+}
+
+pub type MapCollectionTraverseOwnedCallBackRef = Arc<Box<dyn MapCollectionTraverseOwnedCallBack>>;
+
+#[async_trait::async_trait]
+pub trait MapCollectionCursor: Send {
+    /// Returns next owned key-value pair, or None when cursor reaches the end.
+    async fn next(&mut self) -> Result<Option<(String, TypedValue)>, String>;
+}
+
+struct DumpMapCollectionCursor {
+    iter: std::vec::IntoIter<(String, TypedValue)>,
+}
+
+#[async_trait::async_trait]
+impl MapCollectionCursor for DumpMapCollectionCursor {
+    async fn next(&mut self) -> Result<Option<(String, TypedValue)>, String> {
+        Ok(self.iter.next())
+    }
+}
 
 #[async_trait::async_trait]
 pub trait MapCollection: Send + Sync {
@@ -560,11 +581,7 @@ pub trait MapCollection: Send + Sync {
     async fn insert_new(&self, key: &str, value: TypedValue) -> Result<bool, String>;
 
     /// Sets the value for the given key in the collection.
-    async fn insert(
-        &self,
-        key: &str,
-        value: TypedValue,
-    ) -> Result<Option<TypedValue>, String>;
+    async fn insert(&self, key: &str, value: TypedValue) -> Result<Option<TypedValue>, String>;
 
     /// Gets the value for the given key from the collection.
     async fn get(&self, key: &str) -> Result<Option<TypedValue>, String>;
@@ -577,6 +594,37 @@ pub trait MapCollection: Send + Sync {
 
     // Traverses the collection and applies the callback to each key-value pair.
     async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String>;
+
+    /// Returns an owned cursor for this collection.
+    /// Default implementation uses `dump()`, and can be overridden by concrete collections
+    /// for better performance.
+    async fn cursor_owned(&self) -> Result<Box<dyn MapCollectionCursor>, String> {
+        let entries = self.dump().await?;
+        Ok(Box::new(DumpMapCollectionCursor {
+            iter: entries.into_iter(),
+        }))
+    }
+
+    /// Traverses the collection using owned key-value pairs and explicit control flow.
+    async fn traverse_owned(
+        &self,
+        callback: MapCollectionTraverseOwnedCallBackRef,
+    ) -> Result<(), String> {
+        let mut cursor = self.cursor_owned().await?;
+        while let Some((key, value)) = cursor.next().await? {
+            if callback.call(key, value).await? == TraverseControl::Break {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a key snapshot for traversal-oriented read paths.
+    /// Implementations should prefer cloning only keys (not values) to reduce copy overhead.
+    async fn keys_snapshot(&self) -> Result<Vec<String>, String> {
+        let entries = self.dump().await?;
+        Ok(entries.into_iter().map(|(key, _)| key).collect())
+    }
 
     /// Checks if the collection is flushable.
     fn is_flushable(&self) -> bool {
@@ -604,6 +652,43 @@ pub trait MultiMapCollectionTraverseCallBack: Send + Sync {
 }
 
 pub type MultiMapCollectionTraverseCallBackRef = Arc<Box<dyn MultiMapCollectionTraverseCallBack>>;
+
+#[async_trait::async_trait]
+pub trait MultiMapCollectionKeyTraverseCallBack: Send + Sync {
+    /// Traverse the collection and apply the callback to each key.
+    /// If the callback returns false, the traversal stops.
+    async fn call(&self, key: &str) -> Result<bool, String>;
+}
+
+pub type MultiMapCollectionKeyTraverseCallBackRef =
+    Arc<Box<dyn MultiMapCollectionKeyTraverseCallBack>>;
+
+#[async_trait::async_trait]
+pub trait MultiMapCollectionTraverseOwnedCallBack: Send + Sync {
+    /// Traverse the collection and apply the callback to each owned key-values pair.
+    /// Return `TraverseControl::Break` to stop traversal.
+    async fn call(&self, key: String, values: OrderedStringSet) -> Result<TraverseControl, String>;
+}
+
+pub type MultiMapCollectionTraverseOwnedCallBackRef =
+    Arc<Box<dyn MultiMapCollectionTraverseOwnedCallBack>>;
+
+#[async_trait::async_trait]
+pub trait MultiMapCollectionCursor: Send {
+    /// Returns next owned key-values pair, or None when cursor reaches the end.
+    async fn next(&mut self) -> Result<Option<(String, OrderedStringSet)>, String>;
+}
+
+struct DumpMultiMapCollectionCursor {
+    iter: std::vec::IntoIter<(String, OrderedStringSet)>,
+}
+
+#[async_trait::async_trait]
+impl MultiMapCollectionCursor for DumpMultiMapCollectionCursor {
+    async fn next(&mut self) -> Result<Option<(String, OrderedStringSet)>, String> {
+        Ok(self.iter.next())
+    }
+}
 
 #[async_trait::async_trait]
 pub trait MultiMapCollection: Send + Sync {
@@ -648,7 +733,52 @@ pub trait MultiMapCollection: Send + Sync {
 
     /// Traverses the collection and applies the callback to each key-value pair.
     async fn traverse(&self, callback: MultiMapCollectionTraverseCallBackRef)
-        -> Result<(), String>;
+    -> Result<(), String>;
+
+    /// Traverses the collection and applies the callback to each key.
+    async fn traverse_keys(
+        &self,
+        callback: MultiMapCollectionKeyTraverseCallBackRef,
+    ) -> Result<(), String> {
+        let keys = self.keys_snapshot().await?;
+        for key in keys {
+            if !callback.call(&key).await? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns an owned cursor for this collection.
+    /// Default implementation uses `dump()`, and can be overridden by concrete collections
+    /// for better performance.
+    async fn cursor_owned(&self) -> Result<Box<dyn MultiMapCollectionCursor>, String> {
+        let entries = self.dump().await?;
+        Ok(Box::new(DumpMultiMapCollectionCursor {
+            iter: entries.into_iter(),
+        }))
+    }
+
+    /// Traverses the collection using owned key-values pairs and explicit control flow.
+    async fn traverse_owned(
+        &self,
+        callback: MultiMapCollectionTraverseOwnedCallBackRef,
+    ) -> Result<(), String> {
+        let mut cursor = self.cursor_owned().await?;
+        while let Some((key, values)) = cursor.next().await? {
+            if callback.call(key, values).await? == TraverseControl::Break {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a key snapshot for traversal-oriented read paths.
+    /// Implementations should prefer cloning only keys to reduce copy overhead.
+    async fn keys_snapshot(&self) -> Result<Vec<String>, String> {
+        let entries = self.dump().await?;
+        Ok(entries.into_iter().map(|(key, _)| key).collect())
+    }
 
     /// Checks if the collection is flushable.
     fn is_flushable(&self) -> bool {
@@ -663,7 +793,7 @@ pub trait MultiMapCollection: Send + Sync {
     }
 
     /// Dumps the collection to a vector of key-value pairs.
-    async fn dump(&self) -> Result<Vec<(String, HashSet<String>)>, String>;
+    async fn dump(&self) -> Result<Vec<(String, OrderedStringSet)>, String>;
 }
 
 pub type MultiMapCollectionRef = Arc<Box<dyn MultiMapCollection>>;

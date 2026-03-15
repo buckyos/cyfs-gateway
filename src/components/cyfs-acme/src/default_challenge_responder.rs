@@ -1,5 +1,5 @@
-use std::sync::{Arc, Weak};
 use crate::{AcmeCertManager, AcmeChallengeResponder, Challenge};
+use std::sync::{Arc, Weak};
 
 pub(crate) struct DefaultChallengeResponder {
     cert_mgr: Weak<AcmeCertManager>,
@@ -15,7 +15,10 @@ impl DefaultChallengeResponder {
 
 #[async_trait::async_trait]
 impl AcmeChallengeResponder for DefaultChallengeResponder {
-    async fn respond_challenge<'a>(&self, challenges: &'a [Challenge]) -> anyhow::Result<&'a Challenge> {
+    async fn respond_challenge<'a>(
+        &self,
+        challenges: &'a [Challenge],
+    ) -> anyhow::Result<&'a Challenge> {
         if let Some(cert_mgr) = self.cert_mgr.upgrade() {
             cert_mgr.respond_challenge(challenges).await
         } else {

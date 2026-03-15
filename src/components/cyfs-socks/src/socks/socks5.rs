@@ -5,12 +5,16 @@ use super::util::{parse_hook_point_return_value, ProxyAccessMethod, Socks5Util};
 use crate::error::{SocksError, SocksResult};
 use crate::hook::*;
 use buckyos_kit::AsyncStream;
-use cyfs_gateway_lib::{StreamInfo};
+use cyfs_gateway_lib::StreamInfo;
 use cyfs_process_chain::{CollectionValue, CommandControl, EnvExternal};
-use fast_socks5::{server::{Config, SimpleUserPassword}, util::target_addr::TargetAddr, Socks5Command};
+use fast_socks5::server::Socks5Socket;
+use fast_socks5::{
+    server::{Config, SimpleUserPassword},
+    util::target_addr::TargetAddr,
+    Socks5Command,
+};
 use once_cell::sync::OnceCell;
 use std::sync::{Arc, Mutex};
-use fast_socks5::server::{Socks5Socket};
 use tokio::{net::TcpStream, task::JoinHandle};
 use url::Url;
 
@@ -127,14 +131,20 @@ impl Socks5Proxy {
         }
     }
 
-    async fn build_data_tunnel(&self,
-                               proxy: Option<Url>,
-                               target: &TargetAddr) -> SocksResult<Box<dyn AsyncStream>> {
+    async fn build_data_tunnel(
+        &self,
+        proxy: Option<Url>,
+        target: &TargetAddr,
+    ) -> SocksResult<Box<dyn AsyncStream>> {
         debug!("Will build tunnel for {}", target);
 
         if let Some(builder) = self.data_tunnel_provider.get() {
             builder
-                .build(target, proxy.as_ref().unwrap_or(&self.config.target), &self.config.enable_tunnel)
+                .build(
+                    target,
+                    proxy.as_ref().unwrap_or(&self.config.target),
+                    &self.config.enable_tunnel,
+                )
                 .await
         } else {
             let msg = format!(
@@ -188,9 +198,7 @@ impl Socks5Proxy {
                 }
             }
         } else {
-            let msg = format!(
-                "Socks hook point returned {:?}, will use direct", ret
-            );
+            let msg = format!("Socks hook point returned {:?}, will use direct", ret);
             warn!("{}", msg);
             "DIRECT".to_string()
         };
@@ -231,12 +239,11 @@ impl Socks5Proxy {
                     target, proxy_target
                 );
                 let proxy = if let Some(proxy_target) = proxy_target {
-                    let url = Url::parse(proxy_target.as_str())
-                        .map_err(|e| {
-                            let msg = format!("parse proxy {} failed. {:?}", proxy_target, e);
-                            error!("{}", msg);
-                            SocksError::InvalidParam(msg)
-                        })?;
+                    let url = Url::parse(proxy_target.as_str()).map_err(|e| {
+                        let msg = format!("parse proxy {} failed. {:?}", proxy_target, e);
+                        error!("{}", msg);
+                        SocksError::InvalidParam(msg)
+                    })?;
                     Some(url)
                 } else {
                     None

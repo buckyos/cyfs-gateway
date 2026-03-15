@@ -80,9 +80,7 @@ pub struct RuleFileTargetLoader {
 impl RuleFileTargetLoader {
     pub fn new(target: RuleFileTarget) -> Self {
         // Create a new RuleFileLoader to load a rule file from a local path.
-        Self {
-            target,
-        }
+        Self { target }
     }
 
     pub fn target(&self) -> &RuleFileTarget {
@@ -214,12 +212,13 @@ impl RuleFileLoader {
             match item {
                 RuleConfigItem::Include { file } => {
                     let s = self.try_load_rule_file(&file).await?;
-                    let include_items: Vec<RuleConfigItem> = serde_json::from_str(&s).map_err(|e| {
-                        let msg = format!("Failed to parse rule file: {:?}", e);
-                        error!("{}", msg);
-                        RuleError::InvalidFormat(msg)
-                    })?;
-                    
+                    let include_items: Vec<RuleConfigItem> =
+                        serde_json::from_str(&s).map_err(|e| {
+                            let msg = format!("Failed to parse rule file: {:?}", e);
+                            error!("{}", msg);
+                            RuleError::InvalidFormat(msg)
+                        })?;
+
                     all.extend(include_items);
                 }
                 _ => {
@@ -227,17 +226,13 @@ impl RuleFileLoader {
                 }
             }
         }
-        
+
         let mut result = Vec::new();
         for item in all.into_iter() {
             match self.load_rule_item(&item).await {
                 Ok(selector) => {
-
                     let _type = item.get_type();
-                    let rule_item = RuleItem {
-                        _type,
-                        selector,
-                    };
+                    let rule_item = RuleItem { _type, selector };
 
                     result.push(rule_item);
                 }
@@ -293,7 +288,7 @@ impl RuleFileLoader {
 
                 Self::load_pac_selector(target).await
             }
-            RuleConfigItem::Include { file: _} => {
+            RuleConfigItem::Include { file: _ } => {
                 // Load the included file
                 let msg = format!("Invalid rule item: {:?}", item);
                 error!("{}", msg);
@@ -316,7 +311,6 @@ impl RuleFileLoader {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

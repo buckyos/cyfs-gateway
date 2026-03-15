@@ -4,7 +4,7 @@
 
 - crate: `cyfs-process-chain`
 - version: `0.5.1`
-- updated: `2026-03-02`
+- updated: `2026-03-09`
 
 ## 1. 工程定位
 
@@ -240,6 +240,15 @@
 - `Map`
 - `MultiMap`
 
+### 9.1 顺序语义（确定性遍历）
+
+当前 `Set/Map/MultiMap` 在内存和 JSON 后端统一使用有序容器实现（`IndexSet` / `IndexMap`）：
+
+- 遍历相关接口（`traverse` / `get_all` / `keys_snapshot` / `dump`）遵循插入顺序。
+- 对已存在 key/value 的重复 `insert` 不会改变其相对顺序。
+- 删除语义使用“稳定删除”（保留剩余元素相对顺序）。
+- `MultiMap.get(key)` 返回该 key 下“首个插入”的 value。
+
 当前落地状态：
 
 - 内存集合：已实现。
@@ -292,4 +301,5 @@ workspace 内以下组件直接依赖本 crate：
 ## 13. 参考文档
 
 - 命令级帮助请看 [COMMAND_REFERENCE.md](./COMMAND_REFERENCE.md)。
+- 中文对照版请看 [COMMAND_REFERENCE.zh-CN.md](./COMMAND_REFERENCE.zh-CN.md)。
 - 该文件中的 external 命令基于 REPL 默认注册集合；实际网关运行时以业务注册为准。

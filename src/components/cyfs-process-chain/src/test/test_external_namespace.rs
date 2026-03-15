@@ -116,7 +116,7 @@ async fn test_call_external_namespace_scope_mismatch() -> Result<(), String> {
     let err = match hook_point_env.link_hook_point(&hook_point).await {
         Ok(_) => {
             return Err(
-                "link_hook_point should fail when local:: command does not exist".to_string()
+                "link_hook_point should fail when local:: command does not exist".to_string(),
             );
         }
         Err(err) => err,

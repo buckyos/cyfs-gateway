@@ -18,7 +18,10 @@ impl ProxyTcpTunnel {
         Self { source_addr }
     }
 
-    async fn open_stream_by_target(&self, target: &str) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+    async fn open_stream_by_target(
+        &self,
+        target: &str,
+    ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         let stream = percent_decode(target.as_bytes())
             .decode_utf8()
             .map_err(|e| Error::new(std::io::ErrorKind::InvalidInput, e))?

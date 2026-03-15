@@ -262,10 +262,7 @@ impl CommandResult {
     }
 
     pub fn return_with_value(level: CommandControlLevel, value: CollectionValue) -> Self {
-        Self::Control(CommandControl::Return(CommandControlValue {
-            level,
-            value,
-        }))
+        Self::Control(CommandControl::Return(CommandControlValue { level, value }))
     }
 
     pub fn return_error(level: CommandControlLevel) -> Self {
@@ -280,10 +277,7 @@ impl CommandResult {
     }
 
     pub fn return_error_with_value(level: CommandControlLevel, value: CollectionValue) -> Self {
-        Self::Control(CommandControl::Error(CommandControlValue {
-            level,
-            value,
-        }))
+        Self::Control(CommandControl::Error(CommandControlValue { level, value }))
     }
 
     pub fn exit_chain() -> Self {

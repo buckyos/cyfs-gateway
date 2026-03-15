@@ -2,14 +2,14 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::{
-    create_process_chain_executor, get_external_commands, GlobalCollectionManagerRef,
-    GlobalProcessChainsRef, JsExternalsManagerRef, ProcessChainConfigs, ServerManagerWeakRef,
-};
 use crate::ConfigResult;
+use crate::{
+    GlobalCollectionManagerRef, GlobalProcessChainsRef, JsExternalsManagerRef, ProcessChainConfigs,
+    ServerManagerWeakRef, create_process_chain_executor, get_external_commands,
+};
 use log::{debug, error, info};
 use tokio::task::JoinHandle;
-use tokio::time::{interval_at, Instant};
+use tokio::time::{Instant, interval_at};
 
 #[derive(Clone)]
 pub struct TimerTaskConfig {

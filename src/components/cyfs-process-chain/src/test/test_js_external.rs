@@ -95,7 +95,8 @@ fn new_test_data_dir(scope: &str) -> Result<PathBuf, String> {
         .map_err(|e| format!("system time error: {}", e))?
         .as_nanos();
     let pid = std::process::id();
-    let data_dir = std::env::temp_dir().join(format!("cyfs-process-chain-{}-{}-{}", scope, pid, ts));
+    let data_dir =
+        std::env::temp_dir().join(format!("cyfs-process-chain-{}-{}-{}", scope, pid, ts));
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("create test data dir {:?} failed: {}", data_dir, e))?;
     Ok(data_dir)
@@ -140,4 +141,3 @@ async fn test_js_external_command_usage() -> Result<(), String> {
 
     Ok(())
 }
-

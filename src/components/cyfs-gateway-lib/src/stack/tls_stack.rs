@@ -1,40 +1,38 @@
 use crate::global_process_chains::{
-    create_process_chain_executor, execute_stream_chain, GlobalProcessChainsRef,
+    GlobalProcessChainsRef, create_process_chain_executor, execute_stream_chain,
 };
+use crate::self_cert_mgr::SelfCertMgrRef;
+use crate::stack::limiter::Limiter;
+use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
+use crate::stack::{TlsCertResolver, get_limit_info, get_source_addr_from_req_env, stream_forward};
 use crate::{
-    create_io_dump_stack_config,
-    get_external_commands, get_stat_info, hyper_serve_http, into_stack_err, stack_err,
-    DumpStream, IoDumpStackConfig,
-    ConnectionInfo, ConnectionManagerRef, HandleConnectionController, LimiterManagerRef, StatManagerRef,
-    MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs,
-    Server, ServerManagerRef, Stack, StackCertConfig, StackConfig, StackContext, StackErrorCode,
-    StackProtocol, StackResult, StreamInfo, TunnelManager, GlobalCollectionManagerRef,
-    JsExternalsManagerRef,
+    ConnectionInfo, ConnectionManagerRef, DumpStream, GlobalCollectionManagerRef,
+    HandleConnectionController, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
+    MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs, Server, ServerManagerRef,
+    Stack, StackCertConfig, StackConfig, StackContext, StackErrorCode, StackProtocol, StackResult,
+    StatManagerRef, StreamInfo, TunnelManager, create_io_dump_stack_config, get_external_commands,
+    get_stat_info, hyper_serve_http, into_stack_err, stack_err,
 };
+use cyfs_acme::{ACME_TLS_ALPN_NAME, AcmeCertManagerRef, AcmeItem, ChallengeType};
+use cyfs_process_chain::PrefixedStream;
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor, StreamRequest};
-pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
+use rustls::pki_types::pem::PemObject;
+pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::server::ResolvesServerCert;
+use rustls::sign::CertifiedKey;
+use serde::{Deserialize, Serialize};
+use sfo_io::{LimitStream, StatStream};
 use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::sync::{Arc, Mutex, RwLock};
-use rustls::pki_types::pem::PemObject;
-use rustls::server::ResolvesServerCert;
-use rustls::sign::CertifiedKey;
-use sfo_io::{LimitStream, StatStream};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
-use crate::stack::{get_limit_info, get_source_addr_from_req_env, stream_forward, TlsCertResolver};
-use serde::{Deserialize, Serialize};
-use cyfs_acme::{AcmeCertManagerRef, AcmeItem, ChallengeType, ACME_TLS_ALPN_NAME};
-use cyfs_process_chain::PrefixedStream;
-use crate::self_cert_mgr::SelfCertMgrRef;
-use crate::stack::limiter::Limiter;
-use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
 
 const MAX_PROXY_READ_SIZE: usize = 4096;
 const PROXY_V1_PREFIX: &[u8; 6] = b"PROXY ";
@@ -53,25 +51,24 @@ enum ProxyProbeResult {
 }
 
 pub async fn load_certs(path: &str) -> StackResult<Vec<CertificateDer<'static>>> {
-    let certs = CertificateDer::pem_file_iter(path).map_err(
-        into_stack_err!(
+    let certs = CertificateDer::pem_file_iter(path)
+        .map_err(into_stack_err!(
             StackErrorCode::InvalidTlsCert,
             "failed to parse certificate, file:{}",
             path
-        )
-    )?.filter(|item| item.is_ok())
-        .map(|item| item.unwrap()).collect();
+        ))?
+        .filter(|item| item.is_ok())
+        .map(|item| item.unwrap())
+        .collect();
     Ok(certs)
 }
 
 pub async fn load_key(path: &str) -> StackResult<PrivateKeyDer<'static>> {
-    PrivateKeyDer::from_pem_file(path).map_err(
-        into_stack_err!(
-            StackErrorCode::InvalidTlsKey,
-            "failed to parse private key, file:{}",
-            path
-        )
-    )
+    PrivateKeyDer::from_pem_file(path).map_err(into_stack_err!(
+        StackErrorCode::InvalidTlsKey,
+        "failed to parse private key, file:{}",
+        path
+    ))
 }
 pub async fn create_server_config(
     cert_path: &str,
@@ -87,9 +84,7 @@ pub async fn create_server_config(
     ))
 }
 
-async fn build_tls_domain_configs(
-    certs: &[StackCertConfig],
-) -> StackResult<Vec<TlsDomainConfig>> {
+async fn build_tls_domain_configs(certs: &[StackCertConfig]) -> StackResult<Vec<TlsDomainConfig>> {
     let mut cert_list = Vec::with_capacity(certs.len());
     for cert_config in certs.iter() {
         if cert_config.cert_path.is_some() && cert_config.key_path.is_some() {
@@ -186,7 +181,10 @@ impl TlsConnectionHandler {
             let read = stream
                 .read(&mut buffer[total..])
                 .await
-                .map_err(into_stack_err!(StackErrorCode::StreamError, "read stream for proxy protocol failed"))?;
+                .map_err(into_stack_err!(
+                    StackErrorCode::StreamError,
+                    "read stream for proxy protocol failed"
+                ))?;
 
             if read == 0 {
                 if total == 0 {
@@ -377,8 +375,8 @@ impl TlsConnectionHandler {
             Some(get_external_commands(Arc::downgrade(&env.servers))),
             env.js_externals.clone(),
         )
-            .await
-            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        .await
+        .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let certs = Self::build_cert_resolver(certs, env.as_ref())?;
         Ok(Self {
             env,
@@ -390,10 +388,7 @@ impl TlsConnectionHandler {
         })
     }
 
-    async fn rebuild_with_hook_point(
-        &self,
-        hook_point: ProcessChainConfigs,
-    ) -> StackResult<Self> {
+    async fn rebuild_with_hook_point(&self, hook_point: ProcessChainConfigs) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
             self.env.global_process_chains.clone(),
@@ -401,8 +396,8 @@ impl TlsConnectionHandler {
             Some(get_external_commands(Arc::downgrade(&self.env.servers))),
             self.env.js_externals.clone(),
         )
-            .await
-            .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        .await
+        .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         Ok(Self {
             env: self.env.clone(),
             executor,
@@ -427,11 +422,23 @@ impl TlsConnectionHandler {
                 continue;
             }
             if let (Some(certs), Some(key)) = (cert_config.certs, cert_config.key) {
-                let cert_key = CertifiedKey::from_der(certs, key, &crypto_provider)
-                    .map_err(into_stack_err!(StackErrorCode::InvalidTlsCert, "parse {} cert failed", cert_config.domain))?;
+                let cert_key = CertifiedKey::from_der(certs, key, &crypto_provider).map_err(
+                    into_stack_err!(
+                        StackErrorCode::InvalidTlsCert,
+                        "parse {} cert failed",
+                        cert_config.domain
+                    ),
+                )?;
                 cert_resolver
                     .add(&cert_config.domain, cert_key)
-                    .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "add {} cert failed.err {}", cert_config.domain, e))?;
+                    .map_err(|e| {
+                        stack_err!(
+                            StackErrorCode::InvalidConfig,
+                            "add {} cert failed.err {}",
+                            cert_config.domain,
+                            e
+                        )
+                    })?;
             } else {
                 env.acme_manager
                     .add_acme_item(AcmeItem::new(
@@ -443,7 +450,10 @@ impl TlsConnectionHandler {
             }
         }
         let cert: Arc<dyn ResolvesServerCert> = if self_cert {
-            Arc::new(TlsCertResolver::new(cert_resolver, Some(env.self_cert_mgr.clone())))
+            Arc::new(TlsCertResolver::new(
+                cert_resolver,
+                Some(env.self_cert_mgr.clone()),
+            ))
         } else {
             cert_resolver
         };
@@ -458,22 +468,24 @@ impl TlsConnectionHandler {
     ) -> StackResult<()> {
         let servers = self.env.servers.clone();
         let executor = self.executor.fork();
-        let remote_addr = stream
-            .raw_stream()
-            .peer_addr()
-            .map_err(into_stack_err!(StackErrorCode::ServerError, "read remote addr failed"))?;
-        let (stream, proxy_source_addr) = Self::probe_proxy_protocol_stream(Box::new(stream)).await?;
+        let remote_addr = stream.raw_stream().peer_addr().map_err(into_stack_err!(
+            StackErrorCode::ServerError,
+            "read remote addr failed"
+        ))?;
+        let (stream, proxy_source_addr) =
+            Self::probe_proxy_protocol_stream(Box::new(stream)).await?;
         let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
 
-        let mut server_config = ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-            .unwrap()
-            .with_no_client_auth()
-            .with_cert_resolver(self.certs.clone());
+        let mut server_config =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(self.certs.clone());
         server_config.alpn_protocols = self.alpn_protocols.clone();
-        server_config.alpn_protocols.push(ACME_TLS_ALPN_NAME.to_vec());
+        server_config
+            .alpn_protocols
+            .push(ACME_TLS_ALPN_NAME.to_vec());
 
         let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
         let tls_stream = tls_acceptor
@@ -511,16 +523,17 @@ impl TlsConnectionHandler {
                 server_name.as_ref().unwrap_or(&"".to_string())
             );
         }
-        let request_stream: Box<dyn buckyos_kit::AsyncStream> = if let Some(io_dump) = self.io_dump.clone() {
-            Box::new(DumpStream::new(
-                tls_stream,
-                io_dump,
-                remote_addr.to_string(),
-                local_addr.to_string(),
-            ))
-        } else {
-            Box::new(tls_stream)
-        };
+        let request_stream: Box<dyn buckyos_kit::AsyncStream> =
+            if let Some(io_dump) = self.io_dump.clone() {
+                Box::new(DumpStream::new(
+                    tls_stream,
+                    io_dump,
+                    remote_addr.to_string(),
+                    local_addr.to_string(),
+                ))
+            } else {
+                Box::new(tls_stream)
+            };
         let mut request = StreamRequest::new(request_stream, local_addr);
         request.source_addr = Some(request_source_addr);
         request.dest_port = local_addr.port();
@@ -584,20 +597,29 @@ impl TlsConnectionHandler {
                         return Ok(());
                     }
 
-                    let (limiter_id, down_speed, up_speed) = get_limit_info(global_env.clone()).await?;
+                    let (limiter_id, down_speed, up_speed) =
+                        get_limit_info(global_env.clone()).await?;
                     let upper = if limiter_id.is_some() {
                         self.env.limiter_manager.get_limiter(limiter_id.unwrap())
                     } else {
                         None
                     };
                     let limiter = if down_speed.is_some() && up_speed.is_some() {
-                        Some(Limiter::new(upper, Some(1), down_speed.map(|v| v as u32), up_speed.map(|v| v as u32)))
+                        Some(Limiter::new(
+                            upper,
+                            Some(1),
+                            down_speed.map(|v| v as u32),
+                            up_speed.map(|v| v as u32),
+                        ))
                     } else {
                         upper
                     };
 
                     let stat_group_ids = get_stat_info(global_env).await?;
-                    let speed_groups = self.env.stat_manager.get_speed_stats(stat_group_ids.as_slice());
+                    let speed_groups = self
+                        .env
+                        .stat_manager
+                        .get_speed_stats(stat_group_ids.as_slice());
                     compose_stat.set_external_stats(speed_groups);
 
                     let cmd = list[0].as_str();
@@ -611,8 +633,10 @@ impl TlsConnectionHandler {
                             }
                             let target = list[1].as_str();
                             let stream = if limiter.is_some() {
-                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                let (read_limit, write_limit) =
+                                    limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream =
+                                    LimitStream::new(stream, read_limit, write_limit);
                                 Box::new(limit_stream)
                             } else {
                                 stream
@@ -629,8 +653,10 @@ impl TlsConnectionHandler {
                             let server_name = list[1].as_str();
 
                             let stream = if limiter.is_some() {
-                                let (read_limit, write_limit) = limiter.as_ref().unwrap().new_limit_session();
-                                let limit_stream = LimitStream::new(stream, read_limit, write_limit);
+                                let (read_limit, write_limit) =
+                                    limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream =
+                                    LimitStream::new(stream, read_limit, write_limit);
                                 Box::new(limit_stream)
                             } else {
                                 stream
@@ -639,9 +665,13 @@ impl TlsConnectionHandler {
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
                                     Server::Http(http_server) => {
-                                        if let Err(e) = hyper_serve_http(stream,
-                                                                         http_server,
-                                                                         stream_info.clone()).await {
+                                        if let Err(e) = hyper_serve_http(
+                                            stream,
+                                            http_server,
+                                            stream_info.clone(),
+                                        )
+                                        .await
+                                        {
                                             log::error!("hyper serve http failed: {}", e);
                                         }
                                     }
@@ -649,10 +679,15 @@ impl TlsConnectionHandler {
                                         server
                                             .serve_connection(stream, stream_info.clone())
                                             .await
-                                            .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
+                                            .map_err(into_stack_err!(
+                                                StackErrorCode::InvalidConfig
+                                            ))?;
                                     }
                                     _ => {
-                                        return Err(stack_err!(StackErrorCode::InvalidConfig, "unsupported server type"));
+                                        return Err(stack_err!(
+                                            StackErrorCode::InvalidConfig,
+                                            "unsupported server type"
+                                        ));
                                     }
                                 }
                             }
@@ -693,10 +728,7 @@ impl TlsStack {
 
     async fn create(config: TlsStackBuilder) -> StackResult<Self> {
         if config.id.is_none() {
-            return Err(stack_err!(
-                StackErrorCode::InvalidConfig,
-                "id is required"
-            ));
+            return Err(stack_err!(StackErrorCode::InvalidConfig, "id is required"));
         }
         if config.bind.is_none() {
             return Err(stack_err!(
@@ -728,7 +760,7 @@ impl TlsStack {
             config.connection_manager.clone(),
             config.io_dump,
         )
-            .await?;
+        .await?;
 
         Ok(Self {
             id,
@@ -742,37 +774,50 @@ impl TlsStack {
     }
 
     async fn start_listener(&self) -> StackResult<JoinHandle<()>> {
-        let addr: SocketAddr = self.bind_addr.parse()
-            .map_err(into_stack_err!(StackErrorCode::InvalidConfig, "invalid bind address {}", self.bind_addr))?;
+        let addr: SocketAddr = self.bind_addr.parse().map_err(into_stack_err!(
+            StackErrorCode::InvalidConfig,
+            "invalid bind address {}",
+            self.bind_addr
+        ))?;
         let sockaddr: socket2::SockAddr = addr.into();
         let domain = match addr {
             std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
             std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
         };
-        let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-            .map_err(into_stack_err!(StackErrorCode::IoError, "create socket error"))?;
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+                .map_err(into_stack_err!(
+                    StackErrorCode::IoError,
+                    "create socket error"
+                ))?;
 
-        socket.set_nonblocking(true)
-            .map_err(into_stack_err!(StackErrorCode::IoError, "set nonblocking error"))?;
+        socket.set_nonblocking(true).map_err(into_stack_err!(
+            StackErrorCode::IoError,
+            "set nonblocking error"
+        ))?;
         #[cfg(target_os = "linux")]
         {
             if self.reuse_address {
-                socket.set_reuse_address(true)
-                    .map_err(into_stack_err!(StackErrorCode::IoError, "set reuse address error"))?;
+                socket.set_reuse_address(true).map_err(into_stack_err!(
+                    StackErrorCode::IoError,
+                    "set reuse address error"
+                ))?;
             }
         }
-        socket.bind(&sockaddr)
-            .map_err(into_stack_err!(StackErrorCode::BindFailed, "bind {} error", self.bind_addr))?;
-        socket.listen(1024)
-            .map_err(into_stack_err!(StackErrorCode::ListenFailed, "listen error"))?;
+        socket.bind(&sockaddr).map_err(into_stack_err!(
+            StackErrorCode::BindFailed,
+            "bind {} error",
+            self.bind_addr
+        ))?;
+        socket.listen(1024).map_err(into_stack_err!(
+            StackErrorCode::ListenFailed,
+            "listen error"
+        ))?;
         #[cfg(unix)]
-        let std_listener = unsafe {
-            std::net::TcpListener::from_raw_fd(socket.into_raw_fd())
-        };
+        let std_listener = unsafe { std::net::TcpListener::from_raw_fd(socket.into_raw_fd()) };
         #[cfg(windows)]
-        let std_listener = unsafe {
-            std::net::TcpListener::from_raw_socket(socket.into_raw_socket())
-        };
+        let std_listener =
+            unsafe { std::net::TcpListener::from_raw_socket(socket.into_raw_socket()) };
 
         let listener = tokio::net::TcpListener::from_std(std_listener)
             .map_err(into_stack_err!(StackErrorCode::BindFailed))?;
@@ -805,8 +850,9 @@ impl TlsStack {
                     handler.clone()
                 };
                 let handle = tokio::spawn(async move {
-                    if let Err(e) =
-                        handler_snapshot.handle_connect(stat_stream, local_addr, compose_stat).await
+                    if let Err(e) = handler_snapshot
+                        .handle_connect(stat_stream, local_addr, compose_stat)
+                        .await
                     {
                         log::error!("handle tcp stream failed: {}", e);
                     }
@@ -814,7 +860,13 @@ impl TlsStack {
 
                 if let Some(connection_manager) = &connection_manager {
                     let controller = HandleConnectionController::new(handle);
-                    connection_manager.add_connection(ConnectionInfo::new(remote_addr.to_string(), local_addr.to_string(), StackProtocol::Tls, speed, controller));
+                    connection_manager.add_connection(ConnectionInfo::new(
+                        remote_addr.to_string(),
+                        local_addr.to_string(),
+                        StackProtocol::Tls,
+                        speed,
+                        controller,
+                    ));
                 }
             }
         });
@@ -847,9 +899,19 @@ impl Stack for TlsStack {
         Ok(())
     }
 
-    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Option<Arc<dyn StackContext>>) -> StackResult<()> {
-        let config = config.as_ref().as_any().downcast_ref::<TlsStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tls stack config"))?;
+    async fn prepare_update(
+        &self,
+        config: Arc<dyn StackConfig>,
+        context: Option<Arc<dyn StackContext>>,
+    ) -> StackResult<()> {
+        let config = config
+            .as_ref()
+            .as_any()
+            .downcast_ref::<TlsStackConfig>()
+            .ok_or(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid tls stack config"
+            ))?;
         if config.id != self.id {
             return Err(stack_err!(StackErrorCode::InvalidConfig, "id unmatch"));
         }
@@ -858,13 +920,22 @@ impl Stack for TlsStack {
         }
 
         if config.reuse_address.unwrap_or(false) != self.reuse_address {
-            return Err(stack_err!(StackErrorCode::InvalidConfig, "reuse_address unmatch"));
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "reuse_address unmatch"
+            ));
         }
 
         let env = match context {
             Some(context) => {
-                let tls_context = context.as_ref().as_any().downcast_ref::<TlsStackContext>()
-                    .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tls stack context"))?;
+                let tls_context = context
+                    .as_ref()
+                    .as_any()
+                    .downcast_ref::<TlsStackContext>()
+                    .ok_or(stack_err!(
+                        StackErrorCode::InvalidConfig,
+                        "invalid tls stack context"
+                    ))?;
                 Arc::new(tls_context.clone())
             }
             None => self.handler.read().unwrap().env.clone(),
@@ -893,10 +964,10 @@ impl Stack for TlsStack {
                 config.io_dump_max_upload_bytes_per_conn.as_deref(),
                 config.io_dump_max_download_bytes_per_conn.as_deref(),
             )
-                .await
-                .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
+            .await
+            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
         )
-            .await?;
+        .await?;
 
         *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())
@@ -983,12 +1054,8 @@ pub struct TlsStackFactory {
 }
 
 impl TlsStackFactory {
-    pub fn new(
-        connection_manager: ConnectionManagerRef,
-    ) -> Self {
-        Self {
-            connection_manager,
-        }
+    pub fn new(connection_manager: ConnectionManagerRef) -> Self {
+        Self { connection_manager }
     }
 }
 
@@ -1002,7 +1069,10 @@ impl crate::StackFactory for TlsStackFactory {
         let config = config
             .as_any()
             .downcast_ref::<TlsStackConfig>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tls stack config"))?;
+            .ok_or(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid tls stack config"
+            ))?;
 
         let cert_list = build_tls_domain_configs(&config.certs).await?;
 
@@ -1010,7 +1080,10 @@ impl crate::StackFactory for TlsStackFactory {
             .as_ref()
             .as_any()
             .downcast_ref::<TlsStackContext>()
-            .ok_or(stack_err!(StackErrorCode::InvalidConfig, "invalid tls stack context"))?;
+            .ok_or(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid tls stack context"
+            ))?;
         let stack_context = Arc::new(stack_context.clone());
         let io_dump = create_io_dump_stack_config(
             &config.id,
@@ -1020,8 +1093,8 @@ impl crate::StackFactory for TlsStackFactory {
             config.io_dump_max_upload_bytes_per_conn.as_deref(),
             config.io_dump_max_download_bytes_per_conn.as_deref(),
         )
-            .await
-            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
 
         let stack = TlsStack::builder()
             .id(config.id.clone())
@@ -1030,7 +1103,15 @@ impl crate::StackFactory for TlsStackFactory {
             .hook_point(config.hook_point.clone())
             .add_certs(cert_list)
             .concurrency(config.concurrency.unwrap_or(0))
-            .alpn_protocols(config.alpn_protocols.clone().unwrap_or(vec!["http/1.1".to_string()]).iter().map(|s| s.as_bytes().to_vec()).collect())
+            .alpn_protocols(
+                config
+                    .alpn_protocols
+                    .clone()
+                    .unwrap_or(vec!["http/1.1".to_string()])
+                    .iter()
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect(),
+            )
             .reuse_address(config.reuse_address.unwrap_or(false))
             .stack_context(stack_context)
             .io_dump(io_dump)
@@ -1117,7 +1198,7 @@ impl TlsStackBuilder {
         self.io_dump = io_dump;
         self
     }
-    
+
     pub fn reuse_address(mut self, reuse_address: bool) -> Self {
         self.reuse_address = reuse_address;
         self
@@ -1134,30 +1215,45 @@ impl TlsStackBuilder {
 mod tests {
     use super::{load_certs, load_key};
     use crate::global_process_chains::GlobalProcessChains;
-    use crate::{create_io_dump_stack_config, decode_io_dump_frames, ProcessChainConfigs, ServerResult, StreamServer, ServerManager, TunnelManager, Server, ProcessChainHttpServer, Stack, TlsStackFactory, ConnectionManager, TlsStackConfig, StackProtocol, StackFactory, StreamInfo, DefaultLimiterManager, StatManager, GlobalCollectionManager};
-    use crate::{LimiterManagerRef, ServerManagerRef, StackContext, StatManagerRef, TlsDomainConfig, TlsStack, TlsStackContext};
-    use buckyos_kit::{init_logging, AsyncStream};
-    use name_lib::{encode_ed25519_sk_to_pk_jwk, generate_ed25519_key, DeviceConfig};
-    use rcgen::{generate_simple_self_signed, BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+    use crate::self_cert_mgr::{SelfCertConfig, SelfCertMgr, SelfCertMgrRef};
+    use crate::{
+        ConnectionManager, DefaultLimiterManager, GlobalCollectionManager, ProcessChainConfigs,
+        ProcessChainHttpServer, Server, ServerManager, ServerResult, Stack, StackFactory,
+        StackProtocol, StatManager, StreamInfo, StreamServer, TlsStackConfig, TlsStackFactory,
+        TunnelManager, create_io_dump_stack_config, decode_io_dump_frames,
+    };
+    use crate::{
+        LimiterManagerRef, ServerManagerRef, StackContext, StatManagerRef, TlsDomainConfig,
+        TlsStack, TlsStackContext,
+    };
+    use buckyos_kit::{AsyncStream, init_logging};
+    use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, CertManagerConfig};
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use name_lib::{DeviceConfig, encode_ed25519_sk_to_pk_jwk, generate_ed25519_key};
+    use rcgen::{
+        BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, generate_simple_self_signed,
+    };
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{
         CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
     };
-    use rustls::{ClientConfig, DigitallySignedStruct, Error, RootCertStore, ServerConfig, SignatureScheme};
+    use rustls::{
+        ClientConfig, DigitallySignedStruct, Error, RootCertStore, ServerConfig, SignatureScheme,
+    };
     use std::sync::Arc;
     use std::time::Duration;
-    use http_body_util::Full;
-    use hyper::body::Bytes;
-    use hyper_util::rt::{TokioExecutor, TokioIo};
     use tempfile::tempdir;
     use tokio::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::{TlsAcceptor, TlsConnector};
-    use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, CertManagerConfig};
-    use crate::self_cert_mgr::{SelfCertConfig, SelfCertMgr, SelfCertMgrRef};
 
-    async fn wait_dump_frames(file: &std::path::Path, min_frames: usize) -> Vec<crate::DecodedIoDumpFrame> {
+    async fn wait_dump_frames(
+        file: &std::path::Path,
+        min_frames: usize,
+    ) -> Vec<crate::DecodedIoDumpFrame> {
         for _ in 0..50 {
             if let Ok(data) = std::fs::read(file)
                 && !data.is_empty()
@@ -1209,8 +1305,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 None,
             ))
             .build()
@@ -1225,8 +1325,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 None,
             ))
             .build()
@@ -1241,8 +1345,8 @@ mod tests {
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert_key.signing_key.serialize_der()),
-                )),
+                    cert_key.signing_key.serialize_der(),
+                ))),
                 data: None,
             }])
             .stack_context(build_stack_context(
@@ -1250,8 +1354,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .build()
@@ -1283,8 +1391,8 @@ mod tests {
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert_key.signing_key.serialize_der()),
-                )),
+                    cert_key.signing_key.serialize_der(),
+                ))),
                 data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
@@ -1293,8 +1401,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .build()
@@ -1304,11 +1416,13 @@ mod tests {
         let result = stack.start().await;
         assert!(result.is_ok());
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
 
         let stream = TcpStream::connect("127.0.0.1:9080").await.unwrap();
         let connector = TlsConnector::from(Arc::new(config));
@@ -1348,8 +1462,8 @@ mod tests {
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert_key.signing_key.serialize_der()),
-                )),
+                    cert_key.signing_key.serialize_der(),
+                ))),
                 data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
@@ -1358,8 +1472,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .build()
@@ -1369,11 +1487,13 @@ mod tests {
         let result = stack.start().await;
         assert!(result.is_ok());
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
 
         let stream = TcpStream::connect("127.0.0.1:9081").await.unwrap();
         let connector = TlsConnector::from(Arc::new(config));
@@ -1415,8 +1535,8 @@ mod tests {
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert_key.signing_key.serialize_der()),
-                )),
+                    cert_key.signing_key.serialize_der(),
+                ))),
                 data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
@@ -1425,8 +1545,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .build()
@@ -1449,11 +1573,13 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
 
         {
             let stream = TcpStream::connect("127.0.0.1:9091").await.unwrap();
@@ -1462,9 +1588,7 @@ mod tests {
                 .connect(ServerName::try_from("www.buckyos.com").unwrap(), stream)
                 .await
                 .unwrap();
-            let result = stream
-                .write_all(b"test")
-                .await;
+            let result = stream.write_all(b"test").await;
             assert_eq!(connection_manager.get_all_connection_info().len(), 1);
             assert!(result.is_ok());
             let mut buf = [0u8; 4];
@@ -1503,8 +1627,8 @@ mod tests {
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert_key.signing_key.serialize_der()),
-                )),
+                    cert_key.signing_key.serialize_der(),
+                ))),
                 data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
@@ -1513,8 +1637,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .build()
@@ -1526,11 +1654,13 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
 
         let stream = TcpStream::connect("127.0.0.1:9093").await.unwrap();
         let connector = TlsConnector::from(Arc::new(config));
@@ -1538,9 +1668,7 @@ mod tests {
             .connect(ServerName::try_from("www.buckyos.com").unwrap(), stream)
             .await
             .unwrap();
-        let result = stream
-            .write_all(b"test")
-            .await;
+        let result = stream.write_all(b"test").await;
         assert!(result.is_ok());
         let mut buf = [0u8; 4];
         let ret = stream.read_exact(&mut buf).await;
@@ -1562,7 +1690,10 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
-        let tls_self_certs_path = tempfile::env::temp_dir().join("tls_self_certs").to_string_lossy().to_string();
+        let tls_self_certs_path = tempfile::env::temp_dir()
+            .join("tls_self_certs")
+            .to_string_lossy()
+            .to_string();
         let mut self_cert_config = SelfCertConfig::default();
         self_cert_config.store_path = tls_self_certs_path.clone();
         let connection_manager = ConnectionManager::new();
@@ -1584,7 +1715,9 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
                 SelfCertMgr::create(self_cert_config).await.unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
@@ -1608,11 +1741,13 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
 
         {
             let stream = TcpStream::connect("127.0.0.1:9096").await.unwrap();
@@ -1621,9 +1756,7 @@ mod tests {
                 .connect(ServerName::try_from("www.buckyos.com").unwrap(), stream)
                 .await
                 .unwrap();
-            let result = stream
-                .write_all(b"test")
-                .await;
+            let result = stream.write_all(b"test").await;
             assert_eq!(connection_manager.get_all_connection_info().len(), 1);
             assert!(result.is_ok());
             let mut buf = [0u8; 4];
@@ -1635,7 +1768,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
 
-        tokio::fs::remove_dir_all(tls_self_certs_path).await.unwrap();
+        tokio::fs::remove_dir_all(tls_self_certs_path)
+            .await
+            .unwrap();
     }
 
     pub struct MockServer {
@@ -1650,7 +1785,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StreamServer for MockServer {
-        async fn serve_connection(&self, mut stream: Box<dyn AsyncStream>, _info: StreamInfo) -> ServerResult<()> {
+        async fn serve_connection(
+            &self,
+            mut stream: Box<dyn AsyncStream>,
+            _info: StreamInfo,
+        ) -> ServerResult<()> {
             let mut buf = [0u8; 4];
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"test");
@@ -1731,7 +1870,9 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
-        let _ = server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))));
+        let _ = server_manager.add_server(Server::Stream(Arc::new(MockServer::new(
+            "www.buckyos.com".to_string(),
+        ))));
         let result = TlsStack::builder()
             .id("test")
             .bind("127.0.0.1:9085")
@@ -1741,8 +1882,8 @@ mod tests {
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert_key.signing_key.serialize_der()),
-                )),
+                    cert_key.signing_key.serialize_der(),
+                ))),
                 data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
@@ -1751,8 +1892,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .build()
@@ -1764,11 +1909,13 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
         let stream = TcpStream::connect("127.0.0.1:9085").await.unwrap();
         let connector = TlsConnector::from(Arc::new(config));
         let mut stream = connector
@@ -1808,11 +1955,12 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .server_mgr(Arc::downgrade(&server_mgr))
             .tunnel_manager(TunnelManager::new())
-            .build().await.unwrap();
+            .build()
+            .await
+            .unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
         let _ = server_manager.add_server(Server::Http(Arc::new(http_server)));
-
 
         let chains = r#"
 - id: main
@@ -1834,8 +1982,8 @@ mod tests {
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert_key.signing_key.serialize_der()),
-                )),
+                    cert_key.signing_key.serialize_der(),
+                ))),
                 data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
@@ -1844,8 +1992,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .build()
@@ -1855,16 +2007,17 @@ mod tests {
         let result = stack.start().await;
         assert!(result.is_ok());
 
-
         let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let _device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
         let stream = TcpStream::connect("127.0.0.1:9087").await.unwrap();
         let connector = TlsConnector::from(Arc::new(config));
         let stream = connector
@@ -1872,7 +2025,9 @@ mod tests {
             .await
             .unwrap();
         let (mut send, conn) = hyper::client::conn::http1::Builder::new()
-            .handshake(TokioIo::new(stream)).await.unwrap();
+            .handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
         tokio::spawn(async move {
             let _ = conn.await;
         });
@@ -1917,11 +2072,12 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .server_mgr(Arc::downgrade(&server_mgr))
             .tunnel_manager(TunnelManager::new())
-            .build().await.unwrap();
+            .build()
+            .await
+            .unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
         let _ = server_manager.add_server(Server::Http(Arc::new(http_server)));
-
 
         let chains = r#"
 - id: main
@@ -1943,8 +2099,8 @@ mod tests {
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert_key.signing_key.serialize_der()),
-                )),
+                    cert_key.signing_key.serialize_der(),
+                ))),
                 data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
@@ -1953,8 +2109,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .build()
@@ -1964,16 +2124,17 @@ mod tests {
         let result = stack.start().await;
         assert!(result.is_ok());
 
-
         let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let _device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
         let stream = TcpStream::connect("127.0.0.1:9086").await.unwrap();
         let connector = TlsConnector::from(Arc::new(config));
         let stream = connector
@@ -1981,7 +2142,9 @@ mod tests {
             .await
             .unwrap();
         let (mut send, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-            .handshake(TokioIo::new(stream)).await.unwrap();
+            .handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
         tokio::spawn(async move {
             let _ = conn.await;
         });
@@ -2012,7 +2175,9 @@ mod tests {
             .unwrap();
         let server_manager = Arc::new(ServerManager::new());
         server_manager
-            .add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))))
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                "www.buckyos.com".to_string(),
+            ))))
             .unwrap();
         let dir = tempdir().unwrap();
         let dump = dir.path().join("tls_raw.dump");
@@ -2024,8 +2189,8 @@ mod tests {
             None,
             None,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let stack = TlsStack::builder()
             .id("tls-raw")
@@ -2045,8 +2210,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .io_dump(io_dump)
@@ -2055,12 +2224,13 @@ mod tests {
             .unwrap();
         stack.start().await.unwrap();
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
         let stream = TcpStream::connect("127.0.0.1:9093").await.unwrap();
         let connector = TlsConnector::from(Arc::new(config));
         let mut stream = connector
@@ -2074,7 +2244,11 @@ mod tests {
         drop(stream);
 
         let frames = wait_dump_frames(&dump, 1).await;
-        assert!(frames.iter().any(|f| f.upload == b"test" && f.download == b"recv"));
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.upload == b"test" && f.download == b"recv")
+        );
     }
 
     #[tokio::test]
@@ -2087,7 +2261,9 @@ mod tests {
             .unwrap();
         let server_manager = Arc::new(ServerManager::new());
         server_manager
-            .add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string()))))
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                "www.buckyos.com".to_string(),
+            ))))
             .unwrap();
         let dir = tempdir().unwrap();
         let dump = dir.path().join("tls_raw_limit.dump");
@@ -2099,8 +2275,8 @@ mod tests {
             Some("2B"),
             None,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         let stack = TlsStack::builder()
             .id("tls-raw-limit")
@@ -2120,8 +2296,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .io_dump(io_dump)
@@ -2130,12 +2310,13 @@ mod tests {
             .unwrap();
         stack.start().await.unwrap();
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
         let stream = TcpStream::connect("127.0.0.1:9095").await.unwrap();
         let connector = TlsConnector::from(Arc::new(config));
         let mut stream = connector
@@ -2148,7 +2329,11 @@ mod tests {
         assert_eq!(&buf, b"recv");
 
         let frames = wait_dump_frames(&dump, 1).await;
-        assert!(frames.iter().any(|f| f.upload == b"te" && f.download.is_empty()));
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.upload == b"te" && f.download.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -2175,7 +2360,9 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .server_mgr(Arc::downgrade(&server_mgr))
             .tunnel_manager(TunnelManager::new())
-            .build().await.unwrap();
+            .build()
+            .await
+            .unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
         let _ = server_manager.add_server(Server::Http(Arc::new(http_server)));
@@ -2194,8 +2381,8 @@ mod tests {
             None,
             None,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let stack = TlsStack::builder()
             .id("tls-http")
             .bind("127.0.0.1:9094")
@@ -2215,8 +2402,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .io_dump(io_dump)
@@ -2225,12 +2416,13 @@ mod tests {
             .unwrap();
         stack.start().await.unwrap();
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
         let stream = TcpStream::connect("127.0.0.1:9094").await.unwrap();
         let connector = TlsConnector::from(Arc::new(config));
         let stream = connector
@@ -2293,7 +2485,9 @@ mod tests {
             .global_process_chains(Arc::new(GlobalProcessChains::new()))
             .server_mgr(Arc::downgrade(&server_mgr))
             .tunnel_manager(TunnelManager::new())
-            .build().await.unwrap();
+            .build()
+            .await
+            .unwrap();
 
         let server_manager = Arc::new(ServerManager::new());
         let _ = server_manager.add_server(Server::Http(Arc::new(http_server)));
@@ -2312,8 +2506,8 @@ mod tests {
             Some("4B"),
             None,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         let stack = TlsStack::builder()
             .id("tls-http-limit")
             .bind("127.0.0.1:9096")
@@ -2333,8 +2527,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 StatManager::new(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .io_dump(io_dump)
@@ -2343,12 +2541,13 @@ mod tests {
             .unwrap();
         stack.start().await.unwrap();
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
         let stream = TcpStream::connect("127.0.0.1:9096").await.unwrap();
         let connector = TlsConnector::from(Arc::new(config));
         let stream = connector
@@ -2373,7 +2572,11 @@ mod tests {
         assert_eq!(resp.version(), http::Version::HTTP_11);
 
         let frames = wait_dump_frames(&dump, 1).await;
-        assert!(frames.iter().any(|f| f.upload == b"GET " && f.download.is_empty()));
+        assert!(
+            frames
+                .iter()
+                .any(|f| f.upload == b"GET " && f.download.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -2382,7 +2585,9 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         cert_config.keystore_path = data_dir.path().to_string_lossy().to_string();
         let cert_manager = AcmeCertManager::create(cert_config).await.unwrap();
-        let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default()).await.unwrap();
+        let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default())
+            .await
+            .unwrap();
         let server_manager = Arc::new(ServerManager::new());
         let global_process_chains = Arc::new(GlobalProcessChains::new());
         let tunnel_manager = TunnelManager::new();
@@ -2439,7 +2644,11 @@ mod tests {
 
         let stat_manager = StatManager::new();
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                "www.buckyos.com".to_string(),
+            ))))
+            .unwrap();
         let result = TlsStack::builder()
             .id("test")
             .bind("127.0.0.1:9185")
@@ -2449,8 +2658,8 @@ mod tests {
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert_key.signing_key.serialize_der()),
-                )),
+                    cert_key.signing_key.serialize_der(),
+                ))),
                 data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
@@ -2459,8 +2668,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 stat_manager.clone(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .build()
@@ -2472,11 +2685,13 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
         let stream = TcpStream::connect("127.0.0.1:9185").await.unwrap();
         let connector = TlsConnector::from(Arc::new(config));
         let mut stream = connector
@@ -2517,7 +2732,11 @@ mod tests {
 
         let stat_manager = StatManager::new();
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                "www.buckyos.com".to_string(),
+            ))))
+            .unwrap();
         let result = TlsStack::builder()
             .id("test")
             .bind("127.0.0.1:9186")
@@ -2527,8 +2746,8 @@ mod tests {
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert_key.signing_key.serialize_der()),
-                )),
+                    cert_key.signing_key.serialize_der(),
+                ))),
                 data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
@@ -2537,8 +2756,12 @@ mod tests {
                 TunnelManager::new(),
                 Arc::new(DefaultLimiterManager::new()),
                 stat_manager.clone(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .build()
@@ -2550,11 +2773,13 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
         let stream = TcpStream::connect("127.0.0.1:9186").await.unwrap();
         let start = std::time::Instant::now();
         let connector = TlsConnector::from(Arc::new(config));
@@ -2598,10 +2823,20 @@ mod tests {
 
         let stat_manager = StatManager::new();
         let mut limiter_manager = DefaultLimiterManager::new();
-        let _ = limiter_manager.new_limiter("test".to_string(), None::<String>, Some(1), Some(2), Some(2));
+        let _ = limiter_manager.new_limiter(
+            "test".to_string(),
+            None::<String>,
+            Some(1),
+            Some(2),
+            Some(2),
+        );
         let limiter_manager = Arc::new(limiter_manager);
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                "www.buckyos.com".to_string(),
+            ))))
+            .unwrap();
         let result = TlsStack::builder()
             .id("test")
             .bind("127.0.0.1:9187")
@@ -2611,8 +2846,8 @@ mod tests {
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert_key.signing_key.serialize_der()),
-                )),
+                    cert_key.signing_key.serialize_der(),
+                ))),
                 data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
@@ -2621,8 +2856,12 @@ mod tests {
                 TunnelManager::new(),
                 limiter_manager,
                 stat_manager.clone(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .build()
@@ -2634,11 +2873,13 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
         let stream = TcpStream::connect("127.0.0.1:9187").await.unwrap();
         let start = std::time::Instant::now();
         let connector = TlsConnector::from(Arc::new(config));
@@ -2682,10 +2923,20 @@ mod tests {
 
         let stat_manager = StatManager::new();
         let mut limiter_manager = DefaultLimiterManager::new();
-        let _ = limiter_manager.new_limiter("test".to_string(), None::<String>, Some(1), Some(2), Some(2));
+        let _ = limiter_manager.new_limiter(
+            "test".to_string(),
+            None::<String>,
+            Some(1),
+            Some(2),
+            Some(2),
+        );
         let limiter_manager = Arc::new(limiter_manager);
         let server_manager = Arc::new(ServerManager::new());
-        server_manager.add_server(Server::Stream(Arc::new(MockServer::new("www.buckyos.com".to_string())))).unwrap();
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                "www.buckyos.com".to_string(),
+            ))))
+            .unwrap();
         let result = TlsStack::builder()
             .id("test")
             .bind("127.0.0.1:9188")
@@ -2695,8 +2946,8 @@ mod tests {
                 acme_type: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                    cert_key.signing_key.serialize_der()),
-                )),
+                    cert_key.signing_key.serialize_der(),
+                ))),
                 data: None,
             }])
             .alpn_protocols(vec![b"http/1.1".to_vec(), b"h2".to_vec(), b"h3".to_vec()])
@@ -2705,8 +2956,12 @@ mod tests {
                 TunnelManager::new(),
                 limiter_manager,
                 stat_manager.clone(),
-                AcmeCertManager::create(CertManagerConfig::default()).await.unwrap(),
-                SelfCertMgr::create(SelfCertConfig::default()).await.unwrap(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
                 Some(Arc::new(GlobalProcessChains::new())),
             ))
             .build()
@@ -2718,11 +2973,13 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_protocol_versions(rustls::DEFAULT_VERSIONS).unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
         let stream = TcpStream::connect("127.0.0.1:9188").await.unwrap();
         let start = std::time::Instant::now();
         let connector = TlsConnector::from(Arc::new(config));

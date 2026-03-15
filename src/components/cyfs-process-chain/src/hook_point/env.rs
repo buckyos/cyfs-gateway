@@ -44,6 +44,25 @@ pub struct HookPointEnv {
 }
 
 impl HookPointEnv {
+    fn unsupported_sqlite_collection_error(
+        id: &str,
+        collection_type: CollectionType,
+        file_path: &Path,
+    ) -> String {
+        let collection_kind = match collection_type {
+            CollectionType::List => "list",
+            CollectionType::Set => "set",
+            CollectionType::Map => "map",
+            CollectionType::MultiMap => "multi-map",
+        };
+        format!(
+            "Sqlite collection format is not supported yet for {} collection '{}': {}",
+            collection_kind,
+            id,
+            file_path.display()
+        )
+    }
+
     pub fn new(id: impl Into<String>, data_dir: PathBuf) -> Self {
         let pipe: SharedMemoryPipe = SharedMemoryPipe::new_empty();
 
@@ -163,6 +182,13 @@ impl HookPointEnv {
             return Err(msg);
         }
 
+        let sqlite_not_supported = || {
+            let msg =
+                Self::unsupported_sqlite_collection_error(id, collection_type.clone(), &file_path);
+            error!("{}", msg);
+            Err(msg)
+        };
+
         match collection_type {
             CollectionType::List => {
                 let list = match collection_format {
@@ -171,7 +197,7 @@ impl HookPointEnv {
                         Box::new(list) as Box<dyn ListCollection>
                     }
                     CollectionFileFormat::Sqlite => {
-                        unimplemented!("Sqlite collection not implemented yet");
+                        return sqlite_not_supported();
                     }
                 };
 
@@ -195,7 +221,7 @@ impl HookPointEnv {
                         Box::new(set) as Box<dyn SetCollection>
                     }
                     CollectionFileFormat::Sqlite => {
-                        unimplemented!("Sqlite collection not implemented yet");
+                        return sqlite_not_supported();
                     }
                 };
 
@@ -219,7 +245,7 @@ impl HookPointEnv {
                         Box::new(map) as Box<dyn MapCollection>
                     }
                     CollectionFileFormat::Sqlite => {
-                        unimplemented!("Sqlite collection not implemented yet");
+                        return sqlite_not_supported();
                     }
                 };
 
@@ -243,7 +269,7 @@ impl HookPointEnv {
                         Box::new(multi_map) as Box<dyn MultiMapCollection>
                     }
                     CollectionFileFormat::Sqlite => {
-                        unimplemented!("Sqlite collection not implemented yet");
+                        return sqlite_not_supported();
                     }
                 };
 

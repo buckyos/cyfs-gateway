@@ -1,17 +1,17 @@
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-    use std::path::PathBuf;
-    use std::sync::Arc;
     use buckyos_kit::init_logging;
-    use jsonwebtoken::{DecodingKey, EncodingKey};
+    use cyfs_gateway::*;
+    use cyfs_gateway_lib::*;
     use jsonwebtoken::jwk::Jwk;
+    use jsonwebtoken::{DecodingKey, EncodingKey};
     use log::error;
     use name_lib::generate_ed25519_key_pair;
     use serde_json::{json, Value};
-    use cyfs_gateway::*;
-    use cyfs_gateway_lib::*;
     use sfo_js::JsPkgManager;
+    use std::io::{Read, Write};
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     pub struct TempKeyStore {
         private_key: tokio::sync::Mutex<tempfile::NamedTempFile>,
@@ -37,13 +37,15 @@ mod tests {
         async fn load_key(&self) -> ControlResult<(EncodingKey, DecodingKey)> {
             let mut private_key = self.private_key.lock().await;
             let mut content: String = String::new();
-            private_key.read_to_string(&mut content)
+            private_key
+                .read_to_string(&mut content)
                 .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
             let private_key = EncodingKey::from_ed_pem(content.as_bytes())
                 .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
             let mut public_key = self.public_key.lock().await;
             let mut content: String = String::new();
-            public_key.read_to_string(&mut content)
+            public_key
+                .read_to_string(&mut content)
                 .map_err(into_cmd_err!(ControlErrorCode::Failed))?;
 
             let public_key: Jwk = serde_json::from_str(content.as_str())
@@ -57,7 +59,9 @@ mod tests {
             let mut private_key = self.private_key.lock().await;
             private_key.write_all(sign_key.as_bytes()).unwrap();
             let mut public_file = self.public_key.lock().await;
-            public_file.write_all(serde_json::to_string(&public_key).unwrap().as_bytes()).unwrap();
+            public_file
+                .write_all(serde_json::to_string(&public_key).unwrap().as_bytes())
+                .unwrap();
             Ok(())
         }
     }
@@ -65,9 +69,13 @@ mod tests {
     #[tokio::test]
     async fn test_cmd_server() {
         let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("BUCKYOS_ROOT", temp_dir.path().to_string_lossy().to_string());
+        std::env::set_var(
+            "BUCKYOS_ROOT",
+            temp_dir.path().to_string_lossy().to_string(),
+        );
         init_logging("cyfs_gateway", false);
-        let mut cmd_config: serde_json::Value = serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
+        let mut cmd_config: serde_json::Value =
+            serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
 
         // Load config from json
         let parser = Arc::new(GatewayConfigParser::new());
@@ -79,8 +87,14 @@ mod tests {
 
         parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
 
-        parser.register_server_config_parser("control_server", Arc::new(GatewayControlServerConfigParser::new()));
-        parser.register_server_config_parser("acme_response", Arc::new(AcmeHttpChallengeServerConfigParser::new()));
+        parser.register_server_config_parser(
+            "control_server",
+            Arc::new(GatewayControlServerConfigParser::new()),
+        );
+        parser.register_server_config_parser(
+            "acme_response",
+            Arc::new(AcmeHttpChallengeServerConfigParser::new()),
+        );
 
         let load_result = parser.parse(cmd_config);
         if load_result.is_err() {
@@ -94,51 +108,65 @@ mod tests {
         let tunnel_manager = TunnelManager::new();
         let server_manager = Arc::new(ServerManager::new());
         let global_process_chains = Arc::new(GlobalProcessChains::new());
-        let cert_manager = AcmeCertManager::create(CertManagerConfig::default()).await.unwrap();
+        let cert_manager = AcmeCertManager::create(CertManagerConfig::default())
+            .await
+            .unwrap();
         let limiter_manager = DefaultLimiterManager::new();
         let stat_manager = StatManager::new();
-        let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default()).await.unwrap();
+        let self_cert_mgr = SelfCertMgr::create(SelfCertConfig::default())
+            .await
+            .unwrap();
         let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
         let external_cmds = JsPkgManager::new(PathBuf::from("."));
 
         let store = TempKeyStore::new();
-        let token_manager = LocalTokenManager::new(
-            Some("test".to_string()),
-            Some("123456".to_string()),
-            store).await.unwrap();
+        let token_manager =
+            LocalTokenManager::new(Some("test".to_string()), Some("123456".to_string()), store)
+                .await
+                .unwrap();
         let inner_dns_record_manager = cyfs_dns::InnerDnsRecordManager::new();
         let stack_manager = StackManager::new();
-        let factory = GatewayFactory::new(
-            connect_manager.clone(),
-            parser.clone(),
+        let factory = GatewayFactory::new(connect_manager.clone(), parser.clone());
+        factory.register_stack_factory(
+            StackProtocol::Tcp,
+            Arc::new(TcpStackFactory::new(connect_manager.clone())),
         );
-        factory.register_stack_factory(StackProtocol::Tcp, Arc::new(TcpStackFactory::new(
-            connect_manager.clone(),
-        )));
-        factory.register_stack_factory(StackProtocol::Udp, Arc::new(UdpStackFactory::new(
-            connect_manager.clone(),
-        )));
-        factory.register_stack_factory(StackProtocol::Tls, Arc::new(TlsStackFactory::new(
-            connect_manager.clone(),
-        )));
-        factory.register_stack_factory(StackProtocol::Quic, Arc::new(QuicStackFactory::new(
-            connect_manager.clone(),
-        )));
-        factory.register_stack_factory(StackProtocol::Rtcp, Arc::new(RtcpStackFactory::new(
-            connect_manager.clone(),
-        )));
+        factory.register_stack_factory(
+            StackProtocol::Udp,
+            Arc::new(UdpStackFactory::new(connect_manager.clone())),
+        );
+        factory.register_stack_factory(
+            StackProtocol::Tls,
+            Arc::new(TlsStackFactory::new(connect_manager.clone())),
+        );
+        factory.register_stack_factory(
+            StackProtocol::Quic,
+            Arc::new(QuicStackFactory::new(connect_manager.clone())),
+        );
+        factory.register_stack_factory(
+            StackProtocol::Rtcp,
+            Arc::new(RtcpStackFactory::new(connect_manager.clone())),
+        );
 
         factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new()));
 
-        factory.register_server_factory("control_server", Arc::new(GatewayControlServerFactory::new()));
-        factory.register_server_factory("acme_response", Arc::new(AcmeHttpChallengeServerFactory::new()));
+        factory.register_server_factory(
+            "control_server",
+            Arc::new(GatewayControlServerFactory::new()),
+        );
+        factory.register_server_factory(
+            "acme_response",
+            Arc::new(AcmeHttpChallengeServerFactory::new()),
+        );
 
         let login = json!({
             "user_name": "test",
             "password": "123456"
         });
         merge(&mut config_loader.raw_config, &login);
-        let gateway = factory.create_gateway(None, config_loader.clone(), config_loader).await;
+        let gateway = factory
+            .create_gateway(None, config_loader.clone(), config_loader)
+            .await;
         assert!(gateway.is_ok());
         let gateway = gateway.unwrap();
         let params = GatewayParams {
@@ -147,6 +175,18 @@ mod tests {
         gateway.start(params).await.unwrap();
 
         let cmd_client = GatewayControlClient::new("http://127.0.0.1:13451".to_string(), None);
+        let ret = cmd_client.get_system_info().await;
+        assert!(ret.is_ok());
+        let system_info = ret.unwrap();
+        assert_eq!(
+            system_info.get("ui_mode").and_then(Value::as_str),
+            Some("developer")
+        );
+        assert!(system_info
+            .get("uptime_sec")
+            .and_then(Value::as_u64)
+            .is_some());
+
         let ret = cmd_client.get_config_by_id(None).await;
         assert!(ret.is_err());
 

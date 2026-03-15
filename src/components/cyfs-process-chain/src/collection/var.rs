@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use super::coll::CollectionValue;
 use std::any::Any;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[async_trait::async_trait]
 pub trait VariableVisitor: Any + Send + Sync {
@@ -11,11 +11,14 @@ pub trait VariableVisitor: Any + Send + Sync {
     /// Sets the value for the variable with the given id.
     /// Returns the previous value if it exists.
     /// If the variable is read-only, it should return an error.
-    async fn set(&self, id: &str, value: CollectionValue) -> Result<Option<CollectionValue>, String>;
+    async fn set(
+        &self,
+        id: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String>;
 }
 
 pub type VariableVisitorRef = Arc<Box<dyn VariableVisitor>>;
-
 
 use crate::collection::MapCollectionRef;
 
@@ -71,7 +74,11 @@ impl VariableVisitor for VariableVisitorWrapperForMapCollection {
         }
     }
 
-    async fn set(&self, id: &str, value: CollectionValue) -> Result<Option<CollectionValue>, String> {
+    async fn set(
+        &self,
+        id: &str,
+        value: CollectionValue,
+    ) -> Result<Option<CollectionValue>, String> {
         if let Some(item) = self.vars.get(id) {
             if item.read_only {
                 let msg = format!("Cannot set read-only variable '{}'", id);

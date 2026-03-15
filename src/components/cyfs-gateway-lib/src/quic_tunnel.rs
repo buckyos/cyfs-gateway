@@ -1,12 +1,14 @@
-use std::io::Error;
-use std::sync::Arc;
+use crate::{
+    DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelResult, get_dest_info_from_url_path,
+};
 use buckyos_kit::AsyncStream;
-use name_client::{resolve_ip};
+use name_client::resolve_ip;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::ClientConfig;
 use rustls_platform_verifier::BuilderVerifierExt;
 use sfo_split::Splittable;
-use crate::{get_dest_info_from_url_path, DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelResult};
+use std::io::Error;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct QuicTunnel {}
@@ -23,26 +25,44 @@ impl Tunnel for QuicTunnel {
         Ok(())
     }
 
-    async fn open_stream_by_dest(&self, dest_port: u16, dest_host: Option<String>) -> Result<Box<dyn AsyncStream>, Error> {
+    async fn open_stream_by_dest(
+        &self,
+        dest_port: u16,
+        dest_host: Option<String>,
+    ) -> Result<Box<dyn AsyncStream>, Error> {
         if dest_host.is_none() {
             return Err(Error::new(std::io::ErrorKind::Other, "dest_host is None"));
         }
-        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions().unwrap()
-            .with_platform_verifier().unwrap()
-            .with_no_client_auth();
+        let mut config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_platform_verifier()
+                .unwrap()
+                .with_no_client_auth();
         config.enable_early_data = true;
         let client_config =
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
 
-        let ip = resolve_ip(dest_host.as_ref().unwrap().as_str()).await
+        let ip = resolve_ip(dest_host.as_ref().unwrap().as_str())
+            .await
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
         endpoint.set_default_client_config(client_config);
-        let connecting = endpoint.connect(format!("{}:{}", ip.to_string(), dest_port).parse().unwrap(),
-                                          dest_host.as_ref().unwrap().as_str()).map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-        let connection = connecting.await.map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-        let (send, recv) = connection.open_bi().await.map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let connecting = endpoint
+            .connect(
+                format!("{}:{}", ip.to_string(), dest_port).parse().unwrap(),
+                dest_host.as_ref().unwrap().as_str(),
+            )
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let connection = connecting
+            .await
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
         Ok(Box::new(Splittable::new(recv, send)))
     }
 
@@ -51,11 +71,18 @@ impl Tunnel for QuicTunnel {
         self.open_stream_by_dest(dest_port, dest_host).await
     }
 
-    async fn create_datagram_client_by_dest(&self, _dest_port: u16, _dest_host: Option<String>) -> Result<Box<dyn DatagramClientBox>, Error> {
+    async fn create_datagram_client_by_dest(
+        &self,
+        _dest_port: u16,
+        _dest_host: Option<String>,
+    ) -> Result<Box<dyn DatagramClientBox>, Error> {
         unreachable!()
     }
 
-    async fn create_datagram_client(&self, _session_id: &str) -> Result<Box<dyn DatagramClientBox>, Error> {
+    async fn create_datagram_client(
+        &self,
+        _session_id: &str,
+    ) -> Result<Box<dyn DatagramClientBox>, Error> {
         unreachable!()
     }
 }
@@ -70,7 +97,10 @@ impl QuicTunnelBuilder {
 
 #[async_trait::async_trait]
 impl TunnelBuilder for QuicTunnelBuilder {
-    async fn create_tunnel(&self, _tunnel_stack_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>> {
+    async fn create_tunnel(
+        &self,
+        _tunnel_stack_id: Option<&str>,
+    ) -> TunnelResult<Box<dyn TunnelBox>> {
         Ok(Box::new(QuicTunnel::new()))
     }
 }

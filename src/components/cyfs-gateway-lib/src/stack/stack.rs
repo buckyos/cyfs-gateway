@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use crate::{StackErrorCode, StackResult, stack_err};
 use as_any::AsAny;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use crate::{stack_err, StackErrorCode, StackResult};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 #[derive(PartialEq, Eq, Debug, Clone, Hash)]
 pub enum StackProtocol {
@@ -68,7 +68,11 @@ pub trait Stack: Send + Sync + 'static {
         self.commit_update().await;
         Ok(())
     }
-    async fn prepare_update(&self, config: Arc<dyn StackConfig>, context: Option<Arc<dyn StackContext>>) -> StackResult<()>;
+    async fn prepare_update(
+        &self,
+        config: Arc<dyn StackConfig>,
+        context: Option<Arc<dyn StackContext>>,
+    ) -> StackResult<()>;
     async fn commit_update(&self);
     async fn rollback_update(&self);
 }
@@ -89,7 +93,11 @@ impl StackManager {
 
     pub fn add_stack(&self, stack: StackRef) -> StackResult<()> {
         if self.get_stack(stack.id().as_str()).is_some() {
-            return Err(stack_err!(StackErrorCode::AlreadyExists, "stack {} already exists", stack.id()));
+            return Err(stack_err!(
+                StackErrorCode::AlreadyExists,
+                "stack {} already exists",
+                stack.id()
+            ));
         }
         self.stacks.lock().unwrap().push(stack);
         Ok(())
@@ -120,15 +128,11 @@ impl StackManager {
         F: Fn(&str) -> bool,
     {
         let mut stacks = self.stacks.lock().unwrap();
-        stacks.retain(|stack| {
-            f(stack.id().as_str())
-        });
+        stacks.retain(|stack| f(stack.id().as_str()));
     }
 
     pub fn remove(&self, id: &str) {
-        self.retain(|stack_id| {
-            stack_id != id
-        });
+        self.retain(|stack_id| stack_id != id);
     }
 }
 
@@ -172,11 +176,13 @@ impl StackFactory for CyfsStackFactory {
         context: Arc<dyn StackContext>,
     ) -> StackResult<StackRef> {
         let protocol = config.stack_protocol();
-        let factory = {
-            self.stack_factory.lock().unwrap().get(&protocol).cloned()
-        };
+        let factory = { self.stack_factory.lock().unwrap().get(&protocol).cloned() };
         if factory.is_none() {
-            return Err(stack_err!(StackErrorCode::UnsupportedStackProtocol, "unsupported stack protocol {:?}", protocol));
+            return Err(stack_err!(
+                StackErrorCode::UnsupportedStackProtocol,
+                "unsupported stack protocol {:?}",
+                protocol
+            ));
         }
         factory.unwrap().create(config, context).await
     }

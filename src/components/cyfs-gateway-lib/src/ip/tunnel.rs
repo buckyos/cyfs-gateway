@@ -1,16 +1,16 @@
-use std::io::Error;
 use super::udp::UdpClient;
-use crate::tunnel::*;
 use crate::TunnelResult;
+use crate::tunnel::*;
 use async_trait::async_trait;
 use buckyos_kit::AsyncStream;
-use std::net::SocketAddr;
-use std::sync::Arc;
 use name_client::resolve_ip;
 use percent_encoding::percent_decode;
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use rustls_platform_verifier::BuilderVerifierExt;
+use std::io::Error;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio_rustls::TlsConnector;
 use url::Url;
 
@@ -55,11 +55,16 @@ impl IPTunnel {
             } else {
                 socket = tokio::net::TcpSocket::new_v6().unwrap();
             }
-            let local_bind_addr: SocketAddr = format!("{}:0", bind_addr).parse()
+            let local_bind_addr: SocketAddr = format!("{}:0", bind_addr)
+                .parse()
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "invalid bind addr"))?;
             socket.bind(local_bind_addr)?;
-            debug!("use {:?} tcp client addr for open_stream : {}", local_bind_addr, dest_addr);
-            let dest_addr: SocketAddr = dest_addr.parse()
+            debug!(
+                "use {:?} tcp client addr for open_stream : {}",
+                local_bind_addr, dest_addr
+            );
+            let dest_addr: SocketAddr = dest_addr
+                .parse()
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "invalid dest addr"))?;
             stream = socket.connect(dest_addr).await?;
         }
@@ -73,11 +78,15 @@ impl IPTunnel {
         dest_host: Option<String>,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
         if dest_host.is_none() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "invalid dest host"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "invalid dest host",
+            ));
         }
 
         // Resolve IP address
-        let ip = resolve_ip(dest_host.as_ref().unwrap().as_str()).await
+        let ip = resolve_ip(dest_host.as_ref().unwrap().as_str())
+            .await
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
 
         let dest_addr = format!("{}:{}", ip, dest_port);
@@ -94,22 +103,28 @@ impl IPTunnel {
             } else {
                 socket = tokio::net::TcpSocket::new_v6().unwrap();
             }
-            let local_bind_addr: SocketAddr = format!("{}:0", bind_addr).parse()
+            let local_bind_addr: SocketAddr = format!("{}:0", bind_addr)
+                .parse()
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "invalid bind addr"))?;
             socket.bind(local_bind_addr)?;
-            debug!("use {:?} tcp client addr for open_stream : {}", local_bind_addr, dest_addr);
-            let dest_addr: SocketAddr = dest_addr.parse()
+            debug!(
+                "use {:?} tcp client addr for open_stream : {}",
+                local_bind_addr, dest_addr
+            );
+            let dest_addr: SocketAddr = dest_addr
+                .parse()
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "invalid dest addr"))?;
             stream = socket.connect(dest_addr).await?;
         }
 
         // Configure TLS
-        let mut config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?
-            .with_platform_verifier()
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?
-            .with_no_client_auth();
+        let mut config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?
+                .with_platform_verifier()
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?
+                .with_no_client_auth();
 
         // Enable early data if needed
         config.enable_early_data = true;
@@ -119,7 +134,8 @@ impl IPTunnel {
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
 
         // Establish TLS connection
-        let tls_stream = connector.connect(domain, stream)
+        let tls_stream = connector
+            .connect(domain, stream)
             .await
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
 
@@ -134,13 +150,19 @@ impl Tunnel for IPTunnel {
         Ok(())
     }
 
-    async fn open_stream_by_dest(&self, dest_port: u16, dest_host: Option<String>) -> Result<Box<dyn AsyncStream>, Error> {
+    async fn open_stream_by_dest(
+        &self,
+        dest_port: u16,
+        dest_host: Option<String>,
+    ) -> Result<Box<dyn AsyncStream>, Error> {
         self.open_tcp_stream_by_dest(dest_port, dest_host).await
     }
 
     async fn open_stream(&self, stream_id: &str) -> Result<Box<dyn AsyncStream>, std::io::Error> {
-        let stream_id = percent_decode(stream_id.as_bytes()).decode_utf8()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "invalid stream id"))?.to_string();
+        let stream_id = percent_decode(stream_id.as_bytes())
+            .decode_utf8()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "invalid stream id"))?
+            .to_string();
         debug!("ip_tunnel open_stream: {}", stream_id);
         let stream_id = stream_id.trim_start_matches('/');
         // 检测stream_id中是否有协议头
@@ -157,9 +179,17 @@ impl Tunnel for IPTunnel {
                     }
 
                     if url.scheme() == "tcp" {
-                        self.open_tcp_stream_by_dest(url.port().unwrap(), url.host().map(|h| h.to_string())).await
+                        self.open_tcp_stream_by_dest(
+                            url.port().unwrap(),
+                            url.host().map(|h| h.to_string()),
+                        )
+                        .await
                     } else if url.scheme() == "tls" {
-                        self.open_tls_stream_by_dest(url.port().unwrap(), url.host().map(|h| h.to_string())).await
+                        self.open_tls_stream_by_dest(
+                            url.port().unwrap(),
+                            url.host().map(|h| h.to_string()),
+                        )
+                        .await
                     } else {
                         let msg = format!("unsupported protocol: {}", url.scheme());
                         log::error!("{}", msg.as_str());
@@ -175,7 +205,11 @@ impl Tunnel for IPTunnel {
         }
     }
 
-    async fn create_datagram_client_by_dest(&self, dest_port: u16, dest_host: Option<String>) -> Result<Box<dyn DatagramClientBox>, Error> {
+    async fn create_datagram_client_by_dest(
+        &self,
+        dest_port: u16,
+        dest_host: Option<String>,
+    ) -> Result<Box<dyn DatagramClientBox>, Error> {
         let real_dest_host;
         if dest_host.is_none() {
             if self.ip_stack_id.is_none() {
@@ -191,9 +225,13 @@ impl Tunnel for IPTunnel {
         Ok(Box::new(client))
     }
 
-    async fn create_datagram_client(&self, session_id: &str) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
+    async fn create_datagram_client(
+        &self,
+        session_id: &str,
+    ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
         let (dest_host, dest_port) = get_dest_info_from_url_path(session_id)?;
-        self.create_datagram_client_by_dest(dest_port, dest_host).await
+        self.create_datagram_client_by_dest(dest_port, dest_host)
+            .await
     }
 }
 

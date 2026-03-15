@@ -1,8 +1,8 @@
-use crate::chain::*;
 use crate::block::*;
-use xmltree::Element;
+use crate::chain::*;
 use serde::Deserialize;
 use std::sync::Arc;
+use xmltree::Element;
 
 /**
  * Process chain in xml format, at least one block is required in the chain.
@@ -23,7 +23,11 @@ use std::sync::Arc;
 pub struct ProcessChainXMLLoader {}
 
 impl ProcessChainXMLLoader {
-    pub fn load_process_chain_lib(id: &str, priority: i32, config: &str) -> Result<ProcessChainLibRef, String> {
+    pub fn load_process_chain_lib(
+        id: &str,
+        priority: i32,
+        config: &str,
+    ) -> Result<ProcessChainLibRef, String> {
         let chains = Self::parse(config)?;
         let chains = chains
             .into_iter()
@@ -79,10 +83,7 @@ impl ProcessChainXMLLoader {
 
                 // At least one block is required in the chain
                 if chain_item.get_blocks().is_empty() {
-                    let msg = format!(
-                        "Process chain must have at least one block: {}",
-                        id,
-                    );
+                    let msg = format!("Process chain must have at least one block: {}", id,);
                     error!("{}", msg);
                     return Err(msg);
                 }
@@ -101,7 +102,6 @@ impl ProcessChainXMLLoader {
             error!("{}", msg);
             msg
         })?;
-
 
         let block_parser = BlockParser::new(id);
 
@@ -122,7 +122,6 @@ impl ProcessChainXMLLoader {
     }
 }
 
-
 pub struct ProcessChainJSONLoader {}
 
 #[derive(Deserialize, Debug)]
@@ -139,7 +138,11 @@ pub struct BlockJSONItem {
 }
 
 impl ProcessChainJSONLoader {
-    pub fn load_process_chain_lib(id: &str, priority: i32, content: &str) -> Result<ProcessChainLibRef, String> {
+    pub fn load_process_chain_lib(
+        id: &str,
+        priority: i32,
+        content: &str,
+    ) -> Result<ProcessChainLibRef, String> {
         let chains = Self::parse(content)?;
         let chains = chains
             .into_iter()
@@ -177,10 +180,7 @@ impl ProcessChainJSONLoader {
 
             // At least one block is required in the chain
             if chain_item.get_blocks().is_empty() {
-                let msg = format!(
-                    "Process chain must have at least one block: {}",
-                    item.id,
-                );
+                let msg = format!("Process chain must have at least one block: {}", item.id,);
                 error!("{}", msg);
                 return Err(msg);
             }

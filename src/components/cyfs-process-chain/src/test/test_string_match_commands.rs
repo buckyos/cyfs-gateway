@@ -188,6 +188,41 @@ const PROCESS_CHAIN_REWRITE_REGEX_PARSE_ERROR: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_URL_ENCODE_DECODE: &str = r#"
+<process_chain_lib id="url_encode_decode_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local raw="https://sys.test.buckyos.io/oauth/login?redirect_url=/a/b?x=1&y=2";
+                local encoded=$(url_encode $raw);
+                eq $encoded "https%3A%2F%2Fsys.test.buckyos.io%2Foauth%2Flogin%3Fredirect_url%3D%2Fa%2Fb%3Fx%3D1%26y%3D2" || return --from lib "url_encode_value_fail";
+
+                local redirect=$(append "https://control.example.com/oauth/login?redirect_url=" $(url_encode $raw));
+                eq $redirect "https://control.example.com/oauth/login?redirect_url=https%3A%2F%2Fsys.test.buckyos.io%2Foauth%2Flogin%3Fredirect_url%3D%2Fa%2Fb%3Fx%3D1%26y%3D2" || return --from lib "redirect_append_fail";
+
+                local decoded=$(url_decode $encoded);
+                eq $decoded $raw || return --from lib "url_decode_roundtrip_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_URL_DECODE_PARSE_ERROR: &str = r#"
+<process_chain_lib id="url_decode_parse_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                url_decode "https%2";
+                return --from lib "unexpected";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 const PROCESS_CHAIN_MATCH_REGEX_CAPTURE_SUCCESS: &str = r#"
 <process_chain_lib id="match_regex_capture_success_lib" priority="100">
     <process_chain id="main">
@@ -284,11 +319,7 @@ async fn test_range_command_parse_rejects_invalid_begin_literal() -> Result<(), 
 
     let hook_point = HookPoint::new("test_range_parse_error");
     hook_point
-        .load_process_chain_lib(
-            "range_parse_error_lib",
-            0,
-            PROCESS_CHAIN_RANGE_PARSE_ERROR,
-        )
+        .load_process_chain_lib("range_parse_error_lib", 0, PROCESS_CHAIN_RANGE_PARSE_ERROR)
         .await?;
 
     let data_dir = new_test_data_dir("test-range-parse-error")?;
@@ -475,6 +506,56 @@ async fn test_rewrite_regex_rejects_invalid_pattern_at_link_time() -> Result<(),
     assert!(
         err.contains("Invalid regex pattern"),
         "unexpected link error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_url_encode_and_decode_support_nested_urls() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_url_encode_decode");
+    hook_point
+        .load_process_chain_lib("url_encode_decode_lib", 0, PROCESS_CHAIN_URL_ENCODE_DECODE)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-url-encode-decode")?;
+    let hook_point_env = HookPointEnv::new("test-url-encode-decode", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("url_encode_decode_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_url_decode_rejects_incomplete_escape_sequence() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_url_decode_parse_error");
+    hook_point
+        .load_process_chain_lib(
+            "url_decode_parse_error_lib",
+            0,
+            PROCESS_CHAIN_URL_DECODE_PARSE_ERROR,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-url-decode-parse-error")?;
+    let hook_point_env = HookPointEnv::new("test-url-decode-parse-error", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = exec
+        .execute_lib("url_decode_parse_error_lib")
+        .await
+        .err()
+        .ok_or_else(|| "url_decode invalid escape should fail".to_string())?;
+    assert!(
+        err.contains("Incomplete percent-encoded sequence"),
+        "unexpected error: {}",
         err
     );
 

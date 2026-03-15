@@ -34,6 +34,7 @@ pin-project-lite = "*"
 url.workspace = true
 httparse = "*"
 trust-dns-resolver = "*"
+indexmap = { version = "2.13.0", features = ["serde"] }
 
 [dev-dependencies]
 rcgen.workspace = true

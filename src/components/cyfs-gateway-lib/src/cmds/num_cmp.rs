@@ -53,7 +53,10 @@ Operators:
             .parse::<f64>()
             .map_err(|e| format!("invalid {} number '{}': {}", field, value, e))?;
         if !num.is_finite() {
-            return Err(format!("invalid {} number '{}': must be finite", field, value));
+            return Err(format!(
+                "invalid {} number '{}': must be finite",
+                field, value
+            ));
         }
         Ok(num)
     }
@@ -127,11 +130,15 @@ impl ExternalCommand for NumCmp {
             str_args.push(arg.as_str().unwrap());
         }
 
-        let matches = self.cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
-            let msg = format!("Invalid num-cmp command: {:?}, {}", args, e);
-            error!("{}", msg);
-            msg
-        })?;
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid num-cmp command: {:?}, {}", args, e);
+                error!("{}", msg);
+                msg
+            })?;
 
         let result = Self::parse_and_eval(&matches)?;
         if result {
