@@ -9,10 +9,12 @@ use http::{StatusCode, Version};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
+use named_store::{ChunkStoreState, NamedStoreMgr};
+use ndm::{NamedDataMgr, PathKind};
 use ndn_lib::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::SeekFrom;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Wrapper for ChunkReader to make it Sync
@@ -98,19 +100,16 @@ pub struct InnerPathInfo {
     pub inner_proof: Option<String>,
 }
 
-/// Load object from NamedDataMgr
+/// Load object directly from NamedStoreMgr
 async fn load_obj(
-    mgr: Arc<tokio::sync::Mutex<NamedDataMgr>>,
+    store_mgr: Arc<NamedStoreMgr>,
     obj_id: &ObjId,
     offset: u64,
 ) -> ServerResult<LoadedObj> {
-    let real_mgr = mgr.lock().await;
-    let mgr_id = real_mgr.get_mgr_id();
-
     if obj_id.is_chunk() {
-        let chunk_id = ChunkId::from_obj_id(&obj_id);
-        let (chunk_reader, chunk_size) = real_mgr
-            .open_chunk_reader_impl(&chunk_id, offset, true)
+        let chunk_id = ChunkId::from_obj_id(obj_id);
+        let (chunk_reader, chunk_size) = store_mgr
+            .open_chunk_reader(&chunk_id, offset)
             .await
             .map_err(|e| {
                 warn!("get chunk reader by objid failed: {}", e);
@@ -136,25 +135,20 @@ async fn load_obj(
             chunk_size,
         ));
     } else if obj_id.is_chunk_list() {
-        drop(real_mgr);
-        let (chunk_list_reader, chunk_list_size) = NamedDataMgr::open_chunklist_reader(
-            mgr_id.as_deref(),
-            &obj_id,
-            SeekFrom::Start(offset),
-            true,
-        )
-        .await
-        .map_err(|e| {
-            warn!("get chunk list reader by objid failed: {}", e);
-            match e {
-                NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
-                _ => server_err!(
-                    ServerErrorCode::IOError,
-                    "get chunk list reader by objid failed: {}",
-                    e
-                ),
-            }
-        })?;
+        let (chunk_list_reader, chunk_list_size) = store_mgr
+            .open_chunklist_reader(obj_id, offset)
+            .await
+            .map_err(|e| {
+                warn!("get chunk list reader by objid failed: {}", e);
+                match e {
+                    NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
+                    _ => server_err!(
+                        ServerErrorCode::IOError,
+                        "get chunk list reader by objid failed: {}",
+                        e
+                    ),
+                }
+            })?;
 
         debug!(
             "ndn server -> chunk list: {}, chunk list size: {}, offset: {}",
@@ -168,7 +162,7 @@ async fn load_obj(
             chunk_list_size,
         ));
     } else {
-        let obj_body = real_mgr.get_object_impl(&obj_id, None).await.map_err(|e| {
+        let obj_body_str = store_mgr.get_object(obj_id).await.map_err(|e| {
             warn!("get object by objid failed: {}", e);
             match e {
                 NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
@@ -178,6 +172,14 @@ async fn load_obj(
                     e
                 ),
             }
+        })?;
+        let obj_body = load_named_object_from_obj_str(obj_body_str.as_str()).map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidData,
+                "Failed to parse object {}: {}",
+                obj_id,
+                e
+            )
         })?;
         debug!("ndn server -> obj {}", obj_body.to_string());
         return Ok(LoadedObj::new_named_obj_result(obj_id.clone(), obj_body));
@@ -370,6 +372,7 @@ pub struct NdnServer {
     id: String,
     version: http::Version,
     config: NamedDataMgrRouteConfig,
+    store_mgr: Arc<NamedStoreMgr>,
 }
 
 impl NdnServer {
@@ -413,11 +416,45 @@ impl NdnServer {
             None => http::Version::HTTP_11,
         };
 
+        let config = builder.config.unwrap();
+        let store_config_path = config.named_store_config_path.trim();
+        if store_config_path.is_empty() {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "named_store_config_path is required"
+            ));
+        }
+
+        let store_mgr = Arc::new(
+            NamedStoreMgr::get_store_mgr(Path::new(store_config_path))
+                .await
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Failed to open named store config {}: {}",
+                        store_config_path,
+                        e
+                    )
+                })?,
+        );
+
         Ok(NdnServer {
             id: builder.id.unwrap(),
             version,
-            config: builder.config.unwrap(),
+            config,
+            store_mgr,
         })
+    }
+
+    async fn get_default_named_mgr(&self) -> ServerResult<Arc<tokio::sync::Mutex<NamedDataMgr>>> {
+        NamedDataMgr::get_named_data_mgr_by_id(None)
+            .await
+            .ok_or_else(|| {
+                server_err!(
+                    ServerErrorCode::NotFound,
+                    "Default named data manager not found"
+                )
+            })
     }
 
     /// Handle chunk PUT request
@@ -452,18 +489,6 @@ impl NdnServer {
             }
         };
 
-        let named_mgr_id = self.config.named_data_mgr_id.clone();
-        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(Some(named_mgr_id.as_str()))
-            .await
-            .ok_or_else(|| {
-                server_err!(
-                    ServerErrorCode::NotFound,
-                    "Named manager not found: {}",
-                    named_mgr_id
-                )
-            })?;
-
-        let named_mgr_lock = named_mgr.lock().await;
         let chunk_id = ChunkId::from_obj_id(&obj_id);
 
         // Get total size
@@ -473,23 +498,6 @@ impl NdnServer {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
-
-        // Open chunk writer
-        let (chunk_writer, _) = named_mgr_lock
-            .open_chunk_writer_impl(&chunk_id, total_size, 0)
-            .await
-            .map_err(|e| {
-                warn!("Failed to open chunk writer: {}", e);
-                match e {
-                    NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
-                    _ => server_err!(
-                        ServerErrorCode::IOError,
-                        "Failed to open chunk writer: {}",
-                        e
-                    ),
-                }
-            })?;
-        drop(named_mgr_lock);
 
         // Read entire request body to memory
         let body_bytes = req
@@ -504,36 +512,26 @@ impl NdnServer {
             })?
             .to_bytes();
 
-        // Create a memory reader
-        let chunk_reader = std::io::Cursor::new(body_bytes);
-        let write_result =
-            ndn_lib::copy_chunk(chunk_id.clone(), chunk_reader, chunk_writer, None, None)
-                .await
-                .map_err(|e| {
-                    warn!("Failed to copy chunk: {}", e);
-                    match e {
-                        NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
-                        _ => server_err!(ServerErrorCode::IOError, "Failed to copy chunk: {}", e),
-                    }
-                })?;
-
-        if write_result == total_size {
-            let named_mgr_lock = named_mgr.lock().await;
-            named_mgr_lock
-                .complete_chunk_writer_impl(&chunk_id)
-                .await
-                .map_err(|e| {
-                    warn!("Failed to complete chunk: {}", e);
-                    server_err!(ServerErrorCode::IOError, "Failed to complete chunk: {}", e)
-                })?;
-        } else {
-            warn!("Failed to complete chunk: {}", write_result);
+        let body_size = body_bytes.len() as u64;
+        if total_size != 0 && total_size != body_size {
             return Err(server_err!(
-                ServerErrorCode::IOError,
-                "Failed to complete chunk: {}",
-                write_result
+                ServerErrorCode::BadRequest,
+                "Chunk size mismatch, header={}, body={}",
+                total_size,
+                body_size
             ));
         }
+
+        self.store_mgr
+            .put_chunk(&chunk_id, body_bytes.as_ref(), false)
+            .await
+            .map_err(|e| {
+                warn!("Failed to store chunk: {}", e);
+                match e {
+                    NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
+                    _ => server_err!(ServerErrorCode::IOError, "Failed to store chunk: {}", e),
+                }
+            })?;
 
         return Ok(http::Response::builder()
             .status(StatusCode::OK)
@@ -563,30 +561,29 @@ impl NdnServer {
 
         let chunk_id = ChunkId::from_obj_id(&obj_id);
 
-        let (chunk_state, chunk_size, progress) = NamedDataMgr::query_chunk_state(
-            Some(self.config.named_data_mgr_id.as_str()),
-            &chunk_id,
-        )
-        .await
-        .map_err(|e| {
-            warn!("Failed to query chunk state: {}", e);
-            match e {
-                NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
-                _ => server_err!(
-                    ServerErrorCode::IOError,
-                    "Failed to query chunk state: {}",
-                    e
-                ),
-            }
-        })?;
+        let (chunk_state, chunk_size, progress) = self
+            .store_mgr
+            .query_chunk_state(&chunk_id)
+            .await
+            .map_err(|e| {
+                warn!("Failed to query chunk state: {}", e);
+                match e {
+                    NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
+                    _ => server_err!(
+                        ServerErrorCode::IOError,
+                        "Failed to query chunk state: {}",
+                        e
+                    ),
+                }
+            })?;
 
         let status_code = match chunk_state {
-            ChunkState::New => StatusCode::CREATED,
-            ChunkState::Completed => StatusCode::OK,
-            ChunkState::Incompleted => StatusCode::PARTIAL_CONTENT,
-            ChunkState::Disabled => StatusCode::FORBIDDEN,
-            ChunkState::NotExist => StatusCode::NOT_FOUND,
-            ChunkState::LocalLink(_) => StatusCode::OK,
+            ChunkStoreState::New => StatusCode::CREATED,
+            ChunkStoreState::Completed => StatusCode::OK,
+            ChunkStoreState::Incompleted => StatusCode::PARTIAL_CONTENT,
+            ChunkStoreState::Disabled => StatusCode::FORBIDDEN,
+            ChunkStoreState::NotExist => StatusCode::NOT_FOUND,
+            ChunkStoreState::LocalLink(_) => StatusCode::OK,
         };
 
         return Ok(http::Response::builder()
@@ -608,20 +605,6 @@ impl NdnServer {
         req: http::Request<BoxBody<Bytes, ServerError>>,
         host: &str,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        let named_mgr_id = self.config.named_data_mgr_id.clone();
-        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(Some(named_mgr_id.as_str()))
-            .await
-            .ok_or_else(|| {
-                server_err!(
-                    ServerErrorCode::NotFound,
-                    "Named manager not found: {}",
-                    named_mgr_id
-                )
-            })?;
-
-        debug!("named manager founded!");
-        let named_mgr2 = named_mgr.clone();
-
         let range_str = req.headers().get(hyper::header::RANGE);
         let mut start = 0;
         let mut _end = u64::MAX;
@@ -632,7 +615,7 @@ impl NdnServer {
 
         let req_path = req.uri().path();
         let mut obj_id: Option<ObjId> = None;
-        let mut path_obj_jwt: Option<String> = None;
+        let path_obj_jwt: Option<String> = None;
 
         let mut root_obj_id: Option<ObjId> = None;
         let mut _inner_obj_path: Option<String> = None;
@@ -660,49 +643,55 @@ impl NdnServer {
         }
 
         if obj_id.is_none() && self.config.enable_mgr_file_path {
-            // Use req_path as sub_path for simplicity
-            let sub_path = req_path.to_string();
+            let sub_path = NdmPath::new(req_path.to_string());
+            let named_mgr = self.get_default_named_mgr().await?;
             let real_named_mgr = named_mgr.lock().await;
-            let target_obj_result = real_named_mgr.get_obj_id_by_path_impl(&sub_path).await;
-            if target_obj_result.is_ok() {
-                info!(
-                    "ndn_server: get_obj_id_by_path success, ndn_path: {}",
-                    sub_path
-                );
-                let (target_obj_id, the_path_obj_jwt) = target_obj_result.unwrap();
-                path_obj_jwt = the_path_obj_jwt;
-                obj_id = Some(target_obj_id);
-            } else {
-                let root_obj_id_result = real_named_mgr.select_obj_id_by_path_impl(&sub_path).await;
-                if root_obj_id_result.is_ok() {
-                    let (the_root_obj_id, _the_path_obj_jwt, the_inner_path) =
-                        root_obj_id_result.unwrap();
-                    if the_inner_path.is_none() {
-                        return Err(server_err!(
-                            ServerErrorCode::NotFound,
-                            "ndn_server: can't found target object, inner_obj_path is not found"
-                        ));
+            let stat = real_named_mgr.stat(&sub_path).await.map_err(|e| {
+                warn!("ndn_server: stat failed for {}: {}", sub_path.as_str(), e);
+                match e {
+                    NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
+                    _ => server_err!(
+                        ServerErrorCode::IOError,
+                        "ndn_server: stat failed for {}: {}",
+                        sub_path.as_str(),
+                        e
+                    ),
+                }
+            })?;
+
+            if stat.kind != PathKind::NotFound {
+                if let Some(stat_obj_id) = stat.obj_id {
+                    if let Some(the_inner_path) = stat.obj_inner_path {
+                        info!(
+                            "ndn_server: stat success, ndn_path: {}, obj_inner_path: {}",
+                            sub_path.as_str(),
+                            the_inner_path
+                        );
+                        if stat_obj_id.is_chunk() {
+                            return Err(server_err!(
+                                ServerErrorCode::BadRequest,
+                                "ndn_server: chunk is not supported to be root obj"
+                            ));
+                        }
+                        if stat_obj_id.is_big_container() {
+                            warn!("ndn_server: big container is not supported to be root obj");
+                            return Err(server_err!(
+                                ServerErrorCode::BadRequest,
+                                "ndn_server: big container is not supported to be root obj"
+                            ));
+                        }
+                        _inner_obj_path = Some(the_inner_path);
+                        root_obj_id = Some(stat_obj_id);
+                    } else {
+                        info!("ndn_server: stat success, ndn_path: {}", sub_path.as_str());
+                        obj_id = Some(stat_obj_id);
                     }
-                    _inner_obj_path = the_inner_path.clone();
-                    info!(
-                        "ndn_server: select_obj_id_by_path success, ndn_path: {}, obj_inner_path: {}",
-                        sub_path,
-                        the_inner_path.clone().unwrap_or("None".to_string())
+                } else {
+                    debug!(
+                        "ndn_server: stat resolved path {} as {:?} without obj_id",
+                        sub_path.as_str(),
+                        stat.kind
                     );
-                    if the_root_obj_id.is_chunk() {
-                        return Err(server_err!(
-                            ServerErrorCode::BadRequest,
-                            "ndn_server: chunk is not supported to be root obj"
-                        ));
-                    }
-                    if the_root_obj_id.is_big_container() {
-                        warn!("ndn_server: big container is not supported to be root obj");
-                        return Err(server_err!(
-                            ServerErrorCode::BadRequest,
-                            "ndn_server: big container is not supported to be root obj"
-                        ));
-                    }
-                    root_obj_id = Some(the_root_obj_id);
                 }
             }
         }
@@ -728,16 +717,21 @@ impl NdnServer {
         if _inner_obj_path.is_some() {
             let root_obj_id = root_obj_id.unwrap();
             let inner_obj_path = _inner_obj_path.unwrap();
-            let real_named_mgr = named_mgr.lock().await;
-            let root_obj_json = real_named_mgr
-                .get_object_impl(&root_obj_id, None)
-                .await
-                .map_err(|e| {
-                    warn!("Failed to get object: {}", e);
-                    match e {
-                        NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
-                        _ => server_err!(ServerErrorCode::IOError, "Failed to get object: {}", e),
-                    }
+            let root_obj_str = self.store_mgr.get_object(&root_obj_id).await.map_err(|e| {
+                warn!("Failed to get object: {}", e);
+                match e {
+                    NdnError::NotFound(e2) => server_err!(ServerErrorCode::NotFound, "{}", e2),
+                    _ => server_err!(ServerErrorCode::IOError, "Failed to get object: {}", e),
+                }
+            })?;
+            let root_obj_json =
+                load_named_object_from_obj_str(root_obj_str.as_str()).map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidData,
+                        "Failed to parse object {}: {}",
+                        root_obj_id,
+                        e
+                    )
                 })?;
 
             let obj_filed = get_by_json_path(&root_obj_json, &inner_obj_path);
@@ -783,7 +777,7 @@ impl NdnServer {
         debug!("ndn_server: obj_id: {:?}", obj_id);
         let obj_id = obj_id.unwrap();
         debug!("ndn_server: before load obj");
-        let mut load_result: LoadedObj = load_obj(named_mgr2, &obj_id, start).await?;
+        let mut load_result: LoadedObj = load_obj(self.store_mgr.clone(), &obj_id, start).await?;
         load_result.path_obj_jwt = path_obj_jwt;
         let response = build_response_by_obj_get_result(load_result, start, inner_path_info)
             .await
@@ -911,14 +905,28 @@ impl ServerFactory for NdnServerFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    // Helper function to create a temporary directory with a NamedDataMgr
+    // Helper function to create a temporary directory with a minimal NamedStoreMgr config.
     fn create_test_named_data_mgr() -> (TempDir, NamedDataMgrRouteConfig) {
         let temp_dir = TempDir::new().unwrap();
+        let store_config_path = temp_dir.path().join("named_store.json");
+        let store_root = temp_dir.path().join("store");
+        fs::write(
+            &store_config_path,
+            serde_json::json!({
+                "stores": [
+                    { "path": store_root.to_string_lossy() }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
         let config = NamedDataMgrRouteConfig {
-            named_data_mgr_id: "default".to_string(),
+            named_store_config_path: store_config_path.to_string_lossy().to_string(),
             read_only: false,
             guest_access: true,
             is_object_id_in_path: true,

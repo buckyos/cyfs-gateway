@@ -9,7 +9,7 @@ fn default_true() -> bool {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NamedDataMgrRouteConfig {
-    pub named_data_mgr_id: String,
+    pub named_store_config_path: String,
     #[serde(default = "default_true")]
     pub read_only: bool,
     #[serde(default = "default_true")]
@@ -28,7 +28,7 @@ pub struct NamedDataMgrRouteConfig {
 impl Default for NamedDataMgrRouteConfig {
     fn default() -> Self {
         Self {
-            named_data_mgr_id: "default".to_string(),
+            named_store_config_path: String::new(),
             read_only: true,
             guest_access: false,
             is_object_id_in_path: true,

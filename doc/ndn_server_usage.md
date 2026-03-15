@@ -12,7 +12,7 @@ NdnServer 支持以下功能：
 2. **PUT/PATCH 请求** - 上传 chunk 数据
 3. **HEAD 请求** - 查询 chunk 状态
 4. **范围请求** - 支持 HTTP Range 请求进行部分内容下载
-5. **路径解析** - 支持多种对象 ID 解析方式（hostname、path、mgr path）
+5. **路径解析** - 支持多种对象 ID 解析方式（hostname、path、mgr path；其中 mgr path 依赖进程内默认 `NamedDataMgr`）
 
 ## 配置说明
 
@@ -20,7 +20,7 @@ NdnServer 支持以下功能：
 
 ```rust
 pub struct NamedDataMgrRouteConfig {
-    pub named_data_mgr_id: String,     // NamedDataMgr 实例的 ID
+    pub named_store_config_path: String, // named_store 布局配置文件路径
     pub read_only: bool,                // 是否只读模式
     pub guest_access: bool,             // 是否允许 zone 外访问
     pub is_object_id_in_path: bool,    // 对象 ID 是否在路径中
@@ -48,7 +48,7 @@ pub struct NdnServerConfig {
 use cyfs_gateway_lib::{NdnServer, NamedDataMgrRouteConfig};
 
 let config = NamedDataMgrRouteConfig {
-    named_data_mgr_id: "default".to_string(),
+    named_store_config_path: "/etc/buckyos/named_store.json".to_string(),
     read_only: false,
     guest_access: true,
     is_object_id_in_path: true,
@@ -89,7 +89,7 @@ let server = factory.create(Arc::new(config)).await?;
   "type": "ndn",
   "version": "HTTP/1.1",
   "named_mgr": {
-    "named_data_mgr_id": "default",
+    "named_store_config_path": "/etc/buckyos/named_store.json",
     "read_only": false,
     "guest_access": true,
     "is_object_id_in_path": true,
@@ -272,4 +272,3 @@ factory.register("ndn".to_string(), Arc::new(NdnServerFactory));
 - [DIR Server 使用文档](dir_server_usage.md)
 - [NDN Router 实现总结](dir_server_implementation_summary.md)
 - [Process Chain 命令](process_chain_cmd.md)
-
