@@ -10,8 +10,8 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use log::*;
 use serde::{Deserialize, Deserializer, Serialize};
-use std::sync::{Arc, Weak};
 use serde_json::{Map, Number, Value};
+use std::sync::{Arc, Weak};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ControlErrorCode {
@@ -404,9 +404,18 @@ impl HttpServer for GatewayControlServer {
                 if req.sys.is_empty() {
                     let resp = http::Response::builder()
                         .status(http::StatusCode::BAD_REQUEST)
-                        .body(Full::new(Bytes::from("invalid sys param"))
-                            .map_err(|e| ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))).boxed()).unwrap();
-                    return Ok(resp)
+                        .body(
+                            Full::new(Bytes::from("invalid sys param"))
+                                .map_err(|e| {
+                                    ServerError::new(
+                                        ServerErrorCode::BadRequest,
+                                        format!("{:?}", e),
+                                    )
+                                })
+                                .boxed(),
+                        )
+                        .unwrap();
+                    return Ok(resp);
                 }
                 let seq = req.sys[0].clone();
                 if let Some(handler) = self.handler.upgrade() {
@@ -436,9 +445,19 @@ impl HttpServer for GatewayControlServer {
                     };
                     let data = serde_json::to_vec(&resp)
                         .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
-                    return Ok(http::Response::new(Full::new(Bytes::from(data)).map_err(|e| ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))).boxed()));
+                    return Ok(http::Response::new(
+                        Full::new(Bytes::from(data))
+                            .map_err(|e| {
+                                ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))
+                            })
+                            .boxed(),
+                    ));
                 } else {
-                    return Err(cmd_err!(ControlErrorCode::Failed, "{}", "cmd handler has released"));
+                    return Err(cmd_err!(
+                        ControlErrorCode::Failed,
+                        "{}",
+                        "cmd handler has released"
+                    ));
                 }
             }
 

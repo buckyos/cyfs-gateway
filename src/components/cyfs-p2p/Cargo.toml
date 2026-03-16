@@ -1,0 +1,27 @@
+[package]
+name = "cyfs-p2p"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait.workspace = true
+bucky-raw-codec = "0.1.0"
+buckyos-kit.workspace = true
+cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
+cyfs-process-chain = { path = "../cyfs-process-chain" }
+hex.workspace = true
+log.workspace = true
+p2p-frame = { git = "https://github.com/buckyos/bucky-p2p.git", features = ["x509"] }
+percent-encoding = "*"
+ring.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+shlex.workspace = true
+sfo-io = "0.1"
+sfo-cmd-server = "0.2.6"
+tokio.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+serde_yaml_ng.workspace = true

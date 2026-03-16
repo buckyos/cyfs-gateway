@@ -26,6 +26,8 @@ pub fn get_protocol_category(str_protocol: &str) -> TunnelResult<ProtocolCategor
         "rtcp" => Ok(ProtocolCategory::Stream),
         "udp" => Ok(ProtocolCategory::Datagram),
         "rudp" => Ok(ProtocolCategory::Datagram),
+        "sp2p" => Ok(ProtocolCategory::Stream),
+        "up2p" => Ok(ProtocolCategory::Datagram),
         "socks" => Ok(ProtocolCategory::Stream),
         "tls" => Ok(ProtocolCategory::Stream),
         _ => {

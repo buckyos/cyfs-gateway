@@ -6,6 +6,7 @@ use cyfs_gateway_lib::{
     ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig,
     TcpStackConfig, UdpStackConfig,
 };
+use cyfs_p2p::{CyfsP2pStackConfig, P2pPnServerConfig, P2pSnServerConfig};
 use cyfs_sn::*;
 use cyfs_socks::SocksServerConfig;
 use cyfs_tun::TunStackConfig;
@@ -366,6 +367,43 @@ impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for TunStackCon
     }
 }
 
+pub struct P2pStackConfigParser {}
+
+impl P2pStackConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<D: for<'de> Deserializer<'de> + Clone> StackConfigParser<D> for P2pStackConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn StackConfig>> {
+        let mut value = serde_json::Value::deserialize(de.clone()).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid p2p stack config. error: {} input:\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
+                    .unwrap()
+            )
+        })?;
+        if value.get("pre_hook_point").is_none() && value.get("pre-hook-point").is_some() {
+            value["pre_hook_point"] = value["pre-hook-point"].clone();
+        }
+        value = hook_point_value_map_to_vector_in_value(value, "hook_point")?;
+        value = hook_point_value_map_to_vector_in_value(value, "pre_hook_point")?;
+        let p2p_config = CyfsP2pStackConfig::deserialize(value).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid p2p stack config: {}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
+                    .unwrap()
+            )
+        })?;
+        Ok(Arc::new(p2p_config))
+    }
+}
+
 pub trait ServerConfigParser<D: for<'de> Deserializer<'de>>: Send + Sync {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>>;
 }
@@ -559,6 +597,52 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for SNServerCo
             config_err!(
                 ConfigErrorCode::InvalidConfig,
                 "invalid sn server config.{:?}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
+                    .unwrap()
+            )
+        })?;
+        Ok(Arc::new(config))
+    }
+}
+
+pub struct P2pSnServerConfigParser {}
+
+impl P2pSnServerConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for P2pSnServerConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
+        let config = P2pSnServerConfig::deserialize(de.clone()).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid p2p sn server config.{:?}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
+                    .unwrap()
+            )
+        })?;
+        Ok(Arc::new(config))
+    }
+}
+
+pub struct P2pPnServerConfigParser {}
+
+impl P2pPnServerConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for P2pPnServerConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
+        let config = P2pPnServerConfig::deserialize(de.clone()).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid p2p pn server config.{:?}\n{}",
                 e,
                 serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
                     .unwrap()
@@ -988,6 +1072,7 @@ pub struct GatewayConfig {
 mod tests {
     use crate::merge;
     use cyfs_gateway_lib::RtcpStackConfig;
+    use cyfs_p2p::{CyfsP2pStackConfig, P2pPnServerConfig, P2pSnServerConfig};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1143,6 +1228,125 @@ mod tests {
             rtcp_config.keep_tunnel,
             vec!["did:1".to_string(), "did:2".to_string()]
         );
+    }
+
+    #[test]
+    fn test_p2p_stack_config_parser_supports_single_and_array_sn() {
+        let parser = super::GatewayConfigParser::new();
+        parser.register_stack_config_parser("p2p", Arc::new(super::P2pStackConfigParser::new()));
+
+        let config = parser
+            .parse(json!({
+                "stacks": {
+                    "test5": {
+                        "protocol": "p2p",
+                        "bind": "0.0.0.0:3453",
+                        "sn": {
+                            "id": "k9f7p8slxjn7t7k2rw0sb0b7k8r2x2h2czk98b4vprqmk2xxc5g0",
+                            "name": "sn-1",
+                            "endpoints": ["127.0.0.1:3456"]
+                        },
+                        "certs": [{
+                            "type": "x509",
+                            "key_path": "./test.key",
+                            "cert_path": "./test.cert"
+                        }],
+                        "pre_hook_point": {
+                            "main": {
+                                "priority": 1,
+                                "blocks": {
+                                    "default": {"block": "reject;"}
+                                }
+                            }
+                        },
+                        "hook_point": {
+                            "main": {
+                                "priority": 1,
+                                "blocks": {
+                                    "default": {"block": "reject;"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+
+        let p2p_config = config.stacks[0]
+            .as_any()
+            .downcast_ref::<CyfsP2pStackConfig>()
+            .unwrap();
+        assert_eq!(p2p_config.sn.len(), 1);
+        assert_eq!(p2p_config.pre_hook_point.as_ref().unwrap().len(), 1);
+        assert_eq!(p2p_config.hook_point.len(), 1);
+
+        let config = parser
+            .parse(json!({
+                "stacks": {
+                    "test5": {
+                        "protocol": "p2p",
+                        "bind": "0.0.0.0:3453",
+                        "sn": [{
+                            "id": "k9f7p8slxjn7t7k2rw0sb0b7k8r2x2h2czk98b4vprqmk2xxc5g0",
+                            "name": "sn-1",
+                            "endpoints": ["127.0.0.1:3456"]
+                        }, {
+                            "id": "k9f7p8slxjn7t7k2rw0sb0b7k8r2x2h2czk98b4vprqmk2xxc5g1",
+                            "name": "sn-2",
+                            "endpoints": ["L4qic127.0.0.1:3457"]
+                        }],
+                        "certs": [{
+                            "type": "x509",
+                            "key_path": "./test.key",
+                            "cert_path": "./test.cert"
+                        }],
+                        "hook_point": {}
+                    }
+                }
+            }))
+            .unwrap();
+
+        let p2p_config = config.stacks[0]
+            .as_any()
+            .downcast_ref::<CyfsP2pStackConfig>()
+            .unwrap();
+        assert_eq!(p2p_config.sn.len(), 2);
+    }
+
+    #[test]
+    fn test_p2p_sn_server_config_only_accepts_id() {
+        let config = serde_json::from_value::<P2pSnServerConfig>(json!({
+            "id": "sn-server"
+        }))
+        .unwrap();
+        assert_eq!(config.id, "sn-server");
+
+        let legacy = serde_json::from_value::<P2pSnServerConfig>(json!({
+            "id": "sn-server",
+            "endpoints": ["127.0.0.1:3456"],
+            "certs": [{
+                "type": "x509",
+                "key_path": "./test.key",
+                "cert_path": "./test.cert"
+            }]
+        }));
+        assert!(legacy.is_err());
+    }
+
+    #[test]
+    fn test_p2p_pn_server_config_only_accepts_id() {
+        let config = serde_json::from_value::<P2pPnServerConfig>(json!({
+            "id": "pn-server"
+        }))
+        .unwrap();
+        assert_eq!(config.id, "pn-server");
+
+        let legacy = serde_json::from_value::<P2pPnServerConfig>(json!({
+            "id": "pn-server",
+            "bind": "127.0.0.1:3456",
+            "purpose": "proxy_service"
+        }));
+        assert!(legacy.is_err());
     }
 
     #[test]

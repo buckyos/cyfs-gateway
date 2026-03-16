@@ -145,6 +145,7 @@ pub struct StreamInfo {
     pub source_mac: Option<String>,
     pub source_hostname: Option<String>,
     pub source_online_secs: Option<String>,
+    pub extra: Vec<u8>,
 }
 
 impl StreamInfo {
@@ -157,6 +158,7 @@ impl StreamInfo {
             source_mac: None,
             source_hostname: None,
             source_online_secs: None,
+            extra: vec![],
         }
     }
 
@@ -170,6 +172,7 @@ impl StreamInfo {
             source_mac: None,
             source_hostname: None,
             source_online_secs: None,
+            extra: vec![],
         }
     }
 
@@ -187,6 +190,11 @@ impl StreamInfo {
 
     pub fn with_dst_addr(mut self, dst_addr: Option<String>) -> Self {
         self.dst_addr = dst_addr;
+        self
+    }
+
+    pub fn with_extra(mut self, extra: Vec<u8>) -> Self {
+        self.extra = extra;
         self
     }
 }
