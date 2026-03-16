@@ -23,6 +23,7 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
 use cyfs_dns::{InnerDnsRecordManager, LocalDnsFactory, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
+use cyfs_p2p::{CyfsP2pStackFactory, P2pPnServerFactory, P2pSnServerFactory};
 use process_chain_doc::GatewayProcessChainDoc;
 use std::collections::HashSet;
 
@@ -125,6 +126,7 @@ async fn run_gateway_with_config(
     parser.register_stack_config_parser("tls", Arc::new(TlsStackConfigParser::new()));
     parser.register_stack_config_parser("quic", Arc::new(QuicStackConfigParser::new()));
     parser.register_stack_config_parser("tun", Arc::new(TunStackConfigParser::new()));
+    parser.register_stack_config_parser("p2p", Arc::new(P2pStackConfigParser::new()));
 
     parser.register_server_config_parser("http", Arc::new(HttpServerConfigParser::new()));
     parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
@@ -136,6 +138,8 @@ async fn run_gateway_with_config(
     );
     parser.register_server_config_parser("local_dns", Arc::new(LocalDnsConfigParser::new()));
     parser.register_server_config_parser("sn", Arc::new(SNServerConfigParser::new()));
+    parser.register_server_config_parser("p2p_pn", Arc::new(P2pPnServerConfigParser::new()));
+    parser.register_server_config_parser("p2p_sn", Arc::new(P2pSnServerConfigParser::new()));
     parser.register_server_config_parser(
         "acme_response",
         Arc::new(AcmeHttpChallengeServerConfigParser::new()),
@@ -215,6 +219,11 @@ async fn run_gateway_with_config(
         Arc::new(TunStackFactory::new(connect_manager.clone())),
     );
     debug!("Register tun stack context factory");
+    factory.register_stack_factory(
+        StackProtocol::Extension("p2p".to_string()),
+        Arc::new(CyfsP2pStackFactory::new(connect_manager.clone())),
+    );
+    debug!("Register p2p stack factory");
     factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new()));
     debug!("Register http server factory");
     factory.register_server_factory("dir", Arc::new(DirServerFactory::new()));
@@ -238,6 +247,10 @@ async fn run_gateway_with_config(
     sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
     factory.register_server_factory("sn", Arc::new(sn_factory));
     info!("Register sn server factory");
+    factory.register_server_factory("p2p_pn", Arc::new(P2pPnServerFactory::new()));
+    info!("Register p2p pn server factory");
+    factory.register_server_factory("p2p_sn", Arc::new(P2pSnServerFactory::new()));
+    info!("Register p2p sn server factory");
     let gateway = factory
         .create_gateway(config_file, gateway_config, init_gateway_config)
         .await

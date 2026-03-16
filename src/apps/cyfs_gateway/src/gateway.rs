@@ -24,6 +24,7 @@ use chrono::Utc;
 use cyfs_dns::{
     DnsServerContext, InnerDnsRecordManager, InnerDnsRecordManagerRef, LocalDnsServerContext,
 };
+use cyfs_p2p::CyfsP2pStackContext;
 use cyfs_process_chain::CollectionValue;
 use cyfs_socks::SocksServerContext;
 use cyfs_tun::TunStackContext;
@@ -350,6 +351,15 @@ fn build_stack_context(
         ))),
         StackProtocol::Extension(name) => match name.as_str() {
             "tun" => Ok(Arc::new(TunStackContext::new(
+                servers.clone(),
+                tunnel_manager.clone(),
+                limiter_manager.clone(),
+                stat_manager.clone(),
+                global_process_chains.clone(),
+                global_collection_manager.clone(),
+                js_externals.clone(),
+            ))),
+            "p2p" => Ok(Arc::new(CyfsP2pStackContext::new(
                 servers.clone(),
                 tunnel_manager.clone(),
                 limiter_manager.clone(),

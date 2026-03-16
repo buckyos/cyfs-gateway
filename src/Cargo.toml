@@ -13,6 +13,7 @@ members = [
     "components/server-runner",
     "apps/cyfs_gateway",
     "apps/test_server",
+    "components/cyfs-p2p",
 ]
 
 [workspace.package]

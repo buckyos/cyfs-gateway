@@ -2570,6 +2570,7 @@ mod tests {
                     source_mac: None,
                     source_hostname: None,
                     source_online_secs: None,
+                    extra: vec![],
                 },
             )
             .await
