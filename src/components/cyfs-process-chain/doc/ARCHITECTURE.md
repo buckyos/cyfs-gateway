@@ -3,7 +3,7 @@
 本文件描述 `src/components/cyfs-process-chain` 当前实现状态（以代码为准）。
 
 - crate: `cyfs-process-chain`
-- version: `0.5.1`
+- version: `0.6.0`
 - updated: `2026-03-09`
 
 ## 1. 工程定位

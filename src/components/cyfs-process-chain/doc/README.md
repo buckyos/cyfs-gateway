@@ -43,7 +43,7 @@
 ## 版本与时间
 
 - crate: `cyfs-process-chain`
-- version: `0.5.1`
+- version: `0.6.0`
 - generated at: `2026-03-09`
 
 ## 如何重新生成命令参考
