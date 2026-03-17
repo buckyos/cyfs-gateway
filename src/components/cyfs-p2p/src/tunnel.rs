@@ -168,7 +168,7 @@ impl TunnelBuilder for CyfsP2pTunnelBuilder {
             (Some(remote_id), Some(remote_endpoint)) => {
                 match self
                     .tunnel_manager
-                    .open_direct_tunnel(vec![remote_endpoint], Some(remote_id.clone()))
+                    .open_direct_tunnel(vec![remote_endpoint], &remote_id)
                     .await
                 {
                     Ok(tunnel) => tunnel,
@@ -190,12 +190,7 @@ impl TunnelBuilder for CyfsP2pTunnelBuilder {
                 .open_tunnel_from_id(&remote_id)
                 .await
                 .map_err(|err| TunnelError::ConnectError(err.to_string()))?,
-            (None, Some(remote_endpoint)) => self
-                .tunnel_manager
-                .open_direct_tunnel(vec![remote_endpoint], None)
-                .await
-                .map_err(|err| TunnelError::ConnectError(err.to_string()))?,
-            (None, None) => {
+            _ => {
                 return Err(TunnelError::ReasonError(format!(
                     "invalid p2p authority {}",
                     authority

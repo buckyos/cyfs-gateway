@@ -616,13 +616,21 @@ impl P2pSnServerConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for P2pSnServerConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = P2pSnServerConfig::deserialize(de.clone()).map_err(|e| {
+        let mut value = serde_json::Value::deserialize(de).map_err(|e| {
             config_err!(
                 ConfigErrorCode::InvalidConfig,
-                "invalid p2p sn server config.{:?}\n{}",
-                e,
-                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
-                    .unwrap()
+                "invalid p2p sn server config.{:?}",
+                e
+            )
+        })?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("type");
+        }
+        let config = P2pSnServerConfig::deserialize(value).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid p2p sn server config.{:?}",
+                e
             )
         })?;
         Ok(Arc::new(config))
@@ -639,13 +647,21 @@ impl P2pPnServerConfigParser {
 
 impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for P2pPnServerConfigParser {
     fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
-        let config = P2pPnServerConfig::deserialize(de.clone()).map_err(|e| {
+        let mut value = serde_json::Value::deserialize(de).map_err(|e| {
             config_err!(
                 ConfigErrorCode::InvalidConfig,
-                "invalid p2p pn server config.{:?}\n{}",
-                e,
-                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
-                    .unwrap()
+                "invalid p2p pn server config.{:?}",
+                e
+            )
+        })?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("type");
+        }
+        let config = P2pPnServerConfig::deserialize(value).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid p2p pn server config.{:?}",
+                e
             )
         })?;
         Ok(Arc::new(config))

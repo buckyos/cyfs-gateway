@@ -59,3 +59,5 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 hickory-resolver = { version = "0.24", features = ["tokio"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "brotli"] }
+rcgen.workspace = true
+base-x = "0.2"

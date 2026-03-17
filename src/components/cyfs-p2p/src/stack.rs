@@ -1,3 +1,4 @@
+use crate::identity::{DeviceIdentity, DeviceIdentityCertFactory, DeviceIdentityFactory};
 use crate::identity::load_x509_identity_from_paths;
 use crate::pn_server::{register_pn_service, unregister_pn_service};
 use crate::sn_server::P2pStreamExtra;
@@ -29,12 +30,18 @@ use p2p_frame::networks::{
     ValidateResult, allow_all_tunnel_purposes,
 };
 use p2p_frame::p2p_identity::{
-    P2pId, P2pIdentityCertFactoryRef, P2pIdentityFactoryRef, P2pIdentityRef, P2pSn,
+    P2pId, P2pIdentityCertFactoryRef, P2pIdentityFactoryRef, P2pIdentityRef,
+    P2pSn,
 };
 use p2p_frame::sn::client::{SNClientService, SNClientServiceRef};
 use p2p_frame::stack::{P2pConfig, P2pEnvRef, create_p2p_env};
+use p2p_frame::tls::TlsServerCertResolver;
 use p2p_frame::types::{SequenceGenerator, TunnelIdGenerator};
 use p2p_frame::x509::{X509IdentityCertFactory, X509IdentityFactory};
+use name_lib::{
+    encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig,
+    DIDDocumentTrait, EncodedDocument,
+};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
@@ -168,7 +175,7 @@ pub struct CyfsP2pStackConfig {
     pub io_dump_max_download_bytes_per_conn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
-    pub certs: Vec<CyfsP2pCertConfig>,
+    pub cert: CyfsP2pCertConfig,
     #[serde(
         default,
         alias = "pre-hook-point",
@@ -714,6 +721,7 @@ pub struct CyfsP2pStack {
     bind_addr: SocketAddr,
     gateway_tunnel_manager: TunnelManager,
     local_identity: P2pIdentityRef,
+    cert_type: String,
     sn_config: Vec<CyfsP2pSnConfig>,
     sn_list: Vec<P2pSn>,
     reuse_address: bool,
@@ -743,12 +751,7 @@ impl CyfsP2pStack {
         sn_list: Vec<P2pSn>,
         io_dump: Option<IoDumpStackConfig>,
     ) -> StackResult<Self> {
-        if config.certs.is_empty() {
-            return Err(stack_err!(
-                StackErrorCode::InvalidConfig,
-                "certs is required"
-            ));
-        }
+        let cert_type = config.cert.cert_type.clone();
         let handler = CyfsP2pConnectionHandler::create(
             config.hook_point.clone(),
             config.pre_hook_point.clone(),
@@ -761,6 +764,7 @@ impl CyfsP2pStack {
             bind_addr: config.bind,
             gateway_tunnel_manager: stack_context.tunnel_manager.clone(),
             local_identity,
+            cert_type,
             sn_config: config.sn.clone(),
             sn_list,
             reuse_address: config.reuse_address.unwrap_or(false),
@@ -780,14 +784,31 @@ impl CyfsP2pStack {
             );
         }
 
-        let identity_factory: P2pIdentityFactoryRef = Arc::new(X509IdentityFactory);
-        let cert_factory: P2pIdentityCertFactoryRef = Arc::new(X509IdentityCertFactory);
+        // Select identity/cert factory based on cert_type (x509 or device),
+        // not sign_type. Ed25519 keys may appear in both x509 certs and device
+        // certs, but they use different encoding formats and therefore different
+        // factories.
+        let (identity_factory, cert_factory): (P2pIdentityFactoryRef, P2pIdentityCertFactoryRef) =
+            if self.cert_type == "x509" {
+                (
+                    Arc::new(X509IdentityFactory) as P2pIdentityFactoryRef,
+                    Arc::new(X509IdentityCertFactory) as P2pIdentityCertFactoryRef,
+                )
+            } else {
+                (
+                    Arc::new(DeviceIdentityFactory) as P2pIdentityFactoryRef,
+                    Arc::new(DeviceIdentityCertFactory) as P2pIdentityCertFactoryRef,
+                )
+            };
         let validator = Arc::new(CyfsP2pIncomingTunnelValidator::new(self.handler.clone()));
         let endpoint = Endpoint::from((Protocol::Quic, self.bind_addr));
-        let p2p_config = P2pConfig::new(identity_factory, cert_factory.clone(), vec![endpoint])
+        let p2p_config = P2pConfig::new(identity_factory, cert_factory.clone(), vec![])
             .set_incoming_tunnel_validator(validator);
         let cert_cache = p2p_config.identity_cert_cache().clone();
         let connection_info_cache = p2p_config.connection_info_cache().clone();
+        // Clone the cert resolver before consuming p2p_config so we can set the
+        // default server identity after the env is created.
+        let cert_resolver = p2p_config.sever_cert_resolver().clone();
         let env = create_p2p_env(p2p_config).await.map_err(into_stack_err!(
             StackErrorCode::Failed,
             "create p2p env failed"
@@ -1036,29 +1057,36 @@ impl StackFactory for CyfsP2pStackFactory {
         .await
         .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
 
-        let cert = config.certs.first().ok_or(stack_err!(
-            StackErrorCode::InvalidConfig,
-            "certs is required"
-        ))?;
-        if cert.cert_type != "x509" {
-            return Err(stack_err!(
-                StackErrorCode::InvalidConfig,
-                "unsupported p2p cert type {}",
-                cert.cert_type
-            ));
-        }
+        let cert = &config.cert;
 
         let sn_list = parse_sn_list(&config.sn)?;
-        let local_identity = load_x509_identity_from_paths(
-            Path::new(cert.cert_path.as_str()),
-            Path::new(cert.key_path.as_str()),
-            sn_list.clone(),
-            vec![Endpoint::from((Protocol::Quic, config.bind))],
-        )
-        .map_err(into_stack_err!(
-            StackErrorCode::InvalidConfig,
-            "load p2p x509 identity failed"
-        ))?;
+        let local_identity = match cert.cert_type.as_str() {
+            "x509" => {
+                load_x509_identity_from_paths(
+                    Path::new(cert.cert_path.as_str()),
+                    Path::new(cert.key_path.as_str()),
+                    sn_list.clone(),
+                    vec![],
+                )
+                .map_err(into_stack_err!(
+                    StackErrorCode::InvalidConfig,
+                    "load p2p x509 identity failed"
+                ))?
+            }
+            "device" => {
+                load_device_identity_from_config(cert, config.bind).map_err(into_stack_err!(
+                    StackErrorCode::InvalidConfig,
+                    "load p2p device identity failed"
+                ))?
+            }
+            _ => {
+                return Err(stack_err!(
+                    StackErrorCode::InvalidConfig,
+                    "unsupported p2p cert type {}",
+                    cert.cert_type
+                ))
+            }
+        };
 
         let stack = CyfsP2pStack::create(
             config,
@@ -1079,6 +1107,86 @@ fn parse_sn_list(sn_list: &[CyfsP2pSnConfig]) -> StackResult<Vec<P2pSn>> {
         result.push(sn.to_p2p_sn()?);
     }
     Ok(result)
+}
+
+fn load_device_identity_from_config(
+    cert: &CyfsP2pCertConfig,
+    _bind: std::net::SocketAddr,
+) -> StackResult<P2pIdentityRef> {
+    let private_key = load_raw_private_key(Path::new(cert.key_path.as_str()))
+        .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "load private key failed: {}", e))?;
+    let public_key = encode_ed25519_pkcs8_sk_to_pk(&private_key);
+
+    let content = std::fs::read_to_string(cert.cert_path.as_str()).map_err(|e| {
+        stack_err!(
+            StackErrorCode::InvalidConfig,
+            "load device config {} failed: {}",
+            cert.cert_path,
+            e
+        )
+    })?;
+    let device_config = load_device_config_from_path(
+        content.as_str(),
+        cert.cert_path.as_str(),
+        &public_key,
+    )?;
+
+    let identity = DeviceIdentity::new(device_config, private_key.to_vec())
+        .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "create device identity failed: {}", e))?;
+    Ok(Arc::new(identity))
+}
+
+fn load_device_config_from_path(
+    content: &str,
+    path: &str,
+    public_key: &str,
+) -> StackResult<DeviceConfig> {
+    if let Ok(device_config) = serde_json::from_str::<DeviceConfig>(content) {
+        let default_key = device_config.get_default_key().ok_or(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "device config {} has no default key",
+            path
+        ))?;
+        let x_of_auth_key = get_x_from_jwk(&default_key).map_err(|e| stack_err!(
+            StackErrorCode::InvalidConfig,
+            "device config {} has no auth key: {}",
+            path, e
+        ))?;
+        if x_of_auth_key != public_key {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "device config {} public key not match",
+                path
+            ));
+        }
+        return Ok(device_config);
+    }
+
+    let jwt = content.trim();
+    let device_config = DeviceConfig::decode(&EncodedDocument::Jwt(jwt.to_string()), None)
+        .map_err(|e| stack_err!(
+            StackErrorCode::InvalidConfig,
+            "parse device config jwt {} failed: {}",
+            path, e
+        ))?;
+    let default_key = device_config.get_default_key().ok_or(stack_err!(
+        StackErrorCode::InvalidConfig,
+        "device config {} has no default key",
+        path
+    ))?;
+    let x_of_auth_key = get_x_from_jwk(&default_key).map_err(|e| stack_err!(
+        StackErrorCode::InvalidConfig,
+        "device config {} has no auth key: {}",
+        path, e
+    ))?;
+    if x_of_auth_key != public_key {
+        return Err(stack_err!(
+            StackErrorCode::InvalidConfig,
+            "device config {} public key not match",
+            path
+        ));
+    }
+    Ok(device_config)
 }
 
 fn start_subscription_loop(
@@ -1309,10 +1417,7 @@ mod tests {
         StreamServer, server_err,
     };
     use p2p_frame::networks::{IncomingTunnelValidateContext, TunnelPurpose, ValidateResult};
-    use p2p_frame::p2p_identity::{
-        P2pId, P2pIdentity, P2pIdentityCert, P2pIdentityCertRef, P2pIdentityRef, P2pSignature,
-        P2pSn,
-    };
+    use p2p_frame::p2p_identity::{P2pId, P2pIdentity, P2pIdentityCert, P2pIdentityCertRef, P2pIdentityRef, P2pIdentitySignType, P2pSignature, P2pSn};
     use p2p_frame::types::{TunnelCandidateId, TunnelId};
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex, RwLock};
@@ -1425,11 +1530,11 @@ mod tests {
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
             concurrency: Some(0),
-            certs: vec![CyfsP2pCertConfig {
+            cert: CyfsP2pCertConfig {
                 cert_type: "x509".to_string(),
                 key_path: "test.key".to_string(),
                 cert_path: "test.cert".to_string(),
-            }],
+            },
             pre_hook_point,
             hook_point,
         }
@@ -1548,6 +1653,10 @@ mod tests {
             self.name.clone()
         }
 
+        fn sign_type(&self) -> P2pIdentitySignType {
+            P2pIdentitySignType::Rsa
+        }
+
         fn verify(&self, _message: &[u8], _sign: &P2pSignature) -> bool {
             true
         }
@@ -1603,6 +1712,10 @@ mod tests {
 
         fn get_name(&self) -> String {
             self.cert.get_name()
+        }
+
+        fn sign_type(&self) -> P2pIdentitySignType {
+            P2pIdentitySignType::Rsa
         }
 
         fn sign(&self, _message: &[u8]) -> P2pResult<P2pSignature> {
@@ -1756,12 +1869,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_p2p_stack_creation() {
-        let mut invalid_config = build_test_config("test", "127.0.0.1:9450", None, vec![]);
-        invalid_config.certs.clear();
-        let result = build_test_stack(&invalid_config, default_handler_env()).await;
-        assert!(result.is_err());
-        assert_eq!(result.err().unwrap().code(), StackErrorCode::InvalidConfig);
-
         let valid_config = build_test_config("test", "127.0.0.1:9451", None, vec![]);
         let result = build_test_stack(&valid_config, default_handler_env()).await;
         assert!(result.is_ok());
@@ -1775,14 +1882,8 @@ mod tests {
         let factory = CyfsP2pStackFactory::new(ConnectionManager::new());
         let context: Arc<dyn StackContext> = handler_env_with_process_chains();
 
-        let mut empty_certs = build_test_config("test", "127.0.0.1:9452", None, vec![]);
-        empty_certs.certs.clear();
-        let result = factory.create(Arc::new(empty_certs), context.clone()).await;
-        assert!(result.is_err());
-        assert_eq!(result.err().unwrap().code(), StackErrorCode::InvalidConfig);
-
         let mut unsupported = build_test_config("test", "127.0.0.1:9453", None, vec![]);
-        unsupported.certs[0].cert_type = "rsa".to_string();
+        unsupported.cert.cert_type = "rsa".to_string();
         let result = factory.create(Arc::new(unsupported), context.clone()).await;
         assert!(result.is_err());
         assert_eq!(result.err().unwrap().code(), StackErrorCode::InvalidConfig);

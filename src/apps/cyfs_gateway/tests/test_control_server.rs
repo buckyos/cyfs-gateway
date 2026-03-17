@@ -171,6 +171,7 @@ mod tests {
         let gateway = gateway.unwrap();
         let params = GatewayParams {
             keep_tunnel: vec![],
+            no_control_server: false,
         };
         gateway.start(params).await.unwrap();
 

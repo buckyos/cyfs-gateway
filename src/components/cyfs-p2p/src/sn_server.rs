@@ -13,11 +13,11 @@ use p2p_frame::sn::service::{
 use p2p_frame::sn::types::{SnTunnelRead, SnTunnelWrite};
 use p2p_frame::x509::X509IdentityCertFactory;
 use serde::{Deserialize, Serialize};
-use sfo_cmd_server::CmdTunnel;
-use sfo_cmd_server::server::CmdTunnelService;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use p2p_frame::cmd_server::CmdTunnel;
+use p2p_frame::cmd_server::server::CmdTunnelService;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct P2pStreamExtra {

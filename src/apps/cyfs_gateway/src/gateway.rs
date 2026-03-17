@@ -672,6 +672,7 @@ async fn build_global_process_chains_from_config(
 //use buckyos_api::{*};
 pub struct GatewayParams {
     pub keep_tunnel: Vec<String>,
+    pub no_control_server: bool,
 }
 
 pub struct GatewayFactory {

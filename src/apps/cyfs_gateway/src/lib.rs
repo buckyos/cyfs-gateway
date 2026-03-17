@@ -118,7 +118,12 @@ async fn run_gateway_with_config(
     config_file: Option<&Path>,
     params: GatewayParams,
 ) -> Result<()> {
-    let config_json = merge_keep_tunnel_into_rtcp_stack_config(config_json, &params.keep_tunnel);
+    let mut config_json = merge_keep_tunnel_into_rtcp_stack_config(config_json, &params.keep_tunnel);
+    if params.no_control_server {
+        if let Some(stacks) = config_json.get_mut("stacks").and_then(|v| v.as_object_mut()) {
+            stacks.remove(GATEWAY_CONTROL_SERVER_KEY);
+        }
+    }
     let parser = Arc::new(GatewayConfigParser::new());
     parser.register_stack_config_parser("tcp", Arc::new(TcpStackConfigParser::new()));
     parser.register_stack_config_parser("udp", Arc::new(UdpStackConfigParser::new()));
@@ -903,6 +908,7 @@ async fn run_template_local(template_id: &str, args: Vec<String>) -> Result<()> 
         None,
         GatewayParams {
             keep_tunnel: vec![],
+            no_control_server: false,
         },
     )
     .await
@@ -2437,6 +2443,7 @@ pub async fn cyfs_gateway_main() {
             .unwrap_or_default()
             .map(|s| s.to_string())
             .collect(),
+        no_control_server: false,
     };
 
     if let Err(e) = gateway_service_main(config_file.as_path(), params).await {

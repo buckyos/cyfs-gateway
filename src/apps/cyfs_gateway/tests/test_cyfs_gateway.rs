@@ -145,6 +145,27 @@ mod tests {
         listener.local_addr().unwrap().port()
     }
 
+    struct PortBatch {
+        listeners: Vec<tokio::net::TcpListener>,
+    }
+
+    impl PortBatch {
+        async fn new(count: usize) -> Self {
+            let mut listeners = Vec::with_capacity(count);
+            for _ in 0..count {
+                listeners.push(TcpListener::bind("127.0.0.1:0").await.unwrap());
+            }
+            Self { listeners }
+        }
+
+        fn ports(self) -> Vec<u16> {
+            self.listeners
+                .iter()
+                .map(|l| l.local_addr().unwrap().port())
+                .collect()
+        }
+    }
+
     async fn start_echo_server() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -381,6 +402,7 @@ function test_js_hook(context, host) {
                 config_file.path(),
                 GatewayParams {
                     keep_tunnel: vec![],
+                    no_control_server: false,
                 },
             )
             .await
@@ -1326,5 +1348,601 @@ function test_js_hook(context, host) {
         assert!(!json_set_content.is_empty());
         let set: HashSet<String> = serde_json::from_str(json_set_content.as_str()).unwrap();
         assert!(set.contains("upstream_socks_hit"));
+    }
+
+    /// Generate a self-signed X.509 cert + PKCS8 key pair for P2P tests.
+    /// Returns (cert_pem, key_pem, p2p_id) where p2p_id is the base36-encoded
+    /// SHA-256 of the Ed25519 public key — the same value that X509IdentityCert::get_id()
+    /// produces and that parse_p2p_authority expects in sp2p:// URLs.
+    fn generate_x509_test_cert() -> (String, String, String) {
+        use sha2::Digest;
+        const BASE36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let hash = sha2::Sha256::digest(key_pair.public_key_raw());
+        let p2p_id = base_x::encode(BASE36, hash.as_slice());
+        (cert.pem(), key_pair.serialize_pem(), p2p_id)
+    }
+
+    async fn start_p2p_gateway(yaml: String) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::with_suffix(".yaml").unwrap();
+        f.write_all(yaml.as_bytes()).unwrap();
+        let path = f.path().to_path_buf();
+        tokio::spawn(async move {
+            gateway_service_main(
+                &path,
+                GatewayParams {
+                    keep_tunnel: vec![],
+                    no_control_server: true,
+                },
+            )
+            .await
+            .unwrap();
+        });
+        f
+    }
+
+    #[tokio::test]
+    async fn test_p2p() {
+        unsafe {
+            std::env::set_var(
+                "BUCKY_LOG",
+                "debug",
+            );
+        }
+        init_logging("test_p2p", false);
+
+        let root_dir = tempfile::TempDir::new().unwrap();
+        unsafe {
+            std::env::set_var(
+                "BUCKYOS_ROOT",
+                root_dir.path().to_string_lossy().to_string(),
+            );
+        }
+
+        // Each sub-test uses a separate gateway instance (one P2P stack per instance).
+        // All gateways use no_control_server=true to avoid port 13451 conflicts.
+
+        // ── generate self-signed X.509 certs + keys ───────────────────────────
+        let (cert1_pem, key1_pem, id1) = generate_x509_test_cert(); // test-1 server
+        let (cert2_pem, key2_pem, _id2) = generate_x509_test_cert(); // test-1 client
+        let (cert3_pem, key3_pem, id3) = generate_x509_test_cert(); // test-2 server
+        let (cert4_pem, key4_pem, _id4) = generate_x509_test_cert(); // test-2 client
+        let (cert5_pem, key5_pem, id5) = generate_x509_test_cert(); // SN stack
+        let (cert6_pem, key6_pem, _id6) = generate_x509_test_cert(); // PN stack
+        let (cert7_pem, key7_pem, id7) = generate_x509_test_cert(); // test-3 SN-routing server
+        let (cert8_pem, key8_pem, _id8) = generate_x509_test_cert(); // test-3 SN-routing client
+        let (cert9_pem, key9_pem, id9) = generate_x509_test_cert(); // test-4 server
+        let (cert10_pem, key10_pem, _id10) = generate_x509_test_cert(); // test-4 client
+
+        macro_rules! write_cert_files {
+            ($cert:expr, $key:expr) => {{
+                let cf = tempfile::NamedTempFile::with_suffix(".crt").unwrap();
+                let kf = tempfile::NamedTempFile::with_suffix(".pem").unwrap();
+                std::fs::write(cf.path(), $cert).unwrap();
+                std::fs::write(kf.path(), $key).unwrap();
+                (cf, kf)
+            }};
+        }
+        let (cf1, kf1) = write_cert_files!(&cert1_pem, &key1_pem);
+        let (cf2, kf2) = write_cert_files!(&cert2_pem, &key2_pem);
+        let (cf3, kf3) = write_cert_files!(&cert3_pem, &key3_pem);
+        let (cf4, kf4) = write_cert_files!(&cert4_pem, &key4_pem);
+        let (cf5, kf5) = write_cert_files!(&cert5_pem, &key5_pem);
+        let (cf6, kf6) = write_cert_files!(&cert6_pem, &key6_pem);
+        let (cf7, kf7) = write_cert_files!(&cert7_pem, &key7_pem);
+        let (cf8, kf8) = write_cert_files!(&cert8_pem, &key8_pem);
+        let (cf9, kf9) = write_cert_files!(&cert9_pem, &key9_pem);
+        let (cf10, kf10) = write_cert_files!(&cert10_pem, &key10_pem);
+
+        // ── web dirs ──────────────────────────────────────────────────────────
+        let web_dir1 = tempfile::TempDir::new().unwrap();
+        std::fs::write(web_dir1.path().join("index.html"), "p2p-hello").unwrap();
+        let web_dir2 = tempfile::TempDir::new().unwrap();
+        std::fs::write(web_dir2.path().join("index.html"), "p2p-reject").unwrap();
+        let web_dir3 = tempfile::TempDir::new().unwrap();
+        std::fs::write(web_dir3.path().join("index.html"), "p2p-sn-hello").unwrap();
+        let web_dir4 = tempfile::TempDir::new().unwrap();
+        std::fs::write(web_dir4.path().join("index.html"), "p2p-pn-hello").unwrap();
+
+        // ── allocate ports ────────────────────────────────────────────────────
+        let p2p_srv1: u16 = 13674; // test-1 p2p server
+        let p2p_cli1: u16 = 13675; // test-1 p2p client
+        let tcp1: u16 = 13676; // test-1 tcp entry
+        let p2p_srv2: u16 = 13677; // test-2 p2p server (rejects)
+        let p2p_cli2: u16 = 13678; // test-2 p2p client
+        let tcp2: u16 = 13679; // test-2 tcp entry
+        let p2p_sn: u16 = 13680; // SN stack
+        let p2p_pn: u16 = 13681; // PN stack
+        let p2p_srv3: u16 = 13682; // test-3 SN-routing server
+        let p2p_cli3: u16 = 13687; // test-3 SN-routing client
+        let tcp3: u16 = 13683; // test-3 tcp entry (ID-only forward)
+        let p2p_srv4: u16 = 13684; // test-4 p2p server
+        let p2p_cli4: u16 = 13685; // test-4 p2p client
+        let tcp4: u16 = 13686; // test-4 tcp entry
+
+        // ── helper: build YAML for a p2p server gateway ───────────────────────
+        // Each gateway has exactly one P2P stack. The TCP stacks (tcp1/tcp2/tcp3/tcp4)
+        // live in the same gateway as their corresponding p2p_cli stack so that the
+        // sp2p tunnel builder registered by that stack is available for the forward.
+        let c = |f: &tempfile::NamedTempFile| f.path().to_str().unwrap().to_string();
+
+        // ── start server-side gateways first (SN must be up before srv3 registers) ─
+        let _gw_sn = start_p2p_gateway(format!(
+            r#"stacks:
+  p2p_sn_stack:
+    protocol: p2p
+    bind: 0.0.0.0:{p2p_sn}
+    sn: []
+    cert:
+      type: x509
+      key_path: {k5}
+      cert_path: {c5}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server sn_srv;
+servers:
+  sn_srv:
+    type: p2p_sn
+"#,
+            p2p_sn = p2p_sn,
+            c5 = c(&cf5), k5 = c(&kf5),
+        )).await;
+
+        let _gw_pn = start_p2p_gateway(format!(
+            r#"stacks:
+  p2p_pn_stack:
+    protocol: p2p
+    bind: 0.0.0.0:{p2p_pn}
+    sn: []
+    cert:
+      type: x509
+      key_path: {k6}
+      cert_path: {c6}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server pn_srv;
+servers:
+  pn_srv:
+    type: p2p_pn
+"#,
+            p2p_pn = p2p_pn,
+            c6 = c(&cf6), k6 = c(&kf6),
+        )).await;
+
+        let _gw_srv1 = start_p2p_gateway(format!(
+            r#"stacks:
+  p2p_srv1:
+    protocol: p2p
+    bind: 0.0.0.0:{p2p_srv1}
+    sn: []
+    cert:
+      type: x509
+      key_path: {k1}
+      cert_path: {c1}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server http1;
+servers:
+  http1:
+    type: http
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server dir1;
+  dir1:
+    type: dir
+    root_path: {wd1}
+"#,
+            p2p_srv1 = p2p_srv1,
+            c1 = c(&cf1), k1 = c(&kf1),
+            wd1 = web_dir1.path().to_str().unwrap(),
+        )).await;
+
+        let _gw_srv2 = start_p2p_gateway(format!(
+            r#"stacks:
+  p2p_srv2:
+    protocol: p2p
+    bind: 0.0.0.0:{p2p_srv2}
+    sn: []
+    cert:
+      type: x509
+      key_path: {k3}
+      cert_path: {c3}
+    pre_hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              reject;
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server http2;
+servers:
+  http2:
+    type: http
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server dir2;
+  dir2:
+    type: dir
+    root_path: {wd2}
+"#,
+            p2p_srv2 = p2p_srv2,
+            c3 = c(&cf3), k3 = c(&kf3),
+            wd2 = web_dir2.path().to_str().unwrap(),
+        )).await;
+
+        // SN must be up before srv3 starts so it can register immediately
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let _gw_srv3 = start_p2p_gateway(format!(
+            r#"stacks:
+  p2p_srv3:
+    protocol: p2p
+    bind: 0.0.0.0:{p2p_srv3}
+    sn:
+      - id: {id5}
+        name: {id5}
+        endpoints:
+          - 127.0.0.1:{p2p_sn}
+    cert:
+      type: x509
+      key_path: {k7}
+      cert_path: {c7}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server http3;
+servers:
+  http3:
+    type: http
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server dir3;
+  dir3:
+    type: dir
+    root_path: {wd3}
+"#,
+            p2p_srv3 = p2p_srv3,
+            p2p_sn = p2p_sn,
+            id5 = id5,
+            c7 = c(&cf7), k7 = c(&kf7),
+            wd3 = web_dir3.path().to_str().unwrap(),
+        )).await;
+
+        let _gw_srv4 = start_p2p_gateway(format!(
+            r#"stacks:
+  p2p_srv4:
+    protocol: p2p
+    bind: 0.0.0.0:{p2p_srv4}
+    sn: []
+    cert:
+      type: x509
+      key_path: {k9}
+      cert_path: {c9}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server http4;
+servers:
+  http4:
+    type: http
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server dir4;
+  dir4:
+    type: dir
+    root_path: {wd4}
+"#,
+            p2p_srv4 = p2p_srv4,
+            c9 = c(&cf9), k9 = c(&kf9),
+            wd4 = web_dir4.path().to_str().unwrap(),
+        )).await;
+
+        // ── start client-side gateways ────────────────────────────────────────
+        // tcp1/tcp2/tcp3/tcp4 are colocated with their p2p_cli stack so the
+        // sp2p tunnel builder registered by that stack handles the forward.
+        let _gw_cli1 = start_p2p_gateway(format!(
+            r#"stacks:
+  p2p_cli1:
+    protocol: p2p
+    bind: 0.0.0.0:{p2p_cli1}
+    sn: []
+    cert:
+      type: x509
+      key_path: {k2}
+      cert_path: {c2}
+    hook_point: {{}}
+  tcp1:
+    protocol: tcp
+    bind: 0.0.0.0:{tcp1}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              echo "tcp1 test";
+              forward "sp2p://{id1}@127.0.0.1:{p2p_srv1}";
+"#,
+            p2p_cli1 = p2p_cli1,
+            tcp1 = tcp1,
+            id1 = id1,
+            p2p_srv1 = p2p_srv1,
+            c2 = c(&cf2), k2 = c(&kf2),
+        )).await;
+
+        let _gw_cli2 = start_p2p_gateway(format!(
+            r#"stacks:
+  p2p_cli2:
+    protocol: p2p
+    bind: 0.0.0.0:{p2p_cli2}
+    sn: []
+    cert:
+      type: x509
+      key_path: {k4}
+      cert_path: {c4}
+    hook_point: {{}}
+  tcp2:
+    protocol: tcp
+    bind: 0.0.0.0:{tcp2}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              forward "sp2p://{id3}@127.0.0.1:{p2p_srv2}";
+"#,
+            p2p_cli2 = p2p_cli2,
+            tcp2 = tcp2,
+            id3 = id3,
+            p2p_srv2 = p2p_srv2,
+            c4 = c(&cf4), k4 = c(&kf4),
+        )).await;
+
+        // test-3 client: SN-aware; tcp3 uses ID-only sp2p:// which triggers SN lookup
+        let _gw_cli3 = start_p2p_gateway(format!(
+            r#"stacks:
+  p2p_cli3:
+    protocol: p2p
+    bind: 0.0.0.0:{p2p_cli3}
+    sn:
+      - id: {id5}
+        name: {id5}
+        endpoints:
+          - 127.0.0.1:{p2p_sn}
+    cert:
+      type: x509
+      key_path: {k8}
+      cert_path: {c8}
+    hook_point: {{}}
+  tcp3:
+    protocol: tcp
+    bind: 0.0.0.0:{tcp3}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              forward "sp2p://{id7}";
+"#,
+            p2p_cli3 = p2p_cli3,
+            tcp3 = tcp3,
+            id5 = id5,
+            p2p_sn = p2p_sn,
+            id7 = id7,
+            c8 = c(&cf8), k8 = c(&kf8),
+        )).await;
+
+        // test-4 client: direct endpoint-based sp2p:// (no SN needed)
+        let _gw_cli4 = start_p2p_gateway(format!(
+            r#"stacks:
+  p2p_cli4:
+    protocol: p2p
+    bind: 0.0.0.0:{p2p_cli4}
+    sn: []
+    cert:
+      type: x509
+      key_path: {k10}
+      cert_path: {c10}
+    hook_point: {{}}
+  tcp4:
+    protocol: tcp
+    bind: 0.0.0.0:{tcp4}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              forward "sp2p://{id9}@127.0.0.1:{p2p_srv4}";
+"#,
+            p2p_cli4 = p2p_cli4,
+            tcp4 = tcp4,
+            id9 = id9,
+            p2p_srv4 = p2p_srv4,
+            c10 = c(&cf10), k10 = c(&kf10),
+        )).await;
+
+        // Wait for all P2P stacks (QUIC) to fully start and srv3 to register with SN
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+
+        // ── Test 1: basic P2P stream routing ──────────────────────────────────
+        {
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", tcp1))
+                    .await
+                    .unwrap();
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                    .handshake(io)
+                    .await
+                    .unwrap();
+                tokio::spawn(conn);
+                let req = hyper::Request::builder()
+                    .uri("/")
+                    .header("host", "p2p-test")
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
+                    .unwrap();
+                let resp = sender.send_request(req).await.unwrap();
+                resp
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(resp.status(), 200, "test1: expected HTTP 200");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], b"p2p-hello", "test1: expected body p2p-hello");
+        }
+
+        // ── Test 2: pre_hook_point reject ─────────────────────────────────────
+        {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", tcp2)).await {
+                    Ok(stream) => {
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        match hyper::client::conn::http1::Builder::new().handshake(io).await {
+                            Ok((mut sender, conn)) => {
+                                tokio::spawn(conn);
+                                let req = hyper::Request::builder()
+                                    .uri("/")
+                                    .header("host", "p2p-test")
+                                    .body(http_body_util::Empty::<bytes::Bytes>::new())
+                                    .unwrap();
+                                match sender.send_request(req).await {
+                                    Ok(resp) => resp.status().as_u16(),
+                                    Err(_) => 0,
+                                }
+                            }
+                            Err(_) => 0,
+                        }
+                    }
+                    Err(_) => 0,
+                }
+            })
+            .await
+            .unwrap_or(0);
+
+            assert_ne!(result, 200u16, "test2: tunnel should have been rejected");
+        }
+
+        // // ── Test 3: SN-based ID-only routing ─────────────────────────────────
+        // // tcp3 forwards to sp2p://{id7} (no endpoint), forcing the active
+        // // sp2p builder (p2p_cli3, which has SN config) to call open_tunnel_from_id.
+        // // The SN looks up p2p_srv3's registered endpoint and relays the connection.
+        {
+            // Give p2p_srv3 time to register its endpoints with the SN
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", tcp3))
+                    .await
+                    .unwrap();
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                    .handshake(io)
+                    .await
+                    .unwrap();
+                tokio::spawn(conn);
+                let req = hyper::Request::builder()
+                    .uri("/")
+                    .header("host", "p2p-test")
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
+                    .unwrap();
+                sender.send_request(req).await.unwrap()
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(resp.status(), 200, "test3: expected HTTP 200 via SN routing");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], b"p2p-sn-hello", "test3: expected body p2p-sn-hello");
+        }
+
+        // // ── Test 4: direct P2P connection alongside running PN stack ──────────
+        // // tcp4 forwards to sp2p://{id9}@127.0.0.1:{p2p_srv4} (endpoint given),
+        // // so the tunnel builder tries open_direct_tunnel first (QUIC on localhost).
+        {
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", tcp4))
+                    .await
+                    .unwrap();
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+                    .handshake(io)
+                    .await
+                    .unwrap();
+                tokio::spawn(conn);
+                let req = hyper::Request::builder()
+                    .uri("/")
+                    .header("host", "p2p-test")
+                    .body(http_body_util::Empty::<bytes::Bytes>::new())
+                    .unwrap();
+                sender.send_request(req).await.unwrap()
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(resp.status(), 200, "test4: expected HTTP 200 with PN stack running");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], b"p2p-pn-hello", "test4: expected body p2p-pn-hello");
+        }
     }
 }

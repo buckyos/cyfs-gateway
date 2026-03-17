@@ -39,7 +39,7 @@
 #    sn-dns: // buckyos sn
 #      sn: https://sn.buckyos.ai
 #      key_path: ***
-#      device_config_path: ***
+#      cert_path: ***
 #   check_interval: 43200          # certificate check interval (seconds), default 12h
 #   renew_before_expiry: 2592000   # renew ahead of expiry (seconds), default 30d
 
@@ -166,8 +166,6 @@ stacks:
     #   protocol: rtcp
     #   bind: 0.0.0.0:2980
     #   key_path: ./sn_private_key.pem
-    #   device_config_path: ./device.doc.jwt  # 也支持 JSON；只有配置 JWT 时，Hello 才会自动携带 device_doc_jwt
-    #   name: optional_name
     #   reuse_address: false
     #   io_dump_file: rtcp.dump
     #   hook_point: { }
@@ -181,6 +179,43 @@ stacks:
     #   udp_timeout: 60             # default 60
     #   io_dump_file: tun.dump
     #   hook_point: { }
+
+    # p2p_example:
+    #   protocol: p2p
+    #   bind: 0.0.0.0:2981            # UDP port for P2P (QUIC-based transport)
+    #   concurrency: 1024             # optional, default unlimited
+    #   reuse_address: false          # optional, default false
+    #   io_dump_file: p2p.dump        # optional
+    #   sn:                           # SN (Super Node) list; single entry or array
+    #     - id: "<p2p_id>"            # Base58-encoded P2P identity of the SN
+    #       name: sn-name
+    #       endpoints:
+    #         - "quic/1.2.3.4:2980"
+    #   cert:
+    #     type: x509                # cert type: x509 | device
+    #     cert_path: ./cert.pem
+    #     key_path: ./key.pem
+    #   # --- OR: BuckyOS device identity ---
+    #   # cert:
+    #   #   type: device
+    #   #   key_path: ./device_private_key.pem      # Ed25519 private key (PKCS8 PEM)
+    #   #   cert_path: ""                           # unused for device type, but required by schema
+    #   pre_hook_point:               # optional: validate/filter incoming tunnels before accepting
+    #     main:
+    #       priority: 1
+    #       blocks:
+    #         default:
+    #           priority: 1
+    #           block: |
+    #             echo "new p2p tunnel from ${REQ.source_device_id}";
+    #   hook_point:                   # required: handle incoming P2P streams
+    #     main:
+    #       priority: 1
+    #       blocks:
+    #         default:
+    #           priority: 1
+    #           block: |
+    #             call-server p2p_sn;
 
     #servers:
     #  http_main:
@@ -270,3 +305,11 @@ stacks:
   #           priority: 1
   #           block: |
   #             reject;
+
+  # p2p_sn_example:
+  #   type: p2p_sn               # P2P Super Node service: handles SN protocol for the p2p stack
+  #                               # Attach via hook_point: call-server p2p_sn_example;
+
+  # p2p_pn_example:
+  #   type: p2p_pn               # P2P Proxy Node service: proxies streams between P2P peers
+  #                               # Attach via hook_point: call-server p2p_pn_example;
