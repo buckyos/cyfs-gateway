@@ -784,12 +784,12 @@ impl CyfsP2pStack {
             );
         }
 
-        // Select identity/cert factory based on cert_type (x509 or device),
+        // Select identity/cert factory based on cert_type (rsa/ed25519 or device),
         // not sign_type. Ed25519 keys may appear in both x509 certs and device
         // certs, but they use different encoding formats and therefore different
         // factories.
         let (identity_factory, cert_factory): (P2pIdentityFactoryRef, P2pIdentityCertFactoryRef) =
-            if self.cert_type == "x509" {
+            if self.cert_type != "device" {
                 (
                     Arc::new(X509IdentityFactory) as P2pIdentityFactoryRef,
                     Arc::new(X509IdentityCertFactory) as P2pIdentityCertFactoryRef,
@@ -1061,7 +1061,8 @@ impl StackFactory for CyfsP2pStackFactory {
 
         let sn_list = parse_sn_list(&config.sn)?;
         let local_identity = match cert.cert_type.as_str() {
-            "x509" => {
+            // "x509" accepted as a backward-compatible alias for "rsa"
+            "rsa" | "x509" => {
                 load_x509_identity_from_paths(
                     Path::new(cert.cert_path.as_str()),
                     Path::new(cert.key_path.as_str()),
@@ -1070,7 +1071,19 @@ impl StackFactory for CyfsP2pStackFactory {
                 )
                 .map_err(into_stack_err!(
                     StackErrorCode::InvalidConfig,
-                    "load p2p x509 identity failed"
+                    "load p2p rsa identity failed"
+                ))?
+            }
+            "ed25519" => {
+                load_x509_identity_from_paths(
+                    Path::new(cert.cert_path.as_str()),
+                    Path::new(cert.key_path.as_str()),
+                    sn_list.clone(),
+                    vec![],
+                )
+                .map_err(into_stack_err!(
+                    StackErrorCode::InvalidConfig,
+                    "load p2p ed25519 identity failed"
                 ))?
             }
             "device" => {
@@ -1531,7 +1544,7 @@ mod tests {
             io_dump_max_download_bytes_per_conn: None,
             concurrency: Some(0),
             cert: CyfsP2pCertConfig {
-                cert_type: "x509".to_string(),
+                cert_type: "rsa".to_string(),
                 key_path: "test.key".to_string(),
                 cert_path: "test.cert".to_string(),
             },
@@ -1883,7 +1896,7 @@ mod tests {
         let context: Arc<dyn StackContext> = handler_env_with_process_chains();
 
         let mut unsupported = build_test_config("test", "127.0.0.1:9453", None, vec![]);
-        unsupported.cert.cert_type = "rsa".to_string();
+        unsupported.cert.cert_type = "unsupported_type".to_string();
         let result = factory.create(Arc::new(unsupported), context.clone()).await;
         assert!(result.is_err());
         assert_eq!(result.err().unwrap().code(), StackErrorCode::InvalidConfig);

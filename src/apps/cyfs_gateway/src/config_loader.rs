@@ -1263,7 +1263,7 @@ mod tests {
                             "endpoints": ["127.0.0.1:3456"]
                         },
                         "certs": [{
-                            "type": "x509",
+                            "type": "rsa",
                             "key_path": "./test.key",
                             "cert_path": "./test.cert"
                         }],
@@ -1312,7 +1312,7 @@ mod tests {
                             "endpoints": ["L4qic127.0.0.1:3457"]
                         }],
                         "certs": [{
-                            "type": "x509",
+                            "type": "rsa",
                             "key_path": "./test.key",
                             "cert_path": "./test.cert"
                         }],

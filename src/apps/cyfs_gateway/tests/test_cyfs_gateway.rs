@@ -1477,7 +1477,7 @@ function test_js_hook(context, host) {
     bind: 0.0.0.0:{p2p_sn}
     sn: []
     cert:
-      type: x509
+      type: ed25519
       key_path: {k5}
       cert_path: {c5}
     hook_point:
@@ -1503,7 +1503,7 @@ servers:
     bind: 0.0.0.0:{p2p_pn}
     sn: []
     cert:
-      type: x509
+      type: ed25519
       key_path: {k6}
       cert_path: {c6}
     hook_point:
@@ -1529,7 +1529,7 @@ servers:
     bind: 0.0.0.0:{p2p_srv1}
     sn: []
     cert:
-      type: x509
+      type: ed25519
       key_path: {k1}
       cert_path: {c1}
     hook_point:
@@ -1567,7 +1567,7 @@ servers:
     bind: 0.0.0.0:{p2p_srv2}
     sn: []
     cert:
-      type: x509
+      type: ed25519
       key_path: {k3}
       cert_path: {c3}
     pre_hook_point:
@@ -1620,7 +1620,7 @@ servers:
         endpoints:
           - 127.0.0.1:{p2p_sn}
     cert:
-      type: x509
+      type: ed25519
       key_path: {k7}
       cert_path: {c7}
     hook_point:
@@ -1660,7 +1660,7 @@ servers:
     bind: 0.0.0.0:{p2p_srv4}
     sn: []
     cert:
-      type: x509
+      type: ed25519
       key_path: {k9}
       cert_path: {c9}
     hook_point:
@@ -1701,7 +1701,7 @@ servers:
     bind: 0.0.0.0:{p2p_cli1}
     sn: []
     cert:
-      type: x509
+      type: ed25519
       key_path: {k2}
       cert_path: {c2}
     hook_point: {{}}
@@ -1732,7 +1732,7 @@ servers:
     bind: 0.0.0.0:{p2p_cli2}
     sn: []
     cert:
-      type: x509
+      type: ed25519
       key_path: {k4}
       cert_path: {c4}
     hook_point: {{}}
@@ -1767,7 +1767,7 @@ servers:
         endpoints:
           - 127.0.0.1:{p2p_sn}
     cert:
-      type: x509
+      type: ed25519
       key_path: {k8}
       cert_path: {c8}
     hook_point: {{}}
@@ -1799,7 +1799,7 @@ servers:
     bind: 0.0.0.0:{p2p_cli4}
     sn: []
     cert:
-      type: x509
+      type: ed25519
       key_path: {k10}
       cert_path: {c10}
     hook_point: {{}}

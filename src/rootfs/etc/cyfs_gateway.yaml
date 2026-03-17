@@ -192,14 +192,9 @@ stacks:
     #       endpoints:
     #         - "quic/1.2.3.4:2980"
     #   cert:
-    #     type: x509                # cert type: x509 | device
+    #     type: rsa                 # cert type: rsa | ed25519
     #     cert_path: ./cert.pem
     #     key_path: ./key.pem
-    #   # --- OR: BuckyOS device identity ---
-    #   # cert:
-    #   #   type: device
-    #   #   key_path: ./device_private_key.pem      # Ed25519 private key (PKCS8 PEM)
-    #   #   cert_path: ""                           # unused for device type, but required by schema
     #   pre_hook_point:               # optional: validate/filter incoming tunnels before accepting
     #     main:
     #       priority: 1
