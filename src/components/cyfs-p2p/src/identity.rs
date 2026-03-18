@@ -269,6 +269,76 @@ pub fn load_x509_identity_from_pem(
     X509IdentityFactory.create(&encoded)
 }
 
+pub fn generate_rsa_x509_key_to_files(
+    name: &str,
+    cert_path: &Path,
+    key_path: &Path,
+) -> P2pResult<P2pId> {
+    use rcgen::{CertificateParams, KeyPair, PKCS_RSA_SHA256};
+    use sha2::Digest;
+
+    let key_pair = KeyPair::generate_for(&PKCS_RSA_SHA256)
+        .map_err(into_p2p_err!(P2pErrorCode::CertError, "generate RSA key failed"))?;
+
+    let mut sha256 = sha2::Sha256::new();
+    sha256.update(key_pair.public_key_raw());
+    let p2p_id = P2pId::from(sha256.finalize().as_slice());
+
+    let params = CertificateParams::new(vec![name.to_string()])
+        .map_err(into_p2p_err!(P2pErrorCode::CertError, "create cert params failed"))?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(into_p2p_err!(P2pErrorCode::CertError, "self sign cert failed"))?;
+
+    std::fs::write(cert_path, cert.pem().as_bytes()).map_err(into_p2p_err!(
+        P2pErrorCode::IoError,
+        "write cert to {} failed",
+        cert_path.display()
+    ))?;
+    std::fs::write(key_path, key_pair.serialize_pem().as_bytes()).map_err(into_p2p_err!(
+        P2pErrorCode::IoError,
+        "write key to {} failed",
+        key_path.display()
+    ))?;
+
+    Ok(p2p_id)
+}
+
+pub fn generate_ed25519_x509_key_to_files(
+    name: &str,
+    cert_path: &Path,
+    key_path: &Path,
+) -> P2pResult<P2pId> {
+    use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
+    use sha2::Digest;
+
+    let key_pair = KeyPair::generate_for(&PKCS_ED25519)
+        .map_err(into_p2p_err!(P2pErrorCode::CertError, "generate Ed25519 key failed"))?;
+
+    let mut sha256 = sha2::Sha256::new();
+    sha256.update(key_pair.public_key_raw());
+    let p2p_id = P2pId::from(sha256.finalize().as_slice());
+
+    let params = CertificateParams::new(vec![name.to_string()])
+        .map_err(into_p2p_err!(P2pErrorCode::CertError, "create cert params failed"))?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(into_p2p_err!(P2pErrorCode::CertError, "self sign cert failed"))?;
+
+    std::fs::write(cert_path, cert.pem().as_bytes()).map_err(into_p2p_err!(
+        P2pErrorCode::IoError,
+        "write cert to {} failed",
+        cert_path.display()
+    ))?;
+    std::fs::write(key_path, key_pair.serialize_pem().as_bytes()).map_err(into_p2p_err!(
+        P2pErrorCode::IoError,
+        "write key to {} failed",
+        key_path.display()
+    ))?;
+
+    Ok(p2p_id)
+}
+
 fn load_pkcs8_private_key(key_pem: &[u8], key_path: &Path) -> P2pResult<Vec<u8>> {
     let mut keys = Vec::new();
     for key in rustls_pemfile::pkcs8_private_keys(&mut Cursor::new(key_pem)) {

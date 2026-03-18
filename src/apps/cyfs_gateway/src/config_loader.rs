@@ -1262,11 +1262,11 @@ mod tests {
                             "name": "sn-1",
                             "endpoints": ["127.0.0.1:3456"]
                         },
-                        "certs": [{
+                        "cert": {
                             "type": "rsa",
                             "key_path": "./test.key",
                             "cert_path": "./test.cert"
-                        }],
+                        },
                         "pre_hook_point": {
                             "main": {
                                 "priority": 1,
@@ -1311,11 +1311,11 @@ mod tests {
                             "name": "sn-2",
                             "endpoints": ["L4qic127.0.0.1:3457"]
                         }],
-                        "certs": [{
+                        "cert": {
                             "type": "rsa",
                             "key_path": "./test.key",
                             "cert_path": "./test.cert"
-                        }],
+                        },
                         "hook_point": {}
                     }
                 }

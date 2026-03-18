@@ -26,16 +26,18 @@ use p2p_frame::error::{P2pErrorCode, P2pResult, p2p_err};
 use p2p_frame::executor::Executor as P2pExecutor;
 use p2p_frame::networks::{
     DefaultDeviceFinder, IncomingTunnelValidateContext, IncomingTunnelValidator, NetManagerRef,
-    TunnelManager as P2pTunnelManager, TunnelManagerRef as P2pTunnelManagerRef, TunnelRef,
-    ValidateResult, allow_all_tunnel_purposes,
+    TunnelManager as P2pTunnelManager, TunnelManagerRef as P2pTunnelManagerRef,
+    TunnelNetwork, TunnelNetworkRef, TunnelRef, ValidateResult,
+    allow_all_tunnel_purposes,
 };
 use p2p_frame::p2p_identity::{
     P2pId, P2pIdentityCertFactoryRef, P2pIdentityFactoryRef, P2pIdentityRef,
     P2pSn,
 };
+use p2p_frame::pn::{PnClient, pn_virtual_endpoint};
 use p2p_frame::sn::client::{SNClientService, SNClientServiceRef};
-use p2p_frame::stack::{P2pConfig, P2pEnvRef, create_p2p_env};
-use p2p_frame::tls::TlsServerCertResolver;
+use p2p_frame::stack::{P2pConfig, P2pEnvRef, create_p2p_env, DeviceFinder};
+use p2p_frame::ttp::{TtpClient,  TtpTarget};
 use p2p_frame::types::{SequenceGenerator, TunnelIdGenerator};
 use p2p_frame::x509::{X509IdentityCertFactory, X509IdentityFactory};
 use name_lib::{
@@ -125,6 +127,12 @@ impl CyfsP2pSnConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct CyfsP2pPnConfig {
+    pub id: String,
+    pub endpoint: String,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CyfsP2pCertConfig {
     #[serde(rename = "type")]
@@ -161,6 +169,8 @@ pub struct CyfsP2pStackConfig {
     pub bind: SocketAddr,
     #[serde(default, deserialize_with = "deserialize_sn_configs")]
     pub sn: Vec<CyfsP2pSnConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pn: Option<CyfsP2pPnConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reuse_address: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -696,7 +706,7 @@ impl IncomingTunnelValidator for CyfsP2pIncomingTunnelValidator {
 struct CyfsP2pRuntime {
     _env: P2pEnvRef,
     net_manager: NetManagerRef,
-    sn_service: SNClientServiceRef,
+    sn_service: Option<SNClientServiceRef>,
     _tunnel_manager: P2pTunnelManagerRef,
     subscription_task: tokio::task::JoinHandle<()>,
     local_id: P2pId,
@@ -712,7 +722,9 @@ impl CyfsP2pRuntime {
             .remove_listen_device(self.local_id_str.as_str())
             .await;
         self.net_manager.unregister_tunnel_acceptor(&self.local_id);
-        self.sn_service.stop().await;
+        if self.sn_service.is_some() {
+            self.sn_service.as_ref().unwrap().stop().await;
+        }
     }
 }
 
@@ -723,6 +735,7 @@ pub struct CyfsP2pStack {
     local_identity: P2pIdentityRef,
     cert_type: String,
     sn_config: Vec<CyfsP2pSnConfig>,
+    pn_config: Option<CyfsP2pPnConfig>,
     sn_list: Vec<P2pSn>,
     reuse_address: bool,
     concurrency: u32,
@@ -766,6 +779,7 @@ impl CyfsP2pStack {
             local_identity,
             cert_type,
             sn_config: config.sn.clone(),
+            pn_config: config.pn.clone(),
             sn_list,
             reuse_address: config.reuse_address.unwrap_or(false),
             concurrency: config.concurrency.unwrap_or(0),
@@ -777,13 +791,6 @@ impl CyfsP2pStack {
     }
 
     async fn create_runtime(&self) -> StackResult<CyfsP2pRuntime> {
-        if self.reuse_address {
-            warn!(
-                "p2p stack {} configured reuse_address=true, but p2p-frame quic listener has no public reuse-address switch; ignoring",
-                self.id
-            );
-        }
-
         // Select identity/cert factory based on cert_type (rsa/ed25519 or device),
         // not sign_type. Ed25519 keys may appear in both x509 certs and device
         // certs, but they use different encoding formats and therefore different
@@ -806,33 +813,38 @@ impl CyfsP2pStack {
             .set_incoming_tunnel_validator(validator);
         let cert_cache = p2p_config.identity_cert_cache().clone();
         let connection_info_cache = p2p_config.connection_info_cache().clone();
-        // Clone the cert resolver before consuming p2p_config so we can set the
-        // default server identity after the env is created.
-        let cert_resolver = p2p_config.sever_cert_resolver().clone();
         let env = create_p2p_env(p2p_config).await.map_err(into_stack_err!(
             StackErrorCode::Failed,
             "create p2p env failed"
         ))?;
         let net_manager = env.net_manager().clone();
 
-        let sn_service = SNClientService::new(
-            net_manager.clone(),
-            self.sn_list.clone(),
-            self.local_identity.clone(),
-            Arc::new(SequenceGenerator::new()),
-            Arc::new(TunnelIdGenerator::new()),
-            cert_factory.clone(),
-            DEFAULT_SN_TUNNEL_COUNT,
-            DEFAULT_SN_PING_INTERVAL,
-            DEFAULT_SN_CALL_TIMEOUT,
-            DEFAULT_CONN_TIMEOUT,
-        );
-        let device_finder = DefaultDeviceFinder::new(
-            sn_service.clone(),
-            cert_factory,
-            cert_cache,
-            DEFAULT_SN_QUERY_INTERVAL,
-        );
+        let sn_service = if !self.sn_list.is_empty() {
+            Some(SNClientService::new(
+                net_manager.clone(),
+                self.sn_list.clone(),
+                self.local_identity.clone(),
+                Arc::new(SequenceGenerator::new()),
+                Arc::new(TunnelIdGenerator::new()),
+                cert_factory.clone(),
+                DEFAULT_SN_TUNNEL_COUNT,
+                DEFAULT_SN_PING_INTERVAL,
+                DEFAULT_SN_CALL_TIMEOUT,
+                DEFAULT_CONN_TIMEOUT,
+            ))
+        } else {
+            None
+        };
+        let device_finder: Option<Arc<dyn DeviceFinder>> = if sn_service.is_some() {
+            Some(DefaultDeviceFinder::new(
+                sn_service.clone().unwrap(),
+                cert_factory,
+                cert_cache,
+                DEFAULT_SN_QUERY_INTERVAL,
+            ))
+        } else {
+            None
+        };
 
         net_manager
             .add_listen_device(self.local_identity.clone())
@@ -849,13 +861,54 @@ impl CyfsP2pStack {
                 "listen quic endpoint failed"
             ))?;
 
+        let pn_network: Option<TunnelNetworkRef> = if let Some(pn_config) = &self.pn_config {
+            let pn_id = P2pId::from_str(pn_config.id.as_str()).map_err(into_stack_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid pn id {}",
+                pn_config.id
+            ))?;
+            let pn_endpoint = parse_endpoint(&pn_config.endpoint).map_err(into_stack_err!(
+                StackErrorCode::InvalidConfig,
+                "invalid pn endpoint {}",
+                pn_config.endpoint
+            ))?;
+            let ttp_client = TtpClient::new(self.local_identity.clone(), net_manager.clone());
+            let pn_target = TtpTarget {
+                local_ep: None,
+                remote_ep: pn_endpoint,
+                remote_id: pn_id,
+                remote_name: None,
+            };
+            match ttp_client.connect_server(pn_target).await {
+                Ok(()) => {
+                    log::info!("connected to pn server {}", pn_config.endpoint);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "failed to pre-connect to pn server {}: {:?}, PN fallback may not work initially",
+                        pn_config.endpoint,
+                        err
+                    );
+                }
+            }
+            let pn_client = PnClient::new(ttp_client);
+            let pn_ep = pn_virtual_endpoint();
+            pn_client.listen(&pn_ep, None, None).await.map_err(into_stack_err!(
+                StackErrorCode::Failed,
+                "listen pn virtual endpoint failed"
+            ))?;
+            Some(pn_client as TunnelNetworkRef)
+        } else {
+            None
+        };
+
         let tunnel_manager = P2pTunnelManager::new(
             self.local_identity.clone(),
             device_finder,
             net_manager.clone(),
-            Some(sn_service.clone()),
+            sn_service.clone(),
             Arc::new(X509IdentityCertFactory),
-            None,
+            pn_network,
             connection_info_cache,
             Arc::new(TunnelIdGenerator::new()),
             DEFAULT_CONN_TIMEOUT,
@@ -865,10 +918,12 @@ impl CyfsP2pStack {
             StackErrorCode::Failed,
             "create p2p tunnel manager failed"
         ))?;
-        sn_service.start().await.map_err(into_stack_err!(
-            StackErrorCode::Failed,
-            "start sn client failed"
-        ))?;
+        if sn_service.is_some() {
+            sn_service.as_ref().unwrap().start().await.map_err(into_stack_err!(
+                StackErrorCode::Failed,
+                "start sn client failed"
+            ))?;
+        }
         let local_id = self.local_identity.get_id();
         register_pn_service(&local_id, tunnel_manager.clone());
 
@@ -967,6 +1022,13 @@ impl Stack for CyfsP2pStack {
             ));
         }
 
+        if config.pn != self.pn_config {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "pn config unmatch"
+            ));
+        }
+
         let env = match context {
             Some(context) => {
                 let p2p_context = context
@@ -1061,8 +1123,7 @@ impl StackFactory for CyfsP2pStackFactory {
 
         let sn_list = parse_sn_list(&config.sn)?;
         let local_identity = match cert.cert_type.as_str() {
-            // "x509" accepted as a backward-compatible alias for "rsa"
-            "rsa" | "x509" => {
+            "rsa" => {
                 load_x509_identity_from_paths(
                     Path::new(cert.cert_path.as_str()),
                     Path::new(cert.key_path.as_str()),
@@ -1536,6 +1597,7 @@ mod tests {
             protocol: StackProtocol::Extension("p2p".to_string()),
             bind: bind.parse().unwrap(),
             sn: vec![],
+            pn: None,
             reuse_address: Some(false),
             io_dump_file: None,
             io_dump_rotate_size: None,

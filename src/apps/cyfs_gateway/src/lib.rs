@@ -962,6 +962,24 @@ pub async fn cyfs_gateway_main() {
                 .short('p')
                 .help("The save path of the generated key")
                 .required(false)))
+        .subcommand(Command::new("gen_p2p_key")
+            .about("Generate a new P2P identity key pair (X.509 certificate)")
+            .arg(Arg::new("name")
+                .long("name")
+                .short('n')
+                .help("P2P identity name (used as certificate subject)")
+                .required(true))
+            .arg(Arg::new("algo")
+                .long("algo")
+                .short('a')
+                .help("Key algorithm: rsa | ed25519")
+                .required(false)
+                .default_value("ed25519"))
+            .arg(Arg::new("path")
+                .long("path")
+                .short('p')
+                .help("Directory to save the generated key files")
+                .required(false)))
         .subcommand(Command::new("login")
             .about("Login to server")
             .arg(Arg::new("user")
@@ -1538,6 +1556,42 @@ pub async fn cyfs_gateway_main() {
             let pk_file = key_dir.join("device.doc.json");
             std::fs::write(&pk_file, serde_json::to_string(&device_config).unwrap()).unwrap();
             println!("Device doc saved to: {:?}", pk_file);
+            std::process::exit(0);
+        }
+        Some(("gen_p2p_key", sub_matches)) => {
+            let name = sub_matches
+                .get_one::<String>("name")
+                .expect("Missing key 'name'");
+            let algo = sub_matches.get_one::<String>("algo").unwrap();
+            let temp_dir = std::env::temp_dir();
+            let key_dir = temp_dir.join("buckyos").join("keys");
+            let default_path = key_dir.to_string_lossy().to_string();
+            let save_path = sub_matches
+                .get_one::<String>("path")
+                .unwrap_or(&default_path);
+            let key_dir = Path::new(save_path);
+            if !key_dir.is_dir() {
+                std::fs::create_dir_all(key_dir).unwrap();
+            }
+            let cert_file = key_dir.join(format!("{}.pem", name));
+            let key_file = key_dir.join(format!("{}.key", name));
+            let p2p_id = match algo.as_str() {
+                "rsa" => cyfs_p2p::generate_rsa_x509_key_to_files(name, &cert_file, &key_file),
+                "ed25519" => {
+                    cyfs_p2p::generate_ed25519_x509_key_to_files(name, &cert_file, &key_file)
+                }
+                _ => {
+                    println!("Unsupported algorithm: {}. Use 'rsa' or 'ed25519'.", algo);
+                    std::process::exit(1);
+                }
+            }
+            .unwrap_or_else(|e| {
+                println!("Error generating P2P key: {}", e.msg());
+                std::process::exit(1);
+            });
+            println!("cert_path: {}", cert_file.display());
+            println!("key_path: {}", key_file.display());
+            println!("p2p_id: {}", p2p_id);
             std::process::exit(0);
         }
         Some(("login", sub_matches)) => {

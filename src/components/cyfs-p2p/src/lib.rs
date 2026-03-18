@@ -5,6 +5,7 @@ mod stack;
 mod stream;
 mod tunnel;
 
+pub use identity::*;
 pub use pn_server::*;
 pub use sn_server::*;
 pub use stack::*;

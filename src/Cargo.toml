@@ -68,7 +68,7 @@ rustls-platform-verifier = "0.6.1"
 ring = "0.17"
 openssl = { version = "0.10", features = ["vendored"] }
 # 证书生成
-rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+rcgen = { version = "0.14", features = ["pem", "x509-parser", "aws_lc_rs"] }
 # 其他工具
 toml = "0.8.23"
 regex = "1.12.2"
