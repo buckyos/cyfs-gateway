@@ -1,0 +1,14 @@
+{
+    "input": {
+      "REQ": {
+        "path": "/kapi/system_config",
+        "host": "172.21.128.1:3200",
+        "uri": "/kapi/system_config",
+        "url": "http://172.21.128.1:3200/kapi/system_config",
+        "Cookie": ""
+      }
+    },
+    "id": "server:node_gateway:main",
+    "output": ["REQ","RESP"]
+  }
+  
