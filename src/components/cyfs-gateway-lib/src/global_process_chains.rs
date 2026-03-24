@@ -326,80 +326,115 @@ impl MapCollection for StreamRequestMap {
     }
 
     async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
-        let request = self.request.read().await;
-        match key {
-            "dest_port" => Ok(Some(CollectionValue::String(request.dest_port.to_string()))),
-            "dest_host" => Ok(request.dest_host.clone().map(CollectionValue::String)),
-            "dest_addr" => Ok(request
-                .dest_addr
-                .map(|addr| CollectionValue::String(addr.to_string()))),
-            "dest_ip" => Ok(request
-                .dest_addr
-                .map(|addr| CollectionValue::String(addr.ip().to_string()))),
-            "app_protocol" => Ok(request.app_protocol.clone().map(CollectionValue::String)),
-            "dest_url" => Ok(request.dest_url.clone().map(CollectionValue::String)),
-            "source_addr" => Ok(request
-                .source_addr
-                .map(|addr| CollectionValue::String(addr.to_string()))),
-            "source_ip" => Ok(request
-                .source_addr
-                .map(|addr| CollectionValue::String(addr.ip().to_string()))),
-            "source_port" => Ok(request
-                .source_addr
-                .map(|addr| CollectionValue::String(addr.port().to_string()))),
-            "source_mac" => Ok(request.source_mac.clone().map(CollectionValue::String)),
-            "source_hostname" => Ok(request.source_hostname.clone().map(CollectionValue::String)),
-            "source_device_id" => Ok(request
-                .source_device_id
-                .clone()
-                .map(CollectionValue::String)),
-            "source_app_id" => Ok(request.source_app_id.clone().map(CollectionValue::String)),
-            "source_user_id" => Ok(request.source_user_id.clone().map(CollectionValue::String)),
-            "ext" => Ok(request.ext.clone().map(CollectionValue::Map)),
-            "incoming_stream" => {
-                let stream = request.incoming_stream.lock().unwrap();
-                if stream.is_some() {
-                    Ok(Some(CollectionValue::Any(request.incoming_stream.clone())))
-                } else {
-                    Ok(None)
+        let ext = {
+            let request = self.request.read().await;
+            match key {
+                "dest_port" => return Ok(Some(CollectionValue::String(request.dest_port.to_string()))),
+                "dest_host" => return Ok(request.dest_host.clone().map(CollectionValue::String)),
+                "dest_addr" => {
+                    return Ok(request
+                        .dest_addr
+                        .map(|addr| CollectionValue::String(addr.to_string())));
                 }
+                "dest_ip" => {
+                    return Ok(request
+                        .dest_addr
+                        .map(|addr| CollectionValue::String(addr.ip().to_string())));
+                }
+                "app_protocol" => {
+                    return Ok(request.app_protocol.clone().map(CollectionValue::String));
+                }
+                "dest_url" => return Ok(request.dest_url.clone().map(CollectionValue::String)),
+                "source_addr" => {
+                    return Ok(request
+                        .source_addr
+                        .map(|addr| CollectionValue::String(addr.to_string())));
+                }
+                "source_ip" => {
+                    return Ok(request
+                        .source_addr
+                        .map(|addr| CollectionValue::String(addr.ip().to_string())));
+                }
+                "source_port" => {
+                    return Ok(request
+                        .source_addr
+                        .map(|addr| CollectionValue::String(addr.port().to_string())));
+                }
+                "source_mac" => return Ok(request.source_mac.clone().map(CollectionValue::String)),
+                "source_hostname" => {
+                    return Ok(request.source_hostname.clone().map(CollectionValue::String));
+                }
+                "source_device_id" => {
+                    return Ok(request
+                        .source_device_id
+                        .clone()
+                        .map(CollectionValue::String));
+                }
+                "source_app_id" => {
+                    return Ok(request.source_app_id.clone().map(CollectionValue::String));
+                }
+                "source_user_id" => {
+                    return Ok(request.source_user_id.clone().map(CollectionValue::String));
+                }
+                "ext" => return Ok(request.ext.clone().map(CollectionValue::Map)),
+                "incoming_stream" => {
+                    let stream = request.incoming_stream.lock().unwrap();
+                    if stream.is_some() {
+                        return Ok(Some(CollectionValue::Any(request.incoming_stream.clone())));
+                    }
+                    return Ok(None);
+                }
+                _ => request.ext.clone(),
             }
-            _ => {
-                let msg = format!("Unknown key: {}", key);
-                error!("{}", msg);
-                Err(msg)
+        };
+
+        if let Some(ext) = ext {
+            if ext.contains_key(key).await? {
+                return ext.get(key).await;
             }
         }
+
+        let msg = format!("Unknown key: {}", key);
+        error!("{}", msg);
+        Err(msg)
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
-        let request = self.request.read().await;
-        match key {
-            "dest_port" => Ok(true),
-            "dest_host" => Ok(request.dest_host.is_some()),
-            "dest_addr" => Ok(request.dest_addr.is_some()),
-            "dest_ip" => Ok(request.dest_addr.is_some()),
-            "app_protocol" => Ok(request.app_protocol.is_some()),
-            "dest_url" => Ok(request.dest_url.is_some()),
-            "source_addr" => Ok(request.source_addr.is_some()),
-            "source_ip" => Ok(request.source_addr.is_some()),
-            "source_port" => Ok(request.source_addr.is_some()),
-            "source_mac" => Ok(request.source_mac.is_some()),
-            "source_hostname" => Ok(request.source_hostname.is_some()),
-            "source_device_id" => Ok(request.source_device_id.is_some()),
-            "source_app_id" => Ok(request.source_app_id.is_some()),
-            "source_user_id" => Ok(request.source_user_id.is_some()),
-            "ext" => Ok(request.ext.is_some()),
-            "incoming_stream" => {
-                let stream = request.incoming_stream.lock().unwrap();
-                Ok(stream.is_some())
+        let ext = {
+            let request = self.request.read().await;
+            match key {
+                "dest_port" => return Ok(true),
+                "dest_host" => return Ok(request.dest_host.is_some()),
+                "dest_addr" => return Ok(request.dest_addr.is_some()),
+                "dest_ip" => return Ok(request.dest_addr.is_some()),
+                "app_protocol" => return Ok(request.app_protocol.is_some()),
+                "dest_url" => return Ok(request.dest_url.is_some()),
+                "source_addr" => return Ok(request.source_addr.is_some()),
+                "source_ip" => return Ok(request.source_addr.is_some()),
+                "source_port" => return Ok(request.source_addr.is_some()),
+                "source_mac" => return Ok(request.source_mac.is_some()),
+                "source_hostname" => return Ok(request.source_hostname.is_some()),
+                "source_device_id" => return Ok(request.source_device_id.is_some()),
+                "source_app_id" => return Ok(request.source_app_id.is_some()),
+                "source_user_id" => return Ok(request.source_user_id.is_some()),
+                "ext" => return Ok(request.ext.is_some()),
+                "incoming_stream" => {
+                    let stream = request.incoming_stream.lock().unwrap();
+                    return Ok(stream.is_some());
+                }
+                _ => request.ext.clone(),
             }
-            _ => {
-                let msg = format!("Unknown key: {}", key);
-                error!("{}", msg);
-                Err(msg)
+        };
+
+        if let Some(ext) = ext {
+            if ext.contains_key(key).await? {
+                return Ok(true);
             }
         }
+
+        let msg = format!("Unknown key: {}", key);
+        error!("{}", msg);
+        Err(msg)
     }
 
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {

@@ -15,8 +15,12 @@ use crate::{
 };
 use cyfs_acme::{ACME_TLS_ALPN_NAME, AcmeCertManagerRef, AcmeItem, ChallengeType};
 use cyfs_process_chain::PrefixedStream;
-use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor, StreamRequest};
-use rustls::ServerConfig;
+use cyfs_process_chain::{
+    CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor, StreamRequest,
+};
+use openssl::x509::X509;
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig};
 use rustls::pki_types::pem::PemObject;
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::ResolvesServerCert;
@@ -32,7 +36,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::LazyConfigAcceptor;
 
 const MAX_PROXY_READ_SIZE: usize = 4096;
 const PROXY_V1_PREFIX: &[u8; 6] = b"PROXY ";
@@ -110,6 +114,22 @@ async fn build_tls_domain_configs(certs: &[StackCertConfig]) -> StackResult<Vec<
     Ok(cert_list)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsClientAuthMode {
+    #[default]
+    Off,
+    On,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TlsClientAuthConfig {
+    #[serde(default)]
+    pub mode: TlsClientAuthMode,
+    #[serde(default)]
+    pub ca_cert_paths: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct TlsStackContext {
     pub servers: ServerManagerRef,
@@ -159,8 +179,8 @@ struct TlsConnectionHandler {
     env: Arc<TlsStackContext>,
     executor: ProcessChainLibExecutor,
     connection_manager: Option<ConnectionManagerRef>,
-    certs: Arc<dyn ResolvesServerCert>,
-    alpn_protocols: Vec<Vec<u8>>,
+    server_config: Arc<ServerConfig>,
+    acme_server_config: Arc<ServerConfig>,
     io_dump: Option<IoDumpStackConfig>,
 }
 
@@ -364,6 +384,7 @@ impl TlsConnectionHandler {
         hook_point: ProcessChainConfigs,
         certs: Vec<TlsDomainConfig>,
         alpn_protocols: Vec<Vec<u8>>,
+        client_auth: TlsClientAuthConfig,
         env: Arc<TlsStackContext>,
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
@@ -378,12 +399,14 @@ impl TlsConnectionHandler {
         .await
         .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let certs = Self::build_cert_resolver(certs, env.as_ref())?;
+        let (server_config, acme_server_config) =
+            Self::build_server_configs(certs, &alpn_protocols, &client_auth).await?;
         Ok(Self {
             env,
             executor,
             connection_manager,
-            certs,
-            alpn_protocols,
+            server_config,
+            acme_server_config,
             io_dump,
         })
     }
@@ -402,8 +425,8 @@ impl TlsConnectionHandler {
             env: self.env.clone(),
             executor,
             connection_manager: self.connection_manager.clone(),
-            certs: self.certs.clone(),
-            alpn_protocols: self.alpn_protocols.clone(),
+            server_config: self.server_config.clone(),
+            acme_server_config: self.acme_server_config.clone(),
             io_dump: self.io_dump.clone(),
         })
     }
@@ -460,6 +483,184 @@ impl TlsConnectionHandler {
         Ok(cert)
     }
 
+    async fn build_client_auth_root_store(
+        client_auth: &TlsClientAuthConfig,
+    ) -> StackResult<RootCertStore> {
+        let mut roots = RootCertStore::empty();
+        for path in client_auth.ca_cert_paths.iter() {
+            let certs = load_certs(path).await?;
+            for cert in certs {
+                roots.add(cert).map_err(|e| {
+                    stack_err!(
+                        StackErrorCode::InvalidTlsCert,
+                        "invalid client auth ca cert in {}: {}",
+                        path,
+                        e
+                    )
+                })?;
+            }
+        }
+        Ok(roots)
+    }
+
+    async fn build_server_configs(
+        certs: Arc<dyn ResolvesServerCert>,
+        alpn_protocols: &[Vec<u8>],
+        client_auth: &TlsClientAuthConfig,
+    ) -> StackResult<(Arc<ServerConfig>, Arc<ServerConfig>)> {
+        let server_builder =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap();
+        let server_builder = match client_auth.mode {
+            TlsClientAuthMode::Off => server_builder.with_no_client_auth(),
+            TlsClientAuthMode::On => {
+                if client_auth.ca_cert_paths.is_empty() {
+                    return Err(stack_err!(
+                        StackErrorCode::InvalidConfig,
+                        "client_auth.ca_cert_paths is required when client_auth.mode is on"
+                    ));
+                }
+                let roots = Self::build_client_auth_root_store(client_auth).await?;
+                let verifier = WebPkiClientVerifier::builder_with_provider(
+                    Arc::new(roots),
+                    Arc::new(rustls::crypto::ring::default_provider()),
+                )
+                .build()
+                .map_err(|e| {
+                    stack_err!(
+                        StackErrorCode::InvalidTlsCert,
+                        "build client auth verifier failed: {}",
+                        e
+                    )
+                })?;
+                server_builder.with_client_cert_verifier(verifier)
+            }
+        };
+        let mut server_config = server_builder.with_cert_resolver(certs.clone());
+        server_config.alpn_protocols = alpn_protocols.to_vec();
+
+        let mut acme_server_config =
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(certs);
+        acme_server_config.alpn_protocols = vec![ACME_TLS_ALPN_NAME.to_vec()];
+
+        Ok((Arc::new(server_config), Arc::new(acme_server_config)))
+    }
+
+    fn client_hello_uses_acme_alpn(client_hello: rustls::server::ClientHello<'_>) -> bool {
+        client_hello
+            .alpn()
+            .map(|mut alpn_list| alpn_list.any(|alpn| alpn == ACME_TLS_ALPN_NAME))
+            .unwrap_or(false)
+    }
+
+    async fn accept_tls_stream(
+        &self,
+        stream: Box<dyn buckyos_kit::AsyncStream>,
+    ) -> StackResult<tokio_rustls::server::TlsStream<Box<dyn buckyos_kit::AsyncStream>>> {
+        // Inspect ClientHello before the full handshake so ACME traffic can use a different
+        // ServerConfig from normal business traffic on the same listener.
+        let acceptor = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
+        let start = acceptor
+            .await
+            .map_err(into_stack_err!(StackErrorCode::StreamError))?;
+
+        let server_config = {
+            let client_hello = start.client_hello();
+            if Self::client_hello_uses_acme_alpn(client_hello) {
+                self.acme_server_config.clone()
+            } else {
+                self.server_config.clone()
+            }
+        };
+
+        start
+            .into_stream(server_config)
+            .await
+            .map_err(into_stack_err!(StackErrorCode::StreamError))
+    }
+
+    fn parse_tls_client_certificate(cert_der: &[u8]) -> Option<(String, String, String)> {
+        let cert = X509::from_der(cert_der).ok()?;
+        let subject = cert
+            .subject_name()
+            .entries()
+            .map(|entry| {
+                let key = entry.object().nid().short_name().unwrap_or("UNKNOWN");
+                let value = entry
+                    .data()
+                    .as_utf8()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|_| hex::encode(entry.data().as_slice()));
+                format!("{key}={value}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let serial = cert.serial_number().to_bn().ok()?.to_hex_str().ok()?.to_string();
+        let fingerprint = ring::digest::digest(&ring::digest::SHA256, cert_der);
+        let fingerprint = fingerprint
+            .as_ref()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join("");
+
+        Some((subject, serial, fingerprint))
+    }
+
+    async fn build_tls_request_ext(
+        conn: &rustls::ServerConnection,
+    ) -> cyfs_process_chain::MapCollectionRef {
+        let ext = MemoryMapCollection::new_ref();
+        let (verify, subject_dn, serial, fingerprint) = match conn
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+        {
+            Some(cert) => {
+                let (subject_dn, serial, fingerprint) =
+                    Self::parse_tls_client_certificate(cert.as_ref()).unwrap_or_default();
+                ("SUCCESS".to_string(), subject_dn, serial, fingerprint)
+            }
+            None => (
+                "NONE".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+        };
+
+        let _ = ext
+            .insert(
+                "ssl_client_verify",
+                CollectionValue::String(verify),
+            )
+            .await;
+        let _ = ext
+            .insert(
+                "ssl_client_s_dn",
+                CollectionValue::String(subject_dn),
+            )
+            .await;
+        let _ = ext
+            .insert(
+                "ssl_client_serial",
+                CollectionValue::String(serial),
+            )
+            .await;
+        let _ = ext
+            .insert(
+                "ssl_client_fingerprint",
+                CollectionValue::String(fingerprint),
+            )
+            .await;
+
+        ext
+    }
+
     async fn handle_connect(
         &self,
         mut stream: StatStream<TcpStream>,
@@ -476,22 +677,7 @@ impl TlsConnectionHandler {
             Self::probe_proxy_protocol_stream(Box::new(stream)).await?;
         let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
 
-        let mut server_config =
-            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
-                .unwrap()
-                .with_no_client_auth()
-                .with_cert_resolver(self.certs.clone());
-        server_config.alpn_protocols = self.alpn_protocols.clone();
-        server_config
-            .alpn_protocols
-            .push(ACME_TLS_ALPN_NAME.to_vec());
-
-        let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
-        let tls_stream = tls_acceptor
-            .accept(stream)
-            .await
-            .map_err(into_stack_err!(StackErrorCode::StreamError))?;
+        let tls_stream = self.accept_tls_stream(stream).await?;
         {
             let (_, conn) = tls_stream.get_ref();
             if let Some(alpn) = conn.alpn_protocol() {
@@ -507,6 +693,10 @@ impl TlsConnectionHandler {
         if server_name.is_none() {
             return Ok(());
         }
+        let tls_request_ext = {
+            let (_, conn) = tls_stream.get_ref();
+            Self::build_tls_request_ext(conn).await
+        };
         if let Some(proxy_addr) = proxy_source_addr {
             log::info!(
                 "accept tls stream from {} (proxy via {}) to {} name {}",
@@ -535,6 +725,7 @@ impl TlsConnectionHandler {
                 Box::new(tls_stream)
             };
         let mut request = StreamRequest::new(request_stream, local_addr);
+        request.ext = Some(tls_request_ext);
         request.source_addr = Some(request_source_addr);
         request.dest_port = local_addr.port();
         request.dest_host = server_name;
@@ -756,6 +947,7 @@ impl TlsStack {
             config.hook_point.unwrap(),
             config.certs,
             config.alpn_protocols,
+            config.client_auth,
             env,
             config.connection_manager.clone(),
             config.io_dump,
@@ -954,6 +1146,7 @@ impl Stack for TlsStack {
             config.hook_point.clone(),
             certs,
             alpn_protocols,
+            config.client_auth.clone().unwrap_or_default(),
             env,
             self.connection_manager.clone(),
             create_io_dump_stack_config(
@@ -1032,6 +1225,8 @@ pub struct TlsStackConfig {
     pub io_dump_max_upload_bytes_per_conn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_max_download_bytes_per_conn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_auth: Option<TlsClientAuthConfig>,
     pub reuse_address: Option<bool>,
 }
 
@@ -1103,6 +1298,7 @@ impl crate::StackFactory for TlsStackFactory {
             .hook_point(config.hook_point.clone())
             .add_certs(cert_list)
             .concurrency(config.concurrency.unwrap_or(0))
+            .client_auth(config.client_auth.clone().unwrap_or_default())
             .alpn_protocols(
                 config
                     .alpn_protocols
@@ -1129,6 +1325,7 @@ pub struct TlsStackBuilder {
     concurrency: u32,
     connection_manager: Option<ConnectionManagerRef>,
     alpn_protocols: Vec<Vec<u8>>,
+    client_auth: TlsClientAuthConfig,
     stack_context: Option<Arc<TlsStackContext>>,
     io_dump: Option<IoDumpStackConfig>,
     reuse_address: bool,
@@ -1144,6 +1341,7 @@ impl TlsStackBuilder {
             concurrency: 0,
             connection_manager: None,
             alpn_protocols: vec![],
+            client_auth: TlsClientAuthConfig::default(),
             stack_context: None,
             io_dump: None,
             reuse_address: false,
@@ -1194,6 +1392,11 @@ impl TlsStackBuilder {
         self
     }
 
+    pub fn client_auth(mut self, client_auth: TlsClientAuthConfig) -> Self {
+        self.client_auth = client_auth;
+        self
+    }
+
     pub fn io_dump(mut self, io_dump: Option<IoDumpStackConfig>) -> Self {
         self.io_dump = io_dump;
         self
@@ -1213,7 +1416,7 @@ impl TlsStackBuilder {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{load_certs, load_key};
+    use super::{load_certs, load_key, TlsClientAuthConfig, TlsClientAuthMode};
     use crate::global_process_chains::GlobalProcessChains;
     use crate::self_cert_mgr::{SelfCertConfig, SelfCertMgr, SelfCertMgrRef};
     use crate::{
@@ -2609,6 +2812,7 @@ mod tests {
             io_dump_rotate_max_files: None,
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
+            client_auth: None,
             reuse_address: None,
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(TlsStackContext::new(
@@ -3039,6 +3243,52 @@ mod tests {
         (fullchain_pem, leaf_pem, leaf_key_pem, root_der)
     }
 
+    fn build_mutual_tls_materials(
+        server_name: &str,
+        client_name: &str,
+    ) -> (
+        Vec<CertificateDer<'static>>,
+        PrivateKeyDer<'static>,
+        Vec<CertificateDer<'static>>,
+        PrivateKeyDer<'static>,
+        CertificateDer<'static>,
+        String,
+    ) {
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["Test Root CA".to_string()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
+
+        let server_key = KeyPair::generate().unwrap();
+        let server_params = CertificateParams::new(vec![server_name.to_string()]).unwrap();
+        let server_cert = server_params.signed_by(&server_key, &ca_issuer).unwrap();
+
+        let client_key = KeyPair::generate().unwrap();
+        let client_params = CertificateParams::new(vec![client_name.to_string()]).unwrap();
+        let client_cert = client_params.signed_by(&client_key, &ca_issuer).unwrap();
+
+        let ca_pem = ca_cert.pem();
+        let root_der = CertificateDer::from(ca_cert);
+        let server_chain = vec![CertificateDer::from(server_cert)];
+        let server_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            server_key.serialize_der(),
+        ));
+        let client_chain = vec![CertificateDer::from(client_cert)];
+        let client_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            client_key.serialize_der(),
+        ));
+
+        (
+            server_chain,
+            server_key,
+            client_chain,
+            client_key,
+            root_der,
+            ca_pem,
+        )
+    }
+
     #[tokio::test]
     async fn test_tls_fullchain_allows_client_verify() {
         ensure_crypto_provider();
@@ -3117,5 +3367,183 @@ mod tests {
         assert!(result.is_err());
 
         server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_tls_stack_client_auth_off_exposes_none() {
+        ensure_crypto_provider();
+        let server_name = "mtls-off.buckyos.ai";
+        let (server_chain, server_key, _client_chain, _client_key, _root_der, _ca_pem) =
+            build_mutual_tls_materials(server_name, "client.buckyos.ai");
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        ne $REQ.ssl_client_verify "NONE" && reject;
+        return "server test";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockServer::new("test".to_string()))))
+            .unwrap();
+        let result = TlsStack::builder()
+            .id("test-client-auth-off")
+            .bind("127.0.0.1:9191")
+            .hook_point(chains)
+            .add_certs(vec![TlsDomainConfig {
+                domain: server_name.to_string(),
+                acme_type: None,
+                certs: Some(server_chain),
+                key: Some(server_key),
+                data: None,
+            }])
+            .stack_context(build_stack_context(
+                server_manager,
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ))
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let stack = result.unwrap();
+        stack.start().await.unwrap();
+
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
+        let stream = TcpStream::connect("127.0.0.1:9191").await.unwrap();
+        let connector = TlsConnector::from(Arc::new(config));
+        let mut stream = connector
+            .connect(ServerName::try_from(server_name).unwrap(), stream)
+            .await
+            .unwrap();
+        stream.write_all(b"test").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"recv");
+    }
+
+    #[tokio::test]
+    async fn test_tls_stack_client_auth_on_requires_valid_cert() {
+        ensure_crypto_provider();
+        let server_name = "mtls-on.buckyos.ai";
+        let (server_chain, server_key, client_chain, client_key, _root_der, ca_pem) =
+            build_mutual_tls_materials(server_name, "client.buckyos.ai");
+        let temp_dir = tempdir().unwrap();
+        let ca_path = temp_dir.path().join("client_ca.pem");
+        fs::write(&ca_path, ca_pem).await.unwrap();
+
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        ne $REQ.ssl_client_verify "SUCCESS" && reject;
+        return "server test";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let server_manager = Arc::new(ServerManager::new());
+        server_manager
+            .add_server(Server::Stream(Arc::new(MockServer::new("test".to_string()))))
+            .unwrap();
+        let result = TlsStack::builder()
+            .id("test-client-auth-on")
+            .bind("127.0.0.1:9192")
+            .hook_point(chains)
+            .client_auth(TlsClientAuthConfig {
+                mode: TlsClientAuthMode::On,
+                ca_cert_paths: vec![ca_path.to_string_lossy().to_string()],
+            })
+            .add_certs(vec![TlsDomainConfig {
+                domain: server_name.to_string(),
+                acme_type: None,
+                certs: Some(server_chain),
+                key: Some(server_key),
+                data: None,
+            }])
+            .stack_context(build_stack_context(
+                server_manager,
+                TunnelManager::new(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                AcmeCertManager::create(CertManagerConfig::default())
+                    .await
+                    .unwrap(),
+                SelfCertMgr::create(SelfCertConfig::default())
+                    .await
+                    .unwrap(),
+                Some(Arc::new(GlobalProcessChains::new())),
+            ))
+            .build()
+            .await;
+        assert!(result.is_ok());
+        let stack = result.unwrap();
+        stack.start().await.unwrap();
+
+        let no_client_config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
+        let stream = TcpStream::connect("127.0.0.1:9192").await.unwrap();
+        let connector = TlsConnector::from(Arc::new(no_client_config));
+        match connector
+            .connect(ServerName::try_from(server_name).unwrap(), stream)
+            .await
+        {
+            Err(_) => {}
+            Ok(mut stream) => {
+                // With TLS 1.3 the client handshake future can resolve before the server-side
+                // certificate_required alert is observed locally, so assert on the first I/O.
+                let _ = stream.write_all(b"test").await;
+                let mut buf = [0u8; 1];
+                let ret = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf))
+                    .await
+                    .expect("client auth rejection should close the stream promptly");
+                assert!(
+                    matches!(ret, Ok(0) | Err(_)),
+                    "connection without client certificate unexpectedly remained usable"
+                );
+            }
+        }
+
+        let client_config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_client_auth_cert(client_chain, client_key)
+                .unwrap();
+        let stream = TcpStream::connect("127.0.0.1:9192").await.unwrap();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let mut stream = connector
+            .connect(ServerName::try_from(server_name).unwrap(), stream)
+            .await
+            .unwrap();
+        stream.write_all(b"test").await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"recv");
     }
 }
