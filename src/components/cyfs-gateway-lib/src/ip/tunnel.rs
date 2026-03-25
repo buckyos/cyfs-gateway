@@ -245,7 +245,11 @@ impl IPTunnelBuilder {
 
 #[async_trait]
 impl TunnelBuilder for IPTunnelBuilder {
-    async fn create_tunnel(&self, target_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>> {
+    async fn create_tunnel(
+        &self,
+        target_id: Option<&str>,
+        _options: Option<TunnelOptions>,
+    ) -> TunnelResult<Box<dyn TunnelBox>> {
         Ok(Box::new(IPTunnel::new(target_id)))
     }
 }

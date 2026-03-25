@@ -1,8 +1,8 @@
 use crate::{
-    DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelResult, get_dest_info_from_url_path,
+    DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelOptions, TunnelResult,
+    get_dest_info_from_url_path, resolve_host_ip_with_options,
 };
 use buckyos_kit::AsyncStream;
-use name_client::resolve_ip;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::ClientConfig;
 use rustls_platform_verifier::BuilderVerifierExt;
@@ -11,10 +11,12 @@ use std::io::Error;
 use std::sync::Arc;
 
 #[derive(Clone)]
-pub struct QuicTunnel {}
+pub struct QuicTunnel {
+    options: Option<TunnelOptions>,
+}
 impl QuicTunnel {
-    pub fn new() -> Self {
-        QuicTunnel {}
+    pub fn new(options: Option<TunnelOptions>) -> Self {
+        QuicTunnel { options }
     }
 }
 
@@ -44,9 +46,9 @@ impl Tunnel for QuicTunnel {
         let client_config =
             quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
 
-        let ip = resolve_ip(dest_host.as_ref().unwrap().as_str())
-            .await
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let ip =
+            resolve_host_ip_with_options(dest_host.as_ref().unwrap().as_str(), self.options.as_ref())
+                .await?;
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
         endpoint.set_default_client_config(client_config);
@@ -100,7 +102,8 @@ impl TunnelBuilder for QuicTunnelBuilder {
     async fn create_tunnel(
         &self,
         _tunnel_stack_id: Option<&str>,
+        options: Option<TunnelOptions>,
     ) -> TunnelResult<Box<dyn TunnelBox>> {
-        Ok(Box::new(QuicTunnel::new()))
+        Ok(Box::new(QuicTunnel::new(options)))
     }
 }

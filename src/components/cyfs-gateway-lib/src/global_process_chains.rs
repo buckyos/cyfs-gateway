@@ -329,7 +329,9 @@ impl MapCollection for StreamRequestMap {
         let ext = {
             let request = self.request.read().await;
             match key {
-                "dest_port" => return Ok(Some(CollectionValue::String(request.dest_port.to_string()))),
+                "dest_port" => {
+                    return Ok(Some(CollectionValue::String(request.dest_port.to_string())));
+                }
                 "dest_host" => return Ok(request.dest_host.clone().map(CollectionValue::String)),
                 "dest_addr" => {
                     return Ok(request

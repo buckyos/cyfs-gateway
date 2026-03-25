@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 use crate::rtcp::datagram::RTcpTunnelDatagramClient;
 use crate::tunnel::TunnelBox;
 use crate::{
-    DatagramClientBox, EncryptedStream, Tunnel, TunnelEndpoint, TunnelError, TunnelResult,
-    get_dest_info_from_url_path, has_scheme,
+    DatagramClientBox, EncryptedStream, Tunnel, TunnelEndpoint, TunnelError, TunnelOptions,
+    TunnelResult, get_dest_info_from_url_path, has_scheme,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -100,8 +100,9 @@ impl RTcp {
     pub async fn create_tunnel(
         &self,
         tunnel_stack_id: Option<&str>,
+        options: Option<TunnelOptions>,
     ) -> TunnelResult<Box<dyn TunnelBox>> {
-        self.inner.create_tunnel(tunnel_stack_id).await
+        self.inner.create_tunnel(tunnel_stack_id, options).await
     }
 }
 
@@ -1006,6 +1007,7 @@ impl RTcpInner {
     pub async fn create_tunnel(
         &self,
         tunnel_stack_id: Option<&str>,
+        _options: Option<TunnelOptions>,
     ) -> TunnelResult<Box<dyn TunnelBox>> {
         // lookup existing tunnel and resue it
         if tunnel_stack_id.is_none() {
@@ -1999,7 +2001,7 @@ mod tests {
 
         {
             let _tunnel = rtcp1
-                .create_tunnel(Some(format!("{}:19024", id2.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:19024", id2.to_host_name()).as_str()), None)
                 .await
                 .unwrap();
         }
@@ -2007,7 +2009,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
         {
             let ret = rtcp1
-                .create_tunnel(Some(format!("{}:19024", id2.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:19024", id2.to_host_name()).as_str()), None)
                 .await;
             assert!(ret.is_err());
         }
@@ -2075,7 +2077,7 @@ mod tests {
 
         for _ in 0..10 {
             let tunnel = rtcp1
-                .create_tunnel(Some(format!("{}:19034", id2.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:19034", id2.to_host_name()).as_str()), None)
                 .await
                 .unwrap();
             let ret = tunnel.ping().await;
@@ -2222,7 +2224,7 @@ mod tests {
 
         {
             let tunnel = rtcp1
-                .create_tunnel(Some(format!("{}:19054", id2.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:19054", id2.to_host_name()).as_str()), None)
                 .await
                 .unwrap();
             let mut stream = tunnel.open_stream("www.baidu.com:80").await.unwrap();
@@ -2237,7 +2239,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
         {
             let tunnel = rtcp2
-                .create_tunnel(Some(format!("{}:19053", id1.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:19053", id1.to_host_name()).as_str()), None)
                 .await
                 .unwrap();
             let mut stream = tunnel.open_stream("www.baidu.com:80").await.unwrap();
@@ -2314,7 +2316,7 @@ mod tests {
 
         {
             let tunnel = rtcp1
-                .create_tunnel(Some(format!("{}:19044", id2.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:19044", id2.to_host_name()).as_str()), None)
                 .await
                 .unwrap();
             let stream = tunnel
@@ -2334,7 +2336,7 @@ mod tests {
 
         {
             let tunnel = rtcp2
-                .create_tunnel(Some(format!("{}:19043", id1.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:19043", id1.to_host_name()).as_str()), None)
                 .await
                 .unwrap();
             let stream = tunnel

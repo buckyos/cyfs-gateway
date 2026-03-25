@@ -6,7 +6,9 @@ use buckyos_kit::AsyncStream;
 use percent_encoding::percent_decode;
 use tokio::io::AsyncWriteExt;
 
-use crate::{DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelError, TunnelResult};
+use crate::{
+    DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelError, TunnelOptions, TunnelResult,
+};
 
 #[derive(Clone)]
 pub struct ProxyTcpTunnel {
@@ -114,7 +116,11 @@ impl ProxyTcpTunnelBuilder {
 
 #[async_trait]
 impl TunnelBuilder for ProxyTcpTunnelBuilder {
-    async fn create_tunnel(&self, target_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>> {
+    async fn create_tunnel(
+        &self,
+        target_id: Option<&str>,
+        _options: Option<TunnelOptions>,
+    ) -> TunnelResult<Box<dyn TunnelBox>> {
         let source_addr = target_id
             .ok_or_else(|| TunnelError::InvalidState("ptcp source addr is required".to_string()))?
             .parse::<SocketAddr>()

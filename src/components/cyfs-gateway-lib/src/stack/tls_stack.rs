@@ -19,12 +19,12 @@ use cyfs_process_chain::{
     CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor, StreamRequest,
 };
 use openssl::x509::X509;
-use rustls::server::WebPkiClientVerifier;
-use rustls::{RootCertStore, ServerConfig};
 use rustls::pki_types::pem::PemObject;
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::ResolvesServerCert;
+use rustls::server::WebPkiClientVerifier;
 use rustls::sign::CertifiedKey;
+use rustls::{RootCertStore, ServerConfig};
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
 use std::net::{IpAddr, SocketAddr};
@@ -600,7 +600,13 @@ impl TlsConnectionHandler {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let serial = cert.serial_number().to_bn().ok()?.to_hex_str().ok()?.to_string();
+        let serial = cert
+            .serial_number()
+            .to_bn()
+            .ok()?
+            .to_hex_str()
+            .ok()?
+            .to_string();
         let fingerprint = ring::digest::digest(&ring::digest::SHA256, cert_der);
         let fingerprint = fingerprint
             .as_ref()
@@ -616,40 +622,29 @@ impl TlsConnectionHandler {
         conn: &rustls::ServerConnection,
     ) -> cyfs_process_chain::MapCollectionRef {
         let ext = MemoryMapCollection::new_ref();
-        let (verify, subject_dn, serial, fingerprint) = match conn
-            .peer_certificates()
-            .and_then(|certs| certs.first())
-        {
-            Some(cert) => {
-                let (subject_dn, serial, fingerprint) =
-                    Self::parse_tls_client_certificate(cert.as_ref()).unwrap_or_default();
-                ("SUCCESS".to_string(), subject_dn, serial, fingerprint)
-            }
-            None => (
-                "NONE".to_string(),
-                String::new(),
-                String::new(),
-                String::new(),
-            ),
-        };
+        let (verify, subject_dn, serial, fingerprint) =
+            match conn.peer_certificates().and_then(|certs| certs.first()) {
+                Some(cert) => {
+                    let (subject_dn, serial, fingerprint) =
+                        Self::parse_tls_client_certificate(cert.as_ref()).unwrap_or_default();
+                    ("SUCCESS".to_string(), subject_dn, serial, fingerprint)
+                }
+                None => (
+                    "NONE".to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ),
+            };
 
         let _ = ext
-            .insert(
-                "ssl_client_verify",
-                CollectionValue::String(verify),
-            )
+            .insert("ssl_client_verify", CollectionValue::String(verify))
             .await;
         let _ = ext
-            .insert(
-                "ssl_client_s_dn",
-                CollectionValue::String(subject_dn),
-            )
+            .insert("ssl_client_s_dn", CollectionValue::String(subject_dn))
             .await;
         let _ = ext
-            .insert(
-                "ssl_client_serial",
-                CollectionValue::String(serial),
-            )
+            .insert("ssl_client_serial", CollectionValue::String(serial))
             .await;
         let _ = ext
             .insert(
@@ -1416,7 +1411,7 @@ impl TlsStackBuilder {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{load_certs, load_key, TlsClientAuthConfig, TlsClientAuthMode};
+    use super::{TlsClientAuthConfig, TlsClientAuthMode, load_certs, load_key};
     use crate::global_process_chains::GlobalProcessChains;
     use crate::self_cert_mgr::{SelfCertConfig, SelfCertMgr, SelfCertMgrRef};
     use crate::{
@@ -3271,13 +3266,9 @@ mod tests {
         let ca_pem = ca_cert.pem();
         let root_der = CertificateDer::from(ca_cert);
         let server_chain = vec![CertificateDer::from(server_cert)];
-        let server_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            server_key.serialize_der(),
-        ));
+        let server_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der()));
         let client_chain = vec![CertificateDer::from(client_cert)];
-        let client_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            client_key.serialize_der(),
-        ));
+        let client_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key.serialize_der()));
 
         (
             server_chain,
@@ -3388,7 +3379,9 @@ mod tests {
 
         let server_manager = Arc::new(ServerManager::new());
         server_manager
-            .add_server(Server::Stream(Arc::new(MockServer::new("test".to_string()))))
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                "test".to_string(),
+            ))))
             .unwrap();
         let result = TlsStack::builder()
             .id("test-client-auth-off")
@@ -3462,7 +3455,9 @@ mod tests {
 
         let server_manager = Arc::new(ServerManager::new());
         server_manager
-            .add_server(Server::Stream(Arc::new(MockServer::new("test".to_string()))))
+            .add_server(Server::Stream(Arc::new(MockServer::new(
+                "test".to_string(),
+            ))))
             .unwrap();
         let result = TlsStack::builder()
             .id("test-client-auth-on")

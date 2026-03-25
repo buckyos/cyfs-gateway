@@ -1,6 +1,8 @@
 use crate::TunnelResult;
 use async_trait::async_trait;
 use buckyos_kit::AsyncStream;
+use name_client::resolve_ip;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 
@@ -80,11 +82,76 @@ impl Clone for Box<dyn TunnelBox> {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TunnelOptions {
+    params: BTreeMap<String, Vec<String>>,
+}
+
+impl TunnelOptions {
+    pub fn from_query(query: Option<&str>) -> Option<Self> {
+        let query = query?;
+        let mut params = BTreeMap::new();
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            params
+                .entry(key.into_owned())
+                .or_insert_with(Vec::new)
+                .push(value.into_owned());
+        }
+
+        if params.is_empty() {
+            None
+        } else {
+            Some(Self { params })
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.params.is_empty()
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.params.contains_key(key)
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.params
+            .get(key)
+            .and_then(|values| values.first().map(|value| value.as_str()))
+    }
+
+    pub fn get_all(&self, key: &str) -> Option<&[String]> {
+        self.params.get(key).map(Vec::as_slice)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Vec<String>)> {
+        self.params.iter()
+    }
+}
+
+pub async fn resolve_host_ip_with_options(
+    dest_host: &str,
+    options: Option<&TunnelOptions>,
+) -> Result<IpAddr, std::io::Error> {
+    if let Some(ip_str) = options.and_then(|options| options.get(dest_host)) {
+        return ip_str.parse::<IpAddr>().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid ip for host {}: {}", dest_host, e),
+            )
+        });
+    }
+
+    resolve_ip(dest_host)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
 #[async_trait]
 pub trait TunnelBuilder: Send + Sync + 'static {
     async fn create_tunnel(
         &self,
         tunnel_stack_id: Option<&str>,
+        options: Option<TunnelOptions>,
     ) -> TunnelResult<Box<dyn TunnelBox>>;
 }
 
@@ -159,6 +226,47 @@ mod tests {
     use super::*;
     use percent_encoding::percent_decode_str;
     use url::Url;
+
+    #[test]
+    fn test_tunnel_options_from_query() {
+        let options = TunnelOptions::from_query(Some(
+            "client_profile=partner_a&sni=api.example.com&repeat=a&repeat=b&empty=",
+        ))
+        .unwrap();
+        assert_eq!(options.get("client_profile"), Some("partner_a"));
+        assert_eq!(options.get("sni"), Some("api.example.com"));
+        assert_eq!(
+            options.get_all("repeat"),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
+        assert_eq!(options.get("empty"), Some(""));
+        assert!(options.contains_key("client_profile"));
+    }
+
+    #[test]
+    fn test_tunnel_options_from_empty_query() {
+        assert!(TunnelOptions::from_query(None).is_none());
+        assert!(TunnelOptions::from_query(Some("")).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_ip_with_options_prefers_configured_ip() {
+        let options = TunnelOptions::from_query(Some("example.com=127.0.0.1")).unwrap();
+        let ip = resolve_host_ip_with_options("example.com", Some(&options))
+            .await
+            .unwrap();
+        assert_eq!(ip.to_string(), "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_host_ip_with_options_rejects_invalid_ip() {
+        let options = TunnelOptions::from_query(Some("example.com=invalid-ip")).unwrap();
+        let err = resolve_host_ip_with_options("example.com", Some(&options))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
     #[test]
     fn test_get_dest_info_from_url_path() {
         unsafe {

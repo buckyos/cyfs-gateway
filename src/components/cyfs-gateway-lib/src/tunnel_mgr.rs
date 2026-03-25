@@ -3,7 +3,7 @@ use crate::ip::{IPTunnelBuilder, ProxyTcpTunnelBuilder};
 use crate::quic_tunnel::QuicTunnelBuilder;
 use crate::socks::SocksTunnelBuilder;
 use crate::tls_tunnel::TlsTunnelBuilder;
-use crate::{TunnelBox, TunnelBuilder, TunnelError, TunnelResult};
+use crate::{TunnelBox, TunnelBuilder, TunnelError, TunnelOptions, TunnelResult};
 use buckyos_kit::AsyncStream;
 use log::*;
 use std::collections::HashMap;
@@ -48,6 +48,10 @@ impl Default for TunnelManager {
 }
 
 impl TunnelManager {
+    fn build_tunnel_options(url: &Url) -> Option<TunnelOptions> {
+        TunnelOptions::from_query(url.query())
+    }
+
     pub fn new() -> Self {
         let this = Self {
             tunnel_builder_manager: Arc::new(Mutex::new(Default::default())),
@@ -101,10 +105,14 @@ impl TunnelManager {
             })?;
         let auth = target_url.authority();
         let tunnel_stack_id = if auth.is_empty() { None } else { Some(auth) };
-        let tunnel = builder.create_tunnel(tunnel_stack_id).await.map_err(|e| {
-            error!("create_tunnel to {} failed: {:?}", target_url, e);
-            e
-        })?;
+        let options = Self::build_tunnel_options(target_url);
+        let tunnel = builder
+            .create_tunnel(tunnel_stack_id, options)
+            .await
+            .map_err(|e| {
+                error!("create_tunnel to {} failed: {:?}", target_url, e);
+                e
+            })?;
 
         info!("Get tunnel for {} success", target_url);
         return Ok(tunnel);
@@ -114,11 +122,12 @@ impl TunnelManager {
     pub async fn open_stream_by_url(&self, url: &Url) -> TunnelResult<Box<dyn AsyncStream>> {
         let builder = self.get_tunnel_builder_by_protocol(url.scheme()).await?;
         let auth_str = url.authority();
+        let options = Self::build_tunnel_options(url);
         let tunnel;
         if auth_str.is_empty() {
-            tunnel = builder.create_tunnel(None).await?;
+            tunnel = builder.create_tunnel(None, options).await?;
         } else {
-            tunnel = builder.create_tunnel(Some(auth_str)).await?;
+            tunnel = builder.create_tunnel(Some(auth_str), options).await?;
         }
         let path = url.path();
         debug!("Open stream by url.path: {}", path);
@@ -136,10 +145,11 @@ impl TunnelManager {
     ) -> TunnelResult<Box<dyn DatagramClientBox>> {
         let builder = self.get_tunnel_builder_by_protocol(url.scheme()).await?;
         let auth_str = url.authority();
+        let options = Self::build_tunnel_options(url);
         let tunnel = if auth_str.is_empty() {
-            builder.create_tunnel(None).await?
+            builder.create_tunnel(None, options).await?
         } else {
-            builder.create_tunnel(Some(auth_str)).await?
+            builder.create_tunnel(Some(auth_str), options).await?
         };
         let client = tunnel
             .create_datagram_client(url.path())
@@ -214,6 +224,7 @@ mod tests {
     #[derive(Clone)]
     struct MockTunnelBuilder {
         captured: Arc<Mutex<Option<String>>>,
+        captured_options: Arc<Mutex<Option<TunnelOptions>>>,
     }
 
     #[async_trait]
@@ -221,8 +232,10 @@ mod tests {
         async fn create_tunnel(
             &self,
             tunnel_stack_id: Option<&str>,
+            options: Option<TunnelOptions>,
         ) -> TunnelResult<Box<dyn TunnelBox>> {
             *self.captured.lock().unwrap() = tunnel_stack_id.map(|s| s.to_string());
+            *self.captured_options.lock().unwrap() = options;
             Ok(Box::new(MockTunnel::default()))
         }
     }
@@ -264,8 +277,10 @@ mod tests {
     async fn test_get_tunnel_preserves_socks_authority() {
         let manager = TunnelManager::new();
         let captured = Arc::new(Mutex::new(None));
+        let captured_options = Arc::new(Mutex::new(None));
         let builder = MockTunnelBuilder {
             captured: captured.clone(),
+            captured_options,
         };
         manager.register_tunnel_builder("socks", Arc::new(builder));
 
@@ -281,8 +296,10 @@ mod tests {
     async fn test_get_tunnel_non_socks_keeps_host_only_behavior() {
         let manager = TunnelManager::new();
         let captured = Arc::new(Mutex::new(None));
+        let captured_options = Arc::new(Mutex::new(None));
         let builder = MockTunnelBuilder {
             captured: captured.clone(),
+            captured_options,
         };
         manager.register_tunnel_builder("tcp", Arc::new(builder));
 
@@ -292,5 +309,30 @@ mod tests {
 
         let value = captured.lock().unwrap().clone();
         assert_eq!(value.as_deref(), Some("127.0.0.1:18080"));
+    }
+
+    #[tokio::test]
+    async fn test_open_stream_by_url_passes_query_options_to_builder() {
+        let manager = TunnelManager::new();
+        let captured = Arc::new(Mutex::new(None));
+        let captured_options = Arc::new(Mutex::new(None));
+        let builder = MockTunnelBuilder {
+            captured,
+            captured_options: captured_options.clone(),
+        };
+        manager.register_tunnel_builder("tcp", Arc::new(builder));
+
+        let url =
+            Url::parse("tcp://127.0.0.1:18080/test:80?client_profile=partner_a&repeat=a&repeat=b")
+                .unwrap();
+        let ret = manager.open_stream_by_url(&url).await;
+        assert!(ret.is_err());
+
+        let options = captured_options.lock().unwrap().clone().unwrap();
+        assert_eq!(options.get("client_profile"), Some("partner_a"));
+        assert_eq!(
+            options.get_all("repeat"),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
     }
 }

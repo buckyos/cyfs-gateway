@@ -1,8 +1,8 @@
 use crate::{
-    DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelResult, get_dest_info_from_url_path,
+    DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelOptions, TunnelResult,
+    get_dest_info_from_url_path, resolve_host_ip_with_options,
 };
 use buckyos_kit::AsyncStream;
-use name_client::resolve_ip;
 use rustls::{ClientConfig, pki_types::ServerName};
 use rustls_platform_verifier::BuilderVerifierExt;
 use std::io::Error;
@@ -11,10 +11,12 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 #[derive(Clone)]
-pub struct TlsTunnel {}
+pub struct TlsTunnel {
+    options: Option<TunnelOptions>,
+}
 impl TlsTunnel {
-    pub fn new() -> Self {
-        TlsTunnel {}
+    pub fn new(options: Option<TunnelOptions>) -> Self {
+        TlsTunnel { options }
     }
 }
 
@@ -35,9 +37,9 @@ impl Tunnel for TlsTunnel {
         }
 
         // Resolve IP address
-        let ip = resolve_ip(dest_host.as_ref().unwrap().as_str())
-            .await
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let ip =
+            resolve_host_ip_with_options(dest_host.as_ref().unwrap().as_str(), self.options.as_ref())
+                .await?;
 
         // Create TCP connection
         let tcp_stream = TcpStream::connect(format!("{}:{}", ip, dest_port))
@@ -103,7 +105,8 @@ impl TunnelBuilder for TlsTunnelBuilder {
     async fn create_tunnel(
         &self,
         _tunnel_stack_id: Option<&str>,
+        options: Option<TunnelOptions>,
     ) -> TunnelResult<Box<dyn TunnelBox>> {
-        Ok(Box::new(TlsTunnel::new()))
+        Ok(Box::new(TlsTunnel::new(options)))
     }
 }

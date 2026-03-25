@@ -27,8 +27,9 @@ use crate::{
     MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs, RTcp, RTcpListener, Server,
     ServerManagerRef, Stack, StackConfig, StackContext, StackErrorCode, StackFactory,
     StackProtocol, StackRef, StackResult, StatManagerRef, StreamInfo, TunnelBox, TunnelBuilder,
-    TunnelEndpoint, TunnelError, TunnelManager, TunnelResult, create_io_dump_stack_config,
-    get_external_commands, get_stat_info, has_scheme, hyper_serve_http, into_stack_err, stack_err,
+    TunnelEndpoint, TunnelError, TunnelManager, TunnelOptions, TunnelResult,
+    create_io_dump_stack_config, get_external_commands, get_stat_info, has_scheme,
+    hyper_serve_http, into_stack_err, stack_err,
 };
 
 #[derive(Clone)]
@@ -954,8 +955,9 @@ impl TunnelBuilder for RtcpTunnelBuilder {
     async fn create_tunnel(
         &self,
         tunnel_stack_id: Option<&str>,
+        options: Option<TunnelOptions>,
     ) -> TunnelResult<Box<dyn TunnelBox>> {
-        self.rtcp.create_tunnel(tunnel_stack_id).await
+        self.rtcp.create_tunnel(tunnel_stack_id, options).await
     }
 }
 

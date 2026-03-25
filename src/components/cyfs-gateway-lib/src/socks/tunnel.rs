@@ -232,6 +232,7 @@ impl TunnelBuilder for SocksTunnelBuilder {
     async fn create_tunnel(
         &self,
         tunnel_stack_id: Option<&str>,
+        _options: Option<TunnelOptions>,
     ) -> TunnelResult<Box<dyn TunnelBox>> {
         debug!(
             "socks_tunnel_builder create_tunnel: {}",
