@@ -6,7 +6,7 @@ use log::*;
 use openssl::x509::X509;
 use rand::Rng;
 use rustls::crypto::ring::sign::any_supported_type;
-use rustls::pki_types::PrivateKeyDer;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign;
 use rustls::sign::CertifiedKey;
@@ -34,10 +34,22 @@ pub fn is_tls_alpn_challenge(client_hello: &ClientHello) -> bool {
         .eq([ACME_TLS_ALPN_NAME])
 }
 
-#[derive(Clone)]
 struct CertInfo {
     key: Arc<CertifiedKey>,
+    certs: Vec<CertificateDer<'static>>,
+    private_key: PrivateKeyDer<'static>,
     expires: chrono::DateTime<chrono::Utc>,
+}
+
+impl Clone for CertInfo {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            certs: self.certs.clone(),
+            private_key: CertStub::clone_private_key(&self.private_key),
+            expires: self.expires,
+        }
+    }
 }
 
 enum CertState {
@@ -50,6 +62,7 @@ enum CertState {
 struct CertMutPart {
     state: CertState,
     order: Option<AcmeOrderSession>,
+    last_error: Option<String>,
 }
 
 struct CertStubInner {
@@ -105,31 +118,44 @@ impl CertStub {
                 mut_part: Mutex::new(CertMutPart {
                     state: CertState::None,
                     order: None,
+                    last_error: None,
                 }),
                 handle: Mutex::new(None),
             }),
         }
     }
 
-    fn create_certified_key(cert_data: &[u8], key_data: &[u8]) -> Result<CertifiedKey> {
+    fn parse_cert_chain(cert_data: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
         let mut cert_chain = vec![];
         for cert in rustls_pemfile::certs(&mut &*cert_data) {
             cert_chain.push(cert?);
         }
-
-        let mut keys = vec![];
-        for key in rustls_pemfile::pkcs8_private_keys(&mut &*key_data) {
-            keys.push(key?);
+        if cert_chain.is_empty() {
+            return Err(anyhow::anyhow!("No certificate found"));
         }
+        Ok(cert_chain)
+    }
 
-        if keys.is_empty() {
-            return Err(anyhow::anyhow!("No private key found"));
+    fn parse_private_key(key_data: &[u8]) -> Result<PrivateKeyDer<'static>> {
+        rustls_pemfile::private_key(&mut &*key_data)?
+            .ok_or_else(|| anyhow::anyhow!("No private key found"))
+    }
+
+    fn clone_private_key(key: &PrivateKeyDer<'static>) -> PrivateKeyDer<'static> {
+        match key {
+            PrivateKeyDer::Pkcs8(key) => PrivateKeyDer::Pkcs8(key.clone_key()),
+            PrivateKeyDer::Pkcs1(key) => PrivateKeyDer::Pkcs1(key.clone_key()),
+            PrivateKeyDer::Sec1(key) => PrivateKeyDer::Sec1(key.clone_key()),
+            _ => panic!("Unsupported key type"),
         }
+    }
 
-        let key = PrivateKeyDer::Pkcs8(keys.remove(0));
-
+    fn create_certified_key(
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: &PrivateKeyDer<'static>,
+    ) -> Result<CertifiedKey> {
         let signing_key =
-            any_supported_type(&key).map_err(|e| anyhow::anyhow!("Invalid private key: {}", e))?;
+            any_supported_type(key).map_err(|e| anyhow::anyhow!("Invalid private key: {}", e))?;
 
         Ok(CertifiedKey::new(cert_chain, signing_key))
     }
@@ -162,6 +188,32 @@ impl CertStub {
         }
     }
 
+    pub fn get_state(&self) -> CertStubState {
+        let mut_part = self.inner.mut_part.lock().unwrap();
+        match &mut_part.state {
+            CertState::None => CertStubState::Pending,
+            CertState::Ready(_) => CertStubState::Ready,
+            CertState::Renewing(_) => CertStubState::Renewing,
+            CertState::Expired(_) => CertStubState::Expired,
+        }
+    }
+
+    pub fn get_material(&self) -> Option<CertMaterial> {
+        let mut_part = self.inner.mut_part.lock().unwrap();
+        match &mut_part.state {
+            CertState::Ready(info) | CertState::Renewing(info) => Some(info.to_material()),
+            CertState::Expired(_) | CertState::None => None,
+        }
+    }
+
+    pub fn get_last_error(&self) -> Option<String> {
+        self.inner.mut_part.lock().unwrap().last_error.clone()
+    }
+
+    fn set_last_error(&self, err: Option<String>) {
+        self.inner.mut_part.lock().unwrap().last_error = err;
+    }
+
     pub fn load_cert(&self) {
         let mut handle = self.inner.handle.lock().unwrap();
         if handle.is_some() && !handle.as_ref().unwrap().is_finished() {
@@ -171,6 +223,7 @@ impl CertStub {
         let stub = self.clone();
         handle.replace(task::spawn(async move {
             if let Err(e) = stub.load_cert_inner().await {
+                stub.set_last_error(Some(e.to_string()));
                 error!("load cert failed, stub: {}, {}", stub, e);
             }
         }));
@@ -239,19 +292,46 @@ impl CertStub {
             )
         })?;
 
-        let certified_key = Self::create_certified_key(&cert_data, &key_data).map_err(|e| {
+        let cert_chain = Self::parse_cert_chain(&cert_data).map_err(|e| {
             error!(
-                "create certified key failed, stub: {}, cert_path: {}, key_path: {}, {}",
+                "parse cert chain failed, stub: {}, cert_path: {}, key_path: {}, {}",
                 self, cert_path, key_path, e
             );
             anyhow::anyhow!(
-                "create certified key failed, stub: {}, cert_path: {}, key_path: {}, {}",
+                "parse cert chain failed, stub: {}, cert_path: {}, key_path: {}, {}",
                 self,
                 cert_path,
                 key_path,
                 e
             )
         })?;
+        let private_key = Self::parse_private_key(&key_data).map_err(|e| {
+            error!(
+                "parse private key failed, stub: {}, cert_path: {}, key_path: {}, {}",
+                self, cert_path, key_path, e
+            );
+            anyhow::anyhow!(
+                "parse private key failed, stub: {}, cert_path: {}, key_path: {}, {}",
+                self,
+                cert_path,
+                key_path,
+                e
+            )
+        })?;
+        let certified_key =
+            Self::create_certified_key(cert_chain.clone(), &private_key).map_err(|e| {
+                error!(
+                    "create certified key failed, stub: {}, cert_path: {}, key_path: {}, {}",
+                    self, cert_path, key_path, e
+                );
+                anyhow::anyhow!(
+                    "create certified key failed, stub: {}, cert_path: {}, key_path: {}, {}",
+                    self,
+                    cert_path,
+                    key_path,
+                    e
+                )
+            })?;
         let expires = Self::get_cert_expiry(&cert_data).map_err(|e| {
             error!(
                 "get cert expiry failed, stub: {}, cert_path: {}, key_path: {}, {}",
@@ -274,8 +354,11 @@ impl CertStub {
         let mut mut_part = self.inner.mut_part.lock().unwrap();
         mut_part.state = CertState::Ready(CertInfo {
             key: Arc::new(certified_key),
+            certs: cert_chain,
+            private_key,
             expires,
         });
+        mut_part.last_error = None;
 
         Ok(())
     }
@@ -334,7 +417,9 @@ impl CertStub {
         fs::write(&cert_path, &cert_data).await?;
         fs::write(&key_path, &key_data).await?;
 
-        let certified_key = Self::create_certified_key(&cert_data, &key_data)?;
+        let cert_chain = Self::parse_cert_chain(&cert_data)?;
+        let private_key = Self::parse_private_key(&key_data)?;
+        let certified_key = Self::create_certified_key(cert_chain.clone(), &private_key)?;
         let expires = Self::get_cert_expiry(&cert_data)?;
 
         info!(
@@ -346,8 +431,11 @@ impl CertStub {
             let mut mut_part = self.inner.mut_part.lock().unwrap();
             mut_part.state = CertState::Ready(CertInfo {
                 key: Arc::new(certified_key),
+                certs: cert_chain,
+                private_key,
                 expires,
             });
+            mut_part.last_error = None;
         }
 
         Ok(())
@@ -360,9 +448,11 @@ impl CertStub {
 
             match result {
                 Ok(()) => {
+                    self.set_last_error(None);
                     break Ok(());
                 }
                 Err(e) => {
+                    self.set_last_error(Some(e.to_string()));
                     error!("order cert failed, stub: {}, {}", self, e);
                     interval *= 2;
                     if interval > 600 {
@@ -386,6 +476,41 @@ impl CertStub {
                 error!("renew cert failed, stub: {}, {}", stub, e);
             }
         }));
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CertStubState {
+    Pending,
+    Ready,
+    Renewing,
+    Expired,
+}
+
+#[derive(Debug)]
+pub struct CertMaterial {
+    pub certs: Vec<CertificateDer<'static>>,
+    pub private_key: PrivateKeyDer<'static>,
+    pub expires: chrono::DateTime<chrono::Utc>,
+}
+
+impl Clone for CertMaterial {
+    fn clone(&self) -> Self {
+        Self {
+            certs: self.certs.clone(),
+            private_key: CertStub::clone_private_key(&self.private_key),
+            expires: self.expires,
+        }
+    }
+}
+
+impl CertInfo {
+    fn to_material(&self) -> CertMaterial {
+        CertMaterial {
+            certs: self.certs.clone(),
+            private_key: CertStub::clone_private_key(&self.private_key),
+            expires: self.expires,
+        }
     }
 }
 

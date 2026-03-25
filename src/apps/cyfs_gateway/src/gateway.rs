@@ -610,6 +610,46 @@ async fn build_self_cert_mgr_from_config(tls_ca: &Option<TlsCA>) -> Result<SelfC
     Ok(self_cert_manager)
 }
 
+fn prepare_tunnel_client_cert_manager(
+    tunnel_manager: &TunnelManager,
+    config: &GatewayConfig,
+    acme_manager: AcmeCertManagerRef,
+    base_dir: &Path,
+) -> Result<TunnelClientCertManagerRef> {
+    let manager = tunnel_manager.client_cert_manager();
+    manager
+        .prepare_reload(config.tunnel_client_certs.as_ref(), acme_manager, base_dir)
+        .map_err(|e| anyhow!("prepare tunnel_client_certs failed: {}", e))?;
+    Ok(manager)
+}
+
+struct PreparedTunnelClientCertGuard {
+    manager: TunnelClientCertManagerRef,
+    committed: bool,
+}
+
+impl PreparedTunnelClientCertGuard {
+    fn new(manager: TunnelClientCertManagerRef) -> Self {
+        Self {
+            manager,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.manager.commit_prepared();
+        self.committed = true;
+    }
+}
+
+impl Drop for PreparedTunnelClientCertGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.manager.discard_prepared();
+        }
+    }
+}
+
 async fn build_js_externals_from_raw_config(
     base_dir: &Path,
     raw_config: &Value,
@@ -812,6 +852,13 @@ impl GatewayFactory {
             build_global_process_chains_from_config(&config.global_process_chains).await?;
 
         let tunnel_manager = TunnelManager::new();
+        let prepared_tunnel_client_certs = prepare_tunnel_client_cert_manager(
+            &tunnel_manager,
+            &config,
+            cert_manager.clone(),
+            base_dir.as_path(),
+        )?;
+        prepared_tunnel_client_certs.commit_prepared();
         let server_manager = Arc::new(ServerManager::new());
         let control_handler: Arc<dyn GatewayControlCmdHandler> = handler.clone();
         for server_config in config.servers.iter() {
@@ -2845,6 +2892,15 @@ impl Gateway {
         let global_process_chains =
             build_global_process_chains_from_config(&config.global_process_chains).await?;
 
+        let prepared_tunnel_client_certs = prepare_tunnel_client_cert_manager(
+            &self.tunnel_manager,
+            &config,
+            cert_manager.clone(),
+            base_dir.as_path(),
+        )?;
+        let prepared_tunnel_client_certs =
+            PreparedTunnelClientCertGuard::new(prepared_tunnel_client_certs);
+
         let server_manager = Arc::new(ServerManager::new());
         let control_handler: Arc<dyn GatewayControlCmdHandler> = self.control_handler.clone();
         for server_config in config.servers.iter() {
@@ -2967,6 +3023,7 @@ impl Gateway {
             )
             .await?;
 
+        prepared_tunnel_client_certs.commit();
         *self.global_collection_manager.write().unwrap() = global_collections;
         *self.config.lock().unwrap() = config;
         *self.limiter_manager.lock().unwrap() = limiter_manager;

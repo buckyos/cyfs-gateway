@@ -1,4 +1,5 @@
 use crate::DatagramClientBox;
+use crate::TunnelClientCertManagerRef;
 use crate::ip::{IPTunnelBuilder, ProxyTcpTunnelBuilder};
 use crate::quic_tunnel::QuicTunnelBuilder;
 use crate::socks::SocksTunnelBuilder;
@@ -39,6 +40,7 @@ pub fn get_protocol_category(str_protocol: &str) -> TunnelResult<ProtocolCategor
 #[derive(Clone)]
 pub struct TunnelManager {
     tunnel_builder_manager: Arc<Mutex<HashMap<String, Arc<dyn TunnelBuilder>>>>,
+    tunnel_client_cert_manager: TunnelClientCertManagerRef,
 }
 
 impl Default for TunnelManager {
@@ -53,17 +55,29 @@ impl TunnelManager {
     }
 
     pub fn new() -> Self {
+        let tunnel_client_cert_manager = crate::TunnelClientCertManager::new();
         let this = Self {
             tunnel_builder_manager: Arc::new(Mutex::new(Default::default())),
+            tunnel_client_cert_manager: tunnel_client_cert_manager.clone(),
         };
         this.register_tunnel_builder("tcp", Arc::new(IPTunnelBuilder::new()));
         this.register_tunnel_builder("ptcp", Arc::new(ProxyTcpTunnelBuilder::new()));
         this.register_tunnel_builder("udp", Arc::new(IPTunnelBuilder::new()));
-        this.register_tunnel_builder("quic", Arc::new(QuicTunnelBuilder::new()));
-        this.register_tunnel_builder("tls", Arc::new(TlsTunnelBuilder::new()));
+        this.register_tunnel_builder(
+            "quic",
+            Arc::new(QuicTunnelBuilder::new(tunnel_client_cert_manager.clone())),
+        );
+        this.register_tunnel_builder(
+            "tls",
+            Arc::new(TlsTunnelBuilder::new(tunnel_client_cert_manager)),
+        );
         this.register_tunnel_builder("socks", Arc::new(SocksTunnelBuilder::new()));
 
         this
+    }
+
+    pub fn client_cert_manager(&self) -> TunnelClientCertManagerRef {
+        self.tunnel_client_cert_manager.clone()
     }
 
     pub fn register_tunnel_builder(&self, protocol: &str, builder: Arc<dyn TunnelBuilder>) {
@@ -323,13 +337,13 @@ mod tests {
         manager.register_tunnel_builder("tcp", Arc::new(builder));
 
         let url =
-            Url::parse("tcp://127.0.0.1:18080/test:80?client_profile=partner_a&repeat=a&repeat=b")
+            Url::parse("tcp://127.0.0.1:18080/test:80?client_cert=partner_a&repeat=a&repeat=b")
                 .unwrap();
         let ret = manager.open_stream_by_url(&url).await;
         assert!(ret.is_err());
 
         let options = captured_options.lock().unwrap().clone().unwrap();
-        assert_eq!(options.get("client_profile"), Some("partner_a"));
+        assert_eq!(options.client_cert_alias(), Some("partner_a"));
         assert_eq!(
             options.get_all("repeat"),
             Some(&["a".to_string(), "b".to_string()][..])

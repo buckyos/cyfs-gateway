@@ -1,6 +1,6 @@
 use crate::{
-    DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelOptions, TunnelResult,
-    get_dest_info_from_url_path, resolve_host_ip_with_options,
+    DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelClientCertManagerRef, TunnelOptions,
+    TunnelResult, get_dest_info_from_url_path, resolve_host_ip_with_options,
 };
 use buckyos_kit::AsyncStream;
 use quinn::crypto::rustls::QuicClientConfig;
@@ -13,10 +13,17 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct QuicTunnel {
     options: Option<TunnelOptions>,
+    client_cert_manager: TunnelClientCertManagerRef,
 }
 impl QuicTunnel {
-    pub fn new(options: Option<TunnelOptions>) -> Self {
-        QuicTunnel { options }
+    pub fn new(
+        options: Option<TunnelOptions>,
+        client_cert_manager: TunnelClientCertManagerRef,
+    ) -> Self {
+        QuicTunnel {
+            options,
+            client_cert_manager,
+        }
     }
 }
 
@@ -35,27 +42,50 @@ impl Tunnel for QuicTunnel {
         if dest_host.is_none() {
             return Err(Error::new(std::io::ErrorKind::Other, "dest_host is None"));
         }
-        let mut config =
+        let builder =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
-                .unwrap()
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?
                 .with_platform_verifier()
-                .unwrap()
-                .with_no_client_auth();
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let mut config = if let Some(alias) = self
+            .options
+            .as_ref()
+            .and_then(TunnelOptions::client_cert_alias)
+        {
+            let material = self
+                .client_cert_manager
+                .resolve_material(alias)
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            builder
+                .with_client_auth_cert(material.certs, material.private_key)
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?
+        } else {
+            builder.with_no_client_auth()
+        };
         config.enable_early_data = true;
-        let client_config =
-            quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(config).unwrap()));
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(config)
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?,
+        ));
 
-        let ip =
-            resolve_host_ip_with_options(dest_host.as_ref().unwrap().as_str(), self.options.as_ref())
-                .await?;
+        let ip = resolve_host_ip_with_options(
+            dest_host.as_ref().unwrap().as_str(),
+            self.options.as_ref(),
+        )
+        .await?;
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
         endpoint.set_default_client_config(client_config);
+        let sni_host = self
+            .options
+            .as_ref()
+            .and_then(TunnelOptions::sni)
+            .unwrap_or(dest_host.as_ref().unwrap().as_str());
         let connecting = endpoint
             .connect(
                 format!("{}:{}", ip.to_string(), dest_port).parse().unwrap(),
-                dest_host.as_ref().unwrap().as_str(),
+                sni_host,
             )
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
         let connection = connecting
@@ -89,11 +119,15 @@ impl Tunnel for QuicTunnel {
     }
 }
 
-pub struct QuicTunnelBuilder {}
+pub struct QuicTunnelBuilder {
+    client_cert_manager: TunnelClientCertManagerRef,
+}
 
 impl QuicTunnelBuilder {
-    pub fn new() -> Self {
-        QuicTunnelBuilder {}
+    pub fn new(client_cert_manager: TunnelClientCertManagerRef) -> Self {
+        QuicTunnelBuilder {
+            client_cert_manager,
+        }
     }
 }
 
@@ -104,6 +138,9 @@ impl TunnelBuilder for QuicTunnelBuilder {
         _tunnel_stack_id: Option<&str>,
         options: Option<TunnelOptions>,
     ) -> TunnelResult<Box<dyn TunnelBox>> {
-        Ok(Box::new(QuicTunnel::new(options)))
+        Ok(Box::new(QuicTunnel::new(
+            options,
+            self.client_cert_manager.clone(),
+        )))
     }
 }

@@ -4,7 +4,7 @@ use cyfs_gateway_lib::{
     config_err, AcmeHttpChallengeServerConfig, BlockConfig, CollectionConfig, ConfigErrorCode,
     ConfigResult, DirServerConfig, ProcessChainConfig, ProcessChainConfigs,
     ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig,
-    TcpStackConfig, UdpStackConfig,
+    TcpStackConfig, TunnelClientCertConfig, UdpStackConfig,
 };
 use cyfs_sn::*;
 use cyfs_socks::SocksServerConfig;
@@ -775,6 +775,22 @@ impl GatewayConfigParser {
             None => None,
         };
 
+        let tunnel_client_certs = json_value
+            .get("tunnel_client_certs")
+            .map(|value| {
+                serde_json::from_value::<HashMap<String, TunnelClientCertConfig>>(value.clone())
+                    .map_err(|e| {
+                        config_err!(
+                            ConfigErrorCode::InvalidConfig,
+                            "invalid tunnel_client_certs config: {:?}\n{}",
+                            e,
+                            serde_json::to_string_pretty(value)
+                                .unwrap_or_else(|_| "<invalid json>".to_string())
+                        )
+                    })
+            })
+            .transpose()?;
+
         let limiters_config: Option<Vec<LimiterConfig>> = match json_value.get("limiters") {
             Some(config) => {
                 let configs = config.as_object().ok_or(config_err!(
@@ -912,6 +928,7 @@ impl GatewayConfigParser {
             limiters_config,
             acme_config,
             tls_ca,
+            tunnel_client_certs,
             stacks,
             servers,
             global_process_chains,
@@ -976,6 +993,7 @@ pub struct GatewayConfig {
     pub limiters_config: Option<Vec<LimiterConfig>>,
     pub acme_config: Option<AcmeConfig>,
     pub tls_ca: Option<TlsCA>,
+    pub tunnel_client_certs: Option<HashMap<String, TunnelClientCertConfig>>,
     pub stacks: Vec<Arc<dyn StackConfig>>,
     pub servers: Vec<Arc<dyn ServerConfig>>,
     pub global_process_chains: ProcessChainConfigs,
@@ -987,7 +1005,7 @@ pub struct GatewayConfig {
 #[cfg(test)]
 mod tests {
     use crate::merge;
-    use cyfs_gateway_lib::RtcpStackConfig;
+    use cyfs_gateway_lib::{ChallengeType, RtcpStackConfig, TunnelClientCertConfig};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1086,6 +1104,40 @@ mod tests {
             }
         });
         assert!(parser.parse(json).is_err());
+    }
+
+    #[test]
+    fn test_tunnel_client_certs_parser() {
+        let parser = super::GatewayConfigParser::new();
+        let config = parser
+            .parse(json!({
+                "tunnel_client_certs": {
+                    "partner_a": {
+                        "type": "local",
+                        "cert_path": "./certs/partner_a/fullchain.pem",
+                        "key_path": "./certs/partner_a/key.pem"
+                    },
+                    "device_http": {
+                        "type": "acme",
+                        "domain": "client-http.example.com",
+                        "acme_type": "http-01"
+                    }
+                }
+            }))
+            .unwrap();
+
+        let certs = config.tunnel_client_certs.unwrap();
+        assert!(matches!(
+            certs.get("partner_a"),
+            Some(TunnelClientCertConfig::Local { .. })
+        ));
+        assert!(matches!(
+            certs.get("device_http"),
+            Some(TunnelClientCertConfig::Acme {
+                acme_type: ChallengeType::Http01,
+                ..
+            })
+        ));
     }
 
     #[test]

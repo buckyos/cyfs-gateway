@@ -1,6 +1,6 @@
 use crate::{
-    DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelOptions, TunnelResult,
-    get_dest_info_from_url_path, resolve_host_ip_with_options,
+    DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelClientCertManagerRef, TunnelOptions,
+    TunnelResult, get_dest_info_from_url_path, resolve_host_ip_with_options,
 };
 use buckyos_kit::AsyncStream;
 use rustls::{ClientConfig, pki_types::ServerName};
@@ -13,10 +13,17 @@ use tokio_rustls::TlsConnector;
 #[derive(Clone)]
 pub struct TlsTunnel {
     options: Option<TunnelOptions>,
+    client_cert_manager: TunnelClientCertManagerRef,
 }
 impl TlsTunnel {
-    pub fn new(options: Option<TunnelOptions>) -> Self {
-        TlsTunnel { options }
+    pub fn new(
+        options: Option<TunnelOptions>,
+        client_cert_manager: TunnelClientCertManagerRef,
+    ) -> Self {
+        TlsTunnel {
+            options,
+            client_cert_manager,
+        }
     }
 }
 
@@ -37,29 +44,50 @@ impl Tunnel for TlsTunnel {
         }
 
         // Resolve IP address
-        let ip =
-            resolve_host_ip_with_options(dest_host.as_ref().unwrap().as_str(), self.options.as_ref())
-                .await?;
+        let ip = resolve_host_ip_with_options(
+            dest_host.as_ref().unwrap().as_str(),
+            self.options.as_ref(),
+        )
+        .await?;
 
         // Create TCP connection
         let tcp_stream = TcpStream::connect(format!("{}:{}", ip, dest_port))
             .await
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
 
-        // Configure TLS
-        let mut config =
+        let builder =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
                 .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?
                 .with_platform_verifier()
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+
+        let mut config = if let Some(alias) = self
+            .options
+            .as_ref()
+            .and_then(TunnelOptions::client_cert_alias)
+        {
+            let material = self
+                .client_cert_manager
+                .resolve_material(alias)
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            builder
+                .with_client_auth_cert(material.certs, material.private_key)
                 .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?
-                .with_no_client_auth();
+        } else {
+            builder.with_no_client_auth()
+        };
 
         // Enable early data if needed
         config.enable_early_data = true;
 
         let connector = TlsConnector::from(Arc::new(config));
-        let domain = ServerName::try_from(dest_host.as_ref().unwrap().to_string())
+        let sni_host = self
+            .options
+            .as_ref()
+            .and_then(TunnelOptions::sni)
+            .unwrap_or(dest_host.as_ref().unwrap().as_str());
+        let domain = ServerName::try_from(sni_host.to_string())
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
 
         // Establish TLS connection
@@ -92,11 +120,15 @@ impl Tunnel for TlsTunnel {
     }
 }
 
-pub struct TlsTunnelBuilder {}
+pub struct TlsTunnelBuilder {
+    client_cert_manager: TunnelClientCertManagerRef,
+}
 
 impl TlsTunnelBuilder {
-    pub fn new() -> Self {
-        TlsTunnelBuilder {}
+    pub fn new(client_cert_manager: TunnelClientCertManagerRef) -> Self {
+        TlsTunnelBuilder {
+            client_cert_manager,
+        }
     }
 }
 
@@ -107,6 +139,9 @@ impl TunnelBuilder for TlsTunnelBuilder {
         _tunnel_stack_id: Option<&str>,
         options: Option<TunnelOptions>,
     ) -> TunnelResult<Box<dyn TunnelBox>> {
-        Ok(Box::new(TlsTunnel::new(options)))
+        Ok(Box::new(TlsTunnel::new(
+            options,
+            self.client_cert_manager.clone(),
+        )))
     }
 }

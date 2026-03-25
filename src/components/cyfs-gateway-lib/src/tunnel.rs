@@ -6,6 +6,9 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 
+pub const TUNNEL_OPTION_CLIENT_CERT: &str = "client_cert";
+pub const TUNNEL_OPTION_SNI: &str = "sni";
+
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]
 pub struct TunnelEndpoint {
     pub device_id: String,
@@ -123,6 +126,14 @@ impl TunnelOptions {
         self.params.get(key).map(Vec::as_slice)
     }
 
+    pub fn client_cert_alias(&self) -> Option<&str> {
+        self.get(TUNNEL_OPTION_CLIENT_CERT)
+    }
+
+    pub fn sni(&self) -> Option<&str> {
+        self.get(TUNNEL_OPTION_SNI)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Vec<String>)> {
         self.params.iter()
     }
@@ -230,17 +241,17 @@ mod tests {
     #[test]
     fn test_tunnel_options_from_query() {
         let options = TunnelOptions::from_query(Some(
-            "client_profile=partner_a&sni=api.example.com&repeat=a&repeat=b&empty=",
+            "client_cert=partner_a&sni=api.example.com&repeat=a&repeat=b&empty=",
         ))
         .unwrap();
-        assert_eq!(options.get("client_profile"), Some("partner_a"));
-        assert_eq!(options.get("sni"), Some("api.example.com"));
+        assert_eq!(options.client_cert_alias(), Some("partner_a"));
+        assert_eq!(options.sni(), Some("api.example.com"));
         assert_eq!(
             options.get_all("repeat"),
             Some(&["a".to_string(), "b".to_string()][..])
         );
         assert_eq!(options.get("empty"), Some(""));
-        assert!(options.contains_key("client_profile"));
+        assert!(options.contains_key(TUNNEL_OPTION_CLIENT_CERT));
     }
 
     #[test]
