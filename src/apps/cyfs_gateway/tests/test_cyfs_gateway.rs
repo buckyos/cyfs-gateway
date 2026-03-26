@@ -6,17 +6,23 @@ mod tests {
     use cyfs_gateway::{
         gateway_service_main, read_login_token, GatewayControlClient, GatewayParams, CONTROL_SERVER,
     };
+    use cyfs_gateway_lib::*;
     use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
     use hickory_resolver::TokioAsyncResolver;
     use http_body_util::BodyExt;
     use http_body_util::Full;
     use hyper_util::rt::TokioIo;
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use std::collections::HashSet;
     use std::io::Cursor;
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
     use std::path::Path;
+    use std::path::PathBuf;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Once};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -106,7 +112,6 @@ mod tests {
     const SOCKS_VERSION: u8 = 0x05;
     const SOCKS_AUTH_NONE: u8 = 0x00;
     const SOCKS_AUTH_USERNAME_PASSWORD: u8 = 0x02;
-    const SOCKS_AUTH_NO_ACCEPTABLE: u8 = 0xff;
     const SOCKS_CMD_CONNECT: u8 = 0x01;
     const SOCKS_ADDR_IPV4: u8 = 0x01;
     const SOCKS_ADDR_DOMAIN: u8 = 0x03;
@@ -140,9 +145,12 @@ mod tests {
         }
     }
 
-    async fn allocate_free_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
+    fn reserve_free_ports<const N: usize>() -> [StdTcpListener; N] {
+        std::array::from_fn(|_| StdTcpListener::bind(("127.0.0.1", 0)).unwrap())
+    }
+
+    fn reserved_port_numbers<const N: usize>(listeners: &[StdTcpListener; N]) -> [u16; N] {
+        std::array::from_fn(|index| listeners[index].local_addr().unwrap().port())
     }
 
     async fn start_echo_server() -> u16 {
@@ -277,6 +285,142 @@ mod tests {
         Ok(stream)
     }
 
+    struct MutualTlsFiles {
+        server_cert_path: PathBuf,
+        server_key_path: PathBuf,
+        allowed_cert_path: PathBuf,
+        allowed_key_path: PathBuf,
+        denied_cert_path: PathBuf,
+        denied_key_path: PathBuf,
+        ca_cert_path: PathBuf,
+        allowed_fingerprint: String,
+    }
+
+    fn ensure_crypto_provider() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    async fn create_mutual_tls_files(base_dir: &Path, server_name: &str) -> MutualTlsFiles {
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["Test Root CA".to_string()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_issuer = Issuer::from_params(&ca_params, &ca_key);
+
+        let server_key = KeyPair::generate().unwrap();
+        let server_params = CertificateParams::new(vec![server_name.to_string()]).unwrap();
+        let server_cert = server_params.signed_by(&server_key, &ca_issuer).unwrap();
+
+        let allowed_key = KeyPair::generate().unwrap();
+        let allowed_params =
+            CertificateParams::new(vec!["allowed.client.buckyos.ai".to_string()]).unwrap();
+        let allowed_cert = allowed_params.signed_by(&allowed_key, &ca_issuer).unwrap();
+
+        let denied_key = KeyPair::generate().unwrap();
+        let denied_params =
+            CertificateParams::new(vec!["denied.client.buckyos.ai".to_string()]).unwrap();
+        let denied_cert = denied_params.signed_by(&denied_key, &ca_issuer).unwrap();
+
+        let server_cert_path = base_dir.join("server_cert.pem");
+        let server_key_path = base_dir.join("server_key.pem");
+        let allowed_cert_path = base_dir.join("allowed_cert.pem");
+        let allowed_key_path = base_dir.join("allowed_key.pem");
+        let denied_cert_path = base_dir.join("denied_cert.pem");
+        let denied_key_path = base_dir.join("denied_key.pem");
+        let ca_cert_path = base_dir.join("client_ca.pem");
+
+        tokio::fs::write(&server_cert_path, server_cert.pem())
+            .await
+            .unwrap();
+        tokio::fs::write(&server_key_path, server_key.serialize_pem())
+            .await
+            .unwrap();
+        tokio::fs::write(&allowed_cert_path, allowed_cert.pem())
+            .await
+            .unwrap();
+        tokio::fs::write(&allowed_key_path, allowed_key.serialize_pem())
+            .await
+            .unwrap();
+        tokio::fs::write(&denied_cert_path, denied_cert.pem())
+            .await
+            .unwrap();
+        tokio::fs::write(&denied_key_path, denied_key.serialize_pem())
+            .await
+            .unwrap();
+        tokio::fs::write(&ca_cert_path, ca_cert.pem())
+            .await
+            .unwrap();
+
+        let allowed_der = load_certs(allowed_cert_path.to_string_lossy().as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let allowed_fingerprint = hex::encode(Sha256::digest(allowed_der.as_ref()));
+
+        MutualTlsFiles {
+            server_cert_path,
+            server_key_path,
+            allowed_cert_path,
+            allowed_key_path,
+            denied_cert_path,
+            denied_key_path,
+            ca_cert_path,
+            allowed_fingerprint,
+        }
+    }
+
+    async fn start_fixed_http_backend(body: &'static str, hits: Arc<AtomicUsize>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+
+                let hits = hits.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let n = match stream.read(&mut buf).await {
+                            Ok(0) => return,
+                            Ok(n) => n,
+                            Err(_) => return,
+                        };
+                        request.extend_from_slice(&buf[..n]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                        assert!(request.len() <= 8192, "http request headers too large");
+                    }
+
+                    let request = String::from_utf8_lossy(&request);
+                    assert!(request.starts_with("GET / HTTP/1.1\r\n"));
+
+                    hits.fetch_add(1, Ordering::SeqCst);
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        port
+    }
+
     #[tokio::test]
     async fn test_cyfs_gateway() {
         init_logging("test_cyfs_gateway", false);
@@ -295,9 +439,9 @@ mod tests {
 
         let echo_direct_port = start_echo_server().await;
         let echo_proxy_port = start_echo_server().await;
-        let reject_port = allocate_free_port().await;
-        let socks_stack_port = allocate_free_port().await;
-        let upstream_socks_stack_port = allocate_free_port().await;
+        let reserved_ports = reserve_free_ports::<3>();
+        let [reject_port, socks_stack_port, upstream_socks_stack_port] =
+            reserved_port_numbers(&reserved_ports);
 
         let config = include_str!("test_cyfs_gateway.yaml");
         let local_dns = include_str!("local_dns.toml");
@@ -375,6 +519,7 @@ function test_js_hook(context, host) {
         let config = config.replace("{{echo_proxy_port}}", echo_proxy_port.to_string().as_str());
 
         std::fs::write(config_file.path(), config).unwrap();
+        drop(reserved_ports);
 
         tokio::spawn(async move {
             gateway_service_main(
@@ -1326,5 +1471,193 @@ function test_js_hook(context, host) {
         assert!(!json_set_content.is_empty());
         let set: HashSet<String> = serde_json::from_str(json_set_content.as_str()).unwrap();
         assert!(set.contains("upstream_socks_hit"));
+    }
+
+    #[tokio::test]
+    async fn test_socks5_to_tls_stack_with_client_cert_policy() {
+        ensure_crypto_provider();
+        init_logging("test_cyfs_gateway", false);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var(
+                "BUCKYOS_ROOT",
+                temp_dir.path().to_string_lossy().to_string(),
+            );
+        }
+        let server_name = "mtls.test";
+        let reserved_ports = reserve_free_ports::<3>();
+        let [tls_port, allowed_socks_port, denied_socks_port] =
+            reserved_port_numbers(&reserved_ports);
+
+        let certs = create_mutual_tls_files(temp_dir.path(), server_name).await;
+        let backend_hits = Arc::new(AtomicUsize::new(0));
+        let backend_port = start_fixed_http_backend("ok-from-backend", backend_hits.clone()).await;
+
+        let config_file = tempfile::NamedTempFile::with_suffix(".yaml").unwrap();
+        let config = format!(
+            r#"
+tunnel_client_certs:
+  allowed:
+    type: local
+    cert_path: '{allowed_cert_path}'
+    key_path: '{allowed_key_path}'
+  denied:
+    type: local
+    cert_path: '{denied_cert_path}'
+    key_path: '{denied_key_path}'
+
+stacks:
+  tls_mtls_policy:
+    bind: 127.0.0.1:{tls_port}
+    protocol: tls
+    alpn_protocols:
+      - 'http/1.1'
+    client_auth:
+      mode: 'on'
+      ca_cert_paths:
+        - '{ca_cert_path}'
+    certs:
+      - domain: '{server_name}'
+        cert_path: '{server_cert_path}'
+        key_path: '{server_key_path}'
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              ne $REQ.ssl_client_verify "SUCCESS" && reject;
+              ne $REQ.ssl_client_fingerprint "{allowed_fingerprint}" && reject;
+              http-probe && return "server backend_http";
+              reject;
+
+  socks_allowed_entry:
+    bind: 127.0.0.1:{allowed_socks_port}
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              return "server socks_allowed";
+
+  socks_denied_entry:
+    bind: 127.0.0.1:{denied_socks_port}
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              return "server socks_denied";
+
+servers:
+  backend_http:
+    type: http
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              return "forward http://127.0.0.1:{backend_port}";
+
+  socks_allowed:
+    type: socks
+    target: 'tcp://127.0.0.1:9'
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              return "PROXY tls:///${{REQ.target.addr}}?client_cert=allowed&sni={server_name}&insecure=true";
+
+  socks_denied:
+    type: socks
+    target: 'tcp://127.0.0.1:9'
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              return "PROXY tls:///${{REQ.target.addr}}?client_cert=denied&sni={server_name}&insecure=true";
+"#,
+            allowed_cert_path = certs.allowed_cert_path.to_string_lossy(),
+            allowed_key_path = certs.allowed_key_path.to_string_lossy(),
+            denied_cert_path = certs.denied_cert_path.to_string_lossy(),
+            denied_key_path = certs.denied_key_path.to_string_lossy(),
+            tls_port = tls_port,
+            ca_cert_path = certs.ca_cert_path.to_string_lossy(),
+            server_name = server_name,
+            server_cert_path = certs.server_cert_path.to_string_lossy(),
+            server_key_path = certs.server_key_path.to_string_lossy(),
+            allowed_fingerprint = certs.allowed_fingerprint,
+            backend_port = backend_port,
+            allowed_socks_port = allowed_socks_port,
+            denied_socks_port = denied_socks_port,
+        );
+        std::fs::write(config_file.path(), config).unwrap();
+        drop(reserved_ports);
+
+        tokio::spawn(async move {
+            gateway_service_main(
+                config_file.path(),
+                GatewayParams {
+                    keep_tunnel: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        let request_url = format!("http://127.0.0.1:{tls_port}/");
+        let allowed_client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!(
+                "socks5://127.0.0.1:{allowed_socks_port}"
+            ))
+            .unwrap())
+            .build()
+            .unwrap();
+        let allowed_response = allowed_client
+            .get(&request_url)
+            .header("Host", server_name)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(allowed_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(allowed_response.text().await.unwrap(), "ok-from-backend");
+        assert_eq!(backend_hits.load(Ordering::SeqCst), 1);
+
+        let denied_client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!(
+                "socks5://127.0.0.1:{denied_socks_port}"
+            ))
+            .unwrap())
+            .build()
+            .unwrap();
+        let ret = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            denied_client
+                .get(&request_url)
+                .header("Host", server_name)
+                .send(),
+        )
+        .await
+        .expect("denied mTLS connection should close promptly");
+        assert!(ret.is_err(), "denied mTLS request should not succeed");
+        assert_eq!(backend_hits.load(Ordering::SeqCst), 1);
     }
 }

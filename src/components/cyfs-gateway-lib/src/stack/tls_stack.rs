@@ -33,7 +33,7 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use tokio_rustls::LazyConfigAcceptor;
@@ -185,6 +185,15 @@ struct TlsConnectionHandler {
 }
 
 impl TlsConnectionHandler {
+    async fn graceful_shutdown_stream(
+        stream: &mut Box<dyn buckyos_kit::AsyncStream>,
+    ) -> StackResult<()> {
+        stream.shutdown().await.map_err(into_stack_err!(
+            StackErrorCode::StreamError,
+            "shutdown tls stream failed"
+        ))
+    }
+
     async fn probe_proxy_protocol_stream(
         mut stream: Box<dyn buckyos_kit::AsyncStream>,
     ) -> StackResult<(Box<dyn buckyos_kit::AsyncStream>, Option<SocketAddr>)> {
@@ -734,7 +743,7 @@ impl TlsConnectionHandler {
             request.source_online_secs = Some(device_info.today_online_seconds().to_string());
         }
         let global_env = executor.global_env().clone();
-        let (ret, stream) = execute_stream_chain(executor, request)
+        let (ret, mut stream) = execute_stream_chain(executor, request)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let conn_src_addr = Some(remote_addr.to_string());
@@ -759,8 +768,10 @@ impl TlsConnectionHandler {
         }
         if ret.is_control() {
             if ret.is_drop() {
+                Self::graceful_shutdown_stream(&mut stream).await?;
                 return Ok(());
             } else if ret.is_reject() {
+                Self::graceful_shutdown_stream(&mut stream).await?;
                 return Ok(());
             }
 
@@ -1632,8 +1643,10 @@ mod tests {
             .write_all(b"GET / HTTP/1.1\r\nHost: httpbin.org\r\n\r\n")
             .await;
         assert!(result.is_ok());
-        let ret = stream.read(&mut [0; 1024]).await;
-        assert!(ret.is_err());
+        let ret = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut [0; 1024]))
+            .await
+            .expect("rejected tls connection should close promptly");
+        assert_eq!(ret.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1703,8 +1716,10 @@ mod tests {
             .write_all(b"GET / HTTP/1.1\r\nHost: httpbin.org\r\n\r\n")
             .await;
         assert!(result.is_ok());
-        let ret = stream.read(&mut [0; 1024]).await;
-        assert!(ret.is_err());
+        let ret = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut [0; 1024]))
+            .await
+            .expect("dropped tls connection should close promptly");
+        assert_eq!(ret.unwrap(), 0);
     }
 
     #[tokio::test]

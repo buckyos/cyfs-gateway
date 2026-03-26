@@ -4,15 +4,108 @@ use crate::{
 };
 use buckyos_kit::AsyncStream;
 use quinn::crypto::rustls::QuicClientConfig;
-use rustls::ClientConfig;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use rustls_platform_verifier::BuilderVerifierExt;
 use sfo_split::Splittable;
 use std::io::Error;
 use std::sync::Arc;
 
+const QUIC_TUNNEL_OPTION_CLIENT_CERT: &str = "client_cert";
+const QUIC_TUNNEL_OPTION_SNI: &str = "sni";
+const QUIC_TUNNEL_OPTION_INSECURE: &str = "insecure";
+
+#[derive(Clone, Default)]
+struct QuicTunnelOptions {
+    client_cert_alias: Option<String>,
+    sni: Option<String>,
+    insecure: bool,
+}
+
+impl QuicTunnelOptions {
+    fn from_tunnel_options(options: Option<&TunnelOptions>) -> Self {
+        let client_cert_alias = options
+            .and_then(|options| options.get(QUIC_TUNNEL_OPTION_CLIENT_CERT))
+            .map(str::to_owned);
+        let sni = options
+            .and_then(|options| options.get(QUIC_TUNNEL_OPTION_SNI))
+            .map(str::to_owned);
+        let insecure = options
+            .and_then(|options| options.get(QUIC_TUNNEL_OPTION_INSECURE))
+            .map(|value| {
+                value.is_empty()
+                    || matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+            })
+            .unwrap_or(false);
+
+        Self {
+            client_cert_alias,
+            sni,
+            insecure,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NoCertificateVerifier;
+
+impl ServerCertVerifier for NoCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer,
+        _intermediates: &[CertificateDer],
+        _server_name: &ServerName,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA1,
+            SignatureScheme::ECDSA_SHA1_Legacy,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
+    }
+}
+
 #[derive(Clone)]
 pub struct QuicTunnel {
     options: Option<TunnelOptions>,
+    quic_options: QuicTunnelOptions,
     client_cert_manager: TunnelClientCertManagerRef,
 }
 impl QuicTunnel {
@@ -20,8 +113,10 @@ impl QuicTunnel {
         options: Option<TunnelOptions>,
         client_cert_manager: TunnelClientCertManagerRef,
     ) -> Self {
+        let quic_options = QuicTunnelOptions::from_tunnel_options(options.as_ref());
         QuicTunnel {
             options,
+            quic_options,
             client_cert_manager,
         }
     }
@@ -45,23 +140,37 @@ impl Tunnel for QuicTunnel {
         let builder =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
-                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?
+                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let mut config = if self.quic_options.insecure {
+            let builder = builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertificateVerifier));
+            if let Some(alias) = self.quic_options.client_cert_alias.as_deref() {
+                let material = self
+                    .client_cert_manager
+                    .resolve_material(alias)
+                    .map_err(|e| Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                builder
+                    .with_client_auth_cert(material.certs, material.private_key)
+                    .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?
+            } else {
+                builder.with_no_client_auth()
+            }
+        } else {
+            let builder = builder
                 .with_platform_verifier()
                 .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-        let mut config = if let Some(alias) = self
-            .options
-            .as_ref()
-            .and_then(TunnelOptions::client_cert_alias)
-        {
-            let material = self
-                .client_cert_manager
-                .resolve_material(alias)
-                .map_err(|e| Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            builder
-                .with_client_auth_cert(material.certs, material.private_key)
-                .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?
-        } else {
-            builder.with_no_client_auth()
+            if let Some(alias) = self.quic_options.client_cert_alias.as_deref() {
+                let material = self
+                    .client_cert_manager
+                    .resolve_material(alias)
+                    .map_err(|e| Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                builder
+                    .with_client_auth_cert(material.certs, material.private_key)
+                    .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?
+            } else {
+                builder.with_no_client_auth()
+            }
         };
         config.enable_early_data = true;
         let client_config = quinn::ClientConfig::new(Arc::new(
@@ -78,9 +187,9 @@ impl Tunnel for QuicTunnel {
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
         endpoint.set_default_client_config(client_config);
         let sni_host = self
-            .options
-            .as_ref()
-            .and_then(TunnelOptions::sni)
+            .quic_options
+            .sni
+            .as_deref()
             .unwrap_or(dest_host.as_ref().unwrap().as_str());
         let connecting = endpoint
             .connect(

@@ -343,7 +343,7 @@ mod tests {
         assert!(ret.is_err());
 
         let options = captured_options.lock().unwrap().clone().unwrap();
-        assert_eq!(options.client_cert_alias(), Some("partner_a"));
+        assert_eq!(options.get("client_cert"), Some("partner_a"));
         assert_eq!(
             options.get_all("repeat"),
             Some(&["a".to_string(), "b".to_string()][..])

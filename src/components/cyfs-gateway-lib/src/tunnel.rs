@@ -6,9 +6,6 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 
-pub const TUNNEL_OPTION_CLIENT_CERT: &str = "client_cert";
-pub const TUNNEL_OPTION_SNI: &str = "sni";
-
 #[derive(Hash, Eq, PartialEq, Debug, Clone)]
 pub struct TunnelEndpoint {
     pub device_id: String,
@@ -126,14 +123,6 @@ impl TunnelOptions {
         self.params.get(key).map(Vec::as_slice)
     }
 
-    pub fn client_cert_alias(&self) -> Option<&str> {
-        self.get(TUNNEL_OPTION_CLIENT_CERT)
-    }
-
-    pub fn sni(&self) -> Option<&str> {
-        self.get(TUNNEL_OPTION_SNI)
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = (&String, &Vec<String>)> {
         self.params.iter()
     }
@@ -143,7 +132,7 @@ pub async fn resolve_host_ip_with_options(
     dest_host: &str,
     options: Option<&TunnelOptions>,
 ) -> Result<IpAddr, std::io::Error> {
-    if let Some(ip_str) = options.and_then(|options| options.get(dest_host)) {
+    if let Some(ip_str) = options.and_then(|options| options.get("ip")) {
         return ip_str.parse::<IpAddr>().map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -241,17 +230,18 @@ mod tests {
     #[test]
     fn test_tunnel_options_from_query() {
         let options = TunnelOptions::from_query(Some(
-            "client_cert=partner_a&sni=api.example.com&repeat=a&repeat=b&empty=",
+            "client_cert=partner_a&sni=api.example.com&insecure=true&repeat=a&repeat=b&empty=",
         ))
         .unwrap();
-        assert_eq!(options.client_cert_alias(), Some("partner_a"));
-        assert_eq!(options.sni(), Some("api.example.com"));
+        assert_eq!(options.get("client_cert"), Some("partner_a"));
+        assert_eq!(options.get("sni"), Some("api.example.com"));
+        assert_eq!(options.get("insecure"), Some("true"));
         assert_eq!(
             options.get_all("repeat"),
             Some(&["a".to_string(), "b".to_string()][..])
         );
         assert_eq!(options.get("empty"), Some(""));
-        assert!(options.contains_key(TUNNEL_OPTION_CLIENT_CERT));
+        assert!(options.contains_key("client_cert"));
     }
 
     #[test]
@@ -262,7 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_host_ip_with_options_prefers_configured_ip() {
-        let options = TunnelOptions::from_query(Some("example.com=127.0.0.1")).unwrap();
+        let options = TunnelOptions::from_query(Some("ip=127.0.0.1")).unwrap();
         let ip = resolve_host_ip_with_options("example.com", Some(&options))
             .await
             .unwrap();
@@ -271,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_host_ip_with_options_rejects_invalid_ip() {
-        let options = TunnelOptions::from_query(Some("example.com=invalid-ip")).unwrap();
+        let options = TunnelOptions::from_query(Some("ip=invalid-ip")).unwrap();
         let err = resolve_host_ip_with_options("example.com", Some(&options))
             .await
             .unwrap_err();
