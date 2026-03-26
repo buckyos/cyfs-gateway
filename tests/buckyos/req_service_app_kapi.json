@@ -1,0 +1,12 @@
+{
+    "input": {
+      "REQ": {
+        "path": "/kapi/kevent/stream",
+        "host": "test.buckyos.io",
+        "url": "https://test.buckyos.io/kapi/kevent/stream"
+      }
+    },
+    "id": "server:node_gateway:main",
+    "output": ["REQ", "RESP"]
+  }
+  
