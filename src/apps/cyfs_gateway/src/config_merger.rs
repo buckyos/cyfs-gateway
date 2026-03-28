@@ -639,7 +639,8 @@ async fn load_dir_with_root_internal(
 
 #[derive(Debug)]
 struct IndexedFile {
-    index: u32,
+    index: Option<u32>,
+    scan_order: usize,
     path: PathBuf,
 }
 
@@ -652,25 +653,45 @@ async fn scan_files(dir: &Path) -> Result<Vec<IndexedFile>> {
         e
     })?;
 
+    let mut scan_order = 0;
     while let Some(entry) = dir_entries.next_entry().await? {
         let path = entry.path();
 
-        let index = extract_index_from_filename(&path).unwrap_or(0);
-        indexed_files.push(IndexedFile { index, path });
+        let index = extract_index_from_filename(&path);
+        indexed_files.push(IndexedFile {
+            index,
+            scan_order,
+            path,
+        });
+        scan_order += 1;
     }
 
+    sort_indexed_files(&mut indexed_files)?;
+
+    Ok(indexed_files)
+}
+
+fn sort_indexed_files(indexed_files: &mut [IndexedFile]) -> Result<()> {
     let mut index_set = std::collections::HashSet::new();
-    for file in &indexed_files {
-        if !index_set.insert(file.index) {
-            let msg = format!("Duplicated index found: {} {:?}", file.index, file.path);
-            error!("{}", msg);
-            return Err(anyhow!(msg));
+    for file in indexed_files.iter() {
+        if let Some(index) = file.index {
+            if !index_set.insert(index) {
+                let msg = format!("Duplicated index found: {} {:?}", index, file.path);
+                error!("{}", msg);
+                return Err(anyhow!(msg));
+            }
         }
     }
 
-    indexed_files.sort_by_key(|file| file.index);
+    indexed_files.sort_by_key(|file| {
+        (
+            file.index.is_none(),
+            file.index.unwrap_or(u32::MAX),
+            file.scan_order,
+        )
+    });
 
-    Ok(indexed_files)
+    Ok(())
 }
 
 fn extract_index_from_filename(path: &Path) -> Option<u32> {
@@ -728,6 +749,7 @@ async fn load_dir_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_is_remote_path() {
@@ -885,5 +907,106 @@ mod tests {
             }
             ConfigSource::Local(_) => panic!("expected remote source"),
         }
+    }
+
+    #[test]
+    fn test_sort_indexed_files_keeps_unindexed_after_indexed_and_in_scan_order() {
+        let mut indexed_files = vec![
+            IndexedFile {
+                index: None,
+                scan_order: 0,
+                path: PathBuf::from("plain-b.yaml"),
+            },
+            IndexedFile {
+                index: Some(20),
+                scan_order: 1,
+                path: PathBuf::from("second.20.yaml"),
+            },
+            IndexedFile {
+                index: None,
+                scan_order: 2,
+                path: PathBuf::from("plain-a.yaml"),
+            },
+            IndexedFile {
+                index: Some(10),
+                scan_order: 3,
+                path: PathBuf::from("first.10.yaml"),
+            },
+        ];
+
+        sort_indexed_files(&mut indexed_files).unwrap();
+
+        let ordered_paths: Vec<_> = indexed_files
+            .iter()
+            .map(|file| file.path.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            ordered_paths,
+            vec![
+                "first.10.yaml",
+                "second.20.yaml",
+                "plain-b.yaml",
+                "plain-a.yaml",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sort_indexed_files_rejects_duplicate_explicit_indexes() {
+        let mut indexed_files = vec![
+            IndexedFile {
+                index: Some(10),
+                scan_order: 0,
+                path: PathBuf::from("first.10.yaml"),
+            },
+            IndexedFile {
+                index: Some(10),
+                scan_order: 1,
+                path: PathBuf::from("second.10.yaml"),
+            },
+        ];
+
+        let err = sort_indexed_files(&mut indexed_files).unwrap_err();
+        assert!(err.to_string().contains("Duplicated index found: 10"));
+    }
+
+    #[tokio::test]
+    async fn test_scan_files_sorts_explicit_indexes_before_unindexed() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("plain.yaml"), b"plain").unwrap();
+        std::fs::write(dir.path().join("second.20.yaml"), b"second").unwrap();
+        std::fs::write(dir.path().join("first.10.yaml"), b"first").unwrap();
+
+        let files = scan_files(dir.path()).await.unwrap();
+        let ordered_paths: Vec<_> = files
+            .iter()
+            .map(|file| file.path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(
+            ordered_paths,
+            vec!["first.10.yaml", "second.20.yaml", "plain.yaml"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_files_allows_multiple_unindexed_files() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("plain-a.yaml"), b"a").unwrap();
+        std::fs::write(dir.path().join("plain-b.yaml"), b"b").unwrap();
+
+        let files = scan_files(dir.path()).await.unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|file| file.index.is_none()));
+    }
+
+    #[tokio::test]
+    async fn test_scan_files_rejects_duplicate_explicit_indexes() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("first.10.yaml"), b"first").unwrap();
+        std::fs::write(dir.path().join("second.10.yaml"), b"second").unwrap();
+
+        let err = scan_files(dir.path()).await.unwrap_err();
+        assert!(err.to_string().contains("Duplicated index found: 10"));
     }
 }
