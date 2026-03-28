@@ -30,8 +30,6 @@ toml.workspace = true
 hex.workspace = true
 jsonwebtoken.workspace = true
 sfo-io = "0.1.12"
-sfo-log = { version = "0.1"}
-
 buckyos-kit.workspace = true
 name-client.workspace = true
 name-lib.workspace = true

@@ -1,6 +1,6 @@
 use crate::server::dns_server::NameServer;
 use crate::{QAServer, ServerError, ServerErrorCode, ServerResult, server_err};
-use ::kRPC::{RPCHandler, RPCRequest, RPCResponse};
+use ::kRPC::{RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use as_any::AsAny;
 use buckyos_kit::AsyncStream;
 use cyfs_process_chain::{
@@ -954,26 +954,17 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
         }
     };
 
+    let rpc_seq = rpc_request.seq;
+    let rpc_trace_id = rpc_request.trace_id.clone();
     let resp: RPCResponse = match rpc_handler.handle_rpc_call(rpc_request, client_ip).await {
         Ok(resp) => resp,
         Err(e) => {
-            return Ok(http::Response::builder()
-                .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
-                .body(BoxBody::new(
-                    http_body_util::Full::new(Bytes::from(format!(
-                        "Failed to handle rpc call: {}",
-                        e
-                    )))
-                    .map_err(|never| match never {})
-                    .boxed(),
-                ))
-                .map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::InvalidData,
-                        "Failed to build response: {}",
-                        e
-                    )
-                })?);
+            warn!("Failed to handle rpc call: {}", e);
+            RPCResponse {
+                result: RPCResult::Failed(e.to_string()),
+                seq: rpc_seq,
+                trace_id: rpc_trace_id,
+            }
         }
     };
 
@@ -998,6 +989,67 @@ pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
                 e
             )
         })?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::kRPC::RPCErrors;
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::net::IpAddr;
+
+    struct ErrorRpcHandler;
+
+    #[async_trait]
+    impl RPCHandler for ErrorRpcHandler {
+        async fn handle_rpc_call(
+            &self,
+            _req: RPCRequest,
+            _ip_from: IpAddr,
+        ) -> Result<RPCResponse, RPCErrors> {
+            Err(RPCErrors::ReasonError("boom".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_http_by_rpc_handler_returns_rpc_error_response() {
+        let mut rpc_request = RPCRequest::new("test", json!({ "ok": false }));
+        rpc_request.seq = 42;
+        rpc_request.trace_id = Some("trace-1".to_string());
+
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/krpc")
+            .body(
+                Full::new(Bytes::from(serde_json::to_string(&rpc_request).unwrap()))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap();
+
+        let response = serve_http_by_rpc_handler(
+            request,
+            StreamInfo::new("127.0.0.1:12345".to_string()),
+            &ErrorRpcHandler,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let rpc_response: RPCResponse =
+            serde_json::from_slice(&response.collect().await.unwrap().to_bytes()).unwrap();
+
+        assert_eq!(
+            rpc_response,
+            RPCResponse {
+                result: RPCResult::Failed("Failed due to reason: boom".to_string()),
+                seq: 42,
+                trace_id: Some("trace-1".to_string()),
+            }
+        );
+    }
 }
 
 pub struct DatagramInfo {
