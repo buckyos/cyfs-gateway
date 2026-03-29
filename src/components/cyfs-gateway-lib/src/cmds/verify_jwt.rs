@@ -51,6 +51,12 @@ Notes:
         self.name.as_str()
     }
 
+    fn verification_failed(msg: impl Into<String>) -> CommandResult {
+        let msg = msg.into();
+        error!("{}", msg);
+        CommandResult::error_with_string(msg)
+    }
+
     fn parse_jwk(public_key: &str) -> Result<Jwk, String> {
         match serde_json::from_str::<Jwk>(public_key) {
             Ok(jwk) => Ok(jwk),
@@ -90,49 +96,111 @@ impl ExternalCommand for VerifyJwt {
         _origin_args: &CommandArgs,
     ) -> Result<CommandResult, String> {
         if args.len() != 3 {
-            let msg = format!(
+            return Ok(Self::verification_failed(format!(
                 "Invalid verify-jwt command args length: expected 3, got {}",
                 args.len()
-            );
-            error!("{}", msg);
-            return Err(msg);
+            )));
         }
 
-        let jwt = args[1].try_as_str()?.trim().to_string();
+        let jwt = match args[1].try_as_str() {
+            Ok(jwt) => jwt.trim().to_string(),
+            Err(e) => {
+                return Ok(Self::verification_failed(format!(
+                    "verify-jwt requires jwt string: {}",
+                    e
+                )));
+            }
+        };
         if jwt.is_empty() {
-            return Err("verify-jwt requires a non-empty jwt string".to_string());
+            return Ok(Self::verification_failed(
+                "verify-jwt requires a non-empty jwt string",
+            ));
         }
 
-        let key_map = args[2].try_as_map()?;
-        let unverified_payload = decode_jwt_claim_without_verify(jwt.as_str())
-            .map_err(|e| format!("decode jwt payload failed: {}", e))?;
+        let key_map = match args[2].try_as_map() {
+            Ok(key_map) => key_map,
+            Err(e) => {
+                return Ok(Self::verification_failed(format!(
+                    "verify-jwt requires issuer->public key map: {}",
+                    e
+                )));
+            }
+        };
+        let unverified_payload = match decode_jwt_claim_without_verify(jwt.as_str()) {
+            Ok(payload) => payload,
+            Err(e) => {
+                return Ok(Self::verification_failed(format!(
+                    "decode jwt payload failed: {}",
+                    e
+                )));
+            }
+        };
 
-        let iss = unverified_payload
+        let iss = match unverified_payload
             .get("iss")
             .and_then(|value| value.as_str())
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| "verify-jwt requires payload.iss".to_string())?;
+        {
+            Some(iss) => iss,
+            None => return Ok(Self::verification_failed("verify-jwt requires payload.iss")),
+        };
 
-        let public_key = key_map
-            .get(iss)
-            .await?
-            .ok_or_else(|| format!("verify-jwt public key not found for iss '{}'", iss))?;
-        let public_key = public_key.try_as_str()?.trim().to_string();
+        let public_key = match key_map.get(iss).await {
+            Ok(Some(public_key)) => public_key,
+            Ok(None) => {
+                return Ok(Self::verification_failed(format!(
+                    "verify-jwt public key not found for iss '{}'",
+                    iss
+                )));
+            }
+            Err(e) => {
+                return Ok(Self::verification_failed(format!(
+                    "get verify-jwt public key for iss '{}' failed: {}",
+                    iss, e
+                )));
+            }
+        };
+        let public_key = match public_key.try_as_str() {
+            Ok(public_key) => public_key.trim().to_string(),
+            Err(e) => {
+                return Ok(Self::verification_failed(format!(
+                    "verify-jwt public key for iss '{}' must be a string: {}",
+                    iss, e
+                )));
+            }
+        };
         if public_key.is_empty() {
-            return Err(format!("verify-jwt public key for iss '{}' is empty", iss));
+            return Ok(Self::verification_failed(format!(
+                "verify-jwt public key for iss '{}' is empty",
+                iss
+            )));
         }
 
-        let jwk = Self::parse_jwk(public_key.as_str())?;
-        let decoding_key =
-            DecodingKey::from_jwk(&jwk).map_err(|e| format!("build decoding key failed: {}", e))?;
+        let jwk = match Self::parse_jwk(public_key.as_str()) {
+            Ok(jwk) => jwk,
+            Err(e) => return Ok(Self::verification_failed(e)),
+        };
+        let decoding_key = match DecodingKey::from_jwk(&jwk) {
+            Ok(decoding_key) => decoding_key,
+            Err(e) => {
+                return Ok(Self::verification_failed(format!(
+                    "build decoding key failed: {}",
+                    e
+                )));
+            }
+        };
 
-        let payload = decode_json_from_jwt_with_pk(jwt.as_str(), &decoding_key)
-            .map_err(|e| format!("verify jwt failed: {}", e))?;
+        let payload = match decode_json_from_jwt_with_pk(jwt.as_str(), &decoding_key) {
+            Ok(payload) => payload,
+            Err(e) => {
+                return Ok(Self::verification_failed(format!("verify jwt failed: {}", e)));
+            }
+        };
         let payload = json_value_to_collection_value(&payload).await;
 
         match payload {
             CollectionValue::Map(_) => Ok(CommandResult::success_with_value(payload)),
-            _ => Err("verify-jwt payload is not a map".to_string()),
+            _ => Ok(Self::verification_failed("verify-jwt payload is not a map")),
         }
     }
 }
@@ -280,5 +348,60 @@ mod tests {
         let result = exec.execute_lib("verify_jwt_x_lib").await.unwrap();
 
         assert_eq!(result.value(), "ok");
+    }
+
+    #[tokio::test]
+    async fn test_verify_jwt_returns_error_result_for_invalid_jwt() {
+        let public_key_map = MemoryMapCollection::new_ref();
+        public_key_map
+            .insert(
+                "issuer-1",
+                CollectionValue::String(r#"{"kty":"OKP","crv":"Ed25519","x":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#.to_string()),
+            )
+            .await
+            .unwrap();
+
+        let process_chain = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            match-result $(verify-jwt $JWT $KEYS)
+            ok(payload)
+                return --from lib $(append "unexpected_ok:" $payload.iss);
+            err(err_value)
+                return --from lib $(append "handled:" $err_value);
+            end
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+        let hook_point = HookPoint::new("test-verify-jwt-invalid");
+        hook_point
+            .load_process_chain_lib("verify_jwt_invalid_lib", 0, process_chain)
+            .await
+            .unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let hook_point_env =
+            HookPointEnv::new("test-verify-jwt-invalid", data_dir.path().to_path_buf());
+        hook_point_env
+            .register_external_command("verify-jwt", Arc::new(Box::new(VerifyJwt::new())))
+            .unwrap();
+        hook_point_env
+            .hook_point_env()
+            .create("JWT", CollectionValue::String("not-a-jwt".to_string()))
+            .await
+            .unwrap();
+        hook_point_env
+            .hook_point_env()
+            .create("KEYS", CollectionValue::Map(public_key_map))
+            .await
+            .unwrap();
+        let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+        let result = exec.execute_lib("verify_jwt_invalid_lib").await.unwrap();
+
+        assert!(result.value().starts_with("handled:decode jwt payload failed:"));
     }
 }
