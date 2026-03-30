@@ -1,6 +1,6 @@
 use crate::{
     into_sn_err, sn_err, SNDeviceInfo, SNUserInfo, SnClearStateResult, SnDB, SnDBFactory, SnDBRef,
-    SnErrorCode, SnResult, UserState,
+    SnErrorCode, SnResult, SnV2AuthInfo, UserState,
 };
 use cyfs_gateway_lib::{into_server_err, ServerErrorCode, ServerResult};
 use rand::Rng;
@@ -52,6 +52,8 @@ impl SqliteSnDB {
         ))?;
         conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, state TEXT, public_key TEXT, activation_code TEXT, zone_config TEXT, self_cert boolean, user_domain TEXT, sn_ips TEXT)")).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create users table failed"))?;
+        conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS user_auth_v2 (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, password_salt TEXT NOT NULL, password_algo TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_login_at INTEGER NULL)")).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "create user_auth_v2 table failed"))?;
         conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS devices (owner TEXT, device_name TEXT, did TEXT PRIMARY KEY, ip TEXT, description TEXT, mini_config_jwt TEXT, created_at INTEGER, updated_at INTEGER)")).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create devices table failed"))?;
         conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS user_dns_records (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT, domain TEXT, record_type TEXT, record TEXT, ttl INTEGER, created_at INTEGER, updated_at INTEGER)")).await
@@ -225,6 +227,13 @@ impl SnDB for SqliteSnDB {
         .map_err(into_sn_err!(SnErrorCode::DBError, "delete did documents failed"))?;
 
         conn.execute_sql(
+            sql_query("DELETE FROM user_auth_v2 WHERE username IN (SELECT username FROM users WHERE activation_code = ?1)")
+                .bind(active_code),
+        )
+        .await
+        .map_err(into_sn_err!(SnErrorCode::DBError, "delete user auth v2 failed"))?;
+
+        conn.execute_sql(
             sql_query("DELETE FROM users WHERE activation_code = ?1").bind(active_code),
         )
         .await
@@ -385,6 +394,90 @@ impl SnDB for SqliteSnDB {
         Ok(true)
     }
 
+    async fn register_user_v2(
+        &self,
+        active_code: &str,
+        username: &str,
+        password_hash: &str,
+        password_salt: &str,
+        password_algo: &str,
+    ) -> SnResult<bool> {
+        let _locker =
+            async_named_locker::Locker::get_locker(format!("active_code_{}", active_code)).await;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        conn.begin_transaction().await.map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "begin transaction failed"
+        ))?;
+
+        let active_code_row = conn
+            .query_one(sql_query("SELECT used FROM activation_codes WHERE code = ?1").bind(active_code))
+            .await;
+        let code_unused = match active_code_row {
+            Ok(row) => row.get::<i32, _>(0) == 0,
+            Err(_) => false,
+        };
+        if !code_unused {
+            return Ok(false);
+        }
+
+        let user_count: i64 = conn
+            .query_one(sql_query("SELECT COUNT(*) FROM users WHERE username = ?1").bind(username))
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "query user count failed"))?
+            .get(0);
+        if user_count > 0 {
+            return Ok(false);
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let sn_ips: Option<String> = None;
+
+        conn.execute_sql(sql_query("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain, self_cert, sn_ips) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
+            .bind(username)
+            .bind(UserState::Active.to_string())
+            .bind("")
+            .bind(active_code)
+            .bind("")
+            .bind(Option::<String>::None)
+            .bind(false)
+            .bind(sn_ips))
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "insert v2 user failed"))?;
+
+        conn.execute_sql(sql_query("INSERT INTO user_auth_v2 (username, password_hash, password_salt, password_algo, created_at, updated_at, last_login_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)")
+            .bind(username)
+            .bind(password_hash)
+            .bind(password_salt)
+            .bind(password_algo)
+            .bind(now))
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "insert v2 auth failed"))?;
+
+        conn.execute_sql(
+            sql_query("UPDATE activation_codes SET used = 1 WHERE code = ?1").bind(active_code),
+        )
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "update activation code failed"
+        ))?;
+
+        conn.commit_transaction().await.map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "commit transaction failed"
+        ))?;
+        Ok(true)
+    }
+
     async fn is_user_exist(&self, username: &str) -> SnResult<bool> {
         let mut conn = self
             .pool
@@ -397,6 +490,25 @@ impl SnDB for SqliteSnDB {
             .map_err(into_sn_err!(SnErrorCode::DBError, "query user failed"))?;
         let count: i64 = row.get(0);
         Ok(count > 0)
+    }
+
+    async fn update_user_public_key(&self, username: &str, public_key: &str) -> SnResult<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        conn.execute_sql(
+            sql_query("UPDATE users SET public_key = ?1 WHERE username = ?2")
+                .bind(public_key)
+                .bind(username),
+        )
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "update user public key failed"
+        ))?;
+        Ok(())
     }
 
     async fn update_user_zone_config(&self, username: &str, zone_config: &str) -> SnResult<()> {
@@ -719,6 +831,34 @@ impl SnDB for SqliteSnDB {
         }
     }
 
+    async fn list_user_devices(&self, username: &str) -> SnResult<Vec<SNDeviceInfo>> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        let rows = conn
+            .query_all(
+                sql_query("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE owner = ?1 ORDER BY device_name ASC")
+                    .bind(username),
+            )
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "list user devices failed"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| SNDeviceInfo {
+                owner: row.get(0),
+                device_name: row.get(1),
+                mini_config_jwt: row.get(2),
+                did: row.get(3),
+                ip: row.get(4),
+                description: row.get(5),
+                created_at: row.get::<i64, _>(6) as u64,
+                updated_at: row.get::<i64, _>(7) as u64,
+            })
+            .collect())
+    }
+
     async fn query_device_by_did(&self, did: &str) -> SnResult<Option<SNDeviceInfo>> {
         let mut conn = self
             .pool
@@ -981,6 +1121,51 @@ impl SnDB for SqliteSnDB {
             }
             Err(_) => Ok(None),
         }
+    }
+
+    async fn get_v2_auth(&self, username: &str) -> SnResult<Option<SnV2AuthInfo>> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        match conn
+            .query_one(
+                sql_query("SELECT username, password_hash, password_salt, password_algo, created_at, updated_at, last_login_at FROM user_auth_v2 WHERE username = ?1")
+                    .bind(username),
+            )
+            .await
+        {
+            Ok(row) => Ok(Some(SnV2AuthInfo {
+                username: row.get(0),
+                password_hash: row.get(1),
+                password_salt: row.get(2),
+                password_algo: row.get(3),
+                created_at: row.get::<i64, _>(4) as u64,
+                updated_at: row.get::<i64, _>(5) as u64,
+                last_login_at: row.get::<Option<i64>, _>(6).map(|v| v as u64),
+            })),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn update_v2_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        conn.execute_sql(
+            sql_query("UPDATE user_auth_v2 SET last_login_at = ?1, updated_at = ?1 WHERE username = ?2")
+                .bind(last_login_at as i64)
+                .bind(username),
+        )
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "update v2 last login failed"
+        ))?;
+        Ok(())
     }
 }
 

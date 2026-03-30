@@ -1,6 +1,7 @@
 #![allow(unused)]
 use crate::sn_db::{self, *};
 use crate::sqlite_db::SqliteSnDB;
+use crate::v2::{handle_rpc_call_v2, parse_v2_module, SnV2AuthManager};
 use ::kRPC::*;
 use async_trait::async_trait;
 use cyfs_gateway_lib::{into_server_err, server_err};
@@ -53,6 +54,7 @@ pub struct SNServer {
     owner_pkx: String,
     device_jwt: Vec<String>,
     db: SnDBRef,
+    v2_auth: Arc<SnV2AuthManager>,
 }
 
 impl SNServer {
@@ -73,7 +75,7 @@ impl SNServer {
         None
     }
 
-    fn decode_mini_config_with_schema_compat(
+    pub(crate) fn decode_mini_config_with_schema_compat(
         mini_config_jwt: &str,
         user_public_key: &DecodingKey,
         context: &str,
@@ -155,6 +157,11 @@ impl SNServer {
     pub async fn new(server_config: SNServerConfig, db: SnDBRef) -> Self {
         let server_host = server_config.host;
         let server_ip = IpAddr::from_str(server_config.ip.as_str()).unwrap();
+        let v2_auth = Arc::new(
+            SnV2AuthManager::new(server_config.v2_auth_data_dir.as_deref())
+                .await
+                .expect("init sn v2 auth manager"),
+        );
 
         SNServer {
             id: server_config.id,
@@ -165,6 +172,7 @@ impl SNServer {
             owner_pkx: server_config.owner_pkx,
             device_jwt: server_config.device_jwt,
             db,
+            v2_auth,
         }
     }
 
@@ -204,7 +212,7 @@ impl SNServer {
     }
 
     // 辅助函数：检测字符串是否包含特殊字符
-    fn contains_special_chars(s: &str) -> bool {
+    pub(crate) fn contains_special_chars(s: &str) -> bool {
         s.chars()
             .any(|c| !c.is_alphanumeric() && !c.is_whitespace() && c != '_' && c != '-' && c != '.')
     }
@@ -1700,7 +1708,7 @@ impl SNServer {
         });
     }
 
-    async fn query_device_by_hostname(&self, req_host: &str) -> Option<OODInfo> {
+    pub(crate) async fn query_device_by_hostname_v2(&self, req_host: &str) -> Option<OODInfo> {
         let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
         if get_result.is_some() {
             let (sub_host, username) = get_result.unwrap();
@@ -1781,6 +1789,10 @@ impl SNServer {
         }
 
         return None;
+    }
+
+    async fn query_device_by_hostname(&self, req_host: &str) -> Option<OODInfo> {
+        self.query_device_by_hostname_v2(req_host).await
     }
 
     pub fn create_name_info_from_zone_config(
@@ -2190,6 +2202,227 @@ impl SNServer {
             }
         }
     }
+
+    pub(crate) async fn query_did_v2(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+        from_ip: Option<IpAddr>,
+    ) -> ServerResult<EncodedDocument> {
+        let doc_type = doc_type.and_then(|t| {
+            let t = t.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        });
+
+        match did.method.as_str() {
+            "web" => {
+                let id = did.id.as_str();
+
+                match self.resolve_user_by_domain(id).await {
+                    Ok(user_info) => {
+                        let username = user_info.username.clone().ok_or(server_err!(
+                            ServerErrorCode::NotFound,
+                            "user has no username bound for domain {}",
+                            id
+                        ))?;
+
+                        let bns_did_str = format!("did:bns:{}", username);
+                        let bns_did = DID::from_str(bns_did_str.as_str()).map_err(|e| {
+                            server_err!(
+                                ServerErrorCode::InvalidParam,
+                                "invalid mapped bns did: {}",
+                                e
+                            )
+                        })?;
+                        return Box::pin(self.query_did_v2(&bns_did, doc_type, from_ip)).await;
+                    }
+                    Err(e) if e.code() == ServerErrorCode::NotFound => {
+                        if let Some((device_name, domain)) = id.split_once('.') {
+                            let user_info = self.resolve_user_by_domain(domain).await?;
+                            let username = user_info.username.clone().ok_or(server_err!(
+                                ServerErrorCode::NotFound,
+                                "user has no username bound for domain {}",
+                                domain
+                            ))?;
+
+                            let bns_did_str = format!("did:bns:{}.{}", device_name, username);
+                            let bns_did = DID::from_str(bns_did_str.as_str()).map_err(|e| {
+                                server_err!(
+                                    ServerErrorCode::InvalidParam,
+                                    "invalid mapped bns did: {}",
+                                    e
+                                )
+                            })?;
+                            return Box::pin(self.query_did_v2(&bns_did, doc_type, from_ip)).await;
+                        }
+
+                        Err(server_err!(
+                            ServerErrorCode::NotFound,
+                            "user not found for domain {}",
+                            id
+                        ))
+                    }
+                    Err(e) => Err(e),
+                }?
+            }
+            "bns" => {
+                let id = did.id.as_str();
+
+                if let Some((obj_name, tail)) = id.split_once('.') {
+                    let username = if tail.contains('.') {
+                        let user_info = self.resolve_user_by_domain(tail).await?;
+                        user_info.username.clone().ok_or(server_err!(
+                            ServerErrorCode::NotFound,
+                            "user has no username bound for domain {}",
+                            tail
+                        ))?
+                    } else {
+                        tail.to_string()
+                    };
+
+                    match self
+                        .resolve_device_by_name(username.as_str(), obj_name)
+                        .await
+                    {
+                        Ok(device) => match doc_type.unwrap_or("doc") {
+                            "doc" => {
+                                let user = self.resolve_user_by_username(username.as_str()).await?;
+                                let v = Self::device_config_from_mini_jwt(
+                                    device.mini_config_jwt.as_str(),
+                                    user.public_key.as_str(),
+                                    username.as_str(),
+                                )
+                                .map_err(|msg| {
+                                    server_err!(ServerErrorCode::InvalidParam, "{}", msg)
+                                })?;
+                                Ok(EncodedDocument::JsonLd(v))
+                            }
+                            "info" => {
+                                let v = Self::build_device_info_json(&device);
+                                Ok(EncodedDocument::JsonLd(v))
+                            }
+                            other => Err(server_err!(
+                                ServerErrorCode::InvalidParam,
+                                "unsupported doc_type {} for did:bns:{}.{}",
+                                other,
+                                obj_name,
+                                username
+                            )),
+                        },
+                        Err(e) if e.code() == ServerErrorCode::NotFound => {
+                            let latest_doc = self
+                                .db
+                                .query_user_did_document(username.as_str(), obj_name, doc_type)
+                                .await
+                                .map_err(|err| {
+                                    server_err!(
+                                        ServerErrorCode::ProcessChainError,
+                                        "query did document failed: {}",
+                                        err
+                                    )
+                                })?;
+
+                            if let Some((_obj_id, did_doc_str, _stored_type)) = latest_doc {
+                                let v = if did_doc_str.trim().is_empty() {
+                                    Value::Null
+                                } else {
+                                    serde_json::from_str::<Value>(did_doc_str.as_str()).map_err(
+                                        |e| {
+                                            server_err!(
+                                                ServerErrorCode::InvalidParam,
+                                                "invalid did_document json: {}",
+                                                e
+                                            )
+                                        },
+                                    )?
+                                };
+                                Ok(EncodedDocument::JsonLd(v))
+                            } else {
+                                Err(server_err!(
+                                    ServerErrorCode::NotFound,
+                                    "did document not found for did:bns:{}.{}",
+                                    obj_name,
+                                    username
+                                ))
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    let username = id;
+                    let user = self.resolve_user_by_username(username).await?;
+
+                    match doc_type.unwrap_or("zone") {
+                        "zone" => {
+                            let v = Self::build_zone_config_json(username, &user);
+                            Ok(EncodedDocument::JsonLd(v))
+                        }
+                        "boot" => Ok(EncodedDocument::JsonLd(
+                            json!({ "boot": user.zone_config.clone() }),
+                        )),
+                        device_name => {
+                            let device = self.resolve_device_by_name(username, device_name).await?;
+                            let v = Self::device_config_from_mini_jwt(
+                                device.mini_config_jwt.as_str(),
+                                user.public_key.as_str(),
+                                username,
+                            )
+                            .map_err(|msg| server_err!(ServerErrorCode::InvalidParam, "{}", msg))?;
+                            Ok(EncodedDocument::JsonLd(v))
+                        }
+                    }
+                }
+            }
+            "dev" => {
+                let did_str = did.to_string();
+                let device = self.resolve_device_by_did(did_str.as_str()).await?;
+
+                match doc_type.unwrap_or("doc") {
+                    "doc" => {
+                        let user = self.resolve_user_by_username(device.owner.as_str()).await?;
+                        let v = Self::device_config_from_mini_jwt(
+                            device.mini_config_jwt.as_str(),
+                            user.public_key.as_str(),
+                            device.owner.as_str(),
+                        )
+                        .map_err(|msg| server_err!(ServerErrorCode::InvalidParam, "{}", msg))?;
+                        Ok(EncodedDocument::JsonLd(v))
+                    }
+                    "info" => {
+                        let v = Self::build_device_info_json(&device);
+                        Ok(EncodedDocument::JsonLd(v))
+                    }
+                    other => Err(server_err!(
+                        ServerErrorCode::InvalidParam,
+                        "unsupported doc_type {} for {}",
+                        other,
+                        did_str
+                    )),
+                }
+            }
+            other => Err(server_err!(
+                ServerErrorCode::InvalidParam,
+                "unsupported did method {}",
+                other
+            )),
+        }
+    }
+
+    pub(crate) fn db(&self) -> &SnDBRef {
+        &self.db
+    }
+
+    pub(crate) fn v2_auth(&self) -> Arc<SnV2AuthManager> {
+        self.v2_auth.clone()
+    }
+
+    pub(crate) fn server_host_v2(&self) -> &str {
+        self.server_host.as_str()
+    }
 }
 
 #[async_trait]
@@ -2466,224 +2699,7 @@ impl NameServer for SNServer {
         doc_type: Option<&str>,
         from_ip: Option<IpAddr>,
     ) -> ServerResult<EncodedDocument> {
-        let doc_type = doc_type.and_then(|t| {
-            let t = t.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t)
-            }
-        });
-
-        match did.method.as_str() {
-            // did:web:$user_domain -> resolve user by domain -> treat as did:bns:$username
-            // did:web:$device_name.$user_domain -> resolve user by domain -> treat as did:bns:$device_name.$username
-            "web" => {
-                let id = did.id.as_str();
-
-                // First, try treating the whole id as user_domain (did:web:$user_domain).
-                match self.resolve_user_by_domain(id).await {
-                    Ok(user_info) => {
-                        let username = user_info.username.clone().ok_or(server_err!(
-                            ServerErrorCode::NotFound,
-                            "user has no username bound for domain {}",
-                            id
-                        ))?;
-
-                        let bns_did_str = format!("did:bns:{}", username);
-                        let bns_did = DID::from_str(bns_did_str.as_str()).map_err(|e| {
-                            server_err!(
-                                ServerErrorCode::InvalidParam,
-                                "invalid mapped bns did: {}",
-                                e
-                            )
-                        })?;
-                        return self.query_did(&bns_did, doc_type, from_ip).await;
-                    }
-                    Err(e) if e.code() == ServerErrorCode::NotFound => {
-                        // Then, try did:web:$device_name.$user_domain
-                        if let Some((device_name, domain)) = id.split_once('.') {
-                            let user_info = self.resolve_user_by_domain(domain).await?;
-                            let username = user_info.username.clone().ok_or(server_err!(
-                                ServerErrorCode::NotFound,
-                                "user has no username bound for domain {}",
-                                domain
-                            ))?;
-
-                            let bns_did_str = format!("did:bns:{}.{}", device_name, username);
-                            let bns_did = DID::from_str(bns_did_str.as_str()).map_err(|e| {
-                                server_err!(
-                                    ServerErrorCode::InvalidParam,
-                                    "invalid mapped bns did: {}",
-                                    e
-                                )
-                            })?;
-                            return self.query_did(&bns_did, doc_type, from_ip).await;
-                        }
-
-                        Err(server_err!(
-                            ServerErrorCode::NotFound,
-                            "user not found for domain {}",
-                            id
-                        ))
-                    }
-                    Err(e) => Err(e),
-                }?
-            }
-
-            // did:bns:username
-            // did:bns:device_name.username
-            "bns" => {
-                let id = did.id.as_str();
-
-                if let Some((obj_name, tail)) = id.split_once('.') {
-                    let username = if tail.contains('.') {
-                        let user_info = self.resolve_user_by_domain(tail).await?;
-                        user_info.username.clone().ok_or(server_err!(
-                            ServerErrorCode::NotFound,
-                            "user has no username bound for domain {}",
-                            tail
-                        ))?
-                    } else {
-                        tail.to_string()
-                    };
-
-                    // did:bns:$device_name.$username
-                    match self
-                        .resolve_device_by_name(username.as_str(), obj_name)
-                        .await
-                    {
-                        Ok(device) => match doc_type.unwrap_or("doc") {
-                            "doc" => {
-                                let user = self.resolve_user_by_username(username.as_str()).await?;
-                                let v = Self::device_config_from_mini_jwt(
-                                    device.mini_config_jwt.as_str(),
-                                    user.public_key.as_str(),
-                                    username.as_str(),
-                                )
-                                .map_err(|msg| {
-                                    server_err!(ServerErrorCode::InvalidParam, "{}", msg)
-                                })?;
-                                Ok(EncodedDocument::JsonLd(v))
-                            }
-                            "info" => {
-                                let v = Self::build_device_info_json(&device);
-                                Ok(EncodedDocument::JsonLd(v))
-                            }
-                            other => Err(server_err!(
-                                ServerErrorCode::InvalidParam,
-                                "unsupported doc_type {} for did:bns:{}.{}",
-                                other,
-                                obj_name,
-                                username
-                            )),
-                        },
-                        Err(e) if e.code() == ServerErrorCode::NotFound => {
-                            // Not a device: fallback to user-defined did_document stored in DB.
-                            let latest_doc = self
-                                .db
-                                .query_user_did_document(username.as_str(), obj_name, doc_type)
-                                .await
-                                .map_err(|err| {
-                                    server_err!(
-                                        ServerErrorCode::ProcessChainError,
-                                        "query did document failed: {}",
-                                        err
-                                    )
-                                })?;
-
-                            if let Some((_obj_id, did_doc_str, _stored_type)) = latest_doc {
-                                // Empty string is allowed and should return JSON null.
-                                let v = if did_doc_str.trim().is_empty() {
-                                    Value::Null
-                                } else {
-                                    serde_json::from_str::<Value>(did_doc_str.as_str()).map_err(
-                                        |e| {
-                                            server_err!(
-                                                ServerErrorCode::InvalidParam,
-                                                "invalid did_document json: {}",
-                                                e
-                                            )
-                                        },
-                                    )?
-                                };
-                                Ok(EncodedDocument::JsonLd(v))
-                            } else {
-                                Err(server_err!(
-                                    ServerErrorCode::NotFound,
-                                    "did document not found for did:bns:{}.{}",
-                                    obj_name,
-                                    username
-                                ))
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    // did:bns:$username
-                    let username = id;
-                    let user = self.resolve_user_by_username(username).await?;
-
-                    match doc_type.unwrap_or("zone") {
-                        "zone" => {
-                            let v = Self::build_zone_config_json(username, &user);
-                            Ok(EncodedDocument::JsonLd(v))
-                        }
-                        "boot" => {
-                            // Keep HTTP compatibility: still return JSON with "boot" field
-                            Ok(EncodedDocument::JsonLd(
-                                json!({ "boot": user.zone_config.clone() }),
-                            ))
-                        }
-                        device_name => {
-                            let device = self.resolve_device_by_name(username, device_name).await?;
-                            let v = Self::device_config_from_mini_jwt(
-                                device.mini_config_jwt.as_str(),
-                                user.public_key.as_str(),
-                                username,
-                            )
-                            .map_err(|msg| server_err!(ServerErrorCode::InvalidParam, "{}", msg))?;
-                            Ok(EncodedDocument::JsonLd(v))
-                        }
-                    }
-                }
-            }
-
-            // did:dev:$public_key
-            "dev" => {
-                let did_str = did.to_string();
-                let device = self.resolve_device_by_did(did_str.as_str()).await?;
-
-                match doc_type.unwrap_or("doc") {
-                    "doc" => {
-                        let user = self.resolve_user_by_username(device.owner.as_str()).await?;
-                        let v = Self::device_config_from_mini_jwt(
-                            device.mini_config_jwt.as_str(),
-                            user.public_key.as_str(),
-                            device.owner.as_str(),
-                        )
-                        .map_err(|msg| server_err!(ServerErrorCode::InvalidParam, "{}", msg))?;
-                        Ok(EncodedDocument::JsonLd(v))
-                    }
-                    "info" => {
-                        let v = Self::build_device_info_json(&device);
-                        Ok(EncodedDocument::JsonLd(v))
-                    }
-                    other => Err(server_err!(
-                        ServerErrorCode::InvalidParam,
-                        "unsupported doc_type {} for {}",
-                        other,
-                        did_str
-                    )),
-                }
-            }
-
-            other => Err(server_err!(
-                ServerErrorCode::InvalidParam,
-                "unsupported did method {}",
-                other
-            )),
-        }
+        self.query_did_v2(did, doc_type, from_ip).await
     }
 }
 
@@ -2897,9 +2913,24 @@ impl HttpServer for SNServer {
             }
         };
 
-        let resp = match self.handle_rpc_call(rpc_request, client_ip).await {
+        let v2_module = parse_v2_module(path.as_str()).map(|s| s.to_string());
+        let rpc_seq = rpc_request.seq;
+        let rpc_trace_id = rpc_request.trace_id.clone();
+        let resp = match if let Some(module) = v2_module.as_deref() {
+            handle_rpc_call_v2(self, module, rpc_request, client_ip).await
+        } else {
+            self.handle_rpc_call(rpc_request, client_ip).await
+        } {
             Ok(resp) => resp,
             Err(e) => {
+                if v2_module.is_some() {
+                    warn!("Failed to handle sn v2 rpc call: {}", e);
+                    RPCResponse {
+                        result: RPCResult::Failed(e.to_string()),
+                        seq: rpc_seq,
+                        trace_id: rpc_trace_id,
+                    }
+                } else {
                 let msg = format!("Failed to handle rpc call: {}", e);
                 error!("{}", msg);
                 return Ok(Response::builder()
@@ -2911,6 +2942,7 @@ impl HttpServer for SNServer {
                             .boxed(),
                     )
                     .unwrap());
+                }
             }
         };
 
@@ -2944,6 +2976,8 @@ pub struct SNServerConfig {
     pub device_jwt: Vec<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v2_auth_data_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_type: Option<String>,
     #[serde(flatten)]
@@ -3716,5 +3750,320 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn test_sn_v2_api() {
+        init_logging("sn", false);
+        let (user_signing_key, user_pkcs8_bytes) = generate_ed25519_key();
+        let user_public_key = encode_ed25519_sk_to_pk_jwk(&user_signing_key);
+        let user_encoding_key = jsonwebtoken::EncodingKey::from_ed_der(user_pkcs8_bytes.as_slice());
+
+        let now = SystemTime::now();
+        let zone_boot_config = json!({
+            "oods": ["ood1"],
+            "exp": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + 3600,
+            "iat": now.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs(),
+        });
+        let zone_boot_config: ZoneBootConfig = serde_json::from_value(zone_boot_config).unwrap();
+        let zone_jwt = zone_boot_config
+            .encode(Some(&user_encoding_key))
+            .unwrap()
+            .to_string();
+
+        let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let device_config = DeviceConfig::new_by_jwk("ood1", serde_json::from_value(jwk).unwrap());
+        let mini_config_jwt = DeviceMiniConfig::new_by_device_config(&device_config)
+            .to_jwt(&user_encoding_key)
+            .unwrap()
+            .to_string();
+        let device_info = DeviceInfo::from_device_doc(&device_config);
+
+        let mut sn_factory = SnServerFactory::new();
+        sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
+
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let auth_dir = tempfile::tempdir().unwrap();
+
+        {
+            let db = SqliteSnDB::new_by_path(db.path().to_str().unwrap())
+                .await
+                .unwrap();
+            db.initialize_database().await.unwrap();
+            db.insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
+                .await
+                .unwrap();
+        }
+
+        let config = json!({
+            "id": "test-v2",
+            "host": "buckyos.ai",
+            "ip": "127.0.0.1",
+            "boot_jwt": "",
+            "owner_pkx": "",
+            "device_jwt": [],
+            "db_type": "sqlite",
+            "db_path": db.path().to_str().unwrap(),
+            "v2_auth_data_dir": auth_dir.path().to_str().unwrap(),
+        });
+        let config: SNServerConfig = serde_json::from_value(config).unwrap();
+        let servers = sn_factory.create(Arc::new(config), None).await.unwrap();
+        let mut http_server = None;
+        for server in servers.iter() {
+            if let Server::Http(server) = server {
+                http_server = Some(server.clone());
+            }
+        }
+        let http_server = http_server.unwrap();
+
+        tokio::spawn(async move {
+            use http_body_util::BodyExt;
+            use tokio::net::TcpListener;
+
+            let listener = TcpListener::bind("127.0.0.1:19092").await.unwrap();
+
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let http_server = http_server.clone();
+                tokio::spawn(async move {
+                    let ret = hyper_serve_http(
+                        Box::new(stream),
+                        http_server,
+                        StreamInfo::new("127.0.0.1:19092".to_string()),
+                    )
+                    .await;
+                    if let Err(e) = ret {
+                        warn!("hyper_serve_http returned error: {}", e);
+                    }
+                });
+            }
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let auth_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/auth", None);
+        let result = auth_krpc
+            .call(
+                "check_username",
+                json!({
+                    "name": "testv2"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result["valid"].as_bool().unwrap());
+
+        let result = auth_krpc
+            .call(
+                "register",
+                json!({
+                    "name": "testv2",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE,
+                    "pwd": "12345678"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert!(result["need_bind_owner_key"].as_bool().unwrap());
+        let access_token = result["access_token"].as_str().unwrap().to_string();
+        let refresh_token = result["refresh_token"].as_str().unwrap().to_string();
+
+        let auth_me_krpc =
+            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/auth", Some(access_token.clone()));
+        let result = auth_me_krpc.call("me", json!({})).await.unwrap();
+        assert_eq!(result["name"].as_str().unwrap(), "testv2");
+        assert!(!result["owner_key_bound"].as_bool().unwrap());
+
+        let login_krpc = kRPC::new("http://127.0.0.1:19092/v2/auth", None);
+        let result = login_krpc
+            .call(
+                "login",
+                json!({
+                    "name": "testv2",
+                    "pwd": "12345678"
+                }),
+            )
+            .await
+            .unwrap();
+        let login_access_token = result["access_token"].as_str().unwrap().to_string();
+        assert!(!login_access_token.is_empty());
+
+        let refresh_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/auth", None);
+        let result = refresh_krpc
+            .call(
+                "refresh",
+                json!({
+                    "refresh_token": refresh_token
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["access_token"].as_str().unwrap().is_empty());
+
+        let user_krpc =
+            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/user", Some(login_access_token.clone()));
+        let result = user_krpc
+            .call(
+                "bind_owner_key",
+                json!({
+                    "public_key": user_public_key.clone()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+
+        let result = user_krpc.call("get_owner_key", json!({})).await.unwrap();
+        assert_eq!(
+            result["public_key"]["x"].as_str().unwrap(),
+            user_public_key["x"].as_str().unwrap()
+        );
+
+        let zone_krpc =
+            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/zone", Some(login_access_token.clone()));
+        let result = zone_krpc
+            .call(
+                "bind_config",
+                json!({
+                    "zone_config": zone_jwt,
+                    "user_domain": "testv2.buckyos.ai"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+
+        let result = zone_krpc.call("get", json!({})).await.unwrap();
+        assert_eq!(result["user_name"].as_str().unwrap(), "testv2");
+        assert_eq!(result["user_domain"].as_str().unwrap(), "testv2.buckyos.ai");
+
+        let device_krpc =
+            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/device", Some(login_access_token.clone()));
+        let result = device_krpc
+            .call(
+                "register",
+                json!({
+                    "device_name": "ood1",
+                    "device_did": device_config.id.clone(),
+                    "mini_config_jwt": mini_config_jwt.clone(),
+                    "device_ip": "127.0.0.1",
+                    "device_info": serde_json::to_string(&device_info).unwrap(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+
+        let result = device_krpc.call("list", json!({})).await.unwrap();
+        assert_eq!(result["items"].as_array().unwrap().len(), 1);
+
+        let dns_krpc =
+            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/dns", Some(login_access_token.clone()));
+        let result = dns_krpc
+            .call(
+                "add_record",
+                json!({
+                    "device_did": device_config.id.to_string(),
+                    "domain": "home.testv2.web3.buckyos.ai",
+                    "record_type": "A",
+                    "record": "127.0.0.1",
+                    "ttl": 600,
+                    "has_cert": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+
+        let did_krpc =
+            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/did", Some(login_access_token.clone()));
+        let result = did_krpc
+            .call(
+                "set_document",
+                json!({
+                    "obj_name": "profile",
+                    "did_document": {
+                        "name": "testv2",
+                        "version": 2
+                    },
+                    "doc_type": "profile"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["obj_id"].as_str().unwrap().is_empty());
+
+        let result = did_krpc
+            .call(
+                "get_document",
+                json!({
+                    "obj_name": "profile",
+                    "doc_type": "profile"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["did_document"]["name"].as_str().unwrap(), "testv2");
+
+        let query_krpc =
+            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/query", Some(login_access_token.clone()));
+        let result = query_krpc
+            .call(
+                "resolve_hostname",
+                json!({
+                    "host": "home.testv2.web3.buckyos.ai"
+                }),
+            )
+            .await
+            .unwrap();
+        let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert_eq!(ood_info.owner_id, "testv2".to_string());
+        assert!(ood_info.self_cert);
+
+        let result = query_krpc
+            .call(
+                "resolve_did",
+                json!({
+                    "did": "did:bns:testv2",
+                    "type": "zone"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["document"]["user_name"].as_str().unwrap(), "testv2");
+
+        let result = query_krpc
+            .call(
+                "resolve_device",
+                json!({
+                    "name": "testv2",
+                    "device_name": "ood1"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["device_name"].as_str().unwrap(), "ood1");
+
+        let legacy_krpc = kRPC::new("http://127.0.0.1:19092", Some(login_access_token));
+        let result = legacy_krpc
+            .call("clear_state_by_active_code", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+
+        let result = auth_krpc
+            .call(
+                "login",
+                json!({
+                    "name": "testv2",
+                    "pwd": "12345678"
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("[SNV2:1004:user_auth_not_found]"));
     }
 }

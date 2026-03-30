@@ -67,6 +67,17 @@ pub struct SnClearStateResult {
     pub activation_code_reset: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct SnV2AuthInfo {
+    pub username: String,
+    pub password_hash: String,
+    pub password_salt: String,
+    pub password_algo: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub last_login_at: Option<u64>,
+}
+
 #[async_trait::async_trait]
 pub trait SnDB: Send + Sync + 'static {
     async fn get_activation_codes(&self) -> SnResult<Vec<String>>;
@@ -102,7 +113,16 @@ pub trait SnDB: Send + Sync + 'static {
         zone_config: &str,
         user_domain: Option<String>,
     ) -> SnResult<bool>;
+    async fn register_user_v2(
+        &self,
+        active_code: &str,
+        username: &str,
+        password_hash: &str,
+        password_salt: &str,
+        password_algo: &str,
+    ) -> SnResult<bool>;
     async fn is_user_exist(&self, username: &str) -> SnResult<bool>;
+    async fn update_user_public_key(&self, username: &str, public_key: &str) -> SnResult<()>;
     async fn update_user_zone_config(&self, username: &str, zone_config: &str) -> SnResult<()>;
     async fn update_user_sn_ips(&self, username: &str, sn_ips: &str) -> SnResult<()>;
     async fn update_user_self_cert(&self, username: &str, self_cert: bool) -> SnResult<()>;
@@ -145,6 +165,7 @@ pub trait SnDB: Send + Sync + 'static {
         username: &str,
         device_name: &str,
     ) -> SnResult<Option<SNDeviceInfo>>;
+    async fn list_user_devices(&self, username: &str) -> SnResult<Vec<SNDeviceInfo>>;
     async fn query_device_by_did(&self, did: &str) -> SnResult<Option<SNDeviceInfo>>;
     async fn get_user_info_by_domain(&self, domain: &str) -> SnResult<Option<SNUserInfo>>;
     async fn query_device(&self, did: &str) -> SnResult<Option<SNDeviceInfo>>;
@@ -186,5 +207,7 @@ pub trait SnDB: Send + Sync + 'static {
         obj_name: &str,
         doc_type: Option<&str>,
     ) -> SnResult<Option<(String, String, Option<String>)>>;
+    async fn get_v2_auth(&self, username: &str) -> SnResult<Option<SnV2AuthInfo>>;
+    async fn update_v2_last_login(&self, username: &str, last_login_at: u64) -> SnResult<()>;
 }
 pub type SnDBRef = std::sync::Arc<dyn SnDB>;

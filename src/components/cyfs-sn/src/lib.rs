@@ -3,6 +3,7 @@
 mod sn_db;
 mod sn_server;
 mod sqlite_db;
+mod v2;
 
 pub use sn_db::*;
 pub use sn_server::*;
