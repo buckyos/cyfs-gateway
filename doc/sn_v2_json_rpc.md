@@ -50,8 +50,8 @@
 ## Token 说明
 
 - `register` 和 `login` 返回 `access_token` 与 `refresh_token`
-- `access_token` 用于大多数 v2 接口
-- `refresh_token` 仅用于 `auth.refresh`
+- `access_token` 用于大多数 v2 接口，当前有效期为 1 小时
+- `refresh_token` 仅用于 `auth.refresh`，当前有效期为 1 天
 - token 为服务端签发，不复用旧版 user/device 自签 token
 
 ## 错误码

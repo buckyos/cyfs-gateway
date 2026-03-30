@@ -14,6 +14,8 @@ use super::errors::{parse_error, reason_error, SnV2ErrorCode};
 
 const V2_ACCESS_AUD: &str = "sn-v2";
 const V2_REFRESH_AUD: &str = "sn-v2-refresh";
+const V2_ACCESS_TOKEN_EXPIRE_SECS: u64 = 60 * 60;
+const V2_REFRESH_TOKEN_EXPIRE_SECS: u64 = 60 * 60 * 24;
 pub(crate) const PASSWORD_ALGO: &str = "pbkdf2-sha256-100000";
 const PASSWORD_ITERATIONS: u32 = 100_000;
 
@@ -82,11 +84,21 @@ impl SnV2AuthManager {
     }
 
     pub(crate) fn issue_access_token(&self, username: &str) -> RpcCallResult<String> {
-        issue_rpc_jwt(username, V2_ACCESS_AUD, &self.token_encode_key)
+        issue_rpc_jwt(
+            username,
+            V2_ACCESS_AUD,
+            V2_ACCESS_TOKEN_EXPIRE_SECS,
+            &self.token_encode_key,
+        )
     }
 
     pub(crate) fn issue_refresh_token(&self, username: &str) -> RpcCallResult<String> {
-        issue_rpc_jwt(username, V2_REFRESH_AUD, &self.token_encode_key)
+        issue_rpc_jwt(
+            username,
+            V2_REFRESH_AUD,
+            V2_REFRESH_TOKEN_EXPIRE_SECS,
+            &self.token_encode_key,
+        )
     }
 
     pub(crate) fn verify_access_token(&self, token: &str) -> RpcCallResult<String> {
@@ -270,7 +282,12 @@ fn resolve_v2_auth_dir(configured_dir: Option<&str>) -> PathBuf {
     get_buckyos_service_data_dir("cyfs_gateway").join("sn_v2_token_key")
 }
 
-fn issue_rpc_jwt(username: &str, aud: &str, key: &EncodingKey) -> RpcCallResult<String> {
+fn issue_rpc_jwt(
+    username: &str,
+    aud: &str,
+    expire_secs: u64,
+    key: &EncodingKey,
+) -> RpcCallResult<String> {
     let (_, mut session) =
         RPCSessionToken::generate_jwt_token(username, aud, None, key).map_err(|e| {
             reason_error(
@@ -279,6 +296,13 @@ fn issue_rpc_jwt(username: &str, aud: &str, key: &EncodingKey) -> RpcCallResult<
             )
         })?;
     session.aud = Some(aud.to_string());
+    session.exp = Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + expire_secs,
+    );
     session
         .generate_jwt(None, key)
         .map(|jwt| jwt.to_string())
