@@ -1,0 +1,36 @@
+name: cyfs-gateway
+version: 0.6.0
+base_dir: .
+modules:
+  cyfs_gateway:
+    type: rust
+    name: cyfs_gateway
+  test_server:
+    type: rust
+    name: test_server
+apps:
+  cyfs-gateway:
+    name: cyfs-gateway
+    rootfs: rootfs/
+    default_target_rootfs: ${BUCKYOS_ROOT}
+    modules:
+      cyfs_gateway: bin/cyfs-gateway/
+      test_server: bin/test-server/
+    data_paths: []
+    clean_paths: []
+  web3-gateway:
+    name: web3-gateway
+    rootfs: web3-gateway/
+    default_target_rootfs: ${APPDATA}/web3-gateway/
+    modules:
+      cyfs_gateway: web3_gateway
+      web3_gateway_config: web3_gateway.yaml
+      start.py: start.py
+      stop.py: stop.py
+    data_paths:
+      - website.yaml
+      - params.json
+      - local_dns.toml
+    clean_paths: []
+rust_env:
+  OPENSSL_STATIC: "1"

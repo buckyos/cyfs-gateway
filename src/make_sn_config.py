@@ -1,3 +1,5 @@
+#!/usr/bin/env -S uv run
+
 # rootfs的构建
 # 1. git clone 后,rootfs里只有 “必要的代码文件”，（相关配置文件也是以代码的形式存在的）
 # 2. build 后，rootfs里的bin目录会填充正确的编译产物
@@ -552,4 +554,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     sys.exit(main())
-

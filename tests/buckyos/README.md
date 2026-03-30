@@ -2,6 +2,11 @@
 
 Tests for real buckyos config (cyfs_gateway.yaml + includes). Uses the same pattern as `tests/process_chain_debug/`.
 
+## Prerequisites
+
+- `uv`
+- cyfs_gateway binary built at `src/rootfs/bin/cyfs-gateway/cyfs_gateway`
+
 ## Scripts
 
 ### run_debug_tests.py
@@ -9,9 +14,9 @@ Tests for real buckyos config (cyfs_gateway.yaml + includes). Uses the same patt
 Runs all `req_*.json` in this directory against `cyfs_gateway.yaml`.
 
 ```bash
-python run_debug_tests.py
-python run_debug_tests.py -v          # verbose: print full result JSON
-python run_debug_tests.py --config path/to/config.yaml
+uv run ./run_debug_tests.py
+uv run ./run_debug_tests.py -v          # verbose: print full result JSON
+uv run ./run_debug_tests.py --config path/to/config.yaml
 ```
 
 ### run_debug_single.py
@@ -19,9 +24,9 @@ python run_debug_tests.py --config path/to/config.yaml
 Run one req file (manual / ad-hoc debugging).
 
 ```bash
-python run_debug_single.py req_server_node_gateway.json
-python run_debug_single.py req_stack_node_rtcp.json --id stack:node_rtcp:main
-python run_debug_single.py req_stack_zone_gateway_http.json --repeat 3
+uv run ./run_debug_single.py req_server_node_gateway.json
+uv run ./run_debug_single.py req_stack_node_rtcp.json --id stack:node_rtcp:main
+uv run ./run_debug_single.py req_stack_zone_gateway_http.json --repeat 3
 ```
 
 ## Test Cases

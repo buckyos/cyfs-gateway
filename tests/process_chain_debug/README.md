@@ -5,20 +5,21 @@ Python-based test suite for the `cyfs_gateway debug` subcommand. Runs process ch
 ## Prerequisites
 
 - cyfs_gateway binary built at `src/rootfs/bin/cyfs-gateway/cyfs_gateway`
-- Python 3.9+
+- `uv`
+- Python 3.11+
 
 ## Usage
 
 From project root:
 
 ```bash
-python tests/process_chain_debug/run_debug_tests.py
+uv run tests/process_chain_debug/run_debug_tests.py
 ```
 
 Or from this directory:
 
 ```bash
-python run_debug_tests.py
+uv run ./run_debug_tests.py
 ```
 
 ### Options

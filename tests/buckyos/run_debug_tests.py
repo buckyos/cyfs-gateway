@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
 """
 Process chain debug tests for buckyos real config.
 
@@ -6,7 +6,7 @@ Runs cyfs_gateway debug against req_*.json in this directory,
 using tests/buckyos/cyfs_gateway.yaml (includes boot, node, post, user).
 
 Usage:
-    python run_debug_tests.py [--binary PATH] [--config PATH]
+    uv run run_debug_tests.py [--binary PATH] [--config PATH]
 """
 
 import argparse

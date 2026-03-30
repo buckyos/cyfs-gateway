@@ -1,15 +1,15 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
 """
 Run a single process chain debug test (manual / ad-hoc).
 
 Usage:
-    python run_debug_single.py REQ_FILE [--id RULE_ID] [--config PATH] [--repeat N]
+    uv run run_debug_single.py REQ_FILE [--id RULE_ID] [--config PATH] [--repeat N]
 
 Examples:
-    python run_debug_single.py req_stack_node_rtcp.json
-    python run_debug_single.py req_server_node_gateway.json --id server:node_gateway:main
-    python run_debug_single.py req_zone_http_selector.json --config cyfs_gateway.yaml
-    python run_debug_single.py req_stack_zone_gateway_http.json --repeat 3
+    uv run run_debug_single.py req_stack_node_rtcp.json
+    uv run run_debug_single.py req_server_node_gateway.json --id server:node_gateway:main
+    uv run run_debug_single.py req_zone_http_selector.json --config cyfs_gateway.yaml
+    uv run run_debug_single.py req_stack_zone_gateway_http.json --repeat 3
 """
 
 import argparse

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run
 """
 Process chain debug test runner.
 
@@ -8,7 +8,7 @@ req_file that defines input collections, target chain id, and
 expected output variables.
 
 Usage:
-    python run_debug_tests.py [--binary PATH] [--config PATH]
+    uv run run_debug_tests.py [--binary PATH] [--config PATH]
 
 Binary default: ../../src/rootfs/bin/cyfs-gateway/cyfs_gateway
 Config default: config.yaml (in this directory)

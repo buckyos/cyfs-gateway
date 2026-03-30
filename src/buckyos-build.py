@@ -31,27 +31,26 @@ def _find_command(command: str) -> str | None:
     return None
 
 
-def main() -> int:
-    build_executable = _find_command("buckyos-build")
-    if build_executable is None:
-        print("buckyos-build not found in the current environment")
-        print("Install buckyos-devkit first, or use the repo uv runtime:")
-        print("  cd src && uv run ./build.py [args]")
-        print(f'  python3 -m pip install -U "{DEVKIT_SPEC}"')
-        return 1
+def _run_command(command: str, args: list[str]) -> int:
+    executable = _find_command(command)
+    if executable is None:
+        print(f"{command} not found in the current uv runtime.")
+        print(f"Please re-run this script with `uv run src/buckyos-build.py ...` or install `{DEVKIT_SPEC}`.")
+        return 127
 
-    result = subprocess.run([build_executable] + sys.argv[1:], env=os.environ.copy()).returncode
+    result = subprocess.run([executable] + args, env=os.environ.copy())
+    return result.returncode
+
+
+def main() -> int:
+    print("!!! buckyos depend on cyfs-gateway, MAKE SURE YOU HAVE BUILD IT FIRST!", flush=True)
+
+    result = _run_command("buckyos-build", sys.argv[1:])
     if result != 0:
         print(f"buckyos-build failed with return code {result}")
         return result
 
-    update_executable = _find_command("buckyos-update")
-    if update_executable is None:
-        print("buckyos-update not found in the current environment")
-        print(f'Please ensure "{DEVKIT_SPEC}" is installed correctly.')
-        return 1
-
-    result = subprocess.run([update_executable], env=os.environ.copy()).returncode
+    result = _run_command("buckyos-update", [])
     if result != 0:
         print(f"buckyos-update failed with return code {result}")
         return result
@@ -62,4 +61,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
