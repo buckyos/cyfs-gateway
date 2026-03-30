@@ -121,6 +121,14 @@ pub trait SnDB: Send + Sync + 'static {
         password_salt: &str,
         password_algo: &str,
     ) -> SnResult<bool>;
+    async fn create_v2_auth(
+        &self,
+        username: &str,
+        password_hash: &str,
+        password_salt: &str,
+        password_algo: &str,
+    ) -> SnResult<bool>;
+    async fn activate_user_v2(&self, active_code: &str, username: &str) -> SnResult<bool>;
     async fn is_user_exist(&self, username: &str) -> SnResult<bool>;
     async fn update_user_public_key(&self, username: &str, public_key: &str) -> SnResult<()>;
     async fn update_user_zone_config(&self, username: &str, zone_config: &str) -> SnResult<()>;

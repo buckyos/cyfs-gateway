@@ -5,7 +5,7 @@
 ## 设计目标
 
 - 保留旧版 `/kapi/sn` method 分发表和参数语义
-- 新增 `name + active_code + pwd` 的账号注册和登录能力
+- 新增 `register(name, pwd) + active(name, code)` 的账号注册和激活能力
 - 新增 server-signed JWT，作为 v2 管理面的鉴权令牌
 - 在 v2 下补齐 owner key、zone、device、dns、did、query 等管理能力
 - 复用原有 `users`、`devices`、`user_dns_records`、`did_documents` 数据表
@@ -49,7 +49,7 @@
 
 ## Token 说明
 
-- `register` 和 `login` 返回 `access_token` 与 `refresh_token`
+- `active` 和 `login` 返回 `access_token` 与 `refresh_token`
 - `access_token` 用于大多数 v2 接口，当前有效期为 1 小时
 - `refresh_token` 仅用于 `auth.refresh`，当前有效期为 1 天
 - token 为服务端签发，不复用旧版 user/device 自签 token
@@ -88,6 +88,7 @@ v2 的稳定错误码通过 `RPCResult::Failed(string)` 暴露，字符串格式
 - `1019 unsupported_password_algo`
 - `1020 invalid_password_storage`
 - `1021 invalid_did`
+- `1022 user_not_activated`
 - `1099 internal_error`
 
 ## auth
@@ -101,10 +102,14 @@ path: `/kapi/sn/v2/auth`
   - params: `{ "active_code": "..." }`
   - result: `{ "code": 0, "valid": true }`
 - `register`
-  - params: `{ "name": "alice", "active_code": "...", "pwd": "..." }`
+  - params: `{ "name": "alice", "pwd": "..." }`
+  - result: `{ "code": 0, "need_active": true }`
+- `active`
+  - params: `{ "name": "alice", "code": "..." }`
   - result: `{ "code": 0, "access_token": "...", "refresh_token": "...", "need_bind_owner_key": true }`
 - `login`
   - params: `{ "name": "alice", "pwd": "..." }`
+  - 前置条件：用户已完成 `active`
   - result: `{ "code": 0, "access_token": "...", "refresh_token": "..." }`
 - `refresh`
   - params: `{ "refresh_token": "..." }`

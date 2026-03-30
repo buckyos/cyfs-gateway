@@ -3859,8 +3859,33 @@ mod tests {
                 "register",
                 json!({
                     "name": "testv2",
-                    "active_code": CLEAR_STATE_ACTIVE_CODE,
                     "pwd": "12345678"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+        assert!(result["need_active"].as_bool().unwrap());
+
+        let login_krpc = kRPC::new("http://127.0.0.1:19092/v2/auth", None);
+        let result = login_krpc
+            .call(
+                "login",
+                json!({
+                    "name": "testv2",
+                    "pwd": "12345678"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(result.to_string().contains("[SNV2:1022:user_not_activated]"));
+
+        let result = auth_krpc
+            .call(
+                "active",
+                json!({
+                    "name": "testv2",
+                    "code": CLEAR_STATE_ACTIVE_CODE
                 }),
             )
             .await
@@ -3876,7 +3901,6 @@ mod tests {
         assert_eq!(result["name"].as_str().unwrap(), "testv2");
         assert!(!result["owner_key_bound"].as_bool().unwrap());
 
-        let login_krpc = kRPC::new("http://127.0.0.1:19092/v2/auth", None);
         let result = login_krpc
             .call(
                 "login",

@@ -1,7 +1,7 @@
 use super::common::{
     build_profile_json, hash_password, normalize_username, now_secs, ok_response, parse_params,
-    require_account_username, verify_password, ActiveCodeReq, IntoRpcResult, LoginReq,
-    NameReq, PASSWORD_ALGO, RefreshReq, RegisterReq, RpcCallResult,
+    require_account_username, verify_password, ActivateReq, ActiveCodeReq, IntoRpcResult,
+    LoginReq, NameReq, PASSWORD_ALGO, RefreshReq, RegisterReq, RpcCallResult,
 };
 use super::errors::{parse_error, SnV2ErrorCode};
 use crate::SNServer;
@@ -29,7 +29,9 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
         "register" => {
             let params: RegisterReq = parse_params(&req)?;
             let username = normalize_username(params.name.as_str())?;
-            if server.db().is_user_exist(username.as_str()).await.into_rpc()? {
+            if server.db().is_user_exist(username.as_str()).await.into_rpc()?
+                || server.db().get_v2_auth(username.as_str()).await.into_rpc()?.is_some()
+            {
                 return Err(parse_error(
                     SnV2ErrorCode::UsernameAlreadyExists,
                     format!("username {} already exists", username),
@@ -38,8 +40,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
             let (password_hash, password_salt) = hash_password(params.pwd.as_str())?;
             let ok = server
                 .db()
-                .register_user_v2(
-                    params.active_code.as_str(),
+                .create_v2_auth(
                     username.as_str(),
                     password_hash.as_str(),
                     password_salt.as_str(),
@@ -49,8 +50,36 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .into_rpc()?;
             if !ok {
                 return Err(parse_error(
+                    SnV2ErrorCode::UsernameAlreadyExists,
+                    "register failed, username already exists",
+                ));
+            }
+            ok_response(&req, json!({ "code": 0, "need_active": true }))
+        }
+        "active" => {
+            let params: ActivateReq = parse_params(&req)?;
+            let username = normalize_username(params.name.as_str())?;
+            if server
+                .db()
+                .get_v2_auth(username.as_str())
+                .await
+                .into_rpc()?
+                .is_none()
+            {
+                return Err(parse_error(
+                    SnV2ErrorCode::UserAuthNotFound,
+                    "user auth not found",
+                ));
+            }
+            let ok = server
+                .db()
+                .activate_user_v2(params.code.as_str(), username.as_str())
+                .await
+                .into_rpc()?;
+            if !ok {
+                return Err(parse_error(
                     SnV2ErrorCode::InvalidActiveCode,
-                    "register failed, invalid activation code or username already exists",
+                    "activate failed, invalid activation code or username already active",
                 ));
             }
             let access_token = server.v2_auth().issue_access_token(username.as_str())?;
@@ -80,6 +109,18 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 return Err(parse_error(
                     SnV2ErrorCode::InvalidPassword,
                     "invalid password",
+                ));
+            }
+            if server
+                .db()
+                .get_user_info(username.as_str())
+                .await
+                .into_rpc()?
+                .is_none()
+            {
+                return Err(parse_error(
+                    SnV2ErrorCode::UserNotActivated,
+                    "user not activated",
                 ));
             }
             server

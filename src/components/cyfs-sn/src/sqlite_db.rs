@@ -478,6 +478,132 @@ impl SnDB for SqliteSnDB {
         Ok(true)
     }
 
+    async fn create_v2_auth(
+        &self,
+        username: &str,
+        password_hash: &str,
+        password_salt: &str,
+        password_algo: &str,
+    ) -> SnResult<bool> {
+        let _locker =
+            async_named_locker::Locker::get_locker(format!("username_{}", username)).await;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        let user_count: i64 = conn
+            .query_one(sql_query("SELECT COUNT(*) FROM users WHERE username = ?1").bind(username))
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "query user count failed"))?
+            .get(0);
+        if user_count > 0 {
+            return Ok(false);
+        }
+
+        let auth_count: i64 = conn
+            .query_one(
+                sql_query("SELECT COUNT(*) FROM user_auth_v2 WHERE username = ?1").bind(username),
+            )
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "query user auth count failed"))?
+            .get(0);
+        if auth_count > 0 {
+            return Ok(false);
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute_sql(sql_query("INSERT INTO user_auth_v2 (username, password_hash, password_salt, password_algo, created_at, updated_at, last_login_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5, NULL)")
+            .bind(username)
+            .bind(password_hash)
+            .bind(password_salt)
+            .bind(password_algo)
+            .bind(now))
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "insert v2 auth failed"))?;
+        Ok(true)
+    }
+
+    async fn activate_user_v2(&self, active_code: &str, username: &str) -> SnResult<bool> {
+        let _locker =
+            async_named_locker::Locker::get_locker(format!("active_code_{}", active_code)).await;
+        let _username_locker =
+            async_named_locker::Locker::get_locker(format!("username_{}", username)).await;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+
+        conn.begin_transaction().await.map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "begin transaction failed"
+        ))?;
+
+        let auth_count: i64 = conn
+            .query_one(
+                sql_query("SELECT COUNT(*) FROM user_auth_v2 WHERE username = ?1").bind(username),
+            )
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "query user auth count failed"))?
+            .get(0);
+        if auth_count == 0 {
+            return Ok(false);
+        }
+
+        let user_count: i64 = conn
+            .query_one(sql_query("SELECT COUNT(*) FROM users WHERE username = ?1").bind(username))
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "query user count failed"))?
+            .get(0);
+        if user_count > 0 {
+            return Ok(false);
+        }
+
+        let active_code_row = conn
+            .query_one(sql_query("SELECT used FROM activation_codes WHERE code = ?1").bind(active_code))
+            .await;
+        let code_unused = match active_code_row {
+            Ok(row) => row.get::<i32, _>(0) == 0,
+            Err(_) => false,
+        };
+        if !code_unused {
+            return Ok(false);
+        }
+
+        let sn_ips: Option<String> = None;
+        conn.execute_sql(sql_query("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain, self_cert, sn_ips) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
+            .bind(username)
+            .bind(UserState::Active.to_string())
+            .bind("")
+            .bind(active_code)
+            .bind("")
+            .bind(Option::<String>::None)
+            .bind(false)
+            .bind(sn_ips))
+            .await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "insert v2 user failed"))?;
+
+        conn.execute_sql(
+            sql_query("UPDATE activation_codes SET used = 1 WHERE code = ?1").bind(active_code),
+        )
+        .await
+        .map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "update activation code failed"
+        ))?;
+
+        conn.commit_transaction().await.map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "commit transaction failed"
+        ))?;
+        Ok(true)
+    }
+
     async fn is_user_exist(&self, username: &str) -> SnResult<bool> {
         let mut conn = self
             .pool

@@ -24,6 +24,7 @@ pub(crate) enum SnV2ErrorCode {
     UnsupportedPasswordAlgo = 1019,
     InvalidPasswordStorage = 1020,
     InvalidDid = 1021,
+    UserNotActivated = 1022,
     InternalError = 1099,
 }
 
@@ -56,6 +57,7 @@ impl SnV2ErrorCode {
             Self::UnsupportedPasswordAlgo => "unsupported_password_algo",
             Self::InvalidPasswordStorage => "invalid_password_storage",
             Self::InvalidDid => "invalid_did",
+            Self::UserNotActivated => "user_not_activated",
             Self::InternalError => "internal_error",
         }
     }
