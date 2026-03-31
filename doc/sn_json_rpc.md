@@ -79,6 +79,66 @@
 
 `update` 不做 alias，仍是独立旧接口。
 
+## 覆盖与兼容说明
+
+下面这些接口存在覆盖兼容关系：
+
+- `auth.check_username`
+  - 旧逻辑使用 `check_username`
+  - 新逻辑使用 `auth.check_username`
+  - 当请求里使用旧参数风格时，仍走旧校验逻辑；使用新参数风格时，走新的账号逻辑
+- `user.set_self_cert`
+  - 覆盖旧 `set_user_self_cert`
+  - 同时兼容旧 token 语义和新的 access token 语义
+- `zone.bind_config`
+  - 覆盖旧 `bind_zone_config`
+  - 同时兼容旧参数风格和新的 access token 模式
+- `device.register`
+  - 覆盖旧 `register`
+  - 旧设备注册参数和新的管理面参数都兼容
+- `device.get`
+  - 覆盖旧 `get`
+  - 同时兼容旧 `{ owner_id, device_id }` 和新的 `{ name, device_name }` 风格
+- `query.by_hostname`
+  - 覆盖旧 `query_by_hostname`
+  - 也兼容历史上的 `device.query_by_hostname`
+- `query.by_did`
+  - 覆盖旧 `query_by_did`
+  - 也兼容历史上的 `device.query_by_did`
+- `dns.add_record`
+  - 覆盖旧 `add_dns_record`
+  - 同时兼容旧 token 语义和新的 access token 模式
+- `dns.remove_record`
+  - 覆盖旧 `remove_dns_record`
+  - 同时兼容旧 token 语义和新的 access token 模式
+- `did.set_document`
+  - 覆盖旧 `set_user_did_document`
+  - 同时兼容旧参数风格和新的 access token 模式
+
+下面这些接口没有发生“新版覆盖旧版同名逻辑”的收敛，只是新增的 namespaced method 或单独保留的旧接口：
+
+- `auth.register`
+- `auth.active`
+- `auth.login`
+- `auth.refresh`
+- `auth.logout`
+- `auth.me`
+- `user.register_by_public_key`
+- `user.bind_owner_key`
+- `user.get_owner_key`
+- `user.get_profile`
+- `zone.get`
+- `device.update`
+- `device.list`
+- `device.get_by_pk`
+- `query.resolve_did`
+- `query.resolve_hostname`
+- `query.resolve_device`
+- `dns.list_records`
+- `did.get_document`
+- `admin.clear_state_by_active_code`
+- `update`
+
 ## Token 说明
 
 - `auth.active` 和 `auth.login` 返回 `access_token` 与 `refresh_token`
