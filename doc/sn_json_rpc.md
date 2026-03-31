@@ -1,6 +1,6 @@
 # SN JSON-RPC API
 
-本文档描述当前 SN 的 JSON-RPC 管理接口。协议已经收敛为单入口 `/kapi/sn`，不再使用 `/kapi/sn/v2/<module>` 或 `/v2/<module>` 这类子路径。
+本文档描述当前 SN 的 JSON-RPC 管理接口。
 
 ## 总体原则
 
