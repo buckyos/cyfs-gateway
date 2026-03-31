@@ -6,9 +6,7 @@
 
 - 固定入口：`POST /kapi/sn`
 - 请求包体格式不变，继续使用现有 JSON-RPC 封装
-- 新接口通过 namespaced `method` 暴露，例如 `auth.login`、`zone.bind_config`
-- 旧 `method` 仍保留 alias，统一映射到 namespaced `method`
-- `update` 是特例，继续保留原名原语义，不迁到 `device.update`
+- `update` 继续保留原名原语义
 
 ## 请求格式
 
