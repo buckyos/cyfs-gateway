@@ -1,7 +1,10 @@
 #![allow(unused)]
 use crate::sn_db::{self, *};
 use crate::sqlite_db::SqliteSnDB;
-use crate::v2::{handle_rpc_call_v2, parse_v2_module, SnV2AuthManager};
+use crate::v2::{
+    handle_auth, handle_device, handle_did, handle_dns, handle_query, handle_user, handle_zone,
+    SnV2AuthManager,
+};
 use ::kRPC::*;
 use async_trait::async_trait;
 use cyfs_gateway_lib::{into_server_err, server_err};
@@ -58,6 +61,40 @@ pub struct SNServer {
 }
 
 impl SNServer {
+    fn rewrite_rpc_method(mut req: RPCRequest, method: &str) -> RPCRequest {
+        req.method = method.to_string();
+        req
+    }
+
+    fn canonical_method_name(method: &str) -> String {
+        match method {
+            "check_active_code" => "auth.check_active_code".to_string(),
+            "clear_state_by_active_code" => "admin.clear_state_by_active_code".to_string(),
+            "check_username" => "auth.check_username".to_string(),
+            "register_user" => "user.register_by_public_key".to_string(),
+            "bind_zone_config" => "zone.bind_config".to_string(),
+            "set_user_self_cert" => "user.set_self_cert".to_string(),
+            "set_user_did_document" => "did.set_document".to_string(),
+            "register" => "device.register".to_string(),
+            "get" => "device.get".to_string(),
+            "get_by_pk" => "device.get_by_pk".to_string(),
+            "query_by_hostname" => "query.by_hostname".to_string(),
+            "query_by_did" => "query.by_did".to_string(),
+            "add_dns_record" => "dns.add_record".to_string(),
+            "remove_dns_record" => "dns.remove_record".to_string(),
+            "device.query_by_hostname" => "query.by_hostname".to_string(),
+            "device.query_by_did" => "query.by_did".to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    fn has_v2_access_token(&self, req: &RPCRequest) -> bool {
+        req.token
+            .as_ref()
+            .map(|token| self.v2_auth().verify_access_token(token.as_str()).is_ok())
+            .unwrap_or(false)
+    }
+
     fn extract_missing_field_name(err: &str) -> Option<String> {
         for marker in ["missing field `", "missing field '"] {
             if let Some(start) = err.find(marker) {
@@ -1570,123 +1607,152 @@ impl SNServer {
         ))
     }
 
-    async fn handle_rpc_call(
+    pub(crate) async fn handle_namespaced_rpc_call(
         &self,
         req: RPCRequest,
         ip_from: IpAddr,
     ) -> Result<RPCResponse, RPCErrors> {
         info!("sn server handle rpc call: {}", req.method);
         match req.method.as_str() {
-            "check_active_code" => {
-                //check active code
-                return self.check_active_code(req).await;
-            }
-            "clear_state_by_active_code" => {
-                return self.clear_state_by_active_code(req).await;
-            }
-            "check_username" => {
-                //check username
-                return self.check_username(req).await;
-            }
-            "register_user" => {
-                //register user
-                return self.register_user(req).await;
-            }
-            "bind_zone_config" => {
-                //bind zone config to user
-                return self.bind_zone_to_user(req).await;
-            }
-            "set_user_self_cert" => {
-                //update user self cert
-                // set_user_self_cert(name:String,self_cert:boolean) ,如果cert为空，则删除对应的cert
-                // 只需要有设备的签名就可以更新用户的self cert
-                return self.set_user_self_cert(req).await;
-            }
-            "set_user_did_document" => {
-                //set_user_did_document(owner_user:String,obj_name:String,did_document:JSON,doc_type:String)
-                // 保存在数据库中记录为  obj_id(did_document计算得到),owner_user,obj_name,did_document,doc_type(可以为空),update_time
-                // 设置成功可以在query_did_document中查询到（查询update_time最新的一条记录）,did是 did:bns:obj_name.user_name
-                // 如果document为空，则插入一条did_document为空的记录。数据库不删除记录，保存所有曾经设置过的did_document,给用户提供一定的回滚能力
-                // 需要有用户的签名才可以更新用户的did document
-                return self.set_user_did_document(req).await;
-            }
-            "register" => {
-                //register device
-                return self.register_device(req).await;
-            }
-            "update" => {
-                //update device info
-                return self.update_device(req, ip_from).await;
-            }
-            "get" => {
-                //get device info
-                return self.get_device(req).await;
-            }
-            "get_by_pk" => {
-                // get ood all info by public_key
-                return self.get_device_by_public_key(req).await;
-            }
-            "query_by_hostname" => {
-                //query device by hostname
-                let hostname = req.params.get("dest_host");
-                if hostname.is_none() {
-                    return Err(RPCErrors::ParseRequestError(
-                        "Invalid params, hostname is none".to_string(),
-                    ));
-                }
-                let hostname = hostname.unwrap().as_str();
-                if hostname.is_none() {
-                    return Err(RPCErrors::ParseRequestError(
-                        "Invalid params, hostname is none".to_string(),
-                    ));
-                }
-                let hostname = hostname.unwrap();
-                let ood_info = self.query_device_by_hostname(hostname).await;
-                if ood_info.is_some() {
-                    let ood_info = ood_info.unwrap();
-                    let ood_json = serde_json::to_value(ood_info).unwrap();
-                    return Ok(RPCResponse::create_by_req(
-                        RPCResult::Success(ood_json),
-                        &req,
-                    ));
+            "auth.check_active_code" => self
+                .check_active_code(Self::rewrite_rpc_method(req, "check_active_code"))
+                .await,
+            "auth.check_username" => {
+                if req.params.get("name").is_some() && req.params.get("username").is_none() {
+                    handle_auth(self, Self::rewrite_rpc_method(req, "check_username")).await
                 } else {
-                    return Err(RPCErrors::ParseRequestError(
-                        "Invalid params, hostname is none".to_string(),
-                    ));
+                    self.check_username(Self::rewrite_rpc_method(req, "check_username"))
+                        .await
                 }
             }
-            "query_by_did" => {
-                let did = req.params.get("source_device_id");
-                if did.is_none() {
-                    return Err(RPCErrors::ParseRequestError(
-                        "Invalid params, did is none".to_string(),
-                    ));
-                }
-                let did = did.unwrap().as_str();
-                if did.is_none() {
-                    return Err(RPCErrors::ParseRequestError(
-                        "Invalid params, did is none".to_string(),
-                    ));
-                }
-                let did = did.unwrap();
-                let ood_info = self.query_by_did(did).await;
-                if ood_info.is_some() {
-                    let ood_info = ood_info.unwrap();
-                    let ood_json = serde_json::to_value(ood_info).unwrap();
-                    return Ok(RPCResponse::create_by_req(
-                        RPCResult::Success(ood_json),
-                        &req,
-                    ));
+            "auth.register" | "auth.active" | "auth.login" | "auth.refresh" | "auth.logout"
+            | "auth.me" => {
+                let bare_method = req
+                    .method
+                    .strip_prefix("auth.")
+                    .unwrap_or(req.method.as_str())
+                    .to_string();
+                handle_auth(self, Self::rewrite_rpc_method(req, bare_method.as_str())).await
+            }
+            "user.register_by_public_key" => self
+                .register_user(Self::rewrite_rpc_method(req, "register_user"))
+                .await,
+            "user.bind_owner_key" | "user.get_owner_key" | "user.get_profile" => {
+                let bare_method = req
+                    .method
+                    .strip_prefix("user.")
+                    .unwrap_or(req.method.as_str())
+                    .to_string();
+                handle_user(self, Self::rewrite_rpc_method(req, bare_method.as_str())).await
+            }
+            "user.set_self_cert" => {
+                if req.params.get("name").is_some() || !self.has_v2_access_token(&req) {
+                    self.set_user_self_cert(Self::rewrite_rpc_method(req, "set_user_self_cert"))
+                        .await
                 } else {
-                    return Err(RPCErrors::ParseRequestError(
-                        "Invalid params, did is none".to_string(),
-                    ));
+                    handle_user(self, Self::rewrite_rpc_method(req, "set_self_cert")).await
                 }
             }
-            "add_dns_record" => self.add_dns_record(req).await,
-            "remove_dns_record" => self.remove_dns_record(req).await,
+            "zone.bind_config" => {
+                if req.params.get("user_name").is_some() || !self.has_v2_access_token(&req) {
+                    self.bind_zone_to_user(Self::rewrite_rpc_method(req, "bind_zone_config"))
+                        .await
+                } else {
+                    handle_zone(self, Self::rewrite_rpc_method(req, "bind_config")).await
+                }
+            }
+            "zone.get" => handle_zone(self, Self::rewrite_rpc_method(req, "get")).await,
+            "device.register" => {
+                if req.params.get("user_name").is_some() {
+                    self.register_device(Self::rewrite_rpc_method(req, "register"))
+                        .await
+                } else {
+                    handle_device(self, Self::rewrite_rpc_method(req, "register")).await
+                }
+            }
+            "device.update" => handle_device(self, Self::rewrite_rpc_method(req, "update")).await,
+            "update" => self.update_device(Self::rewrite_rpc_method(req, "update"), ip_from).await,
+            "device.get" => {
+                if req.params.get("owner_id").is_some() || req.params.get("device_id").is_some() {
+                    self.get_device(Self::rewrite_rpc_method(req, "get")).await
+                } else {
+                    handle_device(self, Self::rewrite_rpc_method(req, "get")).await
+                }
+            }
+            "device.list" => handle_device(self, Self::rewrite_rpc_method(req, "list")).await,
+            "device.get_by_pk" => self
+                .get_device_by_public_key(Self::rewrite_rpc_method(req, "get_by_pk"))
+                .await,
+            "query.by_hostname" => {
+                handle_device(self, Self::rewrite_rpc_method(req, "query_by_hostname")).await
+            }
+            "query.by_did" => {
+                handle_device(self, Self::rewrite_rpc_method(req, "query_by_did")).await
+            }
+            "query.resolve_did" | "query.resolve_hostname" | "query.resolve_device" => {
+                let bare_method = req
+                    .method
+                    .strip_prefix("query.")
+                    .unwrap_or(req.method.as_str())
+                    .to_string();
+                handle_query(
+                    self,
+                    Self::rewrite_rpc_method(req, bare_method.as_str()),
+                    ip_from,
+                )
+                .await
+            }
+            "dns.add_record" => {
+                if self.has_v2_access_token(&req) {
+                    handle_dns(self, Self::rewrite_rpc_method(req, "add_record")).await
+                } else {
+                    self.add_dns_record(Self::rewrite_rpc_method(req, "add_dns_record"))
+                        .await
+                }
+            }
+            "dns.remove_record" => {
+                if self.has_v2_access_token(&req) {
+                    handle_dns(self, Self::rewrite_rpc_method(req, "remove_record")).await
+                } else {
+                    self.remove_dns_record(Self::rewrite_rpc_method(req, "remove_dns_record"))
+                        .await
+                }
+            }
+            "dns.list_records" => {
+                handle_dns(self, Self::rewrite_rpc_method(req, "list_records")).await
+            }
+            "did.set_document" => {
+                if req.params.get("owner_user").is_some() || !self.has_v2_access_token(&req) {
+                    self.set_user_did_document(Self::rewrite_rpc_method(req, "set_user_did_document"))
+                        .await
+                } else {
+                    handle_did(self, Self::rewrite_rpc_method(req, "set_document")).await
+                }
+            }
+            "did.get_document" => {
+                handle_did(self, Self::rewrite_rpc_method(req, "get_document")).await
+            }
+            "admin.clear_state_by_active_code" => self
+                .clear_state_by_active_code(Self::rewrite_rpc_method(
+                    req,
+                    "clear_state_by_active_code",
+                ))
+                .await,
             _ => Err(RPCErrors::UnknownMethod(req.method)),
         }
+    }
+
+    async fn handle_rpc_call(
+        &self,
+        req: RPCRequest,
+        ip_from: IpAddr,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let canonical_method = Self::canonical_method_name(req.method.as_str());
+        self.handle_namespaced_rpc_call(
+            Self::rewrite_rpc_method(req, canonical_method.as_str()),
+            ip_from,
+        )
+        .await
     }
 
     async fn query_by_did(&self, did: &str) -> Option<OODInfo> {
@@ -2827,6 +2893,18 @@ impl HttpServer for SNServer {
                 .unwrap());
         }
 
+        if path != "/" && path != "/kapi/sn" {
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Access-Control-Allow-Origin", "*")
+                .body(BoxBody::new(
+                    Full::new(Bytes::from_static(b"Not Found"))
+                        .map_err(|e| match e {})
+                        .boxed(),
+                ))
+                .unwrap());
+        }
+
         let client_ip = match info.src_addr {
             Some(addr) => match addr.parse::<SocketAddr>() {
                 Ok(socket_addr) => socket_addr.ip(),
@@ -2913,18 +2991,15 @@ impl HttpServer for SNServer {
             }
         };
 
-        let v2_module = parse_v2_module(path.as_str()).map(|s| s.to_string());
+        let canonical_method = Self::canonical_method_name(rpc_request.method.as_str());
+        let prefer_rpc_failed = canonical_method.contains('.');
         let rpc_seq = rpc_request.seq;
         let rpc_trace_id = rpc_request.trace_id.clone();
-        let resp = match if let Some(module) = v2_module.as_deref() {
-            handle_rpc_call_v2(self, module, rpc_request, client_ip).await
-        } else {
-            self.handle_rpc_call(rpc_request, client_ip).await
-        } {
+        let resp = match self.handle_rpc_call(rpc_request, client_ip).await {
             Ok(resp) => resp,
             Err(e) => {
-                if v2_module.is_some() {
-                    warn!("Failed to handle sn v2 rpc call: {}", e);
+                if prefer_rpc_failed {
+                    warn!("Failed to handle namespaced rpc call: {}", e);
                     RPCResponse {
                         result: RPCResult::Failed(e.to_string()),
                         seq: rpc_seq,
@@ -3842,10 +3917,33 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let auth_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/auth", None);
-        let result = auth_krpc
+        let root_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", None);
+        let result = root_krpc
+            .call(
+                "auth.check_username",
+                json!({
+                    "name": "testroot"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result["valid"].as_bool().unwrap());
+
+        let result = root_krpc
             .call(
                 "check_username",
+                json!({
+                    "username": "testlegacy"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result["valid"].as_bool().unwrap());
+
+        let auth_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", None);
+        let result = auth_krpc
+            .call(
+                "auth.check_username",
                 json!({
                     "name": "testv2"
                 }),
@@ -3856,7 +3954,7 @@ mod tests {
 
         let result = auth_krpc
             .call(
-                "register",
+                "auth.register",
                 json!({
                     "name": "testv2",
                     "pwd": "12345678"
@@ -3867,10 +3965,10 @@ mod tests {
         assert_eq!(result["code"].as_i64().unwrap(), 0);
         assert!(result["need_active"].as_bool().unwrap());
 
-        let login_krpc = kRPC::new("http://127.0.0.1:19092/v2/auth", None);
+        let login_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", None);
         let result = login_krpc
             .call(
-                "login",
+                "auth.login",
                 json!({
                     "name": "testv2",
                     "pwd": "12345678"
@@ -3882,7 +3980,7 @@ mod tests {
 
         let result = auth_krpc
             .call(
-                "active",
+                "auth.active",
                 json!({
                     "name": "testv2",
                     "code": CLEAR_STATE_ACTIVE_CODE
@@ -3896,14 +3994,14 @@ mod tests {
         let refresh_token = result["refresh_token"].as_str().unwrap().to_string();
 
         let auth_me_krpc =
-            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/auth", Some(access_token.clone()));
-        let result = auth_me_krpc.call("me", json!({})).await.unwrap();
+            kRPC::new("http://127.0.0.1:19092/kapi/sn", Some(access_token.clone()));
+        let result = auth_me_krpc.call("auth.me", json!({})).await.unwrap();
         assert_eq!(result["name"].as_str().unwrap(), "testv2");
         assert!(!result["owner_key_bound"].as_bool().unwrap());
 
         let result = login_krpc
             .call(
-                "login",
+                "auth.login",
                 json!({
                     "name": "testv2",
                     "pwd": "12345678"
@@ -3914,10 +4012,10 @@ mod tests {
         let login_access_token = result["access_token"].as_str().unwrap().to_string();
         assert!(!login_access_token.is_empty());
 
-        let refresh_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/auth", None);
+        let refresh_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", None);
         let result = refresh_krpc
             .call(
-                "refresh",
+                "auth.refresh",
                 json!({
                     "refresh_token": refresh_token
                 }),
@@ -3926,11 +4024,10 @@ mod tests {
             .unwrap();
         assert!(!result["access_token"].as_str().unwrap().is_empty());
 
-        let user_krpc =
-            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/user", Some(login_access_token.clone()));
+        let user_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", Some(login_access_token.clone()));
         let result = user_krpc
             .call(
-                "bind_owner_key",
+                "user.bind_owner_key",
                 json!({
                     "public_key": user_public_key.clone()
                 }),
@@ -3939,17 +4036,26 @@ mod tests {
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
 
-        let result = user_krpc.call("get_owner_key", json!({})).await.unwrap();
+        let result = user_krpc.call("user.get_owner_key", json!({})).await.unwrap();
         assert_eq!(
             result["public_key"]["x"].as_str().unwrap(),
             user_public_key["x"].as_str().unwrap()
         );
 
-        let zone_krpc =
-            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/zone", Some(login_access_token.clone()));
+        let root_user_krpc = kRPC::new(
+            "http://127.0.0.1:19092/kapi/sn",
+            Some(login_access_token.clone()),
+        );
+        let result = root_user_krpc
+            .call("user.get_profile", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result["name"].as_str().unwrap(), "testv2");
+
+        let zone_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", Some(login_access_token.clone()));
         let result = zone_krpc
             .call(
-                "bind_config",
+                "zone.bind_config",
                 json!({
                     "zone_config": zone_jwt,
                     "user_domain": "testv2.buckyos.ai"
@@ -3959,15 +4065,15 @@ mod tests {
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
 
-        let result = zone_krpc.call("get", json!({})).await.unwrap();
+        let result = zone_krpc.call("zone.get", json!({})).await.unwrap();
         assert_eq!(result["user_name"].as_str().unwrap(), "testv2");
         assert_eq!(result["user_domain"].as_str().unwrap(), "testv2.buckyos.ai");
 
         let device_krpc =
-            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/device", Some(login_access_token.clone()));
+            kRPC::new("http://127.0.0.1:19092/kapi/sn", Some(login_access_token.clone()));
         let result = device_krpc
             .call(
-                "register",
+                "device.register",
                 json!({
                     "device_name": "ood1",
                     "device_did": device_config.id.clone(),
@@ -3980,14 +4086,13 @@ mod tests {
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
 
-        let result = device_krpc.call("list", json!({})).await.unwrap();
+        let result = device_krpc.call("device.list", json!({})).await.unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 1);
 
-        let dns_krpc =
-            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/dns", Some(login_access_token.clone()));
+        let dns_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", Some(login_access_token.clone()));
         let result = dns_krpc
             .call(
-                "add_record",
+                "dns.add_record",
                 json!({
                     "device_did": device_config.id.to_string(),
                     "domain": "home.testv2.web3.buckyos.ai",
@@ -4001,11 +4106,10 @@ mod tests {
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
 
-        let did_krpc =
-            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/did", Some(login_access_token.clone()));
+        let did_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", Some(login_access_token.clone()));
         let result = did_krpc
             .call(
-                "set_document",
+                "did.set_document",
                 json!({
                     "obj_name": "profile",
                     "did_document": {
@@ -4021,7 +4125,7 @@ mod tests {
 
         let result = did_krpc
             .call(
-                "get_document",
+                "did.get_document",
                 json!({
                     "obj_name": "profile",
                     "doc_type": "profile"
@@ -4032,10 +4136,10 @@ mod tests {
         assert_eq!(result["did_document"]["name"].as_str().unwrap(), "testv2");
 
         let query_krpc =
-            kRPC::new("http://127.0.0.1:19092/kapi/sn/v2/query", Some(login_access_token.clone()));
+            kRPC::new("http://127.0.0.1:19092/kapi/sn", Some(login_access_token.clone()));
         let result = query_krpc
             .call(
-                "resolve_hostname",
+                "query.resolve_hostname",
                 json!({
                     "host": "home.testv2.web3.buckyos.ai"
                 }),
@@ -4046,9 +4150,22 @@ mod tests {
         assert_eq!(ood_info.owner_id, "testv2".to_string());
         assert!(ood_info.self_cert);
 
+        let result = root_krpc
+            .call(
+                "query.by_hostname",
+                json!({
+                    "dest_host": "home.testv2.web3.buckyos.ai"
+                }),
+            )
+            .await
+            .unwrap();
+        let root_ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
+        assert_eq!(root_ood_info.owner_id, "testv2".to_string());
+        assert!(root_ood_info.self_cert);
+
         let result = query_krpc
             .call(
-                "resolve_did",
+                "query.resolve_did",
                 json!({
                     "did": "did:bns:testv2",
                     "type": "zone"
@@ -4060,7 +4177,7 @@ mod tests {
 
         let result = query_krpc
             .call(
-                "resolve_device",
+                "query.resolve_device",
                 json!({
                     "name": "testv2",
                     "device_name": "ood1"
@@ -4072,14 +4189,14 @@ mod tests {
 
         let legacy_krpc = kRPC::new("http://127.0.0.1:19092", Some(login_access_token));
         let result = legacy_krpc
-            .call("clear_state_by_active_code", json!({}))
+            .call("admin.clear_state_by_active_code", json!({}))
             .await
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
 
         let result = auth_krpc
             .call(
-                "login",
+                "auth.login",
                 json!({
                     "name": "testv2",
                     "pwd": "12345678"
