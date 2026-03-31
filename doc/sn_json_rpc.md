@@ -17,7 +17,7 @@
   "method": "auth.login",
   "params": {
     "name": "alice",
-    "pwd": "12345678"
+    "pwd_hash": "12345678"
   },
   "sys": [
     1,
@@ -79,7 +79,7 @@
 
 ## Token 说明
 
-- `auth.active` 和 `auth.login` 返回 `access_token` 与 `refresh_token`
+- `auth.register` 和 `auth.login` 都会返回 `access_token` 与 `refresh_token`
 - `access_token` 用于 namespaced 管理接口，当前有效期为 1 小时
 - `refresh_token` 仅用于 `auth.refresh`，当前有效期为 1 天
 - token 由服务端签发，不复用旧版 user/device 自签 token
@@ -134,14 +134,12 @@
   - params: `{ "active_code": "..." }`
   - result: `{ "code": 0, "valid": true }`
 - `auth.register`
-  - params: `{ "name": "alice", "pwd": "..." }`
-  - result: `{ "code": 0, "need_active": true }`
-- `auth.active`
-  - params: `{ "name": "alice", "code": "..." }`
+  - params: `{ "name": "alice", "pwd_hash": "...", "active_code": "..." }`
+  - 成功后直接完成注册并返回 token
   - result: `{ "code": 0, "access_token": "...", "refresh_token": "...", "need_bind_owner_key": true }`
 - `auth.login`
-  - params: `{ "name": "alice", "pwd": "..." }`
-  - 前置条件：用户已完成 `auth.active`
+  - params: `{ "name": "alice", "pwd_hash": "..." }`
+  - 前置条件：用户已完成 `auth.register`
   - result: `{ "code": 0, "access_token": "...", "refresh_token": "..." }`
 - `auth.refresh`
   - params: `{ "refresh_token": "..." }`
@@ -299,7 +297,6 @@
 下面这些接口没有发生“新版覆盖旧版同名逻辑”的收敛，只是新增的 namespaced method 或单独保留的旧接口：
 
 - `auth.register`
-- `auth.active`
 - `auth.login`
 - `auth.refresh`
 - `auth.logout`

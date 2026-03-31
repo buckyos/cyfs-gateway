@@ -1625,8 +1625,7 @@ impl SNServer {
                         .await
                 }
             }
-            "auth.register" | "auth.active" | "auth.login" | "auth.refresh" | "auth.logout"
-            | "auth.me" => {
+            "auth.register" | "auth.login" | "auth.refresh" | "auth.logout" | "auth.me" => {
                 let bare_method = req
                     .method
                     .strip_prefix("auth.")
@@ -3957,33 +3956,8 @@ mod tests {
                 "auth.register",
                 json!({
                     "name": "testv2",
-                    "pwd": "12345678"
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
-        assert!(result["need_active"].as_bool().unwrap());
-
-        let login_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", None);
-        let result = login_krpc
-            .call(
-                "auth.login",
-                json!({
-                    "name": "testv2",
-                    "pwd": "12345678"
-                }),
-            )
-            .await
-            .unwrap_err();
-        assert!(result.to_string().contains("[SNV2:1022:user_not_activated]"));
-
-        let result = auth_krpc
-            .call(
-                "auth.active",
-                json!({
-                    "name": "testv2",
-                    "code": CLEAR_STATE_ACTIVE_CODE
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
             )
             .await
@@ -3999,12 +3973,13 @@ mod tests {
         assert_eq!(result["name"].as_str().unwrap(), "testv2");
         assert!(!result["owner_key_bound"].as_bool().unwrap());
 
+        let login_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", None);
         let result = login_krpc
             .call(
                 "auth.login",
                 json!({
                     "name": "testv2",
-                    "pwd": "12345678"
+                    "pwd_hash": "12345678"
                 }),
             )
             .await
@@ -4199,7 +4174,7 @@ mod tests {
                 "auth.login",
                 json!({
                     "name": "testv2",
-                    "pwd": "12345678"
+                    "pwd_hash": "12345678"
                 }),
             )
             .await;

@@ -123,24 +123,19 @@ pub(crate) struct ActiveCodeReq {
 #[derive(Deserialize)]
 pub(crate) struct RegisterReq {
     pub(crate) name: String,
-    pub(crate) pwd: String,
+    pub(crate) pwd_hash: String,
+    pub(crate) active_code: String,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct LoginReq {
     pub(crate) name: String,
-    pub(crate) pwd: String,
+    pub(crate) pwd_hash: String,
 }
 
 #[derive(Deserialize)]
 pub(crate) struct RefreshReq {
     pub(crate) refresh_token: String,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct ActivateReq {
-    pub(crate) name: String,
-    pub(crate) code: String,
 }
 
 #[derive(Deserialize)]
