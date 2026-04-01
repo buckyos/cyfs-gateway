@@ -230,7 +230,7 @@ impl AcmeSnProvider {
         }
         Ok(())
     }
-    fn get_krpc(&self) -> anyhow::Result<kRPC::kRPC> {
+    fn get_krpc_for_route(&self, route: Option<&str>) -> anyhow::Result<kRPC::kRPC> {
         let (token, _) = RPCSessionToken::generate_jwt_token(
             self.user_name.as_str(),
             "cyfs_gateway",
@@ -238,13 +238,19 @@ impl AcmeSnProvider {
             &self.private_key,
         )
         .map_err(|_| anyhow!("generate jwt token failed"))?;
-        let krpc = kRPC::kRPC::new(self.sn.as_str(), Some(token));
+        let url = match route {
+            Some(route) if !route.is_empty() => {
+                format!("{}/{}", self.sn.trim_end_matches('/'), route)
+            }
+            _ => self.sn.clone(),
+        };
+        let krpc = kRPC::kRPC::new(url.as_str(), Some(token));
         Ok(krpc)
     }
 
     async fn report_user_cert_ok(&self) -> anyhow::Result<()> {
-        let krpc = self.get_krpc()?;
-        let result = krpc
+        let root_krpc = self.get_krpc_for_route(None)?;
+        let result = root_krpc
             .call(
                 "query_by_did",
                 json!({
@@ -256,7 +262,8 @@ impl AcmeSnProvider {
         let ood_info = serde_json::from_value::<OODInfo>(result)
             .map_err(|_| anyhow!("parse query_by_hostname result failed"))?;
 
-        krpc.call(
+        let bns_krpc = self.get_krpc_for_route(Some("bns"))?;
+        bns_krpc.call(
             "set_user_self_cert",
             json!({
                 "name": ood_info.owner_id,
@@ -290,7 +297,7 @@ impl AcmeSnProvider {
 #[async_trait::async_trait]
 impl DnsProvider for AcmeSnProvider {
     async fn call(&self, op: String, domain: String, key_hash: String) -> anyhow::Result<()> {
-        let krpc = self.get_krpc()?;
+        let krpc = self.get_krpc_for_route(None)?;
         if op == "add_challenge" {
             let original = domain.replace("_acme-challenge.", "*.");
             self.add_cert(original).await?;

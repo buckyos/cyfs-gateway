@@ -37,6 +37,35 @@ use tokio::sync::Mutex;
 
 const CLEAR_STATE_ACTIVE_CODE: &str = "zX6cV7bN8mK9lJ0hG1fD";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnRpcPath {
+    Root,
+    Auth,
+    Bns,
+    InternalRoot,
+}
+
+impl SnRpcPath {
+    fn parse(path: &str) -> Option<Self> {
+        match path {
+            "/" => Some(Self::InternalRoot),
+            "/kapi/sn" => Some(Self::Root),
+            "/kapi/sn/auth" => Some(Self::Auth),
+            "/kapi/sn/bns" => Some(Self::Bns),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "/kapi/sn",
+            Self::Auth => "/kapi/sn/auth",
+            Self::Bns => "/kapi/sn/bns",
+            Self::InternalRoot => "/",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct OODInfo {
     //pub device_info: DeviceInfo,
@@ -85,6 +114,31 @@ impl SNServer {
             "device.query_by_hostname" => "query.by_hostname".to_string(),
             "device.query_by_did" => "query.by_did".to_string(),
             other => other.to_string(),
+        }
+    }
+
+    fn preferred_rpc_path(method: &str) -> SnRpcPath {
+        match method {
+            method if method.starts_with("auth.") => SnRpcPath::Auth,
+            "admin.clear_state_by_active_code"
+            | "device.register"
+            | "device.update"
+            | "device.list"
+            | "user.register_by_public_key"
+            | "user.bind_owner_key"
+            | "user.get_owner_key"
+            | "user.get_profile"
+            | "user.set_self_cert"
+            | "zone.bind_config"
+            | "zone.get" => SnRpcPath::Bns,
+            _ => SnRpcPath::Root,
+        }
+    }
+
+    fn is_method_allowed_on_path(method: &str, path: SnRpcPath) -> bool {
+        match path {
+            SnRpcPath::Auth | SnRpcPath::Bns => Self::preferred_rpc_path(method) == path,
+            SnRpcPath::Root | SnRpcPath::InternalRoot => true,
         }
     }
 
@@ -1754,6 +1808,38 @@ impl SNServer {
         .await
     }
 
+    async fn handle_http_rpc_call(
+        &self,
+        req: RPCRequest,
+        ip_from: IpAddr,
+        path: SnRpcPath,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let canonical_method = Self::canonical_method_name(req.method.as_str());
+        if !Self::is_method_allowed_on_path(canonical_method.as_str(), path) {
+            return Err(RPCErrors::UnknownMethod(format!(
+                "{} is not available on {}",
+                req.method,
+                path.as_str()
+            )));
+        }
+
+        let preferred_path = Self::preferred_rpc_path(canonical_method.as_str());
+        if path == SnRpcPath::Root && preferred_path != SnRpcPath::Root {
+            warn!(
+                "sn rpc method {} hit compatibility path {}; prefer {}",
+                canonical_method,
+                path.as_str(),
+                preferred_path.as_str()
+            );
+        }
+
+        self.handle_namespaced_rpc_call(
+            Self::rewrite_rpc_method(req, canonical_method.as_str()),
+            ip_from,
+        )
+        .await
+    }
+
     async fn query_by_did(&self, did: &str) -> Option<OODInfo> {
         let device_info = self.db.query_device_by_did(did).await;
         if device_info.is_err() {
@@ -2892,17 +2978,20 @@ impl HttpServer for SNServer {
                 .unwrap());
         }
 
-        if path != "/" && path != "/kapi/sn" {
-            return Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(BoxBody::new(
-                    Full::new(Bytes::from_static(b"Not Found"))
-                        .map_err(|e| match e {})
-                        .boxed(),
-                ))
-                .unwrap());
-        }
+        let rpc_path = match SnRpcPath::parse(&path) {
+            Some(rpc_path) => rpc_path,
+            None => {
+                return Ok(Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(BoxBody::new(
+                        Full::new(Bytes::from_static(b"Not Found"))
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    ))
+                    .unwrap());
+            }
+        };
 
         let client_ip = match info.src_addr {
             Some(addr) => match addr.parse::<SocketAddr>() {
@@ -2994,7 +3083,10 @@ impl HttpServer for SNServer {
         let prefer_rpc_failed = canonical_method.contains('.');
         let rpc_seq = rpc_request.seq;
         let rpc_trace_id = rpc_request.trace_id.clone();
-        let resp = match self.handle_rpc_call(rpc_request, client_ip).await {
+        let resp = match self
+            .handle_http_rpc_call(rpc_request, client_ip, rpc_path)
+            .await
+        {
             Ok(resp) => resp,
             Err(e) => {
                 if prefer_rpc_failed {
@@ -3939,7 +4031,7 @@ mod tests {
             .unwrap();
         assert!(result["valid"].as_bool().unwrap());
 
-        let auth_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", None);
+        let auth_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
         let result = auth_krpc
             .call(
                 "auth.check_username",
@@ -3968,12 +4060,12 @@ mod tests {
         let refresh_token = result["refresh_token"].as_str().unwrap().to_string();
 
         let auth_me_krpc =
-            kRPC::new("http://127.0.0.1:19092/kapi/sn", Some(access_token.clone()));
+            kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", Some(access_token.clone()));
         let result = auth_me_krpc.call("auth.me", json!({})).await.unwrap();
         assert_eq!(result["name"].as_str().unwrap(), "testv2");
         assert!(!result["owner_key_bound"].as_bool().unwrap());
 
-        let login_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", None);
+        let login_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
         let result = login_krpc
             .call(
                 "auth.login",
@@ -3987,7 +4079,7 @@ mod tests {
         let login_access_token = result["access_token"].as_str().unwrap().to_string();
         assert!(!login_access_token.is_empty());
 
-        let refresh_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", None);
+        let refresh_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
         let result = refresh_krpc
             .call(
                 "auth.refresh",
@@ -3999,7 +4091,8 @@ mod tests {
             .unwrap();
         assert!(!result["access_token"].as_str().unwrap().is_empty());
 
-        let user_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", Some(login_access_token.clone()));
+        let user_krpc =
+            kRPC::new("http://127.0.0.1:19092/kapi/sn/bns", Some(login_access_token.clone()));
         let result = user_krpc
             .call(
                 "user.bind_owner_key",
@@ -4017,17 +4110,18 @@ mod tests {
             user_public_key["x"].as_str().unwrap()
         );
 
-        let root_user_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn",
+        let bns_user_krpc = kRPC::new(
+            "http://127.0.0.1:19092/kapi/sn/bns",
             Some(login_access_token.clone()),
         );
-        let result = root_user_krpc
+        let result = bns_user_krpc
             .call("user.get_profile", json!({}))
             .await
             .unwrap();
         assert_eq!(result["name"].as_str().unwrap(), "testv2");
 
-        let zone_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn", Some(login_access_token.clone()));
+        let zone_krpc =
+            kRPC::new("http://127.0.0.1:19092/kapi/sn/bns", Some(login_access_token.clone()));
         let result = zone_krpc
             .call(
                 "zone.bind_config",
@@ -4045,7 +4139,7 @@ mod tests {
         assert_eq!(result["user_domain"].as_str().unwrap(), "testv2.buckyos.ai");
 
         let device_krpc =
-            kRPC::new("http://127.0.0.1:19092/kapi/sn", Some(login_access_token.clone()));
+            kRPC::new("http://127.0.0.1:19092/kapi/sn/bns", Some(login_access_token.clone()));
         let result = device_krpc
             .call(
                 "device.register",
@@ -4162,8 +4256,9 @@ mod tests {
             .unwrap();
         assert_eq!(result["device_name"].as_str().unwrap(), "ood1");
 
-        let legacy_krpc = kRPC::new("http://127.0.0.1:19092", Some(login_access_token));
-        let result = legacy_krpc
+        let bns_admin_krpc =
+            kRPC::new("http://127.0.0.1:19092/kapi/sn/bns", Some(login_access_token));
+        let result = bns_admin_krpc
             .call("admin.clear_state_by_active_code", json!({}))
             .await
             .unwrap();

@@ -4,8 +4,12 @@
 
 ## 总体原则
 
-- 固定入口：`POST /kapi/sn`
+- HTTP 入口按路由需求拆成三类：
+  - `POST /kapi/sn`
+  - `POST /kapi/sn/auth`
+  - `POST /kapi/sn/bns`
 - 请求包体格式不变，继续使用现有 JSON-RPC 封装
+- path 先决定路由类别，`method` 再决定具体能力
 - `update` 继续保留原名原语义
 
 ## 请求格式
@@ -35,8 +39,11 @@
 
 ## 入口
 
-- 正式入口：`/kapi/sn`
+- 通用 SN / 边缘查询：`/kapi/sn`
+- 用户 auth 相关：`/kapi/sn/auth`
+- 用户中心 / BNS 管理相关：`/kapi/sn/bns`
 - 内部直连测试也兼容根路径 `/`
+- 为兼容历史调用，`/kapi/sn` 当前仍可兜底处理 auth/bns method，但新接入应按上面三类 path 发送
 - `/kapi/sn/v2/<module>` 和 `/v2/<module>` 已废弃，不应再使用
 
 ## Method 命名
@@ -80,7 +87,7 @@
 ## Token 说明
 
 - `auth.register` 和 `auth.login` 都会返回 `access_token` 与 `refresh_token`
-- `access_token` 用于 namespaced 管理接口，当前有效期为 1 小时
+- `access_token` 用于 auth/bns 管理接口，当前有效期为 1 小时
 - `refresh_token` 仅用于 `auth.refresh`，当前有效期为 1 天
 - token 由服务端签发，不复用旧版 user/device 自签 token
 - 部分兼容接口会同时接受旧 token 语义和新的 access token 语义，服务端按 `params` 和 token 类型自动选择处理逻辑
@@ -124,6 +131,8 @@
 
 ## auth
 
+推荐 path：`/kapi/sn/auth`
+
 推荐 method 前缀：`auth.*`
 
 - `auth.check_username`
@@ -153,6 +162,8 @@
 
 ## user
 
+推荐 path：`/kapi/sn/bns`
+
 推荐 method 前缀：`user.*`
 
 - `user.register_by_public_key`
@@ -171,6 +182,8 @@
 
 ## zone
 
+推荐 path：`/kapi/sn/bns`
+
 推荐 method 前缀：`zone.*`
 
 - `zone.get`
@@ -181,6 +194,11 @@
   - `zone_config` 仍由客户端按旧规则生成签名 JWT
 
 ## device
+
+推荐 path：
+
+- `device.register`、`device.update`、`device.list` -> `/kapi/sn/bns`
+- `device.get`、`device.get_by_pk` -> `/kapi/sn`
 
 推荐 method 前缀：`device.*`
 
@@ -199,6 +217,8 @@
 
 ## query
 
+推荐 path：`/kapi/sn`
+
 推荐 method 前缀：`query.*`
 
 - `query.by_hostname`
@@ -216,6 +236,8 @@
 
 ## dns
 
+推荐 path：`/kapi/sn`
+
 推荐 method 前缀：`dns.*`
 
 - `dns.add_record`
@@ -229,6 +251,8 @@
 
 ## did
 
+推荐 path：`/kapi/sn`
+
 推荐 method 前缀：`did.*`
 
 - `did.set_document`
@@ -238,6 +262,8 @@
   - params: `{ "name": "optional-self-name", "obj_name": "profile", "doc_type": "optional" }`
 
 ## admin
+
+推荐 path：`/kapi/sn/bns`
 
 - `admin.clear_state_by_active_code`
   - 对应旧 `clear_state_by_active_code`
@@ -253,7 +279,7 @@
 
 ## 与实现的对应关系
 
-- 统一入口与 method 归一化：`src/components/cyfs-sn/src/sn_server.rs`
+- path 路由与 method 归一化：`src/components/cyfs-sn/src/sn_server.rs`
 - namespaced handler：`src/components/cyfs-sn/src/v2/mod.rs`
 - 账号鉴权与 JWT 管理：`src/components/cyfs-sn/src/v2/auth.rs`、`src/components/cyfs-sn/src/v2/common.rs`
 - 数据库存储：`src/components/cyfs-sn/src/sn_db.rs`、`src/components/cyfs-sn/src/sqlite_db.rs`

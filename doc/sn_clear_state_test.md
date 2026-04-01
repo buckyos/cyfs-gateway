@@ -7,14 +7,15 @@ Note: `clear_state_by_active_code` does not accept any parameters.
 
 ### RPC endpoint
 
-- URL: `https://sn.buckyos.ai/kapi/sn`
+- Clear state URL: `https://sn.buckyos.ai/kapi/sn/bns`
+- Auth check URL: `https://sn.buckyos.ai/kapi/sn/auth`
 - Method: `POST`
 - Content-Type: `application/json`
 
 ### Clear state (curl)
 
 ```bash
-curl -sS -X POST "https://sn.buckyos.ai/kapi/sn" \
+curl -sS -X POST "https://sn.buckyos.ai/kapi/sn/bns" \
   -H "Content-Type: application/json" \
   -d '{"id":1,"method":"clear_state_by_active_code","params":{}}'
 ```
@@ -28,7 +29,7 @@ Expected response fields:
 ### Verify activation code is reusable
 
 ```bash
-curl -sS -X POST "https://sn.buckyos.ai/kapi/sn" \
+curl -sS -X POST "https://sn.buckyos.ai/kapi/sn/auth" \
   -H "Content-Type: application/json" \
   -d '{"id":2,"method":"check_active_code","params":{"active_code":"zX6cV7bN8mK9lJ0hG1fD"}}'
 ```
@@ -40,7 +41,7 @@ Expected response fields:
 ### Verify username is released
 
 ```bash
-curl -sS -X POST "https://sn.buckyos.ai/kapi/sn" \
+curl -sS -X POST "https://sn.buckyos.ai/kapi/sn/auth" \
   -H "Content-Type: application/json" \
   -d '{"id":3,"method":"check_username","params":{"username":"test"}}'
 ```
