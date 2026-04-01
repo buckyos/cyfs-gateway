@@ -21,7 +21,7 @@
   "method": "auth.login",
   "params": {
     "name": "alice",
-    "pwd_hash": "12345678"
+    "pwd_hash": "<base64-sha256-hash>"
   },
   "sys": [
     1,
@@ -34,8 +34,23 @@
 
 - `method` 负责能力分发
 - `params` 结构保持既有 client 协议，不因为 namespaced `method` 而变化
+- `pwd_hash` 表示前端预处理后的密码摘要值，不是明文密码，也不是可逆加密结果
 - `sys[1]` 用于携带 token；公开查询、注册、登录等接口可不带
 - namespaced 管理接口的稳定错误继续通过 `RPCResult::Failed(string)` 返回
+
+### `pwd_hash` 说明
+
+当前前端主流程 `active_lib / node_active` 提交的 `pwd_hash` 规则是：
+
+```text
+Base64(SHA256(password + username + ".buckyos"))
+```
+
+说明：
+
+- 这里的 `username` 指前端归一化后的用户名
+- `pwd_hash` 是哈希摘要，不是可逆“加密密码”
+- 服务端接口文档约定的是最终提交值；当前前端实现来源于 `buckyos.hashPassword(...)`
 
 ## 入口
 
@@ -144,10 +159,12 @@
   - result: `{ "code": 0, "valid": true }`
 - `auth.register`
   - params: `{ "name": "alice", "pwd_hash": "...", "active_code": "..." }`
+  - `pwd_hash` 当前约定为 `Base64(SHA256(password + username + ".buckyos"))`
   - 成功后直接完成注册并返回 token
   - result: `{ "code": 0, "access_token": "...", "refresh_token": "...", "need_bind_owner_key": true }`
 - `auth.login`
   - params: `{ "name": "alice", "pwd_hash": "..." }`
+  - `pwd_hash` 当前约定为 `Base64(SHA256(password + username + ".buckyos"))`
   - 前置条件：用户已完成 `auth.register`
   - result: `{ "code": 0, "access_token": "...", "refresh_token": "..." }`
 - `auth.refresh`
