@@ -87,12 +87,6 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .ok_or_else(|| {
                     parse_error(SnV2ErrorCode::UserAuthNotFound, "user auth not found")
                 })?;
-            if !verify_password(params.pwd_hash.as_str(), &auth)? {
-                return Err(parse_error(
-                    SnV2ErrorCode::InvalidPassword,
-                    "invalid password",
-                ));
-            }
             let user = server
                 .db()
                 .get_user_info(username.as_str())
@@ -101,6 +95,18 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                 .ok_or_else(|| {
                     parse_error(SnV2ErrorCode::UserNotActivated, "user not activated")
                 })?;
+            if user.activation_code.as_deref() != Some(params.active_code.as_str()) {
+                return Err(parse_error(
+                    SnV2ErrorCode::InvalidActiveCode,
+                    "invalid active code",
+                ));
+            }
+            if !verify_password(params.pwd_hash.as_str(), &auth)? {
+                return Err(parse_error(
+                    SnV2ErrorCode::InvalidPassword,
+                    "invalid password",
+                ));
+            }
             server
                 .db()
                 .update_v2_last_login(username.as_str(), now_secs())

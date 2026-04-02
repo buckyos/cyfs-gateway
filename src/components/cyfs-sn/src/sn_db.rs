@@ -40,6 +40,7 @@ pub struct SNUserInfo {
     pub username: Option<String>,
     pub state: UserState,
     pub public_key: String,
+    pub activation_code: Option<String>,
     pub zone_config: String,
     pub self_cert: bool,
     pub user_domain: Option<String>,

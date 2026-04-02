@@ -21,7 +21,8 @@
   "method": "auth.login",
   "params": {
     "name": "alice",
-    "pwd_hash": "<base64-sha256-hash>"
+    "pwd_hash": "<base64-sha256-hash>",
+    "active_code": "<activation-code>"
   },
   "sys": [
     1,
@@ -163,8 +164,9 @@ Base64(SHA256(password + username + ".buckyos"))
   - 成功后直接完成注册并返回 token
   - result: `{ "code": 0, "access_token": "...", "refresh_token": "...", "need_bind_owner_key": true }`
 - `auth.login`
-  - params: `{ "name": "alice", "pwd_hash": "..." }`
+  - params: `{ "name": "alice", "pwd_hash": "...", "active_code": "..." }`
   - `pwd_hash` 当前约定为 `Base64(SHA256(password + username + ".buckyos"))`
+  - 对外 RPC 登录当前要求同时携带 `active_code`
   - 前置条件：用户已完成 `auth.register`
   - result: `{ "code": 0, "access_token": "...", "refresh_token": "..." }`
 - `auth.refresh`

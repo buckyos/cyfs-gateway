@@ -717,18 +717,19 @@ impl SnDB for SqliteSnDB {
             .get_conn()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        match conn.query_one(sql_query("SELECT state, public_key, zone_config, self_cert, user_domain, sn_ips FROM users WHERE username = ?1").bind(username)).await {
+        match conn.query_one(sql_query("SELECT state, public_key, activation_code, zone_config, self_cert, user_domain, sn_ips FROM users WHERE username = ?1").bind(username)).await {
             Ok(row) => {
                 let state_str: Option<String> = row.get(0);
-                let self_cert: bool = row.get(3);
+                let self_cert: bool = row.get(4);
                 Ok(Some(SNUserInfo {
                     username: None,
                     state: UserState::from_str(state_str.as_deref()),
                     public_key: row.get(1),
-                    zone_config: row.get(2),
+                    activation_code: row.get(2),
+                    zone_config: row.get(3),
                     self_cert,
-                    user_domain: row.get(4),
-                    sn_ips: row.get(5),
+                    user_domain: row.get(5),
+                    sn_ips: row.get(6),
                 }))
             }
             Err(_) => Ok(None)
@@ -938,19 +939,20 @@ impl SnDB for SqliteSnDB {
             .get_conn()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        match conn.query_one(sql_query("SELECT username, state, public_key, zone_config, self_cert, user_domain, sn_ips FROM users WHERE ?1 = user_domain OR ?1 LIKE '%.' || user_domain")
+        match conn.query_one(sql_query("SELECT username, state, public_key, activation_code, zone_config, self_cert, user_domain, sn_ips FROM users WHERE ?1 = user_domain OR ?1 LIKE '%.' || user_domain")
             .bind(domain)).await {
             Ok(row) => {
                 let state_str: Option<String> = row.get(1);
-                let self_cert: bool = row.get(4);
+                let self_cert: bool = row.get(5);
                 Ok(Some(SNUserInfo {
                     username: Some(row.get(0)),
                     state: UserState::from_str(state_str.as_deref()),
                     public_key: row.get(2),
-                    zone_config: row.get(3),
+                    activation_code: row.get(3),
+                    zone_config: row.get(4),
                     self_cert,
-                    user_domain: row.get(5),
-                    sn_ips: row.get(6),
+                    user_domain: row.get(6),
+                    sn_ips: row.get(7),
                 }))
             }
             Err(_) => Ok(None)

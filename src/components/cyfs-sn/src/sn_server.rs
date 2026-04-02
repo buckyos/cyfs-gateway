@@ -4071,13 +4071,28 @@ mod tests {
                 "auth.login",
                 json!({
                     "name": "testv2",
-                    "pwd_hash": "12345678"
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
             )
             .await
             .unwrap();
         let login_access_token = result["access_token"].as_str().unwrap().to_string();
         assert!(!login_access_token.is_empty());
+
+        let invalid_login_result = login_krpc
+            .call(
+                "auth.login",
+                json!({
+                    "name": "testv2",
+                    "pwd_hash": "12345678",
+                    "active_code": "wrong-active-code"
+                }),
+            )
+            .await;
+        assert!(invalid_login_result.is_err());
+        let invalid_login_err = invalid_login_result.err().unwrap().to_string();
+        assert!(invalid_login_err.contains("[SNV2:1003:invalid_active_code]"));
 
         let refresh_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
         let result = refresh_krpc
@@ -4269,7 +4284,8 @@ mod tests {
                 "auth.login",
                 json!({
                     "name": "testv2",
-                    "pwd_hash": "12345678"
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
             )
             .await;
