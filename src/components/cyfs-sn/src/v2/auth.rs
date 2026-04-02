@@ -48,6 +48,9 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
         "register" => {
             let params: RegisterReq = parse_params(&req)?;
             let username = normalize_username(params.name.as_str())?;
+            SNServer::validate_registration_username(username.as_str()).map_err(|message| {
+                parse_error(SnV2ErrorCode::InvalidUsername, message)
+            })?;
             if server.db().is_user_exist(username.as_str()).await.into_rpc()?
                 || server.db().get_v2_auth(username.as_str()).await.into_rpc()?.is_some()
             {

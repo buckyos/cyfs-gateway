@@ -154,6 +154,9 @@ Base64(SHA256(password + username + ".buckyos"))
 - `auth.check_username`
   - params: `{ "name": "alice" }`
   - 兼容旧 `check_username` 的参数风格
+  - 服务端按 `buckyos-kit::is_valid_name(name, NameType::User)` 校验用户名
+  - 额外拦截服务端保留名单文件，默认路径：`$BUCKYOS_ROOT/data/var/sn/reserved_user_names.txt`
+  - 如果设置了环境变量 `BUCKYOS_SN_RESERVED_NAMES_FILE`，则优先读取该文件
   - result: `{ "code": 0, "valid": true }`
 - `auth.check_active_code`
   - params: `{ "active_code": "..." }`
@@ -161,6 +164,7 @@ Base64(SHA256(password + username + ".buckyos"))
 - `auth.register`
   - params: `{ "name": "alice", "pwd_hash": "...", "active_code": "..." }`
   - `pwd_hash` 当前约定为 `Base64(SHA256(password + username + ".buckyos"))`
+  - `name` 需要通过和 `auth.check_username` 相同的服务端校验
   - 成功后直接完成注册并返回 token
   - result: `{ "code": 0, "access_token": "...", "refresh_token": "...", "need_bind_owner_key": true }`
 - `auth.login`
@@ -188,6 +192,7 @@ Base64(SHA256(password + username + ".buckyos"))
 - `user.register_by_public_key`
   - 对应旧 `register_user`
   - params 沿用旧接口格式
+  - `user_name` 需要通过和 `auth.check_username` 相同的服务端校验
 - `user.bind_owner_key`
   - params: `{ "public_key": <jwk-object-or-string> }`
   - 作用：把 owner 公钥写回 `users.public_key`

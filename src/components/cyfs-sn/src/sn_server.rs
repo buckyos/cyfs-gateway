@@ -7,6 +7,7 @@ use crate::v2::{
 };
 use ::kRPC::*;
 use async_trait::async_trait;
+use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
 use cyfs_gateway_lib::{into_server_err, server_err};
 use cyfs_gateway_lib::{
     qa_json_to_rpc_request, HttpServer, NameServer, QAServer, Server, ServerConfig,
@@ -24,8 +25,9 @@ use name_lib::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{
@@ -36,6 +38,8 @@ use std::{
 use tokio::sync::Mutex;
 
 const CLEAR_STATE_ACTIVE_CODE: &str = "zX6cV7bN8mK9lJ0hG1fD";
+const RESERVED_USER_NAMES_FILE_ENV: &str = "BUCKYOS_SN_RESERVED_NAMES_FILE";
+const RESERVED_USER_NAMES_FILE: &str = "reserved_user_names.txt";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SnRpcPath {
@@ -133,6 +137,55 @@ impl SNServer {
             | "zone.get" => SnRpcPath::Bns,
             _ => SnRpcPath::Root,
         }
+    }
+
+    fn normalize_registration_username(username: &str) -> String {
+        username.trim().to_lowercase()
+    }
+
+    fn reserved_user_names_file() -> PathBuf {
+        std::env::var_os(RESERVED_USER_NAMES_FILE_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| get_buckyos_service_data_dir("sn").join(RESERVED_USER_NAMES_FILE))
+    }
+
+    fn load_reserved_user_names() -> HashSet<String> {
+        let path = Self::reserved_user_names_file();
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(err) => {
+                if path.exists() {
+                    warn!(
+                        "failed to read reserved user names file {}: {}",
+                        path.display(),
+                        err
+                    );
+                } else {
+                    debug!("reserved user names file not found: {}", path.display());
+                }
+                return HashSet::new();
+            }
+        };
+
+        content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| line.to_lowercase())
+            .collect()
+    }
+
+    pub(crate) fn validate_registration_username(username: &str) -> std::result::Result<(), String> {
+        if username.is_empty() {
+            return Err("username is empty".to_string());
+        }
+        if !is_valid_name(username, NameType::User) {
+            return Err("username does not meet naming rules".to_string());
+        }
+        if Self::load_reserved_user_names().contains(username) {
+            return Err("username is reserved by server".to_string());
+        }
+        Ok(())
     }
 
     fn is_method_allowed_on_path(method: &str, path: SnRpcPath) -> bool {
@@ -276,26 +329,20 @@ impl SNServer {
         }
         let username = username.unwrap().as_str();
         let username = username.unwrap();
-        let username = username.to_lowercase();
-
-        // 检测用户名是否包含特殊字符
-        if Self::contains_special_chars(username.as_str()) {
-            return Err(RPCErrors::ParseRequestError(
-                "Username contains special characters".to_string(),
-            ));
-        }
-
-        let ret = self
-            .db
-            .is_user_exist(username.as_str())
-            .await
-            .map_err(|e| {
+        let username = Self::normalize_registration_username(username);
+        let valid = if Self::validate_registration_username(username.as_str()).is_ok() {
+            let exists = self.db.is_user_exist(username.as_str()).await.map_err(|e| {
                 error!("Failed to check username: {:?}", e);
                 RPCErrors::ReasonError(e.to_string())
             })?;
+            !exists
+        } else {
+            false
+        };
+
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
-                "valid":!ret
+                "valid": valid
             })),
             &req,
         );
@@ -384,7 +431,13 @@ impl SNServer {
                 "Invalid params, user_name or public_key or active_code is none".to_string(),
             ));
         }
-        let user_name = user_name.unwrap().as_str().unwrap();
+        let user_name = Self::normalize_registration_username(user_name.unwrap().as_str().unwrap());
+        if let Err(err) = Self::validate_registration_username(user_name.as_str()) {
+            return Err(RPCErrors::ParseRequestError(format!(
+                "Invalid user_name: {}",
+                err
+            )));
+        }
         let public_key = public_key.unwrap().as_str().unwrap();
         let active_code = active_code.unwrap().as_str().unwrap();
         let zone_config_jwt = zone_config_jwt
@@ -404,7 +457,7 @@ impl SNServer {
             .db
             .register_user(
                 active_code,
-                user_name,
+                user_name.as_str(),
                 public_key,
                 zone_config_jwt,
                 real_user_domain,
@@ -3236,6 +3289,11 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use std::time::SystemTime;
 
+    const TEST_USER: &str = "testuser";
+    const TEST_USER_V2: &str = "testuserv2";
+    const TEST_ROOT_USER: &str = "testroot";
+    const TEST_LEGACY_USER: &str = "testlegacy";
+
     #[test]
     fn test_split_host_name() {
         let req_host = "home.lzc.web3.buckyos.io".to_string();
@@ -3285,6 +3343,44 @@ mod tests {
         assert_eq!(username, "alice".to_string());
     }
 
+    #[test]
+    fn test_validate_registration_username() {
+        for username in ["validuser", "my-device", "sub.domain"] {
+            assert!(
+                SNServer::validate_registration_username(username).is_ok(),
+                "expected valid username: {}",
+                username
+            );
+        }
+
+        for (username, expected_reason) in [
+            ("", "username is empty"),
+            ("short", "username does not meet naming rules"),
+            ("waterflier", "username does not meet naming rules"),
+            ("security", "username does not meet naming rules"),
+            ("UserName", "username does not meet naming rules"),
+            ("1starter", "username does not meet naming rules"),
+            ("user-", "username does not meet naming rules"),
+            ("user_name", "username does not meet naming rules"),
+            ("sub.admin.domain", "username does not meet naming rules"),
+            ("double..dot", "username does not meet naming rules"),
+        ] {
+            let err = SNServer::validate_registration_username(username).unwrap_err();
+            assert_eq!(err, expected_reason, "unexpected reason for {}", username);
+        }
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let reserved_file = tempdir.path().join(RESERVED_USER_NAMES_FILE);
+        std::fs::write(&reserved_file, "# comment\npremiumname\n").unwrap();
+        std::env::set_var(
+            RESERVED_USER_NAMES_FILE_ENV,
+            reserved_file.to_string_lossy().to_string(),
+        );
+        let err = SNServer::validate_registration_username("premiumname").unwrap_err();
+        assert_eq!(err, "username is reserved by server");
+        std::env::remove_var(RESERVED_USER_NAMES_FILE_ENV);
+    }
+
     #[tokio::test]
     async fn test_sn_api() {
         init_logging("sn", false);
@@ -3304,9 +3400,13 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let (user_token, mut user_session) =
-            RPCSessionToken::generate_jwt_token("test", "active_service", None, &user_encoding_key)
-                .unwrap();
+        let (user_token, mut user_session) = RPCSessionToken::generate_jwt_token(
+            TEST_USER,
+            "active_service",
+            None,
+            &user_encoding_key,
+        )
+        .unwrap();
         user_session.aud = Some("sn".to_string());
         let user_token = user_session
             .generate_jwt(None, &user_encoding_key)
@@ -3344,7 +3444,7 @@ mod tests {
 
         let encoding_key2 = jsonwebtoken::EncodingKey::from_ed_der(pkcs8_bytes2.as_slice());
         let (token2, mut session2) =
-            RPCSessionToken::generate_jwt_token("test", "cyfs_gateway", None, &encoding_key2)
+            RPCSessionToken::generate_jwt_token(TEST_USER, "cyfs_gateway", None, &encoding_key2)
                 .unwrap();
         session2.aud = Some("sn".to_string());
         let token2 = session2
@@ -3425,7 +3525,7 @@ mod tests {
             .call(
                 "check_username",
                 json!({
-                    "username": "test"
+                    "username": TEST_USER
                 }),
             )
             .await
@@ -3440,13 +3540,35 @@ mod tests {
 
         let result = krpc
             .call(
+                "check_username",
+                json!({
+                    "username": "short"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["valid"].as_bool().unwrap());
+
+        let result = krpc
+            .call(
+                "check_username",
+                json!({
+                    "username": "user_name"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["valid"].as_bool().unwrap());
+
+        let result = krpc
+            .call(
                 "register_user",
                 json!({
-                    "user_name": "test",
+                    "user_name": TEST_USER,
                     "public_key": user_public_key.to_string(),
                     "active_code": CLEAR_STATE_ACTIVE_CODE,
                     "zone_config": zone_jwt,
-                    "user_domain": "test.buckyos.ai",
+                    "user_domain": format!("{}.buckyos.ai", TEST_USER),
                 }),
             )
             .await
@@ -3466,7 +3588,7 @@ mod tests {
             .call(
                 "check_username",
                 json!({
-                    "username": "test"
+                    "username": TEST_USER
                 }),
             )
             .await
@@ -3481,9 +3603,20 @@ mod tests {
 
         let result = krpc
             .call(
+                "check_username",
+                json!({
+                    "username": "security"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["valid"].as_bool().unwrap());
+
+        let result = krpc
+            .call(
                 "register",
                 json!({
-                    "user_name": "test",
+                    "user_name": TEST_USER,
                     "device_name": "ood1",
                     "device_did": device_config.id.clone(),
                     "mini_config_jwt": mini_config_jwt.clone(),
@@ -3499,7 +3632,7 @@ mod tests {
             .call(
                 "register",
                 json!({
-                    "user_name": "test",
+                    "user_name": TEST_USER,
                     "device_name": "ood1",
                     "device_did": device_config.id.clone(),
                     "mini_config_jwt": mini_config_jwt.clone(),
@@ -3515,7 +3648,10 @@ mod tests {
 
         // did:bns:username type=boot
         let resp = client
-            .get("http://127.0.0.1:19091/1.0/identifiers/did:bns:test?type=boot")
+            .get(format!(
+                "http://127.0.0.1:19091/1.0/identifiers/did:bns:{}?type=boot",
+                TEST_USER
+            ))
             .send()
             .await
             .unwrap();
@@ -3525,28 +3661,37 @@ mod tests {
 
         // did:bns:username type=zone (default)
         let resp = client
-            .get("http://127.0.0.1:19091/1.0/identifiers/did:bns:test")
+            .get(format!(
+                "http://127.0.0.1:19091/1.0/identifiers/did:bns:{}",
+                TEST_USER
+            ))
             .send()
             .await
             .unwrap();
         assert!(resp.status().is_success());
         let v: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(v.get("user_name").unwrap().as_str().unwrap(), "test");
+        assert_eq!(v.get("user_name").unwrap().as_str().unwrap(), TEST_USER);
         assert!(v.get("boot").is_some());
 
         // did:web:domain -> routes to did:bns:username
         let resp = client
-            .get("http://127.0.0.1:19091/1.0/identifiers/did:web:test.buckyos.ai")
+            .get(format!(
+                "http://127.0.0.1:19091/1.0/identifiers/did:web:{}.buckyos.ai",
+                TEST_USER
+            ))
             .send()
             .await
             .unwrap();
         assert!(resp.status().is_success());
         let v: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(v.get("user_name").unwrap().as_str().unwrap(), "test");
+        assert_eq!(v.get("user_name").unwrap().as_str().unwrap(), TEST_USER);
 
         // did:bns:device.username type=doc
         let resp = client
-            .get("http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.test?type=doc")
+            .get(format!(
+                "http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.{}?type=doc",
+                TEST_USER
+            ))
             .send()
             .await
             .unwrap();
@@ -3557,7 +3702,10 @@ mod tests {
 
         // did:bns:device.domain -> routes domain -> username -> device
         let resp = client
-            .get("http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.test.buckyos.ai?type=doc")
+            .get(format!(
+                "http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.{}.buckyos.ai?type=doc",
+                TEST_USER
+            ))
             .send()
             .await
             .unwrap();
@@ -3567,14 +3715,17 @@ mod tests {
 
         // did:bns:device.username type=info
         let resp = client
-            .get("http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.test?type=info")
+            .get(format!(
+                "http://127.0.0.1:19091/1.0/identifiers/did:bns:ood1.{}?type=info",
+                TEST_USER
+            ))
             .send()
             .await
             .unwrap();
         assert!(resp.status().is_success());
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v.get("device_name").unwrap().as_str().unwrap(), "ood1");
-        assert_eq!(v.get("owner").unwrap().as_str().unwrap(), "test");
+        assert_eq!(v.get("owner").unwrap().as_str().unwrap(), TEST_USER);
         assert!(v.get("ip").is_some());
 
         // did:dev:public_key type=doc/info
@@ -3610,7 +3761,7 @@ mod tests {
                 "get",
                 json!({
                     "device_id": device_config.name,
-                    "owner_id": "test"
+                    "owner_id": TEST_USER
                 }),
             )
             .await;
@@ -3634,7 +3785,7 @@ mod tests {
                 "add_dns_record",
                 json!({
                     "device_did": device_config2.id.to_string(),
-                    "domain": "test.buckyos.ai",
+                    "domain": format!("{}.buckyos.ai", TEST_USER),
                     "record_type": "A",
                     "record": "127.0.0.1",
                 }),
@@ -3647,7 +3798,7 @@ mod tests {
                 "add_dns_record",
                 json!({
                     "device_did": device_config.id.to_string(),
-                    "domain": "test.test.web3.buckyos.ai",
+                    "domain": format!("test.{}.web3.buckyos.ai", TEST_USER),
                     "record_type": "A",
                     "record": "127.0.0.1",
                     "ttl": 600
@@ -3661,7 +3812,7 @@ mod tests {
                 "add_dns_record",
                 json!({
                     "device_did": device_config.id.to_string(),
-                    "domain": "test.buckyos.ai",
+                    "domain": format!("{}.buckyos.ai", TEST_USER),
                     "record_type": "A",
                     "record": "127.0.0.1",
                     "ttl": 600
@@ -3675,7 +3826,7 @@ mod tests {
                 "add_dns_record",
                 json!({
                     "device_did": device_config.id.to_string(),
-                    "domain": "_acme-challenge.test.web3.buckyos.ai",
+                    "domain": format!("_acme-challenge.{}.web3.buckyos.ai", TEST_USER),
                     "record_type": "TXT",
                     "record": "ERWSSDFERWERSD",
                     "ttl": 600
@@ -3686,7 +3837,7 @@ mod tests {
 
         let result = dns_server
             .query(
-                "_acme-challenge.test.web3.buckyos.ai",
+                &format!("_acme-challenge.{}.web3.buckyos.ai", TEST_USER),
                 Some(RecordType::TXT),
                 None,
             )
@@ -3697,7 +3848,11 @@ mod tests {
         assert_eq!(name_info.txt[0], "ERWSSDFERWERSD");
 
         let result = dns_server
-            .query("test.test.web3.buckyos.ai", Some(RecordType::A), None)
+            .query(
+                format!("test.{}.web3.buckyos.ai", TEST_USER).as_str(),
+                Some(RecordType::A),
+                None,
+            )
             .await;
         assert!(result.is_ok());
         let name_info = result.unwrap();
@@ -3708,7 +3863,7 @@ mod tests {
             .call(
                 "query_by_hostname",
                 json!({
-                    "dest_host": "test.test.web3.buckyos.ai"
+                    "dest_host": format!("test.{}.web3.buckyos.ai", TEST_USER)
                 }),
             )
             .await;
@@ -3722,7 +3877,7 @@ mod tests {
                 "remove_dns_record",
                 json!({
                     "device_did": device_config.id.to_string(),
-                    "domain": "_acme-challenge.test.web3.buckyos.ai",
+                    "domain": format!("_acme-challenge.{}.web3.buckyos.ai", TEST_USER),
                     "record_type": "TXT",
                     "has_cert": true
                 }),
@@ -3732,7 +3887,7 @@ mod tests {
 
         let result = dns_server
             .query(
-                "_acme-challenge.test.web3.buckyos.ai",
+                &format!("_acme-challenge.{}.web3.buckyos.ai", TEST_USER),
                 Some(RecordType::TXT),
                 None,
             )
@@ -3748,7 +3903,7 @@ mod tests {
                 "update",
                 json!({
                     "device_info": device_info2,
-                    "owner_id": "test"
+                    "owner_id": TEST_USER
                 }),
             )
             .await;
@@ -3762,7 +3917,7 @@ mod tests {
                 "update",
                 json!({
                     "device_info": device_info,
-                    "owner_id": "test"
+                    "owner_id": TEST_USER
                 }),
             )
             .await;
@@ -3774,7 +3929,7 @@ mod tests {
                 "get",
                 json!({
                     "device_id": device_config.name,
-                    "owner_id": "test"
+                    "owner_id": TEST_USER
                 }),
             )
             .await;
@@ -3799,7 +3954,7 @@ mod tests {
             .call(
                 "query_by_hostname",
                 json!({
-                    "dest_host": "test.test.web3.buckyos.ai"
+                    "dest_host": format!("test.{}.web3.buckyos.ai", TEST_USER)
                 }),
             )
             .await;
@@ -3813,7 +3968,7 @@ mod tests {
             .call(
                 "set_user_self_cert",
                 json!({
-                    "name": "test",
+                    "name": TEST_USER,
                     "self_cert": false
                 }),
             )
@@ -3824,7 +3979,7 @@ mod tests {
             .call(
                 "query_by_hostname",
                 json!({
-                    "dest_host": "test.test.web3.buckyos.ai"
+                    "dest_host": format!("test.{}.web3.buckyos.ai", TEST_USER)
                 }),
             )
             .await;
@@ -3837,7 +3992,7 @@ mod tests {
             .call(
                 "set_user_self_cert",
                 json!({
-                    "name": "test",
+                    "name": TEST_USER,
                     "self_cert": true
                 }),
             )
@@ -3863,7 +4018,7 @@ mod tests {
             .call(
                 "check_username",
                 json!({
-                    "username": "test"
+                    "username": TEST_USER
                 }),
             )
             .await
@@ -3897,11 +4052,11 @@ mod tests {
             .call(
                 "register_user",
                 json!({
-                    "user_name": "test",
+                    "user_name": TEST_USER,
                     "public_key": user_public_key.to_string(),
                     "active_code": CLEAR_STATE_ACTIVE_CODE,
                     "zone_config": zone_jwt,
-                    "user_domain": "test.buckyos.ai",
+                    "user_domain": format!("{}.buckyos.ai", TEST_USER),
                 }),
             )
             .await
@@ -4013,7 +4168,40 @@ mod tests {
             .call(
                 "auth.check_username",
                 json!({
-                    "name": "testroot"
+                    "name": TEST_ROOT_USER
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result["valid"].as_bool().unwrap());
+
+        let result = root_krpc
+            .call(
+                "auth.check_username",
+                json!({
+                    "name": "short"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["valid"].as_bool().unwrap());
+
+        let result = root_krpc
+            .call(
+                "auth.check_username",
+                json!({
+                    "name": "security"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["valid"].as_bool().unwrap());
+
+        let result = root_krpc
+            .call(
+                "check_username",
+                json!({
+                    "username": TEST_LEGACY_USER
                 }),
             )
             .await
@@ -4024,19 +4212,19 @@ mod tests {
             .call(
                 "check_username",
                 json!({
-                    "username": "testlegacy"
+                    "username": "1starter"
                 }),
             )
             .await
             .unwrap();
-        assert!(result["valid"].as_bool().unwrap());
+        assert!(!result["valid"].as_bool().unwrap());
 
         let auth_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
         let result = auth_krpc
             .call(
                 "auth.check_username",
                 json!({
-                    "name": "testv2"
+                    "name": TEST_USER_V2
                 }),
             )
             .await
@@ -4045,9 +4233,20 @@ mod tests {
 
         let result = auth_krpc
             .call(
+                "auth.check_username",
+                json!({
+                    "name": "user_name"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["valid"].as_bool().unwrap());
+
+        let result = auth_krpc
+            .call(
                 "auth.register",
                 json!({
-                    "name": "testv2",
+                    "name": TEST_USER_V2,
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -4062,7 +4261,7 @@ mod tests {
         let auth_me_krpc =
             kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", Some(access_token.clone()));
         let result = auth_me_krpc.call("auth.me", json!({})).await.unwrap();
-        assert_eq!(result["name"].as_str().unwrap(), "testv2");
+        assert_eq!(result["name"].as_str().unwrap(), TEST_USER_V2);
         assert!(!result["owner_key_bound"].as_bool().unwrap());
 
         let login_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
@@ -4070,7 +4269,7 @@ mod tests {
             .call(
                 "auth.login",
                 json!({
-                    "name": "testv2",
+                    "name": TEST_USER_V2,
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
@@ -4084,7 +4283,7 @@ mod tests {
             .call(
                 "auth.login",
                 json!({
-                    "name": "testv2",
+                    "name": TEST_USER_V2,
                     "pwd_hash": "12345678",
                     "active_code": "wrong-active-code"
                 }),
@@ -4093,6 +4292,20 @@ mod tests {
         assert!(invalid_login_result.is_err());
         let invalid_login_err = invalid_login_result.err().unwrap().to_string();
         assert!(invalid_login_err.contains("[SNV2:1003:invalid_active_code]"));
+
+        let invalid_register_result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": "short",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await;
+        assert!(invalid_register_result.is_err());
+        let invalid_register_err = invalid_register_result.err().unwrap().to_string();
+        assert!(invalid_register_err.contains("[SNV2:1001:invalid_username]"));
 
         let refresh_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
         let result = refresh_krpc
@@ -4133,7 +4346,7 @@ mod tests {
             .call("user.get_profile", json!({}))
             .await
             .unwrap();
-        assert_eq!(result["name"].as_str().unwrap(), "testv2");
+        assert_eq!(result["name"].as_str().unwrap(), TEST_USER_V2);
 
         let zone_krpc =
             kRPC::new("http://127.0.0.1:19092/kapi/sn/bns", Some(login_access_token.clone()));
@@ -4142,7 +4355,7 @@ mod tests {
                 "zone.bind_config",
                 json!({
                     "zone_config": zone_jwt,
-                    "user_domain": "testv2.buckyos.ai"
+                    "user_domain": format!("{}.buckyos.ai", TEST_USER_V2)
                 }),
             )
             .await
@@ -4150,8 +4363,11 @@ mod tests {
         assert_eq!(result["code"].as_i64().unwrap(), 0);
 
         let result = zone_krpc.call("zone.get", json!({})).await.unwrap();
-        assert_eq!(result["user_name"].as_str().unwrap(), "testv2");
-        assert_eq!(result["user_domain"].as_str().unwrap(), "testv2.buckyos.ai");
+        assert_eq!(result["user_name"].as_str().unwrap(), TEST_USER_V2);
+        assert_eq!(
+            result["user_domain"].as_str().unwrap(),
+            format!("{}.buckyos.ai", TEST_USER_V2)
+        );
 
         let device_krpc =
             kRPC::new("http://127.0.0.1:19092/kapi/sn/bns", Some(login_access_token.clone()));
@@ -4179,7 +4395,7 @@ mod tests {
                 "dns.add_record",
                 json!({
                     "device_did": device_config.id.to_string(),
-                    "domain": "home.testv2.web3.buckyos.ai",
+                    "domain": format!("home.{}.web3.buckyos.ai", TEST_USER_V2),
                     "record_type": "A",
                     "record": "127.0.0.1",
                     "ttl": 600,
@@ -4197,7 +4413,7 @@ mod tests {
                 json!({
                     "obj_name": "profile",
                     "did_document": {
-                        "name": "testv2",
+                        "name": TEST_USER_V2,
                         "version": 2
                     },
                     "doc_type": "profile"
@@ -4217,7 +4433,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result["did_document"]["name"].as_str().unwrap(), "testv2");
+        assert_eq!(result["did_document"]["name"].as_str().unwrap(), TEST_USER_V2);
 
         let query_krpc =
             kRPC::new("http://127.0.0.1:19092/kapi/sn", Some(login_access_token.clone()));
@@ -4225,45 +4441,45 @@ mod tests {
             .call(
                 "query.resolve_hostname",
                 json!({
-                    "host": "home.testv2.web3.buckyos.ai"
+                    "host": format!("home.{}.web3.buckyos.ai", TEST_USER_V2)
                 }),
             )
             .await
             .unwrap();
         let ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
-        assert_eq!(ood_info.owner_id, "testv2".to_string());
+        assert_eq!(ood_info.owner_id, TEST_USER_V2.to_string());
         assert!(ood_info.self_cert);
 
         let result = root_krpc
             .call(
                 "query.by_hostname",
                 json!({
-                    "dest_host": "home.testv2.web3.buckyos.ai"
+                    "dest_host": format!("home.{}.web3.buckyos.ai", TEST_USER_V2)
                 }),
             )
             .await
             .unwrap();
         let root_ood_info = serde_json::from_value::<OODInfo>(result).unwrap();
-        assert_eq!(root_ood_info.owner_id, "testv2".to_string());
+        assert_eq!(root_ood_info.owner_id, TEST_USER_V2.to_string());
         assert!(root_ood_info.self_cert);
 
         let result = query_krpc
             .call(
                 "query.resolve_did",
                 json!({
-                    "did": "did:bns:testv2",
+                    "did": format!("did:bns:{}", TEST_USER_V2),
                     "type": "zone"
                 }),
             )
             .await
             .unwrap();
-        assert_eq!(result["document"]["user_name"].as_str().unwrap(), "testv2");
+        assert_eq!(result["document"]["user_name"].as_str().unwrap(), TEST_USER_V2);
 
         let result = query_krpc
             .call(
                 "query.resolve_device",
                 json!({
-                    "name": "testv2",
+                    "name": TEST_USER_V2,
                     "device_name": "ood1"
                 }),
             )
@@ -4283,7 +4499,7 @@ mod tests {
             .call(
                 "auth.login",
                 json!({
-                    "name": "testv2",
+                    "name": TEST_USER_V2,
                     "pwd_hash": "12345678",
                     "active_code": CLEAR_STATE_ACTIVE_CODE
                 }),
