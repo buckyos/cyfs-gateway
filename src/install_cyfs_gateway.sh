@@ -3,7 +3,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 REPO="${REPO:-buckyos/cyfs-gateway}"
-API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+API_ROOT="https://api.github.com/repos/${REPO}/releases"
 INSTALL_DIR="${INSTALL_DIR:-/opt/buckyos}"
 CONFIG_PATH="${CONFIG_PATH:-${INSTALL_DIR}/etc/cyfs_gateway.yaml}"
 SERVICE_NAME="${SERVICE_NAME:-cyfs_gateway}"
@@ -11,10 +11,51 @@ SYSTEMD_UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 LAUNCHD_PLIST_PATH="/Library/LaunchDaemons/${SERVICE_NAME}.plist"
 PROFILED_PATH="/etc/profile.d/cyfs_gateway.sh"
 PATHS_D_PATH="/etc/paths.d/cyfs_gateway"
+RELEASE_TAG="${CYFS_GATEWAY_VERSION:-${VERSION:-}}"
 
 log() { printf '%s\n' "$*"; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
+
+usage() {
+	cat <<EOF
+Usage: $0 [--version <tag>] [--help]
+
+Options:
+  --version <tag>  Install the specified release tag, for example: v1.2.3
+                   If omitted, installs the latest release.
+  --help           Show this help message.
+
+Environment variables:
+  CYFS_GATEWAY_VERSION
+                   Same as --version. VERSION is also accepted for compatibility.
+  REPO             GitHub repository, default: ${REPO}
+  INSTALL_DIR      Install directory, default: ${INSTALL_DIR}
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--version)
+		if [[ $# -lt 2 || -z "${2:-}" ]]; then
+			err "Missing value for --version"
+			usage
+			exit 1
+		fi
+		RELEASE_TAG="$2"
+		shift 2
+		;;
+	--help | -h)
+		usage
+		exit 0
+		;;
+	*)
+		err "Unknown argument: $1"
+		usage
+		exit 1
+		;;
+	esac
+done
 
 require_cmd() {
 	if ! command -v "$1" >/dev/null 2>&1; then
@@ -158,18 +199,52 @@ trap cleanup EXIT
 
 release_json_path="${tmp_dir}/release.json"
 
-log "Fetching latest release metadata from ${REPO}..."
+fetch_release_metadata() {
+	local api_url="$1"
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-	http_status="$(curl -sS -w '%{http_code}' -o "$release_json_path" \
-		-H "Authorization: Bearer ${GITHUB_TOKEN}" \
-		-H "X-GitHub-Api-Version: 2022-11-28" \
-		"$API_URL" || true)"
+		curl -sS -w '%{http_code}' -o "$release_json_path" \
+			-H "Authorization: Bearer ${GITHUB_TOKEN}" \
+			-H "X-GitHub-Api-Version: 2022-11-28" \
+			"$api_url" || true
+	else
+		curl -sS -w '%{http_code}' -o "$release_json_path" "$api_url" || true
+	fi
+}
+
+selected_tag=""
+http_status=""
+if [[ -z "$RELEASE_TAG" ]]; then
+	api_url="${API_ROOT}/latest"
+	log "Fetching latest release metadata from ${REPO}..."
+	http_status="$(fetch_release_metadata "$api_url")"
+	if [[ "$http_status" != "200" ]]; then
+		err "GitHub API request failed (HTTP ${http_status})."
+		exit 1
+	fi
 else
-	http_status="$(curl -sS -w '%{http_code}' -o "$release_json_path" "$API_URL" || true)"
-fi
-if [[ "$http_status" != "200" ]]; then
-	err "GitHub API request failed (HTTP ${http_status})."
-	exit 1
+	version_candidates=("$RELEASE_TAG")
+	if [[ "$RELEASE_TAG" != v* ]]; then
+		version_candidates+=("v${RELEASE_TAG}")
+	fi
+
+	log "Fetching release metadata for tag ${RELEASE_TAG} from ${REPO}..."
+	for candidate in "${version_candidates[@]}"; do
+		api_url="${API_ROOT}/tags/${candidate}"
+		http_status="$(fetch_release_metadata "$api_url")"
+		if [[ "$http_status" == "200" ]]; then
+			selected_tag="$candidate"
+			break
+		fi
+		if [[ "$http_status" != "404" ]]; then
+			err "GitHub API request failed for tag ${candidate} (HTTP ${http_status})."
+			exit 1
+		fi
+	done
+
+	if [[ -z "$selected_tag" ]]; then
+		err "Release not found for tag: ${RELEASE_TAG}"
+		exit 1
+	fi
 fi
 
 release_info=()
@@ -206,7 +281,7 @@ if [[ -z "$asset_url" ]]; then
 fi
 
 if [[ -n "$tag" ]]; then
-	log "Latest tag: ${tag}"
+	log "Selected tag: ${tag}"
 fi
 log "Downloading asset: ${asset_name}"
 
