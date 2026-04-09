@@ -1,9 +1,9 @@
-use cyfs_gateway_lib::{into_server_err, server_err, ServerErrorCode, ServerResult};
+use cyfs_gateway_lib::{into_server_err, server_err, ServerError, ServerErrorCode, ServerResult};
 use cyfs_gateway_lib::{
     NameServer, Server, ServerConfig, ServerContext, ServerContextRef, ServerFactory,
 };
 use name_client::{LocalConfigDnsProvider, NameInfo, NsProvider, RecordType};
-use name_lib::{EncodedDocument, DID};
+use name_lib::{EncodedDocument, NSError, DID};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::Path;
@@ -37,10 +37,14 @@ impl NameServer for LocalDns {
         record_type: Option<RecordType>,
         from_ip: Option<IpAddr>,
     ) -> ServerResult<NameInfo> {
-        self.local_provider
-            .query(name, record_type, from_ip)
-            .await
-            .map_err(into_server_err!(ServerErrorCode::DnsQueryError))
+        self.local_provider.query(name, record_type, from_ip).await.map_err(
+            |e| match e {
+                NSError::NotFound(_) => {
+                    ServerError::new(ServerErrorCode::NotFound, e.to_string())
+                }
+                _ => ServerError::new(ServerErrorCode::DnsQueryError, e.to_string()),
+            },
+        )
     }
 
     async fn query_did(
@@ -52,7 +56,12 @@ impl NameServer for LocalDns {
         self.local_provider
             .query_did(did, fragment, from_ip)
             .await
-            .map_err(into_server_err!(ServerErrorCode::DnsQueryError))
+            .map_err(|e| match e {
+                NSError::NotFound(_) => {
+                    ServerError::new(ServerErrorCode::NotFound, e.to_string())
+                }
+                _ => ServerError::new(ServerErrorCode::DnsQueryError, e.to_string()),
+            })
     }
 }
 

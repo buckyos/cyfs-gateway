@@ -65,13 +65,6 @@ pub(crate) async fn nameinfo_to_map_collection(
         })?;
     match record_type {
         "A" => {
-            if name_info.address.is_empty() {
-                return Err(server_err!(
-                    ServerErrorCode::InvalidParam,
-                    "Address is none"
-                ));
-            }
-
             let ip_set = MemorySetCollection::new();
             // Convert all IPv4 addresses to A records
             for addr in name_info.address.iter() {
@@ -96,19 +89,6 @@ pub(crate) async fn nameinfo_to_map_collection(
                 }
             }
 
-            if ip_set.len().await.map_err(|e| {
-                server_err!(
-                    ServerErrorCode::ProcessChainError,
-                    "get ip_set len err {}",
-                    e
-                )
-            })? == 0
-            {
-                return Err(server_err!(
-                    ServerErrorCode::InvalidParam,
-                    "No valid IPv4 addresses found"
-                ));
-            }
             map.insert("address", CollectionValue::Set(Arc::new(Box::new(ip_set))))
                 .await
                 .map_err(|e| {
@@ -117,12 +97,6 @@ pub(crate) async fn nameinfo_to_map_collection(
             Ok(map)
         }
         "AAAA" => {
-            if name_info.address.is_empty() {
-                return Err(server_err!(
-                    ServerErrorCode::InvalidParam,
-                    "Address is none"
-                ));
-            }
             let ip_set = MemorySetCollection::new();
             // Convert all IPv6 addresses to AAAA records
             for addr in name_info.address.iter() {
@@ -147,19 +121,6 @@ pub(crate) async fn nameinfo_to_map_collection(
                 }
             }
 
-            if ip_set.len().await.map_err(|e| {
-                server_err!(
-                    ServerErrorCode::ProcessChainError,
-                    "get ip_set len err {}",
-                    e
-                )
-            })? == 0
-            {
-                return Err(server_err!(
-                    ServerErrorCode::InvalidParam,
-                    "No valid IPv6 addresses found"
-                ));
-            }
             map.insert("address", CollectionValue::Set(Arc::new(Box::new(ip_set))))
                 .await
                 .map_err(|e| {

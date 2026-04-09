@@ -40,10 +40,6 @@ use url::Url;
 fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RData>> {
     match record_type {
         "A" => {
-            if name_info.address.is_empty() {
-                return Err(anyhow::anyhow!("Address is none"));
-            }
-
             let mut records = Vec::new();
             // Convert all IPv4 addresses to A records
             for addr in name_info.address.iter() {
@@ -58,15 +54,9 @@ fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RDat
                 }
             }
 
-            if records.is_empty() {
-                return Err(anyhow::anyhow!("No valid IPv4 addresses found"));
-            }
             Ok(records)
         }
         "AAAA" => {
-            if name_info.address.is_empty() {
-                return Err(anyhow::anyhow!("Address is none"));
-            }
             let mut records = Vec::new();
             // Convert all IPv6 addresses to AAAA records
             for addr in name_info.address.iter() {
@@ -81,9 +71,6 @@ fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RDat
                 }
             }
 
-            if records.is_empty() {
-                return Err(anyhow::anyhow!("No valid IPv6 addresses found"));
-            }
             Ok(records)
         }
         "CNAME" => {
@@ -275,6 +262,38 @@ pub struct ProcessChainDnsServer {
 }
 
 impl ProcessChainDnsServer {
+    async fn command_error_to_server_error(
+        &self,
+        value: &CollectionValue,
+    ) -> Option<ServerError> {
+        let CollectionValue::Map(map) = value else {
+            return None;
+        };
+
+        let code = map.get("code").await.ok().flatten()?;
+        let message = map
+            .get("message")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| value.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+
+        let CollectionValue::String(code) = code else {
+            return None;
+        };
+
+        let server_code = match code.as_str() {
+            "NotFound" => ServerErrorCode::NotFound,
+            "DnsQueryError" => ServerErrorCode::DnsQueryError,
+            "Rejected" => ServerErrorCode::Rejected,
+            "InvalidParam" => ServerErrorCode::InvalidParam,
+            _ => ServerErrorCode::ProcessChainError,
+        };
+
+        Some(ServerError::new(server_code, message))
+    }
+
     pub async fn create_server(
         id: String,
         server_mgr: ServerManagerWeakRef,
@@ -345,6 +364,35 @@ impl ProcessChainDnsServer {
             message.destructive_emit(&mut encoder)
         }
         .map_err(into_server_err!(ServerErrorCode::EncodeError));
+        Ok(buffer)
+    }
+
+    fn response_code_to_buffer(
+        &self,
+        request: &Request,
+        response_code: ResponseCode,
+    ) -> ServerResult<Vec<u8>> {
+        let builder = MessageResponseBuilder::from_message_request(request);
+        let mut header = Header::response_from_request(request.header());
+        header.set_response_code(response_code);
+        let mut message = builder.build(header, vec![], &[], &[], &[]);
+
+        let mut buffer = Vec::with_capacity(512);
+        {
+            let mut encoder = BinEncoder::new(&mut buffer);
+
+            let max_size = if let Some(edns) = message.get_edns() {
+                edns.max_payload()
+            } else {
+                hickory_proto::udp::MAX_RECEIVE_BUFFER_SIZE as u16
+            };
+            encoder.set_max_size(max_size);
+
+            message
+                .destructive_emit(&mut encoder)
+                .map_err(into_server_err!(ServerErrorCode::EncodeError))?;
+        }
+
         Ok(buffer)
     }
 
@@ -442,6 +490,16 @@ impl ProcessChainDnsServer {
         let ret = execute_chain(executor, map)
             .await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
+        if ret.is_error() {
+            if let Some(err) = self.command_error_to_server_error(ret.value_ref()).await {
+                return Err(err);
+            }
+            return Err(server_err!(
+                ServerErrorCode::ProcessChainError,
+                "{}",
+                ret.value()
+            ));
+        }
         if ret.is_control() {
             if ret.is_drop() {
                 return Err(server_err!(ServerErrorCode::Rejected));
@@ -519,27 +577,16 @@ impl ProcessChainDnsServer {
                 match self.handle_request(&request, dst_addr).await {
                     Ok(response) => Ok(response),
                     Err(e) => {
-                        let mut builder = MessageResponseBuilder::from_message_request(&request);
-                        let mut header = Header::response_from_request(request.header());
-                        header.set_response_code(ResponseCode::NXDomain);
-                        let mut message = builder.build(header, vec![], &[], &[], &[]);
-
-                        let mut buffer = Vec::with_capacity(512);
-                        let encode_result = {
-                            let mut encoder = BinEncoder::new(&mut buffer);
-
-                            let max_size = if let Some(edns) = message.get_edns() {
-                                edns.max_payload()
-                            } else {
-                                // No EDNS, use the recommended max from RFC6891.
-                                hickory_proto::udp::MAX_RECEIVE_BUFFER_SIZE as u16
-                            };
-                            encoder.set_max_size(max_size);
-
-                            message.destructive_emit(&mut encoder)
-                        }
-                        .map_err(into_server_err!(ServerErrorCode::EncodeError));
-                        Ok(buffer)
+                        let response_code = match e.code() {
+                            ServerErrorCode::NotFound => ResponseCode::NXDomain,
+                            ServerErrorCode::Rejected => ResponseCode::Refused,
+                            _ => ResponseCode::ServFail,
+                        };
+                        warn!(
+                            "dns request failed for response code {:?}: {:?}",
+                            response_code, e
+                        );
+                        self.response_code_to_buffer(&request, response_code)
                     }
                 }
             }
@@ -694,20 +741,62 @@ mod tests {
         DnsServerConfig, DnsServerContext, InnerDnsRecordManager, LocalDns, ProcessChainDnsServer,
         ProcessChainDnsServerFactory,
     };
+    use async_trait::async_trait;
     use cyfs_gateway_lib::server::DatagramServer;
     use cyfs_gateway_lib::{
         ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager,
-        GlobalProcessChains, JsExternalsManager, Server, ServerFactory, ServerManager,
-        StackContext, StackFactory, StatManager, TunnelManager, UdpStackConfig, UdpStackContext,
-        UdpStackFactory,
+        GlobalProcessChains, JsExternalsManager, NameServer, Server, ServerErrorCode,
+        ServerFactory, ServerManager, ServerResult, StackContext, StackFactory, StatManager,
+        TunnelManager, UdpStackConfig, UdpStackContext, UdpStackFactory,
     };
-    use hickory_proto::op::{Message, Query};
+    use hickory_proto::op::{Message, Query, ResponseCode};
     use hickory_proto::rr::RecordType;
     use hickory_server::proto::rr::{Name, RData};
+    use name_client::NameInfo;
+    use name_lib::{DID, EncodedDocument};
     use std::io::Write;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::str::FromStr;
     use std::sync::Arc;
+
+    struct EmptyAaaaNameServer;
+
+    #[async_trait]
+    impl NameServer for EmptyAaaaNameServer {
+        fn id(&self) -> String {
+            "empty_aaaa".to_string()
+        }
+
+        async fn query(
+            &self,
+            name: &str,
+            record_type: Option<name_client::RecordType>,
+            _from_ip: Option<IpAddr>,
+        ) -> ServerResult<NameInfo> {
+            match record_type.unwrap_or_default() {
+                name_client::RecordType::A => {
+                    Ok(NameInfo::from_address(name, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))))
+                }
+                name_client::RecordType::AAAA => Ok(NameInfo::from_address_vec(name, vec![])),
+                _ => Err(cyfs_gateway_lib::server_err!(
+                    ServerErrorCode::NotFound,
+                    "record type not found"
+                )),
+            }
+        }
+
+        async fn query_did(
+            &self,
+            _did: &DID,
+            _fragment: Option<&str>,
+            _from_ip: Option<IpAddr>,
+        ) -> ServerResult<EncodedDocument> {
+            Err(cyfs_gateway_lib::server_err!(
+                ServerErrorCode::NotFound,
+                "did not found"
+            ))
+        }
+    }
 
     #[tokio::test]
     async fn test_process_chain_dns_server_factory() {
@@ -824,6 +913,7 @@ hook_point:
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 0);
+        assert_eq!(resp.response_code(), ResponseCode::ServFail);
 
         let data = server
             .serve_datagram(
@@ -834,6 +924,7 @@ hook_point:
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 0);
+        assert_eq!(resp.response_code(), ResponseCode::ServFail);
 
         let config = r#"
 type: dns
@@ -958,6 +1049,7 @@ hook_point:
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 0);
+        assert_eq!(resp.response_code(), ResponseCode::NXDomain);
 
         let data = server
             .serve_datagram(&msg_vec[..1], DatagramInfo::new(None))
@@ -969,6 +1061,56 @@ hook_point:
             .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.answers().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_chain_dns_server_empty_aaaa_returns_noerror() {
+        let server_mgr = Arc::new(ServerManager::new());
+        server_mgr
+            .add_server(Server::NameServer(Arc::new(EmptyAaaaNameServer)))
+            .unwrap();
+
+        let config = r#"
+type: dns
+id: test
+hook_point:
+  - id: main
+    priority: 1
+    blocks:
+      - id: main
+        block: |
+           call resolve ${REQ.name} ${REQ.record_type} empty_aaaa && return;
+        "#;
+        let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
+        let server = ProcessChainDnsServer::create_server(
+            config.id,
+            Arc::downgrade(&server_mgr),
+            Some(Arc::new(GlobalProcessChains::new())),
+            Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
+            config.hook_point,
+            InnerDnsRecordManager::new(),
+            Some(Arc::new(JsExternalsManager::new())),
+        )
+        .await
+        .unwrap();
+
+        let mut message = Message::new();
+        let name = Name::from_str("sn.buckyos.ai.").unwrap();
+        let query = Query::query(name, RecordType::AAAA);
+        message.add_query(query);
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let data = server
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(Some("127.0.0.1:5353".to_string())),
+            )
+            .await
+            .unwrap();
+        let resp = Message::from_vec(data.as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
         assert_eq!(resp.answers().len(), 0);
     }
 

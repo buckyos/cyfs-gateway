@@ -3,10 +3,11 @@ use clap::{Arg, Command};
 use cyfs_gateway_lib::ServerManagerWeakRef;
 use cyfs_process_chain::{
     command_help, CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel,
-    ExternalCommand,
+    ExternalCommand, MemoryMapCollection,
 };
 use hickory_proto::xfer::Protocol;
 use log::{error, warn};
+use cyfs_gateway_lib::ServerErrorCode;
 use name_client::{DnsProvider, NameInfo, NsProvider, RecordType};
 use name_lib::{EncodedDocument, DID};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -144,6 +145,22 @@ fn normalize_ptr_query_name(domain: &str, record_type: RecordType) -> String {
     domain.to_string()
 }
 
+async fn server_error_result(
+    code: ServerErrorCode,
+    message: impl Into<String>,
+) -> Result<CommandResult, String> {
+    let map = MemoryMapCollection::new_ref();
+    let code_str = format!("{:?}", code);
+    let message = message.into();
+    map.insert("code", CollectionValue::String(code_str))
+        .await
+        .map_err(|e| e.to_string())?;
+    map.insert("message", CollectionValue::String(message))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(CommandResult::error_with_value(CollectionValue::Map(map)))
+}
+
 #[async_trait::async_trait]
 impl ExternalCommand for CmdResolve {
     fn help(&self, name: &str, help_type: CommandHelpType) -> String {
@@ -264,10 +281,9 @@ impl ExternalCommand for CmdResolve {
                     }
                 };
                 if let Some(dns_service) = server_mgr.get_name_server(server_address) {
-                    match dns_service
-                        .query(query_name.as_str(), Some(record_type), None)
-                        .await
-                        .map_err(|e| {
+                    match dns_service.query(query_name.as_str(), Some(record_type), None).await {
+                        Ok(name_info) => name_info,
+                        Err(e) => {
                             let msg = format!(
                                 "Resolve miss via {} for domain {} record_type {}: {:?}",
                                 server_address, query_name, record_type_str, e
@@ -281,10 +297,8 @@ impl ExternalCommand for CmdResolve {
                                     error!("{}", msg);
                                 }
                             }
-                            msg
-                        }) {
-                        Ok(name_info) => name_info,
-                        Err(e) => return Ok(CommandResult::error_with_string(e)),
+                            return server_error_result(e.code(), msg).await;
+                        }
                     }
                 } else {
                     let msg = format!(
