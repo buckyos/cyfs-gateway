@@ -654,6 +654,7 @@ impl SNServer {
         })?;
 
         rpc_session_token.verify_by_key(&user_public_key)?;
+        //TODO 这里的验证太简单了
 
         // Update zone_config and user_domain in database
         self.db
