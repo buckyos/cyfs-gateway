@@ -240,6 +240,8 @@ pub struct StackCertConfig {
     pub domain: String,
     pub acme_type: Option<ChallengeType>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub acme_issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cert_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_path: Option<String>,

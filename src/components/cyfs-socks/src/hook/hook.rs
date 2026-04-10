@@ -35,7 +35,7 @@ impl SocksHookManager {
             })?;
         }
 
-        let data_dir = get_buckyos_service_data_dir("cyfs-gateway");
+        let data_dir = get_buckyos_service_data_dir("cyfs_gateway");
         if !data_dir.exists() {
             std::fs::create_dir_all(&data_dir).map_err(|e| {
                 let msg = format!(

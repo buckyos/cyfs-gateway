@@ -68,7 +68,7 @@ struct CertMutPart {
 struct CertStubInner {
     acme_item: AcmeItem,
     keystore_path: String,
-    acme_client: AcmeClient,
+    issuer: Arc<IssuerRuntime>,
     responder: AcmeChallengeResponderRef,
     mut_part: Mutex<CertMutPart>,
     handle: Mutex<Option<JoinHandle<()>>>,
@@ -106,14 +106,14 @@ impl CertStub {
     fn new(
         acme_item: AcmeItem,
         keystore_path: String,
-        acme_client: AcmeClient,
+        issuer: Arc<IssuerRuntime>,
         responder: AcmeChallengeResponderRef,
     ) -> Self {
         Self {
             inner: Arc::new(CertStubInner {
                 acme_item,
                 keystore_path,
-                acme_client,
+                issuer,
                 responder,
                 mut_part: Mutex::new(CertMutPart {
                     state: CertState::None,
@@ -230,7 +230,7 @@ impl CertStub {
     }
 
     async fn load_cert_inner(&self) -> Result<()> {
-        // 尝试从 keystore_path 加载最新的证书
+        // 尝试�?keystore_path 加载最新的证书
         let dir = tokio::fs::read_dir(&self.inner.keystore_path)
             .await
             .map_err(|e| {
@@ -363,7 +363,8 @@ impl CertStub {
         Ok(())
     }
 
-    fn check_cert(&self, renew_before_expiry: chrono::Duration) -> Result<()> {
+    fn check_cert(&self) -> Result<()> {
+        let renew_before_expiry = self.inner.issuer.renew_before_expiry;
         let should_order = {
             {
                 let handle = self.inner.handle.lock().unwrap();
@@ -405,7 +406,7 @@ impl CertStub {
     async fn order_inner(&self) -> Result<()> {
         let mut order = AcmeOrderSession::new(
             self.inner.acme_item.domain.clone(),
-            self.inner.acme_client.clone(),
+            self.inner.issuer.acme_client.clone(),
             self.inner.responder.clone(),
         );
         let (cert_data, key_data) = order.start().await?;
@@ -514,10 +515,11 @@ impl CertInfo {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AcmeItem {
     domain: String,
     challenge_type: ChallengeType,
+    issuer: Option<String>,
     data: Option<serde_json::Value>,
 }
 
@@ -525,11 +527,13 @@ impl AcmeItem {
     pub fn new(
         domain: String,
         challenge_type: ChallengeType,
+        issuer: Option<String>,
         data: Option<serde_json::Value>,
     ) -> Self {
         Self {
             domain,
             challenge_type,
+            issuer,
             data,
         }
     }
@@ -600,11 +604,20 @@ struct DnsProviderInfo {
     pub dns_provider: String,
 }
 
+#[derive(Clone)]
+struct IssuerRuntime {
+    name: Option<String>,
+    acme_client: AcmeClient,
+    check_interval: chrono::Duration,
+    renew_before_expiry: chrono::Duration,
+}
+
 pub struct AcmeCertManager {
     config: CertManagerConfig,
-    acme_client: AcmeClient,
+    default_issuer: Arc<IssuerRuntime>,
+    issuers: HashMap<String, Arc<IssuerRuntime>>,
     certs: RwLock<HashMap<String, CertStub>>,
-    check_handler: Mutex<Option<JoinHandle<()>>>,
+    check_handlers: Mutex<Vec<JoinHandle<()>>>,
     responder: Mutex<Option<AcmeChallengeResponderRef>>,
     challenge_certs: Mutex<HashMap<String, Arc<sign::CertifiedKey>>>,
     http_challenges: Mutex<HashMap<String, String>>,
@@ -614,6 +627,16 @@ pub struct AcmeCertManager {
 pub type AcmeCertManagerRef = Arc<AcmeCertManager>;
 
 #[derive(Clone, Debug, Deserialize)]
+pub struct CertManagerIssuerConfig {
+    pub account: Option<String>,
+    pub acme_server: String,
+    #[serde(default = "default_check_interval")]
+    pub check_interval: chrono::Duration,
+    #[serde(default = "default_renew_before_expiry")]
+    pub renew_before_expiry: chrono::Duration,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct CertManagerConfig {
     pub account: Option<String>,
     pub acme_server: String,
@@ -621,17 +644,19 @@ pub struct CertManagerConfig {
     pub keystore_path: String,
     pub dns_provider_path: Option<String>,
     #[serde(default = "default_check_interval")]
-    pub check_interval: chrono::Duration, // 检查证书的时间间隔
+    pub check_interval: chrono::Duration,
     #[serde(default = "default_renew_before_expiry")]
-    pub renew_before_expiry: chrono::Duration, // 过期前多久开始续期
+    pub renew_before_expiry: chrono::Duration,
+    #[serde(default)]
+    pub issuers: HashMap<String, CertManagerIssuerConfig>,
 }
 
 fn default_check_interval() -> chrono::Duration {
-    chrono::Duration::hours(12) // 默认每12小时检查一次
+    chrono::Duration::hours(12)
 }
 
 fn default_renew_before_expiry() -> chrono::Duration {
-    chrono::Duration::days(30) // 默认过期前30天续期
+    chrono::Duration::days(30)
 }
 
 impl Default for CertManagerConfig {
@@ -644,6 +669,7 @@ impl Default for CertManagerConfig {
             dns_provider_path: None,
             check_interval: default_check_interval(),
             renew_before_expiry: default_renew_before_expiry(),
+            issuers: HashMap::new(),
         }
     }
 }
@@ -657,8 +683,8 @@ impl std::fmt::Display for AcmeCertManager {
 impl Drop for AcmeCertManager {
     fn drop(&mut self) {
         debug!("drop cert manager, {}", self);
-        let mut check_handler = self.check_handler.lock().unwrap();
-        if let Some(handler) = check_handler.take() {
+        let mut check_handlers = self.check_handlers.lock().unwrap();
+        for handler in check_handlers.drain(..) {
             handler.abort();
         }
     }
@@ -672,6 +698,99 @@ impl AcmeCertManager {
             .insert(name.into(), factory);
     }
 
+    fn default_issuer_config(config: &CertManagerConfig) -> CertManagerIssuerConfig {
+        CertManagerIssuerConfig {
+            account: config.account.clone(),
+            acme_server: config.acme_server.clone(),
+            check_interval: config.check_interval,
+            renew_before_expiry: config.renew_before_expiry,
+        }
+    }
+
+    fn issuer_account_path(config: &CertManagerConfig, issuer_name: Option<&str>) -> PathBuf {
+        match issuer_name {
+            Some(issuer_name) => buckyos_kit::path_join(
+                &config.keystore_path,
+                &format!("accounts/{}/acme_account.json", sanitize_path_component(issuer_name)),
+            ),
+            None => buckyos_kit::path_join(&config.keystore_path, "acme_account.json"),
+        }
+    }
+
+    async fn load_or_create_account(
+        account_path: &Path,
+        account_name: Option<String>,
+    ) -> Result<AcmeAccount> {
+        if let Some(parent) = account_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        match AcmeAccount::from_file(account_path).await {
+            Ok(account) => {
+                info!("Loading ACME account from {}", account_path.to_string_lossy());
+                match account_name {
+                    Some(account_name) if account_name.as_str() != account.email() => {
+                        let account = AcmeAccount::new(account_name);
+                        if let Err(e) = account.save_to_file(account_path).await {
+                            error!("Failed to save ACME account: {}", e);
+                        }
+                        Ok(account)
+                    }
+                    _ => Ok(account),
+                }
+            }
+            Err(_) => {
+                let account = match account_name {
+                    Some(account_name) => AcmeAccount::new(account_name),
+                    None => {
+                        let random_str = rand::rng().random_range(0..1000000);
+                        let random_domain = rand::rng().random_range(0..1000000);
+                        let email = format!("{}@{}.com", random_str, random_domain);
+                        info!("Generated random email address: {}", email);
+                        AcmeAccount::new(email)
+                    }
+                };
+                if let Err(e) = account.save_to_file(account_path).await {
+                    error!("Failed to save ACME account: {}", e);
+                }
+                Ok(account)
+            }
+        }
+    }
+
+    async fn create_issuer_runtime(
+        config: &CertManagerConfig,
+        issuer_name: Option<&str>,
+        issuer_config: &CertManagerIssuerConfig,
+    ) -> Result<Arc<IssuerRuntime>> {
+        let account_path = Self::issuer_account_path(config, issuer_name);
+        let account =
+            Self::load_or_create_account(account_path.as_path(), issuer_config.account.clone())
+                .await?;
+        let acme_client = AcmeClient::new(account, issuer_config.acme_server.clone()).await?;
+        Ok(Arc::new(IssuerRuntime {
+            name: issuer_name.map(|value| value.to_string()),
+            acme_client,
+            check_interval: issuer_config.check_interval,
+            renew_before_expiry: issuer_config.renew_before_expiry,
+        }))
+    }
+
+    fn resolve_issuer_runtime(&self, issuer_name: Option<&str>) -> Result<Arc<IssuerRuntime>> {
+        match issuer_name {
+            None => Ok(self.default_issuer.clone()),
+            Some(name) => self
+                .issuers
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown acme issuer: {}", name)),
+        }
+    }
+
+    fn issuer_matches(item_issuer: Option<&str>, issuer_name: Option<&str>) -> bool {
+        item_issuer == issuer_name
+    }
+
     pub async fn create(config: CertManagerConfig) -> Result<AcmeCertManagerRef> {
         info!("create cert manager, config: {:?}", config);
 
@@ -683,58 +802,24 @@ impl AcmeCertManager {
                     e
                 })?;
         }
-
-        let account_path = buckyos_kit::path_join(&config.keystore_path, "acme_account.json");
-        let account = match AcmeAccount::from_file(&*account_path).await {
-            Ok(account) => {
-                info!(
-                    "Loading ACME account from {}",
-                    account_path.to_str().unwrap()
-                );
-                match config.account.clone() {
-                    Some(account_name) => {
-                        if account_name.as_str() != account.email() {
-                            let account = AcmeAccount::new(account_name);
-                            if let Err(e) = account.save_to_file(&*account_path).await {
-                                error!("Failed to save ACME account: {}", e);
-                            }
-                            account
-                        } else {
-                            account
-                        }
-                    }
-                    None => account,
-                }
-            }
-            Err(_) => {
-                let account = match config.account.clone() {
-                    Some(account_name) => AcmeAccount::new(account_name),
-                    None => {
-                        // 生成随机邮箱并创建新账号
-                        let random_str = rand::rng().random_range(0..1000000);
-                        let random_domain = rand::rng().random_range(0..1000000);
-                        let email = format!("{}@{}.com", random_str, random_domain);
-                        info!("Generated random email address: {}", email);
-
-                        let account = AcmeAccount::new(email);
-                        account
-                    }
-                };
-                if let Err(e) = account.save_to_file(&*account_path).await {
-                    error!("Failed to save ACME account: {}", e);
-                }
-                account
-            }
-        };
-
-        let acme_client = AcmeClient::new(account, config.acme_server.clone()).await?;
+        let default_issuer_config = Self::default_issuer_config(&config);
+        let default_issuer =
+            Self::create_issuer_runtime(&config, None, &default_issuer_config).await?;
+        let mut issuers = HashMap::new();
+        for (issuer_name, issuer_config) in &config.issuers {
+            let runtime =
+                Self::create_issuer_runtime(&config, Some(issuer_name.as_str()), issuer_config)
+                    .await?;
+            issuers.insert(issuer_name.clone(), runtime);
+        }
 
         let mut dns_providers = HashMap::<String, DnsProviderRef>::new();
         let manager = AcmeCertManagerRef::new(Self {
             config: config.clone(),
-            acme_client,
+            default_issuer,
+            issuers,
             certs: RwLock::new(HashMap::new()),
-            check_handler: Mutex::new(None),
+            check_handlers: Mutex::new(Vec::new()),
             responder: Mutex::new(None),
             challenge_certs: Mutex::new(Default::default()),
             http_challenges: Mutex::new(Default::default()),
@@ -779,21 +864,31 @@ impl AcmeCertManager {
         }
         // 启动定期检查任务
         {
-            let weak_manager = Arc::downgrade(&manager);
-            let handle: JoinHandle<()> = tokio::spawn(async move {
-                let check_interval =
-                    tokio::time::Duration::from_secs(config.check_interval.num_seconds() as u64);
-                let mut interval = tokio::time::interval(check_interval);
-                loop {
-                    interval.tick().await;
-                    if let Some(manager) = weak_manager.upgrade() {
-                        if let Err(e) = manager.check_all_certs() {
-                            error!("check certs failed: {}", e);
+            let runtimes = std::iter::once(manager.default_issuer.clone())
+                .chain(manager.issuers.values().cloned())
+                .collect::<Vec<_>>();
+            let mut check_handlers = manager.check_handlers.lock().unwrap();
+            for runtime in runtimes {
+                let weak_manager = Arc::downgrade(&manager);
+                let issuer_name = runtime.name.clone();
+                let check_interval = tokio::time::Duration::from_secs(
+                    runtime.check_interval.num_seconds().max(1) as u64,
+                );
+                let handle: JoinHandle<()> = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(check_interval);
+                    loop {
+                        interval.tick().await;
+                        if let Some(manager) = weak_manager.upgrade() {
+                            if let Err(e) = manager.check_all_certs(issuer_name.as_deref()) {
+                                error!("check certs failed: {}", e);
+                            }
+                        } else {
+                            break;
                         }
                     }
-                }
-            });
-            *manager.check_handler.lock().unwrap() = Some(handle);
+                });
+                check_handlers.push(handle);
+            }
         }
 
         Ok(manager)
@@ -826,15 +921,22 @@ impl AcmeCertManager {
         }
 
         let responder = { self.responder.lock().unwrap().clone().unwrap() };
+        let issuer = self.resolve_issuer_runtime(item.issuer.as_deref())?;
         let mut certs = self.certs.write().unwrap();
-        if certs.contains_key(&item.domain) {
-            return Ok(());
+        if let Some(existing) = certs.get(&item.domain) {
+            if existing.inner.acme_item == item {
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!(
+                "acme domain {} conflicts with existing certificate config",
+                item.domain
+            ));
         }
         let domain = item.domain.clone();
         let cert_stub = CertStub::new(
             item,
             keystore_path.to_str().unwrap().to_string(),
-            self.acme_client.clone(),
+            issuer,
             responder,
         );
         certs.insert(domain, cert_stub.clone());
@@ -862,17 +964,20 @@ impl AcmeCertManager {
         None
     }
 
-    fn check_all_certs(&self) -> Result<()> {
+    fn check_all_certs(&self, issuer_name: Option<&str>) -> Result<()> {
         let certs = self
             .certs
             .read()
             .unwrap()
             .values()
+            .filter(|cert| {
+                Self::issuer_matches(cert.inner.acme_item.issuer.as_deref(), issuer_name)
+            })
             .cloned()
             .collect::<Vec<_>>();
 
         for cert in certs {
-            if let Err(e) = cert.check_cert(self.config.renew_before_expiry) {
+            if let Err(e) = cert.check_cert() {
                 error!("check cert failed, stub: {}, error: {}", cert, e);
             }
         }
@@ -1064,3 +1169,4 @@ fn sanitize_path_component(s: &str) -> String {
         })
         .collect()
 }
+

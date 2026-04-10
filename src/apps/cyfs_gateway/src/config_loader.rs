@@ -940,12 +940,22 @@ impl GatewayConfigParser {
 }
 
 #[derive(Deserialize, Clone, Eq, PartialEq)]
+pub struct AcmeIssuerConfig {
+    pub account: Option<String>,
+    pub issuer: Option<String>,
+    pub check_interval: Option<u64>,
+    pub renew_before_expiry: Option<u64>,
+}
+
+#[derive(Deserialize, Clone, Eq, PartialEq)]
 pub struct AcmeConfig {
     pub account: Option<String>,
     pub issuer: Option<String>,
     pub dns_providers: Option<HashMap<String, serde_json::Value>>,
     pub check_interval: Option<u64>,
     pub renew_before_expiry: Option<u64>,
+    #[serde(default)]
+    pub issuers: HashMap<String, AcmeIssuerConfig>,
 }
 
 #[derive(Deserialize, Clone, Eq, PartialEq)]

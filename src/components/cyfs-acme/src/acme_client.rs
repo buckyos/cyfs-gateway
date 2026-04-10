@@ -5,7 +5,7 @@ use base64::Engine;
 use openssl::{
     pkey::{PKey, Private},
     rsa::Rsa,
-    x509::{X509NameBuilder, X509ReqBuilder, extension::SubjectAlternativeName},
+    x509::{extension::SubjectAlternativeName, X509NameBuilder, X509ReqBuilder},
 };
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use reqwest;
@@ -288,7 +288,7 @@ impl AcmeOrderSession {
     pub async fn start(&mut self) -> Result<(Vec<u8>, Vec<u8>)> {
         let directory = self.client.get_directory().await?;
         // 1. 创建订单
-        let (authorizations, finalize_url) = self
+        let (authorizations, finalize_url, order_url) = self
             .client
             .create_order(&[self.domain.clone()], directory.clone())
             .await?;
@@ -297,6 +297,7 @@ impl AcmeOrderSession {
         self.order_info = Some(OrderInfo {
             authorizations,
             finalize_url,
+            order_url,
         });
         self.update_status(OrderStatus::Pending);
 
@@ -329,17 +330,27 @@ impl AcmeOrderSession {
 
         // 3. 完成订单
         if let Some(order_info) = &self.order_info {
+            let finalize_url = order_info.finalize_url.clone();
+            let order_url = order_info.order_url.clone();
+            self.update_status(OrderStatus::Ready);
             // 生成CSR
             let (csr, private_key) = self.client.generate_csr(&[self.domain.clone()])?;
 
             // Finalize订单
+            self.update_status(OrderStatus::Processing);
             let cert_url = self
                 .client
-                .finalize_order(&order_info.finalize_url, directory.clone(), &csr)
+                .finalize_order(
+                    &finalize_url,
+                    order_url.as_deref(),
+                    directory.clone(),
+                    &csr,
+                )
                 .await?;
 
             // 下载证书
             let cert = self.client.download_certificate(&cert_url).await?;
+            self.update_status(OrderStatus::Valid);
 
             Ok((cert, private_key))
         } else {
@@ -360,6 +371,7 @@ impl Drop for AcmeOrderSession {
 struct OrderInfo {
     authorizations: Vec<String>,
     finalize_url: String,
+    order_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -379,8 +391,14 @@ struct OrderResponse {
     status: String,
     expires: String,
     identifiers: Vec<Identifier>,
+    #[serde(default)]
     authorizations: Vec<String>,
+    #[serde(default)]
     finalize: String,
+    #[serde(default)]
+    certificate: Option<String>,
+    #[serde(default)]
+    error: Option<AcmeError>,
 }
 
 impl AcmeOrderSession {
@@ -449,7 +467,7 @@ impl AcmeClient {
     // 已有方法改为使用 inner
     pub async fn new(account: AcmeAccount, acme_directory: String) -> Result<Self> {
         info!("create acme client, account: {}", account);
-        let http_client = reqwest::Client::new();
+        let http_client = reqwest::Client::builder().no_proxy().build().unwrap();
 
         let inner = AcmeClientInner {
             directory: tokio::sync::Mutex::new(None),
@@ -587,13 +605,7 @@ impl AcmeClient {
         }))
     }
 
-    // 新增方法
-    async fn get_challenge(&self, auth_url: &str) -> Result<Vec<Challenge>> {
-        info!(
-            "get acme challenge, client: {}, auth_url: {}",
-            self, auth_url
-        );
-
+    async fn fetch_authz_by_get(&self, auth_url: &str) -> Result<AuthzResponse> {
         let response = self
             .inner
             .http_client
@@ -602,11 +614,11 @@ impl AcmeClient {
             .await
             .map_err(|e| {
                 error!(
-                    "get acme challenge failed, client: {}, auth_url: {}, {}",
+                    "get acme authz failed, client: {}, auth_url: {}, {}",
                     self, auth_url, e
                 );
                 anyhow::anyhow!(
-                    "get acme challenge failed, client: {}, auth_url: {}, {}",
+                    "get acme authz failed, client: {}, auth_url: {}, {}",
                     self,
                     auth_url,
                     e
@@ -614,6 +626,91 @@ impl AcmeClient {
             })?;
 
         let authz: AuthzResponse = response.json().await?;
+        Ok(authz)
+    }
+
+    async fn fetch_authz(&self, auth_url: &str) -> Result<AuthzResponse> {
+        info!("fetch acme authz, client: {}, auth_url: {}", self, auth_url);
+
+        match self.get_directory().await {
+            Ok(directory) => match self.signed_post_as_get(auth_url, directory).await {
+                Ok(authz) => return Ok(authz),
+                Err(e) => {
+                    info!(
+                        "post-as-get acme authz failed, fallback to get, client: {}, auth_url: {}, {}",
+                        self, auth_url, e
+                    );
+                }
+            },
+            Err(e) => {
+                info!(
+                    "prepare post-as-get acme authz failed, fallback to get, client: {}, auth_url: {}, {}",
+                    self, auth_url, e
+                );
+            }
+        }
+
+        self.fetch_authz_by_get(auth_url).await
+    }
+
+    async fn fetch_order_by_get(&self, order_url: &str) -> Result<OrderResponse> {
+        let response = self
+            .inner
+            .http_client
+            .get(order_url)
+            .send()
+            .await
+            .map_err(|e| {
+                error!(
+                    "get acme order failed, client: {}, order_url: {}, {}",
+                    self, order_url, e
+                );
+                anyhow::anyhow!(
+                    "get acme order failed, client: {}, order_url: {}, {}",
+                    self,
+                    order_url,
+                    e
+                )
+            })?;
+
+        let order: OrderResponse = response.json().await?;
+        Ok(order)
+    }
+
+    async fn fetch_order(&self, order_url: &str) -> Result<OrderResponse> {
+        info!(
+            "fetch acme order, client: {}, order_url: {}",
+            self, order_url
+        );
+
+        match self.get_directory().await {
+            Ok(directory) => match self.signed_post_as_get(order_url, directory).await {
+                Ok(order) => return Ok(order),
+                Err(e) => {
+                    info!(
+                        "post-as-get acme order failed, fallback to get, client: {}, order_url: {}, {}",
+                        self, order_url, e
+                    );
+                }
+            },
+            Err(e) => {
+                info!(
+                    "prepare post-as-get acme order failed, fallback to get, client: {}, order_url: {}, {}",
+                    self, order_url, e
+                );
+            }
+        }
+
+        self.fetch_order_by_get(order_url).await
+    }
+
+    async fn get_challenge(&self, auth_url: &str) -> Result<Vec<Challenge>> {
+        info!(
+            "get acme challenge, client: {}, auth_url: {}",
+            self, auth_url
+        );
+
+        let authz = self.fetch_authz(auth_url).await?;
 
         let mut challengs = vec![];
         for challenge in authz.challenges.iter() {
@@ -767,26 +864,18 @@ impl AcmeClient {
         let wait_seconds = 3;
 
         for _ in 0..max_attempts {
-            let response = self
-                .inner
-                .http_client
-                .get(auth_url)
-                .send()
-                .await
-                .map_err(|e| {
-                    error!(
-                        "poll acme authorization failed, client: {}, auth_url: {}, {}",
-                        self, auth_url, e
-                    );
-                    anyhow::anyhow!(
-                        "poll acme authorization failed, client: {}, auth_url: {}, {}",
-                        self,
-                        auth_url,
-                        e
-                    )
-                })?;
-
-            let authz: AuthzResponse = response.json().await?;
+            let authz = self.fetch_authz(auth_url).await.map_err(|e| {
+                error!(
+                    "poll acme authorization failed, client: {}, auth_url: {}, {}",
+                    self, auth_url, e
+                );
+                anyhow::anyhow!(
+                    "poll acme authorization failed, client: {}, auth_url: {}, {}",
+                    self,
+                    auth_url,
+                    e
+                )
+            })?;
 
             match authz.status.as_str() {
                 "valid" => {
@@ -832,11 +921,18 @@ impl AcmeClient {
     }
 
     /// 完成订单
-    async fn finalize_order(&self, url: &str, directory: Directory, csr: &[u8]) -> Result<String> {
+    async fn finalize_order(
+        &self,
+        url: &str,
+        order_url: Option<&str>,
+        directory: Directory,
+        csr: &[u8],
+    ) -> Result<String> {
         info!(
-            "finalize acme order, client: {}, url: {}, csr: {}",
+            "finalize acme order, client: {}, url: {}, order_url: {:?}, csr: {}",
             self,
             url,
+            order_url,
             csr.len()
         );
         let payload = serde_json::json!({
@@ -864,9 +960,10 @@ impl AcmeClient {
                 })?;
 
         info!(
-            "finalize acme order success, client: {}, url: {}, csr: {}, response: {:?}",
+            "finalize acme order success, client: {}, url: {}, order_url: {:?}, csr: {}, response: {:?}",
             self,
             url,
+            order_url,
             csr.len(),
             response
         );
@@ -874,6 +971,15 @@ impl AcmeClient {
             "valid" => Ok(response
                 .certificate
                 .ok_or_else(|| anyhow::anyhow!("No certificate URL in response"))?),
+            "processing" | "pending" | "ready" => {
+                let order_url = order_url.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Order finalization returned status {} but no order URL is available",
+                        response.status
+                    )
+                })?;
+                self.poll_order_certificate(order_url).await
+            }
             _ => Err(anyhow::anyhow!(
                 "Order finalization failed: {}",
                 response.status
@@ -884,6 +990,33 @@ impl AcmeClient {
     /// 下载证书
     async fn download_certificate(&self, url: &str) -> Result<Vec<u8>> {
         info!("download acme certificate, client: {}, url: {}", self, url);
+
+        match self.get_directory().await {
+            Ok(directory) => match self
+                .signed_post_as_get_bytes(url, directory, Some("application/pem-certificate-chain"))
+                .await
+            {
+                Ok(cert_data) => {
+                    info!(
+                        "download acme certificate success via post-as-get, client: {}, url: {}",
+                        self, url
+                    );
+                    return Ok(cert_data);
+                }
+                Err(e) => {
+                    info!(
+                        "post-as-get certificate download failed, fallback to get, client: {}, url: {}, {}",
+                        self, url, e
+                    );
+                }
+            },
+            Err(e) => {
+                info!(
+                    "prepare post-as-get certificate download failed, fallback to get, client: {}, url: {}, {}",
+                    self, url, e
+                );
+            }
+        }
 
         let response = self
             .inner
@@ -923,7 +1056,7 @@ impl AcmeClient {
         &self,
         domains: &[String],
         directory: Directory,
-    ) -> Result<(Vec<String>, String)> {
+    ) -> Result<(Vec<String>, String, Option<String>)> {
         info!(
             "create acme order, client: {}, domains: {}",
             self,
@@ -940,9 +1073,16 @@ impl AcmeClient {
                 .collect(),
         };
 
-        // 发送订单请求
-        let response: OrderResponse = self
-            .signed_post(directory.new_order.clone().as_str(), directory, &request)
+        let nonce = self.get_nonce(directory.clone()).await?;
+        let jws = self.sign_request(directory.new_order.as_str(), &nonce, &request)?;
+
+        let response = self
+            .inner
+            .http_client
+            .post(directory.new_order.as_str())
+            .header("Content-Type", "application/jose+json")
+            .json(&jws)
+            .send()
             .await
             .map_err(|e| {
                 error!(
@@ -959,15 +1099,67 @@ impl AcmeClient {
                 )
             })?;
 
+        let order_url = response
+            .headers()
+            .get("Location")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+
+        let response: OrderResponse = self.handle_response(response).await?;
+
         info!(
-            "create acme order success, client: {}, domains: {}, response: {:?}",
+            "create acme order success, client: {}, domains: {}, order_url: {:?}, response: {:?}",
             self,
             domains.join(","),
+            order_url,
             response
         );
 
-        // 返回授权URL列表和finalize URL
-        Ok((response.authorizations, response.finalize))
+        // 返回授权URL列表、finalize URL和order URL
+        Ok((response.authorizations, response.finalize, order_url))
+    }
+
+    async fn poll_order_certificate(&self, order_url: &str) -> Result<String> {
+        info!(
+            "poll acme order, client: {}, order_url: {}",
+            self, order_url
+        );
+        let max_attempts = 10;
+        let wait_seconds = 3;
+
+        for _ in 0..max_attempts {
+            let order = self.fetch_order(order_url).await?;
+
+            match order.status.as_str() {
+                "valid" => {
+                    return order
+                        .certificate
+                        .ok_or_else(|| anyhow::anyhow!("No certificate URL in order response"));
+                }
+                "processing" | "pending" | "ready" => {
+                    info!(
+                        "poll acme order pending, client: {}, order_url: {}, status: {}, wait {} seconds",
+                        self, order_url, order.status, wait_seconds
+                    );
+                    tokio::time::sleep(Duration::from_secs(wait_seconds)).await;
+                }
+                "invalid" => {
+                    return Err(anyhow::anyhow!(
+                        "Order became invalid: {}",
+                        order
+                            .error
+                            .as_ref()
+                            .map(|e| format!("{} ({})", e.detail, e.type_))
+                            .unwrap_or_else(|| "unknown error".to_string())
+                    ));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unexpected order status: {}", order.status));
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Order polling timeout"))
     }
 
     fn generate_csr(&self, domains: &[String]) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -1016,6 +1208,48 @@ impl AcmeClient {
             .await?;
 
         self.handle_response(response).await
+    }
+
+    async fn signed_post_as_get<R>(&self, url: &str, directory: Directory) -> Result<R>
+    where
+        R: DeserializeOwned,
+    {
+        let nonce = self.get_nonce(directory).await?;
+        let jws = self.sign_request_with_payload_b64(url, &nonce, "")?;
+
+        let response = self
+            .inner
+            .http_client
+            .post(url)
+            .header("Content-Type", "application/jose+json")
+            .json(&jws)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    async fn signed_post_as_get_bytes(
+        &self,
+        url: &str,
+        directory: Directory,
+        accept: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let nonce = self.get_nonce(directory).await?;
+        let jws = self.sign_request_with_payload_b64(url, &nonce, "")?;
+
+        let mut request = self
+            .inner
+            .http_client
+            .post(url)
+            .header("Content-Type", "application/jose+json");
+
+        if let Some(accept) = accept {
+            request = request.header("Accept", accept);
+        }
+
+        let response = request.json(&jws).send().await?;
+        self.handle_response_bytes(response).await
     }
 
     /// 获取 nonce
@@ -1081,6 +1315,23 @@ impl AcmeClient {
         Ok(result)
     }
 
+    async fn handle_response_bytes(&self, response: reqwest::Response) -> Result<Vec<u8>> {
+        if let Some(new_nonce) = response.headers().get("Replay-Nonce") {
+            if let Ok(nonce) = new_nonce.to_str() {
+                self.inner.nonce_manager.update_nonce(nonce.to_string());
+            }
+        }
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await?;
+            error!("acme response error, status: {}, body: {}", status, body);
+            return Err(anyhow::anyhow!("HTTP error: {} - {}", status, body));
+        }
+
+        Ok(response.bytes().await?.to_vec())
+    }
+
     /// 签名请求数据
     fn sign_request<T: Serialize>(
         &self,
@@ -1090,6 +1341,17 @@ impl AcmeClient {
     ) -> Result<serde_json::Value> {
         let payload_str = serde_json::to_string(payload)?;
         let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_str);
+
+        self.sign_request_with_payload_b64(url, nonce, payload_b64.as_str())
+    }
+
+    fn sign_request_with_payload_b64(
+        &self,
+        url: &str,
+        nonce: &str,
+        payload_b64: &str,
+    ) -> Result<serde_json::Value> {
+        let payload_b64 = payload_b64.to_owned();
 
         let protected = if let Some(kid) = self.inner.account.kid() {
             // 已注册账户使用 kid

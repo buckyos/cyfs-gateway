@@ -1,4 +1,4 @@
-use crate::global_process_chains::{
+﻿use crate::global_process_chains::{
     GlobalProcessChainsRef, create_process_chain_executor, execute_stream_chain,
 };
 use crate::self_cert_mgr::SelfCertMgrRef;
@@ -43,7 +43,6 @@ const PROXY_V1_PREFIX: &[u8; 6] = b"PROXY ";
 const PROXY_V2_SIGNATURE: [u8; 12] = [
     0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
 ];
-
 #[derive(Debug, Clone, Copy)]
 enum ProxyProbeResult {
     NeedMore,
@@ -97,6 +96,7 @@ async fn build_tls_domain_configs(certs: &[StackCertConfig]) -> StackResult<Vec<
             cert_list.push(TlsDomainConfig {
                 domain: cert_config.domain.clone(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(certs),
                 key: Some(key),
                 data: None,
@@ -104,7 +104,8 @@ async fn build_tls_domain_configs(certs: &[StackCertConfig]) -> StackResult<Vec<
         } else {
             cert_list.push(TlsDomainConfig {
                 domain: cert_config.domain.clone(),
-                acme_type: cert_config.acme_type,
+                acme_type: cert_config.acme_type.clone(),
+                acme_issuer: cert_config.acme_issuer.clone(),
                 certs: None,
                 key: None,
                 data: cert_config.data.clone(),
@@ -476,6 +477,7 @@ impl TlsConnectionHandler {
                     .add_acme_item(AcmeItem::new(
                         cert_config.domain,
                         cert_config.acme_type.unwrap_or(ChallengeType::TlsAlpn01),
+                        cert_config.acme_issuer,
                         cert_config.data,
                     ))
                     .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
@@ -1186,17 +1188,19 @@ impl Stack for TlsStack {
 pub struct TlsDomainConfig {
     pub domain: String,
     pub acme_type: Option<ChallengeType>,
+    pub acme_issuer: Option<String>,
     pub certs: Option<Vec<CertificateDer<'static>>>,
     pub key: Option<PrivateKeyDer<'static>>,
     pub data: Option<serde_json::Value>,
 }
 
-// 为TlsDomainConfig实现Clone trait
+// 涓篢lsDomainConfig瀹炵幇Clone trait
 impl Clone for TlsDomainConfig {
     fn clone(&self) -> Self {
         Self {
             domain: self.domain.clone(),
             acme_type: self.acme_type.clone(),
+            acme_issuer: self.acme_issuer.clone(),
             certs: self.certs.clone(),
             key: match &self.key {
                 None => None,
@@ -1552,6 +1556,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -1598,6 +1603,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -1671,6 +1677,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -1746,6 +1753,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -1838,6 +1846,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -1918,6 +1927,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "*".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: None,
                 key: None,
                 data: None,
@@ -2093,6 +2103,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -2193,6 +2204,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -2310,6 +2322,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -2412,6 +2425,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -2498,6 +2512,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -2603,6 +2618,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -2728,6 +2744,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -2870,6 +2887,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -2958,6 +2976,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -3058,6 +3077,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -3158,6 +3178,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: "www.buckyos.com".to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(vec![cert_key.cert.der().clone()]),
                 key: Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
                     cert_key.signing_key.serialize_der(),
@@ -3405,6 +3426,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: server_name.to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(server_chain),
                 key: Some(server_key),
                 data: None,
@@ -3485,6 +3507,7 @@ mod tests {
             .add_certs(vec![TlsDomainConfig {
                 domain: server_name.to_string(),
                 acme_type: None,
+                acme_issuer: None,
                 certs: Some(server_chain),
                 key: Some(server_key),
                 data: None,

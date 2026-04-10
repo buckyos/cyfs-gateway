@@ -162,6 +162,7 @@ impl TunnelClientCertManager {
                         acme_manager.add_acme_item(AcmeItem::new(
                             domain.clone(),
                             acme_type.clone(),
+                            None,
                             data,
                         ))?;
 

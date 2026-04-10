@@ -380,7 +380,7 @@ pub fn read_login_token(server: &str) -> Option<String> {
         };
 
         let (token, _) =
-            match RPCSessionToken::generate_jwt_token("root", "cyfs-gateway", None, &encode_key) {
+            match RPCSessionToken::generate_jwt_token("root", "cyfs_gateway", None, &encode_key) {
                 Ok(token) => token,
                 Err(e) => {
                     error!("generate jwt token failed: {}", e);

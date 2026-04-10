@@ -564,6 +564,10 @@ pub(crate) async fn run_server_tempalte_pkg(
 async fn build_acme_mgr_from_config(
     acme_config: &Option<AcmeConfig>,
 ) -> Result<AcmeCertManagerRef> {
+    fn parse_acme_duration(value: Option<u64>) -> Option<chrono::Duration> {
+        value.and_then(|seconds| chrono::Duration::new(seconds as i64, 0))
+    }
+
     let mut cert_config = CertManagerConfig::default();
     let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
     let dns_provider_dir = get_buckyos_system_etc_dir()
@@ -576,20 +580,30 @@ async fn build_acme_mgr_from_config(
             cert_config.acme_server = acme_config.issuer.unwrap();
         }
         cert_config.dns_providers = acme_config.dns_providers;
-        if acme_config.check_interval.is_some() {
-            if let Some(check_interval) =
-                chrono::Duration::new(acme_config.check_interval.unwrap() as i64, 0)
-            {
-                cert_config.check_interval = check_interval;
-            }
+        if let Some(check_interval) = parse_acme_duration(acme_config.check_interval) {
+            cert_config.check_interval = check_interval;
         }
 
-        if acme_config.renew_before_expiry.is_some() {
-            if let Some(renew_before_expiry) =
-                chrono::Duration::new(acme_config.renew_before_expiry.unwrap() as i64, 0)
-            {
-                cert_config.renew_before_expiry = renew_before_expiry;
-            }
+        if let Some(renew_before_expiry) = parse_acme_duration(acme_config.renew_before_expiry) {
+            cert_config.renew_before_expiry = renew_before_expiry;
+        }
+
+        for (name, issuer_config) in acme_config.issuers {
+            cert_config.issuers.insert(
+                name,
+                CertManagerIssuerConfig {
+                    account: issuer_config.account.or_else(|| cert_config.account.clone()),
+                    acme_server: issuer_config
+                        .issuer
+                        .unwrap_or_else(|| cert_config.acme_server.clone()),
+                    check_interval: parse_acme_duration(issuer_config.check_interval)
+                        .unwrap_or(cert_config.check_interval),
+                    renew_before_expiry: parse_acme_duration(
+                        issuer_config.renew_before_expiry,
+                    )
+                    .unwrap_or(cert_config.renew_before_expiry),
+                },
+            );
         }
     }
     cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
