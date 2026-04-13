@@ -1,4 +1,4 @@
-use crate::{SnDBRef, SnV2AuthInfo, SNServer};
+use crate::{SNServer, SnDBRef, SnV2AuthInfo};
 use ::kRPC::*;
 use buckyos_kit::get_buckyos_service_data_dir;
 use jsonwebtoken::{jwk::Jwk, DecodingKey, EncodingKey};
@@ -51,8 +51,7 @@ impl SnV2AuthManager {
         let private_key = data_dir.join("private_key.pem");
         let public_key = data_dir.join("public_key.json");
         let (encode_key, decode_key) = if private_key.exists() && public_key.exists() {
-            let encode_key =
-                load_private_key(private_key.as_path()).map_err(|e| e.to_string())?;
+            let encode_key = load_private_key(private_key.as_path()).map_err(|e| e.to_string())?;
             let public_key = std::fs::read_to_string(public_key.as_path())
                 .map_err(|e| format!("read public key failed: {}", e))?;
             let public_key: Jwk = serde_json::from_str(public_key.as_str())
@@ -262,8 +261,12 @@ pub(crate) fn parse_params<T>(req: &RPCRequest) -> RpcCallResult<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    serde_json::from_value(req.params.clone())
-        .map_err(|e| parse_error(SnV2ErrorCode::InvalidParams, format!("{}: {}", req.method, e)))
+    serde_json::from_value(req.params.clone()).map_err(|e| {
+        parse_error(
+            SnV2ErrorCode::InvalidParams,
+            format!("{}: {}", req.method, e),
+        )
+    })
 }
 
 pub(crate) fn ok_response(req: &RPCRequest, value: Value) -> RpcCallResult<RPCResponse> {
@@ -346,10 +349,18 @@ pub(crate) fn verify_password(password: &str, auth: &SnV2AuthInfo) -> RpcCallRes
             format!("unsupported password algo {}", auth.password_algo),
         ));
     }
-    let salt = hex::decode(auth.password_salt.as_str())
-        .map_err(|e| reason_error(SnV2ErrorCode::InvalidPasswordStorage, format!("invalid password salt: {}", e)))?;
-    let expected = hex::decode(auth.password_hash.as_str())
-        .map_err(|e| reason_error(SnV2ErrorCode::InvalidPasswordStorage, format!("invalid password hash: {}", e)))?;
+    let salt = hex::decode(auth.password_salt.as_str()).map_err(|e| {
+        reason_error(
+            SnV2ErrorCode::InvalidPasswordStorage,
+            format!("invalid password salt: {}", e),
+        )
+    })?;
+    let expected = hex::decode(auth.password_hash.as_str()).map_err(|e| {
+        reason_error(
+            SnV2ErrorCode::InvalidPasswordStorage,
+            format!("invalid password hash: {}", e),
+        )
+    })?;
     Ok(pbkdf2::verify(
         PBKDF2_HMAC_SHA256,
         NonZeroU32::new(PASSWORD_ITERATIONS).unwrap(),
@@ -361,8 +372,12 @@ pub(crate) fn verify_password(password: &str, auth: &SnV2AuthInfo) -> RpcCallRes
 }
 
 fn derive_password_hash(password: &str, salt_hex: &str) -> RpcCallResult<String> {
-    let salt = hex::decode(salt_hex)
-        .map_err(|e| reason_error(SnV2ErrorCode::InvalidPasswordStorage, format!("invalid password salt: {}", e)))?;
+    let salt = hex::decode(salt_hex).map_err(|e| {
+        reason_error(
+            SnV2ErrorCode::InvalidPasswordStorage,
+            format!("invalid password salt: {}", e),
+        )
+    })?;
     let mut hash = [0u8; 32];
     pbkdf2::derive(
         PBKDF2_HMAC_SHA256,
@@ -377,7 +392,10 @@ fn derive_password_hash(password: &str, salt_hex: &str) -> RpcCallResult<String>
 pub(crate) fn normalize_username(username: &str) -> RpcCallResult<String> {
     let username = username.trim().to_lowercase();
     if username.is_empty() {
-        return Err(parse_error(SnV2ErrorCode::InvalidUsername, "username is empty"));
+        return Err(parse_error(
+            SnV2ErrorCode::InvalidUsername,
+            "username is empty",
+        ));
     }
     if SNServer::contains_special_chars(username.as_str()) {
         return Err(parse_error(
@@ -401,13 +419,12 @@ pub(crate) fn normalize_public_key(public_key: Value) -> RpcCallResult<String> {
         }
         Value::Object(_) => {
             let s = public_key.to_string();
-            let _: Jwk = serde_json::from_str(s.as_str())
-                .map_err(|e| {
-                    parse_error(
-                        SnV2ErrorCode::InvalidPublicKey,
-                        format!("invalid public key: {}", e),
-                    )
-                })?;
+            let _: Jwk = serde_json::from_str(s.as_str()).map_err(|e| {
+                parse_error(
+                    SnV2ErrorCode::InvalidPublicKey,
+                    format!("invalid public key: {}", e),
+                )
+            })?;
             Ok(s)
         }
         _ => Err(parse_error(
@@ -496,13 +513,12 @@ pub(crate) fn ensure_owner_key_bound(user: &crate::SNUserInfo) -> RpcCallResult<
 
 pub(crate) fn ensure_owner_decoding_key(user: &crate::SNUserInfo) -> RpcCallResult<DecodingKey> {
     ensure_owner_key_bound(user)?;
-    let user_public_key: Jwk = serde_json::from_str(user.public_key.as_str())
-        .map_err(|e| {
-            parse_error(
-                SnV2ErrorCode::InvalidPublicKey,
-                format!("invalid user public key: {}", e),
-            )
-        })?;
+    let user_public_key: Jwk = serde_json::from_str(user.public_key.as_str()).map_err(|e| {
+        parse_error(
+            SnV2ErrorCode::InvalidPublicKey,
+            format!("invalid user public key: {}", e),
+        )
+    })?;
     DecodingKey::from_jwk(&user_public_key).map_err(|e| {
         parse_error(
             SnV2ErrorCode::InvalidPublicKey,

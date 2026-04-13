@@ -4,7 +4,7 @@ use super::common::{
 };
 use super::errors::{parse_error, SnV2ErrorCode};
 use crate::SNServer;
-use ::kRPC::{RPCRequest, RPCResponse, RPCErrors};
+use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use serde_json::json;
 
 pub(crate) async fn handle_zone(server: &SNServer, req: RPCRequest) -> RpcCallResult<RPCResponse> {

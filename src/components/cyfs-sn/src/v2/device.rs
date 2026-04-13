@@ -1,12 +1,11 @@
 use super::common::{
-    device_to_json, ensure_owner_decoding_key, ok_response, parse_params,
-    query_by_did, require_account_username, resolve_self_scoped_username, DeviceGetReq,
-    DeviceRegisterReq, DeviceUpdateReq, IntoRpcResult, QueryByDidReq, QueryByHostnameReq,
-    QueryByPkReq, RpcCallResult,
+    device_to_json, ensure_owner_decoding_key, ok_response, parse_params, query_by_did,
+    require_account_username, resolve_self_scoped_username, DeviceGetReq, DeviceRegisterReq,
+    DeviceUpdateReq, IntoRpcResult, QueryByDidReq, QueryByHostnameReq, QueryByPkReq, RpcCallResult,
 };
 use super::errors::{parse_error, SnV2ErrorCode};
 use crate::SNServer;
-use ::kRPC::{RPCRequest, RPCResponse, RPCErrors};
+use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use serde_json::{json, Value};
 
 pub(crate) async fn handle_device(
@@ -55,7 +54,10 @@ pub(crate) async fn handle_device(
         "update" => {
             let username = require_account_username(server, &req)?;
             let params: DeviceUpdateReq = parse_params(&req)?;
-            match (params.device_did.as_deref(), params.mini_config_jwt.as_deref()) {
+            match (
+                params.device_did.as_deref(),
+                params.mini_config_jwt.as_deref(),
+            ) {
                 (Some(device_did), Some(mini_config_jwt)) => {
                     server
                         .db()
@@ -129,7 +131,9 @@ pub(crate) async fn handle_device(
             let ood_info = server
                 .query_device_by_hostname_v2(params.dest_host.as_str())
                 .await
-                .ok_or_else(|| parse_error(SnV2ErrorCode::HostnameNotFound, "hostname not found"))?;
+                .ok_or_else(|| {
+                    parse_error(SnV2ErrorCode::HostnameNotFound, "hostname not found")
+                })?;
             ok_response(&req, serde_json::to_value(ood_info).unwrap())
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),

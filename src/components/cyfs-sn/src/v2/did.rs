@@ -4,7 +4,7 @@ use super::common::{
 };
 use super::errors::{parse_error, SnV2ErrorCode};
 use crate::SNServer;
-use ::kRPC::{RPCRequest, RPCResponse, RPCErrors};
+use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use serde_json::{json, Value};
 use sha2::Digest;
 
@@ -51,10 +51,7 @@ pub(crate) async fn handle_did(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 .await
                 .into_rpc()?
                 .ok_or_else(|| {
-                    parse_error(
-                        SnV2ErrorCode::DidDocumentNotFound,
-                        "did document not found",
-                    )
+                    parse_error(SnV2ErrorCode::DidDocumentNotFound, "did document not found")
                 })?;
             let did_document = if doc.1.trim().is_empty() {
                 Value::Null

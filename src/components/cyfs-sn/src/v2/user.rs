@@ -1,10 +1,10 @@
 use super::common::{
-    build_profile_json, normalize_public_key, ok_response, parse_params,
-    require_account_username, BindOwnerKeyReq, IntoRpcResult, RpcCallResult, SetSelfCertReq,
+    build_profile_json, normalize_public_key, ok_response, parse_params, require_account_username,
+    BindOwnerKeyReq, IntoRpcResult, RpcCallResult, SetSelfCertReq,
 };
 use super::errors::{parse_error, SnV2ErrorCode};
 use crate::SNServer;
-use ::kRPC::{RPCRequest, RPCResponse, RPCErrors};
+use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use jsonwebtoken::{jwk::Jwk, DecodingKey};
 use serde_json::{json, Value};
 
@@ -14,20 +14,19 @@ pub(crate) async fn handle_user(server: &SNServer, req: RPCRequest) -> RpcCallRe
             let username = require_account_username(server, &req)?;
             let params: BindOwnerKeyReq = parse_params(&req)?;
             let public_key_str = normalize_public_key(params.public_key)?;
-            let public_key_jwk: Jwk = serde_json::from_str(public_key_str.as_str())
-                .map_err(|e| {
+            let public_key_jwk: Jwk =
+                serde_json::from_str(public_key_str.as_str()).map_err(|e| {
                     parse_error(
                         SnV2ErrorCode::InvalidPublicKey,
                         format!("invalid public key: {}", e),
                     )
                 })?;
-            let _ = DecodingKey::from_jwk(&public_key_jwk)
-                .map_err(|e| {
-                    parse_error(
-                        SnV2ErrorCode::InvalidPublicKey,
-                        format!("invalid public key: {}", e),
-                    )
-                })?;
+            let _ = DecodingKey::from_jwk(&public_key_jwk).map_err(|e| {
+                parse_error(
+                    SnV2ErrorCode::InvalidPublicKey,
+                    format!("invalid public key: {}", e),
+                )
+            })?;
             server
                 .db()
                 .update_user_public_key(username.as_str(), public_key_str.as_str())

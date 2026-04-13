@@ -17,6 +17,8 @@ pub struct SqliteSnDB {
 }
 
 impl SqliteSnDB {
+    const USER_DOMAIN_BINDING_LOCK: &'static str = "sn_user_domain_binding";
+
     pub async fn new() -> SnResult<SqliteSnDB> {
         //获得当前可执行文件所在的目录
         let base_dir = PathBuf::from(std::env::current_exe().unwrap().parent().unwrap());
@@ -62,11 +64,58 @@ impl SqliteSnDB {
             .map_err(into_sn_err!(SnErrorCode::DBError, "create unique index on user_dns_records failed"))?;
         conn.execute_sql(sql_query("CREATE INDEX IF NOT EXISTS user_dns_records_domain_index ON user_dns_records (domain, id)")).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create user_dns_records_domain_index failed"))?;
+        conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS user_domain_history (domain TEXT PRIMARY KEY, owner TEXT NOT NULL, created_at INTEGER NOT NULL)")).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "create user_domain_history table failed"))?;
         conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS did_documents (id INTEGER PRIMARY KEY AUTOINCREMENT, obj_id TEXT, owner_user TEXT, obj_name TEXT, did_document TEXT, doc_type TEXT, update_time INTEGER)")).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create did_documents table failed"))?;
         conn.execute_sql(sql_query("CREATE INDEX IF NOT EXISTS idx_did_documents_owner_obj ON did_documents (owner_user, obj_name, update_time)")).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create did_documents index failed"))?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let rows = conn
+            .query_all(sql_query(
+                "SELECT username, user_domain FROM users WHERE user_domain IS NOT NULL",
+            ))
+            .await
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "query existing user_domain history failed"
+            ))?;
+        for row in rows {
+            let username: String = row.get(0);
+            let user_domain: String = row.get(1);
+            if let Some(canonical_domain) = Self::canonical_user_domain(user_domain.as_str()) {
+                conn.execute_sql(
+                    sql_query("INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at) VALUES (?1, ?2, ?3)")
+                        .bind(canonical_domain)
+                        .bind(username)
+                        .bind(now),
+                )
+                .await
+                .map_err(into_sn_err!(
+                    SnErrorCode::DBError,
+                    "backfill user_domain_history failed"
+                ))?;
+            }
+        }
         Ok(())
+    }
+
+    fn canonical_user_domain(domain: &str) -> Option<String> {
+        let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if normalized.is_empty() {
+            return None;
+        }
+
+        Some(
+            normalized
+                .strip_prefix("*.")
+                .unwrap_or(normalized.as_str())
+                .to_string(),
+        )
     }
 }
 
@@ -292,6 +341,14 @@ impl SnDB for SqliteSnDB {
     ) -> SnResult<bool> {
         let _locker =
             async_named_locker::Locker::get_locker(format!("active_code_{}", active_code)).await;
+        let _user_domain_locker = if user_domain.is_some() {
+            Some(
+                async_named_locker::Locker::get_locker(Self::USER_DOMAIN_BINDING_LOCK.to_string())
+                    .await,
+            )
+        } else {
+            None
+        };
         let mut conn = self
             .pool
             .get_conn()
@@ -312,6 +369,38 @@ impl SnDB for SqliteSnDB {
             Ok(row) => {
                 let used: i32 = row.get(0);
                 if used == 0 {
+                    if let Some(user_domain) = user_domain.as_ref() {
+                        if let Some(canonical_domain) =
+                            Self::canonical_user_domain(user_domain.as_str())
+                        {
+                            let descendant_pattern = format!("%.{}", canonical_domain);
+                            let conflicts = conn
+                                .query_all(
+                                    sql_query("SELECT domain, owner FROM user_domain_history WHERE domain = ?1 OR domain LIKE ?2 OR ?1 LIKE '%.' || domain")
+                                        .bind(canonical_domain.as_str())
+                                        .bind(descendant_pattern),
+                                )
+                                .await
+                                .map_err(into_sn_err!(
+                                    SnErrorCode::DBError,
+                                    "query user_domain history failed"
+                                ))?;
+                            for conflict in conflicts {
+                                let conflict_domain: String = conflict.get(0);
+                                let conflict_owner: String = conflict.get(1);
+                                if conflict_owner != username {
+                                    return Err(sn_err!(
+                                        SnErrorCode::Failed,
+                                        "user_domain {} conflicts with historical domain {} owned by {}",
+                                        user_domain,
+                                        conflict_domain,
+                                        conflict_owner
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     // 插入用户记录
                     conn.execute_sql(sql_query("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain, sn_ips) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
                         .bind(username)
@@ -319,9 +408,31 @@ impl SnDB for SqliteSnDB {
                         .bind(public_key)
                         .bind(active_code)
                         .bind(zone_config)
-                        .bind(user_domain)
+                        .bind(user_domain.clone())
                         .bind(sn_ips)).await
                         .map_err(into_sn_err!(SnErrorCode::DBError, "insert user failed"))?;
+
+                    if let Some(user_domain) = user_domain.as_ref() {
+                        if let Some(canonical_domain) =
+                            Self::canonical_user_domain(user_domain.as_str())
+                        {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as i64;
+                            conn.execute_sql(
+                                sql_query("INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at) VALUES (?1, ?2, ?3)")
+                                    .bind(canonical_domain)
+                                    .bind(username)
+                                    .bind(now),
+                            )
+                            .await
+                            .map_err(into_sn_err!(
+                                SnErrorCode::DBError,
+                                "insert user_domain history failed"
+                            ))?;
+                        }
+                    }
 
                     // 更新激活码为已使用
                     conn.execute_sql(
@@ -375,22 +486,90 @@ impl SnDB for SqliteSnDB {
         zone_config: &str,
         user_domain: Option<String>,
     ) -> SnResult<bool> {
+        let _user_domain_locker = if user_domain.is_some() {
+            Some(
+                async_named_locker::Locker::get_locker(Self::USER_DOMAIN_BINDING_LOCK.to_string())
+                    .await,
+            )
+        } else {
+            None
+        };
         let sn_ips: Option<String> = None;
         let mut conn = self
             .pool
             .get_conn()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        conn.begin_transaction().await.map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "begin transaction failed"
+        ))?;
+
+        if let Some(user_domain) = user_domain.as_ref() {
+            if let Some(canonical_domain) = Self::canonical_user_domain(user_domain.as_str()) {
+                let descendant_pattern = format!("%.{}", canonical_domain);
+                let conflicts = conn
+                    .query_all(
+                        sql_query("SELECT domain, owner FROM user_domain_history WHERE domain = ?1 OR domain LIKE ?2 OR ?1 LIKE '%.' || domain")
+                            .bind(canonical_domain.as_str())
+                            .bind(descendant_pattern),
+                    )
+                    .await
+                    .map_err(into_sn_err!(
+                        SnErrorCode::DBError,
+                        "query user_domain history failed"
+                    ))?;
+                for conflict in conflicts {
+                    let conflict_domain: String = conflict.get(0);
+                    let conflict_owner: String = conflict.get(1);
+                    if conflict_owner != username {
+                        return Err(sn_err!(
+                            SnErrorCode::Failed,
+                            "user_domain {} conflicts with historical domain {} owned by {}",
+                            user_domain,
+                            conflict_domain,
+                            conflict_owner
+                        ));
+                    }
+                }
+            }
+        }
+
         conn.execute_sql(sql_query("INSERT INTO users (username, state, public_key, activation_code, zone_config, user_domain, self_cert, sn_ips) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
             .bind(username)
             .bind(UserState::Active.to_string())
             .bind(public_key)
             .bind("DIRECT")
             .bind(zone_config)
-            .bind(user_domain)
+            .bind(user_domain.clone())
             .bind(true)
             .bind(sn_ips)).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "insert user failed"))?;
+
+        if let Some(user_domain) = user_domain.as_ref() {
+            if let Some(canonical_domain) = Self::canonical_user_domain(user_domain.as_str()) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                conn.execute_sql(
+                    sql_query("INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at) VALUES (?1, ?2, ?3)")
+                        .bind(canonical_domain)
+                        .bind(username)
+                        .bind(now),
+                )
+                .await
+                .map_err(into_sn_err!(
+                    SnErrorCode::DBError,
+                    "insert user_domain history failed"
+                ))?;
+            }
+        }
+
+        conn.commit_transaction().await.map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "commit transaction failed"
+        ))?;
         Ok(true)
     }
 
@@ -416,7 +595,9 @@ impl SnDB for SqliteSnDB {
         ))?;
 
         let active_code_row = conn
-            .query_one(sql_query("SELECT used FROM activation_codes WHERE code = ?1").bind(active_code))
+            .query_one(
+                sql_query("SELECT used FROM activation_codes WHERE code = ?1").bind(active_code),
+            )
             .await;
         let code_unused = match active_code_row {
             Ok(row) => row.get::<i32, _>(0) == 0,
@@ -429,7 +610,10 @@ impl SnDB for SqliteSnDB {
         let user_count: i64 = conn
             .query_one(sql_query("SELECT COUNT(*) FROM users WHERE username = ?1").bind(username))
             .await
-            .map_err(into_sn_err!(SnErrorCode::DBError, "query user count failed"))?
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "query user count failed"
+            ))?
             .get(0);
         if user_count > 0 {
             return Ok(false);
@@ -496,7 +680,10 @@ impl SnDB for SqliteSnDB {
         let user_count: i64 = conn
             .query_one(sql_query("SELECT COUNT(*) FROM users WHERE username = ?1").bind(username))
             .await
-            .map_err(into_sn_err!(SnErrorCode::DBError, "query user count failed"))?
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "query user count failed"
+            ))?
             .get(0);
         if user_count > 0 {
             return Ok(false);
@@ -507,7 +694,10 @@ impl SnDB for SqliteSnDB {
                 sql_query("SELECT COUNT(*) FROM user_auth_v2 WHERE username = ?1").bind(username),
             )
             .await
-            .map_err(into_sn_err!(SnErrorCode::DBError, "query user auth count failed"))?
+            .map_err(into_sn_err!(
+                SnErrorCode::DBError,
+                "query user auth count failed"
+            ))?
             .get(0);
         if auth_count > 0 {
             return Ok(false);
@@ -623,20 +813,83 @@ impl SnDB for SqliteSnDB {
         username: &str,
         user_domain: Option<String>,
     ) -> SnResult<()> {
+        let _user_domain_locker =
+            async_named_locker::Locker::get_locker(Self::USER_DOMAIN_BINDING_LOCK.to_string())
+                .await;
         let mut conn = self
             .pool
             .get_conn()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
+        conn.begin_transaction().await.map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "begin transaction failed"
+        ))?;
+
+        if let Some(user_domain) = user_domain.as_ref() {
+            if let Some(canonical_domain) = Self::canonical_user_domain(user_domain.as_str()) {
+                let descendant_pattern = format!("%.{}", canonical_domain);
+                let conflicts = conn
+                    .query_all(
+                        sql_query("SELECT domain, owner FROM user_domain_history WHERE domain = ?1 OR domain LIKE ?2 OR ?1 LIKE '%.' || domain")
+                            .bind(canonical_domain.as_str())
+                            .bind(descendant_pattern),
+                    )
+                    .await
+                    .map_err(into_sn_err!(
+                        SnErrorCode::DBError,
+                        "query user_domain history failed"
+                    ))?;
+                for conflict in conflicts {
+                    let conflict_domain: String = conflict.get(0);
+                    let conflict_owner: String = conflict.get(1);
+                    if conflict_owner != username {
+                        return Err(sn_err!(
+                            SnErrorCode::Failed,
+                            "user_domain {} conflicts with historical domain {} owned by {}",
+                            user_domain,
+                            conflict_domain,
+                            conflict_owner
+                        ));
+                    }
+                }
+            }
+        }
+
         conn.execute_sql(
             sql_query("UPDATE users SET user_domain =?1 WHERE username =?2")
-                .bind(user_domain)
+                .bind(user_domain.clone())
                 .bind(username),
         )
         .await
         .map_err(into_sn_err!(
             SnErrorCode::DBError,
             "update user user_domain failed"
+        ))?;
+
+        if let Some(user_domain) = user_domain.as_ref() {
+            if let Some(canonical_domain) = Self::canonical_user_domain(user_domain.as_str()) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                conn.execute_sql(
+                    sql_query("INSERT OR IGNORE INTO user_domain_history (domain, owner, created_at) VALUES (?1, ?2, ?3)")
+                        .bind(canonical_domain)
+                        .bind(username)
+                        .bind(now),
+                )
+                .await
+                .map_err(into_sn_err!(
+                    SnErrorCode::DBError,
+                    "insert user_domain history failed"
+                ))?;
+            }
+        }
+
+        conn.commit_transaction().await.map_err(into_sn_err!(
+            SnErrorCode::DBError,
+            "commit transaction failed"
         ))?;
         Ok(())
     }
@@ -1208,9 +1461,11 @@ impl SnDB for SqliteSnDB {
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
         conn.execute_sql(
-            sql_query("UPDATE user_auth_v2 SET last_login_at = ?1, updated_at = ?1 WHERE username = ?2")
-                .bind(last_login_at as i64)
-                .bind(username),
+            sql_query(
+                "UPDATE user_auth_v2 SET last_login_at = ?1, updated_at = ?1 WHERE username = ?2",
+            )
+            .bind(last_login_at as i64)
+            .bind(username),
         )
         .await
         .map_err(into_sn_err!(
@@ -1501,6 +1756,50 @@ mod tests {
                 println!("SN IPs from domain query: {}", sn_ips);
             }
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_user_domain_history_blocks_overlapping_rebinds() -> SnResult<()> {
+        let db_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let db = SqliteSnDB::new_by_path(db_file.path().to_str().unwrap()).await?;
+        db.initialize_database().await?;
+
+        db.register_user_directly("user_b", "pk_b", "", Some("bob.abc.com".to_string()))
+            .await?;
+        db.register_user_directly("user_a", "pk_a", "", None)
+            .await?;
+
+        db.update_user_domain("user_b", None).await?;
+
+        let parent_err = db
+            .update_user_domain("user_a", Some("abc.com".to_string()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            parent_err.contains("conflicts with historical domain bob.abc.com"),
+            "unexpected parent conflict error: {}",
+            parent_err
+        );
+
+        let child_err = db
+            .update_user_domain("user_a", Some("home.bob.abc.com".to_string()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            child_err.contains("conflicts with historical domain bob.abc.com"),
+            "unexpected child conflict error: {}",
+            child_err
+        );
+
+        db.update_user_domain("user_a", Some("alice.abc.com".to_string()))
+            .await?;
+
+        db.update_user_domain("user_b", Some("bob.abc.com".to_string()))
+            .await?;
 
         Ok(())
     }

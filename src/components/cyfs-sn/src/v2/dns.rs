@@ -5,7 +5,7 @@ use super::common::{
 };
 use super::errors::{parse_error, SnV2ErrorCode};
 use crate::SNServer;
-use ::kRPC::{RPCRequest, RPCResponse, RPCErrors};
+use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use serde_json::{json, Value};
 
 pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallResult<RPCResponse> {
@@ -13,12 +13,9 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
         "add_record" => {
             let username = require_account_username(server, &req)?;
             let params: AddDnsRecordReq = parse_params(&req)?;
-            let device = ensure_owned_device(
-                server.db(),
-                username.as_str(),
-                params.device_did.as_str(),
-            )
-            .await?;
+            let device =
+                ensure_owned_device(server.db(), username.as_str(), params.device_did.as_str())
+                    .await?;
             let domain_suffix = format!(".{}.web3.{}", username, server.server_host_v2());
             if !params.domain.ends_with(domain_suffix.as_str()) {
                 return Err(parse_error(

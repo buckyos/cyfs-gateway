@@ -4476,50 +4476,6 @@ mod tests {
             format!("{}.buckyos.ai", TEST_USER_V2)
         );
 
-        let access_unbind = zone_krpc
-            .call(
-                "zone.unbind_config",
-                json!({
-                    "user_name": TEST_USER_V2
-                }),
-            )
-            .await;
-        assert!(access_unbind.is_err());
-
-        let owner_zone_krpc = kRPC::new(
-            "http://127.0.0.1:19092/kapi/sn/bns",
-            Some(owner_signed_token.clone()),
-        );
-        let result = owner_zone_krpc
-            .call(
-                "zone.unbind_config",
-                json!({
-                    "user_name": TEST_USER_V2
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
-
-        let result = zone_krpc.call("zone.get", json!({})).await.unwrap();
-        assert_eq!(result["boot"].as_str().unwrap(), "");
-        assert_eq!(
-            result["user_domain"].as_str().unwrap(),
-            format!("{}.buckyos.ai", TEST_USER_V2)
-        );
-
-        let result = zone_krpc
-            .call(
-                "zone.bind_config",
-                json!({
-                    "zone_config": zone_jwt,
-                    "user_domain": format!("{}.buckyos.ai", TEST_USER_V2)
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result["code"].as_i64().unwrap(), 0);
-
         let device_krpc = kRPC::new(
             "http://127.0.0.1:19092/kapi/sn/bns",
             Some(login_access_token.clone()),

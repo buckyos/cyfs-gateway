@@ -1,11 +1,11 @@
 use super::common::{
     build_profile_json, hash_password, normalize_username, now_secs, ok_response, parse_params,
     require_account_username, verify_password, ActiveCodeReq, IntoRpcResult, LoginReq, NameReq,
-    PASSWORD_ALGO, RefreshReq, RegisterReq, RpcCallResult,
+    RefreshReq, RegisterReq, RpcCallResult, PASSWORD_ALGO,
 };
 use super::errors::{parse_error, SnV2ErrorCode};
 use crate::SNServer;
-use ::kRPC::{RPCRequest, RPCResponse, RPCErrors};
+use ::kRPC::{RPCErrors, RPCRequest, RPCResponse};
 use serde_json::json;
 
 fn build_auth_success_response(
@@ -48,11 +48,19 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
         "register" => {
             let params: RegisterReq = parse_params(&req)?;
             let username = normalize_username(params.name.as_str())?;
-            SNServer::validate_registration_username(username.as_str()).map_err(|message| {
-                parse_error(SnV2ErrorCode::InvalidUsername, message)
-            })?;
-            if server.db().is_user_exist(username.as_str()).await.into_rpc()?
-                || server.db().get_v2_auth(username.as_str()).await.into_rpc()?.is_some()
+            SNServer::validate_registration_username(username.as_str())
+                .map_err(|message| parse_error(SnV2ErrorCode::InvalidUsername, message))?;
+            if server
+                .db()
+                .is_user_exist(username.as_str())
+                .await
+                .into_rpc()?
+                || server
+                    .db()
+                    .get_v2_auth(username.as_str())
+                    .await
+                    .into_rpc()?
+                    .is_some()
             {
                 return Err(parse_error(
                     SnV2ErrorCode::UsernameAlreadyExists,
