@@ -216,6 +216,10 @@ Base64(SHA256(password + username + ".buckyos"))
   - params: `{ "zone_config": "<jwt>", "user_domain": "optional-domain" }`
   - 兼容旧 `bind_zone_config` 的参数与 token 语义
   - `zone_config` 仍由客户端按旧规则生成签名 JWT
+- `zone.unbind_config`
+  - params: `{ "user_name": "alice" }`
+  - 只支持 owner key 签名 token，不支持 access token
+  - 语义是清空当前用户的 `zone_config`；接口保持幂等，未绑定时也返回成功
 
 ## device
 
@@ -356,6 +360,7 @@ Base64(SHA256(password + username + ".buckyos"))
 - `user.get_owner_key`
 - `user.get_profile`
 - `zone.get`
+- `zone.unbind_config`
 - `device.update`
 - `device.list`
 - `device.get_by_pk`
