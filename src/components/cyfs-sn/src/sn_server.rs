@@ -4507,7 +4507,7 @@ mod tests {
                 "dns.add_record",
                 json!({
                     "device_did": device_config.id.to_string(),
-                    "domain": format!("home.{}.web3.buckyos.ai", TEST_USER_V2),
+                    "domain": format!("home.{}.buckyos.ai", TEST_USER_V2),
                     "record_type": "A",
                     "record": "127.0.0.1",
                     "ttl": 600,
@@ -4517,6 +4517,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
+
+        let result = dns_krpc
+            .call(
+                "dns.remove_record",
+                json!({
+                    "device_did": device_config.id.to_string(),
+                    "domain": "home.other.buckyos.ai",
+                    "record_type": "A"
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("[SNV2:1015:invalid_domain]"));
 
         let did_krpc = kRPC::new(
             "http://127.0.0.1:19092/kapi/sn",
@@ -4561,7 +4575,7 @@ mod tests {
             .call(
                 "query.resolve_hostname",
                 json!({
-                    "host": format!("home.{}.web3.buckyos.ai", TEST_USER_V2)
+                    "host": format!("home.{}.buckyos.ai", TEST_USER_V2)
                 }),
             )
             .await
@@ -4574,7 +4588,7 @@ mod tests {
             .call(
                 "query.by_hostname",
                 json!({
-                    "dest_host": format!("home.{}.web3.buckyos.ai", TEST_USER_V2)
+                    "dest_host": format!("home.{}.buckyos.ai", TEST_USER_V2)
                 }),
             )
             .await
@@ -4609,6 +4623,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["device_name"].as_str().unwrap(), "ood1");
+
+        let result = dns_krpc
+            .call(
+                "dns.remove_record",
+                json!({
+                    "device_did": device_config.id.to_string(),
+                    "domain": format!("home.{}.buckyos.ai", TEST_USER_V2),
+                    "record_type": "A"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
 
         let bns_admin_krpc = kRPC::new(
             "http://127.0.0.1:19092/kapi/sn/bns",
