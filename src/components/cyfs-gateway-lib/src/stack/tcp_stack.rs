@@ -16,7 +16,6 @@ use crate::{
     StackRef, StatManagerRef, StreamInfo, TunnelManager, create_io_dump_stack_config,
     get_external_commands, get_stat_info, hyper_serve_http, into_stack_err, stack_err,
 };
-use clap::value_parser;
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor, StreamRequest};
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};

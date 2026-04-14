@@ -210,7 +210,10 @@ impl Drop for ProcessChainHttpServer {
 }
 
 impl ProcessChainHttpServer {
-    fn request_header_value(req: &http::Request<BoxBody<Bytes, ServerError>>, name: &str) -> &str {
+    fn request_header_value<'a>(
+        req: &'a http::Request<BoxBody<Bytes, ServerError>>,
+        name: &str,
+    ) -> &'a str {
         req.headers()
             .get(name)
             .and_then(|value| value.to_str().ok())
