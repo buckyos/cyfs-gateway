@@ -27,6 +27,7 @@ use cyfs_process_chain::{
 };
 use futures::stream::{self, StreamExt};
 use hickory_proto::op::message::EmitAndCount;
+use hickory_proto::serialize::txt::RDataParser;
 use hickory_proto::xfer::{Protocol, SerialMessage};
 use hickory_proto::{ProtoError, ProtoErrorKind};
 use name_client::{DnsProvider, LocalConfigDnsProvider, NameInfo, NsProvider, RecordType};
@@ -86,6 +87,16 @@ fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RDat
             let mut records = Vec::new();
             for txt in name_info.txt.iter() {
                 records.push(RData::TXT(TXT::new(vec![txt.clone()])));
+            }
+            return Ok(records);
+        }
+        "CAA" => {
+            let mut records = Vec::new();
+            for caa in name_info.caa.iter() {
+                let rdata =
+                    RData::try_from_str(hickory_server::proto::rr::RecordType::CAA, caa.as_str())
+                    .map_err(|e| anyhow::anyhow!("invalid CAA {}: {}", caa, e))?;
+                records.push(rdata);
             }
             return Ok(records);
         }
@@ -208,6 +219,14 @@ impl InnerDnsRecordManager {
                     .or_insert(NameInfo::new(name.as_str()));
                 info.txt.push(value);
             }
+            "CAA" => {
+                let info = records
+                    .entry(name.clone())
+                    .or_insert(HashMap::new())
+                    .entry(record_type)
+                    .or_insert(NameInfo::new(name.as_str()));
+                info.caa.push(value);
+            }
             "CNAME" => {
                 let info = records
                     .entry(name.clone())
@@ -262,10 +281,7 @@ pub struct ProcessChainDnsServer {
 }
 
 impl ProcessChainDnsServer {
-    async fn command_error_to_server_error(
-        &self,
-        value: &CollectionValue,
-    ) -> Option<ServerError> {
+    async fn command_error_to_server_error(&self, value: &CollectionValue) -> Option<ServerError> {
         let CollectionValue::Map(map) = value else {
             return None;
         };
@@ -737,6 +753,7 @@ impl ServerConfig for DnsServerConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::nameinfo_to_rdata;
     use crate::{
         DnsServerConfig, DnsServerContext, InnerDnsRecordManager, LocalDns, ProcessChainDnsServer,
         ProcessChainDnsServerFactory,
@@ -753,7 +770,7 @@ mod tests {
     use hickory_proto::rr::RecordType;
     use hickory_server::proto::rr::{Name, RData};
     use name_client::NameInfo;
-    use name_lib::{DID, EncodedDocument};
+    use name_lib::{EncodedDocument, DID};
     use std::io::Write;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::str::FromStr;
@@ -774,9 +791,10 @@ mod tests {
             _from_ip: Option<IpAddr>,
         ) -> ServerResult<NameInfo> {
             match record_type.unwrap_or_default() {
-                name_client::RecordType::A => {
-                    Ok(NameInfo::from_address(name, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))))
-                }
+                name_client::RecordType::A => Ok(NameInfo::from_address(
+                    name,
+                    IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                )),
                 name_client::RecordType::AAAA => Ok(NameInfo::from_address_vec(name, vec![])),
                 _ => Err(cyfs_gateway_lib::server_err!(
                     ServerErrorCode::NotFound,
@@ -826,6 +844,55 @@ hook_point:
         assert!(ret.is_ok());
     }
 
+    #[test]
+    fn test_nameinfo_to_rdata_caa_variants() {
+        let mut name_info = NameInfo::new("web3.buckyos.ai");
+        name_info.caa = vec![
+            "0 issue \"letsencrypt.org\"".to_string(),
+            "0 iodef \"mailto:ops@buckyos.ai\"".to_string(),
+        ];
+
+        let rdata = nameinfo_to_rdata("CAA", &name_info).unwrap();
+        assert_eq!(rdata.len(), 2);
+        assert!(matches!(rdata[0], RData::CAA(_)));
+        assert!(matches!(rdata[1], RData::CAA(_)));
+
+        let empty = nameinfo_to_rdata("CAA", &NameInfo::new("web3.buckyos.ai")).unwrap();
+        assert!(empty.is_empty());
+
+        let mut invalid = NameInfo::new("web3.buckyos.ai");
+        invalid.caa = vec!["not-a-valid-caa".to_string()];
+        assert!(nameinfo_to_rdata("CAA", &invalid).is_err());
+    }
+
+    #[test]
+    fn test_inner_dns_record_manager_caa_records() {
+        let manager = InnerDnsRecordManager::new();
+        manager
+            .add_record(
+                "web3.buckyos.ai",
+                "CAA",
+                "0 issue \"letsencrypt.org\"",
+            )
+            .unwrap();
+        manager
+            .add_record(
+                "web3.buckyos.ai",
+                "CAA",
+                "0 iodef \"mailto:ops@buckyos.ai\"",
+            )
+            .unwrap();
+
+        let name_info = manager.get_record("web3.buckyos.ai", "CAA").unwrap();
+        assert_eq!(name_info.caa.len(), 2);
+        assert!(name_info
+            .caa
+            .contains(&"0 issue \"letsencrypt.org\"".to_string()));
+
+        manager.remove_record("web3.buckyos.ai", "CAA");
+        assert!(manager.get_record("web3.buckyos.ai", "CAA").is_none());
+    }
+
     #[tokio::test]
     async fn test_process_chain_dns_server_local_dns() {
         let local_dns_content = r#"
@@ -837,6 +904,11 @@ txt = [
 "PKX=qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM;",
 "DEV=eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA;"
 ]
+caa = ["0 issue \"letsencrypt.org\""]
+
+["_acme-challenge.web3.buckyos.com"]
+ttl = 300
+txt = ["challenge-token"]
 
 ["*.buckyos.com"]
 ttl = 300
@@ -1024,6 +1096,57 @@ hook_point:
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
         assert_eq!(resp.answers().len(), 3);
+        assert_eq!(resp.answers()[0].record_type(), RecordType::TXT);
+
+        let mut message = Message::new();
+        let name = Name::from_str("www.buckyos.com.").unwrap();
+        let query = Query::query(name, RecordType::CAA);
+        message.add_query(query);
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let data = server
+            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.answers()[0].record_type(), RecordType::CAA);
+        match resp.answers()[0].data() {
+            RData::CAA(caa) => assert_eq!(caa.to_string(), "0 issue \"letsencrypt.org\""),
+            _ => panic!("expected CAA answer"),
+        }
+
+        let mut message = Message::new();
+        let name = Name::from_str("mail.buckyos.com.").unwrap();
+        let query = Query::query(name, RecordType::CAA);
+        message.add_query(query);
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let data = server
+            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.answers().len(), 0);
+
+        let mut message = Message::new();
+        let name = Name::from_str("_acme-challenge.web3.buckyos.com.").unwrap();
+        let query = Query::query(name, RecordType::TXT);
+        message.add_query(query);
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let data = server
+            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.answers().len(), 1);
         assert_eq!(resp.answers()[0].record_type(), RecordType::TXT);
 
         let mut message = Message::new();

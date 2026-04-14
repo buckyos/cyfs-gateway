@@ -149,7 +149,6 @@ pub(crate) async fn nameinfo_to_map_collection(
             if name_info.txt.is_empty() {
                 return Err(server_err!(ServerErrorCode::InvalidParam, "TXT is empty"));
             }
-
             let txt_set = MemorySetCollection::new();
             for txt in name_info.txt.iter() {
                 txt_set.insert(txt).await.map_err(|e| {
@@ -168,11 +167,29 @@ pub(crate) async fn nameinfo_to_map_collection(
                 })?;
             return Ok(map);
         }
+        "CAA" => {
+            let caa_set = MemorySetCollection::new();
+            for caa in name_info.caa.iter() {
+                caa_set.insert(caa).await.map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::ProcessChainError,
+                        "add caa {} err {}",
+                        caa,
+                        e
+                    )
+                })?;
+            }
+            map.insert("caa", CollectionValue::Set(Arc::new(Box::new(caa_set))))
+                .await
+                .map_err(|e| {
+                    server_err!(ServerErrorCode::ProcessChainError, "add caa err {}", e)
+                })?;
+            return Ok(map);
+        }
         "PTR" => {
             if name_info.ptr_records.is_empty() {
                 return Err(server_err!(ServerErrorCode::InvalidParam, "PTR is empty"));
             }
-
             let ptr_set = MemorySetCollection::new();
             for ptr in name_info.ptr_records.iter() {
                 ptr_set.insert(ptr).await.map_err(|e| {
@@ -380,6 +397,39 @@ pub(crate) async fn map_collection_to_nameinfo(map: &MapCollectionRef) -> Server
 
             Ok(name_info)
         }
+        "CAA" => {
+            let mut name_info = NameInfo::new(name.as_str());
+            let caa = map.get("caa").await.map_err(|e| {
+                server_err!(ServerErrorCode::ProcessChainError, "get caa err {}", e)
+            })?;
+            if let Some(caa) = caa {
+                match caa {
+                    CollectionValue::String(s) => {
+                        name_info.caa.push(s);
+                    }
+                    CollectionValue::Set(s) => {
+                        let all = s.get_all().await.map_err(|e| {
+                            server_err!(
+                                ServerErrorCode::ProcessChainError,
+                                "get caa set all err {}",
+                                e
+                            )
+                        })?;
+                        for item in all.iter() {
+                            name_info.caa.push(item.clone());
+                        }
+                    }
+                    _ => {
+                        return Err(server_err!(
+                            ServerErrorCode::ProcessChainError,
+                            "caa is not string"
+                        ))
+                    }
+                }
+            }
+
+            Ok(name_info)
+        }
         "PTR" => {
             let mut name_info = NameInfo::new(name.as_str());
             let ptr_records = map.get("ptr_records").await.map_err(|e| {
@@ -422,5 +472,38 @@ pub(crate) async fn map_collection_to_nameinfo(map: &MapCollectionRef) -> Server
             "Unknown record type:{}",
             record_type
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_caa_map_collection_round_trip() {
+        let mut name_info = NameInfo::new("web3.buckyos.ai");
+        name_info.ttl = Some(600);
+        name_info.caa = vec![
+            "0 issue \"letsencrypt.org\"".to_string(),
+            "0 iodef \"mailto:ops@buckyos.ai\"".to_string(),
+        ];
+
+        let map = nameinfo_to_map_collection("CAA", &name_info).await.unwrap();
+        let restored = map_collection_to_nameinfo(&map).await.unwrap();
+
+        assert_eq!(restored.name, "web3.buckyos.ai");
+        assert_eq!(restored.caa, name_info.caa);
+    }
+
+    #[tokio::test]
+    async fn test_empty_caa_map_collection_round_trip() {
+        let mut name_info = NameInfo::new("web3.buckyos.ai");
+        name_info.ttl = Some(300);
+
+        let map = nameinfo_to_map_collection("CAA", &name_info).await.unwrap();
+        let restored = map_collection_to_nameinfo(&map).await.unwrap();
+
+        assert_eq!(restored.name, "web3.buckyos.ai");
+        assert!(restored.caa.is_empty());
     }
 }
