@@ -41,6 +41,36 @@ const CLEAR_STATE_ACTIVE_CODE: &str = "zX6cV7bN8mK9lJ0hG1fD";
 const RESERVED_USER_NAMES_FILE_ENV: &str = "BUCKYOS_SN_RESERVED_NAMES_FILE";
 const RESERVED_USER_NAMES_FILE: &str = "reserved_user_names.txt";
 
+fn is_filtered_zonegate_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            if ipv4.is_loopback() {
+                return true;
+            }
+
+            let octets = ipv4.octets();
+            octets[0] == 172 && (16..=31).contains(&octets[1])
+        }
+        IpAddr::V6(ipv6) => ipv6.is_loopback(),
+    }
+}
+
+fn push_zonegate_address(address_vec: &mut Vec<IpAddr>, ip: IpAddr, record_type: RecordType) {
+    if is_filtered_zonegate_ip(ip) {
+        return;
+    }
+
+    if record_type == RecordType::A {
+        if ip.is_ipv4() && !address_vec.contains(&ip) {
+            address_vec.push(ip);
+        }
+    } else if record_type == RecordType::AAAA {
+        if ip.is_ipv6() && !address_vec.contains(&ip) {
+            address_vec.push(ip);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SnRpcPath {
     Root,
@@ -1262,18 +1292,7 @@ impl SNServer {
         ip: IpAddr,
         record_type: RecordType,
     ) {
-        if ip.is_loopback() {
-            return;
-        }
-        if record_type == RecordType::A {
-            if ip.is_ipv4() {
-                address_vec.push(ip);
-            }
-        } else if record_type == RecordType::AAAA {
-            if ip.is_ipv6() {
-                address_vec.push(ip);
-            }
-        }
+        push_zonegate_address(address_vec, ip, record_type);
     }
 
     async fn get_user_zonegate_address(
@@ -3464,6 +3483,81 @@ mod tests {
         let err = SNServer::validate_registration_username("premiumname").unwrap_err();
         assert_eq!(err, "username is reserved by server");
         std::env::remove_var(RESERVED_USER_NAMES_FILE_ENV);
+    }
+
+    #[test]
+    fn test_zonegate_ip_filter_only_blocks_172_private_range() {
+        assert!(is_filtered_zonegate_ip("172.17.0.1".parse().unwrap()));
+        assert!(is_filtered_zonegate_ip("172.31.255.254".parse().unwrap()));
+
+        assert!(!is_filtered_zonegate_ip("192.168.100.191".parse().unwrap()));
+        assert!(!is_filtered_zonegate_ip("207.246.96.13".parse().unwrap()));
+        assert!(!is_filtered_zonegate_ip("240e:3b3:30c0:930::47f".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_push_zonegate_address_for_a_record_keeps_192_filters_172_and_dedups() {
+        let mut addresses = Vec::new();
+
+        push_zonegate_address(
+            &mut addresses,
+            "172.17.0.1".parse().unwrap(),
+            RecordType::A,
+        );
+        push_zonegate_address(
+            &mut addresses,
+            "192.168.100.191".parse().unwrap(),
+            RecordType::A,
+        );
+        push_zonegate_address(
+            &mut addresses,
+            "207.246.96.13".parse().unwrap(),
+            RecordType::A,
+        );
+        push_zonegate_address(
+            &mut addresses,
+            "192.168.100.191".parse().unwrap(),
+            RecordType::A,
+        );
+        push_zonegate_address(&mut addresses, "::1".parse().unwrap(), RecordType::A);
+
+        assert_eq!(
+            addresses,
+            vec![
+                "192.168.100.191".parse::<IpAddr>().unwrap(),
+                "207.246.96.13".parse::<IpAddr>().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_push_zonegate_address_for_aaaa_record_keeps_ipv6_and_filters_loopback() {
+        let mut addresses = Vec::new();
+
+        push_zonegate_address(
+            &mut addresses,
+            "240e:3b3:30c0:930::47f".parse().unwrap(),
+            RecordType::AAAA,
+        );
+        push_zonegate_address(
+            &mut addresses,
+            "fdc8:b144:c39b::47f".parse().unwrap(),
+            RecordType::AAAA,
+        );
+        push_zonegate_address(&mut addresses, "::1".parse().unwrap(), RecordType::AAAA);
+        push_zonegate_address(
+            &mut addresses,
+            "240e:3b3:30c0:930::47f".parse().unwrap(),
+            RecordType::AAAA,
+        );
+
+        assert_eq!(
+            addresses,
+            vec![
+                "240e:3b3:30c0:930::47f".parse::<IpAddr>().unwrap(),
+                "fdc8:b144:c39b::47f".parse::<IpAddr>().unwrap()
+            ]
+        );
     }
 
     #[tokio::test]

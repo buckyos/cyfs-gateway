@@ -40,6 +40,20 @@ use tokio::time::timeout;
 use url::Url;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
+fn is_filtered_tunnel_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            if ipv4.is_loopback() || ipv4.is_unspecified() {
+                return true;
+            }
+
+            let octets = ipv4.octets();
+            octets[0] == 172 && (16..=31).contains(&octets[1])
+        }
+        std::net::IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unspecified(),
+    }
+}
+
 pub struct RTcp {
     inner: Arc<RTcpInner>,
     handle: Option<JoinHandle<()>>,
@@ -326,14 +340,18 @@ impl RTcpInner {
     fn extract_ip_from_info_json(info_json: &Value) -> Option<std::net::IpAddr> {
         if let Some(ip_str) = info_json.get("ip").and_then(|v| v.as_str()) {
             if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
-                return Some(ip);
+                if !is_filtered_tunnel_ip(ip) {
+                    return Some(ip);
+                }
             }
         }
 
         if let Some(ips) = info_json.get("ips").and_then(|v| v.as_array()) {
             for ip in ips.iter().filter_map(|v| v.as_str()) {
                 if let Ok(ip) = ip.parse::<std::net::IpAddr>() {
-                    return Some(ip);
+                    if !is_filtered_tunnel_ip(ip) {
+                        return Some(ip);
+                    }
                 }
             }
         }
@@ -1057,6 +1075,15 @@ impl RTcpInner {
         for candidate in resolve_candidates.iter() {
             match resolve_ip(candidate.as_str()).await {
                 Ok(ip) => {
+                    if is_filtered_tunnel_ip(ip) {
+                        let err_msg = format!("{} => filtered ip {}", candidate, ip);
+                        debug!(
+                            "resolve target device {} failed: {}",
+                            target_id_str, err_msg
+                        );
+                        resolve_errors.push(err_msg);
+                        continue;
+                    }
                     info!(
                         "resolve target device {} ip by {} => {}",
                         target_id_str, candidate, ip
@@ -1879,6 +1906,52 @@ mod tests {
         // 这里可以添加更多针对公共方法的测试
         // 目前只验证基本创建
         assert!(true);
+    }
+
+    #[test]
+    fn test_extract_ip_from_info_json_filters_172_private_ip() {
+        let info_json = serde_json::json!({
+            "ips": ["172.17.0.1", "192.168.100.191", "240e:3b3:30c0:930::47f"]
+        });
+
+        let ip = RTcpInner::extract_ip_from_info_json(&info_json);
+        assert_eq!(
+            ip,
+            Some("192.168.100.191".parse().unwrap()),
+            "172.16/12 should be skipped while 192.168 remains usable"
+        );
+    }
+
+    #[test]
+    fn test_extract_ip_from_info_json_returns_none_when_only_172_private_ip_exists() {
+        let info_json = serde_json::json!({
+            "ips": ["172.17.0.1", "172.20.1.2"]
+        });
+
+        let ip = RTcpInner::extract_ip_from_info_json(&info_json);
+        assert_eq!(ip, None);
+    }
+
+    #[test]
+    fn test_extract_ip_from_info_json_skips_filtered_ip_field_and_falls_back_to_ips() {
+        let info_json = serde_json::json!({
+            "ip": "172.17.0.1",
+            "ips": ["172.20.1.2", "192.168.100.191"]
+        });
+
+        let ip = RTcpInner::extract_ip_from_info_json(&info_json);
+        assert_eq!(ip, Some("192.168.100.191".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_extract_ip_from_info_json_prefers_valid_ip_field() {
+        let info_json = serde_json::json!({
+            "ip": "192.168.100.191",
+            "ips": ["207.246.96.13"]
+        });
+
+        let ip = RTcpInner::extract_ip_from_info_json(&info_json);
+        assert_eq!(ip, Some("192.168.100.191".parse().unwrap()));
     }
 
     // Mock实现用于测试
