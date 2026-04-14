@@ -210,6 +210,24 @@ impl Drop for ProcessChainHttpServer {
 }
 
 impl ProcessChainHttpServer {
+    fn request_header_value(req: &http::Request<BoxBody<Bytes, ServerError>>, name: &str) -> &str {
+        req.headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-")
+    }
+
+    fn request_version(version: http::Version) -> &'static str {
+        match version {
+            http::Version::HTTP_09 => "HTTP/0.9",
+            http::Version::HTTP_10 => "HTTP/1.0",
+            http::Version::HTTP_11 => "HTTP/1.1",
+            http::Version::HTTP_2 => "HTTP/2.0",
+            http::Version::HTTP_3 => "HTTP/3.0",
+            _ => "HTTP/?",
+        }
+    }
+
     pub fn builder() -> ProcessChainHttpServerBuilder {
         ProcessChainHttpServerBuilder {
             id: None,
@@ -872,6 +890,23 @@ impl HttpServer for ProcessChainHttpServer {
             .to_string();
         let req_uri = req.uri().to_string();
         let req_remote = info.src_addr.as_deref().unwrap_or("unknown").to_string();
+        let req_version = Self::request_version(req.version());
+        let req_user_agent = Self::request_header_value(&req, "user-agent").to_string();
+        let req_referer = Self::request_header_value(&req, "referer").to_string();
+        let req_x_forwarded_for = Self::request_header_value(&req, "x-forwarded-for").to_string();
+
+        info!(
+            "{} - - \"{} {} {}\" host=\"{}\" ua=\"{}\" referer=\"{}\" xff=\"{}\" server=\"{}\"",
+            req_remote,
+            req_method,
+            req_uri,
+            req_version,
+            req_host,
+            req_user_agent,
+            req_referer,
+            req_x_forwarded_for,
+            self.id,
+        );
 
         let executor = { self.executor.lock().unwrap().fork() };
 

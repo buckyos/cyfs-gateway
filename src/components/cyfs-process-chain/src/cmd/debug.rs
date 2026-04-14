@@ -196,7 +196,7 @@ impl CommandExecutor for EchoCommandExecutor {
             }
             output_str = output.join(" ");
 
-            debug!("Echo output: {}", output_str);
+            warn!("process_chain echo: {}", output_str);
             let mut stdout = context.pipe().stdout.lock().await;
             debug!("Writing output to stdout: {}", output_str);
             // Write the output to stdout
