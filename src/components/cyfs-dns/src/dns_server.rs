@@ -15,7 +15,7 @@ use hickory_server::server::{Request, RequestHandler, RequestInfo, ResponseHandl
 use hickory_server::ServerFuture;
 use log::trace;
 use log::{debug, error, info, warn};
-use rdata::{A, AAAA, CNAME, PTR, TXT};
+use rdata::{A, AAAA, CNAME, NS, PTR, SOA, TXT};
 use tokio::net::UdpSocket;
 
 use crate::cmd_resolve::CmdResolve;
@@ -33,7 +33,7 @@ use hickory_proto::{ProtoError, ProtoErrorKind};
 use name_client::{DnsProvider, LocalConfigDnsProvider, NameInfo, NsProvider, RecordType};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::timeout;
 use url::Url;
 
@@ -117,6 +117,78 @@ fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RDat
             return Err(anyhow::anyhow!("Unknown record type:{}", record_type));
         }
     }
+}
+
+const AUTH_ZONE_TTL: u32 = 300;
+const AUTH_SOA_REFRESH: i32 = 300;
+const AUTH_SOA_RETRY: i32 = 60;
+const AUTH_SOA_EXPIRE: i32 = 86400;
+const AUTH_SOA_MINIMUM: u32 = 60;
+
+#[derive(Clone, Debug)]
+struct Web3ZoneAuthority {
+    zone_name: Name,
+    zone_name_str: String,
+    ns_name: Name,
+    mbox_name: Name,
+}
+
+fn normalize_fqdn(name: &Name) -> String {
+    name.to_utf8().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn detect_web3_zone_authority(name: &Name) -> Option<Web3ZoneAuthority> {
+    let normalized = normalize_fqdn(name);
+    let labels: Vec<&str> = normalized.split('.').collect();
+    let web3_index = labels.iter().position(|label| *label == "web3")?;
+    if web3_index >= labels.len() - 1 {
+        return None;
+    }
+
+    let zone_name_str = labels[web3_index..].join(".");
+    let suffix = labels[web3_index + 1..].join(".");
+    let zone_name = Name::from_str(format!("{}.", zone_name_str).as_str()).ok()?;
+    let ns_name = Name::from_str(format!("dns.{}.", suffix).as_str()).ok()?;
+    let mbox_name = Name::from_str(format!("hostmaster.{}.", suffix).as_str()).ok()?;
+
+    Some(Web3ZoneAuthority {
+        zone_name,
+        zone_name_str,
+        ns_name,
+        mbox_name,
+    })
+}
+
+fn zone_serial() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(u32::MAX as u64) as u32
+}
+
+fn zone_ns_record(zone: &Web3ZoneAuthority) -> Record {
+    Record::from_rdata(
+        zone.zone_name.clone(),
+        AUTH_ZONE_TTL,
+        RData::NS(NS(zone.ns_name.clone())),
+    )
+}
+
+fn zone_soa_record(zone: &Web3ZoneAuthority) -> Record {
+    Record::from_rdata(
+        zone.zone_name.clone(),
+        AUTH_ZONE_TTL,
+        RData::SOA(SOA::new(
+            zone.ns_name.clone(),
+            zone.mbox_name.clone(),
+            zone_serial(),
+            AUTH_SOA_REFRESH,
+            AUTH_SOA_RETRY,
+            AUTH_SOA_EXPIRE,
+            AUTH_SOA_MINIMUM,
+        )),
+    )
 }
 
 /// Trait for handling incoming requests, and providing a message response.
@@ -383,15 +455,26 @@ impl ProcessChainDnsServer {
         Ok(buffer)
     }
 
-    fn response_code_to_buffer(
+    fn records_response_to_buffer(
         &self,
         request: &Request,
         response_code: ResponseCode,
+        authoritative: bool,
+        answers: Vec<Record>,
+        name_servers: Vec<Record>,
+        soa: Vec<Record>,
     ) -> ServerResult<Vec<u8>> {
         let builder = MessageResponseBuilder::from_message_request(request);
         let mut header = Header::response_from_request(request.header());
         header.set_response_code(response_code);
-        let mut message = builder.build(header, vec![], &[], &[], &[]);
+        header.set_authoritative(authoritative);
+        let mut message = builder.build(
+            header,
+            answers.iter(),
+            name_servers.iter(),
+            soa.iter(),
+            &[],
+        );
 
         let mut buffer = Vec::with_capacity(512);
         {
@@ -410,6 +493,72 @@ impl ProcessChainDnsServer {
         }
 
         Ok(buffer)
+    }
+
+    fn response_code_to_buffer(
+        &self,
+        request: &Request,
+        response_code: ResponseCode,
+    ) -> ServerResult<Vec<u8>> {
+        self.records_response_to_buffer(request, response_code, false, vec![], vec![], vec![])
+    }
+
+    fn authoritative_zone_response_to_buffer(
+        &self,
+        request: &Request,
+        response_code: ResponseCode,
+        answers: Vec<Record>,
+        authority_soa: Vec<Record>,
+    ) -> ServerResult<Vec<u8>> {
+        self.records_response_to_buffer(
+            request,
+            response_code,
+            true,
+            answers,
+            vec![],
+            authority_soa,
+        )
+    }
+
+    fn authoritative_web3_zone_response(
+        &self,
+        request: &Request,
+        request_info: &RequestInfo<'_>,
+    ) -> Option<ServerResult<Vec<u8>>> {
+        let query_name = request_info.query.name();
+        let query_type = request_info.query.query_type();
+        let zone = detect_web3_zone_authority(query_name)?;
+        let query_name_str = normalize_fqdn(query_name);
+        let is_zone_apex = query_name_str == zone.zone_name_str;
+
+        match query_type {
+            hickory_server::proto::rr::RecordType::NS if is_zone_apex => Some(
+                self.authoritative_zone_response_to_buffer(
+                    request,
+                    ResponseCode::NoError,
+                    vec![zone_ns_record(&zone)],
+                    vec![],
+                ),
+            ),
+            hickory_server::proto::rr::RecordType::SOA if is_zone_apex => Some(
+                self.authoritative_zone_response_to_buffer(
+                    request,
+                    ResponseCode::NoError,
+                    vec![zone_soa_record(&zone)],
+                    vec![],
+                ),
+            ),
+            hickory_server::proto::rr::RecordType::NS
+            | hickory_server::proto::rr::RecordType::SOA => Some(
+                self.authoritative_zone_response_to_buffer(
+                    request,
+                    ResponseCode::NoError,
+                    vec![],
+                    vec![zone_soa_record(&zone)],
+                ),
+            ),
+            _ => None,
+        }
     }
 
     async fn handle_request<'a>(
@@ -441,6 +590,10 @@ impl ProcessChainDnsServer {
             .map_err(into_server_err!(ServerErrorCode::BadRequest))?;
         let name = reqeust_info.query.name().to_string();
         let record_type_str = reqeust_info.query.query_type().to_string();
+
+        if let Some(response) = self.authoritative_web3_zone_response(request, &reqeust_info) {
+            return response;
+        }
 
         // First, check if the record exists in the inner record manager
         if let Some(name_info) = self
@@ -593,6 +746,31 @@ impl ProcessChainDnsServer {
                 match self.handle_request(&request, dst_addr).await {
                     Ok(response) => Ok(response),
                     Err(e) => {
+                        if let Ok(request_info) = request.request_info() {
+                            if let Some(zone) = detect_web3_zone_authority(request_info.query.name())
+                            {
+                                let query_type = request_info.query.query_type();
+                                let is_zone_apex =
+                                    normalize_fqdn(request_info.query.name()) == zone.zone_name_str;
+                                let is_core_zone_type = matches!(
+                                    query_type,
+                                    hickory_server::proto::rr::RecordType::A
+                                        | hickory_server::proto::rr::RecordType::AAAA
+                                        | hickory_server::proto::rr::RecordType::TXT
+                                        | hickory_server::proto::rr::RecordType::NS
+                                        | hickory_server::proto::rr::RecordType::SOA
+                                );
+
+                                if is_zone_apex && !is_core_zone_type {
+                                    return self.authoritative_zone_response_to_buffer(
+                                        &request,
+                                        ResponseCode::NoError,
+                                        vec![],
+                                        vec![zone_soa_record(&zone)],
+                                    );
+                                }
+                            }
+                        }
                         let response_code = match e.code() {
                             ServerErrorCode::NotFound => ResponseCode::NXDomain,
                             ServerErrorCode::Rejected => ResponseCode::Refused,
@@ -842,6 +1020,157 @@ hook_point:
         let factory = ProcessChainDnsServerFactory::new();
         let ret = factory.create(config, Some(Arc::new(context))).await;
         assert!(ret.is_ok());
+    }
+
+    async fn create_authoritative_test_server() -> ProcessChainDnsServer {
+        let server_mgr = Arc::new(ServerManager::new());
+        let config = r#"
+type: dns
+id: test
+hook_point:
+  - id: main
+    priority: 1
+    blocks:
+      - id: main
+        block: |
+          return "server missing";
+        "#;
+        let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
+        ProcessChainDnsServer::create_server(
+            config.id,
+            Arc::downgrade(&server_mgr),
+            Some(Arc::new(GlobalProcessChains::new())),
+            Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
+            config.hook_point,
+            InnerDnsRecordManager::new(),
+            Some(Arc::new(JsExternalsManager::new())),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn create_authoritative_notfound_test_server() -> ProcessChainDnsServer {
+        let server_mgr = Arc::new(ServerManager::new());
+        server_mgr
+            .add_server(Server::NameServer(Arc::new(EmptyAaaaNameServer)))
+            .unwrap();
+
+        let config = r#"
+type: dns
+id: test
+hook_point:
+  - id: main
+    priority: 1
+    blocks:
+      - id: main
+        block: |
+          call resolve ${REQ.name} ${REQ.record_type} empty_aaaa && return;
+        "#;
+        let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
+        ProcessChainDnsServer::create_server(
+            config.id,
+            Arc::downgrade(&server_mgr),
+            Some(Arc::new(GlobalProcessChains::new())),
+            Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
+            config.hook_point,
+            InnerDnsRecordManager::new(),
+            Some(Arc::new(JsExternalsManager::new())),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_web3_zone_ns_query_returns_answer() {
+        let server = create_authoritative_test_server().await;
+
+        let mut message = Message::new();
+        let name = Name::from_str("web3.buckyos.ai.").unwrap();
+        let query = Query::query(name, RecordType::NS);
+        message.add_query(query);
+
+        let data = server
+            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .await
+            .unwrap();
+        let resp = Message::from_vec(data.as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert!(resp.header().authoritative());
+        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.answers()[0].record_type(), RecordType::NS);
+        match resp.answers()[0].data() {
+            RData::NS(ns) => assert_eq!(ns.0.to_string(), "dns.buckyos.ai."),
+            _ => panic!("expected NS answer"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_web3_zone_soa_query_returns_answer() {
+        let server = create_authoritative_test_server().await;
+
+        let mut message = Message::new();
+        let name = Name::from_str("web3.buckyos.ai.").unwrap();
+        let query = Query::query(name, RecordType::SOA);
+        message.add_query(query);
+
+        let data = server
+            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .await
+            .unwrap();
+        let resp = Message::from_vec(data.as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert!(resp.header().authoritative());
+        assert_eq!(resp.answers().len(), 1);
+        assert_eq!(resp.answers()[0].record_type(), RecordType::SOA);
+        match resp.answers()[0].data() {
+            RData::SOA(soa) => {
+                assert_eq!(soa.mname().to_string(), "dns.buckyos.ai.");
+                assert_eq!(soa.rname().to_string(), "hostmaster.buckyos.ai.");
+            }
+            _ => panic!("expected SOA answer"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_web3_zone_subdomain_ns_query_returns_nodata_with_soa() {
+        let server = create_authoritative_test_server().await;
+
+        let mut message = Message::new();
+        let name = Name::from_str("foo.web3.buckyos.ai.").unwrap();
+        let query = Query::query(name, RecordType::NS);
+        message.add_query(query);
+
+        let data = server
+            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .await
+            .unwrap();
+        let resp = Message::from_vec(data.as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert!(resp.header().authoritative());
+        assert_eq!(resp.answers().len(), 0);
+        assert_eq!(resp.name_servers().len(), 1);
+        assert_eq!(resp.name_servers()[0].record_type(), RecordType::SOA);
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_web3_zone_apex_missing_record_returns_nodata_with_soa() {
+        let server = create_authoritative_notfound_test_server().await;
+
+        let mut message = Message::new();
+        let name = Name::from_str("web3.buckyos.ai.").unwrap();
+        let query = Query::query(name, RecordType::MX);
+        message.add_query(query);
+
+        let data = server
+            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .await
+            .unwrap();
+        let resp = Message::from_vec(data.as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert!(resp.header().authoritative());
+        assert_eq!(resp.answers().len(), 0);
+        assert_eq!(resp.name_servers().len(), 1);
+        assert_eq!(resp.name_servers()[0].record_type(), RecordType::SOA);
     }
 
     #[test]
