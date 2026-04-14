@@ -460,7 +460,7 @@ impl RTcpTunnelPackage {
         })?;
 
         let len = u16::from_be_bytes(buf);
-        info!("{} ==> rtcp package, len: {}", source_info, len);
+        debug!("{} ==> rtcp package, len: {}", source_info, len);
         if len == 0 {
             if !is_first_package {
                 error!("HelloStream MUST be first package.");
@@ -596,10 +596,9 @@ impl RTcpTunnelPackage {
         write_buf.extend_from_slice(&bytes);
         write_buf.extend_from_slice(body_bytes);
 
-        info!(
-            "Send package cmd:{} {} len:{} buf_len:{}",
+        debug!(
+            "Send package cmd:{} len:{} buf_len:{}",
             pkg.cmd,
-            json_body.as_str(),
             total_len,
             write_buf.len()
         );

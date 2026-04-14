@@ -807,7 +807,7 @@ impl VariableVisitor for HttpRequestUrlVisitor {
         let old_value = request.uri().to_string();
         *request.uri_mut() = new_url;
 
-        info!("Set request url variable '{}' to '{}'", id, value);
+        debug!("Set request url variable '{}' to '{}'", id, value);
         Ok(Some(CollectionValue::String(old_value)))
     }
 }
@@ -1318,7 +1318,7 @@ pub async fn hyper_serve_http(
                         .unwrap_or("none")
                         .to_string();
                     let uri = req.uri().to_string();
-                    log::info!(
+                    log::debug!(
                         "recv http request:remote {} method {} host {} path {}",
                         remote,
                         method,
@@ -1382,7 +1382,7 @@ pub async fn hyper_serve_http(
                         .unwrap_or("none")
                         .to_string();
                     let uri = req.uri().to_string();
-                    log::info!(
+                    log::debug!(
                         "recv http request:remote {} method {} host {} path {}",
                         remote,
                         method,
@@ -1449,7 +1449,7 @@ pub async fn hyper_serve_http(
                         .unwrap_or("none")
                         .to_string();
                     let uri = req.uri().to_string();
-                    log::info!(
+                    log::debug!(
                         "recv http request:remote {} method {} host {} path {}",
                         remote,
                         method,
@@ -1503,36 +1503,42 @@ pub async fn hyper_serve_http1(
     info: StreamInfo,
 ) -> ServerResult<()> {
     hyper::server::conn::http1::Builder::new()
-        .serve_connection(TokioIo::new(stream), hyper::service::service_fn(|req| {
-            let server = server.clone();
-            let info = info.clone();
-            async move {
-                let (parts, body) = req.into_parts();
-                let req = Request::new(BoxBody::new(body))
-                    .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e)).boxed();
-                let req = Request::from_parts(parts, req);
-                let remote = info.src_addr.clone().unwrap_or_else(|| "unknown".to_string());
-                let method_is_options = req.method() == Method::OPTIONS;
-                let method = req.method().to_string();
-                let host = req
-                    .headers()
-                    .get("host")
-                    .and_then(|h| h.to_str().ok())
-                    .unwrap_or("none")
-                    .to_string();
-                let uri = req.uri().to_string();
-                log::info!(
-                    "recv http request:remote {} method {} host {} path {}",
-                    remote,
-                    method,
-                    host,
-                    uri,
-                );
-                match server.serve_request(req, info).await {
-                    Ok(resp) => {
-                        if resp.status() == StatusCode::FORBIDDEN {
-                            if method_is_options {
-                                log::warn!(
+        .serve_connection(
+            TokioIo::new(stream),
+            hyper::service::service_fn(|req| {
+                let server = server.clone();
+                let info = info.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    let req = Request::new(BoxBody::new(body))
+                        .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e))
+                        .boxed();
+                    let req = Request::from_parts(parts, req);
+                    let remote = info
+                        .src_addr
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let method_is_options = req.method() == Method::OPTIONS;
+                    let method = req.method().to_string();
+                    let host = req
+                        .headers()
+                        .get("host")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("none")
+                        .to_string();
+                    let uri = req.uri().to_string();
+                    log::debug!(
+                        "recv http request:remote {} method {} host {} path {}",
+                        remote,
+                        method,
+                        host,
+                        uri,
+                    );
+                    match server.serve_request(req, info).await {
+                        Ok(resp) => {
+                            if resp.status() == StatusCode::FORBIDDEN {
+                                if method_is_options {
+                                    log::warn!(
                                     "http_forbidden server={} remote={} method={} host={} uri={}",
                                     server.id(),
                                     remote,
@@ -1540,8 +1546,8 @@ pub async fn hyper_serve_http1(
                                     host,
                                     uri,
                                 );
-                            } else {
-                                log::debug!(
+                                } else {
+                                    log::debug!(
                                     "http_forbidden server={} remote={} method={} host={} uri={}",
                                     server.id(),
                                     remote,
@@ -1549,20 +1555,28 @@ pub async fn hyper_serve_http1(
                                     host,
                                     uri,
                                 );
+                                }
                             }
+                            Ok(resp)
                         }
-                        Ok(resp)
-                    }
-                    Err(e) => {
-                        log::error!("http error {}", e);
-                        Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .body(Full::new(Bytes::from(e.msg().to_string()))
-                                .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{:?}", e)).boxed())
-                            .map_err(|e| server_err!(ServerErrorCode::StreamError, "{:?}", e))
+                        Err(e) => {
+                            log::error!("http error {}", e);
+                            Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(
+                                    Full::new(Bytes::from(e.msg().to_string()))
+                                        .map_err(|e| {
+                                            server_err!(ServerErrorCode::BadRequest, "{:?}", e)
+                                        })
+                                        .boxed(),
+                                )
+                                .map_err(|e| server_err!(ServerErrorCode::StreamError, "{:?}", e))
+                        }
                     }
                 }
-            }
-        })).await.map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
+            }),
+        )
+        .await
+        .map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
     Ok(())
 }

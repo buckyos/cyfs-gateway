@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use httpdate::{fmt_http_date, parse_http_date};
 use log::*;
 use reqwest::header::{IF_MODIFIED_SINCE, LAST_MODIFIED};
@@ -55,7 +55,7 @@ impl ConfigMerger {
         modified_since: Option<SystemTime>,
         cache_dir: &Path,
     ) -> Result<JsonValue> {
-        info!("Loading config files from directory: {:?}", dir);
+        debug!("Loading config files from directory: {:?}", dir);
 
         let configs = load_dir_internal(dir, modified_since, cache_dir).await?;
         let merged = merge_configs(&configs)?;
@@ -69,7 +69,7 @@ impl ConfigMerger {
         modified_since: Option<SystemTime>,
         cache_dir: &Path,
     ) -> Result<JsonValue> {
-        info!(
+        debug!(
             "Loading config files from directory: {:?} with root file: {:?}",
             dir, root_file
         );
@@ -108,11 +108,11 @@ fn merge_configs(configs: &[ConfigItem]) -> Result<JsonValue> {
         return Err(anyhow!("no config files loaded"));
     }
 
-    info!("Loaded {} config files: {:?}", configs.len(), configs);
+    debug!("Loaded {} config files: {:?}", configs.len(), configs);
 
     let mut merged = configs[0].clone();
     for config in configs.iter().skip(1) {
-        info!("Will merge config: {:?} -> {:?}", config.path, merged.path);
+        debug!("Will merge config: {:?} -> {:?}", config.path, merged.path);
         merge(&mut merged.value, &config.value);
     }
 

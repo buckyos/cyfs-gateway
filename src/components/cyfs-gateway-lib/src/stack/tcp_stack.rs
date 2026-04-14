@@ -507,7 +507,7 @@ impl TcpStack {
                         continue;
                     }
                 };
-                log::info!("accept tcp stream from {} to {}", remote_addr, dest_addr);
+                log::debug!("accept tcp stream from {} to {}", remote_addr, dest_addr);
                 let compose_stat = MutComposedSpeedStat::new();
                 let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
                 let speed = stat_stream.get_speed_stat();

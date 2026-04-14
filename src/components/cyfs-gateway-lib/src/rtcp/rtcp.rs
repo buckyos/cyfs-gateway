@@ -69,7 +69,7 @@ pub struct RTcpSourceDeviceInfo {
 
 impl Drop for RTcp {
     fn drop(&mut self) {
-        log::info!("RTcp {} drop", self.inner.this_device_did.to_string());
+        log::debug!("RTcp {} drop", self.inner.this_device_did.to_string());
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
@@ -134,7 +134,7 @@ struct RTcpInner {
 
 impl Drop for RTcpInner {
     fn drop(&mut self) {
-        log::info!("RTcpInner {} drop", self.this_device_did.to_string());
+        log::debug!("RTcpInner {} drop", self.this_device_did.to_string());
     }
 }
 
@@ -190,7 +190,7 @@ impl RTcpInner {
             return Ok(None);
         }
 
-        info!(
+        debug!(
             "try resolve target device {} exchange key by TXT records of {}",
             remote_did.to_string(),
             web_host
@@ -237,7 +237,7 @@ impl RTcpInner {
 
                 let dev_did = DID::new("dev", x);
                 if let Some(exchange_key) = dev_did.get_ed25519_auth_key() {
-                    info!(
+                    debug!(
                         "resolve target device {} exchange key by {} TXT DEV",
                         remote_did.to_string(),
                         web_host
@@ -253,7 +253,7 @@ impl RTcpInner {
                 if !x.is_empty() {
                     let dev_did = DID::new("dev", x);
                     if let Some(exchange_key) = dev_did.get_ed25519_auth_key() {
-                        info!(
+                        debug!(
                             "resolve target device {} exchange key by {} TXT PKX",
                             remote_did.to_string(),
                             web_host
@@ -304,14 +304,14 @@ impl RTcpInner {
                 }
 
                 if remote_did.method == "web" {
-                    info!(
+                    debug!(
                         "try resolve exchange key for {} by web TXT fallback",
                         remote_did.to_string()
                     );
 
                     match Self::resolve_exchange_key_by_web_name_info(remote_did).await {
                         Ok(Some(exchange_key)) => {
-                            info!(
+                            debug!(
                                 "resolve exchange key for {} by web TXT fallback success",
                                 remote_did.to_string()
                             );
@@ -424,7 +424,7 @@ impl RTcpInner {
                 .map_err(|e| format!("{} => parse json failed: {}", base, e))?;
 
             if let Some(ip) = Self::extract_ip_from_info_json(&info_json) {
-                info!(
+                debug!(
                     "resolve target device {} ip by did-info fallback {} => {}",
                     target_did.to_string(),
                     base,
@@ -587,7 +587,10 @@ impl RTcpInner {
             xpub: my_public_hex,
             exp: buckyos_get_unix_timestamp() + 3600 * 2,
         };
-        info!("send tunnel_token_payload: {:?}", tunnel_token_payload);
+        debug!(
+            "generated tunnel token payload for {} -> {}",
+            tunnel_token_payload.from, tunnel_token_payload.to
+        );
         let payload = serde_json::to_value(&tunnel_token_payload).map_err(|op| {
             TunnelError::ReasonError(format!("encode tunnel token payload error:{}", op))
         })?;
@@ -879,7 +882,7 @@ impl RTcpInner {
         let package = first_package.unwrap();
         match package {
             RTcpTunnelPackage::HelloStream(session_key) => {
-                info!(
+                debug!(
                     "RTcp stack {} accept new stream: {}, {}",
                     self.this_device_did.to_string(),
                     addr,
@@ -888,7 +891,7 @@ impl RTcpInner {
                 self.on_new_stream(stream, session_key).await;
             }
             RTcpTunnelPackage::Hello(hello_package) => {
-                info!(
+                debug!(
                     "RTcp stack {} accept new tunnel: {}, {} -> {}",
                     self.this_device_did.to_string(),
                     addr,
@@ -1084,7 +1087,7 @@ impl RTcpInner {
                         resolve_errors.push(err_msg);
                         continue;
                     }
-                    info!(
+                    debug!(
                         "resolve target device {} ip by {} => {}",
                         target_id_str, candidate, ip
                     );
@@ -1105,7 +1108,7 @@ impl RTcpInner {
         if device_ip.is_none() {
             match Self::resolve_ip_by_did_info(&target.did).await {
                 Ok(Some(ip)) => {
-                    info!(
+                    debug!(
                         "resolve target device {} ip by did-info => {}",
                         target_id_str, ip
                     );
@@ -1131,7 +1134,7 @@ impl RTcpInner {
         let port = target.stack_port;
         let remote_addr = format!("{}:{}", device_ip, port);
 
-        info!(
+        debug!(
             "Will open tunnel to {}, target addr is {}",
             target_id_str.as_str(),
             remote_addr.as_str()
@@ -1211,7 +1214,7 @@ impl RTcpInner {
         let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
         let tunnel_map = self.tunnel_map.clone();
         task::spawn(async move {
-            info!(
+            debug!(
                 "RTcp tunnel {} established, tunnel running",
                 tunnel_key.as_str()
             );
@@ -1339,7 +1342,7 @@ impl RTcpTunnel {
     }
 
     async fn on_ropen(&self, ropen_package: RTcpROpenPackage) -> Result<(), anyhow::Error> {
-        info!(
+        debug!(
             "RTcp tunnel ropen request: {:?}:{}, {:?}",
             ropen_package.body.dest_host, ropen_package.body.dest_port, ropen_package.body.purpose
         );
@@ -1393,10 +1396,9 @@ impl RTcpTunnel {
         let aes_key = self.get_key().clone();
         let aes_stream = EncryptedStream::new(rtcp_stream, &aes_key, &nonce_bytes);
 
-        info!(
-            "RTcp stream encrypted with aes_key:{}, nonce_bytes:{}",
-            hex::encode(aes_key),
-            hex::encode(nonce_bytes)
+        debug!(
+            "RTcp stream encryption initialized for ropen stream {}",
+            ropen_package.body.stream_id
         );
 
         let purpose = ropen_package.body.purpose.clone().unwrap_or_default();
@@ -1476,7 +1478,7 @@ impl RTcpTunnel {
     }
 
     async fn on_open(&self, open_package: RTcpOpenPackage) -> Result<(), anyhow::Error> {
-        info!(
+        debug!(
             "RTcp tunnel open request: {:?}:{}, {:?}",
             open_package.body.dest_host, open_package.body.dest_port, open_package.body.purpose
         );
@@ -1514,10 +1516,9 @@ impl RTcpTunnel {
         let aes_key = self.get_key().clone();
         let aes_stream = EncryptedStream::new(stream, &aes_key, &nonce_bytes);
 
-        info!(
-            "RTcp stream encrypted with aes_key:{}, nonce_bytes:{}",
-            hex::encode(aes_key),
-            hex::encode(nonce_bytes)
+        debug!(
+            "RTcp stream encryption initialized for open stream {}",
+            open_package.body.stream_id
         );
 
         let purpose = open_package.body.purpose.clone().unwrap_or_default();
@@ -1643,7 +1644,7 @@ impl RTcpTunnel {
         let real_key = format!("{}_{}", self.this_device.to_string(), session_key);
         let seq = self.next_seq();
 
-        info!(
+        debug!(
             "RTcp tunnel open stream to {}:{}, can_direct:{}",
             dest_host.clone().unwrap_or("127.0.0.1".to_string()),
             dest_port,
@@ -1700,7 +1701,7 @@ impl RTcpTunnel {
             let aes_stream: EncryptedStream<TcpStream> =
                 EncryptedStream::new(stream, &self.get_key(), &random_bytes);
 
-            info!(
+            debug!(
                 "RTcp tunnel open direct stream to {}, {}",
                 target_addr,
                 self.target.did.to_string()

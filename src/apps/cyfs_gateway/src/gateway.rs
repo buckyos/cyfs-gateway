@@ -13,12 +13,12 @@ use crate::gateway_control_server::{
     ControlErrorCode, ControlResult, CyfsTokenFactory, CyfsTokenVerifier, GatewayControlCmdHandler,
 };
 use crate::gateway_control_server::{
-    GatewayControlServerConfigParser, GatewayControlServerContext, GATEWAY_CONTROL_SERVER_CONFIG,
-    GATEWAY_CONTROL_SERVER_KEY,
+    GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY, GatewayControlServerConfigParser,
+    GatewayControlServerContext,
 };
 use crate::socks::SocksTunnelBuilder;
-use crate::{merge, AcmeConfig, TlsCA};
-use anyhow::{anyhow, Result};
+use crate::{AcmeConfig, TlsCA, merge};
+use anyhow::{Result, anyhow};
 use buckyos_kit::*;
 use chrono::Utc;
 use cyfs_dns::{
@@ -33,11 +33,11 @@ use kRPC::RPCSessionToken;
 use log::*;
 use name_client::*;
 use name_lib::*;
+use rand::Rng;
 use rand::distr::Alphanumeric;
 use rand::rng;
-use rand::Rng;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sfo_js::object::builtins::JsArray;
 use sfo_js::{JsEngine, JsPkg, JsPkgManager, JsPkgManagerRef, JsString, JsValue, NativeFunction};
 use sha2::Digest;
@@ -465,7 +465,7 @@ pub async fn load_config_from_file(config_file: &Path) -> Result<LoadedGatewayCo
             Ok(saved_value) => match serde_json::from_value::<SavedConfigPatch>(saved_value) {
                 Ok(saved_patch) => {
                     effective_config = apply_saved_config_patch(effective_config, &saved_patch);
-                    info!(
+                    debug!(
                         "Apply saved gateway config patch {}",
                         saved_path.to_string_lossy()
                     );
@@ -515,7 +515,7 @@ async fn load_user_config_from_file(config_file: &Path) -> Result<serde_json::Va
                 anyhow::anyhow!(msg)
             })?;
 
-    info!(
+    debug!(
         "Gateway config before merge: {}",
         serde_json::to_string_pretty(&config_json).unwrap()
     );
@@ -529,9 +529,9 @@ async fn load_user_config_from_file(config_file: &Path) -> Result<serde_json::Va
         error!("{}", msg);
         anyhow::anyhow!(msg)
     })?;
-    info!("Apply params to gateway config.");
+    debug!("Apply params to gateway config.");
     normalize_all_path_value_config(&mut config_json, config_dir);
-    info!("normalize_all_path_value_config for gateway config.");
+    debug!("normalize_all_path_value_config for gateway config.");
     Ok(config_json)
 }
 
@@ -929,7 +929,7 @@ pub struct Gateway {
 impl Drop for Gateway {
     fn drop(&mut self) {
         self.timer_manager.stop_all();
-        info!("Gateway is dropped!");
+        debug!("Gateway is dropped!");
     }
 }
 
@@ -966,7 +966,7 @@ impl Gateway {
             error!("{}", msg);
             return Err(anyhow!("{}", msg));
         }
-        info!("init default name client OK!");
+        debug!("init default name client OK!");
 
         if let Err(e) = self.stack_manager.start().await {
             error!("start stack manager failed, err:{}", e);
@@ -2754,7 +2754,7 @@ impl Gateway {
                 info!("device_manager reloaded: enabled=false");
             }
         } else {
-            info!("device_manager config unchanged, keep current manager");
+            debug!("device_manager config unchanged, keep current manager");
         }
 
         let user_name: Option<String> = match config.raw_config.get("user_name") {
@@ -3728,7 +3728,7 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                         "Invalid params: config_file is None",
                     ))?;
                 }
-                info!("*** reload gateway config ...");
+                debug!("*** reload gateway config ...");
                 let loaded_config =
                     load_config_from_file(self.config_file.as_ref().unwrap().as_path())
                         .await
@@ -3746,7 +3746,7 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     .await
                     .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
                 gateway.update_init_config(init_config);
-                info!("*** reload gateway config success !");
+                info!("gateway config reload applied");
                 Ok(Value::String("ok".to_string()))
             }
             "start" => {
@@ -4990,11 +4990,13 @@ mod tests {
         println!("{}", rule);
         assert!(rule.starts_with(r#"match ${REQ.path} "/static/*" && rewrite ${REQ.path} "/static/*" "/*" && call-server"#));
         // dir server created
-        assert!(updated["servers"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .any(|k| k.starts_with("router_dir_")));
+        assert!(
+            updated["servers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|k| k.starts_with("router_dir_"))
+        );
 
         let (updated, removed_id) =
             Gateway::remove_router_from_config(updated, Some("router_test"), "/static/*", "/www/")

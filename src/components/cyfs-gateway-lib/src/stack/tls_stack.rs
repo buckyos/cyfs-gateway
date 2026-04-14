@@ -508,7 +508,7 @@ impl TlsConnectionHandler {
             return Ok(());
         }
         if let Some(proxy_addr) = proxy_source_addr {
-            log::info!(
+            log::debug!(
                 "accept tls stream from {} (proxy via {}) to {} name {}",
                 proxy_addr,
                 remote_addr,
@@ -516,7 +516,7 @@ impl TlsConnectionHandler {
                 server_name.as_ref().unwrap_or(&"".to_string())
             );
         } else {
-            log::info!(
+            log::debug!(
                 "accept tls stream from {} to {} name {}",
                 remote_addr,
                 local_addr,
@@ -841,7 +841,7 @@ impl TlsStack {
                     }
                 };
 
-                log::info!("accept tcp stream from {} to {}", remote_addr, local_addr);
+                log::debug!("accept tcp stream from {} to {}", remote_addr, local_addr);
                 let compose_stat = MutComposedSpeedStat::new();
                 let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
                 let speed = stat_stream.get_speed_stat();

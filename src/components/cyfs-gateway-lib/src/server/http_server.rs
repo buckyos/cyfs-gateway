@@ -334,7 +334,7 @@ impl ProcessChainHttpServer {
                 e
             )
         })?;
-        info!("handle_upstream url: {}", request_url);
+        debug!("handle_upstream url: {}", request_url);
         let scheme = request_url.scheme();
         match scheme {
             "http" => {

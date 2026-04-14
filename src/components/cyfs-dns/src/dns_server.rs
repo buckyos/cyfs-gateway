@@ -595,13 +595,14 @@ impl ProcessChainDnsServer {
             return response;
         }
 
+
         // First, check if the record exists in the inner record manager
         if let Some(name_info) = self
             .inner_record_manager
             .get_record(&name, &record_type_str)
         {
-            debug!(
-                "Found record in inner record manager: {} {}",
+            info!(
+                "dns query resolved by provider=inner_record_manager: name={} type={}",
                 name, record_type_str
             );
             return self
@@ -610,7 +611,7 @@ impl ProcessChainDnsServer {
         }
 
         let map = MemoryMapCollection::new_ref();
-        map.insert("name", CollectionValue::String(name))
+        map.insert("name", CollectionValue::String(name.clone()))
             .await
             .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
         map.insert(
@@ -693,10 +694,21 @@ impl ProcessChainDnsServer {
                             .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
                         if let Some(resp) = resp {
                             if let CollectionValue::Map(resp) = resp {
+                                let provider_name = chain_env
+                                    .get("RESOLVE_PROVIDER")
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|value| value.as_str().map(|s| s.to_string()))
+                                    .unwrap_or_else(|| "process_chain".to_string());
                                 let name_info =
                                     map_collection_to_nameinfo(&resp).await.map_err(|e| {
                                         server_err!(ServerErrorCode::ProcessChainError, "{e}")
                                     })?;
+                                info!(
+                                    "dns query resolved by provider={}: name={} type={}",
+                                    provider_name, name, record_type_str
+                                );
                                 return self
                                     .name_info_to_buffer(
                                         request,
@@ -743,6 +755,11 @@ impl ProcessChainDnsServer {
                 };
 
                 let request = Request::new(message, addr, Protocol::Udp);
+                let request_info = request
+                    .request_info()
+                    .map_err(into_server_err!(ServerErrorCode::BadRequest))?;
+                let query_name = request_info.query.name().to_string();
+                let query_type = request_info.query.query_type().to_string();
                 match self.handle_request(&request, dst_addr).await {
                     Ok(response) => Ok(response),
                     Err(e) => {
@@ -777,8 +794,12 @@ impl ProcessChainDnsServer {
                             _ => ResponseCode::ServFail,
                         };
                         warn!(
-                            "dns request failed for response code {:?}: {:?}",
-                            response_code, e
+                            "dns query failed: name={} type={} src={} response_code={:?} err={}",
+                            query_name,
+                            query_type,
+                            addr,
+                            response_code,
+                            e
                         );
                         self.response_code_to_buffer(&request, response_code)
                     }

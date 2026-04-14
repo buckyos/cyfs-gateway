@@ -114,7 +114,7 @@ impl UdpDatagramHandler {
         data: Vec<u8>,
         len: usize,
     ) -> StackResult<Option<NewDatagramSession>> {
-        log::info!("new udp session: {} -> {}", src_addr, dest_addr);
+        log::debug!("new udp session: {} -> {}", src_addr, dest_addr);
         let executor = self.executor.fork();
         let global_env = executor.global_env();
         let map = MemoryMapCollection::new_ref();

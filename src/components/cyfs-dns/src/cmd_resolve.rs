@@ -1,13 +1,13 @@
 use crate::nameinfo_to_map_collection;
 use clap::{Arg, Command};
+use cyfs_gateway_lib::ServerErrorCode;
 use cyfs_gateway_lib::ServerManagerWeakRef;
 use cyfs_process_chain::{
     command_help, CollectionValue, CommandArgs, CommandHelpType, CommandResult, Context, EnvLevel,
     ExternalCommand, MemoryMapCollection,
 };
 use hickory_proto::xfer::Protocol;
-use log::{error, warn};
-use cyfs_gateway_lib::ServerErrorCode;
+use log::error;
 use name_client::{DnsProvider, NameInfo, NsProvider, RecordType};
 use name_lib::{EncodedDocument, DID};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -226,50 +226,56 @@ impl ExternalCommand for CmdResolve {
 
         let query_name = normalize_ptr_query_name(domain, record_type);
         let server_address = matches.get_one::<String>("server_address");
-        let name_info = if server_address.is_none() {
+        let (provider_name, name_info) = if server_address.is_none() {
+            let provider_name = "default_dns".to_string();
             let provider = DnsProvider::new(None);
-            match provider
+            let name_info = match provider
                 .query(query_name.as_str(), Some(record_type), None)
                 .await
             {
                 Ok(name_info) => name_info,
                 Err(e) => {
                     return Ok(CommandResult::error_with_string(format!(
-                        "Failed to resolve domain {} record_type {}: {:?}",
-                        query_name, record_type_str, e
+                        "Failed to resolve domain {} record_type {} via {}: {:?}",
+                        query_name, record_type_str, provider_name, e
                     )));
                 }
-            }
+            };
+            (provider_name, name_info)
         } else {
             let server_address = server_address.unwrap();
             if let Ok(address) = server_address.parse::<IpAddr>() {
-                let provider = DnsProvider::new(Some(server_address.to_string()));
-                match provider
+                let provider_name = address.to_string();
+                let provider = DnsProvider::new(Some(provider_name.clone()));
+                let name_info = match provider
                     .query(query_name.as_str(), Some(record_type), None)
                     .await
                 {
                     Ok(name_info) => name_info,
                     Err(e) => {
                         return Ok(CommandResult::error_with_string(format!(
-                            "Failed to resolve domain {} record_type {}: {:?}",
-                            query_name, record_type_str, e
+                            "Failed to resolve domain {} record_type {} via {}: {:?}",
+                            query_name, record_type_str, provider_name, e
                         )));
                     }
-                }
+                };
+                (provider_name, name_info)
             } else if let Ok(address) = server_address.parse::<SocketAddr>() {
-                let provider = DnsProvider::new(Some(address.to_string()));
-                match provider
+                let provider_name = address.to_string();
+                let provider = DnsProvider::new(Some(provider_name.clone()));
+                let name_info = match provider
                     .query(query_name.as_str(), Some(record_type), None)
                     .await
                 {
                     Ok(name_info) => name_info,
                     Err(e) => {
                         return Ok(CommandResult::error_with_string(format!(
-                            "Failed to resolve domain {} record_type {}: {:?}",
-                            query_name, record_type_str, e
+                            "Failed to resolve domain {} record_type {} via {}: {:?}",
+                            query_name, record_type_str, provider_name, e
                         )));
                     }
-                }
+                };
+                (provider_name, name_info)
             } else {
                 let server_mgr = match self.server_mgr.upgrade() {
                     Some(server_mgr) => server_mgr,
@@ -281,25 +287,21 @@ impl ExternalCommand for CmdResolve {
                     }
                 };
                 if let Some(dns_service) = server_mgr.get_name_server(server_address) {
-                    match dns_service.query(query_name.as_str(), Some(record_type), None).await {
+                    let provider_name = dns_service.id();
+                    let name_info = match dns_service
+                        .query(query_name.as_str(), Some(record_type), None)
+                        .await
+                    {
                         Ok(name_info) => name_info,
                         Err(e) => {
                             let msg = format!(
-                                "Resolve miss via {} for domain {} record_type {}: {:?}",
-                                server_address, query_name, record_type_str, e
+                                "Resolve failed via {} for domain {} record_type {}: {:?}",
+                                provider_name, query_name, record_type_str, e
                             );
-                            match e.code() {
-                                cyfs_gateway_lib::ServerErrorCode::NotFound
-                                | cyfs_gateway_lib::ServerErrorCode::DnsQueryError => {
-                                    warn!("{}", msg);
-                                }
-                                _ => {
-                                    error!("{}", msg);
-                                }
-                            }
                             return server_error_result(e.code(), msg).await;
                         }
-                    }
+                    };
+                    (provider_name, name_info)
                 } else {
                     let msg = format!(
                         "Invalid resolve command: inner service {} not found",
@@ -319,6 +321,14 @@ impl ExternalCommand for CmdResolve {
             .create(
                 "RESOLVE_RESP",
                 CollectionValue::Map(result),
+                EnvLevel::Global,
+            )
+            .await?;
+        context
+            .env()
+            .create(
+                "RESOLVE_PROVIDER",
+                CollectionValue::String(provider_name),
                 EnvLevel::Global,
             )
             .await?;

@@ -6,7 +6,7 @@ use cyfs_gateway_lib::{
 use cyfs_sn::OODInfo;
 use kRPC::RPCSessionToken;
 use name_lib::{
-    encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key, DeviceConfig, DID,
+    DID, DeviceConfig, encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -263,15 +263,16 @@ impl AcmeSnProvider {
             .map_err(|_| anyhow!("parse query_by_hostname result failed"))?;
 
         let bns_krpc = self.get_krpc_for_route(Some("bns"))?;
-        bns_krpc.call(
-            "set_user_self_cert",
-            json!({
-                "name": ood_info.owner_id,
-                "self_cert": true
-            }),
-        )
-        .await
-        .map_err(|e| anyhow!("set_user_self_cert failed.{:?}", e))?;
+        bns_krpc
+            .call(
+                "set_user_self_cert",
+                json!({
+                    "name": ood_info.owner_id,
+                    "self_cert": true
+                }),
+            )
+            .await
+            .map_err(|e| anyhow!("set_user_self_cert failed.{:?}", e))?;
         Ok(())
     }
 

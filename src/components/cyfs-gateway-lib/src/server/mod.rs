@@ -12,6 +12,8 @@ mod welcome_server;
 use std::path::Path;
 use std::path::PathBuf;
 
+use log::*;
+
 pub use acme_http_challenge_server::*;
 pub use dir_server::*;
 pub use dns_server::*;
@@ -122,7 +124,7 @@ pub fn normalize_all_path_value_config(config: &mut serde_json::Value, base_dir:
                 if key.ends_with("_path") || key == "path" {
                     let value_str = value.as_str().unwrap();
                     let value_path = normalize_config_path_value(value_str, base_dir);
-                    info!(
+                    debug!(
                         "normalize_all_path_value_config: key: {}, value: {} -> {}",
                         key, value_str, value_path
                     );

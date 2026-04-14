@@ -231,7 +231,7 @@ impl DirServer {
                 e
             )
         })?;
-        info!("after normalize,root_dir is : {:?}", new_root_dir);
+        debug!("after normalize,root_dir is : {:?}", new_root_dir);
         Ok(DirServer {
             id: builder.id.unwrap(),
             version,
@@ -690,7 +690,7 @@ impl HttpServer for DirServer {
         let req_path = req.uri().path();
         let req_method = req.method();
 
-        info!("DirServer[{}] {} {}", self.id, req_method, req_path);
+        debug!("DirServer[{}] {} {}", self.id, req_method, req_path);
 
         // Only support GET and HEAD methods
         if req_method != hyper::Method::GET && req_method != hyper::Method::HEAD {

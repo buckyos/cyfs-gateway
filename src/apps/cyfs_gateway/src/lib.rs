@@ -26,8 +26,8 @@ use cyfs_gateway_lib::*;
 use process_chain_doc::GatewayProcessChainDoc;
 use std::collections::HashSet;
 
-use anyhow::anyhow;
 use anyhow::Result;
+use anyhow::anyhow;
 use buckyos_kit::init_logging;
 use buckyos_kit::{get_buckyos_service_data_dir, get_buckyos_system_etc_dir};
 use cyfs_sn::{SnServerFactory, SqliteDBFactory};
@@ -51,7 +51,7 @@ use url::Url;
 
 pub async fn gateway_service_main(config_file: &Path, params: GatewayParams) -> Result<()> {
     let loaded_config = load_config_from_file(config_file).await?;
-    info!(
+    debug!(
         "Gateway config: {}",
         serde_json::to_string_pretty(&loaded_config.effective_config).unwrap()
     );
@@ -95,7 +95,7 @@ async fn run_gateway_with_config(
         Arc::new(AcmeHttpChallengeServerConfigParser::new()),
     );
 
-    info!("Parse cyfs-gatway config...");
+    debug!("Parse cyfs-gatway config...");
     let gateway_config = parser.parse(config_json.clone()).map_err(|e| {
         let msg = format!("Error loading config: {}", e.msg());
         error!("{}", msg);
@@ -110,7 +110,7 @@ async fn run_gateway_with_config(
     } else {
         gateway_config.clone()
     };
-    info!("Parse cyfs-gatway config success");
+    debug!("Parse cyfs-gatway config success");
 
     let connect_manager = ConnectionManager::new();
     if gateway_config.device_manager.enabled {
@@ -185,13 +185,13 @@ async fn run_gateway_with_config(
         "control_server",
         Arc::new(GatewayControlServerFactory::new()),
     );
-    info!("Register control server factory");
+    debug!("Register control server factory");
     factory.register_server_factory("local_dns", Arc::new(LocalDnsFactory::new()));
-    info!("Register local dns server factory");
+    debug!("Register local dns server factory");
     let mut sn_factory = SnServerFactory::new();
     sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
     factory.register_server_factory("sn", Arc::new(sn_factory));
-    info!("Register sn server factory");
+    debug!("Register sn server factory");
     let gateway = factory
         .create_gateway(config_file, gateway_config, init_gateway_config)
         .await
@@ -2297,7 +2297,7 @@ pub async fn cyfs_gateway_main() {
             info!("cyfs_gateway start...");
 
             if matches.get_flag("debug") {
-                info!("Debug mode enabled");
+                debug!("Debug mode enabled");
                 unsafe {
                     std::env::set_var("RUST_BACKTRACE", "1");
                 }
@@ -2318,7 +2318,7 @@ pub async fn cyfs_gateway_main() {
     info!("cyfs gateway service start...");
 
     if matches.get_flag("debug") {
-        info!("Debug mode enabled");
+        debug!("Debug mode enabled");
         unsafe {
             std::env::set_var("RUST_BACKTRACE", "1");
         }

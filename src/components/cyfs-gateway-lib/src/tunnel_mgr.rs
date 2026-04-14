@@ -106,7 +106,7 @@ impl TunnelManager {
             e
         })?;
 
-        info!("Get tunnel for {} success", target_url);
+        debug!("Get tunnel for {} success", target_url);
         return Ok(tunnel);
     }
 

@@ -37,14 +37,13 @@ impl NameServer for LocalDns {
         record_type: Option<RecordType>,
         from_ip: Option<IpAddr>,
     ) -> ServerResult<NameInfo> {
-        self.local_provider.query(name, record_type, from_ip).await.map_err(
-            |e| match e {
-                NSError::NotFound(_) => {
-                    ServerError::new(ServerErrorCode::NotFound, e.to_string())
-                }
+        self.local_provider
+            .query(name, record_type, from_ip)
+            .await
+            .map_err(|e| match e {
+                NSError::NotFound(_) => ServerError::new(ServerErrorCode::NotFound, e.to_string()),
                 _ => ServerError::new(ServerErrorCode::DnsQueryError, e.to_string()),
-            },
-        )
+            })
     }
 
     async fn query_did(
@@ -57,9 +56,7 @@ impl NameServer for LocalDns {
             .query_did(did, fragment, from_ip)
             .await
             .map_err(|e| match e {
-                NSError::NotFound(_) => {
-                    ServerError::new(ServerErrorCode::NotFound, e.to_string())
-                }
+                NSError::NotFound(_) => ServerError::new(ServerErrorCode::NotFound, e.to_string()),
                 _ => ServerError::new(ServerErrorCode::DnsQueryError, e.to_string()),
             })
     }

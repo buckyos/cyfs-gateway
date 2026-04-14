@@ -56,7 +56,7 @@ impl HttpServer for AcmeHttpChallengeServer {
             }
         }
 
-        log::info!("acme challenge {} failed", path);
+        log::debug!("acme challenge {} failed", path);
         // 如果不是有效的ACME挑战请求，返回404
         let response = Response::builder()
             .status(StatusCode::NOT_FOUND)

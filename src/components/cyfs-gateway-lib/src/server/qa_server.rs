@@ -296,7 +296,7 @@ impl ExternalCommand for CmdQa {
             .map(|s| s.as_str())
             .unwrap_or("REQ");
 
-        info!(
+        debug!(
             "will execute qa command: server_id={}, map_id={}",
             server_id, map_id
         );
@@ -332,7 +332,7 @@ impl ExternalCommand for CmdQa {
             msg.to_string()
         })?;
 
-        info!(
+        debug!(
             "Calling QA server '{}' with request: {}",
             server_id, request_json
         );
@@ -344,7 +344,7 @@ impl ExternalCommand for CmdQa {
             msg
         })?;
 
-        info!("QA server '{}' response: {}", server_id, response_json);
+        debug!("QA server '{}' response: {}", server_id, response_json);
 
         // Convert response JSON to map using the trait
         let answer_map = MapCollectionRef::from_json(&response_json)
@@ -366,7 +366,10 @@ impl ExternalCommand for CmdQa {
                 msg
             })?;
 
-        info!("QA command completed successfully");
+        info!(
+            "QA command completed successfully: server_id={}, map_id={}",
+            server_id, map_id
+        );
         Ok(CommandResult::success())
     }
 }

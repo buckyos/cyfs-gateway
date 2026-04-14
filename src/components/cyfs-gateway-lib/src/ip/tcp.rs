@@ -1,6 +1,7 @@
 use crate::tunnel::{StreamListener, TunnelEndpoint};
 use crate::{TunnelError, TunnelResult};
 use buckyos_kit::AsyncStream;
+use log::*;
 use url::Url;
 
 pub struct TcpStreamListener {
@@ -20,7 +21,7 @@ impl TcpStreamListener {
         let host = self.bind_addr.host_str().unwrap();
         let port = self.bind_addr.port().unwrap();
         let bind_str = format!("{}:{}", host, port);
-        info!("TcpStreamListener try bind to {}", bind_str);
+        debug!("TcpStreamListener try bind to {}", bind_str);
         let listener = tokio::net::TcpListener::bind(bind_str.as_str())
             .await
             .map_err(|e| TunnelError::BindError(e.to_string()))?;

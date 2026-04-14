@@ -2,10 +2,10 @@ use crate::config_loader::ServerConfigParser;
 use crate::gateway_control_client::cmd_err;
 use bytes::Bytes;
 use cyfs_gateway_lib::{
-    config_err, ConfigErrorCode, ConfigResult, Server, ServerConfig, ServerError, StreamInfo,
+    ConfigErrorCode, ConfigResult, Server, ServerConfig, ServerError, StreamInfo, config_err,
 };
-use cyfs_gateway_lib::{server_err, ServerErrorCode, ServerResult};
 use cyfs_gateway_lib::{HttpServer, ServerContext, ServerContextRef, ServerFactory};
+use cyfs_gateway_lib::{ServerErrorCode, ServerResult, server_err};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use log::*;
@@ -167,7 +167,7 @@ pub trait GatewayControlCmdHandler: Send + Sync + 'static {
 #[async_trait::async_trait]
 pub trait CyfsTokenFactory: Send + Sync + 'static {
     async fn create(&self, use_name: &str, password: &str, timestamp: u64)
-        -> ControlResult<String>;
+    -> ControlResult<String>;
 }
 
 #[async_trait::async_trait]

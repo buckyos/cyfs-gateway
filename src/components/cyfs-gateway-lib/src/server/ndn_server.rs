@@ -662,7 +662,7 @@ impl NdnServer {
             if stat.kind != PathKind::NotFound {
                 if let Some(stat_obj_id) = stat.obj_id {
                     if let Some(the_inner_path) = stat.obj_inner_path {
-                        info!(
+                        debug!(
                             "ndn_server: stat success, ndn_path: {}, obj_inner_path: {}",
                             sub_path.as_str(),
                             the_inner_path
@@ -683,7 +683,7 @@ impl NdnServer {
                         _inner_obj_path = Some(the_inner_path);
                         root_obj_id = Some(stat_obj_id);
                     } else {
-                        info!("ndn_server: stat success, ndn_path: {}", sub_path.as_str());
+                        debug!("ndn_server: stat success, ndn_path: {}", sub_path.as_str());
                         obj_id = Some(stat_obj_id);
                     }
                 } else {
@@ -806,7 +806,7 @@ impl HttpServer for NdnServer {
             .unwrap_or("localhost")
             .to_string();
 
-        info!(
+        debug!(
             "NdnServer[{}] {} {} from {:?}",
             self.id, req_method, req_path, info.src_addr
         );

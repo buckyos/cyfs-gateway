@@ -193,7 +193,10 @@ impl ExternalCommand for VerifyJwt {
         let payload = match decode_json_from_jwt_with_pk(jwt.as_str(), &decoding_key) {
             Ok(payload) => payload,
             Err(e) => {
-                return Ok(Self::verification_failed(format!("verify jwt failed: {}", e)));
+                return Ok(Self::verification_failed(format!(
+                    "verify jwt failed: {}",
+                    e
+                )));
             }
         };
         let payload = json_value_to_collection_value(&payload).await;
@@ -402,6 +405,10 @@ mod tests {
         let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
         let result = exec.execute_lib("verify_jwt_invalid_lib").await.unwrap();
 
-        assert!(result.value().starts_with("handled:decode jwt payload failed:"));
+        assert!(
+            result
+                .value()
+                .starts_with("handled:decode jwt payload failed:")
+        );
     }
 }

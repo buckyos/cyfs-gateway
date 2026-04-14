@@ -3,7 +3,7 @@ use cyfs_gateway_lib::TunnelManager;
 use cyfs_socks::{
     SocksDataTunnelProvider, SocksDataTunnelProviderRef, SocksError, SocksResult, TargetAddr,
 };
-use log::{error, info};
+use log::{debug, error};
 use std::sync::Arc;
 use url::Url;
 
@@ -25,7 +25,7 @@ impl SocksDataTunnelProvider for SocksTunnelBuilder {
         proxy_target: &Url,
         enable_tunnel: &Option<Vec<String>>,
     ) -> SocksResult<Box<dyn AsyncStream>> {
-        info!(
+        debug!(
             "Will build tunnel for request: {:?}, {:?}",
             request_target, proxy_target
         );

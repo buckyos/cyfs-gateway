@@ -219,7 +219,7 @@ impl QuicConnectionHandler {
         };
 
         let remote_addr = connection.remote_address();
-        log::info!("quic accept: {} -> {}", remote_addr, local_addr);
+        log::debug!("quic accept: {} -> {}", remote_addr, local_addr);
         let map = MemoryMapCollection::new_ref();
         map.insert("dest_host", CollectionValue::String(server_name))
             .await
@@ -347,7 +347,7 @@ impl QuicConnectionHandler {
                                     .accept_bi()
                                     .await
                                     .map_err(into_stack_err!(StackErrorCode::QuicError))?;
-                                log::info!("quic accept bi: {} -> {}", remote_addr, local_addr);
+                                log::debug!("quic accept bi: {} -> {}", remote_addr, local_addr);
                                 let stream = sfo_split::Splittable::new(recv, send);
                                 let stream: Box<dyn AsyncStream> =
                                     if let Some(io_dump) = self.io_dump.clone() {
@@ -473,7 +473,7 @@ impl QuicConnectionHandler {
                                                             .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed()
                                                     };
                                                     let req = http::Request::from_parts(parts, body);
-                                                    log::info!("recv http request:remote {} method {} host {} path {}",
+                                                    log::debug!("recv http request:remote {} method {} host {} path {}",
                                                         remote_addr,
                                                         req.method().to_string(),
                                                         req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
@@ -548,7 +548,7 @@ impl QuicConnectionHandler {
                                             .accept_bi()
                                             .await
                                             .map_err(into_stack_err!(StackErrorCode::QuicError))?;
-                                        log::info!(
+                                        log::debug!(
                                             "quic accept bi: {} -> {}",
                                             remote_addr,
                                             local_addr
