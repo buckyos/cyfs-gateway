@@ -11,6 +11,17 @@ use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
 use crate::pipe::CommandPipe;
 use std::sync::Arc;
 
+fn command_result_kind(result: &CommandResult) -> &'static str {
+    match result {
+        CommandResult::Success(_) => "success",
+        CommandResult::Error(_) => "error",
+        CommandResult::Control(CommandControl::Return(_)) => "return",
+        CommandResult::Control(CommandControl::Error(_)) => "control_error",
+        CommandResult::Control(CommandControl::Exit(_)) => "exit",
+        CommandResult::Control(CommandControl::Break(_)) => "break",
+    }
+}
+
 pub struct ProcessChainExecutor;
 
 impl ProcessChainExecutor {
@@ -71,7 +82,7 @@ impl ProcessChainExecutor {
                 let control = result.as_control().unwrap();
                 match control {
                     CommandControl::Return(value) => {
-                        info!("Returning from block '{}': {:?}", block.id, value);
+                        debug!("Returning from block '{}': {:?}", block.id, value);
 
                         match value.level {
                             CommandControlLevel::Block => {
@@ -87,7 +98,7 @@ impl ProcessChainExecutor {
                         }
                     }
                     CommandControl::Error(value) => {
-                        warn!("Error return in block '{}': {:?}", block.id, value);
+                        debug!("Error return in block '{}': {:?}", block.id, value);
 
                         match value.level {
                             CommandControlLevel::Block => {
@@ -103,7 +114,7 @@ impl ProcessChainExecutor {
                         }
                     }
                     CommandControl::Exit(value) => {
-                        info!("Exiting chain from block '{}': {}", block.id, value);
+                        debug!("Exiting chain from block '{}': {}", block.id, value);
                         chain_result = result;
                         break;
                     }
@@ -225,18 +236,18 @@ impl ProcessChainLibExecutor {
             if ret.is_control() {
                 let control = ret.as_control().unwrap();
                 if control.is_exit() {
-                    info!(
+                    debug!(
                         "Exiting process chain execution from chain '{}'",
                         chain.id(),
                     );
                     final_result = ret;
                     break;
                 } else if control.is_return_from_lib() {
-                    info!("Returning from process chain lib with value: {:?}", control,);
+                    debug!("Returning from process chain lib with value: {:?}", control,);
                     final_result = ret;
                     break;
                 } else if control.is_error_from_lib() {
-                    info!(
+                    debug!(
                         "Error return from process chain lib with value: {:?}",
                         control,
                     );
@@ -253,6 +264,13 @@ impl ProcessChainLibExecutor {
 
             chain_index += 1;
         }
+
+        info!(
+            "process_chain_final_result lib={} kind={} value={:?}",
+            self.process_chain_lib.get_id(),
+            command_result_kind(&final_result),
+            final_result.value_ref(),
+        );
 
         Ok(final_result)
     }

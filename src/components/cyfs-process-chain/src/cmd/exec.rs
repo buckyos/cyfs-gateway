@@ -72,15 +72,15 @@ pub(crate) fn normalize_exec_result(
 ) -> Result<CommandResult, String> {
     let ret = if cmd_ret.is_control() {
         // If the execution result is a control action, we handle it immediately
-        info!("Control action in {} command: {:?}", command_name, cmd_ret);
+        debug!("Control action in {} command: {:?}", command_name, cmd_ret);
         let control = cmd_ret.into_control().unwrap();
         match control {
             CommandControl::Return(value) => {
-                info!("Returning value from {} command: {:?}", command_name, value);
+                debug!("Returning value from {} command: {:?}", command_name, value);
                 CommandResult::success_with_value(value.value)
             }
             CommandControl::Error(value) => {
-                info!("Error control in {} command: {:?}", command_name, value);
+                debug!("Error control in {} command: {:?}", command_name, value);
                 CommandResult::error_with_value(value.value)
             }
             CommandControl::Exit(_value) => {

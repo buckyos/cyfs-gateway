@@ -913,7 +913,7 @@ impl BlockExecuter {
         line_no: Option<usize>,
         source: Option<String>,
     ) -> Result<CommandResult, String> {
-        debug!("Executing command: {:?}", cmd);
+        trace!("Executing command: {:?}", cmd);
         let command_text = format!("{:?}", cmd.command);
         let exec = cmd.executor.as_ref().ok_or_else(|| {
             let msg = format!("Command not linked: {:?}", cmd);
@@ -940,7 +940,7 @@ impl BlockExecuter {
                 e,
             )
         })?;
-        debug!("Command executed: {:?}, result: {:?}", cmd, ret);
+        trace!("Command executed: {:?}, result: {:?}", cmd, ret);
 
         Ok(ret)
     }

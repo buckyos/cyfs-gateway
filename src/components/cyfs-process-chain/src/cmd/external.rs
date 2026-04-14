@@ -248,7 +248,7 @@ impl CommandExecutor for ExternalCommandExecutor {
                 msg
             })?;
 
-        info!(
+        debug!(
             "Executed external command: {}, args: {:?}, result: {:?}",
             self.name, self.args, ret
         );
