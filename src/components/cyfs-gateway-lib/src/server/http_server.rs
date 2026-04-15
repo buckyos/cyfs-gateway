@@ -231,6 +231,16 @@ impl ProcessChainHttpServer {
         }
     }
 
+    fn upstream_sni_host(request_url: &Url) -> ServerResult<String> {
+        request_url.host_str().map(|h| h.to_string()).ok_or_else(|| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "Missing SNI host for upstream: {}",
+                request_url
+            )
+        })
+    }
+
     pub fn builder() -> ProcessChainHttpServerBuilder {
         ProcessChainHttpServerBuilder {
             id: None,
@@ -421,30 +431,8 @@ impl ProcessChainHttpServer {
                     )
                 })?;
 
-                let sni_host = {
-                    let host = header
-                        .get("host")
-                        .and_then(|h| h.to_str().ok())
-                        .map(|h| h.trim());
-                    let parsed = host.and_then(|h| {
-                        if h.is_empty() {
-                            return None;
-                        }
-                        if let Some(stripped) = h.strip_prefix('[') {
-                            let end = stripped.find(']')?;
-                            return Some(stripped[..end].to_string());
-                        }
-                        Some(h.split(':').next().unwrap_or(h).to_string())
-                    });
-                    parsed.or_else(|| request_url.host_str().map(|h| h.to_string()))
-                }
-                .ok_or_else(|| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "Missing SNI host for upstream: {}",
-                        request_url
-                    )
-                })?;
+                // SNI must target the upstream host, not the inbound Host header.
+                let sni_host = Self::upstream_sni_host(&request_url)?;
 
                 let tcp_stream = TcpStream::connect(format!("{}:{}", connect_host, connect_port))
                     .await
@@ -2781,6 +2769,21 @@ mod tests {
         let resp = sender.send_request(request).await.unwrap();
         // 褰揻orward澶辫触鏃讹紝搴旇杩斿洖500閿欒
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_upstream_sni_host_uses_upstream_host() {
+        let request_url = Url::parse("https://inuy7.tbudr.top/api/v1/ai/chat/completions").unwrap();
+        let sni_host = ProcessChainHttpServer::upstream_sni_host(&request_url).unwrap();
+        assert_eq!(sni_host, "inuy7.tbudr.top");
+    }
+
+    #[test]
+    fn test_upstream_sni_host_ignores_inbound_host_semantics() {
+        let request_url = Url::parse("https://inuy7.tbudr.top/api/v1/payment/ping").unwrap();
+        let sni_host = ProcessChainHttpServer::upstream_sni_host(&request_url).unwrap();
+        assert_ne!(sni_host, "sn.buckyos.ai");
+        assert_eq!(sni_host, "inuy7.tbudr.top");
     }
 
     #[tokio::test]
