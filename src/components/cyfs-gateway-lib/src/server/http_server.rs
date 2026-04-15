@@ -26,7 +26,8 @@ use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureSc
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
+use tokio::time::{Duration, timeout};
 use tokio_rustls::TlsConnector;
 use url::Url;
 
@@ -210,6 +211,8 @@ impl Drop for ProcessChainHttpServer {
 }
 
 impl ProcessChainHttpServer {
+    const HTTPS_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
+
     fn request_header_value<'a>(
         req: &'a http::Request<BoxBody<Bytes, ServerError>>,
         name: &str,
@@ -239,6 +242,52 @@ impl ProcessChainHttpServer {
                 request_url
             )
         })
+    }
+
+    async fn connect_upstream_candidates(
+        candidates: Vec<SocketAddr>,
+    ) -> ServerResult<(TcpStream, SocketAddr)> {
+        if candidates.is_empty() {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "No upstream socket addresses resolved"
+            ));
+        }
+
+        let mut errors = Vec::new();
+        for addr in candidates {
+            match timeout(Self::HTTPS_UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => return Ok((stream, addr)),
+                Ok(Err(err)) => errors.push(format!("{} ({})", addr, err)),
+                Err(_) => errors.push(format!("{} (connect timeout)", addr)),
+            }
+        }
+
+        Err(server_err!(
+            ServerErrorCode::InvalidConfig,
+            "Failed to connect upstream candidates: {}",
+            errors.join(", ")
+        ))
+    }
+
+    async fn connect_upstream_with_fallback(
+        connect_host: &str,
+        connect_port: u16,
+    ) -> ServerResult<(TcpStream, SocketAddr)> {
+        let candidates: Vec<SocketAddr> = lookup_host((connect_host, connect_port))
+            .await
+            .map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "Failed to resolve upstream {}:{}: {}",
+                    connect_host,
+                    connect_port,
+                    e
+                )
+            })?
+            .collect();
+
+        Self::connect_upstream_candidates(candidates).await
     }
 
     pub fn builder() -> ProcessChainHttpServerBuilder {
@@ -434,17 +483,8 @@ impl ProcessChainHttpServer {
                 // SNI must target the upstream host, not the inbound Host header.
                 let sni_host = Self::upstream_sni_host(&request_url)?;
 
-                let tcp_stream = TcpStream::connect(format!("{}:{}", connect_host, connect_port))
-                    .await
-                    .map_err(|e| {
-                        server_err!(
-                            ServerErrorCode::InvalidConfig,
-                            "Failed to connect upstream {}:{}: {}",
-                            connect_host,
-                            connect_port,
-                            e
-                        )
-                    })?;
+                let (tcp_stream, connected_addr) =
+                    Self::connect_upstream_with_fallback(connect_host, connect_port).await?;
 
                 let tls_config = ClientConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),
@@ -471,10 +511,9 @@ impl ProcessChainHttpServer {
                     .map_err(|e| {
                         server_err!(
                             ServerErrorCode::InvalidConfig,
-                            "Failed tls handshake with upstream {} via {}:{}: {}",
+                            "Failed tls handshake with upstream {} via {}: {}",
                             sni_host,
-                            connect_host,
-                            connect_port,
+                            connected_addr,
                             e
                         )
                     })?;
@@ -514,15 +553,14 @@ impl ProcessChainHttpServer {
                 *upstream_req.headers_mut() = header;
 
                 let resp = sender.send_request(upstream_req).await.map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "Failed to request https upstream {} via {}:{}: {}",
-                        sni_host,
-                        connect_host,
-                        connect_port,
-                        e
-                    )
-                })?;
+                        server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "Failed to request https upstream {} via {}: {}",
+                            sni_host,
+                            connected_addr,
+                            e
+                        )
+                    })?;
                 let resp = resp.map(|body| {
                     body.map_err(|e| {
                         ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
@@ -2784,6 +2822,41 @@ mod tests {
         let sni_host = ProcessChainHttpServer::upstream_sni_host(&request_url).unwrap();
         assert_ne!(sni_host, "sn.buckyos.ai");
         assert_eq!(sni_host, "inuy7.tbudr.top");
+    }
+
+    #[tokio::test]
+    async fn test_connect_upstream_candidates_falls_back_after_failed_address() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+
+        let unreachable_v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let (stream, connected_addr) =
+            ProcessChainHttpServer::connect_upstream_candidates(vec![unreachable_v6, listen_addr])
+                .await
+                .unwrap();
+
+        assert_eq!(connected_addr, listen_addr);
+        assert_eq!(stream.peer_addr().unwrap(), listen_addr);
+    }
+
+    #[tokio::test]
+    async fn test_connect_upstream_candidates_reports_when_all_fail() {
+        let unreachable_v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let closed_v4: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        let err = ProcessChainHttpServer::connect_upstream_candidates(vec![unreachable_v6, closed_v4])
+            .await
+            .unwrap_err();
+
+        let msg = err.msg().to_string();
+        assert!(msg.contains("Failed to connect upstream candidates"));
+        assert!(msg.contains("2001:db8::1"));
+        assert!(msg.contains("127.0.0.1:9"));
     }
 
     #[tokio::test]
