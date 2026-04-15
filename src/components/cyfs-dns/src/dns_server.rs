@@ -83,6 +83,11 @@ fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RDat
             records.push(RData::CNAME(CNAME(Name::from_str(cname.as_str()).unwrap())));
             return Ok(records);
         }
+        "HTTPS" => {
+            // Recognize HTTPS/SVCB queries, but treat them as NODATA until
+            // explicit HTTPS record support is added.
+            return Ok(vec![]);
+        }
         "TXT" => {
             let mut records = Vec::new();
             for txt in name_info.txt.iter() {
@@ -1216,6 +1221,12 @@ hook_point:
     }
 
     #[test]
+    fn test_nameinfo_to_rdata_https_is_empty_success() {
+        let rdata = nameinfo_to_rdata("HTTPS", &NameInfo::new("web3.buckyos.ai")).unwrap();
+        assert!(rdata.is_empty());
+    }
+
+    #[test]
     fn test_inner_dns_record_manager_caa_records() {
         let manager = InnerDnsRecordManager::new();
         manager
@@ -1471,6 +1482,21 @@ hook_point:
         let mut message = Message::new();
         let name = Name::from_str("mail.buckyos.com.").unwrap();
         let query = Query::query(name, RecordType::CAA);
+        message.add_query(query);
+        message.set_authentic_data(true);
+        message.set_checking_disabled(false);
+
+        let data = server
+            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .await;
+        assert!(data.is_ok());
+        let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.answers().len(), 0);
+
+        let mut message = Message::new();
+        let name = Name::from_str("www.buckyos.com.").unwrap();
+        let query = Query::query(name, RecordType::HTTPS);
         message.add_query(query);
         message.set_authentic_data(true);
         message.set_checking_disabled(false);

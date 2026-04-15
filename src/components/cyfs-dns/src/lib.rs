@@ -145,6 +145,9 @@ pub(crate) async fn nameinfo_to_map_collection(
                 })?;
             return Ok(map);
         }
+        "HTTPS" => {
+            return Ok(map);
+        }
         "TXT" => {
             if name_info.txt.is_empty() {
                 return Err(server_err!(ServerErrorCode::InvalidParam, "TXT is empty"));
@@ -364,8 +367,14 @@ pub(crate) async fn map_collection_to_nameinfo(map: &MapCollectionRef) -> Server
                 ));
             }
         }
+        "HTTPS" => {
+            let mut name_info = NameInfo::new(name.as_str());
+            name_info.ttl = Some(ttl);
+            Ok(name_info)
+        }
         "TXT" => {
             let mut name_info = NameInfo::new(name.as_str());
+            name_info.ttl = Some(ttl);
             let txt = map.get("txt").await.map_err(|e| {
                 server_err!(ServerErrorCode::ProcessChainError, "get txt err {}", e)
             })?;
@@ -399,6 +408,7 @@ pub(crate) async fn map_collection_to_nameinfo(map: &MapCollectionRef) -> Server
         }
         "CAA" => {
             let mut name_info = NameInfo::new(name.as_str());
+            name_info.ttl = Some(ttl);
             let caa = map.get("caa").await.map_err(|e| {
                 server_err!(ServerErrorCode::ProcessChainError, "get caa err {}", e)
             })?;
@@ -432,6 +442,7 @@ pub(crate) async fn map_collection_to_nameinfo(map: &MapCollectionRef) -> Server
         }
         "PTR" => {
             let mut name_info = NameInfo::new(name.as_str());
+            name_info.ttl = Some(ttl);
             let ptr_records = map.get("ptr_records").await.map_err(|e| {
                 server_err!(
                     ServerErrorCode::ProcessChainError,
@@ -504,6 +515,21 @@ mod tests {
         let restored = map_collection_to_nameinfo(&map).await.unwrap();
 
         assert_eq!(restored.name, "web3.buckyos.ai");
+        assert!(restored.caa.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_https_map_collection_round_trip() {
+        let mut name_info = NameInfo::new("web3.buckyos.ai");
+        name_info.ttl = Some(300);
+
+        let map = nameinfo_to_map_collection("HTTPS", &name_info).await.unwrap();
+        let restored = map_collection_to_nameinfo(&map).await.unwrap();
+
+        assert_eq!(restored.name, "web3.buckyos.ai");
+        assert_eq!(restored.ttl, Some(300));
+        assert!(restored.address.is_empty());
+        assert!(restored.txt.is_empty());
         assert!(restored.caa.is_empty());
     }
 }
