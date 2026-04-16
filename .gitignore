@@ -33,3 +33,4 @@ src/apps/cyfs_gateway/web/pnpm-lock.yaml
 local_rootfs
 .sisyphus
 .tmp_oss
+uv.lock

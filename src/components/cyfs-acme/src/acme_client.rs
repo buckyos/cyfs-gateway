@@ -304,7 +304,10 @@ impl AcmeOrderSession {
         if let Some(order_info) = &self.order_info {
             for auth_url in &order_info.authorizations {
                 // 获取挑战信息
-                let mut challenges = self.client.get_challenge(auth_url).await?;
+                let mut challenges = self
+                    .client
+                    .get_challenge(auth_url, directory.clone())
+                    .await?;
                 for challenge in challenges.iter_mut() {
                     challenge.domain = self.domain.clone();
                 }
@@ -321,7 +324,9 @@ impl AcmeOrderSession {
                     .await?;
 
                 // 等待验证完成
-                self.client.poll_authorization(auth_url).await?;
+                self.client
+                    .poll_authorization(auth_url, directory.clone())
+                    .await?;
 
                 self.respond_logs.push(resp_challenge.clone());
             }
@@ -339,7 +344,10 @@ impl AcmeOrderSession {
                 .await?;
 
             // 下载证书
-            let cert = self.client.download_certificate(&cert_url).await?;
+            let cert = self
+                .client
+                .download_certificate(&cert_url, directory.clone())
+                .await?;
 
             Ok((cert, private_key))
         } else {
@@ -588,32 +596,27 @@ impl AcmeClient {
     }
 
     // 新增方法
-    async fn get_challenge(&self, auth_url: &str) -> Result<Vec<Challenge>> {
+    async fn get_challenge(&self, auth_url: &str, directory: Directory) -> Result<Vec<Challenge>> {
         info!(
             "get acme challenge, client: {}, auth_url: {}",
             self, auth_url
         );
 
-        let response = self
-            .inner
-            .http_client
-            .get(auth_url)
-            .send()
-            .await
-            .map_err(|e| {
-                error!(
-                    "get acme challenge failed, client: {}, auth_url: {}, {}",
-                    self, auth_url, e
-                );
-                anyhow::anyhow!(
-                    "get acme challenge failed, client: {}, auth_url: {}, {}",
-                    self,
-                    auth_url,
-                    e
-                )
-            })?;
-
-        let authz: AuthzResponse = response.json().await?;
+        let authz: AuthzResponse =
+            self.signed_post_as_get(auth_url, directory)
+                .await
+                .map_err(|e| {
+                    error!(
+                        "get acme challenge failed, client: {}, auth_url: {}, {}",
+                        self, auth_url, e
+                    );
+                    anyhow::anyhow!(
+                        "get acme challenge failed, client: {}, auth_url: {}, {}",
+                        self,
+                        auth_url,
+                        e
+                    )
+                })?;
 
         let mut challengs = vec![];
         for challenge in authz.challenges.iter() {
@@ -758,7 +761,7 @@ impl AcmeClient {
     }
 
     /// 轮询授权状态
-    async fn poll_authorization(&self, auth_url: &str) -> Result<()> {
+    async fn poll_authorization(&self, auth_url: &str, directory: Directory) -> Result<()> {
         info!(
             "poll acme authorization, client: {}, auth_url: {}",
             self, auth_url
@@ -767,26 +770,21 @@ impl AcmeClient {
         let wait_seconds = 3;
 
         for _ in 0..max_attempts {
-            let response = self
-                .inner
-                .http_client
-                .get(auth_url)
-                .send()
+            let authz: AuthzResponse = self
+                .signed_post_as_get(auth_url, directory.clone())
                 .await
                 .map_err(|e| {
-                    error!(
-                        "poll acme authorization failed, client: {}, auth_url: {}, {}",
-                        self, auth_url, e
-                    );
-                    anyhow::anyhow!(
-                        "poll acme authorization failed, client: {}, auth_url: {}, {}",
-                        self,
-                        auth_url,
-                        e
-                    )
-                })?;
-
-            let authz: AuthzResponse = response.json().await?;
+                error!(
+                    "poll acme authorization failed, client: {}, auth_url: {}, {}",
+                    self, auth_url, e
+                );
+                anyhow::anyhow!(
+                    "poll acme authorization failed, client: {}, auth_url: {}, {}",
+                    self,
+                    auth_url,
+                    e
+                )
+            })?;
 
             match authz.status.as_str() {
                 "valid" => {
@@ -882,15 +880,11 @@ impl AcmeClient {
     }
 
     /// 下载证书
-    async fn download_certificate(&self, url: &str) -> Result<Vec<u8>> {
+    async fn download_certificate(&self, url: &str, directory: Directory) -> Result<Vec<u8>> {
         info!("download acme certificate, client: {}, url: {}", self, url);
 
-        let response = self
-            .inner
-            .http_client
-            .get(url)
-            .header("Accept", "application/pem-certificate-chain")
-            .send()
+        let cert_data = self
+            .signed_post_as_get_bytes(url, directory, Some("application/pem-certificate-chain"))
             .await
             .map_err(|e| {
                 error!(
@@ -900,17 +894,6 @@ impl AcmeClient {
                 anyhow::anyhow!("download acme certificate failed: {}", e)
             })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await?;
-            error!(
-                "download certificate failed with status {}: {}",
-                status, body
-            );
-            return Err(anyhow::anyhow!("Certificate download failed: {}", body));
-        }
-
-        let cert_data = response.bytes().await?.to_vec();
         info!(
             "download acme certificate success, client: {}, url: {}",
             self, url
@@ -1018,6 +1001,61 @@ impl AcmeClient {
         self.handle_response(response).await
     }
 
+    async fn signed_post_as_get<R>(&self, url: &str, directory: Directory) -> Result<R>
+    where
+        R: DeserializeOwned,
+    {
+        let nonce = self.get_nonce(directory).await?;
+        let jws = self.sign_request_post_as_get(url, &nonce)?;
+
+        let response = self
+            .inner
+            .http_client
+            .post(url)
+            .header("Content-Type", "application/jose+json")
+            .json(&jws)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    async fn signed_post_as_get_bytes(
+        &self,
+        url: &str,
+        directory: Directory,
+        accept: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let nonce = self.get_nonce(directory).await?;
+        let jws = self.sign_request_post_as_get(url, &nonce)?;
+
+        let mut request = self
+            .inner
+            .http_client
+            .post(url)
+            .header("Content-Type", "application/jose+json");
+        if let Some(accept) = accept {
+            request = request.header("Accept", accept);
+        }
+
+        let response = request.json(&jws).send().await?;
+
+        if let Some(new_nonce) = response.headers().get("Replay-Nonce") {
+            if let Ok(nonce) = new_nonce.to_str() {
+                self.inner.nonce_manager.update_nonce(nonce.to_string());
+            }
+        }
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await?;
+            error!("acme response error, status: {}, body: {}", status, body);
+            return Err(anyhow::anyhow!("HTTP error: {} - {}", status, body));
+        }
+
+        Ok(response.bytes().await?.to_vec())
+    }
+
     /// 获取 nonce
     async fn get_nonce(&self, directory: Directory) -> Result<String> {
         if let Some(nonce) = self.inner.nonce_manager.take_nonce() {
@@ -1077,7 +1115,14 @@ impl AcmeClient {
         }
 
         // 解析响应体
-        let result = response.json().await?;
+        let body = response.text().await?;
+        let result = serde_json::from_str(&body).map_err(|e| {
+            error!(
+                "decode acme response failed, status: {}, error: {}, body: {}",
+                status, e, body
+            );
+            anyhow::anyhow!("decode acme response failed: {}", e)
+        })?;
         Ok(result)
     }
 
@@ -1101,6 +1146,49 @@ impl AcmeClient {
             })
         } else {
             // 未注册账户使用 jwk
+            serde_json::json!({
+                "alg": "RS256",
+                "nonce": nonce,
+                "url": url,
+                "jwk": {
+                    "kty": "RSA",
+                    "n": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.account().key().rsa()?.n().to_vec()),
+                    "e": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.account().key().rsa()?.e().to_vec()),
+                }
+            })
+        };
+
+        let protected_str = serde_json::to_string(&protected)?;
+        let protected_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(protected_str);
+
+        let signing_input = format!("{}.{}", protected_b64, payload_b64);
+        let mut signer = openssl::sign::Signer::new(
+            openssl::hash::MessageDigest::sha256(),
+            &self.account().key(),
+        )?;
+        let mut signature = vec![0; signer.len()?];
+        signer.sign_oneshot(&mut signature, signing_input.as_bytes())?;
+
+        let signature_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature);
+
+        Ok(serde_json::json!({
+            "protected": protected_b64,
+            "payload": payload_b64,
+            "signature": signature_b64,
+        }))
+    }
+
+    fn sign_request_post_as_get(&self, url: &str, nonce: &str) -> Result<serde_json::Value> {
+        let payload_b64 = String::new();
+
+        let protected = if let Some(kid) = self.inner.account.kid() {
+            serde_json::json!({
+                "alg": "RS256",
+                "kid": kid,
+                "nonce": nonce,
+                "url": url
+            })
+        } else {
             serde_json::json!({
                 "alg": "RS256",
                 "nonce": nonce,
@@ -1204,4 +1292,28 @@ struct AccountResponse {
     #[serde(default)]
     contact: Vec<String>,
     orders: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_as_get_uses_empty_payload() {
+        let client = AcmeClient {
+            inner: Arc::new(AcmeClientInner {
+                directory: tokio::sync::Mutex::new(None),
+                http_client: reqwest::Client::new(),
+                nonce_manager: NonceManager::new(),
+                account: AcmeAccount::new("test@example.com".to_string()),
+                acme_server: "https://example.com/directory".to_string(),
+            }),
+        };
+
+        let jws = client
+            .sign_request_post_as_get("https://example.com/acme/authz/1", "nonce")
+            .unwrap();
+
+        assert_eq!(jws["payload"].as_str(), Some(""));
+    }
 }
