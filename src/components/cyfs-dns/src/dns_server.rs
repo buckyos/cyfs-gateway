@@ -18,7 +18,7 @@ use log::{debug, error, info, warn};
 use rdata::{A, AAAA, CNAME, NS, PTR, SOA, TXT};
 use tokio::net::UdpSocket;
 
-use crate::cmd_resolve::CmdResolve;
+use crate::cmd_resolve::{CmdResolve, DNS_AUTH_LOOPBACK_SUPPRESSED_MSG};
 use crate::map_collection_to_nameinfo;
 use anyhow::Result;
 use cyfs_gateway_lib::*;
@@ -194,6 +194,24 @@ fn zone_soa_record(zone: &Web3ZoneAuthority) -> Record {
             AUTH_SOA_MINIMUM,
         )),
     )
+}
+
+fn is_core_authoritative_record_type(query_type: hickory_server::proto::rr::RecordType) -> bool {
+    matches!(
+        query_type,
+        hickory_server::proto::rr::RecordType::A
+            | hickory_server::proto::rr::RecordType::AAAA
+            | hickory_server::proto::rr::RecordType::TXT
+            | hickory_server::proto::rr::RecordType::NS
+            | hickory_server::proto::rr::RecordType::SOA
+    )
+}
+
+fn is_authoritative_loopback_suppressed_error(err: &ServerError) -> bool {
+    err.code() == ServerErrorCode::NotFound
+        && err
+            .to_string()
+            .contains(DNS_AUTH_LOOPBACK_SUPPRESSED_MSG)
 }
 
 /// Trait for handling incoming requests, and providing a message response.
@@ -595,6 +613,7 @@ impl ProcessChainDnsServer {
             .map_err(into_server_err!(ServerErrorCode::BadRequest))?;
         let name = reqeust_info.query.name().to_string();
         let record_type_str = reqeust_info.query.query_type().to_string();
+        let authoritative_zone = detect_web3_zone_authority(reqeust_info.query.name());
 
         if let Some(response) = self.authoritative_web3_zone_response(request, &reqeust_info) {
             return response;
@@ -662,6 +681,22 @@ impl ProcessChainDnsServer {
 
         let executor = { self.executor.lock().unwrap().fork() };
         let chain_env = executor.chain_env().clone();
+        chain_env
+            .create(
+                "REQ_dns_authoritative",
+                CollectionValue::String(authoritative_zone.is_some().to_string()),
+            )
+            .await
+            .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+        if let Some(zone) = &authoritative_zone {
+            chain_env
+                .create(
+                    "REQ_dns_authoritative_zone",
+                    CollectionValue::String(zone.zone_name_str.clone()),
+                )
+                .await
+                .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{e}"))?;
+        }
         let ret = execute_chain(executor, map)
             .await
             .map_err(into_server_err!(ServerErrorCode::ProcessChainError))?;
@@ -774,14 +809,18 @@ impl ProcessChainDnsServer {
                                 let query_type = request_info.query.query_type();
                                 let is_zone_apex =
                                     normalize_fqdn(request_info.query.name()) == zone.zone_name_str;
-                                let is_core_zone_type = matches!(
-                                    query_type,
-                                    hickory_server::proto::rr::RecordType::A
-                                        | hickory_server::proto::rr::RecordType::AAAA
-                                        | hickory_server::proto::rr::RecordType::TXT
-                                        | hickory_server::proto::rr::RecordType::NS
-                                        | hickory_server::proto::rr::RecordType::SOA
-                                );
+                                let is_core_zone_type = is_core_authoritative_record_type(query_type);
+
+                                if is_authoritative_loopback_suppressed_error(&e)
+                                    && !is_core_zone_type
+                                {
+                                    return self.authoritative_zone_response_to_buffer(
+                                        &request,
+                                        ResponseCode::NoError,
+                                        vec![],
+                                        vec![zone_soa_record(&zone)],
+                                    );
+                                }
 
                                 if is_zone_apex && !is_core_zone_type {
                                     return self.authoritative_zone_response_to_buffer(
@@ -1106,6 +1145,34 @@ hook_point:
         .unwrap()
     }
 
+    async fn create_authoritative_loopback_fallback_test_server() -> ProcessChainDnsServer {
+        let server_mgr = Arc::new(ServerManager::new());
+
+        let config = r#"
+type: dns
+id: test
+hook_point:
+  - id: main
+    priority: 1
+    blocks:
+      - id: main
+        block: |
+          call resolve ${REQ.name} ${REQ.record_type} 127.0.0.1 && return;
+        "#;
+        let config: DnsServerConfig = serde_yaml_ng::from_str(config).unwrap();
+        ProcessChainDnsServer::create_server(
+            config.id,
+            Arc::downgrade(&server_mgr),
+            Some(Arc::new(GlobalProcessChains::new())),
+            Some(GlobalCollectionManager::create(vec![]).await.unwrap()),
+            config.hook_point,
+            InnerDnsRecordManager::new(),
+            Some(Arc::new(JsExternalsManager::new())),
+        )
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn test_authoritative_web3_zone_ns_query_returns_answer() {
         let server = create_authoritative_test_server().await;
@@ -1197,6 +1264,44 @@ hook_point:
         assert_eq!(resp.answers().len(), 0);
         assert_eq!(resp.name_servers().len(), 1);
         assert_eq!(resp.name_servers()[0].record_type(), RecordType::SOA);
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_web3_zone_subdomain_caa_loopback_fallback_returns_nodata() {
+        let server = create_authoritative_loopback_fallback_test_server().await;
+
+        let mut message = Message::new();
+        let name = Name::from_str("wugren2026.web3.buckyos.ai.").unwrap();
+        let query = Query::query(name, RecordType::CAA);
+        message.add_query(query);
+
+        let data = server
+            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .await
+            .unwrap();
+        let resp = Message::from_vec(data.as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert!(resp.header().authoritative());
+        assert_eq!(resp.answers().len(), 0);
+        assert_eq!(resp.name_servers().len(), 1);
+        assert_eq!(resp.name_servers()[0].record_type(), RecordType::SOA);
+    }
+
+    #[tokio::test]
+    async fn test_authoritative_web3_zone_subdomain_a_loopback_fallback_still_returns_nxdomain() {
+        let server = create_authoritative_loopback_fallback_test_server().await;
+
+        let mut message = Message::new();
+        let name = Name::from_str("wugren2026.web3.buckyos.ai.").unwrap();
+        let query = Query::query(name, RecordType::A);
+        message.add_query(query);
+
+        let data = server
+            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .await
+            .unwrap();
+        let resp = Message::from_vec(data.as_slice()).unwrap();
+        assert_eq!(resp.response_code(), ResponseCode::NXDomain);
     }
 
     #[test]

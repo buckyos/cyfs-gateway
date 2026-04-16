@@ -13,6 +13,9 @@ use name_lib::{EncodedDocument, DID};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
+pub(crate) const DNS_AUTH_LOOPBACK_SUPPRESSED_MSG: &str =
+    "authoritative_loopback_recursion_suppressed";
+
 //todo:implement the cmd_resolve_did
 
 pub struct CmdResolve {
@@ -145,6 +148,36 @@ fn normalize_ptr_query_name(domain: &str, record_type: RecordType) -> String {
     domain.to_string()
 }
 
+fn is_loopback_dns_server(server_address: &str) -> bool {
+    if let Ok(ip) = server_address.parse::<IpAddr>() {
+        return ip.is_loopback();
+    }
+
+    if let Ok(addr) = server_address.parse::<SocketAddr>() {
+        return addr.ip().is_loopback();
+    }
+
+    false
+}
+
+async fn should_suppress_loopback_recursion(
+    context: &Context,
+    server_address: &str,
+) -> Result<bool, String> {
+    if !is_loopback_dns_server(server_address) {
+        return Ok(false);
+    }
+
+    let authoritative = context
+        .env()
+        .get("REQ_dns_authoritative", None)
+        .await?
+        .and_then(|value| value.as_str().map(|s| s.eq_ignore_ascii_case("true")))
+        .unwrap_or(false);
+
+    Ok(authoritative)
+}
+
 async fn server_error_result(
     code: ServerErrorCode,
     message: impl Into<String>,
@@ -245,6 +278,16 @@ impl ExternalCommand for CmdResolve {
         } else {
             let server_address = server_address.unwrap();
             if let Ok(address) = server_address.parse::<IpAddr>() {
+                if should_suppress_loopback_recursion(context, server_address).await? {
+                    let msg = format!(
+                        "{}: skip resolve {} {} via loopback {}",
+                        DNS_AUTH_LOOPBACK_SUPPRESSED_MSG,
+                        query_name,
+                        record_type_str,
+                        server_address
+                    );
+                    return server_error_result(ServerErrorCode::NotFound, msg).await;
+                }
                 let provider_name = address.to_string();
                 let provider = DnsProvider::new(Some(provider_name.clone()));
                 let name_info = match provider
@@ -261,6 +304,16 @@ impl ExternalCommand for CmdResolve {
                 };
                 (provider_name, name_info)
             } else if let Ok(address) = server_address.parse::<SocketAddr>() {
+                if should_suppress_loopback_recursion(context, server_address).await? {
+                    let msg = format!(
+                        "{}: skip resolve {} {} via loopback {}",
+                        DNS_AUTH_LOOPBACK_SUPPRESSED_MSG,
+                        query_name,
+                        record_type_str,
+                        server_address
+                    );
+                    return server_error_result(ServerErrorCode::NotFound, msg).await;
+                }
                 let provider_name = address.to_string();
                 let provider = DnsProvider::new(Some(provider_name.clone()));
                 let name_info = match provider
@@ -339,6 +392,11 @@ impl ExternalCommand for CmdResolve {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cyfs_process_chain::{
+        CommandPipe, Context as ChainContext, Env, EnvLevel, GotoCounter,
+        ProcessChainLinkedManager,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn test_normalize_ptr_query_name_ipv4_arpa() {
@@ -359,5 +417,51 @@ mod tests {
     fn test_normalize_ptr_query_name_plain_ip() {
         let name = normalize_ptr_query_name("192.168.1.1", RecordType::PTR);
         assert_eq!(name, "192.168.1.1");
+    }
+
+    #[test]
+    fn test_is_loopback_dns_server() {
+        assert!(is_loopback_dns_server("127.0.0.1"));
+        assert!(is_loopback_dns_server("127.0.0.1:53"));
+        assert!(is_loopback_dns_server("::1"));
+        assert!(is_loopback_dns_server("[::1]:53"));
+        assert!(!is_loopback_dns_server("8.8.8.8"));
+        assert!(!is_loopback_dns_server("8.8.8.8:53"));
+        assert!(!is_loopback_dns_server("local_dns"));
+    }
+
+    #[tokio::test]
+    async fn test_should_suppress_loopback_recursion_only_for_authoritative_queries() {
+        let env = Arc::new(Env::new(EnvLevel::Global, None));
+        let context = ChainContext::new(
+            Arc::new(ProcessChainLinkedManager::new()),
+            env.clone(),
+            Arc::new(GotoCounter::new()),
+            CommandPipe::default(),
+        );
+
+        assert!(
+            !should_suppress_loopback_recursion(&context, "127.0.0.1")
+                .await
+                .unwrap()
+        );
+
+        env.create(
+            "REQ_dns_authoritative",
+            CollectionValue::String("true".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            should_suppress_loopback_recursion(&context, "127.0.0.1")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !should_suppress_loopback_recursion(&context, "8.8.8.8")
+                .await
+                .unwrap()
+        );
     }
 }
