@@ -212,6 +212,9 @@ impl SNServer {
         if username.is_empty() {
             return Err("username is empty".to_string());
         }
+        if username.contains('.') {
+            return Err("username does not meet naming rules".to_string());
+        }
         if !is_valid_name(username, NameType::User) {
             return Err("username does not meet naming rules".to_string());
         }
@@ -3449,7 +3452,7 @@ mod tests {
 
     #[test]
     fn test_validate_registration_username() {
-        for username in ["validuser", "my-device", "sub.domain"] {
+        for username in ["validuser", "my-device"] {
             assert!(
                 SNServer::validate_registration_username(username).is_ok(),
                 "expected valid username: {}",
@@ -3466,6 +3469,7 @@ mod tests {
             ("1starter", "username does not meet naming rules"),
             ("user-", "username does not meet naming rules"),
             ("user_name", "username does not meet naming rules"),
+            ("sub.domain", "username does not meet naming rules"),
             ("sub.admin.domain", "username does not meet naming rules"),
             ("double..dot", "username does not meet naming rules"),
         ] {
@@ -3738,6 +3742,33 @@ mod tests {
             .await
             .unwrap();
         assert!(!result["valid"].as_bool().unwrap());
+
+        let result = krpc
+            .call(
+                "check_username",
+                json!({
+                    "username": "sub.domain"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["valid"].as_bool().unwrap());
+
+        let invalid_register_result = krpc
+            .call(
+                "register_user",
+                json!({
+                    "user_name": "sub.domain",
+                    "public_key": user_public_key.to_string(),
+                    "active_code": CLEAR_STATE_ACTIVE_CODE,
+                    "zone_config": zone_jwt,
+                    "user_domain": "sub.domain.buckyos.ai",
+                }),
+            )
+            .await;
+        assert!(invalid_register_result.is_err());
+        let invalid_register_err = invalid_register_result.err().unwrap().to_string();
+        assert!(invalid_register_err.contains("username does not meet naming rules"));
 
         let result = krpc
             .call(
@@ -4420,6 +4451,31 @@ mod tests {
             .await
             .unwrap();
         assert!(!result["valid"].as_bool().unwrap());
+
+        let result = auth_krpc
+            .call(
+                "auth.check_username",
+                json!({
+                    "name": "sub.domain"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["valid"].as_bool().unwrap());
+
+        let dotted_register_result = auth_krpc
+            .call(
+                "auth.register",
+                json!({
+                    "name": "sub.domain",
+                    "pwd_hash": "12345678",
+                    "active_code": CLEAR_STATE_ACTIVE_CODE
+                }),
+            )
+            .await;
+        assert!(dotted_register_result.is_err());
+        let dotted_register_err = dotted_register_result.err().unwrap().to_string();
+        assert!(dotted_register_err.contains("[SNV2:1001:invalid_username]"));
 
         let result = auth_krpc
             .call(
