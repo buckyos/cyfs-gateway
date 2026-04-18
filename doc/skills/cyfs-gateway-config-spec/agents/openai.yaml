@@ -1,0 +1,7 @@
+interface:
+  display_name: "CYFS Gateway Config Spec"
+  short_description: "cyfs-gateway config and process-chain spec"
+  default_prompt: "Use $cyfs-gateway-config-spec to draft, review, or explain a standalone cyfs-gateway config spec with process-chain rules."
+
+policy:
+  allow_implicit_invocation: true
