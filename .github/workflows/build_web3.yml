@@ -29,7 +29,13 @@ jobs:
         - name: Setup Needed Packages
           run: |
             sudo apt update
-            sudo apt install -y musl-tools
+            sudo apt install -y musl-tools g++ binutils
+            sudo ln -sf "$(command -v g++)" /usr/local/bin/musl-g++
+            sudo ln -sf "$(command -v ar)" /usr/local/bin/musl-ar
+            sudo ln -sf "$(command -v ranlib)" /usr/local/bin/musl-ranlib
+            sudo ln -sf /usr/local/bin/musl-g++ /usr/local/bin/x86_64-linux-musl-g++
+            sudo ln -sf /usr/local/bin/musl-ar /usr/local/bin/x86_64-linux-musl-ar
+            sudo ln -sf /usr/local/bin/musl-ranlib /usr/local/bin/x86_64-linux-musl-ranlib
         - name: install buckyos devkit
           run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
         - name: Build
