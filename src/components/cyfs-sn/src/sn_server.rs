@@ -2516,7 +2516,7 @@ impl SNServer {
         // Treat HTTP `type` as NameServer::query_did doc_type.
         let doc_type = resolve_type.as_deref();
 
-        let from_ip = get_request_client_ip(&req, &info);
+        let from_ip = None;
 
         match self.query_did(&did, doc_type, from_ip).await {
             Ok(doc) => {
@@ -3121,7 +3121,7 @@ impl HttpServer for SNServer {
                 )
             })?;
 
-            let from_ip = get_request_client_ip(&req, &info);
+            let from_ip = get_request_client_ip(&request, &info);
 
             let doc = self.query_did(&did, doc_type.as_deref(), from_ip).await;
             match doc {
@@ -3183,7 +3183,7 @@ impl HttpServer for SNServer {
             }
         };
 
-        let client_ip = match get_request_client_ip(&req, &info) {
+        let client_ip = match get_request_client_ip(&request, &info) {
             Some(ip) => ip,
             None => {
                 error!("Failed to get client ip");
