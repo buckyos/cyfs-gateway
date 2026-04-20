@@ -337,26 +337,45 @@ impl RTcpInner {
         }
     }
 
-    fn extract_ip_from_info_json(info_json: &Value) -> Option<std::net::IpAddr> {
+    fn push_unique_ip(
+        ips: &mut Vec<std::net::IpAddr>,
+        seen: &mut HashSet<std::net::IpAddr>,
+        ip: std::net::IpAddr,
+    ) {
+        if is_filtered_tunnel_ip(ip) {
+            return;
+        }
+
+        if seen.insert(ip) {
+            ips.push(ip);
+        }
+    }
+
+    fn extract_ips_from_info_json(info_json: &Value) -> Vec<std::net::IpAddr> {
+        let mut ips = Vec::new();
+        let mut seen = HashSet::new();
+
         if let Some(ip_str) = info_json.get("ip").and_then(|v| v.as_str()) {
             if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
-                if !is_filtered_tunnel_ip(ip) {
-                    return Some(ip);
-                }
+                Self::push_unique_ip(&mut ips, &mut seen, ip);
             }
         }
 
-        if let Some(ips) = info_json.get("ips").and_then(|v| v.as_array()) {
-            for ip in ips.iter().filter_map(|v| v.as_str()) {
-                if let Ok(ip) = ip.parse::<std::net::IpAddr>() {
-                    if !is_filtered_tunnel_ip(ip) {
-                        return Some(ip);
+        for key in ["ips", "all_ip"] {
+            if let Some(ip_values) = info_json.get(key).and_then(|v| v.as_array()) {
+                for ip_str in ip_values.iter().filter_map(|v| v.as_str()) {
+                    if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+                        Self::push_unique_ip(&mut ips, &mut seen, ip);
                     }
                 }
             }
         }
 
-        None
+        ips
+    }
+
+    fn extract_ip_from_info_json(info_json: &Value) -> Option<std::net::IpAddr> {
+        Self::extract_ips_from_info_json(info_json).into_iter().next()
     }
 
     fn did_info_fallback_base_urls() -> Vec<String> {
@@ -375,9 +394,9 @@ impl RTcpInner {
         vec!["https://sn.buckyos.ai".to_string()]
     }
 
-    async fn resolve_ip_by_did_info_http_fallback(
+    async fn resolve_ips_by_did_info_http_fallback(
         target_did: &DID,
-    ) -> Result<Option<std::net::IpAddr>, String> {
+    ) -> Result<Vec<std::net::IpAddr>, String> {
         let fallback_urls = Self::did_info_fallback_base_urls();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(8))
@@ -423,35 +442,37 @@ impl RTcpInner {
             let info_json: Value = serde_json::from_str(body.as_str())
                 .map_err(|e| format!("{} => parse json failed: {}", base, e))?;
 
-            if let Some(ip) = Self::extract_ip_from_info_json(&info_json) {
+            let ips = Self::extract_ips_from_info_json(&info_json);
+            if !ips.is_empty() {
                 debug!(
-                    "resolve target device {} ip by did-info fallback {} => {}",
+                    "resolve target device {} ips by did-info fallback {} => {:?}",
                     target_did.to_string(),
                     base,
-                    ip
+                    ips
                 );
-                return Ok(Some(ip));
+                return Ok(ips);
             }
 
             errors.push(format!("{} => did-info has no ip/ips field", base));
         }
 
         if errors.is_empty() {
-            Ok(None)
+            Ok(Vec::new())
         } else {
             Err(errors.join("; "))
         }
     }
 
-    async fn resolve_ip_by_did_info(target_did: &DID) -> Result<Option<std::net::IpAddr>, String> {
+    async fn resolve_ips_by_did_info(target_did: &DID) -> Result<Vec<std::net::IpAddr>, String> {
         let mut errors = Vec::new();
         match resolve_did(target_did, Some("info")).await {
             Ok(info_doc) => {
                 let info_json = info_doc
                     .to_json_value()
                     .map_err(|e| format!("parse did info doc failed: {}", e))?;
-                if let Some(ip) = Self::extract_ip_from_info_json(&info_json) {
-                    return Ok(Some(ip));
+                let ips = Self::extract_ips_from_info_json(&info_json);
+                if !ips.is_empty() {
+                    return Ok(ips);
                 }
                 errors.push("did-info has no ip/ips field".to_string());
             }
@@ -460,11 +481,11 @@ impl RTcpInner {
             }
         }
 
-        match Self::resolve_ip_by_did_info_http_fallback(target_did).await {
-            Ok(Some(ip)) => Ok(Some(ip)),
-            Ok(None) => {
+        match Self::resolve_ips_by_did_info_http_fallback(target_did).await {
+            Ok(ips) if !ips.is_empty() => Ok(ips),
+            Ok(_) => {
                 if errors.is_empty() {
-                    Ok(None)
+                    Ok(Vec::new())
                 } else {
                     Err(errors.join("; "))
                 }
@@ -473,6 +494,18 @@ impl RTcpInner {
                 errors.push(format!("did-info fallback failed: {}", e));
                 Err(errors.join("; "))
             }
+        }
+    }
+
+    async fn resolve_ips_by_candidate(candidate: &str) -> Result<Vec<std::net::IpAddr>, String> {
+        let ip = resolve_ip(candidate)
+            .await
+            .map_err(|e| format!("resolve {} failed: {}", candidate, e))?;
+
+        if is_filtered_tunnel_ip(ip) {
+            Err(format!("{} => filtered ip {}", candidate, ip))
+        } else {
+            Ok(vec![ip])
         }
     }
 
@@ -1073,26 +1106,23 @@ impl RTcpInner {
             target_id_str, resolve_candidates
         );
 
-        let mut device_ip = None;
+        let mut candidate_ips = Vec::new();
+        let mut seen_ips = HashSet::new();
         let mut resolve_errors = Vec::new();
         for candidate in resolve_candidates.iter() {
-            match resolve_ip(candidate.as_str()).await {
-                Ok(ip) => {
-                    if is_filtered_tunnel_ip(ip) {
-                        let err_msg = format!("{} => filtered ip {}", candidate, ip);
-                        debug!(
-                            "resolve target device {} failed: {}",
-                            target_id_str, err_msg
-                        );
-                        resolve_errors.push(err_msg);
-                        continue;
+            match Self::resolve_ips_by_candidate(candidate.as_str()).await {
+                Ok(ips) => {
+                    let mut newly_resolved = Vec::new();
+                    for ip in ips {
+                        if seen_ips.insert(ip) {
+                            candidate_ips.push(ip);
+                            newly_resolved.push(ip);
+                        }
                     }
                     debug!(
-                        "resolve target device {} ip by {} => {}",
-                        target_id_str, candidate, ip
+                        "resolve target device {} ips by {} => {:?}",
+                        target_id_str, candidate, newly_resolved
                     );
-                    device_ip = Some(ip);
-                    break;
                 }
                 Err(err) => {
                     let err_msg = format!("{} => {}", candidate, err);
@@ -1105,128 +1135,138 @@ impl RTcpInner {
             }
         }
 
-        if device_ip.is_none() {
-            match Self::resolve_ip_by_did_info(&target.did).await {
-                Ok(Some(ip)) => {
-                    debug!(
-                        "resolve target device {} ip by did-info => {}",
-                        target_id_str, ip
-                    );
-                    device_ip = Some(ip);
+        match Self::resolve_ips_by_did_info(&target.did).await {
+            Ok(ips) if !ips.is_empty() => {
+                debug!(
+                    "resolve target device {} ips by did-info => {:?}",
+                    target_id_str, ips
+                );
+                for ip in ips {
+                    if seen_ips.insert(ip) {
+                        candidate_ips.push(ip);
+                    }
                 }
-                Ok(None) => {
+            }
+            Ok(_) => {
+                if candidate_ips.is_empty() {
                     resolve_errors.push("did-info has no ip/ips field".to_string());
                 }
-                Err(err) => {
+            }
+            Err(err) => {
+                if candidate_ips.is_empty() {
                     resolve_errors.push(format!("did-info => {}", err));
+                } else {
+                    debug!(
+                        "resolve target device {} extra ips by did-info failed: {}",
+                        target_id_str, err
+                    );
                 }
             }
         }
 
-        let device_ip = device_ip.ok_or_else(|| {
+        if candidate_ips.is_empty() {
             let msg = format!(
                 "cann't resolve target device {} ip, tried {:?}, errors: {:?}",
                 target_id_str, resolve_candidates, resolve_errors
             );
             error!("{}", msg);
-            TunnelError::DocumentError(msg)
-        })?;
+            return Err(TunnelError::DocumentError(msg));
+        }
         let port = target.stack_port;
-        let remote_addr = format!("{}:{}", device_ip, port);
+        let mut connect_errors = Vec::new();
+        for device_ip in candidate_ips {
+            let remote_addr = format!("{}:{}", device_ip, port);
 
-        debug!(
-            "Will open tunnel to {}, target addr is {}",
-            target_id_str.as_str(),
-            remote_addr.as_str()
-        );
-
-        // connect to target
-        let tunnel_stream = tokio::net::TcpStream::connect(remote_addr.clone()).await;
-        if tunnel_stream.is_err() {
-            let connect_err = tunnel_stream.err().unwrap();
-            if connect_err.kind() == std::io::ErrorKind::ConnectionRefused {
-                warn!(
-                    "connect to {} refused when opening tunnel to {} (did resolved, but rtcp port {} is unreachable/refused)",
-                    remote_addr, target_id_str, port
-                );
-            } else {
-                warn!("connect to {} error: {}", remote_addr, connect_err);
-            }
-            return Err(TunnelError::ConnectError(format!(
-                "connect to {} error: {}",
-                remote_addr, connect_err
-            )));
-        }
-        // create tunnel token
-        let (tunnel_token, aes_key, random_pk) = self
-            .generate_tunnel_token(target_id_str.clone())
-            .await
-            .map_err(|e| {
-                let msg = format!("generate tunnel token error: {}, {}", target_id_str, e);
-                error!("{}", msg);
-                e
-            })?;
-
-        let addr: SocketAddr = self.bind_addr.parse().unwrap();
-        // send hello to target
-        let mut tunnel_stream = tunnel_stream.unwrap();
-        let hello_package = RTcpHelloPackage::new(
-            0,
-            self.this_device_did.to_string(),
-            target_id_str.clone(),
-            addr.port(),
-            Some(tunnel_token),
-            self.this_device_doc_jwt.clone(),
-        );
-        let send_result =
-            RTcpTunnelPackage::send_package(Pin::new(&mut tunnel_stream), hello_package).await;
-        if send_result.is_err() {
-            warn!(
-                "send hello package to {} error:{}",
-                remote_addr,
-                send_result.err().unwrap()
-            );
-            return Err(TunnelError::ConnectError(format!(
-                "send hello package to {} error.",
-                remote_addr
-            )));
-        }
-
-        // create tunnel and add to map
-        let tunnel = RTcpTunnel::new(
-            self.stream_helper.clone(),
-            self.this_device_did.clone(),
-            &target,
-            true,
-            tunnel_stream,
-            aes_key,
-            random_pk,
-            self.listener.clone(),
-        );
-        all_tunnel.insert(tunnel_key.clone(), tunnel.clone());
-        info!(
-            "create tunnel {} ok, remote addr is {}",
-            tunnel_key.as_str(),
-            remote_addr.as_str()
-        );
-        drop(all_tunnel);
-
-        let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
-        let tunnel_map = self.tunnel_map.clone();
-        task::spawn(async move {
             debug!(
-                "RTcp tunnel {} established, tunnel running",
-                tunnel_key.as_str()
+                "Will open tunnel to {}, target addr is {}",
+                target_id_str.as_str(),
+                remote_addr.as_str()
             );
-            tunnel.run().await;
 
-            // remove tunnel from manager
-            tunnel_map.remove_tunnel(&tunnel_key).await;
+            let tunnel_stream = tokio::net::TcpStream::connect(remote_addr.clone()).await;
+            let mut tunnel_stream = match tunnel_stream {
+                Ok(stream) => stream,
+                Err(connect_err) => {
+                    if connect_err.kind() == std::io::ErrorKind::ConnectionRefused {
+                        warn!(
+                            "connect to {} refused when opening tunnel to {} (did resolved, but rtcp port {} is unreachable/refused)",
+                            remote_addr, target_id_str, port
+                        );
+                    } else {
+                        warn!("connect to {} error: {}", remote_addr, connect_err);
+                    }
+                    connect_errors.push(format!("{} => {}", remote_addr, connect_err));
+                    continue;
+                }
+            };
 
-            info!("RTcp tunnel {} end", tunnel_key.as_str());
-        });
+            let (tunnel_token, aes_key, random_pk) = self
+                .generate_tunnel_token(target_id_str.clone())
+                .await
+                .map_err(|e| {
+                    let msg = format!("generate tunnel token error: {}, {}", target_id_str, e);
+                    error!("{}", msg);
+                    e
+                })?;
 
-        return result;
+            let addr: SocketAddr = self.bind_addr.parse().unwrap();
+            let hello_package = RTcpHelloPackage::new(
+                0,
+                self.this_device_did.to_string(),
+                target_id_str.clone(),
+                addr.port(),
+                Some(tunnel_token),
+                self.this_device_doc_jwt.clone(),
+            );
+            let send_result =
+                RTcpTunnelPackage::send_package(Pin::new(&mut tunnel_stream), hello_package).await;
+            if let Err(send_err) = send_result {
+                warn!("send hello package to {} error:{}", remote_addr, send_err);
+                connect_errors.push(format!("{} => send hello package error: {}", remote_addr, send_err));
+                continue;
+            }
+
+            let tunnel = RTcpTunnel::new(
+                self.stream_helper.clone(),
+                self.this_device_did.clone(),
+                &target,
+                true,
+                tunnel_stream,
+                aes_key,
+                random_pk,
+                self.listener.clone(),
+            );
+            all_tunnel.insert(tunnel_key.clone(), tunnel.clone());
+            info!(
+                "create tunnel {} ok, remote addr is {}",
+                tunnel_key.as_str(),
+                remote_addr.as_str()
+            );
+            drop(all_tunnel);
+
+            let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
+            let tunnel_map = self.tunnel_map.clone();
+            task::spawn(async move {
+                debug!(
+                    "RTcp tunnel {} established, tunnel running",
+                    tunnel_key.as_str()
+                );
+                tunnel.run().await;
+
+                // remove tunnel from manager
+                tunnel_map.remove_tunnel(&tunnel_key).await;
+
+                info!("RTcp tunnel {} end", tunnel_key.as_str());
+            });
+
+            return result;
+        }
+
+        Err(TunnelError::ConnectError(format!(
+            "connect to target {} failed after trying all candidates: {}",
+            target_id_str,
+            connect_errors.join("; ")
+        )))
     }
 }
 
@@ -1955,6 +1995,37 @@ mod tests {
         assert_eq!(ip, Some("192.168.100.191".parse().unwrap()));
     }
 
+    #[test]
+    fn test_extract_ips_from_info_json_preserves_order_and_skips_filtered_values() {
+        let info_json = serde_json::json!({
+            "ip": "172.17.0.1",
+            "all_ip": [
+                "240e:3b3:30c1:5380:f370:ecf5:8fad:d1ea",
+                "192.168.100.182",
+                "172.26.48.1",
+                "192.168.100.182"
+            ],
+            "ips": [
+                "240e:3b3:30c1:5380::997",
+                "192.168.100.182"
+            ]
+        });
+
+        let ips = RTcpInner::extract_ips_from_info_json(&info_json);
+        assert_eq!(
+            ips,
+            vec![
+                "240e:3b3:30c1:5380::997"
+                    .parse::<std::net::IpAddr>()
+                    .unwrap(),
+                "192.168.100.182".parse::<std::net::IpAddr>().unwrap(),
+                "240e:3b3:30c1:5380:f370:ecf5:8fad:d1ea"
+                    .parse::<std::net::IpAddr>()
+                    .unwrap(),
+            ]
+        );
+    }
+
     // Mock实现用于测试
     struct MockRTcpListener;
 
@@ -2324,6 +2395,77 @@ mod tests {
             assert_eq!(&buf[..len], b"test");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_create_tunnel_falls_back_to_next_resolved_ip() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let _id1 = device_config.id.clone();
+        let did_doc_value = serde_json::to_value(&device_config).unwrap();
+        let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
+        update_did_cache(device_config.id.clone(), None, encoded_doc)
+            .await
+            .unwrap();
+        add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(
+                device_config.id.to_string().as_str(),
+                "127.0.0.1".parse().unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let mut rtcp1 = RTcp::new(
+            device_config.id,
+            "127.0.0.1:19073".to_string(),
+            Some(pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        rtcp1.start().await.unwrap();
+
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let id2 = device_config.id.clone();
+        let did_doc_value = serde_json::to_value(&device_config).unwrap();
+        let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
+        update_did_cache(device_config.id.clone(), None, encoded_doc)
+            .await
+            .unwrap();
+        add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo {
+                name: device_config.id.to_string(),
+                address: vec![
+                    "127.0.0.2".parse().unwrap(),
+                    "127.0.0.1".parse().unwrap(),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut rtcp2 = RTcp::new(
+            device_config.id,
+            "127.0.0.1:19074".to_string(),
+            Some(pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        rtcp2.start().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let tunnel = rtcp1
+            .create_tunnel(Some(format!("{}:19074", id2.to_host_name()).as_str()))
+            .await
+            .unwrap();
+        tunnel.ping().await.unwrap();
     }
 
     #[tokio::test]
