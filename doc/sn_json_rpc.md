@@ -157,7 +157,9 @@ Base64(SHA256(password + username + ".buckyos"))
   - 服务端按 `buckyos-kit::is_valid_name(name, NameType::User)` 校验用户名
   - 额外拦截服务端保留名单文件，默认路径：`$BUCKYOS_ROOT/data/var/sn/reserved_user_names.txt`
   - 如果设置了环境变量 `BUCKYOS_SN_RESERVED_NAMES_FILE`，则优先读取该文件
-  - result: `{ "code": 0, "valid": true }`
+  - result:
+    - 可用：`{ "valid": true, "reason": "ok", "message": "", "normalized_name": "alice" }`
+    - 不可用：`{ "valid": false, "reason": "invalid_username" | "already_exists", "message": "...", "normalized_name": "alice" }`
 - `auth.check_active_code`
   - params: `{ "active_code": "..." }`
   - result: `{ "code": 0, "valid": true }`

@@ -366,23 +366,39 @@ impl SNServer {
         let username = username.unwrap().as_str();
         let username = username.unwrap();
         let username = Self::normalize_registration_username(username);
-        let valid = if Self::validate_registration_username(username.as_str()).is_ok() {
-            let exists = self
-                .db
-                .is_user_exist(username.as_str())
-                .await
-                .map_err(|e| {
-                    error!("Failed to check username: {:?}", e);
-                    RPCErrors::ReasonError(e.to_string())
-                })?;
-            !exists
-        } else {
-            false
-        };
+        let (valid, reason, message) =
+            if let Err(message) = Self::validate_registration_username(username.as_str()) {
+                (
+                    false,
+                    "invalid_username".to_string(),
+                    message.to_string(),
+                )
+            } else {
+                let exists = self
+                    .db
+                    .is_user_exist(username.as_str())
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to check username: {:?}", e);
+                        RPCErrors::ReasonError(e.to_string())
+                    })?;
+                if exists {
+                    (
+                        false,
+                        "already_exists".to_string(),
+                        format!("username {} already exists", username),
+                    )
+                } else {
+                    (true, "ok".to_string(), String::new())
+                }
+            };
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
-                "valid": valid
+                "valid": valid,
+                "reason": reason,
+                "message": message,
+                "normalized_name": username
             })),
             &req,
         );
@@ -3720,6 +3736,8 @@ mod tests {
             .unwrap()
             .as_bool()
             .unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "ok");
+        assert_eq!(result["normalized_name"].as_str().unwrap(), TEST_USER);
 
         let result = krpc
             .call(
@@ -3731,6 +3749,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
+        assert_eq!(
+            result["message"].as_str().unwrap(),
+            "username does not meet naming rules"
+        );
 
         let result = krpc
             .call(
@@ -3742,6 +3765,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
         let result = krpc
             .call(
@@ -3753,6 +3777,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
         let invalid_register_result = krpc
             .call(
@@ -3810,6 +3835,11 @@ mod tests {
             .unwrap()
             .as_bool()
             .unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "already_exists");
+        assert!(result["message"]
+            .as_str()
+            .unwrap()
+            .contains("already exists"));
 
         let result = krpc
             .call(
@@ -3821,6 +3851,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
         let result = krpc
             .call(
@@ -4384,6 +4415,8 @@ mod tests {
             .await
             .unwrap();
         assert!(result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "ok");
+        assert_eq!(result["normalized_name"].as_str().unwrap(), TEST_ROOT_USER);
 
         let result = root_krpc
             .call(
@@ -4395,6 +4428,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
         let result = root_krpc
             .call(
@@ -4406,6 +4440,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
         let result = root_krpc
             .call(
@@ -4417,6 +4452,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "ok");
 
         let result = root_krpc
             .call(
@@ -4428,6 +4464,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
         let auth_krpc = kRPC::new("http://127.0.0.1:19092/kapi/sn/auth", None);
         let result = auth_krpc
@@ -4440,6 +4477,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "ok");
 
         let result = auth_krpc
             .call(
@@ -4451,6 +4489,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
         let result = auth_krpc
             .call(
@@ -4462,6 +4501,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "invalid_username");
 
         let dotted_register_result = auth_krpc
             .call(
@@ -4492,6 +4532,22 @@ mod tests {
         assert!(result["need_bind_owner_key"].as_bool().unwrap());
         let access_token = result["access_token"].as_str().unwrap().to_string();
         let refresh_token = result["refresh_token"].as_str().unwrap().to_string();
+
+        let result = auth_krpc
+            .call(
+                "auth.check_username",
+                json!({
+                    "name": TEST_USER_V2
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result["valid"].as_bool().unwrap());
+        assert_eq!(result["reason"].as_str().unwrap(), "already_exists");
+        assert!(result["message"]
+            .as_str()
+            .unwrap()
+            .contains("already exists"));
 
         let auth_me_krpc = kRPC::new(
             "http://127.0.0.1:19092/kapi/sn/auth",
