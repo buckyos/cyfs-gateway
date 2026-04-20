@@ -146,6 +146,8 @@ stacks:
             priority: 1
             block: |
               call https-sni-probe || reject; 
+              map-create "REQ.ext";
+              map-add "REQ.ext" "proxy_source_addr" "${REQ.source_addr}";
               eq ${REQ.dest_host} "sn.{{sn_host}}" && return "forward tcp:///:3443";
               eq ${REQ.dest_host} "www.{{sn_host}}" && return "forward tcp:///:3443";
               eq ${REQ.dest_host} "{{sn_host}}" && return "forward tcp:///:3443";

@@ -147,6 +147,16 @@ pub struct StreamInfo {
     pub source_online_secs: Option<String>,
 }
 
+#[derive(Default, Debug, Clone)]
+pub struct HttpRequestProcessChainVars {
+    pub req_remote_ip: Option<String>,
+    pub req_remote_port: Option<String>,
+    pub req_conn_remote_ip: Option<String>,
+    pub req_conn_remote_port: Option<String>,
+    pub req_real_remote_ip: Option<String>,
+    pub req_real_remote_port: Option<String>,
+}
+
 impl StreamInfo {
     pub fn new(src_addr: String) -> Self {
         Self {

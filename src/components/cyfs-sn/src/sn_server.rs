@@ -10,8 +10,9 @@ use async_trait::async_trait;
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
 use cyfs_gateway_lib::{into_server_err, server_err};
 use cyfs_gateway_lib::{
-    qa_json_to_rpc_request, HttpServer, NameServer, QAServer, Server, ServerConfig,
-    ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo,
+    qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer, NameServer, QAServer,
+    Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory,
+    ServerResult, StreamInfo,
 };
 use http::{Method, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -77,6 +78,29 @@ enum SnRpcPath {
     Auth,
     Bns,
     InternalRoot,
+}
+
+fn parse_ip_or_socket_addr(value: &str) -> Option<IpAddr> {
+    value
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| value.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
+}
+
+fn get_request_client_ip(
+    req: &http::Request<BoxBody<Bytes, ServerError>>,
+    info: &StreamInfo,
+) -> Option<IpAddr> {
+    req.extensions()
+        .get::<HttpRequestProcessChainVars>()
+        .and_then(|vars| vars.req_real_remote_ip.as_deref())
+        .and_then(parse_ip_or_socket_addr)
+        .or_else(|| {
+            info.real_src_addr
+                .as_deref()
+                .and_then(parse_ip_or_socket_addr)
+        })
+        .or_else(|| info.src_addr.as_deref().and_then(parse_ip_or_socket_addr))
 }
 
 impl SnRpcPath {
@@ -2492,12 +2516,7 @@ impl SNServer {
         // Treat HTTP `type` as NameServer::query_did doc_type.
         let doc_type = resolve_type.as_deref();
 
-        // best-effort parse client ip from StreamInfo
-        let from_ip = info
-            .src_addr
-            .as_ref()
-            .and_then(|addr| addr.parse::<SocketAddr>().ok())
-            .map(|s| s.ip());
+        let from_ip = get_request_client_ip(&req, &info);
 
         match self.query_did(&did, doc_type, from_ip).await {
             Ok(doc) => {
@@ -3102,12 +3121,7 @@ impl HttpServer for SNServer {
                 )
             })?;
 
-            // best-effort parse client ip from StreamInfo
-            let from_ip = info
-                .src_addr
-                .as_ref()
-                .and_then(|addr| addr.parse::<SocketAddr>().ok())
-                .map(|s| s.ip());
+            let from_ip = get_request_client_ip(&req, &info);
 
             let doc = self.query_did(&did, doc_type.as_deref(), from_ip).await;
             match doc {
@@ -3169,22 +3183,8 @@ impl HttpServer for SNServer {
             }
         };
 
-        let client_ip = match info.src_addr {
-            Some(addr) => match addr.parse::<SocketAddr>() {
-                Ok(socket_addr) => socket_addr.ip(),
-                Err(e) => {
-                    error!("parse client ip {} err {}", addr.as_str(), e);
-                    return Ok(Response::builder()
-                        .status(StatusCode::BAD_REQUEST)
-                        .header("Access-Control-Allow-Origin", "*")
-                        .body(
-                            BoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
-                                .map_err(|e| match e {})
-                                .boxed(),
-                        )
-                        .unwrap());
-                }
-            },
+        let client_ip = match get_request_client_ip(&req, &info) {
+            Some(ip) => ip,
             None => {
                 error!("Failed to get client ip");
                 return Ok(Response::builder()

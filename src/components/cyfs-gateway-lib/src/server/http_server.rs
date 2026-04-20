@@ -6,7 +6,8 @@ use super::{into_server_err, server_err};
 use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
 use crate::tunnel_connector::TunnelConnector;
 use crate::{
-    GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpResponseHeaderMap, HttpServer,
+    GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestProcessChainVars,
+    HttpResponseHeaderMap, HttpServer,
     JsExternalsManagerRef, ProcessChainConfigs, Server, ServerConfig, ServerContext,
     ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef,
     ServerResult, StreamInfo, TunnelManager, get_external_commands,
@@ -893,7 +894,7 @@ impl HttpServer for ProcessChainHttpServer {
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let req_info = CompressionRequestInfo::from_request(&req);
-        let req = match apply_request_decompression(req, &self.compression) {
+        let mut req = match apply_request_decompression(req, &self.compression) {
             Ok(req) => req,
             Err(err) => {
                 let mut response = http::Response::new(
@@ -937,12 +938,14 @@ impl HttpServer for ProcessChainHttpServer {
             self.id,
         );
 
+        let mut process_chain_vars = HttpRequestProcessChainVars::default();
         let executor = { self.executor.lock().unwrap().fork() };
 
-        let req_map = HttpRequestHeaderMap::new(req);
         let global_env = executor.global_env();
         if let Some(src_addr) = info.src_addr.as_ref() {
             if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
+                process_chain_vars.req_remote_ip = Some(socket_addr.ip().to_string());
+                process_chain_vars.req_remote_port = Some(socket_addr.port().to_string());
                 global_env
                     .create(
                         "REQ_remote_ip",
@@ -961,6 +964,8 @@ impl HttpServer for ProcessChainHttpServer {
         }
         if let Some(src_addr) = info.conn_src_addr.as_ref() {
             if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
+                process_chain_vars.req_conn_remote_ip = Some(socket_addr.ip().to_string());
+                process_chain_vars.req_conn_remote_port = Some(socket_addr.port().to_string());
                 global_env
                     .create(
                         "REQ_conn_remote_ip",
@@ -979,6 +984,8 @@ impl HttpServer for ProcessChainHttpServer {
         }
         if let Some(src_addr) = info.real_src_addr.as_ref() {
             if let Ok(socket_addr) = src_addr.parse::<SocketAddr>() {
+                process_chain_vars.req_real_remote_ip = Some(socket_addr.ip().to_string());
+                process_chain_vars.req_real_remote_port = Some(socket_addr.port().to_string());
                 global_env
                     .create(
                         "REQ_real_remote_ip",
@@ -995,6 +1002,8 @@ impl HttpServer for ProcessChainHttpServer {
                     .map_err(|e| server_err!(ServerErrorCode::ProcessChainError, "{}", e))?;
             }
         }
+        req.extensions_mut().insert(process_chain_vars);
+        let req_map = HttpRequestHeaderMap::new(req);
         if let Some(dst_addr) = info.dst_addr.as_ref() {
             if let Ok(socket_addr) = dst_addr.parse::<SocketAddr>() {
                 global_env
