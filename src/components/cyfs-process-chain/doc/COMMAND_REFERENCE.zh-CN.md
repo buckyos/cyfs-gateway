@@ -138,24 +138,26 @@
 
 参数:
   <var>       要重写的变量，例如 $REQ.url
-  <pattern>   要匹配的 glob 模式，例如 /kapi/my-service/*
-  <template>  使用 * 通配符的替换模板，例如 /kapi/*
+  <pattern>   以大小写不敏感方式匹配的 glob 模式
+  <template>  替换字符串，或以 `*` 结尾的后缀透传模板
 
 行为:
   - 以大小写不敏感方式执行 glob 匹配。
-  - pattern/template 当前只支持一个 `*` 通配符。
-  - 如果匹配成功，则用模板替换 `*` 对应部分并重写变量值。
+  - 如果 <pattern> 未匹配，则返回 error，且变量保持不变。
+  - 如果 <pattern> 以 `*` 结尾且 <template> 也以 `*` 结尾，则保留匹配到的后缀，
+    并把该后缀追加到去掉末尾 `*` 的模板后面。
+  - 否则，只要 <pattern> 匹配成功，就直接把变量重写为 <template> 当前求值结果。
 
 示例:
   rewrite $REQ.url "/kapi/my-service/*" "/kapi/*"
-  rewrite host "api.*.domain.com" "svc-*.internal"
+  rewrite $REQ.host "*.example.com" "backend.internal"
 ```
 
 ### `rewrite-reg`
 ```
 使用正则表达式与替换模板重写变量。
 
-用法: rewrite-regex <var> <regex> <template>
+用法: rewrite-reg <var> <regex> <template>
 
 参数:
   <var>
@@ -179,11 +181,13 @@
 
 行为:
   - 如果正则匹配成功，则按模板重写变量值。
+  - 只有 `$` 后紧跟 1 位 ASCII 数字时，才会被当作捕获组引用；
+    其他 `$` 都按普通字符保留。
   - 未匹配到的捕获组会替换为空字符串。
-  - 如果未匹配成功，变量保持不变。
+  - 如果未匹配成功，则返回 error，且变量保持不变。
 
 示例:
-  rewrite-regex $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
+  rewrite-reg $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
 ```
 
 ### `slice`

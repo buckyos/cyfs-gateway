@@ -136,24 +136,26 @@ Options:
 
 Arguments:
   <var>       The variable to rewrite (e.g. $REQ.url)
-  <pattern>   A glob-style pattern to match (e.g. /kapi/my-service/*)
-  <template>  A replacement template using * wildcard (e.g. /kapi/*)
+  <pattern>   A case-insensitive glob pattern to match
+  <template>  The replacement string or trailing-* template
 
 Behavior:
-  - Performs case-insensitive glob pattern match.
-  - Supports only a single '*' wildcard in pattern/template.
-  - Rewrites the variable if pattern matches, replacing the '*' part.
+  - Performs case-insensitive glob pattern matching.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+  - If <pattern> ends with '*' and <template> also ends with '*', preserves the
+    matched suffix by appending it to <template> without its trailing '*'.
+  - Otherwise, if <pattern> matches, rewrites the variable to <template> as-is.
 
 Examples:
   rewrite $REQ.url "/kapi/my-service/*" "/kapi/*"
-  rewrite host "api.*.domain.com" "svc-*.internal"
+  rewrite $REQ.host "*.example.com" "backend.internal"
 ```
 
 ### `rewrite-reg`
 ```
 Rewrite a variable using a regular expression and a replacement template.
 
-Usage: rewrite-regex <var> <regex> <template>
+Usage: rewrite-reg <var> <regex> <template>
 
 Arguments:
   <var>
@@ -177,11 +179,13 @@ Arguments:
 
 Behavior:
   - If the regex matches, rewrites the variable with the template.
+  - Only '$' followed by one ASCII digit is treated as a capture reference.
+    Other '$' characters are kept literally.
   - Unmatched captures are replaced with empty strings.
-  - If the pattern does not match, the variable remains unchanged.
+  - If the pattern does not match, returns error and leaves the variable unchanged.
 
 Examples:
-  rewrite-regex $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
+  rewrite-reg $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
 ```
 
 ### `slice`
