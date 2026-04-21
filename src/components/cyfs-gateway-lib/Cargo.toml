@@ -76,8 +76,7 @@ buckyos-kit.workspace = true
 kRPC.workspace = true
 name-client.workspace = true
 name-lib.workspace = true
-ndn-lib.workspace = true
-named_store.workspace = true
+
 cyfs-process-chain = { path = "../cyfs-process-chain" }
 cyfs-acme = { path = "../cyfs-acme" }
 cyfs-lookup = { path = "../cyfs-lookup" }
