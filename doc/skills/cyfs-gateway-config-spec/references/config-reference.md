@@ -258,15 +258,18 @@ hook_point:
 
 ### `tun`
 
-字段：
+必填字段：
 
 - `bind`
+- `hook_point`
+
+可选字段：
+
 - `mask?`
 - `mtu?`
 - `tcp_timeout?`
 - `udp_timeout?`
 - `io_dump_*`
-- `hook_point`
 
 默认：
 
@@ -274,6 +277,49 @@ hook_point:
 - `mtu = 1500`
 - `tcp_timeout = 60`
 - `udp_timeout = 60`
+
+运行时语义：
+
+- `tun` 当前应按带 IP 参数的 stack 配置理解，不是普通监听 socket，也不能直接等价成二层 bridge / TAP
+- `bind` 是传给 `TunStack` builder 的本地 IP 参数
+- `mask` 是传给 `TunStack` builder 的掩码参数
+- `mtu` 是传给 `TunStack` builder 的 MTU 参数；当前默认值为 `1500`
+- `tcp_timeout`、`udp_timeout` 是当前 `tun` stack 暴露出来的超时类参数；当前默认值都为 `60`
+- `hook_point` 不只是一个可挂载 DSL 的入口，而是 `tun` 流量处理路径的必需部分
+- `tun` 的 TCP / UDP 连接处理会先执行 `hook_point`
+- `hook_point` 需要返回当前宿主可消费的转发动作；当前应按 `forward ...` 或 `server ...` 理解
+- 若 `hook_point` 没有返回可消费动作，则不会形成有效业务转发路径
+
+使用约束：
+
+- `bind` 与 `mask` 只定义 `tun` stack 的 IP 参数，不自动证明 underlay 联通、静态路由、IP 转发或防火墙已经满足
+- 仅有 `bind` / `mask` / `mtu` 这类地址参数不足以形成可用业务路径，还必须说明 `hook_point` 的转发逻辑
+- 若用户继续讨论跨机互通，必须把 underlay、静态路由、防火墙、MTU、是否需要 NAT 单列为外部前提
+- 若目标是多节点或站点互联，不能把它表述成“当前应用原生内建能力”；只能写成外部组网方案，并要求补验证步骤
+- app 是否访问 `tun` 地址、物理地址或代理入口，属于部署与接入设计，不属于 `tun` 字段自身语义
+- 如果用户需求依赖广播、ARP、mDNS、NetBIOS 或零配置发现，不能把 `tun` 方案表述成“天然等价于原生局域网”
+- 不能给出缺少 `hook_point` 的 `tun` 配置示例
+
+回答 `tun` 使用问题时至少写出：
+
+- 已确认字段：`bind`、`mask`、`mtu`、`tcp_timeout`、`udp_timeout`、`hook_point`
+- 已确认默认值：`mask = 255.255.255.0`、`mtu = 1500`、`tcp_timeout = 60`、`udp_timeout = 60`
+- `hook_point` 的转发目标是 `call-server` 还是 `forward`
+- 外部前提：underlay、静态路由、防火墙、MTU、是否需要 NAT
+- 接入方式：应用访问哪个地址或是否应改走代理
+- 无证据部分：哪些组网效果当前不能直接承诺
+
+推荐写法：
+
+- 把 `tun` 和宿主机动作拆开描述：
+  `cyfs-gateway` 负责 `tun` stack 配置
+  宿主机负责路由、转发、防火墙和 MTU
+- 把 `tun` 和 `socks` 区分描述：
+  `tun` 负责 IP 级参数配置
+  `socks` 适合支持代理的单个应用接入
+- 把 `tun` 和 `forward` / `call-server` 区分描述：
+  `tun` 解决的是 `tun` stack 的 IP 级入口配置
+  `forward` / `call-server` 解决的是流量命中后交给哪个 server 或 upstream
 
 ## 8. 已支持的 server 类型
 

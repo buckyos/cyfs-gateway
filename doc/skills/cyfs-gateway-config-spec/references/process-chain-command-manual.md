@@ -343,6 +343,31 @@ forward round_robin --map $UPSTREAMS
 - 支持 `ip_hash`
 - inline upstream 可写 `url,weight=N`
 - `--map` 需要一个 map，key 是 upstream URL，value 是权重
+- upstream 的基础语法是 URL，而不是裸的 `host:port`
+- 命令本身只校验“URL 能否解析”，具体 scheme 是否可运行，要看消费这个 `forward` 动作的入口
+
+常见 upstream URL 形态：
+
+```txt
+http://127.0.0.1:8080
+https://api.example.com
+tcp:///127.0.0.1:80
+udp:///127.0.0.1:2300
+tls:///example.com:443
+rtcp://remote-stack-id/:80
+rudp://remote-stack-id:2998/test:80
+socks://user:pass@127.0.0.1:1080
+```
+
+补充说明：
+
+- `http://` / `https://` 常用于 HTTP server 的反向代理目标
+- `tcp:///...` / `udp:///...` 常用于本地 stream/datagram 目标
+- `tls:///...` 通过 path 承载 `host:port`，适用于当前 TLS tunnel 实现
+- `rtcp://...` / `rudp://...` 常用于远端 tunnel 目标
+- 如果省略 scheme，例如 `127.0.0.1:8080`，不应当视为规范写法
+
+如果用户追问不同 scheme 的运行时语义、path 如何解释、HTTP `forward` 会不会拼接原请求 URI，转到 [data-forwarding.md](data-forwarding.md)。
 
 ### 8.2 Probe / 协议探测命令
 
