@@ -3,7 +3,7 @@ mod dir_server;
 mod dns_server;
 mod http_compression;
 mod http_server;
-mod ndn_server;
+
 mod qa_server;
 mod server;
 mod socks5_server;
@@ -18,7 +18,7 @@ pub use acme_http_challenge_server::*;
 pub use dir_server::*;
 pub use dns_server::*;
 pub use http_server::*;
-pub use ndn_server::*;
+
 pub use qa_server::*;
 pub use server::*;
 pub use socks5_server::*;

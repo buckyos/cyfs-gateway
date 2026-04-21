@@ -76,9 +76,8 @@ buckyos-kit.workspace = true
 kRPC.workspace = true
 name-client.workspace = true
 name-lib.workspace = true
-ndn-lib = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "ndn-lib", branch = "main"}
-ndm = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "ndm", branch = "main" }
-named_store = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "named_store", branch = "main" }
+ndn-lib.workspace = true
+named_store.workspace = true
 cyfs-process-chain = { path = "../cyfs-process-chain" }
 cyfs-acme = { path = "../cyfs-acme" }
 cyfs-lookup = { path = "../cyfs-lookup" }
