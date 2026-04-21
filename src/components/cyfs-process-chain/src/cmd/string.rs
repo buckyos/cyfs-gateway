@@ -1,7 +1,7 @@
 use super::cmd::*;
 use crate::block::{CommandArg, CommandArgEvaluator, CommandArgs};
 use crate::chain::{Context, ParserContext};
-use crate::collection::{CollectionValue, NumberValue};
+use crate::collection::{CollectionValue, MemoryListCollection, MemoryMapCollection, NumberValue};
 use clap::{Arg, ArgAction, Command};
 use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
@@ -1145,6 +1145,213 @@ impl CommandExecutor for StringSliceCommand {
                 Ok(CommandResult::error())
             }
         }
+    }
+}
+
+// split <value> <delimiter>
+// This command splits a string into segments and optionally captures them into name[0], name[1], ...
+pub struct StringSplitCommandParser {
+    cmd: Command,
+}
+
+impl StringSplitCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("split")
+            .about("Split a string into segments using a delimiter.")
+            .after_help(
+                r#"
+Arguments:
+  <value>       The input string or variable.
+  <delimiter>   The delimiter string used to split the input.
+
+Options:
+  --capture <name>   Store segments into a fresh map variable as name[0], name[1], ...
+  --skip-empty       Drop empty segments from the result
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - Returns a List of string segments.
+  - By default, empty segments are preserved, including leading or trailing ones.
+  - If --skip-empty is set, empty segments are removed from both the returned list and captured slots.
+  - If --capture is set, <name> is replaced with a fresh map whose keys are "0", "1", ...
+  - <name> must be a literal variable name or path.
+  - Empty delimiter is invalid and returns a runtime error.
+
+Examples:
+  split "/a/b/c" "/"
+  split --skip-empty "/.cluster/klog/ood1/admin/" "/"
+  split --capture parts $REQ.path $delimiter
+"#,
+            )
+            .arg(
+                Arg::new("capture")
+                    .long("capture")
+                    .value_name("name")
+                    .help("Store split segments into a fresh map variable"),
+            )
+            .arg(
+                Arg::new("skip_empty")
+                    .long("skip-empty")
+                    .action(ArgAction::SetTrue)
+                    .help("Drop empty segments from the result"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("Input string to split"),
+            )
+            .arg(
+                Arg::new("delimiter")
+                    .required(true)
+                    .help("Delimiter string used for splitting"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for StringSplitCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid string split command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let capture = match matches.index_of("capture") {
+            Some(index) => {
+                let name = args[index].as_literal_str().ok_or_else(|| {
+                    let msg = format!("Capture name must be a literal string: {:?}", args[index]);
+                    error!("{}", msg);
+                    msg
+                })?;
+                Some(name.to_string())
+            }
+            None => None,
+        };
+
+        let skip_empty = matches.get_flag("skip_empty");
+
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = format!("Value is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        let delimiter_index = matches.index_of("delimiter").ok_or_else(|| {
+            let msg = format!("Delimiter is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let delimiter = args[delimiter_index].clone();
+
+        let cmd = StringSplitCommand::new(value, delimiter, capture, skip_empty);
+
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct StringSplitCommand {
+    value: CommandArg,
+    delimiter: CommandArg,
+    capture: Option<String>,
+    skip_empty: bool,
+}
+
+impl StringSplitCommand {
+    pub fn new(
+        value: CommandArg,
+        delimiter: CommandArg,
+        capture: Option<String>,
+        skip_empty: bool,
+    ) -> Self {
+        Self {
+            value,
+            delimiter,
+            capture,
+            skip_empty,
+        }
+    }
+
+    fn split_segments(
+        value: &str,
+        delimiter: &str,
+        skip_empty: bool,
+    ) -> Result<Vec<String>, String> {
+        if delimiter.is_empty() {
+            let msg = "Delimiter for split command cannot be empty".to_string();
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        Ok(value
+            .split(delimiter)
+            .filter(|segment| !skip_empty || !segment.is_empty())
+            .map(|segment| segment.to_owned())
+            .collect())
+    }
+
+    async fn build_list(segments: &[String]) -> Result<CollectionValue, String> {
+        let list = MemoryListCollection::new_ref();
+        for segment in segments {
+            list.push(CollectionValue::String(segment.clone())).await?;
+        }
+
+        Ok(CollectionValue::List(list))
+    }
+
+    async fn build_capture_map(segments: &[String]) -> Result<CollectionValue, String> {
+        let map = MemoryMapCollection::new_ref();
+        for (index, segment) in segments.iter().enumerate() {
+            map.insert(
+                index.to_string().as_str(),
+                CollectionValue::String(segment.clone()),
+            )
+            .await?;
+        }
+
+        Ok(CollectionValue::Map(map))
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for StringSplitCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let value = self.value.evaluate_string(context).await?;
+        let delimiter = self.delimiter.evaluate_string(context).await?;
+        let segments = Self::split_segments(&value, &delimiter, self.skip_empty)?;
+
+        if let Some(name) = &self.capture {
+            let capture_map = Self::build_capture_map(&segments).await?;
+            context.env().set(name, capture_map, None).await?;
+        }
+
+        debug!(
+            "split value='{}' delimiter='{}' skip_empty={} segments={:?} capture={:?}",
+            value, delimiter, self.skip_empty, segments, self.capture
+        );
+
+        Ok(super::CommandResult::success_with_value(
+            Self::build_list(&segments).await?,
+        ))
     }
 }
 

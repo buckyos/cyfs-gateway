@@ -211,6 +211,70 @@ const PROCESS_CHAIN_STRIP_PREFIX_IGNORE_CASE: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_SPLIT_BASIC: &str = r#"
+<process_chain_lib id="split_basic_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                capture --value raw $(split "/a/b/" "/");
+                eq $(list-remove $raw 0) "" || return --from lib "split_keep_empty_0_fail";
+                eq $(list-remove $raw 0) "a" || return --from lib "split_keep_empty_1_fail";
+                eq $(list-remove $raw 0) "b" || return --from lib "split_keep_empty_2_fail";
+                eq $(list-remove $raw 0) "" || return --from lib "split_keep_empty_3_fail";
+                list-pop $raw && return --from lib "split_keep_empty_tail_should_be_empty";
+
+                capture --value trimmed $(split --skip-empty "/a/b/" "/");
+                eq $(list-remove $trimmed 0) "a" || return --from lib "split_skip_empty_0_fail";
+                eq $(list-remove $trimmed 0) "b" || return --from lib "split_skip_empty_1_fail";
+                list-pop $trimmed && return --from lib "split_skip_empty_tail_should_be_empty";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_SPLIT_CAPTURE: &str = r#"
+<process_chain_lib id="split_capture_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local delimiter="/";
+                split --capture parts --skip-empty "/.cluster/klog/ood1/admin/" $delimiter;
+                eq $parts[0] ".cluster" || return --from lib "split_capture_0_fail";
+                eq $parts[1] "klog" || return --from lib "split_capture_1_fail";
+                eq $parts[2] "ood1" || return --from lib "split_capture_2_fail";
+                eq $parts[3] "admin" || return --from lib "split_capture_3_fail";
+
+                split --capture parts "svc:9000" ":";
+                eq $parts[0] "svc" || return --from lib "split_capture_overwrite_0_fail";
+                eq $parts[1] "9000" || return --from lib "split_capture_overwrite_1_fail";
+
+                local stale=${parts?.["2"] ?? "missing"};
+                eq $stale "missing" || return --from lib "split_capture_stale_slot_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_SPLIT_EMPTY_DELIMITER_ERROR: &str = r#"
+<process_chain_lib id="split_empty_delimiter_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local delimiter="";
+                split "abc" $delimiter;
+                return --from lib "unexpected";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 const PROCESS_CHAIN_STRING_REGEX_PIPELINE: &str = r#"
 <process_chain_lib id="string_regex_pipeline_lib" priority="100">
     <process_chain id="main">
@@ -590,6 +654,75 @@ async fn test_strip_prefix_ignore_case_is_opt_in() -> Result<(), String> {
     let exec = hook_point_env.link_hook_point(&hook_point).await?;
     let ret = exec.execute_lib("strip_prefix_ignore_case_lib").await?;
     assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_split_returns_list_and_respects_skip_empty() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_split_basic");
+    hook_point
+        .load_process_chain_lib("split_basic_lib", 0, PROCESS_CHAIN_SPLIT_BASIC)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-split-basic")?;
+    let hook_point_env = HookPointEnv::new("test-split-basic", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("split_basic_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_split_capture_populates_fresh_slots() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_split_capture");
+    hook_point
+        .load_process_chain_lib("split_capture_lib", 0, PROCESS_CHAIN_SPLIT_CAPTURE)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-split-capture")?;
+    let hook_point_env = HookPointEnv::new("test-split-capture", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("split_capture_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_split_rejects_empty_delimiter() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_split_empty_delimiter_error");
+    hook_point
+        .load_process_chain_lib(
+            "split_empty_delimiter_error_lib",
+            0,
+            PROCESS_CHAIN_SPLIT_EMPTY_DELIMITER_ERROR,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-split-empty-delimiter-error")?;
+    let hook_point_env = HookPointEnv::new("test-split-empty-delimiter-error", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = exec
+        .execute_lib("split_empty_delimiter_error_lib")
+        .await
+        .err()
+        .ok_or_else(|| "split with empty delimiter should fail".to_string())?;
+    assert!(
+        err.contains("Delimiter for split command cannot be empty"),
+        "unexpected error: {}",
+        err
+    );
 
     Ok(())
 }

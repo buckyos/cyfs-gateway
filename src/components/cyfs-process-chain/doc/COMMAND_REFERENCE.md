@@ -260,6 +260,53 @@ Examples:
   starts-with "example.com" "test"      → false
 ```
 
+### `split`
+```
+Split a string into segments using a delimiter.
+
+Usage: split [OPTIONS] <value> <delimiter>
+
+Arguments:
+  <value>
+          Input string to split
+
+  <delimiter>
+          Delimiter string used for splitting
+
+Options:
+      --capture <name>
+          Store split segments into a fresh map variable
+
+      --skip-empty
+          Drop empty segments from the result
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>       The input string or variable.
+  <delimiter>   The delimiter string used to split the input.
+
+Options:
+  --capture <name>   Store segments into a fresh map variable as name[0], name[1], ...
+  --skip-empty       Drop empty segments from the result
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - Returns a List of string segments.
+  - By default, empty segments are preserved, including leading or trailing ones.
+  - If --skip-empty is set, empty segments are removed from both the returned list and captured slots.
+  - If --capture is set, <name> is replaced with a fresh map whose keys are "0", "1", ...
+  - <name> must be a literal variable name or path.
+  - Empty delimiter is invalid and returns a runtime error.
+
+Examples:
+  split "/a/b/c" "/"
+  split --skip-empty "/.cluster/klog/ood1/admin/" "/"
+  split --capture parts $REQ.path $delimiter
+```
+
 ### `strip-prefix`
 ```
 Strip a prefix from a string and return the remaining tail.

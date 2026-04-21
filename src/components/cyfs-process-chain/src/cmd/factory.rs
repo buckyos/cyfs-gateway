@@ -124,6 +124,7 @@ impl CommandParserFactory {
             Arc::new(Box::new(StringAppendCommandParser::new())),
         );
         self.register("slice", Arc::new(Box::new(StringSliceCommandParser::new())));
+        self.register("split", Arc::new(Box::new(StringSplitCommandParser::new())));
         self.register(
             "strlen",
             Arc::new(Box::new(StringLengthCommandParser::new())),

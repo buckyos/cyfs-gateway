@@ -262,6 +262,53 @@
   starts-with "example.com" "test"      → false
 ```
 
+### `split`
+```
+使用分隔符把字符串拆分成多个片段。
+
+用法: split [OPTIONS] <value> <delimiter>
+
+参数:
+  <value>
+          待拆分的输入字符串
+
+  <delimiter>
+          用于拆分的分隔符字符串
+
+选项:
+      --capture <name>
+          把拆分结果写入一个新的 map 变量
+
+      --skip-empty
+          丢弃空片段
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <value>       输入字符串或变量。
+  <delimiter>   用于拆分输入的分隔符字符串。
+
+选项:
+  --capture <name>   把片段写入一个新的 map 变量，形式为 name[0]、name[1]...
+  --skip-empty       从返回结果和 capture 槽位中都移除空片段
+
+行为:
+  - 两个参数都在运行时动态求值。
+  - 返回一个由字符串片段组成的 List。
+  - 默认保留空片段，包括开头或结尾产生的空片段。
+  - 指定 --skip-empty 后，会同时从返回的 List 和 capture 槽位中移除空片段。
+  - 指定 --capture 后，会用一个新的 map 替换 <name>，其 key 为 "0"、"1"...
+  - <name> 必须是字面量变量名或变量路径。
+  - 空分隔符是非法输入，会返回运行时错误。
+
+示例:
+  split "/a/b/c" "/"
+  split --skip-empty "/.cluster/klog/ood1/admin/" "/"
+  split --capture parts $REQ.path $delimiter
+```
+
 ### `strip-prefix`
 ```
 移除字符串前缀并返回剩余 tail。
