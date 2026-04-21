@@ -1,4 +1,7 @@
-use super::{Stack, get_limit_info, get_source_addr_from_req_env, stream_forward};
+use super::{
+    Stack, get_limit_info, get_source_addr_from_req_env, probe_proxy_protocol_stream,
+    stream_forward,
+};
 
 #[cfg(target_os = "linux")]
 use super::{has_root_privileges, set_socket_opt};
@@ -143,13 +146,16 @@ impl TcpConnectionHandler {
             } else {
                 Box::new(stream)
             };
+        let (req_stream, proxy_source_addr) = probe_proxy_protocol_stream(req_stream).await?;
+        let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
+        let device_lookup_ip = request_source_addr.ip();
         let mut request = StreamRequest::new(req_stream, dest_addr);
-        request.source_addr = Some(remote_addr);
+        request.source_addr = Some(request_source_addr);
         request.dest_port = dest_addr.port();
         if let Some(device_info) = self
             .connection_manager
             .as_ref()
-            .and_then(|manager| manager.get_device_info_by_source(remote_addr.ip()))
+            .and_then(|manager| manager.get_device_info_by_source(device_lookup_ip))
         {
             request.source_mac = device_info.mac().map(|v| v.to_string());
             request.source_hostname = device_info.hostname().map(|v| v.to_string());
@@ -160,15 +166,18 @@ impl TcpConnectionHandler {
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
         let conn_src_addr = Some(remote_addr.to_string());
-        let real_src_addr = get_source_addr_from_req_env(&global_env)
+        let mut real_src_addr = get_source_addr_from_req_env(&global_env)
             .await
             .and_then(|addr| addr.parse::<SocketAddr>().ok().map(|_| addr));
+        if real_src_addr.is_none() {
+            real_src_addr = proxy_source_addr.map(|addr| addr.to_string());
+        }
         let mut stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr)
             .with_dst_addr(Some(dest_addr.to_string()));
         if let Some(device_info) = self
             .connection_manager
             .as_ref()
-            .and_then(|manager| manager.get_device_info_by_source(remote_addr.ip()))
+            .and_then(|manager| manager.get_device_info_by_source(device_lookup_ip))
         {
             stream_info = stream_info.with_device_info(
                 device_info.mac().map(|v| v.to_string()),
@@ -247,7 +256,13 @@ impl TcpConnectionHandler {
                                 stream
                             };
 
-                            stream_forward(stream, target, &self.env.tunnel_manager).await?;
+                            stream_forward(
+                                stream,
+                                target,
+                                &self.env.tunnel_manager,
+                                Some(&stream_info),
+                            )
+                            .await?;
                         }
                         "server" => {
                             if list.len() < 2 {
@@ -964,7 +979,7 @@ mod tests {
                 .await;
             assert!(result.is_ok());
             let ret = stream.read(&mut [0; 1024]).await;
-            assert!(ret.is_err());
+            assert!(matches!(ret, Err(_) | Ok(0)));
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
@@ -1008,7 +1023,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
         let ret = stream.read(&mut [0; 1024]).await;
-        assert!(ret.is_err());
+        assert!(matches!(ret, Err(_) | Ok(0)));
     }
 
     #[tokio::test]

@@ -20,7 +20,10 @@ use crate::global_process_chains::{
 };
 use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
-use crate::stack::{datagram_forward, get_limit_info, stream_forward};
+use crate::stack::{
+    datagram_forward, get_limit_info, get_source_addr_from_req_env,
+    probe_proxy_protocol_stream, stream_forward,
+};
 use crate::{
     ConnectionInfo, ConnectionManagerRef, DatagramInfo, DumpStream, GlobalCollectionManagerRef,
     HandleConnectionController, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
@@ -241,12 +244,15 @@ impl RtcpConnectionHandler {
     ) -> StackResult<()> {
         let executor = self.executor.fork();
         let servers = self.env.servers.clone();
-        let remote_ip = remote_addr.ip();
+        let (stream, proxy_source_addr) = probe_proxy_protocol_stream(stream).await?;
+        let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
+        let device_lookup_ip = request_source_addr.ip();
         let device_info = self
             .connection_manager
             .as_ref()
-            .and_then(|manager| manager.get_device_info_by_source(remote_ip));
+            .and_then(|manager| manager.get_device_info_by_source(device_lookup_ip));
         let remote_addr_str = remote_addr.to_string();
+        let request_source_addr_str = request_source_addr.to_string();
         let dest_host = dest_host.unwrap_or_default();
         let map = MemoryMapCollection::new_ref();
         map.insert(
@@ -257,19 +263,19 @@ impl RtcpConnectionHandler {
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert(
             "source_addr",
-            CollectionValue::String(remote_addr_str.clone()),
+            CollectionValue::String(request_source_addr_str.clone()),
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert(
             "source_ip",
-            CollectionValue::String(remote_addr.ip().to_string()),
+            CollectionValue::String(request_source_addr.ip().to_string()),
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
         map.insert(
             "source_port",
-            CollectionValue::String(remote_addr.port().to_string()),
+            CollectionValue::String(request_source_addr.port().to_string()),
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
@@ -319,6 +325,26 @@ impl RtcpConnectionHandler {
         let ret = execute_chain(executor, map)
             .await
             .map_err(into_stack_err!(StackErrorCode::ProcessChainError))?;
+        let conn_src_addr = Some(remote_addr_str.clone());
+        let mut real_src_addr = get_source_addr_from_req_env(&global_env)
+            .await
+            .and_then(|addr| addr.parse::<SocketAddr>().ok().map(|_| addr));
+        if real_src_addr.is_none() {
+            real_src_addr = proxy_source_addr.map(|addr| addr.to_string());
+        }
+        let stream_info = StreamInfo::with_addrs(conn_src_addr, real_src_addr)
+            .with_dst_addr(Some(local_addr.to_string()))
+            .with_device_info(
+                device_info
+                    .as_ref()
+                    .and_then(|v| v.mac().map(|m| m.to_string())),
+                device_info
+                    .as_ref()
+                    .and_then(|v| v.hostname().map(|h| h.to_string())),
+                device_info
+                    .as_ref()
+                    .map(|v| v.today_online_seconds().to_string()),
+            );
         if ret.is_control() {
             if ret.is_drop() {
                 return Ok(());
@@ -381,7 +407,13 @@ impl RtcpConnectionHandler {
                             } else {
                                 stream
                             };
-                            stream_forward(stream, target, &self.env.tunnel_manager).await?;
+                            stream_forward(
+                                stream,
+                                target,
+                                &self.env.tunnel_manager,
+                                Some(&stream_info),
+                            )
+                            .await?;
                         }
                         "server" => {
                             if list.len() < 2 {
@@ -404,20 +436,7 @@ impl RtcpConnectionHandler {
                             if let Some(server) = servers.get_server(server_name) {
                                 match server {
                                     Server::Http(server) => {
-                                        let stream_info = StreamInfo::new(remote_addr_str.clone())
-                                            .with_dst_addr(Some(local_addr.to_string()))
-                                            .with_device_info(
-                                                device_info
-                                                    .as_ref()
-                                                    .and_then(|v| v.mac().map(|m| m.to_string())),
-                                                device_info.as_ref().and_then(|v| {
-                                                    v.hostname().map(|h| h.to_string())
-                                                }),
-                                                device_info
-                                                    .as_ref()
-                                                    .map(|v| v.today_online_seconds().to_string()),
-                                            );
-                                        hyper_serve_http(stream, server, stream_info)
+                                        hyper_serve_http(stream, server, stream_info.clone())
                                             .await
                                             .map_err(into_stack_err!(
                                                 StackErrorCode::ServerError,
@@ -425,21 +444,8 @@ impl RtcpConnectionHandler {
                                             ))?;
                                     }
                                     Server::Stream(server) => {
-                                        let stream_info = StreamInfo::new(remote_addr_str.clone())
-                                            .with_dst_addr(Some(local_addr.to_string()))
-                                            .with_device_info(
-                                                device_info
-                                                    .as_ref()
-                                                    .and_then(|v| v.mac().map(|m| m.to_string())),
-                                                device_info.as_ref().and_then(|v| {
-                                                    v.hostname().map(|h| h.to_string())
-                                                }),
-                                                device_info
-                                                    .as_ref()
-                                                    .map(|v| v.today_online_seconds().to_string()),
-                                            );
                                         server
-                                            .serve_connection(stream, stream_info)
+                                            .serve_connection(stream, stream_info.clone())
                                             .await
                                             .map_err(into_stack_err!(
                                                 StackErrorCode::ServerError,

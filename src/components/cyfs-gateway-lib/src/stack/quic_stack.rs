@@ -10,7 +10,7 @@ use crate::global_process_chains::{
 };
 use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
-use crate::stack::{TlsCertResolver, get_limit_info, stream_forward};
+use crate::stack::{TlsCertResolver, get_limit_info, probe_proxy_protocol_stream, stream_forward};
 use crate::{
     ComposedSpeedStat, ConnectionController, ConnectionInfo, ConnectionManagerRef, DumpStream,
     GlobalCollectionManagerRef, HandleConnectionController, IoDumpStackConfig,
@@ -360,6 +360,27 @@ impl QuicConnectionHandler {
                                     } else {
                                         Box::new(stream)
                                     };
+                                let (stream, proxy_source_addr) =
+                                    probe_proxy_protocol_stream(stream).await?;
+                                let request_source_addr =
+                                    proxy_source_addr.unwrap_or(remote_addr);
+                                let stream_info = StreamInfo::with_addrs(
+                                    Some(remote_addr.to_string()),
+                                    proxy_source_addr.map(|a| a.to_string()),
+                                )
+                                .with_dst_addr(Some(local_addr.to_string()))
+                                .with_device_info(
+                                    device_info.as_ref().and_then(|v| {
+                                        v.mac().map(|m| m.to_string())
+                                    }),
+                                    device_info.as_ref().and_then(|v| {
+                                        v.hostname().map(|h| h.to_string())
+                                    }),
+                                    device_info
+                                        .as_ref()
+                                        .map(|v| v.today_online_seconds().to_string()),
+                                );
+                                let _ = request_source_addr;
                                 let stat_stream =
                                     StatStream::new_with_tracker(stream, speed_stat.clone());
                                 let speed = stat_stream.get_speed_stat();
@@ -374,10 +395,15 @@ impl QuicConnectionHandler {
                                     Box::new(stat_stream)
                                 };
                                 let tunnel_manager = self.env.tunnel_manager.clone();
+                                let forward_info = stream_info.clone();
                                 let handle = tokio::spawn(async move {
-                                    if let Err(e) =
-                                        stream_forward(stream, target.as_str(), &tunnel_manager)
-                                            .await
+                                    if let Err(e) = stream_forward(
+                                        stream,
+                                        target.as_str(),
+                                        &tunnel_manager,
+                                        Some(&forward_info),
+                                    )
+                                    .await
                                     {
                                         log::error!("stream forward error: {}", e);
                                     }
@@ -566,6 +592,8 @@ impl QuicConnectionHandler {
                                             } else {
                                                 Box::new(stream)
                                             };
+                                        let (stream, proxy_source_addr) =
+                                            probe_proxy_protocol_stream(stream).await?;
                                         let stat_stream = StatStream::new_with_tracker(
                                             stream,
                                             speed_stat.clone(),
@@ -585,23 +613,24 @@ impl QuicConnectionHandler {
                                         };
                                         let device_info = device_info.clone();
                                         let handle = tokio::spawn(async move {
+                                            let info = StreamInfo::with_addrs(
+                                                Some(remote_addr.to_string()),
+                                                proxy_source_addr.map(|a| a.to_string()),
+                                            )
+                                            .with_dst_addr(Some(local_addr.to_string()))
+                                            .with_device_info(
+                                                device_info.as_ref().and_then(|v| {
+                                                    v.mac().map(|m| m.to_string())
+                                                }),
+                                                device_info.as_ref().and_then(|v| {
+                                                    v.hostname().map(|h| h.to_string())
+                                                }),
+                                                device_info.as_ref().map(|v| {
+                                                    v.today_online_seconds().to_string()
+                                                }),
+                                            );
                                             if let Err(e) = server
-                                                .serve_connection(
-                                                    stream,
-                                                    StreamInfo::new(remote_addr.to_string())
-                                                        .with_dst_addr(Some(local_addr.to_string()))
-                                                        .with_device_info(
-                                                            device_info.as_ref().and_then(|v| {
-                                                                v.mac().map(|m| m.to_string())
-                                                            }),
-                                                            device_info.as_ref().and_then(|v| {
-                                                                v.hostname().map(|h| h.to_string())
-                                                            }),
-                                                            device_info.as_ref().map(|v| {
-                                                                v.today_online_seconds().to_string()
-                                                            }),
-                                                        ),
-                                                )
+                                                .serve_connection(stream, info)
                                                 .await
                                             {
                                                 log::error!("server error: {}", e);

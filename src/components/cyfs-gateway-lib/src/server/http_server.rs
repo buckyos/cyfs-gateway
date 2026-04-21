@@ -392,10 +392,40 @@ impl ProcessChainHttpServer {
         })
     }
 
+    fn inject_forward_headers(header: &mut http::HeaderMap, info: &StreamInfo) {
+        let Some(addr) = info
+            .src_addr
+            .as_deref()
+            .and_then(|s| s.parse::<SocketAddr>().ok())
+        else {
+            return;
+        };
+        let ip = addr.ip().to_string();
+        let port = addr.port().to_string();
+        if !header.contains_key("X-Real-IP") {
+            if let Ok(v) = http::HeaderValue::from_str(&ip) {
+                header.insert("X-Real-IP", v);
+            }
+        }
+        if !header.contains_key("X-Real-Port") {
+            if let Ok(v) = http::HeaderValue::from_str(&port) {
+                header.insert("X-Real-Port", v);
+            }
+        }
+        let xff = match header.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
+            Some(existing) => format!("{}, {}", existing, ip),
+            None => ip,
+        };
+        if let Ok(v) = http::HeaderValue::from_str(&xff) {
+            header.insert("X-Forwarded-For", v);
+        }
+    }
+
     async fn handle_forward_upstream(
         &self,
         req: http::Request<BoxBody<Bytes, ServerError>>,
         target_url: &str,
+        info: &StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let org_url = req.uri().to_string();
         // Trim URL boundary slashes so we don't end up with "//" when target_url ends with '/'
@@ -421,7 +451,8 @@ impl ProcessChainHttpServer {
             "http" => {
                 let client: Client<_, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>> =
                     Client::builder(TokioExecutor::new()).build_http();
-                let header = req.headers().clone();
+                let mut header = req.headers().clone();
+                Self::inject_forward_headers(&mut header, info);
                 let method = req.method().clone();
                 let body = req
                     .into_body()
@@ -458,7 +489,8 @@ impl ProcessChainHttpServer {
                 Ok(resp)
             }
             "https" => {
-                let header = req.headers().clone();
+                let mut header = req.headers().clone();
+                Self::inject_forward_headers(&mut header, info);
                 let method = req.method().clone();
                 let upstream_http_version = match req.version() {
                     http::Version::HTTP_10 => http::Version::HTTP_10,
@@ -581,7 +613,8 @@ impl ProcessChainHttpServer {
                     BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>,
                 > = Client::builder(TokioExecutor::new()).build(tunnel_connector);
 
-                let header = req.headers().clone();
+                let mut header = req.headers().clone();
+                Self::inject_forward_headers(&mut header, info);
                 let mut host_name = "localhost".to_string();
                 let hname = req.headers().get("host");
                 if hname.is_some() {
@@ -1162,7 +1195,9 @@ impl HttpServer for ProcessChainHttpServer {
                             let post_req = req_map.into_request().map_err(|e| {
                                 server_err!(ServerErrorCode::ProcessChainError, "{}", e)
                             })?;
-                            let resp = self.handle_forward_upstream(post_req, target_url).await;
+                            let resp = self
+                                .handle_forward_upstream(post_req, target_url, &info)
+                                .await;
                             return self
                                 .apply_post_chain_result(resp, &req_info, Some(&info))
                                 .await;

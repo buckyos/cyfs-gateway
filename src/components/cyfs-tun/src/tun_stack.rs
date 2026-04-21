@@ -170,7 +170,15 @@ impl TunConnectionHandler {
                             } else {
                                 stream
                             };
-                            stream_forward(stream, target, &self.env.tunnel_manager).await?;
+                            let stream_info = StreamInfo::new(remote_addr.to_string())
+                                .with_dst_addr(Some(dest_addr.to_string()));
+                            stream_forward(
+                                stream,
+                                target,
+                                &self.env.tunnel_manager,
+                                Some(&stream_info),
+                            )
+                            .await?;
                         }
                         "server" => {
                             if list.len() < 2 {

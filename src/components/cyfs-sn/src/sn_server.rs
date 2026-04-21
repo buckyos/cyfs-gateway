@@ -2563,7 +2563,11 @@ impl SNServer {
         // Treat HTTP `type` as NameServer::query_did doc_type.
         let doc_type = resolve_type.as_deref();
 
-        let from_ip = None;
+        let from_ip = info
+            .real_src_addr
+            .as_deref()
+            .and_then(parse_ip_or_socket_addr)
+            .or_else(|| info.src_addr.as_deref().and_then(parse_ip_or_socket_addr));
 
         match self.query_did(&did, doc_type, from_ip).await {
             Ok(doc) => {

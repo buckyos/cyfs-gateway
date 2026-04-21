@@ -1,4 +1,5 @@
 mod limiter;
+mod proxy_protocol;
 mod quic_stack;
 mod rtcp_stack;
 mod stack;
@@ -10,6 +11,7 @@ mod udp_stack;
 use buckyos_kit::AsyncStream;
 use cyfs_process_chain::CollectionValue;
 pub use limiter::*;
+pub use proxy_protocol::*;
 pub use quic_stack::*;
 pub use rtcp_stack::*;
 pub use stack::*;
@@ -79,16 +81,36 @@ pub async fn stream_forward(
     mut stream: Box<dyn AsyncStream>,
     target: &str,
     tunnel_manager: &TunnelManager,
+    info: Option<&crate::StreamInfo>,
 ) -> StackResult<()> {
     let url = Url::parse(target).map_err(into_stack_err!(
         StackErrorCode::InvalidConfig,
         "invalid forward url {}",
         target
     ))?;
+    // Opt-in PROXY v2: `?proxy_protocol=v2` on the forward URL.
+    // Without opt-in we stay transparent to non-PROXY-aware downstreams.
+    let emit_proxy_v2 = url
+        .query_pairs()
+        .any(|(k, v)| k == "proxy_protocol" && v.eq_ignore_ascii_case("v2"));
+
     let mut forward_stream = tunnel_manager
         .open_stream_by_url(&url)
         .await
         .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
+
+    if emit_proxy_v2 {
+        if let Some(info) = info {
+            let src_addr = info.src_addr.as_deref();
+            let dst_addr = info.dst_addr.as_deref();
+            let _ = proxy_protocol::write_proxy_v2_preamble(
+                &mut forward_stream,
+                src_addr,
+                dst_addr,
+            )
+            .await?;
+        }
+    }
 
     tokio::io::copy_bidirectional(&mut stream, forward_stream.as_mut())
         .await
