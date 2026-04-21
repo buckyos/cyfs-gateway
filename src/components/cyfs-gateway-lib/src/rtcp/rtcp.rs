@@ -40,20 +40,6 @@ use tokio::time::timeout;
 use url::Url;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
-fn is_filtered_tunnel_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(ipv4) => {
-            if ipv4.is_loopback() || ipv4.is_unspecified() {
-                return true;
-            }
-
-            let octets = ipv4.octets();
-            octets[0] == 172 && (16..=31).contains(&octets[1])
-        }
-        std::net::IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unspecified(),
-    }
-}
-
 pub struct RTcp {
     inner: Arc<RTcpInner>,
     handle: Option<JoinHandle<()>>,
@@ -342,10 +328,6 @@ impl RTcpInner {
         seen: &mut HashSet<std::net::IpAddr>,
         ip: std::net::IpAddr,
     ) {
-        if is_filtered_tunnel_ip(ip) {
-            return;
-        }
-
         if seen.insert(ip) {
             ips.push(ip);
         }
@@ -502,11 +484,7 @@ impl RTcpInner {
             .await
             .map_err(|e| format!("resolve {} failed: {}", candidate, e))?;
 
-        if is_filtered_tunnel_ip(ip) {
-            Err(format!("{} => filtered ip {}", candidate, ip))
-        } else {
-            Ok(vec![ip])
-        }
+        Ok(vec![ip])
     }
 
     fn get_resolve_candidates(
@@ -1950,7 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_ip_from_info_json_filters_172_private_ip() {
+    fn test_extract_ip_from_info_json_keeps_172_private_ip_order() {
         let info_json = serde_json::json!({
             "ips": ["172.17.0.1", "192.168.100.191", "240e:3b3:30c0:930::47f"]
         });
@@ -1958,30 +1936,30 @@ mod tests {
         let ip = RTcpInner::extract_ip_from_info_json(&info_json);
         assert_eq!(
             ip,
-            Some("192.168.100.191".parse().unwrap()),
-            "172.16/12 should be skipped while 192.168 remains usable"
+            Some("172.17.0.1".parse().unwrap()),
+            "RTCP should preserve raw candidate order and leave 172 filtering to upstream exporters"
         );
     }
 
     #[test]
-    fn test_extract_ip_from_info_json_returns_none_when_only_172_private_ip_exists() {
+    fn test_extract_ip_from_info_json_returns_172_when_only_172_exists() {
         let info_json = serde_json::json!({
             "ips": ["172.17.0.1", "172.20.1.2"]
         });
 
         let ip = RTcpInner::extract_ip_from_info_json(&info_json);
-        assert_eq!(ip, None);
+        assert_eq!(ip, Some("172.17.0.1".parse().unwrap()));
     }
 
     #[test]
-    fn test_extract_ip_from_info_json_skips_filtered_ip_field_and_falls_back_to_ips() {
+    fn test_extract_ip_from_info_json_keeps_ip_field_even_if_172() {
         let info_json = serde_json::json!({
             "ip": "172.17.0.1",
             "ips": ["172.20.1.2", "192.168.100.191"]
         });
 
         let ip = RTcpInner::extract_ip_from_info_json(&info_json);
-        assert_eq!(ip, Some("192.168.100.191".parse().unwrap()));
+        assert_eq!(ip, Some("172.17.0.1".parse().unwrap()));
     }
 
     #[test]
@@ -1996,7 +1974,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_ips_from_info_json_preserves_order_and_skips_filtered_values() {
+    fn test_extract_ips_from_info_json_preserves_order_and_keeps_172_values() {
         let info_json = serde_json::json!({
             "ip": "172.17.0.1",
             "all_ip": [
@@ -2015,6 +1993,7 @@ mod tests {
         assert_eq!(
             ips,
             vec![
+                "172.17.0.1".parse::<std::net::IpAddr>().unwrap(),
                 "240e:3b3:30c1:5380::997"
                     .parse::<std::net::IpAddr>()
                     .unwrap(),
@@ -2022,6 +2001,7 @@ mod tests {
                 "240e:3b3:30c1:5380:f370:ecf5:8fad:d1ea"
                     .parse::<std::net::IpAddr>()
                     .unwrap(),
+                "172.26.48.1".parse::<std::net::IpAddr>().unwrap(),
             ]
         );
     }

@@ -72,6 +72,16 @@ fn push_zonegate_address(address_vec: &mut Vec<IpAddr>, ip: IpAddr, record_type:
     }
 }
 
+fn push_exportable_device_ip(address_vec: &mut Vec<IpAddr>, ip: IpAddr) {
+    if is_filtered_zonegate_ip(ip) {
+        return;
+    }
+
+    if !address_vec.contains(&ip) {
+        address_vec.push(ip);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SnRpcPath {
     Root,
@@ -2325,9 +2335,46 @@ impl SNServer {
                 "updated_at".to_string(),
                 Value::Number(serde_json::Number::from(device.updated_at)),
             );
+            Self::sanitize_device_info_json_for_export(obj);
         }
 
         v
+    }
+
+    fn sanitize_device_info_json_for_export(obj: &mut serde_json::Map<String, Value>) {
+        let mut exportable_ips = Vec::new();
+
+        if let Some(ip_str) = obj.get("ip").and_then(|v| v.as_str()) {
+            if let Some(ip) = parse_ip_or_socket_addr(ip_str) {
+                push_exportable_device_ip(&mut exportable_ips, ip);
+            }
+        }
+
+        for key in ["ips", "all_ip"] {
+            if let Some(ip_values) = obj.get(key).and_then(|v| v.as_array()) {
+                for ip_str in ip_values.iter().filter_map(|v| v.as_str()) {
+                    if let Some(ip) = parse_ip_or_socket_addr(ip_str) {
+                        push_exportable_device_ip(&mut exportable_ips, ip);
+                    }
+                }
+            }
+        }
+
+        if let Some(first_ip) = exportable_ips.first() {
+            obj.insert("ip".to_string(), Value::String(first_ip.to_string()));
+        } else {
+            obj.remove("ip");
+        }
+
+        let exportable_ip_values: Vec<Value> = exportable_ips
+            .iter()
+            .map(|ip| Value::String(ip.to_string()))
+            .collect();
+        for key in ["ips", "all_ip"] {
+            if obj.contains_key(key) {
+                obj.insert(key.to_string(), Value::Array(exportable_ip_values.clone()));
+            }
+        }
     }
 
     fn build_zone_config_json(username: &str, user: &SNUserInfo) -> serde_json::Value {
@@ -3577,6 +3624,72 @@ mod tests {
                 "240e:3b3:30c0:930::47f".parse::<IpAddr>().unwrap(),
                 "fdc8:b144:c39b::47f".parse::<IpAddr>().unwrap()
             ]
+        );
+    }
+
+    #[test]
+    fn test_build_device_info_json_filters_172_from_exported_ip_fields() {
+        let device = SNDeviceInfo {
+            owner: "meteormeta".to_string(),
+            device_name: "ood1".to_string(),
+            mini_config_jwt: "mini-jwt".to_string(),
+            did: "did:dev:test".to_string(),
+            ip: "172.26.48.1".to_string(),
+            description: json!({
+                "ip": "172.17.0.1",
+                "ips": ["172.20.1.2", "192.168.100.182", "240e:3b3:30c1:5380::997"],
+                "all_ip": ["172.26.48.1", "192.168.100.182", "240e:3b3:30c1:5380::997"]
+            })
+            .to_string(),
+            created_at: 1,
+            updated_at: 2,
+        };
+
+        let exported = SNServer::build_device_info_json(&device);
+        assert_eq!(
+            exported.get("ip").and_then(|v| v.as_str()),
+            Some("192.168.100.182")
+        );
+        assert_eq!(
+            exported.get("ips").and_then(|v| v.as_array()).cloned(),
+            Some(vec![
+                Value::String("192.168.100.182".to_string()),
+                Value::String("240e:3b3:30c1:5380::997".to_string()),
+            ])
+        );
+        assert_eq!(
+            exported.get("all_ip").and_then(|v| v.as_array()).cloned(),
+            Some(vec![
+                Value::String("192.168.100.182".to_string()),
+                Value::String("240e:3b3:30c1:5380::997".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_build_device_info_json_removes_ip_when_only_filtered_values_exist() {
+        let device = SNDeviceInfo {
+            owner: "meteormeta".to_string(),
+            device_name: "ood1".to_string(),
+            mini_config_jwt: "mini-jwt".to_string(),
+            did: "did:dev:test".to_string(),
+            ip: "172.26.48.1".to_string(),
+            description: json!({
+                "ip": "172.17.0.1",
+                "ips": ["172.20.1.2"],
+                "all_ip": ["172.26.48.1"]
+            })
+            .to_string(),
+            created_at: 1,
+            updated_at: 2,
+        };
+
+        let exported = SNServer::build_device_info_json(&device);
+        assert!(exported.get("ip").is_none());
+        assert_eq!(exported.get("ips").and_then(|v| v.as_array()).cloned(), Some(vec![]));
+        assert_eq!(
+            exported.get("all_ip").and_then(|v| v.as_array()).cloned(),
+            Some(vec![])
         );
     }
 
