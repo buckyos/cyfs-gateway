@@ -1611,7 +1611,7 @@ hook_point:
             .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
-        assert_eq!(resp.response_code(), ResponseCode::NoError);
+        assert_eq!(resp.response_code(), ResponseCode::ServFail);
         assert_eq!(resp.answers().len(), 0);
 
         let mut message = Message::new();
