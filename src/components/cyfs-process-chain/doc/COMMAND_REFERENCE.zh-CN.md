@@ -262,6 +262,45 @@
   starts-with "example.com" "test"      → false
 ```
 
+### `strip-prefix`
+```
+移除字符串前缀并返回剩余 tail。
+
+用法: strip-prefix [OPTIONS] <value> <prefix>
+
+参数:
+  <value>
+          要处理的输入字符串
+
+  <prefix>
+          要移除的前缀
+
+选项:
+  -i, --ignore-case
+          执行大小写不敏感比较
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <value>      完整输入字符串或变量。
+  <prefix>     要移除的前缀。
+
+行为:
+  - 两个参数都在运行时动态求值。
+  - 如果 <value> 以 <prefix> 开头，则 success 返回剩余 tail。
+  - 如果 <value> 与 <prefix> 完全相等，则 success 返回空字符串。
+  - 默认区分大小写。
+  - 如果 <value> 不以 <prefix> 开头，则返回 error，且原值不变。
+  - 不会修改任何变量或环境。
+
+示例:
+  strip-prefix "/api/v1/users" "/api"
+  strip-prefix --ignore-case "/API/v1/users" "/api"
+  strip-prefix $REQ.url $route_prefix
+```
+
 ### `strlen`
 ```
 返回字符串长度。

@@ -145,6 +145,72 @@ const PROCESS_CHAIN_SLICE_PARSE_ERROR: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_STRIP_PREFIX_DYNAMIC: &str = r#"
+<process_chain_lib id="strip_prefix_dynamic_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local route_prefix="/.cluster/klog";
+                local path="/.cluster/klog/ood1/admin/cluster-state";
+                local tail=$(strip-prefix $path $route_prefix);
+                eq $tail "/ood1/admin/cluster-state" || return --from lib "strip_prefix_tail_fail";
+
+                local exact=$(strip-prefix $route_prefix $route_prefix);
+                eq $exact "" || return --from lib "strip_prefix_exact_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_STRIP_PREFIX_ERROR: &str = r#"
+<process_chain_lib id="strip_prefix_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local route_prefix="/.cluster/klog";
+                local path="/service/admin";
+
+                match-result $(strip-prefix $path $route_prefix)
+                ok(value)
+                    return --from lib $(append "unexpected_ok:" $value);
+                err(err_value)
+                    eq $err_value "" || return --from lib "strip_prefix_err_value_fail";
+                    return --from lib "handled_error";
+                end
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_STRIP_PREFIX_IGNORE_CASE: &str = r#"
+<process_chain_lib id="strip_prefix_ignore_case_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local route_prefix="/.cluster/klog";
+                local path="/.Cluster/Klog/OOD1/admin";
+
+                match-result $(strip-prefix $path $route_prefix)
+                ok(value)
+                    return --from lib $(append "unexpected_sensitive_ok:" $value);
+                err(err_value)
+                    eq $err_value "" || return --from lib "strip_prefix_sensitive_err_value_fail";
+                end
+
+                local tail=$(strip-prefix --ignore-case $path $route_prefix);
+                eq $tail "/OOD1/admin" || return --from lib "strip_prefix_ignore_case_tail_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 const PROCESS_CHAIN_STRING_REGEX_PIPELINE: &str = r#"
 <process_chain_lib id="string_regex_pipeline_lib" priority="100">
     <process_chain id="main">
@@ -455,6 +521,75 @@ async fn test_slice_rejects_invalid_range_format() -> Result<(), String> {
         "unexpected error: {}",
         err
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_strip_prefix_supports_dynamic_prefix_and_exact_match() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_strip_prefix_dynamic");
+    hook_point
+        .load_process_chain_lib(
+            "strip_prefix_dynamic_lib",
+            0,
+            PROCESS_CHAIN_STRIP_PREFIX_DYNAMIC,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-strip-prefix-dynamic")?;
+    let hook_point_env = HookPointEnv::new("test-strip-prefix-dynamic", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("strip_prefix_dynamic_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_strip_prefix_returns_error_when_prefix_does_not_match() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_strip_prefix_error");
+    hook_point
+        .load_process_chain_lib(
+            "strip_prefix_error_lib",
+            0,
+            PROCESS_CHAIN_STRIP_PREFIX_ERROR,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-strip-prefix-error")?;
+    let hook_point_env = HookPointEnv::new("test-strip-prefix-error", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("strip_prefix_error_lib").await?;
+    assert_eq!(ret.value(), "handled_error");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_strip_prefix_ignore_case_is_opt_in() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_strip_prefix_ignore_case");
+    hook_point
+        .load_process_chain_lib(
+            "strip_prefix_ignore_case_lib",
+            0,
+            PROCESS_CHAIN_STRIP_PREFIX_IGNORE_CASE,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-strip-prefix-ignore-case")?;
+    let hook_point_env = HookPointEnv::new("test-strip-prefix-ignore-case", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("strip_prefix_ignore_case_lib").await?;
+    assert_eq!(ret.value(), "ok");
 
     Ok(())
 }

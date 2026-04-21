@@ -1408,6 +1408,162 @@ impl CommandExecutor for StringStartsWithCommand {
     }
 }
 
+// strip-prefix <value> <prefix>
+// This command removes a dynamic prefix from a string and returns the remaining tail.
+pub struct StringStripPrefixCommandParser {
+    cmd: Command,
+}
+
+impl StringStripPrefixCommandParser {
+    fn strip_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+        if !value.to_lowercase().starts_with(&prefix.to_lowercase()) {
+            return None;
+        }
+
+        let prefix_char_count = prefix.chars().count();
+        let split_index = value
+            .char_indices()
+            .nth(prefix_char_count)
+            .map(|(index, _)| index)
+            .unwrap_or(value.len());
+        value.get(split_index..)
+    }
+
+    pub fn new() -> Self {
+        let cmd = Command::new("strip-prefix")
+            .about("Strip a prefix from a string and return the remaining tail.")
+            .after_help(
+                r#"
+Arguments:
+  <value>      The full input string or variable.
+  <prefix>     The prefix to remove.
+
+Options:
+  --ignore-case,-i   Perform case-insensitive comparison
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - If <value> starts with <prefix>, returns success with the remaining tail.
+  - If <value> equals <prefix>, returns success with an empty string.
+  - Comparison is case-sensitive by default.
+  - If <value> does not start with <prefix>, returns error and leaves the value unchanged.
+  - Does not modify any variable or environment.
+
+Examples:
+  strip-prefix "/api/v1/users" "/api"
+  strip-prefix --ignore-case "/API/v1/users" "/api"
+  strip-prefix $REQ.url $route_prefix
+"#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .short('i')
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-insensitive comparison"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("Input string to strip"),
+            )
+            .arg(Arg::new("prefix").required(true).help("Prefix to remove"));
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for StringStripPrefixCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid strip-prefix command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let ignore_case = matches.get_flag("ignore_case");
+
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = format!("Value is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        let prefix_index = matches.index_of("prefix").ok_or_else(|| {
+            let msg = format!("Prefix is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let prefix = args[prefix_index].clone();
+
+        let cmd = StringStripPrefixCommand::new(value, prefix, ignore_case);
+
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct StringStripPrefixCommand {
+    ignore_case: bool,
+    value: CommandArg,
+    prefix: CommandArg,
+}
+
+impl StringStripPrefixCommand {
+    pub fn new(value: CommandArg, prefix: CommandArg, ignore_case: bool) -> Self {
+        Self {
+            ignore_case,
+            value,
+            prefix,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for StringStripPrefixCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let value = self.value.evaluate_string(context).await?;
+        let prefix = self.prefix.evaluate_string(context).await?;
+
+        let tail = if self.ignore_case {
+            StringStripPrefixCommandParser::strip_prefix_ignore_case(&value, &prefix)
+        } else {
+            value.strip_prefix(prefix.as_str())
+        };
+
+        if let Some(tail) = tail {
+            info!(
+                "strip-prefix matched value='{}' prefix='{}' ignore_case={} tail='{}'",
+                value, prefix, self.ignore_case, tail
+            );
+            Ok(super::CommandResult::success_with_string(tail))
+        } else {
+            debug!(
+                "strip-prefix not-matched value='{}' prefix='{}' ignore_case={}",
+                value, prefix, self.ignore_case
+            );
+            Ok(super::CommandResult::error())
+        }
+    }
+}
+
 // ends-with <string> <suffix>
 // This command checks if a string ends with a given suffix
 pub struct StringEndsWithCommandParser {
