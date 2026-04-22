@@ -17,6 +17,7 @@ mod test_first_ok;
 mod test_for;
 mod test_goto;
 mod test_if;
+mod test_js_external;
 mod test_list;
 mod test_match_result;
 mod test_string_match_commands;
