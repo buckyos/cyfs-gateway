@@ -2,7 +2,7 @@ use super::cmd::*;
 use super::exec::{
     ExecScope, InvokeArgSpec, InvokeCommandExecutor, parse_exec_scope_and_target, parse_invoke_args,
 };
-use crate::block::{CommandArg, CommandArgs};
+use crate::block::{BlockExecuter, CommandArg, CommandArgs, Expression};
 use crate::chain::{Context, ParserContext};
 use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
 use std::str::FromStr;
@@ -27,6 +27,135 @@ fn parse_goto_from_level(
             error!("{}", msg);
             msg
         })
+}
+
+pub struct FirstOkCommandParser {
+    cmd: Command,
+}
+
+impl FirstOkCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("first-ok")
+            .about(
+                "Try command substitutions left-to-right and return the first successful result.",
+            )
+            .after_help(
+                r#"
+DESCRIPTION:
+  first-ok is a result-level fallback combinator. It executes each command
+  substitution from left to right and returns the first `success(value)`.
+
+BEHAVIOR:
+  - `success(value)`    => stop immediately and return that success.
+  - `error(value)`      => remember it and continue with the next candidate.
+  - `control(...)`      => propagate immediately without swallowing it.
+  - If all candidates return `error(value)`, the last error is returned.
+
+NOTES:
+  - All inputs must be command substitutions: `$(...)`.
+  - This is intended for sequential fallback of parsing/lookup helpers,
+    not for general branching logic.
+
+EXAMPLES:
+  first-ok $(strip-prefix $path $route_prefix) $(strip-prefix $path "/api")
+
+  local target=$(first-ok
+    $(parse-authority $REQ.host)
+    $(parse-authority --default-port 3180 $REQ.dest_host)
+  )
+"#,
+            )
+            .arg(
+                Arg::new("commands")
+                    .required(true)
+                    .num_args(2..)
+                    .help("Candidate sub-commands in command substitution form: $(...)"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for FirstOkCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Control
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid first-ok command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let command_indices = matches.indices_of("commands").ok_or_else(|| {
+            let msg = "At least two command substitutions are required for first-ok".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+
+        let mut commands = Vec::new();
+        for index in command_indices {
+            let arg = &args[index];
+            if !arg.is_command_substitution() {
+                let msg = format!(
+                    "first-ok expects command substitution arguments, found: {:?}",
+                    arg
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+            commands.push(arg.as_command_substitution().unwrap().clone());
+        }
+
+        Ok(Arc::new(Box::new(FirstOkCommandExecutor::new(commands))))
+    }
+}
+
+pub struct FirstOkCommandExecutor {
+    commands: Vec<Box<Expression>>,
+}
+
+impl FirstOkCommandExecutor {
+    pub fn new(commands: Vec<Box<Expression>>) -> Self {
+        Self { commands }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for FirstOkCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let mut last_error = None;
+
+        for command in &self.commands {
+            let ret = BlockExecuter::execute_expression(command, context).await?;
+
+            if ret.is_success() {
+                return Ok(ret);
+            }
+
+            if ret.is_control() {
+                return Ok(ret);
+            }
+
+            last_error = Some(ret);
+        }
+
+        Ok(last_error.unwrap_or_else(CommandResult::error))
+    }
 }
 
 // goto command: tail-transfer style control command.

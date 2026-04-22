@@ -2237,6 +2237,44 @@ EXAMPLES:
   invoke --block helper_block --arg req $REQ
 ```
 
+### `first-ok`
+```
+依次执行多个命令替换，并返回第一个成功结果。
+
+用法: first-ok <commands>...
+
+参数:
+  <commands>...
+      候选子命令，必须使用命令替换形式：$(...)
+
+选项:
+  -h, --help
+      显示帮助
+
+
+说明:
+  `first-ok` 是一个结果级 fallback 组合命令。它会从左到右依次执行
+  每个命令替换，并返回第一个 `success(value)`。
+
+行为:
+  - `success(value)`    => 立即停止，并返回该 success。
+  - `error(value)`      => 记录后继续尝试下一个候选项。
+  - `control(...)`      => 立即向外传播，不会被吞掉。
+  - 如果所有候选项都返回 `error(value)`，则返回最后一个 error。
+
+说明:
+  - 所有输入都必须是命令替换：`$(...)`。
+  - 它适合做解析/查找类 helper 的顺序 fallback，不适合替代通用分支控制。
+
+EXAMPLES:
+  first-ok $(strip-prefix $path $route_prefix) $(strip-prefix $path "/api")
+
+  local target=$(first-ok
+    $(parse-authority $REQ.host)
+    $(parse-authority --default-port 3180 $REQ.dest_host)
+  )
+```
+
 ### `goto`
 ```
 尾转移到指定的 block/chain/lib，并从选定作用域返回。

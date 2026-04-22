@@ -2247,6 +2247,45 @@ EXAMPLES:
   invoke --block helper_block --arg req $REQ
 ```
 
+### `first-ok`
+```
+Try command substitutions left-to-right and return the first successful result.
+
+Usage: first-ok <commands>...
+
+Arguments:
+  <commands>...
+          Candidate sub-commands in command substitution form: $(...)
+
+Options:
+  -h, --help
+          Print help
+
+
+DESCRIPTION:
+  first-ok is a result-level fallback combinator. It executes each command
+  substitution from left to right and returns the first `success(value)`.
+
+BEHAVIOR:
+  - `success(value)`    => stop immediately and return that success.
+  - `error(value)`      => remember it and continue with the next candidate.
+  - `control(...)`      => propagate immediately without swallowing it.
+  - If all candidates return `error(value)`, the last error is returned.
+
+NOTES:
+  - All inputs must be command substitutions: `$(...)`.
+  - This is intended for sequential fallback of parsing/lookup helpers,
+    not for general branching logic.
+
+EXAMPLES:
+  first-ok $(strip-prefix $path $route_prefix) $(strip-prefix $path "/api")
+
+  local target=$(first-ok
+    $(parse-authority $REQ.host)
+    $(parse-authority --default-port 3180 $REQ.dest_host)
+  )
+```
+
 ### `goto`
 ```
 Tail-transfer to a block/chain/lib and then return from a chosen scope.

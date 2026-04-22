@@ -13,6 +13,7 @@ mod test_env;
 mod test_eq;
 mod test_exec;
 mod test_external_namespace;
+mod test_first_ok;
 mod test_for;
 mod test_goto;
 mod test_if;
