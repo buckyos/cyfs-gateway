@@ -1,4 +1,5 @@
 use super::cmd::*;
+use super::template::TemplateMatcher;
 use crate::block::{CommandArg, CommandArgEvaluator, CommandArgs};
 use crate::chain::{Context, ParserContext};
 use crate::collection::{CollectionValue, MemoryListCollection, NumberValue};
@@ -412,6 +413,308 @@ impl CommandExecutor for RewriteRegexCommand {
 
             Ok(CommandResult::success_with_string(result))
         } else {
+            Ok(CommandResult::error())
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TemplateRewriteDefaults {
+    separator: char,
+    ignore_case: bool,
+}
+
+pub struct RewritePathCommandParser {
+    cmd: Command,
+}
+
+impl RewritePathCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("rewrite-path")
+            .about("Rewrite a path-like variable using segment templates.")
+            .after_help(
+                r#"
+Arguments:
+  <var>       The path-like variable to rewrite (e.g. $REQ.path)
+  <pattern>   The template pattern to match against
+  <template>  The rewrite template using {name} and optional ** rest splice
+
+Options:
+  --ignore-case   Perform case-insensitive matching (default is case-sensitive)
+
+Behavior:
+  - Uses '/' as the default segment separator.
+  - <pattern> and <template> are evaluated dynamically at runtime.
+  - <pattern> follows the same template rules as match-path:
+      {name} captures one segment and ** matches the remaining segments at the end.
+  - <template> can reference named captures using {name}.
+  - If <pattern> contains **, <template> may include a segment ** to splice the matched remaining segments.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+
+Examples:
+  rewrite-path $REQ.path "/kapi/{service}/**" "/api/{service}/**"
+  rewrite-path $REQ.path "${route_prefix}/{node}/{plane}/**" "/klog/{node}/{plane}/**"
+"#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-insensitive matching (default is case-sensitive)"),
+            )
+            .arg(Arg::new("var").required(true).help("The variable to rewrite"))
+            .arg(
+                Arg::new("pattern")
+                    .required(true)
+                    .help("The template pattern to match"),
+            )
+            .arg(
+                Arg::new("template")
+                    .required(true)
+                    .help("The rewrite template"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for RewritePathCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        parse_template_rewrite_command(
+            &self.cmd,
+            "rewrite-path",
+            str_args,
+            args,
+            TemplateRewriteDefaults {
+                separator: '/',
+                ignore_case: false,
+            },
+            Some("ignore_case"),
+            None,
+        )
+    }
+}
+
+pub struct RewriteHostCommandParser {
+    cmd: Command,
+}
+
+impl RewriteHostCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("rewrite-host")
+            .about("Rewrite a host-like variable using segment templates.")
+            .after_help(
+                r#"
+Arguments:
+  <var>       The host-like variable to rewrite (e.g. $REQ.host)
+  <pattern>   The template pattern to match against
+  <template>  The rewrite template using {name} and optional ** rest splice
+
+Options:
+  --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
+
+Behavior:
+  - Uses '.' as the default segment separator.
+  - <pattern> and <template> are evaluated dynamically at runtime.
+  - <pattern> follows the same template rules as match-host:
+      {name} captures one host label and ** matches the remaining labels at the end.
+  - <template> can reference named captures using {name}.
+  - If <pattern> contains **, <template> may include a segment ** to splice the matched remaining labels.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+
+Examples:
+  rewrite-host $REQ.host "{app}.${zone}" "{app}-internal.{zone}"
+  rewrite-host $REQ.host "{app}.**" "{app}.internal.**"
+"#,
+            )
+            .arg(
+                Arg::new("no_ignore_case")
+                    .long("no-ignore-case")
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-sensitive matching (default is case-insensitive)"),
+            )
+            .arg(Arg::new("var").required(true).help("The variable to rewrite"))
+            .arg(
+                Arg::new("pattern")
+                    .required(true)
+                    .help("The template pattern to match"),
+            )
+            .arg(
+                Arg::new("template")
+                    .required(true)
+                    .help("The rewrite template"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for RewriteHostCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        parse_template_rewrite_command(
+            &self.cmd,
+            "rewrite-host",
+            str_args,
+            args,
+            TemplateRewriteDefaults {
+                separator: '.',
+                ignore_case: true,
+            },
+            None,
+            Some("no_ignore_case"),
+        )
+    }
+}
+
+fn parse_template_rewrite_command(
+    cmd: &Command,
+    command_name: &str,
+    str_args: Vec<&str>,
+    args: &CommandArgs,
+    defaults: TemplateRewriteDefaults,
+    ignore_case_flag: Option<&str>,
+    no_ignore_case_flag: Option<&str>,
+) -> Result<CommandExecutorRef, String> {
+    let matches = cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+        let msg = format!("Invalid {} command: {:?}, {}", command_name, str_args, e);
+        error!("{}", msg);
+        msg
+    })?;
+
+    let key_index = matches.index_of("var").ok_or_else(|| {
+        let msg = format!("Variable name is required for {} command", command_name);
+        error!("{}", msg);
+        msg
+    })?;
+    let key = args[key_index].clone();
+    if !key.is_var() {
+        let msg = format!(
+            "Invalid {} command: {:?}, the first argument must be a variable",
+            command_name, args
+        );
+        error!("{}", msg);
+        return Err(msg);
+    }
+
+    let pattern_index = matches.index_of("pattern").ok_or_else(|| {
+        let msg = format!("Pattern is required for {} command", command_name);
+        error!("{}", msg);
+        msg
+    })?;
+    let pattern = args[pattern_index].clone();
+
+    let template_index = matches.index_of("template").ok_or_else(|| {
+        let msg = format!("Template is required for {} command", command_name);
+        error!("{}", msg);
+        msg
+    })?;
+    let template = args[template_index].clone();
+
+    let ignore_case = if let Some(flag) = ignore_case_flag {
+        matches.get_flag(flag)
+    } else if let Some(flag) = no_ignore_case_flag {
+        !matches.get_flag(flag)
+    } else {
+        defaults.ignore_case
+    };
+
+    let exec = TemplateRewriteCommand::new(
+        command_name.to_owned(),
+        key,
+        pattern,
+        template,
+        defaults.separator,
+        ignore_case,
+    );
+    Ok(Arc::new(Box::new(exec)))
+}
+
+pub struct TemplateRewriteCommand {
+    command_name: String,
+    key: CommandArg,
+    pattern: CommandArg,
+    template: CommandArg,
+    separator: char,
+    ignore_case: bool,
+}
+
+impl TemplateRewriteCommand {
+    pub fn new(
+        command_name: String,
+        key: CommandArg,
+        pattern: CommandArg,
+        template: CommandArg,
+        separator: char,
+        ignore_case: bool,
+    ) -> Self {
+        Self {
+            command_name,
+            key,
+            pattern,
+            template,
+            separator,
+            ignore_case,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for TemplateRewriteCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let key_value = self.key.evaluate_string(context).await?;
+        let pattern = self.pattern.evaluate_string(context).await?;
+        let template = self.template.evaluate_string(context).await?;
+        let matcher = TemplateMatcher::new(&self.command_name, self.separator, self.ignore_case);
+
+        if let Some(rewritten) = matcher.rewrite(&key_value, &pattern, &template)? {
+            context
+                .env()
+                .set(
+                    self.key.as_str(),
+                    CollectionValue::String(rewritten.clone()),
+                    None,
+                )
+                .await?;
+            info!(
+                "Rewritten value for {} via {}: {} -> {}",
+                self.key.as_str(),
+                self.command_name,
+                key_value,
+                rewritten
+            );
+
+            Ok(CommandResult::success_with_string(rewritten))
+        } else {
+            info!(
+                "{} pattern '{}' did not match '{}'",
+                self.command_name, pattern, key_value
+            );
             Ok(CommandResult::error())
         }
     }

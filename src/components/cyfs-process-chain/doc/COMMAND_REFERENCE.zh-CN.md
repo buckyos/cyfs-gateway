@@ -153,6 +153,102 @@
   rewrite $REQ.host "*.example.com" "backend.internal"
 ```
 
+### `rewrite-path`
+```
+使用按段模板重写 path 风格变量。
+
+用法: rewrite-path [OPTIONS] <var> <pattern> <template>
+
+参数:
+  <var>
+          要重写的变量
+
+  <pattern>
+          要匹配的模板模式
+
+  <template>
+          重写模板
+
+选项:
+      --ignore-case
+          执行大小写不敏感匹配（默认大小写敏感）
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <var>       要重写的 path 风格变量，例如 $REQ.path
+  <pattern>   用于匹配的模板模式
+  <template>  重写模板，可使用 {name} 和可选的 ** 剩余段拼接
+
+选项:
+  --ignore-case   执行大小写不敏感匹配（默认大小写敏感）
+
+行为:
+  - 使用 `/` 作为默认分段符。
+  - <pattern> 和 <template> 都会在运行时动态求值。
+  - <pattern> 中的捕获名必须唯一。
+  - <pattern> 遵循与 match-path 相同的模板规则：
+      {name} 捕获单个 segment，** 匹配末尾剩余所有 segment。
+  - <template> 可以用 {name} 引用捕获结果。
+  - 如果 <pattern> 含有 **，则 <template> 可以放置一个独立 segment 的 **，
+    用来拼接匹配到的剩余 segment。
+  - 如果 <pattern> 未命中，则返回 error，且变量保持不变。
+
+示例:
+  rewrite-path $REQ.path "/kapi/{service}/**" "/api/{service}/**"
+  rewrite-path $REQ.path "${route_prefix}/{node}/{plane}/**" "/klog/{node}/{plane}/**"
+```
+
+### `rewrite-host`
+```
+使用按段模板重写 host 风格变量。
+
+用法: rewrite-host [OPTIONS] <var> <pattern> <template>
+
+参数:
+  <var>
+          要重写的变量
+
+  <pattern>
+          要匹配的模板模式
+
+  <template>
+          重写模板
+
+选项:
+      --no-ignore-case
+          执行大小写敏感匹配（默认大小写不敏感）
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <var>       要重写的 host 风格变量，例如 $REQ.host
+  <pattern>   用于匹配的模板模式
+  <template>  重写模板，可使用 {name} 和可选的 ** 剩余 label 拼接
+
+选项:
+  --no-ignore-case   执行大小写敏感匹配（默认大小写不敏感）
+
+行为:
+  - 使用 `.` 作为默认分段符。
+  - <pattern> 和 <template> 都会在运行时动态求值。
+  - <pattern> 中的捕获名必须唯一。
+  - <pattern> 遵循与 match-host 相同的模板规则：
+      {name} 捕获单个 host label，** 匹配末尾剩余所有 label。
+  - <template> 可以用 {name} 引用捕获结果。
+  - 如果 <pattern> 含有 **，则 <template> 可以放置一个独立 segment 的 **，
+    用来拼接匹配到的剩余 label。
+  - 如果 <pattern> 未命中，则返回 error，且变量保持不变。
+
+示例:
+  rewrite-host $REQ.host "{app}.${THIS_ZONE_HOST}" "{app}-internal.${THIS_ZONE_HOST}"
+  rewrite-host $REQ.host "{app}.**" "{app}.internal.**"
+```
+
 ### `rewrite-reg`
 ```
 使用正则表达式与替换模板重写变量。
@@ -1452,6 +1548,7 @@
 行为:
   - 使用 `/` 作为默认分段符。
   - pattern 会在运行时动态求值。
+  - pattern 中的捕获名必须唯一。
   - `{name}` 会在单个 segment 内捕获文本，不会跨越 `/`。
   - `**` 表示匹配剩余所有 segment，并且必须出现在最后一个 segment。
   - 如果提供 `--capture`，则匹配结果会写入一个新的 List：
@@ -1500,6 +1597,7 @@
 行为:
   - 使用 `.` 作为默认分段符。
   - pattern 会在运行时动态求值。
+  - pattern 中的捕获名必须唯一。
   - `{name}` 会在单个 host label 内捕获文本，不会跨越 `.`。
   - `**` 表示匹配剩余所有 label，并且必须出现在最后一个 label。
   - 如果提供 `--capture`，则匹配结果会写入一个新的 List：

@@ -1,4 +1,5 @@
 use super::cmd::*;
+use super::template::TemplateMatcher;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
 use crate::collection::{CollectionValue, MemoryListCollection};
@@ -347,18 +348,6 @@ impl CommandExecutor for MatchRegexCommandExecutor {
     }
 }
 
-#[derive(Clone, Debug)]
-enum TemplatePatternSegment {
-    Template(Vec<TemplateFragment>),
-    WildcardRest,
-}
-
-#[derive(Clone, Debug)]
-enum TemplateFragment {
-    Literal(String),
-    Capture(String),
-}
-
 #[derive(Clone, Copy)]
 struct TemplateMatchDefaults {
     separator: char,
@@ -648,170 +637,6 @@ impl TemplateMatchCommandExecutor {
 
         Ok(CollectionValue::List(list))
     }
-
-    fn parse_pattern(&self, pattern: &str) -> Result<Vec<TemplatePatternSegment>, String> {
-        let raw_segments: Vec<&str> = pattern.split(self.separator).collect();
-        let mut segments = Vec::with_capacity(raw_segments.len());
-        for (index, segment) in raw_segments.iter().enumerate() {
-            if *segment == "**" {
-                if index + 1 != raw_segments.len() {
-                    let msg = format!(
-                        "{} pattern '{}' contains '**' before the last segment",
-                        self.command_name, pattern
-                    );
-                    error!("{}", msg);
-                    return Err(msg);
-                }
-                segments.push(TemplatePatternSegment::WildcardRest);
-                continue;
-            }
-
-            let fragments = self.parse_segment_template(pattern, segment)?;
-            segments.push(TemplatePatternSegment::Template(fragments));
-        }
-
-        Ok(segments)
-    }
-
-    fn parse_segment_template(
-        &self,
-        pattern: &str,
-        segment: &str,
-    ) -> Result<Vec<TemplateFragment>, String> {
-        let mut fragments = Vec::new();
-        let mut literal_start = 0usize;
-        let mut cursor = 0usize;
-
-        while let Some(rel_open) = segment[cursor..].find('{') {
-            let open = cursor + rel_open;
-            if literal_start < open {
-                fragments.push(TemplateFragment::Literal(
-                    segment[literal_start..open].to_owned(),
-                ));
-            }
-
-            let close = segment[open + 1..]
-                .find('}')
-                .map(|offset| open + 1 + offset)
-                .ok_or_else(|| {
-                    let msg = format!(
-                        "Invalid {} pattern '{}': missing closing '}}' in segment '{}'",
-                        self.command_name, pattern, segment
-                    );
-                    error!("{}", msg);
-                    msg
-                })?;
-
-            let name = &segment[open + 1..close];
-            if !is_valid_template_capture_name(name) {
-                let msg = format!(
-                    "Invalid {} pattern '{}': capture name '{}' must match [A-Za-z_][A-Za-z0-9_]*",
-                    self.command_name, pattern, name
-                );
-                error!("{}", msg);
-                return Err(msg);
-            }
-
-            fragments.push(TemplateFragment::Capture(name.to_owned()));
-            cursor = close + 1;
-            literal_start = cursor;
-        }
-
-        if literal_start < segment.len() {
-            fragments.push(TemplateFragment::Literal(
-                segment[literal_start..].to_owned(),
-            ));
-        }
-
-        if fragments.is_empty() {
-            fragments.push(TemplateFragment::Literal(String::new()));
-        }
-
-        Ok(fragments)
-    }
-
-    fn match_template(&self, value: &str, pattern: &str) -> Result<Option<Vec<String>>, String> {
-        let pattern_segments = self.parse_pattern(pattern)?;
-        let value_segments: Vec<&str> = value.split(self.separator).collect();
-        let mut captures = Vec::new();
-        let mut value_index = 0usize;
-
-        for segment in pattern_segments.iter() {
-            match segment {
-                TemplatePatternSegment::WildcardRest => return Ok(Some(captures)),
-                TemplatePatternSegment::Template(fragments) => {
-                    if value_index >= value_segments.len() {
-                        return Ok(None);
-                    }
-                    let segment_captures =
-                        self.match_segment_template(fragments, value_segments[value_index])?;
-                    let Some(segment_captures) = segment_captures else {
-                        return Ok(None);
-                    };
-                    captures.extend(segment_captures);
-                    value_index += 1;
-                }
-            }
-        }
-
-        if value_index == value_segments.len() {
-            Ok(Some(captures))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn match_segment_template(
-        &self,
-        fragments: &[TemplateFragment],
-        value: &str,
-    ) -> Result<Option<Vec<String>>, String> {
-        self.match_segment_from(fragments, value, 0, 0)
-    }
-
-    fn match_segment_from(
-        &self,
-        fragments: &[TemplateFragment],
-        value: &str,
-        fragment_index: usize,
-        offset: usize,
-    ) -> Result<Option<Vec<String>>, String> {
-        if fragment_index == fragments.len() {
-            return Ok((offset == value.len()).then(Vec::new));
-        }
-
-        match &fragments[fragment_index] {
-            TemplateFragment::Literal(literal) => {
-                if !segment_starts_with(&value[offset..], literal, self.ignore_case) {
-                    return Ok(None);
-                }
-
-                self.match_segment_from(
-                    fragments,
-                    value,
-                    fragment_index + 1,
-                    offset + literal.len(),
-                )
-            }
-            TemplateFragment::Capture(_name) => {
-                if fragment_index + 1 == fragments.len() {
-                    return Ok(Some(vec![value[offset..].to_owned()]));
-                }
-
-                for end in candidate_segment_end_offsets(value, offset) {
-                    if let Some(mut rest) =
-                        self.match_segment_from(fragments, value, fragment_index + 1, end)?
-                    {
-                        let mut captures = vec![value[offset..end].to_owned()];
-                        captures.append(&mut rest);
-                        return Ok(Some(captures));
-                    }
-                }
-
-                Ok(None)
-            }
-        }
-    }
 }
 
 #[async_trait::async_trait]
@@ -819,10 +644,12 @@ impl CommandExecutor for TemplateMatchCommandExecutor {
     async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
         let value = self.value.evaluate_string(context).await?;
         let pattern = self.pattern.evaluate_string(context).await?;
+        let matcher = TemplateMatcher::new(&self.command_name, self.separator, self.ignore_case);
 
-        if let Some(captures) = self.match_template(&value, &pattern)? {
+        if let Some(result) = matcher.match_template(&value, &pattern)? {
             if let Some(name) = &self.capture {
-                let capture_list = Self::build_capture_list(&value, &captures).await?;
+                let capture_list =
+                    Self::build_capture_list(&value, result.positional_captures()).await?;
                 context.env().set(name, capture_list, None).await?;
             }
 
@@ -835,51 +662,6 @@ impl CommandExecutor for TemplateMatchCommandExecutor {
             )))
         }
     }
-}
-
-fn is_valid_template_capture_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn segment_starts_with(value: &str, prefix: &str, ignore_case: bool) -> bool {
-    match value.get(..prefix.len()) {
-        Some(candidate) => segment_text_eq(candidate, prefix, ignore_case),
-        None => false,
-    }
-}
-
-fn segment_text_eq(left: &str, right: &str, ignore_case: bool) -> bool {
-    if ignore_case {
-        left.eq_ignore_ascii_case(right)
-    } else {
-        left == right
-    }
-}
-
-fn candidate_segment_end_offsets(value: &str, start: usize) -> Vec<usize> {
-    let mut offsets = Vec::new();
-    offsets.push(value.len());
-
-    let tail = &value[start..];
-    for (rel, _) in tail.char_indices() {
-        if rel == 0 {
-            continue;
-        }
-        offsets.push(start + rel);
-    }
-
-    offsets.sort_unstable();
-    offsets.dedup();
-    offsets.reverse();
-    offsets
 }
 
 // EQ command, like: eq REQ_HEADER.host "localhost"; eq --ignore-case REQ_HEADER.host "LOCALHOST"; eq --loose 1 "1"

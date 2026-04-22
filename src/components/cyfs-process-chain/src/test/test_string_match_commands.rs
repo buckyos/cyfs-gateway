@@ -462,6 +462,75 @@ const PROCESS_CHAIN_MATCH_HOST_TEMPLATE: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_REWRITE_PATH_TEMPLATE: &str = r#"
+<process_chain_lib id="rewrite_path_template_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local route_prefix="/.cluster/klog";
+                local path="/.cluster/klog/ood1/admin/cluster-state";
+                rewrite-path $path "${route_prefix}/{node}/{plane}/**" "/klog/{node}/{plane}/**" || return --from lib "rewrite_path_tail_fail";
+                eq $path "/klog/ood1/admin/cluster-state" || return --from lib "rewrite_path_tail_value_fail";
+
+                local exact="/kapi/system_config";
+                rewrite-path $exact "/kapi/{service}/**" "/internal/{service}/**" || return --from lib "rewrite_path_empty_rest_fail";
+                eq $exact "/internal/system_config" || return --from lib "rewrite_path_empty_rest_value_fail";
+
+                local case_path="/API/Users";
+                rewrite-path --ignore-case $case_path "/api/{kind}" "/internal/{kind}" || return --from lib "rewrite_path_ignore_case_fail";
+                eq $case_path "/internal/Users" || return --from lib "rewrite_path_ignore_case_value_fail";
+
+                local untouched="/public/healthz";
+                rewrite-path $untouched "/kapi/{service}/**" "/internal/{service}/**" && return --from lib "rewrite_path_should_not_match";
+                eq $untouched "/public/healthz" || return --from lib "rewrite_path_non_match_mutated_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_REWRITE_HOST_TEMPLATE: &str = r#"
+<process_chain_lib id="rewrite_host_template_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local zone="app1.com";
+
+                local host="Api.App1.Com";
+                rewrite-host $host "{app}.${zone}" "{app}-internal.${zone}" || return --from lib "rewrite_host_basic_fail";
+                eq $host "Api-internal.app1.com" || return --from lib "rewrite_host_basic_value_fail";
+
+                local wildcard="api.edge.internal.app1.com";
+                rewrite-host $wildcard "{app}.**" "{app}.gateway.**" || return --from lib "rewrite_host_rest_fail";
+                eq $wildcard "api.gateway.edge.internal.app1.com" || return --from lib "rewrite_host_rest_value_fail";
+
+                local strict="Api.App1.Com";
+                rewrite-host --no-ignore-case $strict "{app}.${zone}" "{app}-internal.${zone}" && return --from lib "rewrite_host_case_sensitive_should_fail";
+                eq $strict "Api.App1.Com" || return --from lib "rewrite_host_case_sensitive_mutated_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_REWRITE_PATH_TEMPLATE_ERROR: &str = r#"
+<process_chain_lib id="rewrite_path_template_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local path="/kapi/system_config";
+                rewrite-path $path "/kapi/{service}" "/internal/{missing}";
+                return --from lib "unexpected";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 #[tokio::test]
 async fn test_range_command_basic_flow() -> Result<(), String> {
     init_test_logger();
@@ -998,6 +1067,83 @@ async fn test_match_host_template_supports_hyphen_and_dot_forms() -> Result<(), 
     let exec = hook_point_env.link_hook_point(&hook_point).await?;
     let ret = exec.execute_lib("match_host_template_lib").await?;
     assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rewrite_path_template_supports_named_capture_and_rest_splice() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_rewrite_path_template");
+    hook_point
+        .load_process_chain_lib(
+            "rewrite_path_template_lib",
+            0,
+            PROCESS_CHAIN_REWRITE_PATH_TEMPLATE,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-rewrite-path-template")?;
+    let hook_point_env = HookPointEnv::new("test-rewrite-path-template", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("rewrite_path_template_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rewrite_host_template_supports_named_capture_and_rest_splice() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_rewrite_host_template");
+    hook_point
+        .load_process_chain_lib(
+            "rewrite_host_template_lib",
+            0,
+            PROCESS_CHAIN_REWRITE_HOST_TEMPLATE,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-rewrite-host-template")?;
+    let hook_point_env = HookPointEnv::new("test-rewrite-host-template", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("rewrite_host_template_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rewrite_path_template_rejects_unknown_capture_name() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_rewrite_path_template_error");
+    hook_point
+        .load_process_chain_lib(
+            "rewrite_path_template_error_lib",
+            0,
+            PROCESS_CHAIN_REWRITE_PATH_TEMPLATE_ERROR,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-rewrite-path-template-error")?;
+    let hook_point_env = HookPointEnv::new("test-rewrite-path-template-error", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = exec
+        .execute_lib("rewrite_path_template_error_lib")
+        .await
+        .err()
+        .ok_or_else(|| "rewrite-path with unknown capture should fail".to_string())?;
+    assert!(
+        err.contains("unknown capture name 'missing'"),
+        "unexpected error: {}",
+        err
+    );
 
     Ok(())
 }

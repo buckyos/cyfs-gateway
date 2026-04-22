@@ -151,6 +151,100 @@ Examples:
   rewrite $REQ.host "*.example.com" "backend.internal"
 ```
 
+### `rewrite-path`
+```
+Rewrite a path-like variable using segment templates.
+
+Usage: rewrite-path [OPTIONS] <var> <pattern> <template>
+
+Arguments:
+  <var>
+          The variable to rewrite
+
+  <pattern>
+          The template pattern to match
+
+  <template>
+          The rewrite template
+
+Options:
+      --ignore-case
+          Perform case-insensitive matching (default is case-sensitive)
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <var>       The path-like variable to rewrite (e.g. $REQ.path)
+  <pattern>   The template pattern to match against
+  <template>  The rewrite template using {name} and optional ** rest splice
+
+Options:
+  --ignore-case   Perform case-insensitive matching (default is case-sensitive)
+
+Behavior:
+  - Uses '/' as the default segment separator.
+  - <pattern> and <template> are evaluated dynamically at runtime.
+  - Capture names in <pattern> must be unique.
+  - <pattern> follows the same template rules as match-path:
+      {name} captures one segment and ** matches the remaining segments at the end.
+  - <template> can reference named captures using {name}.
+  - If <pattern> contains **, <template> may include a segment ** to splice the matched remaining segments.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+
+Examples:
+  rewrite-path $REQ.path "/kapi/{service}/**" "/api/{service}/**"
+  rewrite-path $REQ.path "${route_prefix}/{node}/{plane}/**" "/klog/{node}/{plane}/**"
+```
+
+### `rewrite-host`
+```
+Rewrite a host-like variable using segment templates.
+
+Usage: rewrite-host [OPTIONS] <var> <pattern> <template>
+
+Arguments:
+  <var>
+          The variable to rewrite
+
+  <pattern>
+          The template pattern to match
+
+  <template>
+          The rewrite template
+
+Options:
+      --no-ignore-case
+          Perform case-sensitive matching (default is case-insensitive)
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <var>       The host-like variable to rewrite (e.g. $REQ.host)
+  <pattern>   The template pattern to match against
+  <template>  The rewrite template using {name} and optional ** rest splice
+
+Options:
+  --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
+
+Behavior:
+  - Uses '.' as the default segment separator.
+  - <pattern> and <template> are evaluated dynamically at runtime.
+  - Capture names in <pattern> must be unique.
+  - <pattern> follows the same template rules as match-host:
+      {name} captures one host label and ** matches the remaining labels at the end.
+  - <template> can reference named captures using {name}.
+  - If <pattern> contains **, <template> may include a segment ** to splice the matched remaining labels.
+  - If <pattern> does not match, returns error and leaves the variable unchanged.
+
+Examples:
+  rewrite-host $REQ.host "{app}.${THIS_ZONE_HOST}" "{app}-internal.${THIS_ZONE_HOST}"
+  rewrite-host $REQ.host "{app}.**" "{app}.internal.**"
+```
+
 ### `rewrite-reg`
 ```
 Rewrite a variable using a regular expression and a replacement template.
@@ -1453,6 +1547,7 @@ Options:
 Behavior:
   - Uses '/' as the default segment separator.
   - Pattern is evaluated dynamically at runtime.
+  - Capture names in the pattern must be unique.
   - `{name}` captures text inside a single segment and never crosses '/'.
   - `**` matches the remaining segments and must appear as the last segment.
   - If --capture is provided, match results are saved into a fresh List as:
@@ -1501,6 +1596,7 @@ Options:
 Behavior:
   - Uses '.' as the default segment separator.
   - Pattern is evaluated dynamically at runtime.
+  - Capture names in the pattern must be unique.
   - `{name}` captures text inside a single host label and never crosses '.'.
   - `**` matches the remaining labels and must appear as the last segment.
   - If --capture is provided, match results are saved into a fresh List as:

@@ -11,6 +11,7 @@ mod helper;
 mod map;
 mod match_;
 mod string;
+mod template;
 mod type_;
 mod value;
 mod var;

@@ -163,6 +163,8 @@ range $REQ.target.port 1000 2000 && accept;
 | 命令 | 规范语法 | 说明 |
 | --- | --- | --- |
 | `rewrite` | `rewrite <$var> <glob> <template>` | 用 glob 重写变量值；会回写原变量 |
+| `rewrite-path` | `rewrite-path [--ignore-case] <$var> <pattern> <template>` | 用 path 模板重写变量值；支持 `{name}` 和尾部 `**` |
+| `rewrite-host` | `rewrite-host [--no-ignore-case] <$var> <pattern> <template>` | 用 host 模板重写变量值；支持 `{name}` 和尾部 `**` |
 | `rewrite-reg` | `rewrite-reg <$var> <regex> <template>` | 用正则重写变量值；模板里可用 `$1`、`$2` |
 | `replace` | `replace [-i|--ignore-case] <$var> <match> <replacement>` | 替换变量值中的子串；会回写原变量 |
 | `append` | `append <a> <b> [more...]` | 直接拼接多个参数并返回新字符串 |
@@ -176,13 +178,19 @@ range $REQ.target.port 1000 2000 && accept;
 ### 字符串命令细节
 
 - `rewrite` 适合 glob 改写，比如路径前缀、host 模板。
+- `rewrite-path` / `rewrite-host` 使用和 `match-path` / `match-host` 相同的模板规则：
+  - `{name}` 捕获单个 segment / label
+  - `**` 匹配剩余尾部；若 pattern 里有 `**`，template 里也可放一个独立 segment 的 `**` 来拼接剩余尾部
+  - pattern 中的捕获名必须唯一
 - `rewrite-reg` 的 canonical 名是 `rewrite-reg`；不要写成 `rewrite_reg`。
-- `replace` / `rewrite` / `rewrite-reg` 都会修改原变量。
+- `replace` / `rewrite` / `rewrite-path` / `rewrite-host` / `rewrite-reg` 都会修改原变量。
 - `append` 只返回结果，不会自动写回变量；需要配合赋值：
 
 ```txt
 local full_url=$(append "https://" $REQ.host $REQ.url)
 rewrite $REQ.url "/kapi/my-service/*" "/kapi/*"
+rewrite-path $REQ.path "/kapi/{service}/**" "/api/{service}/**"
+rewrite-host $REQ.host "{app}.${THIS_ZONE_HOST}" "{app}-internal.${THIS_ZONE_HOST}"
 rewrite-reg $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
 replace -i $REQ.host ".internal" ".svc"
 slice $REQ.path 0:10
@@ -454,7 +462,7 @@ call global::geo_lookup $REQ_real_remote_ip
 - 控制流：`goto` `exec` `invoke` `return` `error` `exit` `break` `accept` `reject` `drop`
 - 变量：赋值语法、`delete` `type` `to-bool` `to-number` `is-null` `is-bool` `is-number` `capture`
 - 匹配：`match` `match-reg` `eq` `ne` `gt` `ge` `lt` `le` `range`
-- 字符串：`rewrite` `rewrite-reg` `replace` `append` `slice` `strlen` `starts-with` `ends-with` `url_encode` `url_decode`
+- 字符串：`rewrite` `rewrite-path` `rewrite-host` `rewrite-reg` `replace` `append` `slice` `strlen` `starts-with` `ends-with` `url_encode` `url_decode`
 - 集合：`match-include`、所有 `list-*` / `set-*` / `map-*`
 - 聚合：`map`
 - 网关宿主扩展：`call-server` `forward` `redirect` `error` `http-probe` `https-sni-probe` `proxy-protocol-probe` `verify-jwt` `parse-cookie` `set-limit` `set-stat` `in-time-range` `num-cmp`

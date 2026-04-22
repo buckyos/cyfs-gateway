@@ -119,6 +119,14 @@ impl CommandParserFactory {
         // string command
         self.register("rewrite", Arc::new(Box::new(RewriteCommandParser::new())));
         self.register(
+            "rewrite-path",
+            Arc::new(Box::new(RewritePathCommandParser::new())),
+        );
+        self.register(
+            "rewrite-host",
+            Arc::new(Box::new(RewriteHostCommandParser::new())),
+        );
+        self.register(
             "rewrite-reg",
             Arc::new(Box::new(RewriteRegexCommandParser::new())),
         );
