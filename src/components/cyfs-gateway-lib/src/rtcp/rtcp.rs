@@ -1160,7 +1160,7 @@ impl RTcpInner {
                 target_id_str.as_str(),
                 remote_addr.as_str()
             );
-
+            //TODO:通过tunnel框架创建stream
             let tunnel_stream = tokio::net::TcpStream::connect(remote_addr.clone()).await;
             let mut tunnel_stream = match tunnel_stream {
                 Ok(stream) => stream,
@@ -1694,6 +1694,7 @@ impl RTcpTunnel {
             // Build a direct stream to target
             let mut target_addr = self.peer_addr.clone();
             target_addr.set_port(self.target.stack_port);
+            //TODO:通过tunnel框架创建stream
             let ret = tokio::net::TcpStream::connect(target_addr).await;
             if ret.is_err() {
                 let e = ret.err().unwrap();
