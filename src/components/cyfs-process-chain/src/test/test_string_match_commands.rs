@@ -662,11 +662,13 @@ const PROCESS_CHAIN_MATCH_REGEX_CAPTURE_SUCCESS: &str = r#"
         <block id="entry">
             <![CDATA[
                 local input="AbC-123";
-                match-reg --capture cap $input "^([a-z]+)-([0-9]+)\$" || return --from lib "capture_fail";
+                match-reg --capture cap --capture-named named $input "^(?P<kind>[a-z]+)-(?P<id>[0-9]+)\$" || return --from lib "capture_fail";
                 eq $(list-remove $cap 0) "AbC-123" || return --from lib "capture_0_fail";
                 eq $(list-remove $cap 0) "AbC" || return --from lib "capture_1_fail";
                 eq $(list-remove $cap 0) "123" || return --from lib "capture_2_fail";
                 list-pop $cap && return --from lib "capture_tail_should_be_empty";
+                eq $named.kind "AbC" || return --from lib "named_capture_kind_fail";
+                eq $named.id "123" || return --from lib "named_capture_id_fail";
                 return --from lib "ok";
             ]]>
         </block>
@@ -680,20 +682,27 @@ const PROCESS_CHAIN_MATCH_REGEX_CAPTURE_FRESH_LIST: &str = r#"
         <block id="entry">
             <![CDATA[
                 local extended="abc-123-def";
-                match-reg --capture cap $extended "^([a-z]+)-([0-9]+)-([a-z]+)\$" || return --from lib "extended_capture_fail";
+                match-reg --capture cap --capture-named named $extended "^(?P<service>[a-z]+)-(?P<port>[0-9]+)-(?P<env>[a-z]+)\$" || return --from lib "extended_capture_fail";
                 eq $cap[0] "abc-123-def" || return --from lib "extended_capture_0_fail";
                 eq $cap[1] "abc" || return --from lib "extended_capture_1_fail";
                 eq $cap[2] "123" || return --from lib "extended_capture_2_fail";
                 eq $cap[3] "def" || return --from lib "extended_capture_3_fail";
+                eq $named.service "abc" || return --from lib "extended_named_service_fail";
+                eq $named.port "123" || return --from lib "extended_named_port_fail";
+                eq $named.env "def" || return --from lib "extended_named_env_fail";
 
                 local optional="svc";
-                match-reg --capture cap $optional "^([a-z]+)(?:-([0-9]+))?\$" || return --from lib "optional_capture_fail";
+                match-reg --capture cap --capture-named named $optional "^(?P<service>[a-z]+)(?:-(?P<port>[0-9]+))?\$" || return --from lib "optional_capture_fail";
                 eq $cap[0] "svc" || return --from lib "optional_capture_0_fail";
                 eq $cap[1] "svc" || return --from lib "optional_capture_1_fail";
                 is-null $cap[2] || return --from lib "optional_capture_2_should_be_null";
+                eq $named.service "svc" || return --from lib "optional_named_service_fail";
+                is-null $named.port || return --from lib "optional_named_port_should_be_null";
 
                 local stale=${cap?.[3] ?? "missing"};
                 eq $stale "missing" || return --from lib "capture_stale_index_fail";
+                local named_stale=${named?.env ?? "missing"};
+                eq $named_stale "missing" || return --from lib "named_capture_stale_key_fail";
 
                 return --from lib "ok";
             ]]>
@@ -709,19 +718,24 @@ const PROCESS_CHAIN_MATCH_PATH_TEMPLATE: &str = r#"
             <![CDATA[
                 local route_prefix="/.cluster/klog";
                 local path="/.cluster/klog/ood1/admin/cluster-state";
-                match-path --capture cap $path "${route_prefix}/{node}/{plane}/**" || return --from lib "path_match_fail";
+                match-path --capture cap --capture-named named $path "${route_prefix}/{node}/{plane}/**" || return --from lib "path_match_fail";
                 eq $cap[0] "/.cluster/klog/ood1/admin/cluster-state" || return --from lib "path_capture_0_fail";
                 eq $cap[1] "ood1" || return --from lib "path_capture_1_fail";
                 eq $cap[2] "admin" || return --from lib "path_capture_2_fail";
+                eq $named.node "ood1" || return --from lib "path_named_node_fail";
+                eq $named.plane "admin" || return --from lib "path_named_plane_fail";
                 local stale=${cap?.[3] ?? "missing"};
                 eq $stale "missing" || return --from lib "path_capture_stale_index_fail";
 
                 local exact="/kapi/system_config";
-                match-path --capture cap $exact "/kapi/{service_id}" || return --from lib "path_exact_fail";
+                match-path --capture cap --capture-named named $exact "/kapi/{service_id}" || return --from lib "path_exact_fail";
                 eq $cap[0] "/kapi/system_config" || return --from lib "path_exact_capture_0_fail";
                 eq $cap[1] "system_config" || return --from lib "path_exact_capture_1_fail";
+                eq $named.service_id "system_config" || return --from lib "path_exact_named_service_fail";
                 local overwritten=${cap?.[2] ?? "missing"};
                 eq $overwritten "missing" || return --from lib "path_capture_overwrite_fail";
+                local named_overwritten=${named?.plane ?? "missing"};
+                eq $named_overwritten "missing" || return --from lib "path_named_capture_overwrite_fail";
 
                 match-path "/API/Users" "/api/users" && return --from lib "path_case_sensitive_should_fail";
                 match-path --ignore-case "/API/Users" "/api/users" || return --from lib "path_ignore_case_fail";
@@ -740,23 +754,45 @@ const PROCESS_CHAIN_MATCH_HOST_TEMPLATE: &str = r#"
             <![CDATA[
                 local zone="app1.com";
 
-                match-host --capture cap "buckyos-app1.com" "{app}-${zone}" || return --from lib "host_hyphen_match_fail";
+                match-host --capture cap --capture-named named "buckyos-app1.com" "{app}-${zone}" || return --from lib "host_hyphen_match_fail";
                 eq $cap[0] "buckyos-app1.com" || return --from lib "host_hyphen_capture_0_fail";
                 eq $cap[1] "buckyos" || return --from lib "host_hyphen_capture_1_fail";
+                eq $named.app "buckyos" || return --from lib "host_hyphen_named_app_fail";
 
                 match-host "www.buckyos-app1.com" "{app}-${zone}" && return --from lib "host_hyphen_should_not_match_prefixed_host";
 
-                match-host --capture cap "Api.App1.Com" "{app}.${zone}" || return --from lib "host_dot_match_fail";
+                match-host --capture cap --capture-named named "Api.App1.Com" "{app}.${zone}" || return --from lib "host_dot_match_fail";
                 eq $cap[0] "Api.App1.Com" || return --from lib "host_dot_capture_0_fail";
                 eq $cap[1] "Api" || return --from lib "host_dot_capture_1_fail";
+                eq $named.app "Api" || return --from lib "host_dot_named_app_fail";
 
                 match-host --no-ignore-case "Api.App1.Com" "{app}.${zone}" && return --from lib "host_case_sensitive_should_fail";
 
-                match-host --capture cap "api-stage.app1.com" "{app}-{env}.${zone}" || return --from lib "host_multi_capture_fail";
+                match-host --capture cap --capture-named named "api-stage.app1.com" "{app}-{env}.${zone}" || return --from lib "host_multi_capture_fail";
                 eq $cap[1] "api" || return --from lib "host_multi_capture_1_fail";
                 eq $cap[2] "stage" || return --from lib "host_multi_capture_2_fail";
+                eq $named.app "api" || return --from lib "host_multi_named_app_fail";
+                eq $named.env "stage" || return --from lib "host_multi_named_env_fail";
+
+                match-host --capture cap --capture-named named "svc.app1.com" "{app}.${zone}" || return --from lib "host_named_overwrite_fail";
+                eq $named.app "svc" || return --from lib "host_named_overwrite_app_fail";
+                local named_stale=${named?.env ?? "missing"};
+                eq $named_stale "missing" || return --from lib "host_named_capture_overwrite_fail";
 
                 return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_MATCH_CAPTURE_NAMED_CONFLICT: &str = r#"
+<process_chain_lib id="match_capture_named_conflict_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                match-path --capture cap --capture-named cap "/kapi/system_config" "/kapi/{service_id}";
+                return --from lib "unexpected";
             ]]>
         </block>
     </process_chain>
@@ -1768,6 +1804,38 @@ async fn test_match_host_template_supports_hyphen_and_dot_forms() -> Result<(), 
     let exec = hook_point_env.link_hook_point(&hook_point).await?;
     let ret = exec.execute_lib("match_host_template_lib").await?;
     assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_match_capture_named_rejects_same_variable_name() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_match_capture_named_conflict");
+    hook_point
+        .load_process_chain_lib(
+            "match_capture_named_conflict_lib",
+            0,
+            PROCESS_CHAIN_MATCH_CAPTURE_NAMED_CONFLICT,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-match-capture-named-conflict")?;
+    let hook_point_env = HookPointEnv::new("test-match-capture-named-conflict", data_dir);
+
+    let err = hook_point_env
+        .link_hook_point(&hook_point)
+        .await
+        .err()
+        .ok_or_else(|| {
+            "link should fail when capture and capture-named share a variable".to_string()
+        })?;
+    assert!(
+        err.contains("capture and capture-named must use different variable names"),
+        "unexpected link error: {}",
+        err
+    );
 
     Ok(())
 }

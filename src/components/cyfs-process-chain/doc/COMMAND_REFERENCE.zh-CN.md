@@ -1834,6 +1834,9 @@
       --capture <name>
           把正则匹配结果写入一个新的 List 变量
 
+      --capture-named <name>
+          把命名正则捕获写入一个新的 Map 变量
+
   -h, --help
           显示帮助
 
@@ -1844,6 +1847,7 @@
 
 选项:
   --capture name   将正则匹配结果写入一个新的 List 变量，可通过 name[0]、name[1] ... 访问
+  --capture-named name   将命名正则捕获写入一个新的 Map 变量，可通过 name.group 访问
   --no-ignore-case   执行大小写敏感匹配（默认大小写不敏感）
 
 行为:
@@ -1853,12 +1857,16 @@
       name[0] 表示完整匹配文本，
       name[1] 表示第一个捕获组，
       name[2] 表示第二个捕获组，以此类推。
+  - 如果提供 `--capture-named`，则命名捕获组 `(?P<name>...)` 会写入一个新的 Map。
+  - 未命中的可选命名捕获组会写成 Null，以保持 key 稳定。
   - 未命中的可选捕获组会写成 Null，以保持索引稳定。
+  - `--capture` 和 `--capture-named` 可以同时使用，但变量名必须不同。
   - 默认行为为大小写不敏感匹配。
 
 示例:
   match-reg $REQ_HEADER.host "^(.*)\.local$"
   match-reg --capture parts $REQ_HEADER.host "^(.+)\.(local|dev)$"
+  match-reg --capture-named host $REQ_HEADER.host "^(?P<app>.+)\.(?P<zone>local|dev)$"
 ```
 
 ### `match-path`
@@ -1881,6 +1889,9 @@
       --capture <name>
           把模板匹配结果写入一个新的 List 变量
 
+      --capture-named <name>
+          把命名模板捕获写入一个新的 Map 变量
+
   -h, --help
           显示帮助
 
@@ -1891,6 +1902,7 @@
 
 选项:
   --capture name   将模板匹配结果写入一个新的 List 变量，可通过 name[0]、name[1] ... 访问
+  --capture-named name   将命名模板捕获写入一个新的 Map 变量，可通过 name.key 访问
   --ignore-case    执行大小写不敏感匹配（默认大小写敏感）
 
 行为:
@@ -1903,11 +1915,14 @@
       name[0] 表示完整匹配文本，
       name[1] 表示第一个模板捕获，
       name[2] 表示第二个模板捕获，以此类推。
+  - 如果提供 `--capture-named`，则每个 `{name}` 捕获都会写入一个新的 Map 项。
+  - `--capture` 和 `--capture-named` 可以同时使用，但变量名必须不同。
   - 默认大小写敏感。
 
 示例:
   match-path $REQ.path "/kapi/{service_id}/**"
   match-path --capture parts $REQ.path "${route_prefix}/{node}/{plane}/**"
+  match-path --capture-named route $REQ.path "${route_prefix}/{node}/{plane}/**"
 ```
 
 ### `match-host`
@@ -1930,6 +1945,9 @@
       --capture <name>
           把模板匹配结果写入一个新的 List 变量
 
+      --capture-named <name>
+          把命名模板捕获写入一个新的 Map 变量
+
   -h, --help
           显示帮助
 
@@ -1940,6 +1958,7 @@
 
 选项:
   --capture name     将模板匹配结果写入一个新的 List 变量，可通过 name[0]、name[1] ... 访问
+  --capture-named name   将命名模板捕获写入一个新的 Map 变量，可通过 name.key 访问
   --no-ignore-case   执行大小写敏感匹配（默认大小写不敏感）
 
 行为:
@@ -1952,11 +1971,14 @@
       name[0] 表示完整匹配文本，
       name[1] 表示第一个模板捕获，
       name[2] 表示第二个模板捕获，以此类推。
+  - 如果提供 `--capture-named`，则每个 `{name}` 捕获都会写入一个新的 Map 项。
+  - `--capture` 和 `--capture-named` 可以同时使用，但变量名必须不同。
   - 默认大小写不敏感。
 
 示例:
   match-host $REQ.host "{app}.${THIS_ZONE_HOST}"
   match-host --capture host $REQ.host "{app}-${THIS_ZONE_HOST}"
+  match-host --capture-named host $REQ.host "{app}-${THIS_ZONE_HOST}"
 ```
 
 ### `range`

@@ -2,8 +2,8 @@ use super::cmd::*;
 use super::template::TemplateMatcher;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
-use crate::collection::{CollectionValue, MemoryListCollection};
-use clap::{Arg, ArgAction, Command};
+use crate::collection::{CollectionValue, MemoryListCollection, MemoryMapCollection};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use globset::{GlobBuilder, GlobMatcher};
 use regex::{Regex, RegexBuilder};
 use std::sync::Arc;
@@ -160,6 +160,47 @@ impl CommandExecutor for MatchCommandExecutor {
 * match-reg some_input "^pattern$"
 * match-reg --capture name some_input "^pattern$"
 */
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MatchCaptureTargets {
+    positional: Option<String>,
+    named: Option<String>,
+}
+
+fn parse_capture_target_name(
+    matches: &ArgMatches,
+    args: &CommandArgs,
+    arg_name: &str,
+) -> Result<Option<String>, String> {
+    match matches.index_of(arg_name) {
+        Some(index) => {
+            let name = args[index].as_literal_str().ok_or_else(|| {
+                let msg = format!("Capture name must be a literal string: {:?}", args[index]);
+                error!("{}", msg);
+                msg
+            })?;
+            Ok(Some(name.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+fn parse_capture_targets(
+    matches: &ArgMatches,
+    args: &CommandArgs,
+) -> Result<MatchCaptureTargets, String> {
+    let positional = parse_capture_target_name(matches, args, "capture")?;
+    let named = parse_capture_target_name(matches, args, "capture_named")?;
+
+    if positional.is_some() && positional == named {
+        let msg = "capture and capture-named must use different variable names".to_string();
+        error!("{}", msg);
+        return Err(msg);
+    }
+
+    Ok(MatchCaptureTargets { positional, named })
+}
+
 pub struct MatchRegexCommandParser {
     cmd: Command,
 }
@@ -167,7 +208,7 @@ pub struct MatchRegexCommandParser {
 impl MatchRegexCommandParser {
     pub fn new() -> Self {
         let cmd = Command::new("match-reg")
-            .about("Match a value against a regular expression. Supports optional named capture.")
+            .about("Match a value against a regular expression. Supports optional capture.")
             .after_help(
                 r#"
 Arguments:
@@ -176,6 +217,7 @@ Arguments:
 
 Options:
   --capture name   Store regex match results into a fresh List variable accessible as name[0], name[1], ...
+  --capture-named name   Store named regex captures into a fresh Map variable accessible as name.group
   --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
 
 Behavior:
@@ -185,12 +227,15 @@ Behavior:
       name[0] is the full matched text,
       name[1] is the first capture group,
       name[2] is the second capture group, etc.
+  - If --capture-named is provided, named capture groups `(?P<name>...)` are saved into a fresh Map.
+  - Unmatched optional named capture groups are stored as Null to preserve keys.
   - Unmatched optional capture groups are stored as Null to preserve indexes.
   - Default behavior is case-insensitive matching.
 
 Examples:
   match-reg $REQ_HEADER.host "^(.*)\.local$"
   match-reg --capture parts $REQ_HEADER.host "^(.+)\.(local|dev)$"
+  match-reg --capture-named host $REQ_HEADER.host "^(?P<app>.+)\.(?P<zone>local|dev)$"
 "#,
             )
             .arg(
@@ -204,6 +249,12 @@ Examples:
                     .long("capture")
                     .value_name("name")
                     .help("Store regex match results into a fresh List variable"),
+            )
+            .arg(
+                Arg::new("capture_named")
+                    .long("capture-named")
+                    .value_name("name")
+                    .help("Store named regex captures into a fresh Map variable"),
             )
             .arg(
                 Arg::new("value")
@@ -245,17 +296,7 @@ impl CommandParser for MatchRegexCommandParser {
                 msg
             })?;
 
-        let capture = match matches.index_of("capture") {
-            Some(index) => {
-                let name = args[index].as_literal_str().ok_or_else(|| {
-                    let msg = format!("Capture name must be a literal string: {:?}", args[index]);
-                    error!("{}", msg);
-                    msg
-                })?;
-                Some(name.to_string())
-            }
-            None => None,
-        };
+        let capture_targets = parse_capture_targets(&matches, args)?;
 
         let value_index = matches.index_of("value").ok_or_else(|| {
             let msg = "Value argument is required for match-reg command".to_string();
@@ -288,7 +329,7 @@ impl CommandParser for MatchRegexCommandParser {
                 msg
             })?;
 
-        let cmd = MatchRegexCommandExecutor::new(value, pattern, capture);
+        let cmd = MatchRegexCommandExecutor::new(value, pattern, capture_targets);
 
         Ok(Arc::new(Box::new(cmd)))
     }
@@ -296,17 +337,17 @@ impl CommandParser for MatchRegexCommandParser {
 
 // Match regex command executer
 pub struct MatchRegexCommandExecutor {
-    pub capture: Option<String>, // Optional capture result list variable name
+    pub capture_targets: MatchCaptureTargets,
     pub value: CommandArg,
     pub pattern: Regex,
 }
 
 impl MatchRegexCommandExecutor {
-    pub fn new(value: CommandArg, pattern: Regex, capture: Option<String>) -> Self {
+    pub fn new(value: CommandArg, pattern: Regex, capture_targets: MatchCaptureTargets) -> Self {
         Self {
             value,
             pattern,
-            capture,
+            capture_targets,
         }
     }
 
@@ -321,6 +362,23 @@ impl MatchRegexCommandExecutor {
 
         Ok(CollectionValue::List(list))
     }
+
+    async fn build_named_capture_map(
+        &self,
+        caps: &regex::Captures<'_>,
+    ) -> Result<CollectionValue, String> {
+        let map = MemoryMapCollection::new_ref();
+
+        for name in self.pattern.capture_names().flatten() {
+            let value = caps
+                .name(name)
+                .map(|m| CollectionValue::String(m.as_str().to_owned()))
+                .unwrap_or(CollectionValue::Null);
+            map.insert(name, value).await?;
+        }
+
+        Ok(CollectionValue::Map(map))
+    }
 }
 
 #[async_trait::async_trait]
@@ -331,10 +389,14 @@ impl CommandExecutor for MatchRegexCommandExecutor {
 
         // Match the value
         if let Some(caps) = self.pattern.captures(&value) {
-            if let Some(name) = &self.capture {
+            if let Some(name) = &self.capture_targets.positional {
                 let capture_list = Self::build_capture_list(&caps).await?;
                 // TODO: Add env level support, such as --capture export/local name
                 context.env().set(name, capture_list, None).await?;
+            }
+            if let Some(name) = &self.capture_targets.named {
+                let capture_map = self.build_named_capture_map(&caps).await?;
+                context.env().set(name, capture_map, None).await?;
             }
 
             Ok(CommandResult::success_with_value(CollectionValue::Bool(
@@ -370,6 +432,7 @@ Arguments:
 
 Options:
   --capture name   Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --capture-named name   Store named template captures into a fresh Map variable accessible as name.key
   --ignore-case    Perform case-insensitive matching (default is case-sensitive)
 
 Behavior:
@@ -381,11 +444,13 @@ Behavior:
       name[0] is the full matched text,
       name[1] is the first template capture,
       name[2] is the second template capture, etc.
+  - If --capture-named is provided, each `{name}` capture is saved into a fresh Map entry.
   - Matching is case-sensitive by default.
 
 Examples:
   match-path $REQ.path "/kapi/{service_id}/**"
   match-path --capture parts $REQ.path "${route_prefix}/{node}/{plane}/**"
+  match-path --capture-named route $REQ.path "${route_prefix}/{node}/{plane}/**"
 "#,
             )
             .arg(
@@ -399,6 +464,12 @@ Examples:
                     .long("capture")
                     .value_name("name")
                     .help("Store template match results into a fresh List variable"),
+            )
+            .arg(
+                Arg::new("capture_named")
+                    .long("capture-named")
+                    .value_name("name")
+                    .help("Store named template captures into a fresh Map variable"),
             )
             .arg(
                 Arg::new("value")
@@ -461,6 +532,7 @@ Arguments:
 
 Options:
   --capture name     Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --capture-named name   Store named template captures into a fresh Map variable accessible as name.key
   --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
 
 Behavior:
@@ -472,11 +544,13 @@ Behavior:
       name[0] is the full matched text,
       name[1] is the first template capture,
       name[2] is the second template capture, etc.
+  - If --capture-named is provided, each `{name}` capture is saved into a fresh Map entry.
   - Matching is case-insensitive by default.
 
 Examples:
   match-host $REQ.host "{app}.${THIS_ZONE_HOST}"
   match-host --capture host $REQ.host "{app}-${THIS_ZONE_HOST}"
+  match-host --capture-named host $REQ.host "{app}-${THIS_ZONE_HOST}"
 "#,
             )
             .arg(
@@ -490,6 +564,12 @@ Examples:
                     .long("capture")
                     .value_name("name")
                     .help("Store template match results into a fresh List variable"),
+            )
+            .arg(
+                Arg::new("capture_named")
+                    .long("capture-named")
+                    .value_name("name")
+                    .help("Store named template captures into a fresh Map variable"),
             )
             .arg(
                 Arg::new("value")
@@ -551,17 +631,7 @@ fn parse_template_match_command(
         msg
     })?;
 
-    let capture = match matches.index_of("capture") {
-        Some(index) => {
-            let name = args[index].as_literal_str().ok_or_else(|| {
-                let msg = format!("Capture name must be a literal string: {:?}", args[index]);
-                error!("{}", msg);
-                msg
-            })?;
-            Some(name.to_string())
-        }
-        None => None,
-    };
+    let capture_targets = parse_capture_targets(&matches, args)?;
 
     let value_index = matches.index_of("value").ok_or_else(|| {
         let msg = format!("Value argument is required for {} command", command_name);
@@ -589,7 +659,7 @@ fn parse_template_match_command(
         command_name.to_owned(),
         value,
         pattern,
-        capture,
+        capture_targets,
         defaults.separator,
         ignore_case,
     );
@@ -598,7 +668,7 @@ fn parse_template_match_command(
 
 pub struct TemplateMatchCommandExecutor {
     command_name: String,
-    capture: Option<String>,
+    capture_targets: MatchCaptureTargets,
     value: CommandArg,
     pattern: CommandArg,
     separator: char,
@@ -610,13 +680,13 @@ impl TemplateMatchCommandExecutor {
         command_name: String,
         value: CommandArg,
         pattern: CommandArg,
-        capture: Option<String>,
+        capture_targets: MatchCaptureTargets,
         separator: char,
         ignore_case: bool,
     ) -> Self {
         Self {
             command_name,
-            capture,
+            capture_targets,
             value,
             pattern,
             separator,
@@ -637,6 +707,18 @@ impl TemplateMatchCommandExecutor {
 
         Ok(CollectionValue::List(list))
     }
+
+    async fn build_named_capture_map(
+        captures: &std::collections::HashMap<String, String>,
+    ) -> Result<CollectionValue, String> {
+        let map = MemoryMapCollection::new_ref();
+        for (name, value) in captures {
+            map.insert(name, CollectionValue::String(value.clone()))
+                .await?;
+        }
+
+        Ok(CollectionValue::Map(map))
+    }
 }
 
 #[async_trait::async_trait]
@@ -647,10 +729,14 @@ impl CommandExecutor for TemplateMatchCommandExecutor {
         let matcher = TemplateMatcher::new(&self.command_name, self.separator, self.ignore_case);
 
         if let Some(result) = matcher.match_template(&value, &pattern)? {
-            if let Some(name) = &self.capture {
+            if let Some(name) = &self.capture_targets.positional {
                 let capture_list =
                     Self::build_capture_list(&value, result.positional_captures()).await?;
                 context.env().set(name, capture_list, None).await?;
+            }
+            if let Some(name) = &self.capture_targets.named {
+                let capture_map = Self::build_named_capture_map(result.named_captures()).await?;
+                context.env().set(name, capture_map, None).await?;
             }
 
             Ok(CommandResult::success_with_value(CollectionValue::Bool(

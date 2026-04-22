@@ -1815,7 +1815,7 @@ Examples:
 
 ### `match-reg`
 ```
-Match a value against a regular expression. Supports optional named capture.
+Match a value against a regular expression. Supports optional capture.
 
 Usage: match-reg [OPTIONS] <value> <pattern>
 
@@ -1833,6 +1833,9 @@ Options:
       --capture <name>
           Store regex match results into a fresh List variable
 
+      --capture-named <name>
+          Store named regex captures into a fresh Map variable
+
   -h, --help
           Print help
 
@@ -1843,6 +1846,7 @@ Arguments:
 
 Options:
   --capture name   Store regex match results into a fresh List variable accessible as name[0], name[1], ...
+  --capture-named name   Store named regex captures into a fresh Map variable accessible as name.group
   --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
 
 Behavior:
@@ -1852,12 +1856,16 @@ Behavior:
       name[0] is the full matched text,
       name[1] is the first capture group,
       name[2] is the second capture group, etc.
+  - If --capture-named is provided, named capture groups `(?P<name>...)` are saved into a fresh Map.
+  - Unmatched optional named capture groups are stored as Null to preserve keys.
   - Unmatched optional capture groups are stored as Null to preserve indexes.
+  - --capture and --capture-named may be used together, but they must use different variable names.
   - Default behavior is case-insensitive matching.
 
 Examples:
   match-reg $REQ_HEADER.host "^(.*)\.local$"
   match-reg --capture parts $REQ_HEADER.host "^(.+)\.(local|dev)$"
+  match-reg --capture-named host $REQ_HEADER.host "^(?P<app>.+)\.(?P<zone>local|dev)$"
 ```
 
 ### `match-path`
@@ -1880,6 +1888,9 @@ Options:
       --capture <name>
           Store template match results into a fresh List variable
 
+      --capture-named <name>
+          Store named template captures into a fresh Map variable
+
   -h, --help
           Print help
 
@@ -1890,6 +1901,7 @@ Arguments:
 
 Options:
   --capture name   Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --capture-named name   Store named template captures into a fresh Map variable accessible as name.key
   --ignore-case    Perform case-insensitive matching (default is case-sensitive)
 
 Behavior:
@@ -1902,11 +1914,14 @@ Behavior:
       name[0] is the full matched text,
       name[1] is the first template capture,
       name[2] is the second template capture, etc.
+  - If --capture-named is provided, each `{name}` capture is saved into a fresh Map entry.
+  - --capture and --capture-named may be used together, but they must use different variable names.
   - Matching is case-sensitive by default.
 
 Examples:
   match-path $REQ.path "/kapi/{service_id}/**"
   match-path --capture parts $REQ.path "${route_prefix}/{node}/{plane}/**"
+  match-path --capture-named route $REQ.path "${route_prefix}/{node}/{plane}/**"
 ```
 
 ### `match-host`
@@ -1929,6 +1944,9 @@ Options:
       --capture <name>
           Store template match results into a fresh List variable
 
+      --capture-named <name>
+          Store named template captures into a fresh Map variable
+
   -h, --help
           Print help
 
@@ -1939,6 +1957,7 @@ Arguments:
 
 Options:
   --capture name     Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --capture-named name   Store named template captures into a fresh Map variable accessible as name.key
   --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
 
 Behavior:
@@ -1951,11 +1970,14 @@ Behavior:
       name[0] is the full matched text,
       name[1] is the first template capture,
       name[2] is the second template capture, etc.
+  - If --capture-named is provided, each `{name}` capture is saved into a fresh Map entry.
+  - --capture and --capture-named may be used together, but they must use different variable names.
   - Matching is case-insensitive by default.
 
 Examples:
   match-host $REQ.host "{app}.${THIS_ZONE_HOST}"
   match-host --capture host $REQ.host "{app}-${THIS_ZONE_HOST}"
+  match-host --capture-named host $REQ.host "{app}-${THIS_ZONE_HOST}"
 ```
 
 ### `range`
