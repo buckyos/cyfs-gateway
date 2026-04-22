@@ -29,6 +29,69 @@ enum LineControlKeyword {
     Control,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LogicalLineState {
+    paren_depth: usize,
+    bracket_depth: usize,
+    brace_depth: usize,
+    quote: Option<char>,
+    escaped_in_quote: bool,
+}
+
+impl LogicalLineState {
+    fn consume(&mut self, input: &str) {
+        for ch in input.chars() {
+            if let Some(quote) = self.quote {
+                if self.escaped_in_quote {
+                    self.escaped_in_quote = false;
+                    continue;
+                }
+
+                if ch == '\\' {
+                    self.escaped_in_quote = true;
+                    continue;
+                }
+
+                if ch == quote {
+                    self.quote = None;
+                }
+
+                continue;
+            }
+
+            match ch {
+                '"' | '\'' => self.quote = Some(ch),
+                '(' => self.paren_depth += 1,
+                ')' => {
+                    if self.paren_depth > 0 {
+                        self.paren_depth -= 1;
+                    }
+                }
+                '[' => self.bracket_depth += 1,
+                ']' => {
+                    if self.bracket_depth > 0 {
+                        self.bracket_depth -= 1;
+                    }
+                }
+                '{' => self.brace_depth += 1,
+                '}' => {
+                    if self.brace_depth > 0 {
+                        self.brace_depth -= 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.quote.is_some()
+            || self.paren_depth > 0
+            || self.bracket_depth > 0
+            || self.brace_depth > 0
+    }
+}
+
 impl BlockParser {
     fn parse_typed_number_literal(input: &str) -> Option<CollectionValue> {
         if input.is_empty() {
@@ -206,7 +269,7 @@ impl BlockParser {
 
 impl BlockParser {
     pub fn parse(&self, block: &str) -> Result<Block, String> {
-        let lines: Vec<&str> = Self::split_lines(block);
+        let lines: Vec<String> = Self::split_lines(block);
         let mut block = Block::new(&self.id);
 
         if lines.is_empty() {
@@ -231,23 +294,41 @@ impl BlockParser {
 
     // Block contains multiple lines, first split them into lines
     // The lines are separated by '\n' or '\r\n' or '\r' for different OS
-    fn split_lines(block: &str) -> Vec<&str> {
-        block
-            .split(|c| c == '\n' || c == '\r')
-            .map(|line| line.trim_end_matches('\r').trim()) // Remove '\r' at the end of line if any
-            .filter(|line| {
-                if line.is_empty() {
-                    return false; // Filter out empty lines
-                }
+    fn split_lines(block: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut current = String::new();
+        let mut state = LogicalLineState::default();
 
-                // Filter out lines that are comments
-                !line.starts_with('#') && !line.starts_with("//")
-            }) // Filter out empty lines
-            .collect()
+        for raw_line in block.split(|c| c == '\n' || c == '\r') {
+            let line = raw_line.trim_end_matches('\r').trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            if line.starts_with('#') || line.starts_with("//") {
+                continue;
+            }
+
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(line);
+            state.consume(line);
+
+            if !state.is_open() {
+                lines.push(std::mem::take(&mut current));
+            }
+        }
+
+        if !current.is_empty() {
+            lines.push(current);
+        }
+
+        lines
     }
 
     fn parse_lines(
-        lines: &[&str],
+        lines: &[String],
         mut index: usize,
         stop_at_control_keywords: bool,
     ) -> Result<(Vec<Line>, usize), String> {
@@ -469,7 +550,7 @@ impl BlockParser {
         Ok(condition)
     }
 
-    fn parse_if_statement(lines: &[&str], index: usize) -> Result<(Line, usize), String> {
+    fn parse_if_statement(lines: &[String], index: usize) -> Result<(Line, usize), String> {
         let if_source = lines[index].trim().to_string();
         let mut branches = Vec::new();
         let mut else_lines = None;
@@ -656,7 +737,10 @@ impl BlockParser {
         ))
     }
 
-    fn parse_match_result_statement(lines: &[&str], index: usize) -> Result<(Line, usize), String> {
+    fn parse_match_result_statement(
+        lines: &[String],
+        index: usize,
+    ) -> Result<(Line, usize), String> {
         let source = lines[index].trim().to_string();
         let command = Self::parse_match_result_command(source.as_str())?;
         let mut ok_branch = None;
@@ -789,7 +873,7 @@ impl BlockParser {
         }
     }
 
-    fn parse_for_statement(lines: &[&str], index: usize) -> Result<(Line, usize), String> {
+    fn parse_for_statement(lines: &[String], index: usize) -> Result<(Line, usize), String> {
         let for_source = lines[index].trim().to_string();
         let (key_var, value_var, iterable) = Self::parse_for_header(for_source.as_str())?;
 
@@ -1756,6 +1840,32 @@ mod tests {
             }
             other => panic!("expected list literal, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_multiline_collection_literal_block() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            local route={
+                "kind": "app",
+                "target": {
+                    "node_id": $REQ.nodeId
+                },
+                "ports": [
+                    3180,
+                    3181
+                ]
+            };
+            return --from lib $route.target.node_id;
+        "#;
+
+        let block = parser.parse(block_str).unwrap();
+        assert_eq!(block.lines.len(), 2);
+
+        let statement = &block.lines[0].statements[0];
+        let assign = statement.expressions[0].1.as_command().unwrap();
+        assert_eq!(assign.command.name, "assign");
+        assert!(matches!(assign.command.args[2], CommandArg::MapLiteral(_)));
     }
 
     #[test]

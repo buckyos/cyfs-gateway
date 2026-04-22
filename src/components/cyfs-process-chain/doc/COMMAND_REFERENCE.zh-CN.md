@@ -610,7 +610,7 @@
   - value 可以是字符串字面量、typed literal、变量、命令替换，或嵌套的 map/list literal。
   - 每次表达式求值都会创建 fresh collection instance。
   - 这些 literal 复用的是现有 collection runtime type，不会引入独立的 `Object` 类型。
-  - v1 里 literal 需要写在同一条 statement line 内。
+  - 只要外围 `[]` / `{}` / `()` 在 statement 结束前保持配对，就支持多行 literal。
   - 暂不支持 Set literal。
 
 典型用法:

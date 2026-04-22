@@ -606,7 +606,7 @@ Semantics:
   - Values may be string literals, typed literals, variables, command substitutions, or nested map/list literals.
   - A fresh collection instance is created each time the expression is evaluated.
   - These literals reuse the existing collection runtime types; they do not introduce a separate `Object` type.
-  - In v1, the literal must stay within a single statement line.
+  - Multi-line literals are supported as long as the surrounding `[]` / `{}` / `()` stay balanced until the statement closes.
   - Set literal is not supported yet.
 
 Typical use:

@@ -38,7 +38,18 @@ const PROCESS_CHAIN_COLLECTION_LITERAL: &str = r#"
     <process_chain id="main">
         <block id="entry">
             <![CDATA[
-                local route={"kind": "app", "app_id": $REQ.appId, "target": {"node_id": $REQ.nodeId, "port": $REQ.port}, "tags": ["alpha", "beta"]};
+                local route={
+                    "kind": "app",
+                    "app_id": $REQ.appId,
+                    "target": {
+                        "node_id": $REQ.nodeId,
+                        "port": $REQ.port
+                    },
+                    "tags": [
+                        "alpha",
+                        "beta"
+                    ]
+                };
                 eq $route.kind "app" || return --from lib "route_kind_fail";
                 eq $route.target.node_id $REQ.nodeId || return --from lib "route_target_fail";
                 eq $route.tags[1] "beta" || return --from lib "route_tag_fail";
@@ -56,7 +67,18 @@ const PROCESS_CHAIN_COLLECTION_LITERAL: &str = r#"
 
         <block id="helper">
             <![CDATA[
-                return --from block {"kind": "service", "service_id": $REQ.serviceId, "ports": [$REQ.port, 3180], "meta": {"region.code": $REQ.regionCode, "enabled": true}};
+                return --from block {
+                    "kind": "service",
+                    "service_id": $REQ.serviceId,
+                    "ports": [
+                        $REQ.port,
+                        3180
+                    ],
+                    "meta": {
+                        "region.code": $REQ.regionCode,
+                        "enabled": true
+                    }
+                };
             ]]>
         </block>
     </process_chain>
