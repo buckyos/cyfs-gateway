@@ -174,15 +174,16 @@ Arguments:
   <pattern>    The regular expression to match against.
 
 Options:
-  --capture name   Capture groups into environment variables like name[0], name[1], ...
+  --capture name   Save regex match results into environment variables like name[0], name[1], ...
   --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
 
 Behavior:
   - Uses Rust-style regular expressions.
   - If the pattern matches, the command returns success, otherwise it returns error.
-  - If --capture is provided, matched groups are saved into environment as:
-      name[0] is the first capture group,
-      name[1] is the second capture group, etc.
+  - If --capture is provided, match results are saved into environment as:
+      name[0] is the full matched text,
+      name[1] is the first capture group,
+      name[2] is the second capture group, etc.
   - Default behavior is case-insensitive matching.
 
 Examples:
