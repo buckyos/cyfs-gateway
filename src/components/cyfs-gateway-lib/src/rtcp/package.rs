@@ -297,7 +297,7 @@ impl RTcpROpenPackage {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct RTcpROpenRespBody {
-    result: u32,
+    pub(crate) result: u32,
 }
 pub(crate) type RTcpROpenRespPackage = RTcpTunnelPackageImpl<RTcpROpenRespBody>;
 

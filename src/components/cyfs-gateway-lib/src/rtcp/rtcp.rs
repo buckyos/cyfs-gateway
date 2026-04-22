@@ -1073,11 +1073,24 @@ impl RTcpInner {
         let remote_stack: RTcpTargetStackEP = remote_stack.unwrap();
         let remote_device_id = remote_stack.did.to_string();
 
-        let tunnel_key = format!(
-            "{}_{}",
-            self.this_device_did.to_string(),
-            remote_device_id.as_str()
-        );
+        // Bootstrap-backed tunnels must NOT collide with direct ones (or with
+        // each other across different bootstrap transports), or routing,
+        // credentials and isolation semantics from one bootstrap path could
+        // bleed into another reusing the same remote did. Tag the reuse key
+        // with the bootstrap URL when present.
+        let tunnel_key = match remote_stack.bootstrap_stream_url.as_ref() {
+            Some(bootstrap_url) => format!(
+                "{}_{}|bootstrap={}",
+                self.this_device_did.to_string(),
+                remote_device_id.as_str(),
+                bootstrap_url
+            ),
+            None => format!(
+                "{}_{}",
+                self.this_device_did.to_string(),
+                remote_device_id.as_str()
+            ),
+        };
         debug!(
             "will create tunnel to {} ,tunnel key is {},try reuse",
             remote_device_id.as_str(),
@@ -1402,6 +1415,12 @@ struct RTcpTunnel {
     // optimistically connecting and producing a "late HelloStream" on the peer.
     open_resp_waiters: Arc<Mutex<HashMap<u32, oneshot::Sender<u32>>>>,
 
+    // Same fail-fast channel for the ROpen path: a non-zero ROpenResp tells
+    // the initiator that no HelloStream is coming, so it can drop its
+    // wait-HelloStream slot immediately instead of stalling for the full
+    // 30s STREAM_WAIT_TIMEOUT.
+    ropen_resp_waiters: Arc<Mutex<HashMap<u32, oneshot::Sender<u32>>>>,
+
     // Per-tunnel concurrency quota for inbound Open requests.
     inbound_open_slots: Arc<Semaphore>,
 }
@@ -1439,6 +1458,7 @@ impl RTcpTunnel {
             next_seq: Arc::new(AtomicU32::new(0)),
             listener,
             open_resp_waiters: Arc::new(Mutex::new(HashMap::new())),
+            ropen_resp_waiters: Arc::new(Mutex::new(HashMap::new())),
             inbound_open_slots: Arc::new(Semaphore::new(MAX_PENDING_INBOUND_OPENS)),
         }
     }
@@ -1469,8 +1489,19 @@ impl RTcpTunnel {
                 return Ok(());
             }
             RTcpTunnelPackage::ROpen(ropen_package) => self.on_ropen(ropen_package).await,
-            RTcpTunnelPackage::ROpenResp(_ropen_resp_package) => {
-                //check result
+            RTcpTunnelPackage::ROpenResp(ropen_resp_package) => {
+                // Deliver the result code to the post_ropen waiter. A
+                // non-zero result tells the initiator no HelloStream is
+                // coming, so it can release its wait-HelloStream slot
+                // immediately instead of stalling for the full 30s timeout.
+                let waiter = self
+                    .ropen_resp_waiters
+                    .lock()
+                    .await
+                    .remove(&ropen_resp_package.seq);
+                if let Some(sender) = waiter {
+                    let _ = sender.send(ropen_resp_package.body.result);
+                }
                 Ok(())
             }
             RTcpTunnelPackage::Open(open_package) => self.on_open(open_package).await,
@@ -1867,6 +1898,17 @@ impl RTcpTunnel {
         dest_port: u16,
         dest_host: Option<String>,
     ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+        // Bootstrap-backed tunnels (peer_addr == None) cannot fulfil either the
+        // Open or ROpen path because both reconnect via "peer_addr:stack_port".
+        // Reject up front so the peer is never asked to allocate a 30s pending
+        // Open / wait-HelloStream slot. Tracked as TODO 14.5 in doc/rtcp.md.
+        if self.peer_addr.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "open stream on bootstrap-backed rtcp tunnel not yet supported",
+            ));
+        }
+
         // First generate 32byte session_key
         let random_bytes: [u8; 16] = rand::rng().random();
         let session_key = hex::encode(random_bytes);
@@ -1930,16 +1972,12 @@ impl RTcpTunnel {
                 ));
             }
 
-            // Build a direct stream to remote stack.
-            // Bootstrap-backed tunnels (peer_addr == None) can't take this
-            // path; Open over such tunnels is not yet supported — tracked as
-            // TODO 14.5 in doc/rtcp.md.
-            let peer_addr = self.peer_addr.ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "open stream on bootstrap-backed rtcp tunnel not yet supported",
-                )
-            })?;
+            // Build a direct stream to remote stack. peer_addr is guaranteed
+            // to be Some here: request_open_stream rejects bootstrap-backed
+            // tunnels up front before reaching this point.
+            let peer_addr = self
+                .peer_addr
+                .expect("peer_addr must be set on can_direct tunnels");
             let mut remote_stack_addr = peer_addr;
             remote_stack_addr.set_port(self.remote_stack.stack_port);
             //TODO:通过tunnel框架创建stream
@@ -1978,6 +2016,13 @@ impl RTcpTunnel {
         } else {
             //send ropen to remote stack
 
+            // Register the ROpenResp waiter BEFORE posting so a fast peer
+            // reply can never lose the race. A non-zero result lets us bail
+            // out of the wait_ropen_stream slot immediately instead of
+            // burning the full 30s STREAM_WAIT_TIMEOUT.
+            let (resp_tx, resp_rx) = oneshot::channel::<u32>();
+            self.ropen_resp_waiters.lock().await.insert(seq, resp_tx);
+
             self.build_helper.new_wait_stream(&real_key).await;
 
             //info!("insert session_key {} to wait ropen stream map",real_key.as_str());
@@ -1988,13 +2033,51 @@ impl RTcpTunnel {
                 // Send failed: no HelloStream will ever arrive for this key,
                 // so the waiting slot must be reclaimed now rather than
                 // relying on the 30s timeout path.
+                self.ropen_resp_waiters.lock().await.remove(&seq);
                 self.build_helper.remove_wait_stream(&real_key).await;
                 return Err(e);
             }
 
-            // wait new stream with session_key from remote stack
-            // (wait_ropen_stream reclaims the slot on timeout internally).
-            let stream = self.wait_ropen_stream(&session_key.as_str()).await?;
+            // Race the HelloStream wait against ROpenResp. Either:
+            //  - HelloStream arrives -> success path.
+            //  - ROpenResp(0) arrives first -> peer accepted, fall through
+            //    and keep waiting for HelloStream.
+            //  - ROpenResp(non-zero) arrives -> peer rejected, abort now.
+            // (wait_ropen_stream reclaims its own slot on timeout internally.)
+            let stream = tokio::select! {
+                res = self.wait_ropen_stream(&session_key.as_str()) => {
+                    self.ropen_resp_waiters.lock().await.remove(&seq);
+                    res?
+                }
+                resp = resp_rx => {
+                    match resp {
+                        Ok(0) => {
+                            // Accepted; HelloStream is en route.
+                            self.wait_ropen_stream(&session_key.as_str()).await?
+                        }
+                        Ok(code) => {
+                            warn!(
+                                "RTcp ropen stream {} rejected by peer, result={}",
+                                real_key.as_str(),
+                                code
+                            );
+                            self.build_helper.remove_wait_stream(&real_key).await;
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionRefused,
+                                format!("peer rejected ropen, result={}", code),
+                            ));
+                        }
+                        Err(_) => {
+                            // Tunnel dropped the waiter (likely tunnel closed).
+                            self.build_helper.remove_wait_stream(&real_key).await;
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "tunnel dropped ropen resp waiter",
+                            ));
+                        }
+                    }
+                }
+            };
             let aes_stream: EncryptedStream<TcpStream> =
                 EncryptedStream::new(stream, &self.get_key(), &random_bytes);
             //info!("wait ropen stream ok,return aes stream: aes_key:{},nonce_bytes:{}",hex::encode(self.get_key()),hex::encode(random_bytes));
