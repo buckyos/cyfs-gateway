@@ -180,6 +180,14 @@ impl CommandParserFactory {
             "parse-auth",
             Arc::new(Box::new(ParseAuthorityCommandParser::new("parse-auth"))),
         );
+        self.register(
+            "parse-uri",
+            Arc::new(Box::new(ParseUriCommandParser::new())),
+        );
+        self.register(
+            "build-uri",
+            Arc::new(Box::new(BuildUriCommandParser::new())),
+        );
 
         // collection commands
         self.register(

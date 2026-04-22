@@ -542,6 +542,74 @@ Examples:
   parse-auth "user:pass@[::1]:8080"
 ```
 
+### `parse-uri`
+```
+Parse an absolute URI string into a typed Map.
+
+Usage: parse-uri <value>
+
+Arguments:
+  <value>
+          Input absolute URI string to parse
+
+Options:
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Accepts absolute URI input and parses it with `url::Url`.
+  - Returns a fresh Map with fields: `scheme`, `authority`, `host`, `port`, `effective_port`, `has_port`, `username`, `password`, `path`, `query`, `fragment`.
+  - `authority` is Null when the URI has no authority component.
+  - `host` preserves IPv6 brackets when present.
+  - `port` reflects the normalized serialized port; known default ports are omitted.
+  - `effective_port` includes known scheme defaults such as `https -> 443`.
+  - `username` is always returned as a String and may be empty.
+  - `password`, `query`, and `fragment` are Null when absent.
+  - Relative references or invalid URI syntax return error.
+
+Examples:
+  parse-uri "https://user:pass@example.com:8443/api/v1?q=1#frag"
+  parse-uri $REQ.ext.url
+```
+
+### `build-uri`
+```
+Build an absolute URI string from a typed Map.
+
+Usage: build-uri <parts>
+
+Arguments:
+  <parts>
+          Map or map literal describing the URI parts
+
+Options:
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Expects a typed Map.
+  - Supported input keys: `scheme`, `authority`, `host`, `port`, `username`, `password`, `path`, `query`, `fragment`.
+  - `authority` is used only when `host` is absent.
+  - Parsed-output helper keys `effective_port` and `has_port` are accepted and ignored.
+  - Structured authority fields (`host`, `port`, `username`, `password`) take precedence over `authority`.
+  - For `http`, `https`, `ws`, `wss`, and `ftp`, `host` or `authority` is required.
+  - Returns a normalized absolute URI string.
+  - Invalid field types or invalid URI components return error.
+
+Examples:
+  build-uri {
+    "scheme": "https",
+    "host": "example.com",
+    "path": "/oauth/login",
+    "query": "redirect_url=%2Fdashboard"
+  }
+
+  capture --value parsed $(parse-uri "https://user:pass@example.com:8443/api/v1?q=1#frag")
+  build-uri $parsed
+```
+
 ## debug
 
 ### `echo`

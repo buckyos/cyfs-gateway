@@ -546,6 +546,74 @@
   parse-auth "user:pass@[::1]:8080"
 ```
 
+### `parse-uri`
+```
+将绝对 URI 字符串解析为 typed Map。
+
+用法: parse-uri <value>
+
+参数:
+  <value>
+          要解析的绝对 URI 字符串
+
+选项:
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 接受绝对 URI 输入，并使用 `url::Url` 解析。
+  - 返回一个 fresh Map，包含字段：`scheme`、`authority`、`host`、`port`、`effective_port`、`has_port`、`username`、`password`、`path`、`query`、`fragment`。
+  - 当 URI 不包含 authority 组件时，`authority` 为 Null。
+  - 如果是 IPv6，`host` 会保留方括号形式。
+  - `port` 反映规范化后的序列化端口；已知默认端口会被省略。
+  - `effective_port` 会补上已知 scheme 的默认端口，例如 `https -> 443`。
+  - `username` 始终返回 String，可能为空字符串。
+  - `password`、`query`、`fragment` 在缺失时返回 Null。
+  - 相对引用或非法 URI 语法会返回 error。
+
+示例:
+  parse-uri "https://user:pass@example.com:8443/api/v1?q=1#frag"
+  parse-uri $REQ.ext.url
+```
+
+### `build-uri`
+```
+根据 typed Map 构造绝对 URI 字符串。
+
+用法: build-uri <parts>
+
+参数:
+  <parts>
+          描述 URI 各字段的 Map 或 map literal
+
+选项:
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 期望输入为 typed Map。
+  - 支持的输入 key：`scheme`、`authority`、`host`、`port`、`username`、`password`、`path`、`query`、`fragment`。
+  - 只有当 `host` 缺失时，才会使用 `authority`。
+  - `effective_port` 和 `has_port` 这两个 parse 输出辅助字段会被接受但忽略。
+  - 结构化 authority 字段（`host`、`port`、`username`、`password`）优先级高于 `authority`。
+  - 对于 `http`、`https`、`ws`、`wss`、`ftp`，必须提供 `host` 或 `authority`。
+  - 返回规范化后的绝对 URI 字符串。
+  - 字段类型非法或 URI 组件非法时返回 error。
+
+示例:
+  build-uri {
+    "scheme": "https",
+    "host": "example.com",
+    "path": "/oauth/login",
+    "query": "redirect_url=%2Fdashboard"
+  }
+
+  capture --value parsed $(parse-uri "https://user:pass@example.com:8443/api/v1?q=1#frag")
+  build-uri $parsed
+```
+
 ## debug 调试
 
 ### `echo`

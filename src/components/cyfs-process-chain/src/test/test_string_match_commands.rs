@@ -195,6 +195,115 @@ const PROCESS_CHAIN_PARSE_AUTHORITY_ERROR: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_PARSE_URI_RETURN: &str = r#"
+<process_chain_lib id="parse_uri_return_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                return --from lib $(parse-uri "https://user:pass@example.com:8443/api/v1?q=1#frag");
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_PARSE_URI_EFFECTIVE_PORT: &str = r#"
+<process_chain_lib id="parse_uri_effective_port_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                capture --value secure $(parse-uri "https://example.com");
+                eq $secure.scheme "https" || return --from lib "scheme_fail";
+                eq $secure.authority "example.com" || return --from lib "authority_fail";
+                eq $secure.host "example.com" || return --from lib "host_fail";
+                is-null $secure.port || return --from lib "port_fail";
+                eq $secure.effective_port 443 || return --from lib "effective_port_fail";
+                eq $secure.has_port false || return --from lib "has_port_fail";
+                eq $secure.username "" || return --from lib "username_fail";
+                is-null $secure.password || return --from lib "password_fail";
+                eq $secure.path "/" || return --from lib "path_fail";
+                is-null $secure.query || return --from lib "query_fail";
+                is-null $secure.fragment || return --from lib "fragment_fail";
+
+                capture --value hostless $(parse-uri "unix:/run/foo.socket");
+                eq $hostless.scheme "unix" || return --from lib "hostless_scheme_fail";
+                is-null $hostless.authority || return --from lib "hostless_authority_fail";
+                is-null $hostless.host || return --from lib "hostless_host_fail";
+                eq $hostless.path "/run/foo.socket" || return --from lib "hostless_path_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_BUILD_URI_SUCCESS: &str = r#"
+<process_chain_lib id="build_uri_success_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local built=$(build-uri {
+                    "scheme": "https",
+                    "host": "example.com",
+                    "username": "user",
+                    "password": "pass",
+                    "port": 8443,
+                    "path": "/api/v1",
+                    "query": "q=1",
+                    "fragment": "frag"
+                });
+                eq $built "https://user:pass@example.com:8443/api/v1?q=1#frag" || return --from lib "build_fail";
+
+                capture --value parsed $(parse-uri $built);
+                local rebuilt=$(build-uri $parsed);
+                eq $rebuilt $built || return --from lib "roundtrip_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_BUILD_URI_HOSTLESS: &str = r#"
+<process_chain_lib id="build_uri_hostless_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local built=$(build-uri {
+                    "scheme": "unix",
+                    "path": "/run/foo.socket"
+                });
+                eq $built "unix:/run/foo.socket" || return --from lib "build_hostless_fail";
+
+                capture --value parsed $(parse-uri $built);
+                eq $parsed.path "/run/foo.socket" || return --from lib "parse_hostless_path_fail";
+                is-null $parsed.host || return --from lib "parse_hostless_host_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_BUILD_URI_ERROR: &str = r#"
+<process_chain_lib id="build_uri_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                build-uri {
+                    "scheme": "https",
+                    "path": "/api/v1"
+                };
+                return --from lib "unexpected";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 const PROCESS_CHAIN_STRIP_PREFIX_DYNAMIC: &str = r#"
 <process_chain_lib id="strip_prefix_dynamic_lib" priority="100">
     <process_chain id="main">
@@ -1242,6 +1351,141 @@ async fn test_parse_authority_rejects_full_url_input() -> Result<(), String> {
         .ok_or_else(|| "parse-authority full URL should fail".to_string())?;
     assert!(
         err.contains("Invalid authority"),
+        "unexpected error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_parse_uri_returns_typed_map() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_parse_uri_return");
+    hook_point
+        .load_process_chain_lib("parse_uri_return_lib", 0, PROCESS_CHAIN_PARSE_URI_RETURN)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-parse-uri-return")?;
+    let hook_point_env = HookPointEnv::new("test-parse-uri-return", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("parse_uri_return_lib").await?;
+    let map = ret.value_ref().try_as_map()?.clone();
+
+    assert_eq!(map.get("scheme").await?.unwrap().as_str(), Some("https"));
+    assert_eq!(
+        map.get("authority").await?.unwrap().as_str(),
+        Some("user:pass@example.com:8443")
+    );
+    assert_eq!(
+        map.get("host").await?.unwrap().as_str(),
+        Some("example.com")
+    );
+    assert!(matches!(
+        map.get("port").await?.unwrap(),
+        CollectionValue::Number(NumberValue::Int(8443))
+    ));
+    assert!(matches!(
+        map.get("effective_port").await?.unwrap(),
+        CollectionValue::Number(NumberValue::Int(8443))
+    ));
+    assert_eq!(map.get("has_port").await?.unwrap().as_bool(), Some(true));
+    assert_eq!(map.get("username").await?.unwrap().as_str(), Some("user"));
+    assert_eq!(map.get("password").await?.unwrap().as_str(), Some("pass"));
+    assert_eq!(map.get("path").await?.unwrap().as_str(), Some("/api/v1"));
+    assert_eq!(map.get("query").await?.unwrap().as_str(), Some("q=1"));
+    assert_eq!(map.get("fragment").await?.unwrap().as_str(), Some("frag"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_parse_uri_supports_effective_port_and_hostless_uri() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_parse_uri_effective_port");
+    hook_point
+        .load_process_chain_lib(
+            "parse_uri_effective_port_lib",
+            0,
+            PROCESS_CHAIN_PARSE_URI_EFFECTIVE_PORT,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-parse-uri-effective-port")?;
+    let hook_point_env = HookPointEnv::new("test-parse-uri-effective-port", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("parse_uri_effective_port_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_build_uri_supports_roundtrip_from_parse_uri_map() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_build_uri_success");
+    hook_point
+        .load_process_chain_lib("build_uri_success_lib", 0, PROCESS_CHAIN_BUILD_URI_SUCCESS)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-build-uri-success")?;
+    let hook_point_env = HookPointEnv::new("test-build-uri-success", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("build_uri_success_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_build_uri_supports_hostless_path_based_uri() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_build_uri_hostless");
+    hook_point
+        .load_process_chain_lib(
+            "build_uri_hostless_lib",
+            0,
+            PROCESS_CHAIN_BUILD_URI_HOSTLESS,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-build-uri-hostless")?;
+    let hook_point_env = HookPointEnv::new("test-build-uri-hostless", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("build_uri_hostless_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_build_uri_rejects_missing_authority_for_special_scheme() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_build_uri_error");
+    hook_point
+        .load_process_chain_lib("build_uri_error_lib", 0, PROCESS_CHAIN_BUILD_URI_ERROR)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-build-uri-error")?;
+    let hook_point_env = HookPointEnv::new("test-build-uri-error", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = exec
+        .execute_lib("build_uri_error_lib")
+        .await
+        .err()
+        .ok_or_else(|| "build-uri without host on https should fail".to_string())?;
+    assert!(
+        err.contains("requires host or authority"),
         "unexpected error: {}",
         err
     );
