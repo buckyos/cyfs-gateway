@@ -659,6 +659,84 @@ Examples:
   slice $REQ.url 0:10
 ```
 
+### `strip-prefix`
+```
+Strip a prefix from a string and return the remaining tail.
+
+Usage: strip-prefix [OPTIONS] <value> <prefix>
+
+Arguments:
+  <value>
+          Input string to strip
+
+  <prefix>
+          Prefix to remove
+
+Options:
+  -i, --ignore-case
+          Perform case-insensitive comparison
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>      The full input string or variable.
+  <prefix>     The prefix to remove.
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - If <value> starts with <prefix>, returns success with the remaining tail.
+  - If <value> equals <prefix>, returns success with an empty string.
+  - Comparison is case-sensitive by default.
+  - If <value> does not start with <prefix>, returns error and leaves the value unchanged.
+  - Does not modify any variable or environment.
+
+Examples:
+  strip-prefix "/api/v1/users" "/api"
+  strip-prefix --ignore-case "/API/v1/users" "/api"
+  strip-prefix $REQ.url $route_prefix
+```
+
+### `strip-suffix`
+```
+Strip a suffix from a string and return the remaining head.
+
+Usage: strip-suffix [OPTIONS] <value> <suffix>
+
+Arguments:
+  <value>
+          Input string to strip
+
+  <suffix>
+          Suffix to remove
+
+Options:
+  -i, --ignore-case
+          Perform case-insensitive comparison
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>      The full input string or variable.
+  <suffix>     The suffix to remove.
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - If <value> ends with <suffix>, returns success with the remaining head.
+  - If <value> equals <suffix>, returns success with an empty string.
+  - Comparison is case-sensitive by default.
+  - If <value> does not end with <suffix>, returns error and leaves the value unchanged.
+  - Does not modify any variable or environment.
+
+Examples:
+  strip-suffix "/api/v1/users" "/users"
+  strip-suffix --ignore-case "/api/v1/USERS" "/users"
+  strip-suffix $REQ.host $zone_suffix
+```
+
 ### `starts-with`
 ```
 Check if a string starts with the given prefix.

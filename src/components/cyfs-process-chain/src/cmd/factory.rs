@@ -154,6 +154,10 @@ impl CommandParserFactory {
             Arc::new(Box::new(StringStripPrefixCommandParser::new())),
         );
         self.register(
+            "strip-suffix",
+            Arc::new(Box::new(StringStripSuffixCommandParser::new())),
+        );
+        self.register(
             "ends-with",
             Arc::new(Box::new(StringEndsWithCommandParser::new())),
         );

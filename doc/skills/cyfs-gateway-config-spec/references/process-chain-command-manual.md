@@ -169,6 +169,8 @@ range $REQ.target.port 1000 2000 && accept;
 | `replace` | `replace [-i|--ignore-case] <$var> <match> <replacement>` | 替换变量值中的子串；会回写原变量 |
 | `append` | `append <a> <b> [more...]` | 直接拼接多个参数并返回新字符串 |
 | `slice` | `slice <string> <start:end>` | 按字节区间切片；要求 UTF-8 边界合法 |
+| `strip-prefix` | `strip-prefix [-i|--ignore-case] <value> <prefix>` | 去掉前缀并返回剩余 tail；不修改原变量 |
+| `strip-suffix` | `strip-suffix [-i|--ignore-case] <value> <suffix>` | 去掉后缀并返回剩余 head；不修改原变量 |
 | `strlen` | `strlen <string>` | 返回字符串长度；当前实现按字节数计算 |
 | `starts-with` | `starts-with [-i|--ignore-case] <string> <prefix>` | 前缀判断 |
 | `ends-with` | `ends-with [-i|--ignore-case] <string> <suffix>` | 后缀判断 |
@@ -184,6 +186,10 @@ range $REQ.target.port 1000 2000 && accept;
   - pattern 中的捕获名必须唯一
 - `rewrite-reg` 的 canonical 名是 `rewrite-reg`；不要写成 `rewrite_reg`。
 - `replace` / `rewrite` / `rewrite-path` / `rewrite-host` / `rewrite-reg` 都会修改原变量。
+- `strip-prefix` / `strip-suffix` 只返回裁剪结果，不会回写原变量：
+  - 匹配成功时返回 success 和剩余字符串
+  - 完全相等时返回空字符串
+  - 未命中时返回 error
 - `append` 只返回结果，不会自动写回变量；需要配合赋值：
 
 ```txt
@@ -193,6 +199,8 @@ rewrite-path $REQ.path "/kapi/{service}/**" "/api/{service}/**"
 rewrite-host $REQ.host "{app}.${THIS_ZONE_HOST}" "{app}-internal.${THIS_ZONE_HOST}"
 rewrite-reg $REQ.url "^/test/(\\w+)(?:/(\\d+))?" "/new/$1/$2"
 replace -i $REQ.host ".internal" ".svc"
+local tail=$(strip-prefix $REQ.path "/api")
+local head=$(strip-suffix $REQ.host ".example.com")
 slice $REQ.path 0:10
 strlen $REQ.path
 starts-with $REQ.path "/api/"
@@ -462,7 +470,7 @@ call global::geo_lookup $REQ_real_remote_ip
 - 控制流：`goto` `exec` `invoke` `return` `error` `exit` `break` `accept` `reject` `drop`
 - 变量：赋值语法、`delete` `type` `to-bool` `to-number` `is-null` `is-bool` `is-number` `capture`
 - 匹配：`match` `match-reg` `eq` `ne` `gt` `ge` `lt` `le` `range`
-- 字符串：`rewrite` `rewrite-path` `rewrite-host` `rewrite-reg` `replace` `append` `slice` `strlen` `starts-with` `ends-with` `url_encode` `url_decode`
+- 字符串：`rewrite` `rewrite-path` `rewrite-host` `rewrite-reg` `replace` `append` `slice` `strip-prefix` `strip-suffix` `strlen` `starts-with` `ends-with` `url_encode` `url_decode`
 - 集合：`match-include`、所有 `list-*` / `set-*` / `map-*`
 - 聚合：`map`
 - 网关宿主扩展：`call-server` `forward` `redirect` `error` `http-probe` `https-sni-probe` `proxy-protocol-probe` `verify-jwt` `parse-cookie` `set-limit` `set-stat` `in-time-range` `num-cmp`

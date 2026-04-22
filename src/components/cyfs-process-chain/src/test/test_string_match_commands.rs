@@ -211,6 +211,72 @@ const PROCESS_CHAIN_STRIP_PREFIX_IGNORE_CASE: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_STRIP_SUFFIX_DYNAMIC: &str = r#"
+<process_chain_lib id="strip_suffix_dynamic_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local zone_suffix=".example.com";
+                local host="api.example.com";
+                local head=$(strip-suffix $host $zone_suffix);
+                eq $head "api" || return --from lib "strip_suffix_head_fail";
+
+                local exact=$(strip-suffix $zone_suffix $zone_suffix);
+                eq $exact "" || return --from lib "strip_suffix_exact_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_STRIP_SUFFIX_ERROR: &str = r#"
+<process_chain_lib id="strip_suffix_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local zone_suffix=".example.com";
+                local host="api.internal";
+
+                match-result $(strip-suffix $host $zone_suffix)
+                ok(value)
+                    return --from lib $(append "unexpected_ok:" $value);
+                err(err_value)
+                    eq $err_value "" || return --from lib "strip_suffix_err_value_fail";
+                    return --from lib "handled_error";
+                end
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_STRIP_SUFFIX_IGNORE_CASE: &str = r#"
+<process_chain_lib id="strip_suffix_ignore_case_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local zone_suffix=".example.com";
+                local host="Api.Example.Com";
+
+                match-result $(strip-suffix $host $zone_suffix)
+                ok(value)
+                    return --from lib $(append "unexpected_sensitive_ok:" $value);
+                err(err_value)
+                    eq $err_value "" || return --from lib "strip_suffix_sensitive_err_value_fail";
+                end
+
+                local head=$(strip-suffix --ignore-case $host $zone_suffix);
+                eq $head "Api" || return --from lib "strip_suffix_ignore_case_head_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 const PROCESS_CHAIN_SPLIT_BASIC: &str = r#"
 <process_chain_lib id="split_basic_lib" priority="100">
     <process_chain id="main">
@@ -799,6 +865,75 @@ async fn test_strip_prefix_ignore_case_is_opt_in() -> Result<(), String> {
 
     let exec = hook_point_env.link_hook_point(&hook_point).await?;
     let ret = exec.execute_lib("strip_prefix_ignore_case_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_strip_suffix_supports_dynamic_suffix_and_exact_match() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_strip_suffix_dynamic");
+    hook_point
+        .load_process_chain_lib(
+            "strip_suffix_dynamic_lib",
+            0,
+            PROCESS_CHAIN_STRIP_SUFFIX_DYNAMIC,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-strip-suffix-dynamic")?;
+    let hook_point_env = HookPointEnv::new("test-strip-suffix-dynamic", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("strip_suffix_dynamic_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_strip_suffix_returns_error_when_suffix_does_not_match() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_strip_suffix_error");
+    hook_point
+        .load_process_chain_lib(
+            "strip_suffix_error_lib",
+            0,
+            PROCESS_CHAIN_STRIP_SUFFIX_ERROR,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-strip-suffix-error")?;
+    let hook_point_env = HookPointEnv::new("test-strip-suffix-error", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("strip_suffix_error_lib").await?;
+    assert_eq!(ret.value(), "handled_error");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_strip_suffix_ignore_case_is_opt_in() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_strip_suffix_ignore_case");
+    hook_point
+        .load_process_chain_lib(
+            "strip_suffix_ignore_case_lib",
+            0,
+            PROCESS_CHAIN_STRIP_SUFFIX_IGNORE_CASE,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-strip-suffix-ignore-case")?;
+    let hook_point_env = HookPointEnv::new("test-strip-suffix-ignore-case", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("strip_suffix_ignore_case_lib").await?;
     assert_eq!(ret.value(), "ok");
 
     Ok(())

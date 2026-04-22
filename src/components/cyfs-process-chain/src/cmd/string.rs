@@ -2061,6 +2061,164 @@ impl CommandExecutor for StringStripPrefixCommand {
     }
 }
 
+// strip-suffix <value> <suffix>
+// This command removes a dynamic suffix from a string and returns the remaining head.
+pub struct StringStripSuffixCommandParser {
+    cmd: Command,
+}
+
+impl StringStripSuffixCommandParser {
+    fn strip_suffix_ignore_case<'a>(value: &'a str, suffix: &str) -> Option<&'a str> {
+        if !value.to_lowercase().ends_with(&suffix.to_lowercase()) {
+            return None;
+        }
+
+        let suffix_char_count = suffix.chars().count();
+        let value_char_count = value.chars().count();
+        let split_char_index = value_char_count.saturating_sub(suffix_char_count);
+        let split_index = value
+            .char_indices()
+            .nth(split_char_index)
+            .map(|(index, _)| index)
+            .unwrap_or(value.len());
+        value.get(..split_index)
+    }
+
+    pub fn new() -> Self {
+        let cmd = Command::new("strip-suffix")
+            .about("Strip a suffix from a string and return the remaining head.")
+            .after_help(
+                r#"
+Arguments:
+  <value>      The full input string or variable.
+  <suffix>     The suffix to remove.
+
+Options:
+  --ignore-case,-i   Perform case-insensitive comparison
+
+Behavior:
+  - Both arguments are evaluated dynamically at runtime.
+  - If <value> ends with <suffix>, returns success with the remaining head.
+  - If <value> equals <suffix>, returns success with an empty string.
+  - Comparison is case-sensitive by default.
+  - If <value> does not end with <suffix>, returns error and leaves the value unchanged.
+  - Does not modify any variable or environment.
+
+Examples:
+  strip-suffix "/api/v1/users" "/users"
+  strip-suffix --ignore-case "/api/v1/USERS" "/users"
+  strip-suffix $REQ.host $zone_suffix
+"#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .short('i')
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-insensitive comparison"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("Input string to strip"),
+            )
+            .arg(Arg::new("suffix").required(true).help("Suffix to remove"));
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for StringStripSuffixCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid strip-suffix command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let ignore_case = matches.get_flag("ignore_case");
+
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = format!("Value is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        let suffix_index = matches.index_of("suffix").ok_or_else(|| {
+            let msg = format!("Suffix is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let suffix = args[suffix_index].clone();
+
+        let cmd = StringStripSuffixCommand::new(value, suffix, ignore_case);
+
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct StringStripSuffixCommand {
+    ignore_case: bool,
+    value: CommandArg,
+    suffix: CommandArg,
+}
+
+impl StringStripSuffixCommand {
+    pub fn new(value: CommandArg, suffix: CommandArg, ignore_case: bool) -> Self {
+        Self {
+            ignore_case,
+            value,
+            suffix,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for StringStripSuffixCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let value = self.value.evaluate_string(context).await?;
+        let suffix = self.suffix.evaluate_string(context).await?;
+
+        let head = if self.ignore_case {
+            StringStripSuffixCommandParser::strip_suffix_ignore_case(&value, &suffix)
+        } else {
+            value.strip_suffix(suffix.as_str())
+        };
+
+        if let Some(head) = head {
+            info!(
+                "strip-suffix matched value='{}' suffix='{}' ignore_case={} head='{}'",
+                value, suffix, self.ignore_case, head
+            );
+            Ok(super::CommandResult::success_with_string(head))
+        } else {
+            debug!(
+                "strip-suffix not-matched value='{}' suffix='{}' ignore_case={}",
+                value, suffix, self.ignore_case
+            );
+            Ok(super::CommandResult::error())
+        }
+    }
+}
+
 // ends-with <string> <suffix>
 // This command checks if a string ends with a given suffix
 pub struct StringEndsWithCommandParser {

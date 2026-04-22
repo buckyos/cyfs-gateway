@@ -444,6 +444,45 @@
   strip-prefix $REQ.url $route_prefix
 ```
 
+### `strip-suffix`
+```
+移除字符串后缀并返回剩余 head。
+
+用法: strip-suffix [OPTIONS] <value> <suffix>
+
+参数:
+  <value>
+          要处理的输入字符串
+
+  <suffix>
+          要移除的后缀
+
+选项:
+  -i, --ignore-case
+          执行大小写不敏感比较
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <value>      完整输入字符串或变量。
+  <suffix>     要移除的后缀。
+
+行为:
+  - 两个参数都在运行时动态求值。
+  - 如果 <value> 以 <suffix> 结尾，则 success 返回剩余 head。
+  - 如果 <value> 与 <suffix> 完全相等，则 success 返回空字符串。
+  - 默认区分大小写。
+  - 如果 <value> 不以 <suffix> 结尾，则返回 error，且原值不变。
+  - 不会修改任何变量或环境。
+
+示例:
+  strip-suffix "/api/v1/users" "/users"
+  strip-suffix --ignore-case "/api/v1/USERS" "/users"
+  strip-suffix $REQ.host $zone_suffix
+```
+
 ### `strlen`
 ```
 返回字符串长度。
