@@ -2,9 +2,10 @@ use super::cmd::*;
 use super::template::TemplateMatcher;
 use crate::block::{CommandArg, CommandArgEvaluator, CommandArgs};
 use crate::chain::{Context, ParserContext};
-use crate::collection::{CollectionValue, MemoryListCollection, NumberValue};
+use crate::collection::{CollectionValue, MemoryListCollection, MemoryMapCollection, NumberValue};
 use clap::{Arg, ArgAction, Command};
 use globset::{GlobBuilder, GlobMatcher};
+use http::uri::Authority;
 use regex::Regex;
 use std::sync::Arc;
 
@@ -1268,6 +1269,217 @@ impl CommandExecutor for UrlDecodeCommand {
         let string_value = self.string.evaluate_string(context).await?;
         let decoded = percent_decode_url_component(&string_value)?;
         Ok(super::CommandResult::success_with_string(decoded))
+    }
+}
+
+pub struct ParseAuthorityCommandParser {
+    cmd: Command,
+}
+
+impl ParseAuthorityCommandParser {
+    pub fn new(name: &'static str) -> Self {
+        let cmd = Command::new(name)
+            .about("Parse an authority string into a typed Map.")
+            .after_help(
+                r#"
+Arguments:
+  <value>     The authority-like string or variable to parse.
+
+Options:
+  --default-port <port>   Default port to use when the input has no explicit port
+
+Behavior:
+  - Accepts authority-like input such as `example.com`, `example.com:3180`, `user:pass@[::1]:8080`.
+  - Returns a fresh Map with fields: `host`, `port`, `has_port`, `userinfo`.
+  - `host` preserves IPv6 brackets when present.
+  - `port` is Number when present or defaulted, otherwise Null.
+  - `has_port` is true only when the input explicitly contains a port.
+  - `userinfo` is returned as raw text before `@`, without percent-decoding.
+  - Full URLs such as `https://example.com/path` are not accepted.
+  - Returns error for invalid authority syntax or invalid default port.
+
+Examples:
+  parse-authority $REQ.host
+  parse-authority --default-port 3180 $REQ.host
+  parse-auth "user:pass@[::1]:8080"
+"#,
+            )
+            .arg(
+                Arg::new("default_port")
+                    .long("default-port")
+                    .value_name("port")
+                    .help("Default port to use when the input has no explicit port"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("Input authority-like string to parse"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for ParseAuthorityCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::String
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!(
+                    "Invalid {} command: {:?}, {}",
+                    self.cmd.get_name(),
+                    str_args,
+                    e
+                );
+                error!("{}", msg);
+                msg
+            })?;
+
+        let default_port = matches
+            .index_of("default_port")
+            .map(|index| args[index].clone());
+
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = format!("Value is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        Ok(Arc::new(Box::new(ParseAuthorityCommand::new(
+            value,
+            default_port,
+        ))))
+    }
+}
+
+pub struct ParseAuthorityCommand {
+    value: CommandArg,
+    default_port: Option<CommandArg>,
+}
+
+impl ParseAuthorityCommand {
+    pub fn new(value: CommandArg, default_port: Option<CommandArg>) -> Self {
+        Self {
+            value,
+            default_port,
+        }
+    }
+
+    fn parse_port_arg(field: &str, value: &CollectionValue) -> Result<u16, String> {
+        match value {
+            CollectionValue::String(raw) => raw.parse::<u16>().map_err(|e| {
+                let msg = format!("Invalid {} '{}': {}", field, raw, e);
+                error!("{}", msg);
+                msg
+            }),
+            CollectionValue::Number(NumberValue::Int(port)) => u16::try_from(*port).map_err(|_| {
+                let msg = format!("Invalid {} '{}': expected 0..=65535", field, port);
+                error!("{}", msg);
+                msg
+            }),
+            CollectionValue::Number(NumberValue::Float(port)) => {
+                let msg = format!(
+                    "Invalid {} '{}': floating-point values are not supported",
+                    field, port
+                );
+                error!("{}", msg);
+                Err(msg)
+            }
+            _ => {
+                let msg = format!(
+                    "Invalid {} type '{}': expected String or integer Number",
+                    field,
+                    value.get_type()
+                );
+                error!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+
+    async fn evaluate_default_port(&self, context: &Context) -> Result<Option<u16>, String> {
+        let Some(default_port) = self.default_port.as_ref() else {
+            return Ok(None);
+        };
+
+        let value = default_port.evaluate(context).await?;
+        Ok(Some(Self::parse_port_arg("default port", &value)?))
+    }
+
+    fn userinfo_from_raw(raw: &str) -> Option<&str> {
+        raw.rsplit_once('@').map(|(userinfo, _)| userinfo)
+    }
+
+    async fn build_map(
+        authority: &Authority,
+        has_port: bool,
+        default_port: Option<u16>,
+    ) -> Result<CollectionValue, String> {
+        let map = MemoryMapCollection::new_ref();
+        map.insert(
+            "host",
+            CollectionValue::String(authority.host().to_string()),
+        )
+        .await?;
+
+        let port_value = if let Some(port) = authority.port_u16().or(default_port) {
+            CollectionValue::Number(NumberValue::Int(port as i64))
+        } else {
+            CollectionValue::Null
+        };
+        map.insert("port", port_value).await?;
+        map.insert("has_port", CollectionValue::Bool(has_port))
+            .await?;
+
+        let userinfo = Self::userinfo_from_raw(authority.as_str())
+            .map(|value| CollectionValue::String(value.to_string()))
+            .unwrap_or(CollectionValue::Null);
+        map.insert("userinfo", userinfo).await?;
+
+        Ok(CollectionValue::Map(map))
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for ParseAuthorityCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let value = self.value.evaluate_string(context).await?;
+        let default_port = self.evaluate_default_port(context).await?;
+
+        let authority = Authority::from_maybe_shared(value.clone()).map_err(|e| {
+            let msg = format!("Invalid authority '{}': {}", value, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let has_port = authority.port().is_some();
+        info!(
+            "parse-authority parsed raw='{}' host='{}' has_port={} default_port={:?}",
+            value,
+            authority.host(),
+            has_port,
+            default_port
+        );
+
+        Ok(super::CommandResult::success_with_value(
+            Self::build_map(&authority, has_port, default_port).await?,
+        ))
     }
 }
 

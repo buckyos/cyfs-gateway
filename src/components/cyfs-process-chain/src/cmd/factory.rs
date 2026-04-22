@@ -170,6 +170,16 @@ impl CommandParserFactory {
             "url_decode",
             Arc::new(Box::new(UrlDecodeCommandParser::new())),
         );
+        self.register(
+            "parse-authority",
+            Arc::new(Box::new(ParseAuthorityCommandParser::new(
+                "parse-authority",
+            ))),
+        );
+        self.register(
+            "parse-auth",
+            Arc::new(Box::new(ParseAuthorityCommandParser::new("parse-auth"))),
+        );
 
         // collection commands
         self.register(

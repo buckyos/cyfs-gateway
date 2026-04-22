@@ -145,6 +145,56 @@ const PROCESS_CHAIN_SLICE_PARSE_ERROR: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_PARSE_AUTHORITY_RETURN: &str = r#"
+<process_chain_lib id="parse_authority_return_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                return --from lib $(parse-authority "user:pass@[::1]:8080");
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_PARSE_AUTHORITY_DEFAULT_PORT: &str = r#"
+<process_chain_lib id="parse_authority_default_port_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local fallback_port=3180;
+
+                capture --value auth $(parse-auth --default-port $fallback_port "service.internal");
+                eq $auth.host "service.internal" || return --from lib "default_host_fail";
+                eq $auth.port 3180 || return --from lib "default_port_fail";
+                eq $auth.has_port false || return --from lib "default_has_port_fail";
+                is-null $auth.userinfo || return --from lib "default_userinfo_fail";
+
+                capture --value auth2 $(parse-authority --default-port 3180 "api.example.com:8443");
+                eq $auth2.host "api.example.com" || return --from lib "explicit_host_fail";
+                eq $auth2.port 8443 || return --from lib "explicit_port_fail";
+                eq $auth2.has_port true || return --from lib "explicit_has_port_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_PARSE_AUTHORITY_ERROR: &str = r#"
+<process_chain_lib id="parse_authority_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                parse-authority "https://example.com/path";
+                return --from lib "unexpected";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 const PROCESS_CHAIN_STRIP_PREFIX_DYNAMIC: &str = r#"
 <process_chain_lib id="strip_prefix_dynamic_lib" priority="100">
     <process_chain id="main">
@@ -1104,6 +1154,94 @@ async fn test_url_decode_rejects_incomplete_escape_sequence() -> Result<(), Stri
         .ok_or_else(|| "url_decode invalid escape should fail".to_string())?;
     assert!(
         err.contains("Incomplete percent-encoded sequence"),
+        "unexpected error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_parse_authority_returns_typed_map_and_preserves_fields() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_parse_authority_return");
+    hook_point
+        .load_process_chain_lib(
+            "parse_authority_return_lib",
+            0,
+            PROCESS_CHAIN_PARSE_AUTHORITY_RETURN,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-parse-authority-return")?;
+    let hook_point_env = HookPointEnv::new("test-parse-authority-return", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("parse_authority_return_lib").await?;
+    let map = ret.value_ref().try_as_map()?.clone();
+
+    assert_eq!(map.get("host").await?.unwrap().as_str(), Some("[::1]"));
+    assert!(matches!(
+        map.get("port").await?.unwrap(),
+        CollectionValue::Number(NumberValue::Int(8080))
+    ));
+    assert_eq!(map.get("has_port").await?.unwrap().as_bool(), Some(true));
+    assert_eq!(
+        map.get("userinfo").await?.unwrap().as_str(),
+        Some("user:pass")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_parse_authority_alias_and_default_port_support() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_parse_authority_default_port");
+    hook_point
+        .load_process_chain_lib(
+            "parse_authority_default_port_lib",
+            0,
+            PROCESS_CHAIN_PARSE_AUTHORITY_DEFAULT_PORT,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-parse-authority-default-port")?;
+    let hook_point_env = HookPointEnv::new("test-parse-authority-default-port", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("parse_authority_default_port_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_parse_authority_rejects_full_url_input() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_parse_authority_error");
+    hook_point
+        .load_process_chain_lib(
+            "parse_authority_error_lib",
+            0,
+            PROCESS_CHAIN_PARSE_AUTHORITY_ERROR,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-parse-authority-error")?;
+    let hook_point_env = HookPointEnv::new("test-parse-authority-error", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = exec
+        .execute_lib("parse_authority_error_lib")
+        .await
+        .err()
+        .ok_or_else(|| "parse-authority full URL should fail".to_string())?;
+    assert!(
+        err.contains("Invalid authority"),
         "unexpected error: {}",
         err
     );

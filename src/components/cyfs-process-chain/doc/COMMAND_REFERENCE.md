@@ -507,6 +507,41 @@ Examples:
   strlen $REQ.path
 ```
 
+### `parse-authority` / `parse-auth`
+```
+Parse an authority string into a typed Map.
+
+Usage: parse-authority [OPTIONS] <value>
+       parse-auth [OPTIONS] <value>
+
+Arguments:
+  <value>
+          Input authority-like string to parse
+
+Options:
+      --default-port <port>
+          Default port to use when the input has no explicit port
+
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Accepts authority-like input such as `example.com`, `example.com:3180`, `user:pass@[::1]:8080`.
+  - Returns a fresh Map with fields: `host`, `port`, `has_port`, `userinfo`.
+  - `host` preserves IPv6 brackets when present.
+  - `port` is Number when present or defaulted, otherwise Null.
+  - `has_port` is true only when the input explicitly contains a port.
+  - `userinfo` is returned as raw text before `@`, without percent-decoding.
+  - Full URLs such as `https://example.com/path` are not accepted.
+  - Returns error for invalid authority syntax or invalid default port.
+
+Examples:
+  parse-authority $REQ.host
+  parse-authority --default-port 3180 $REQ.host
+  parse-auth "user:pass@[::1]:8080"
+```
+
 ## debug
 
 ### `echo`

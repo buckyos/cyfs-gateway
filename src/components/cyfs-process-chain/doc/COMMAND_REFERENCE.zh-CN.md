@@ -511,6 +511,41 @@
   strlen $REQ.path
 ```
 
+### `parse-authority` / `parse-auth`
+```
+将 authority 字符串解析为 typed Map。
+
+用法: parse-authority [OPTIONS] <value>
+     parse-auth [OPTIONS] <value>
+
+参数:
+  <value>
+          要解析的 authority 风格输入字符串
+
+选项:
+      --default-port <port>
+          当输入中没有显式端口时使用的默认端口
+
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 接受 authority 风格输入，例如 `example.com`、`example.com:3180`、`user:pass@[::1]:8080`。
+  - 返回一个 fresh Map，包含字段：`host`、`port`、`has_port`、`userinfo`。
+  - 如果是 IPv6，`host` 会保留方括号形式。
+  - `port` 在存在显式端口或命中默认端口时返回 Number，否则返回 Null。
+  - `has_port` 仅在输入中显式带端口时为 true。
+  - `userinfo` 返回 `@` 之前的原始文本，不做 percent-decoding。
+  - 不接受 `https://example.com/path` 这类完整 URL。
+  - authority 语法非法，或默认端口非法时返回 error。
+
+示例:
+  parse-authority $REQ.host
+  parse-authority --default-port 3180 $REQ.host
+  parse-auth "user:pass@[::1]:8080"
+```
+
 ## debug 调试
 
 ### `echo`
