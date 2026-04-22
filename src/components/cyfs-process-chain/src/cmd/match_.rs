@@ -1,7 +1,7 @@
 use super::cmd::*;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
-use crate::collection::CollectionValue;
+use crate::collection::{CollectionValue, MemoryListCollection};
 use clap::{Arg, ArgAction, Command};
 use globset::{GlobBuilder, GlobMatcher};
 use regex::{Regex, RegexBuilder};
@@ -154,7 +154,7 @@ impl CommandExecutor for MatchCommandExecutor {
 }
 
 // Match regex command, like: match-reg REQ_HEADER.host "^(.*)\.local$"
-// If capture is provided, it will capture the matched groups into the environment with name `name[i]`
+// If capture is provided, it stores match results in a fresh List accessible by `name[i]`
 /*
 * match-reg some_input "^pattern$"
 * match-reg --capture name some_input "^pattern$"
@@ -174,16 +174,17 @@ Arguments:
   <pattern>    The regular expression to match against.
 
 Options:
-  --capture name   Save regex match results into environment variables like name[0], name[1], ...
+  --capture name   Store regex match results into a fresh List variable accessible as name[0], name[1], ...
   --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
 
 Behavior:
   - Uses Rust-style regular expressions.
   - If the pattern matches, the command returns success, otherwise it returns error.
-  - If --capture is provided, match results are saved into environment as:
+  - If --capture is provided, match results are saved into a fresh List as:
       name[0] is the full matched text,
       name[1] is the first capture group,
       name[2] is the second capture group, etc.
+  - Unmatched optional capture groups are stored as Null to preserve indexes.
   - Default behavior is case-insensitive matching.
 
 Examples:
@@ -201,7 +202,7 @@ Examples:
                 Arg::new("capture")
                     .long("capture")
                     .value_name("name")
-                    .help("Name to use when storing regex captures into the environment"),
+                    .help("Store regex match results into a fresh List variable"),
             )
             .arg(
                 Arg::new("value")
@@ -294,7 +295,7 @@ impl CommandParser for MatchRegexCommandParser {
 
 // Match regex command executer
 pub struct MatchRegexCommandExecutor {
-    pub capture: Option<String>, // Optional capture group name
+    pub capture: Option<String>, // Optional capture result list variable name
     pub value: CommandArg,
     pub pattern: Regex,
 }
@@ -307,6 +308,18 @@ impl MatchRegexCommandExecutor {
             capture,
         }
     }
+
+    async fn build_capture_list(caps: &regex::Captures<'_>) -> Result<CollectionValue, String> {
+        let list = MemoryListCollection::new_ref();
+        for cap in caps.iter() {
+            let value = cap
+                .map(|m| CollectionValue::String(m.as_str().to_owned()))
+                .unwrap_or(CollectionValue::Null);
+            list.push(value).await?;
+        }
+
+        Ok(CollectionValue::List(list))
+    }
 }
 
 #[async_trait::async_trait]
@@ -318,19 +331,9 @@ impl CommandExecutor for MatchRegexCommandExecutor {
         // Match the value
         if let Some(caps) = self.pattern.captures(&value) {
             if let Some(name) = &self.capture {
-                for (i, cap) in caps.iter().enumerate() {
-                    if let Some(m) = cap {
-                        // TODO: Add env level support, such as --capture export/local name
-                        context
-                            .env()
-                            .set(
-                                format!("{}[{}]", name, i).as_str(),
-                                CollectionValue::String(m.as_str().to_owned()),
-                                None,
-                            )
-                            .await?;
-                    }
-                }
+                let capture_list = Self::build_capture_list(&caps).await?;
+                // TODO: Add env level support, such as --capture export/local name
+                context.env().set(name, capture_list, None).await?;
             }
 
             Ok(CommandResult::success_with_value(CollectionValue::Bool(

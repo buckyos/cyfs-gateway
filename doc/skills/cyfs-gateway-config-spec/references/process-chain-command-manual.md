@@ -114,7 +114,7 @@ delete --block tmp_value
 | 命令 | 规范语法 | 说明 |
 | --- | --- | --- |
 | `match` | `match [--no-ignore-case] <value> <glob>` | glob 匹配，默认大小写不敏感 |
-| `match-reg` | `match-reg [--capture name] [--no-ignore-case] <value> <regex>` | 正则匹配；可把匹配结果写回 `name[0]`、`name[1]`... |
+| `match-reg` | `match-reg [--capture name] [--no-ignore-case] <value> <regex>` | 正则匹配；可把匹配结果写入一个新的 List，并通过 `name[0]`、`name[1]`... 访问 |
 | `eq` | `eq [--ignore-case] [--loose] <left> <right>` | 相等比较；默认强类型比较 |
 | `ne` | `ne [--ignore-case] [--loose] <left> <right>` | 不等比较 |
 | `gt` | `gt [--loose] <left> <right>` | 数值大于 |
@@ -127,9 +127,11 @@ delete --block tmp_value
 
 - `match` 用 glob，不是正则。
 - `match-reg` 用 Rust regex；`--capture name` 会写环境变量：
+  - 会创建一个新的 List 变量
   - `name[0]` 是完整匹配文本
   - `name[1]` 是第一个捕获组
   - `name[2]` 是第二个捕获组，以此类推
+  - 未命中的可选捕获组会写成 `Null`，以保持索引稳定
 - `eq` / `ne`：
   - 默认强类型比较
   - `--ignore-case` 只对字符串比较有意义

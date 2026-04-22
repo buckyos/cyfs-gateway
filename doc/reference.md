@@ -975,7 +975,7 @@ Options:
           Perform case-sensitive matching (default is case-insensitive)
 
       --capture <name>
-          Name to use when storing regex captures into the environment
+          Store regex match results into a fresh List variable
 
   -h, --help
           Print help
@@ -986,16 +986,17 @@ Arguments:
   <pattern>    The regular expression to match against.
 
 Options:
-  --capture name   Save regex match results into environment variables like name[0], name[1], ...
+  --capture name   Store regex match results into a fresh List variable accessible as name[0], name[1], ...
   --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
 
 Behavior:
   - Uses Rust-style regular expressions.
   - If the pattern matches, the command returns success, otherwise it returns error.
-  - If --capture is provided, match results are saved into environment as:
+  - If --capture is provided, match results are saved into a fresh List as:
       name[0] is the full matched text,
       name[1] is the first capture group,
       name[2] is the second capture group, etc.
+  - Unmatched optional capture groups are stored as Null to preserve indexes.
   - Default behavior is case-insensitive matching.
 
 Examples:

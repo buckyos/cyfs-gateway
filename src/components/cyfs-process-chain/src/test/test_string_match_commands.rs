@@ -360,12 +360,12 @@ const PROCESS_CHAIN_MATCH_REGEX_CAPTURE_SUCCESS: &str = r#"
     <process_chain id="main">
         <block id="entry">
             <![CDATA[
-                map-create --block cap;
                 local input="AbC-123";
                 match-reg --capture cap $input "^([a-z]+)-([0-9]+)\$" || return --from lib "capture_fail";
-                eq $cap[0] "AbC-123" || return --from lib "capture_0_fail";
-                eq $cap[1] "AbC" || return --from lib "capture_1_fail";
-                eq $cap[2] "123" || return --from lib "capture_2_fail";
+                eq $(list-remove $cap 0) "AbC-123" || return --from lib "capture_0_fail";
+                eq $(list-remove $cap 0) "AbC" || return --from lib "capture_1_fail";
+                eq $(list-remove $cap 0) "123" || return --from lib "capture_2_fail";
+                list-pop $cap && return --from lib "capture_tail_should_be_empty";
                 return --from lib "ok";
             ]]>
         </block>
@@ -373,14 +373,28 @@ const PROCESS_CHAIN_MATCH_REGEX_CAPTURE_SUCCESS: &str = r#"
 </process_chain_lib>
 "#;
 
-const PROCESS_CHAIN_MATCH_REGEX_CAPTURE_REQUIRES_MAP: &str = r#"
-<process_chain_lib id="match_regex_capture_requires_map_lib" priority="100">
+const PROCESS_CHAIN_MATCH_REGEX_CAPTURE_FRESH_LIST: &str = r#"
+<process_chain_lib id="match_regex_capture_fresh_list_lib" priority="100">
     <process_chain id="main">
         <block id="entry">
             <![CDATA[
-                local input="abc-123";
-                match-reg --capture cap $input "^([a-z]+)-([0-9]+)\$";
-                return --from lib "unexpected";
+                local extended="abc-123-def";
+                match-reg --capture cap $extended "^([a-z]+)-([0-9]+)-([a-z]+)\$" || return --from lib "extended_capture_fail";
+                eq $cap[0] "abc-123-def" || return --from lib "extended_capture_0_fail";
+                eq $cap[1] "abc" || return --from lib "extended_capture_1_fail";
+                eq $cap[2] "123" || return --from lib "extended_capture_2_fail";
+                eq $cap[3] "def" || return --from lib "extended_capture_3_fail";
+
+                local optional="svc";
+                match-reg --capture cap $optional "^([a-z]+)(?:-([0-9]+))?\$" || return --from lib "optional_capture_fail";
+                eq $cap[0] "svc" || return --from lib "optional_capture_0_fail";
+                eq $cap[1] "svc" || return --from lib "optional_capture_1_fail";
+                is-null $cap[2] || return --from lib "optional_capture_2_should_be_null";
+
+                local stale=${cap?.[3] ?? "missing"};
+                eq $stale "missing" || return --from lib "capture_stale_index_fail";
+
+                return --from lib "ok";
             ]]>
         </block>
     </process_chain>
@@ -833,7 +847,7 @@ async fn test_url_decode_rejects_incomplete_escape_sequence() -> Result<(), Stri
 }
 
 #[tokio::test]
-async fn test_match_regex_capture_populates_capture_slots() -> Result<(), String> {
+async fn test_match_regex_capture_populates_fresh_list() -> Result<(), String> {
     init_test_logger();
 
     let hook_point = HookPoint::new("test_match_regex_capture_success");
@@ -856,32 +870,26 @@ async fn test_match_regex_capture_populates_capture_slots() -> Result<(), String
 }
 
 #[tokio::test]
-async fn test_match_regex_capture_requires_target_map() -> Result<(), String> {
+async fn test_match_regex_capture_overwrites_with_fresh_list() -> Result<(), String> {
     init_test_logger();
 
-    let hook_point = HookPoint::new("test_match_regex_capture_requires_map");
+    let hook_point = HookPoint::new("test_match_regex_capture_fresh_list");
     hook_point
         .load_process_chain_lib(
-            "match_regex_capture_requires_map_lib",
+            "match_regex_capture_fresh_list_lib",
             0,
-            PROCESS_CHAIN_MATCH_REGEX_CAPTURE_REQUIRES_MAP,
+            PROCESS_CHAIN_MATCH_REGEX_CAPTURE_FRESH_LIST,
         )
         .await?;
 
-    let data_dir = new_test_data_dir("test-match-regex-capture-requires-map")?;
-    let hook_point_env = HookPointEnv::new("test-match-regex-capture-requires-map", data_dir);
+    let data_dir = new_test_data_dir("test-match-regex-capture-fresh-list")?;
+    let hook_point_env = HookPointEnv::new("test-match-regex-capture-fresh-list", data_dir);
 
     let exec = hook_point_env.link_hook_point(&hook_point).await?;
-    let err = exec
-        .execute_lib("match_regex_capture_requires_map_lib")
-        .await
-        .err()
-        .ok_or_else(|| "match-reg capture without map should fail".to_string())?;
-    assert!(
-        err.contains("please create the collection first"),
-        "unexpected error: {}",
-        err
-    );
+    let ret = exec
+        .execute_lib("match_regex_capture_fresh_list_lib")
+        .await?;
+    assert_eq!(ret.value(), "ok");
 
     Ok(())
 }
