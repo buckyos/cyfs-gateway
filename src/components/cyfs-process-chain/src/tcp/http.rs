@@ -136,6 +136,12 @@ Examples:
     }
 }
 
+impl Default for HttpProbeCommand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl ExternalCommand for HttpProbeCommand {
     fn help(&self, name: &str, help_type: CommandHelpType) -> String {

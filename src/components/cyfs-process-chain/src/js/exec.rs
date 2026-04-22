@@ -13,10 +13,10 @@ use boa_gc::Tracer;
 use boa_runtime::Console;
 use std::error::Error;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 pub struct JavaScriptExecutor {
-    context: Arc<Mutex<JsContext>>,
+    context: Mutex<JsContext>,
 }
 
 #[derive(Clone, JsData, Finalize)]
@@ -89,12 +89,12 @@ impl JavaScriptExecutor {
         ContextWrapper::register(&mut context)?;
         EnvManagerWrapper::register(&mut context)?;
 
-        let context = Arc::new(Mutex::new(context));
+        let context = Mutex::new(context);
 
         Ok(Self { context })
     }
 
-    pub fn context(&self) -> &Arc<Mutex<JsContext>> {
+    pub fn context(&self) -> &Mutex<JsContext> {
         &self.context
     }
 
@@ -121,7 +121,7 @@ impl JavaScriptExecutor {
 
 pub struct JavaScriptFunctionCaller {
     name: String,
-    caller: Arc<Mutex<JsObject>>,
+    caller: JsObject,
 }
 
 impl JavaScriptFunctionCaller {
@@ -148,12 +148,10 @@ impl JavaScriptFunctionCaller {
             msg
         })?;
 
-        let ret = Self {
+        Ok(Self {
             name: name.to_string(),
-            caller: Arc::new(Mutex::new(func.clone())),
-        };
-
-        Ok(ret)
+            caller: func.clone(),
+        })
     }
 
     pub fn load_option(name: &str, context: &mut JsContext) -> Result<Option<Self>, String> {
@@ -193,9 +191,9 @@ impl JavaScriptFunctionCaller {
 
         info!("Calling function {} with args: {:?}", self.name, js_args);
 
-        let caller = self.caller.lock().unwrap();
         // Call the function
-        let result = caller
+        let result = self
+            .caller
             .call(&JsValue::undefined(), &js_args, context)
             .map_err(|e| {
                 let msg = format!("Failed to call function {}: {:?}", self.name, e);
@@ -226,7 +224,7 @@ impl JavaScriptFunctionCaller {
         args: Vec<CollectionValue>,
     ) -> Result<CommandResult, String> {
         assert!(
-            args.len() > 0,
+            !args.is_empty(),
             "JavaScript function must have at least one argument"
         );
 
@@ -256,9 +254,9 @@ impl JavaScriptFunctionCaller {
 
         info!("Calling function {} with args: {:?}", self.name, js_args);
 
-        let caller = self.caller.lock().unwrap();
         // Call the function
-        let result = caller
+        let result = self
+            .caller
             .call(&JsValue::undefined(), &js_args, context)
             .map_err(|e| {
                 let msg = format!("Failed to call function {}: {:?}", self.name, e);
@@ -311,7 +309,7 @@ impl JavaScriptFunctionCaller {
             })?
             .as_boolean()
             .ok_or_else(|| {
-                let msg = format!("'state' is not a boolean in return object");
+                let msg = "'state' is not a boolean in return object".to_string();
                 error!("{}", msg);
                 msg
             })?;

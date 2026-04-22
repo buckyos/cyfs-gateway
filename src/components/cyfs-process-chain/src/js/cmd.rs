@@ -150,11 +150,9 @@ impl Drop for AsyncJavaScriptCommandExecutor {
 
 impl AsyncJavaScriptCommandExecutor {
     pub fn new() -> Self {
-        let ret = Self {
+        Self {
             sender: Arc::new(OnceCell::new()),
-        };
-
-        ret
+        }
     }
 
     async fn get_sender(&self) -> &AsyncRequestSenderRef {
@@ -238,10 +236,10 @@ impl AsyncJavaScriptCommandExecutor {
     }
 
     pub fn stop(&self) {
-        if let Some(sender) = self.sender.get() {
-            if let Err(e) = sender.lock().unwrap().send(AsyncRequest::Exit(())) {
-                error!("Failed to send exit request: {}", e);
-            }
+        if let Some(sender) = self.sender.get()
+            && let Err(e) = sender.lock().unwrap().send(AsyncRequest::Exit(()))
+        {
+            error!("Failed to send exit request: {}", e);
         }
     }
 
@@ -270,7 +268,7 @@ impl AsyncJavaScriptCommandExecutor {
         if contains {
             let msg = format!("Command {} already loaded", name);
             error!("{}", msg);
-            if let Err(_) = responder.send(Err(msg)) {
+            if responder.send(Err(msg)).is_err() {
                 error!("Failed to send load error for {}", name);
             }
             return;
@@ -282,14 +280,14 @@ impl AsyncJavaScriptCommandExecutor {
                     cmds.borrow_mut().insert(name.clone(), cmd);
                 });
 
-                if let Err(_) = responder.send(Ok(())) {
+                if responder.send(Ok(())).is_err() {
                     error!("Failed to send load result for {}", name);
                 } else {
                     info!("Successfully loaded js command: {}", name);
                 }
             }
             Err(e) => {
-                if let Err(_) = responder.send(Err(e)) {
+                if responder.send(Err(e)).is_err() {
                     error!("Failed to send load error for {}", name);
                 }
             }
@@ -300,7 +298,7 @@ impl AsyncJavaScriptCommandExecutor {
         COMMANDS.with(|cmds| {
             if let Some(cmd) = cmds.borrow().get(&name) {
                 let help = cmd.help(&name, help_type);
-                if let Err(_) = responder.send(help) {
+                if responder.send(help).is_err() {
                     error!("Failed to send help for {}", name);
                 }
             } else {
@@ -321,12 +319,12 @@ impl AsyncJavaScriptCommandExecutor {
             if let Some(cmd) = cmds.borrow().get(&name) {
                 match cmd.exec(env_manager, args) {
                     Ok(result) => {
-                        if let Err(_) = responder.send(Ok(result)) {
+                        if responder.send(Ok(result)).is_err() {
                             error!("Failed to send exec result for {}", name);
                         }
                     }
                     Err(e) => {
-                        if let Err(_) = responder.send(Err(e)) {
+                        if responder.send(Err(e)).is_err() {
                             error!("Failed to send exec error for {}", name);
                         }
                     }
@@ -383,7 +381,7 @@ impl ExternalCommand for AsyncJavaScriptExternalCommand {
         let rt = tokio::runtime::Handle::current();
         let (tx, rx) = oneshot::channel();
         let request = AsyncRequest::Help(name.to_string(), help_type, tx);
-        if let Ok(_) = self.sender.lock().unwrap().send(request) {
+        if self.sender.lock().unwrap().send(request).is_ok() {
             match rt.block_on(rx) {
                 Ok(help) => help,
                 Err(e) => {

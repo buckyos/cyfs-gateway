@@ -1,6 +1,5 @@
 use super::action::ActionCommandParser;
 use super::capture::CaptureCommandParser;
-use super::cmd::*;
 use super::coll::*;
 use super::control::*;
 use super::debug::EchoCommandParser;
@@ -10,6 +9,7 @@ use super::map::*;
 use super::match_::*;
 use super::string::*;
 use super::type_::*;
+use super::types::*;
 use super::uri::*;
 use super::value::*;
 use super::var::*;
@@ -23,9 +23,7 @@ pub struct CommandParserFactory {
 
 impl CommandParserFactory {
     pub fn new() -> Self {
-        Self {
-            parsers: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::default()
     }
 
     pub fn register(&self, name: &str, parser: CommandParserRef) {
@@ -268,6 +266,14 @@ impl CommandParserFactory {
         let mut parsers = self.parsers.lock().unwrap();
         info!("Clearing all command parsers {}", parsers.len());
         parsers.clear();
+    }
+}
+
+impl Default for CommandParserFactory {
+    fn default() -> Self {
+        Self {
+            parsers: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 

@@ -1,9 +1,9 @@
-use super::block::{
+use super::exec::BlockExecuter;
+use super::parser::BlockParser;
+use super::types::{
     Block, CaseStatement, CommandArg, CommandItem, Expression, ForStatement, IfStatement, Line,
     MatchResultStatement, Statement,
 };
-use super::exec::BlockExecuter;
-use super::parser::BlockParser;
 use crate::chain::{Context, MissingVarPolicy, ParserContextRef};
 use crate::cmd::CommandParserFactory;
 use crate::collection::{CollectionValue, MemoryListCollection, MemoryMapCollection};
@@ -80,10 +80,10 @@ impl BlockCommandLinker {
     }
 
     fn link_case_statement(&self, case_statement: &mut CaseStatement) -> Result<(), String> {
-        if let Some(subject) = case_statement.subject.as_mut() {
-            if let Some(exp) = subject.as_command_substitution_mut() {
-                self.link_expression(exp)?;
-            }
+        if let Some(subject) = case_statement.subject.as_mut()
+            && let Some(exp) = subject.as_command_substitution_mut()
+        {
+            self.link_expression(exp)?;
         }
 
         for branch in &mut case_statement.branches {
@@ -704,9 +704,7 @@ impl CommandArgEvaluator {
                 continue;
             }
             if ch == ']' {
-                if bracket_depth > 0 {
-                    bracket_depth -= 1;
-                }
+                bracket_depth = bracket_depth.saturating_sub(1);
                 i += ch.len_utf8();
                 continue;
             }
@@ -717,9 +715,7 @@ impl CommandArgEvaluator {
                 continue;
             }
             if ch == ')' {
-                if paren_depth > 0 {
-                    paren_depth -= 1;
-                }
+                paren_depth = paren_depth.saturating_sub(1);
                 i += ch.len_utf8();
                 continue;
             }

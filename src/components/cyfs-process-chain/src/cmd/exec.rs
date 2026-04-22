@@ -1,4 +1,4 @@
-use super::cmd::*;
+use super::types::*;
 use crate::ProcessChainExecutor;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{
@@ -506,7 +506,7 @@ pub(crate) fn parse_invoke_args(
         return Ok(Vec::new());
     }
 
-    if indices.len() % 2 != 0 {
+    if !indices.len().is_multiple_of(2) {
         let msg = format!(
             "Invalid invoke command: --arg expects key/value pairs, got {} values",
             indices.len()

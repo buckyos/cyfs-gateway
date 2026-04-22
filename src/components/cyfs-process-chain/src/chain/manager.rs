@@ -1,4 +1,4 @@
-use super::chain::{ParserContextRef, ProcessChain, ProcessChainRef};
+use super::types::{ParserContextRef, ProcessChain, ProcessChainRef};
 use std::{
     any::Any,
     ops::Deref,
@@ -35,7 +35,7 @@ impl ProcessChainListLib {
 
     pub fn new(id: &str, priority: i32, mut chains: Vec<ProcessChainRef>) -> Self {
         // Sort the chains by priority
-        chains.sort_by(|a, b| a.priority().cmp(&b.priority()));
+        chains.sort_by_key(|chain| chain.priority());
 
         Self {
             id: id.to_owned(),
@@ -60,7 +60,7 @@ impl ProcessChainListLib {
         chains.push(chain);
 
         // Sort the chains by priority
-        chains.sort_by(|a, b| a.priority().cmp(&b.priority()));
+        chains.sort_by_key(|chain| chain.priority());
 
         Ok(())
     }
@@ -111,7 +111,7 @@ pub struct ProcessChainConstListLib {
 impl ProcessChainConstListLib {
     pub fn new(id: &str, priority: i32, mut chains: Vec<ProcessChainRef>) -> Self {
         // Sort the chains by priority
-        chains.sort_by(|a, b| a.priority().cmp(&b.priority()));
+        chains.sort_by_key(|chain| chain.priority());
 
         Self {
             id: id.to_owned(),
@@ -126,7 +126,7 @@ impl ProcessChainConstListLib {
             .map(Arc::new)
             .collect::<Vec<ProcessChainRef>>();
         // Sort the chains by priority
-        chains.sort_by(|a, b| a.priority().cmp(&b.priority()));
+        chains.sort_by_key(|chain| chain.priority());
 
         Self {
             id: id.to_owned(),
@@ -201,9 +201,7 @@ pub struct ProcessChainManager {
 
 impl ProcessChainManager {
     pub fn new() -> Self {
-        Self {
-            libs: RwLock::new(Vec::new()),
-        }
+        Self::default()
     }
 
     pub fn add_lib(&self, lib: ProcessChainLibRef) -> Result<(), String> {
@@ -221,7 +219,7 @@ impl ProcessChainManager {
         libs.push(lib);
 
         // Sort the libraries by priority
-        libs.sort_by(|a, b| a.get_priority().cmp(&b.get_priority()));
+        libs.sort_by_key(|lib| lib.get_priority());
 
         Ok(())
     }
@@ -306,16 +304,25 @@ impl ProcessChainManager {
     }
 }
 
+impl Default for ProcessChainManager {
+    fn default() -> Self {
+        Self {
+            libs: RwLock::new(Vec::new()),
+        }
+    }
+}
+
 pub type ProcessChainManagerRef = Arc<ProcessChainManager>;
 
 /// A manager for linked process chains, which can be used to execute multiple chains
+#[derive(Default)]
 pub struct ProcessChainLinkedManager {
     libs: Vec<ProcessChainLibRef>,
 }
 
 impl ProcessChainLinkedManager {
     pub fn new() -> Self {
-        Self { libs: Vec::new() }
+        Self::default()
     }
 
     /// Create a new linked manager with the given libraries, the libraries must be linked first
@@ -338,8 +345,7 @@ impl ProcessChainLinkedManager {
         self.libs.push(lib);
 
         // Sort the libraries by priority
-        self.libs
-            .sort_by(|a, b| a.get_priority().cmp(&b.get_priority()));
+        self.libs.sort_by_key(|lib| lib.get_priority());
 
         Ok(())
     }

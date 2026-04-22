@@ -1,5 +1,5 @@
-use super::cmd::*;
 use super::template::TemplateMatcher;
+use super::types::*;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
 use crate::collection::{CollectionValue, MemoryListCollection, MemoryMapCollection};
@@ -898,10 +898,10 @@ impl EQCommandExecutor {
         left: &CollectionValue,
         right: &CollectionValue,
     ) -> bool {
-        if ignore_case {
-            if let (CollectionValue::String(lhs), CollectionValue::String(rhs)) = (left, right) {
-                return lhs.eq_ignore_ascii_case(rhs);
-            }
+        if ignore_case
+            && let (CollectionValue::String(lhs), CollectionValue::String(rhs)) = (left, right)
+        {
+            return lhs.eq_ignore_ascii_case(rhs);
         }
 
         left == right
@@ -934,12 +934,10 @@ impl EQCommandExecutor {
 
         if let (CollectionValue::String(_), CollectionValue::Number(_))
         | (CollectionValue::Number(_), CollectionValue::String(_)) = (left, right)
-        {
-            if let (Some(lhs), Some(rhs)) =
+            && let (Some(lhs), Some(rhs)) =
                 (Self::as_loose_number(left), Self::as_loose_number(right))
-            {
-                return lhs == rhs;
-            }
+        {
+            return lhs == rhs;
         }
 
         left == right
@@ -1522,12 +1520,12 @@ impl CommandParser for RangeCommandParser {
             msg
         })?;
         let value = args[value_index].clone();
-        if value.is_literal() {
-            if let Err(e) = value.as_literal_str().unwrap().parse::<f64>() {
-                let msg = format!("Invalid range command value: {:?}: {}", value, e);
-                error!("{}", msg);
-                return Err(msg);
-            }
+        if value.is_literal()
+            && let Err(e) = value.as_literal_str().unwrap().parse::<f64>()
+        {
+            let msg = format!("Invalid range command value: {:?}: {}", value, e);
+            error!("{}", msg);
+            return Err(msg);
         }
 
         // Get the range bounds and check they are valid numbers if is literal
@@ -1537,12 +1535,12 @@ impl CommandParser for RangeCommandParser {
             msg
         })?;
         let begin = args[begin_index].clone();
-        if begin.is_literal() {
-            if let Err(e) = begin.as_literal_str().unwrap().parse::<f64>() {
-                let msg = format!("Invalid range command begin value: {:?}: {}", begin, e);
-                error!("{}", msg);
-                return Err(msg);
-            }
+        if begin.is_literal()
+            && let Err(e) = begin.as_literal_str().unwrap().parse::<f64>()
+        {
+            let msg = format!("Invalid range command begin value: {:?}: {}", begin, e);
+            error!("{}", msg);
+            return Err(msg);
         }
         let end_index = matches.index_of("end").ok_or_else(|| {
             let msg = "End argument is required for range command".to_string();
@@ -1551,12 +1549,12 @@ impl CommandParser for RangeCommandParser {
         })?;
 
         let end = args[end_index].clone();
-        if end.is_literal() {
-            if let Err(e) = end.as_literal_str().unwrap().parse::<f64>() {
-                let msg = format!("Invalid range command end value: {:?}: {}", end, e);
-                error!("{}", msg);
-                return Err(msg);
-            }
+        if end.is_literal()
+            && let Err(e) = end.as_literal_str().unwrap().parse::<f64>()
+        {
+            let msg = format!("Invalid range command end value: {:?}: {}", end, e);
+            error!("{}", msg);
+            return Err(msg);
         }
 
         let cmd = RangeCommandExecutor::new(value, begin, end);

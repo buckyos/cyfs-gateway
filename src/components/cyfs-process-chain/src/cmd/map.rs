@@ -1,4 +1,4 @@
-use super::cmd::*;
+use super::types::*;
 use crate::block::{BlockExecuter, CommandArgs, Expression};
 use crate::chain::{Context, EnvExternal, EnvExternalRef, EnvLevel, ParserContext};
 use crate::collection::{
@@ -178,9 +178,7 @@ impl CommandParser for MapReduceCommandParser {
             let coll_index = matches
                 .index_of("coll")
                 .ok_or_else(|| {
-                    let msg = format!(
-                        "Collection name is required in long mode, but not provided. Use <coll> at the end."
-                    );
+                    let msg = "Collection name is required in long mode, but not provided. Use <coll> at the end.".to_string();
                     error!("{}", msg);
                     msg
                 })?;
@@ -189,9 +187,9 @@ impl CommandParser for MapReduceCommandParser {
             let begin_cmd_index = matches.index_of("begin");
 
             let map_cmd_index = matches.index_of("map").ok_or_else(|| {
-                let msg = format!(
+                let msg =
                     "Map command is required in long mode, but not provided. Use --map <command>."
-                );
+                        .to_string();
                 error!("{}", msg);
                 msg
             })?;
@@ -204,9 +202,7 @@ impl CommandParser for MapReduceCommandParser {
             let coll_index = matches
                 .index_of("coll")
                 .ok_or_else(|| {
-                    let msg = format!(
-                        "Collection name is required in positional mode, but not provided. Use map <coll> <map_cmd>."
-                    );
+                    let msg = "Collection name is required in positional mode, but not provided. Use map <coll> <map_cmd>.".to_string();
                     error!("{}", msg);
                     msg
                 })?;
@@ -214,9 +210,7 @@ impl CommandParser for MapReduceCommandParser {
             let map_cmd_index = matches
                 .index_of("map_cmd")
                 .ok_or_else(|| {
-                    let msg = format!(
-                        "Map command is required in positional mode, but not provided. Use map <coll> <map_cmd>."
-                    );
+                    let msg = "Map command is required in positional mode, but not provided. Use map <coll> <map_cmd>.".to_string();
                     error!("{}", msg);
                     msg
                 })?;
@@ -225,9 +219,8 @@ impl CommandParser for MapReduceCommandParser {
             let reduce_kw_index = matches.index_of("reduce_kw");
             let reduce_cmd_index = if reduce_kw_index.is_some() {
                 let index = matches.index_of("reduce_cmd").ok_or_else(|| {
-                    let msg = format!(
-                        "Reduce command is required if 'reduce' is used in positional mode."
-                    );
+                    let msg = "Reduce command is required if 'reduce' is used in positional mode."
+                        .to_string();
                     error!("{}", msg);
                     msg
                 })?;
@@ -276,7 +269,9 @@ impl CommandParser for MapReduceCommandParser {
                 return Err(msg);
             }
 
-            Some(begin_cmd.as_command_substitution().unwrap().clone())
+            Some(Box::new(
+                begin_cmd.as_command_substitution().unwrap().clone(),
+            ))
         } else {
             None
         };
@@ -295,7 +290,7 @@ impl CommandParser for MapReduceCommandParser {
             return Err(msg);
         }
         debug!("Map command: {}", map_cmd.as_str());
-        let map_cmd = map_cmd.as_command_substitution().unwrap().clone();
+        let map_cmd = Box::new(map_cmd.as_command_substitution().unwrap().clone());
 
         let reduce_cmd = if let Some(reduce_cmd_index) = indexes.3 {
             let reduce_cmd = args.get(reduce_cmd_index).ok_or_else(|| {
@@ -313,7 +308,9 @@ impl CommandParser for MapReduceCommandParser {
                 return Err(msg);
             }
 
-            Some(reduce_cmd.as_command_substitution().unwrap().clone())
+            Some(Box::new(
+                reduce_cmd.as_command_substitution().unwrap().clone(),
+            ))
         } else {
             None
         };
@@ -393,12 +390,11 @@ impl MapReduceCommand {
                     Box::new(cb) as Box<dyn SetCollectionTraverseCallBack>
                 ))
                 .await?;
-                let result = ret_item
+                ret_item
                     .lock()
                     .unwrap()
                     .take()
-                    .unwrap_or(CommandResult::success());
-                result
+                    .unwrap_or(CommandResult::success())
             }
             CollectionValue::Map(map) => {
                 context
@@ -417,12 +413,11 @@ impl MapReduceCommand {
                     Box::new(cb) as Box<dyn MapCollectionTraverseCallBack>
                 ))
                 .await?;
-                let result = ret_item
+                ret_item
                     .lock()
                     .unwrap()
                     .take()
-                    .unwrap_or(CommandResult::success());
-                result
+                    .unwrap_or(CommandResult::success())
             }
             CollectionValue::MultiMap(multi_map) => {
                 context
@@ -442,12 +437,11 @@ impl MapReduceCommand {
                         Box::new(cb) as Box<dyn MultiMapCollectionTraverseCallBack>
                     ))
                     .await?;
-                let result = ret_item
+                ret_item
                     .lock()
                     .unwrap()
                     .take()
-                    .unwrap_or(CommandResult::success());
-                result
+                    .unwrap_or(CommandResult::success())
             }
             _ => {
                 let msg = format!(
@@ -530,7 +524,7 @@ impl CommandExecutor for MapReduceCommand {
                 if let Some(map_reduce_env) = MapReduceVariableEnv::try_from_external(&env) {
                     map_reduce_env.clone()
                 } else {
-                    let msg = format!("Failed to convert external env to MapReduceVariableEnv");
+                    let msg = "Failed to convert external env to MapReduceVariableEnv".to_string();
                     error!("{}", msg);
                     return Err(msg);
                 }
@@ -726,19 +720,8 @@ impl MapReduceVariableEnv {
     }
 
     pub fn try_from_external(external: &EnvExternalRef) -> Option<&Self> {
-        let boxed_external: &Box<dyn EnvExternal> = external.as_ref();
-
-        let any_external: &dyn std::any::Any = boxed_external.as_ref();
-        if let Some(env) = any_external.downcast_ref::<Self>() {
-            Some(env)
-        } else {
-            assert!(
-                false,
-                "Expected MapReduceVariableEnv, found: {:?}",
-                any_external.type_id()
-            );
-            None
-        }
+        let any_external = external.as_ref().as_ref() as &dyn std::any::Any;
+        any_external.downcast_ref::<Self>()
     }
 }
 

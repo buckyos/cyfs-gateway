@@ -1,4 +1,4 @@
-use super::block::{
+use super::types::{
     Block, CaseStatement, CommandItem, Expression, ExpressionChain, ForStatement, IfStatement,
     Line, MatchResultBranch, MatchResultControlBranch, MatchResultStatement, Operator, Statement,
 };

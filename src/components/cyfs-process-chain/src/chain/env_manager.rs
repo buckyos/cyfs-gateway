@@ -38,7 +38,7 @@ impl PathCollection {
             PathCollection::MultiMap(multi_map) => multi_map
                 .get_many(key)
                 .await
-                .map(|value| value.map(|set| CollectionValue::Set(set))),
+                .map(|value| value.map(CollectionValue::Set)),
         }
     }
 
@@ -149,11 +149,7 @@ impl PathCollection {
             }
             PathCollection::MultiMap(multi_map) => {
                 let ret = multi_map.remove_all(key).await?;
-                if ret.is_some() {
-                    Ok(Some(CollectionValue::Set(ret.unwrap())))
-                } else {
-                    Ok(None)
-                }
+                Ok(ret.map(CollectionValue::Set))
             }
         }
     }
@@ -680,11 +676,11 @@ impl EnvManager {
                             // Last part can be a multi-map
                             return Ok(Some(PathCollection::MultiMap(multi_map.clone())));
                         }
-                    } else if let CollectionValue::Set(set) = &value {
-                        if i == sub_key_list.len() - 1 {
-                            // Last part can be a set
-                            return Ok(Some(PathCollection::Set(set.clone())));
-                        }
+                    } else if let CollectionValue::Set(set) = &value
+                        && i == sub_key_list.len() - 1
+                    {
+                        // Last part can be a set
+                        return Ok(Some(PathCollection::Set(set.clone())));
                     }
 
                     let msg = format!("Expected a map at '{}', found: {}", part, value);
@@ -705,8 +701,7 @@ impl EnvManager {
         key_list: &[&str],
         value: CollectionValue,
     ) -> Result<bool, String> {
-        let parent = self.get_parent_collection_by_path(&key_list, level).await?;
-        if parent.is_none() {
+        let Some(coll) = self.get_parent_collection_by_path(key_list, level).await? else {
             // If parent is None, caller need to create the collection on the path
             let msg = format!(
                 "Parent collection not found for key list '{:?}', please create the collection first",
@@ -714,9 +709,7 @@ impl EnvManager {
             );
             warn!("{}", msg);
             return Err(msg);
-        }
-
-        let coll = parent.unwrap();
+        };
         let key = key_list.last().unwrap();
         coll.insert_new(key, value).await
     }

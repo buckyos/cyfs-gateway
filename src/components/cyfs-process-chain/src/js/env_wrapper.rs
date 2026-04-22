@@ -53,7 +53,7 @@ impl EnvManagerWrapper {
         let env_manager = match this {
             Some(this) => this.env_manager.clone(),
             None => {
-                let msg = format!("Failed to get EnvManagerWrapper from this");
+                let msg = "Failed to get EnvManagerWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -67,7 +67,7 @@ impl EnvManagerWrapper {
 
         // Get first argument as key
         let key = args
-            .get(0)
+            .first()
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
@@ -76,7 +76,7 @@ impl EnvManagerWrapper {
 
         let env_level = if args.len() > 2 {
             let level = args
-                .get(0)
+                .get(2)
                 .and_then(|v| v.as_string())
                 .map(|s| s.to_std_string_escaped())
                 .ok_or_else(|| JsNativeError::error().with_message("Expected a string level"))?;
@@ -111,7 +111,7 @@ impl EnvManagerWrapper {
         let env_manager = match this {
             Some(this) => this.env_manager.clone(),
             None => {
-                let msg = format!("Failed to get EnvManagerWrapper from this");
+                let msg = "Failed to get EnvManagerWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -125,7 +125,7 @@ impl EnvManagerWrapper {
 
         // Get first argument as key
         let key = args
-            .get(0)
+            .first()
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
@@ -172,7 +172,7 @@ impl EnvManagerWrapper {
         let env_manager = match this {
             Some(this) => this.env_manager.clone(),
             None => {
-                let msg = format!("Failed to get EnvManagerWrapper from this");
+                let msg = "Failed to get EnvManagerWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -186,7 +186,7 @@ impl EnvManagerWrapper {
 
         // Get first argument as key
         let key = args
-            .get(0)
+            .first()
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
@@ -237,7 +237,7 @@ impl EnvManagerWrapper {
         let env_manager = match this {
             Some(this) => this.env_manager.clone(),
             None => {
-                let msg = format!("Failed to get EnvManagerWrapper from this");
+                let msg = "Failed to get EnvManagerWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -251,7 +251,7 @@ impl EnvManagerWrapper {
 
         // Get first argument as key
         let key = args
-            .get(0)
+            .first()
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;

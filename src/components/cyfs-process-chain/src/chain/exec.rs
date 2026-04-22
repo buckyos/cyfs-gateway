@@ -1,10 +1,10 @@
-use super::chain::ProcessChainRef;
 use super::context::Context;
 use super::env::EnvRef;
 use super::manager::{ProcessChainLibRef, ProcessChainLinkedManagerRef};
 use super::stack::{
     ExecPointerBlockGuard, ExecPointerChainGuard, ExecPointerLibGuard, GotoCounter,
 };
+use super::types::ProcessChainRef;
 use crate::block::BlockExecuter;
 use crate::chain::{Env, EnvLevel};
 use crate::cmd::{CommandControl, CommandControlLevel, CommandResult};
@@ -42,7 +42,7 @@ impl ProcessChainExecutor {
             return Err(msg);
         }
 
-        let _block_guard = ExecPointerBlockGuard::new(&context.current_pointer(), block_id)?;
+        let _block_guard = ExecPointerBlockGuard::new(context.current_pointer(), block_id)?;
 
         let block = block.unwrap();
         let block_executer = BlockExecuter::new(&block.id);
@@ -63,14 +63,12 @@ impl ProcessChainExecutor {
             return Ok(CommandResult::success());
         }
 
-        let _chain_guard = ExecPointerChainGuard::new(&context.current_pointer(), chain.clone())?;
+        let _chain_guard = ExecPointerChainGuard::new(context.current_pointer(), chain.clone())?;
 
         let mut chain_result = CommandResult::success();
 
-        for i in 0..blocks.len() {
-            let block = &blocks[i];
-
-            let _block_guard = ExecPointerBlockGuard::new(&context.current_pointer(), &block.id)?;
+        for block in blocks {
+            let _block_guard = ExecPointerBlockGuard::new(context.current_pointer(), &block.id)?;
 
             let block_executer = BlockExecuter::new(&block.id);
             let block_context = context.fork_block();
@@ -215,7 +213,7 @@ impl ProcessChainLibExecutor {
         let mut final_result = CommandResult::success();
 
         let _lib_guard = ExecPointerLibGuard::new(
-            &self.context.current_pointer(),
+            self.context.current_pointer(),
             self.process_chain_lib.clone(),
         )?;
 
@@ -284,7 +282,7 @@ impl ProcessChainLibExecutor {
         })?;
 
         let _lib_guard = ExecPointerLibGuard::new(
-            &self.context.current_pointer(),
+            self.context.current_pointer(),
             self.process_chain_lib.clone(),
         )?;
 

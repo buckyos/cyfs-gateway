@@ -1,4 +1,4 @@
-use super::cmd::*;
+use super::types::*;
 use crate::block::{BlockExecuter, CommandArgs, Expression};
 use crate::chain::{Context, EnvLevel, ParserContext};
 use crate::collection::CollectionValue;
@@ -166,8 +166,8 @@ impl CommandParser for CaptureCommandParser {
             return Err(msg);
         }
 
-        let sub_command = cmd.as_command_substitution().unwrap().clone();
-        let executor = CaptureCommandExecutor::new(
+        let sub_command = Box::new(cmd.as_command_substitution().unwrap().clone());
+        let executor = CaptureCommandExecutor {
             value_var,
             status_var,
             ok_var,
@@ -176,7 +176,7 @@ impl CommandParser for CaptureCommandParser {
             control_kind_var,
             from_var,
             sub_command,
-        );
+        };
         Ok(Arc::new(Box::new(executor)))
     }
 }
@@ -190,30 +190,6 @@ pub struct CaptureCommandExecutor {
     control_kind_var: Option<String>,
     from_var: Option<String>,
     sub_command: Box<Expression>,
-}
-
-impl CaptureCommandExecutor {
-    pub fn new(
-        value_var: Option<String>,
-        status_var: Option<String>,
-        ok_var: Option<String>,
-        error_var: Option<String>,
-        control_var: Option<String>,
-        control_kind_var: Option<String>,
-        from_var: Option<String>,
-        sub_command: Box<Expression>,
-    ) -> Self {
-        Self {
-            value_var,
-            status_var,
-            ok_var,
-            error_var,
-            control_var,
-            control_kind_var,
-            from_var,
-            sub_command,
-        }
-    }
 }
 
 #[async_trait::async_trait]

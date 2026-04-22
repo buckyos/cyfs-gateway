@@ -165,7 +165,7 @@ impl SetCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get SetCollectionWrapper from this");
+                let msg = "Failed to get SetCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -203,14 +203,14 @@ impl SetCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get SetCollectionWrapper from this");
+                let msg = "Failed to get SetCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         let key = args
-            .get(0)
+            .first()
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
@@ -236,14 +236,14 @@ impl SetCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get SetCollectionWrapper from this");
+                let msg = "Failed to get SetCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         let key = args
-            .get(0)
+            .first()
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
@@ -269,7 +269,7 @@ impl SetCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get SetCollectionWrapper from this");
+                let msg = "Failed to get SetCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -375,7 +375,7 @@ impl MapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MapCollectionWrapper from this");
+                let msg = "Failed to get MapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -415,14 +415,14 @@ impl MapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MapCollectionWrapper from this");
+                let msg = "Failed to get MapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         let key = args
-            .get(0)
+            .first()
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| {
@@ -465,14 +465,14 @@ impl MapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MapCollectionWrapper from this");
+                let msg = "Failed to get MapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         let key = args
-            .get(0)
+            .first()
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
@@ -505,14 +505,14 @@ impl MapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MapCollectionWrapper from this");
+                let msg = "Failed to get MapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         let key = args
-            .get(0)
+            .first()
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
@@ -538,14 +538,14 @@ impl MapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MapCollectionWrapper from this");
+                let msg = "Failed to get MapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         let key = args
-            .get(0)
+            .first()
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| {
@@ -664,7 +664,7 @@ impl MultiMapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MultiMapCollectionWrapper from this");
+                let msg = "Failed to get MultiMapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -711,7 +711,7 @@ impl MultiMapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MultiMapCollectionWrapper from this");
+                let msg = "Failed to get MultiMapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -752,7 +752,7 @@ impl MultiMapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MultiMapCollectionWrapper from this");
+                let msg = "Failed to get MultiMapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -793,14 +793,14 @@ impl MultiMapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MultiMapCollectionWrapper from this");
+                let msg = "Failed to get MultiMapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
         };
 
         let key = args
-            .get(0)
+            .first()
             .and_then(|v| v.as_string())
             .map(|s| s.to_std_string_escaped())
             .ok_or_else(|| JsNativeError::error().with_message("Expected a string key"))?;
@@ -837,7 +837,7 @@ impl MultiMapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MultiMapCollectionWrapper from this");
+                let msg = "Failed to get MultiMapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -879,7 +879,7 @@ impl MultiMapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MultiMapCollectionWrapper from this");
+                let msg = "Failed to get MultiMapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -923,7 +923,7 @@ impl MultiMapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MultiMapCollectionWrapper from this");
+                let msg = "Failed to get MultiMapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -970,7 +970,7 @@ impl MultiMapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MultiMapCollectionWrapper from this");
+                let msg = "Failed to get MultiMapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }
@@ -1032,7 +1032,7 @@ impl MultiMapCollectionWrapper {
         let collection = match this {
             Some(this) => this.collection.clone(),
             None => {
-                let msg = format!("Failed to get MultiMapCollectionWrapper from this");
+                let msg = "Failed to get MultiMapCollectionWrapper from this".to_string();
                 error!("{}", msg);
                 return Err(JsNativeError::error().with_message(msg).into());
             }

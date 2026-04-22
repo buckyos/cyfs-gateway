@@ -39,9 +39,7 @@ pub struct EnvExternalManager {
 
 impl EnvExternalManager {
     pub fn new() -> Self {
-        Self {
-            external: AsyncRwLock::new(Vec::new()),
-        }
+        Self::default()
     }
 
     pub async fn add_external(&self, id: &str, value: EnvExternalRef) -> Result<(), String> {
@@ -138,5 +136,13 @@ impl EnvExternalManager {
         }
 
         Ok((false, None))
+    }
+}
+
+impl Default for EnvExternalManager {
+    fn default() -> Self {
+        Self {
+            external: AsyncRwLock::new(Vec::new()),
+        }
     }
 }

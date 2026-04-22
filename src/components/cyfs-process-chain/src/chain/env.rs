@@ -4,17 +4,12 @@ use std::{str::FromStr, sync::Arc};
 
 use log::{Level, log};
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 pub enum EnvLevel {
     Global, // Global level environment, used for global settings, used by: export name=value
-    Chain,  // Chain level environment, used for chain-wide settings, which is default
+    #[default]
+    Chain, // Chain level environment, used for chain-wide settings, which is default
     Block,  // Block level environment, used for block-specific settings, use by: local name=value
-}
-
-impl Default for EnvLevel {
-    fn default() -> Self {
-        EnvLevel::Chain // Default to chain level
-    }
 }
 
 impl EnvLevel {

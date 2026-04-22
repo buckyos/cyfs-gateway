@@ -281,17 +281,16 @@ impl MapCollection for StreamRequestMap {
             "incoming_stream" => {
                 if value.is_any() {
                     if let CollectionValue::Any(stream) = value {
-                        if let Some(async_stream) = stream
-                            .downcast::<Arc<Mutex<Option<Box<dyn AsyncStream>>>>>()
-                            .ok()
+                        if let Ok(async_stream) =
+                            stream.downcast::<Arc<Mutex<Option<Box<dyn AsyncStream>>>>>()
                         {
                             prev = Some(CollectionValue::Any(request.incoming_stream.clone()));
                             *request.incoming_stream.lock().unwrap() =
                                 async_stream.lock().unwrap().take();
                         } else {
-                            let msg = format!(
-                                "incoming_stream must be of type Arc<Mutex<Option<Box<dyn AsyncStream>>>>",
-                            );
+                            let msg =
+                                "incoming_stream must be of type Arc<Mutex<Option<Box<dyn AsyncStream>>>>"
+                                    .to_string();
                             error!("{}", msg);
                             return Err(msg);
                         }

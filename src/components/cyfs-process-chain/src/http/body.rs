@@ -15,7 +15,7 @@ impl PathParser {
 
     // Normal path, like a.[0].c
     fn parse_normal_path(path: &str) -> Vec<&str> {
-        path.split(|c| c == '.' || c == '[' || c == ']')
+        path.split(['.', '[', ']'])
             .filter(|s| !s.is_empty())
             .collect()
     }
@@ -24,11 +24,9 @@ impl PathParser {
     fn parse_posix_path(path: &str) -> Vec<&str> {
         assert!(path.starts_with('/'));
 
-        let parts = path
-            .split('/')
+        path.split('/')
             .filter(|s| !s.is_empty())
-            .collect::<Vec<&str>>();
-        parts
+            .collect::<Vec<&str>>()
     }
 }
 
@@ -191,7 +189,7 @@ impl TomlModifier for TomlValue {
     fn get(&self, path: &str) -> Result<Option<TomlValue>, String> {
         let parts = PathParser::parse_path(path);
         let mut current = self;
-        for (_i, part) in parts.iter().enumerate() {
+        for part in &parts {
             match current {
                 TomlValue::Table(map) => match map.get(*part) {
                     Some(value) => current = value,
@@ -434,7 +432,7 @@ impl XmlModifier for Element {
                 let child_index_opt = current
                     .children
                     .iter()
-                    .position(|node| node.as_element().map_or(false, |e| e.name == *part));
+                    .position(|node| node.as_element().is_some_and(|e| e.name == *part));
 
                 if let Some(idx) = child_index_opt {
                     if is_last {
@@ -497,7 +495,7 @@ impl XmlModifier for Element {
                 let child_index = current
                     .children
                     .iter()
-                    .position(|n| n.as_element().map_or(false, |e| e.name == *part));
+                    .position(|n| n.as_element().is_some_and(|e| e.name == *part));
                 if let Some(index) = child_index {
                     if is_last {
                         let removed = current.children.remove(index);

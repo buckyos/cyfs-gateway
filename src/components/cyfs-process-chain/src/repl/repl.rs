@@ -174,7 +174,7 @@ impl ProcessChainREPL {
     async fn process_help(&self, line: &str) -> Result<bool, String> {
         // Check if help is requested
         let args: Vec<&str> = line.split_whitespace().collect();
-        if args.len() < 1 {
+        if args.is_empty() {
             return Ok(false);
         }
 
@@ -255,7 +255,7 @@ impl ProcessChainREPL {
         let block_parser = BlockParser::new(&block_id);
 
         // Parse block content
-        let mut item = block_parser.parse(&line).map_err(|e| {
+        let mut item = block_parser.parse(line).map_err(|e| {
             let msg = format!("Parse line error: {}, {}", line, e);
             error!("{}", msg);
             msg

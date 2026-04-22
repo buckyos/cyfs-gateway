@@ -432,6 +432,11 @@ pub trait SetCollection: Send + Sync {
     /// Returns the number of elements in the collection.
     async fn len(&self) -> Result<usize, String>;
 
+    /// Returns true if the collection contains no elements.
+    async fn is_empty(&self) -> Result<bool, String> {
+        Ok(self.len().await? == 0)
+    }
+
     /// Sets the collection with the given value.
     async fn insert(&self, value: &str) -> Result<bool, String>;
 
@@ -479,6 +484,11 @@ pub type ListCollectionTraverseCallBackRef = Arc<Box<dyn ListCollectionTraverseC
 pub trait ListCollection: Send + Sync {
     /// Returns the number of elements in the collection.
     async fn len(&self) -> Result<usize, String>;
+
+    /// Returns true if the collection contains no elements.
+    async fn is_empty(&self) -> Result<bool, String> {
+        Ok(self.len().await? == 0)
+    }
 
     /// Appends a value to the end of the list.
     async fn push(&self, value: TypedValue) -> Result<(), String>;
@@ -575,6 +585,11 @@ impl MapCollectionCursor for DumpMapCollectionCursor {
 pub trait MapCollection: Send + Sync {
     /// Returns the number of elements in the collection.
     async fn len(&self) -> Result<usize, String>;
+
+    /// Returns true if the collection contains no elements.
+    async fn is_empty(&self) -> Result<bool, String> {
+        Ok(self.len().await? == 0)
+    }
 
     /// Inserts a key-value pair into the collection.
     /// If the key already exists, it will return false.
@@ -694,6 +709,11 @@ impl MultiMapCollectionCursor for DumpMultiMapCollectionCursor {
 pub trait MultiMapCollection: Send + Sync {
     /// Returns the number of elements in the collection.
     async fn len(&self) -> Result<usize, String>;
+
+    /// Returns true if the collection contains no elements.
+    async fn is_empty(&self) -> Result<bool, String> {
+        Ok(self.len().await? == 0)
+    }
 
     /// Sets the value for the given key in the collection.
     async fn insert(&self, key: &str, value: &str) -> Result<bool, String>;

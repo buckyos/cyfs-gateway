@@ -1,4 +1,4 @@
-use super::block::*;
+use super::types::*;
 use crate::collection::{CollectionValue, NumberValue};
 use nom::{
     IResult, Parser,
@@ -300,7 +300,7 @@ impl BlockParser {
         let mut current = String::new();
         let mut state = LogicalLineState::default();
 
-        for raw_line in block.split(|c| c == '\n' || c == '\r') {
+        for raw_line in block.split(['\n', '\r']) {
             let line = raw_line.trim_end_matches('\r').trim();
             if line.is_empty() {
                 continue;
@@ -1123,9 +1123,7 @@ impl BlockParser {
     }
 
     // Parse expressions with operators
-    fn parse_expressions(
-        input: &str,
-    ) -> IResult<&str, Vec<(Option<Operator>, Expression, Option<Operator>)>> {
+    fn parse_expressions(input: &str) -> IResult<&str, ExpressionChain> {
         debug!("Parsing expressions: {}", input);
         let input = input.trim();
         if input.is_empty() {
@@ -1271,10 +1269,8 @@ impl BlockParser {
             CommandArg::Literal(key.to_string()),
         ];
 
-        if value.is_some() {
-            args.push(value.unwrap());
-        } else {
-            // For assignments without value, such as: export KEY
+        if let Some(value) = value {
+            args.push(value);
         }
 
         let args = CommandArgs::new(args);
@@ -1441,7 +1437,7 @@ impl BlockParser {
                         // Wrap multiple args into a command substitution
                         let args = vec![CommandArg::Literal("append".to_string())]
                             .into_iter()
-                            .chain(args.into_iter())
+                            .chain(args)
                             .collect::<Vec<_>>();
                         CommandArg::CommandSubstitution(Box::new(Expression::Command(
                             CommandItem::new("append".to_string(), CommandArgs::new(args)),
@@ -1720,9 +1716,9 @@ impl BlockParser {
     fn parse_command_subst(input: &str) -> IResult<&str, CommandArg> {
         let (rest, _) = tag("$(")(input)?;
         let mut depth = 1;
-        let mut chars = rest.char_indices();
+        let chars = rest.char_indices();
 
-        while let Some((idx, c)) = chars.next() {
+        for (idx, c) in chars {
             match c {
                 '(' => depth += 1,
                 ')' => {
@@ -1866,7 +1862,7 @@ impl BlockParser {
         } else {
             let args = vec![CommandArg::Literal("append".to_string())]
                 .into_iter()
-                .chain(parts.into_iter())
+                .chain(parts)
                 .collect::<Vec<_>>();
             CommandArg::CommandSubstitution(Box::new(Expression::Command(CommandItem::new(
                 "append".to_string(),

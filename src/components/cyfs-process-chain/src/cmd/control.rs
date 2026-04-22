@@ -1,7 +1,7 @@
-use super::cmd::*;
 use super::exec::{
     ExecScope, InvokeArgSpec, InvokeCommandExecutor, parse_exec_scope_and_target, parse_invoke_args,
 };
+use super::types::*;
 use crate::block::{BlockExecuter, CommandArg, CommandArgs, Expression};
 use crate::chain::{Context, ParserContext};
 use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
@@ -126,11 +126,11 @@ impl CommandParser for FirstOkCommandParser {
 }
 
 pub struct FirstOkCommandExecutor {
-    commands: Vec<Box<Expression>>,
+    commands: Vec<Expression>,
 }
 
 impl FirstOkCommandExecutor {
-    pub fn new(commands: Vec<Box<Expression>>) -> Self {
+    pub fn new(commands: Vec<Expression>) -> Self {
         Self { commands }
     }
 }
@@ -452,12 +452,7 @@ impl CommandParser for ReturnCommandParser {
         })?;
 
         // Get the optional return value
-        let value_index = matches.index_of("value");
-        let value = if let Some(index) = value_index {
-            Some(args[index].clone())
-        } else {
-            None
-        };
+        let value = matches.index_of("value").map(|index| args[index].clone());
 
         let cmd = ReturnCommandExecutor::new(from_level, value);
         Ok(Arc::new(Box::new(cmd)))
@@ -598,12 +593,7 @@ impl CommandParser for ErrorCommandParser {
         })?;
 
         // Get the optional error value
-        let value_index = matches.index_of("value");
-        let value = if let Some(index) = value_index {
-            Some(args[index].clone())
-        } else {
-            None
-        };
+        let value = matches.index_of("value").map(|index| args[index].clone());
 
         let cmd = ErrorCommandExecutor::new(from_level, value);
         Ok(Arc::new(Box::new(cmd)))
@@ -702,12 +692,7 @@ impl CommandParser for ExitCommandParser {
             })?;
 
         // Get the optional exit value
-        let value_index = matches.index_of("value");
-        let value = if let Some(index) = value_index {
-            Some(args[index].clone())
-        } else {
-            None
-        };
+        let value = matches.index_of("value").map(|index| args[index].clone());
 
         let cmd = ExitCommandExecutor::new(value);
         Ok(Arc::new(Box::new(cmd)))
@@ -805,12 +790,7 @@ impl CommandParser for BreakCommandParser {
             })?;
 
         // Get the optional break value
-        let value_index = matches.index_of("value");
-        let value = if let Some(index) = value_index {
-            Some(args[index].clone())
-        } else {
-            None
-        };
+        let value = matches.index_of("value").map(|index| args[index].clone());
 
         let cmd = BreakCommandExecutor::new(value);
         Ok(Arc::new(Box::new(cmd)))

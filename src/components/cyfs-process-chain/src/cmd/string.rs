@@ -1,5 +1,5 @@
-use super::cmd::*;
 use super::template::TemplateMatcher;
+use super::types::*;
 use crate::block::{CommandArg, CommandArgEvaluator, CommandArgs};
 use crate::chain::{Context, ParserContext};
 use crate::collection::{CollectionValue, MemoryListCollection, NumberValue};
@@ -375,24 +375,23 @@ impl CommandExecutor for RewriteRegexCommand {
 
             while let Some(c) = chars.next() {
                 if c == '$' {
-                    if let Some(&next_c) = chars.peek() {
-                        if next_c.is_ascii_digit() {
-                            chars.next(); // consume digit
-                            let idx = next_c.to_digit(10).ok_or_else(|| {
-                                let msg =
-                                    format!("Invalid digit after $ in template: {}", template);
-                                error!("{}", msg);
-                                msg
-                            })? as usize;
+                    if let Some(&next_c) = chars.peek()
+                        && next_c.is_ascii_digit()
+                    {
+                        chars.next(); // consume digit
+                        let idx = next_c.to_digit(10).ok_or_else(|| {
+                            let msg = format!("Invalid digit after $ in template: {}", template);
+                            error!("{}", msg);
+                            msg
+                        })? as usize;
 
-                            if let Some(m) = captures.get(idx) {
-                                result.push_str(m.as_str());
-                            } else {
-                                // if the capture group does not exist, we should skip it as empty
-                            }
-
-                            continue;
+                        if let Some(m) = captures.get(idx) {
+                            result.push_str(m.as_str());
+                        } else {
+                            // if the capture group does not exist, we should skip it as empty
                         }
+
+                        continue;
                     }
 
                     result.push('$'); // literal $
@@ -884,13 +883,11 @@ impl CommandExecutor for StringReplaceCommand {
             } else {
                 None
             }
+        } else if key_value.contains(&match_text) {
+            let rewritten = Self::replace_case_sensitive(&key_value, &match_text, &new_text);
+            Some(rewritten)
         } else {
-            if key_value.contains(&match_text) {
-                let rewritten = Self::replace_case_sensitive(&key_value, &match_text, &new_text);
-                Some(rewritten)
-            } else {
-                None
-            }
+            None
         };
 
         // If a rewritten value is found, set it in the environment

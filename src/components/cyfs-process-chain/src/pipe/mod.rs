@@ -1,5 +1,6 @@
 mod mem;
-mod pipe;
+#[path = "pipe.rs"]
+mod types;
 
 pub use mem::*;
-pub use pipe::*;
+pub use types::*;

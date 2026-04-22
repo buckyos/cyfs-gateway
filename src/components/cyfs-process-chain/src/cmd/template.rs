@@ -173,15 +173,15 @@ impl TemplateMatcher {
 
             let fragments = self.parse_segment_template(pattern, segment)?;
             for fragment in fragments.iter() {
-                if let TemplateFragment::Capture(name) = fragment {
-                    if !seen_capture_names.insert(name.clone()) {
-                        let msg = format!(
-                            "Invalid {} pattern '{}': duplicate capture name '{}'",
-                            self.command_name, pattern, name
-                        );
-                        error!("{}", msg);
-                        return Err(msg);
-                    }
+                if let TemplateFragment::Capture(name) = fragment
+                    && !seen_capture_names.insert(name.clone())
+                {
+                    let msg = format!(
+                        "Invalid {} pattern '{}': duplicate capture name '{}'",
+                        self.command_name, pattern, name
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
                 }
             }
             segments.push(TemplatePatternSegment::Template(fragments));
