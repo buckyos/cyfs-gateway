@@ -33,7 +33,7 @@ use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Semaphore, TryAcquireError, oneshot};
 use tokio::task;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -1248,6 +1248,12 @@ impl RTcpInner {
     }
 }
 
+// Per-tunnel cap on concurrent inbound stream establishments (Open packets
+// waiting for the peer's HelloStream). Protocol-level quota: prevents a
+// malicious or misbehaving peer from exhausting memory by initiating
+// streams and never completing them.
+const MAX_PENDING_INBOUND_OPENS: usize = 64;
+
 #[derive(Clone)]
 struct RTcpTunnel {
     build_helper: RTcpStreamBuildHelper,
@@ -1262,8 +1268,14 @@ struct RTcpTunnel {
     next_seq: Arc<AtomicU32>,
     listener: RTcpListenerRef,
 
-    // Use to notify the open stream waiter
-    open_resp_notify: Arc<Mutex<HashMap<u32, Arc<Notify>>>>,
+    // Use to deliver the OpenResp result code back to the open stream waiter.
+    // The result code (0 = success, non-zero = rejection, e.g. quota
+    // exhausted) must reach the initiator so it can fail fast instead of
+    // optimistically connecting and producing a "late HelloStream" on the peer.
+    open_resp_waiters: Arc<Mutex<HashMap<u32, oneshot::Sender<u32>>>>,
+
+    // Per-tunnel concurrency quota for inbound Open requests.
+    inbound_open_slots: Arc<Semaphore>,
 }
 
 impl RTcpTunnel {
@@ -1298,7 +1310,8 @@ impl RTcpTunnel {
 
             next_seq: Arc::new(AtomicU32::new(0)),
             listener,
-            open_resp_notify: Arc::new(Mutex::new(HashMap::new())),
+            open_resp_waiters: Arc::new(Mutex::new(HashMap::new())),
+            inbound_open_slots: Arc::new(Semaphore::new(MAX_PENDING_INBOUND_OPENS)),
         }
     }
 
@@ -1334,17 +1347,18 @@ impl RTcpTunnel {
             }
             RTcpTunnelPackage::Open(open_package) => self.on_open(open_package).await,
             RTcpTunnelPackage::OpenResp(open_resp_package) => {
-                // Notify the open_stream waiter with the seq
-                let notify = self
-                    .open_resp_notify
+                // Deliver the result code to the open_stream waiter so it
+                // can distinguish success (0) from rejection (non-zero).
+                let waiter = self
+                    .open_resp_waiters
                     .lock()
                     .await
                     .remove(&open_resp_package.seq);
-                if notify.is_some() {
-                    notify.unwrap().notify_one();
+                if let Some(sender) = waiter {
+                    let _ = sender.send(open_resp_package.body.result);
                 } else {
                     warn!(
-                        "Tunnel open stream notify not found: seq={}",
+                        "Tunnel open stream waiter not found: seq={}",
                         open_resp_package.seq
                     );
                 }
@@ -1501,7 +1515,30 @@ impl RTcpTunnel {
             open_package.body.dest_host, open_package.body.dest_port, open_package.body.purpose
         );
 
-        // 1. Prepare wait for the new stream before send open_resp
+        // 1. Enforce per-tunnel concurrency quota for pending inbound opens.
+        // try_acquire is non-blocking: if the tunnel already has too many
+        // streams waiting for HelloStream, reject immediately with a non-zero
+        // OpenResp code rather than queuing up and letting the waiting table
+        // grow. This also keeps the read loop responsive.
+        let permit = match self.inbound_open_slots.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(TryAcquireError::NoPermits) => {
+                warn!(
+                    "RTcp tunnel inbound open quota exhausted ({} pending), rejecting stream {}",
+                    MAX_PENDING_INBOUND_OPENS, open_package.body.stream_id
+                );
+                let mut write_stream = self.write_stream.lock().await;
+                let write_stream = Pin::new(&mut *write_stream);
+                let open_resp_package = RTcpOpenRespPackage::new(open_package.seq, 1);
+                RTcpTunnelPackage::send_package(write_stream, open_resp_package).await?;
+                return Ok(());
+            }
+            Err(TryAcquireError::Closed) => {
+                return Err(anyhow::format_err!("inbound open semaphore closed"));
+            }
+        };
+
+        // 2. Prepare wait for the new stream before send open_resp.
         let real_key = format!(
             "{}_{}",
             self.this_device.to_string(),
@@ -1509,7 +1546,8 @@ impl RTcpTunnel {
         );
         self.build_helper.new_wait_stream(&real_key).await;
 
-        // 2. send open_resp with success
+        // 3. send open_resp with success (synchronous: keeps seq/response
+        // ordering intact on the read loop).
         {
             let mut write_stream = self.write_stream.lock().await;
             let write_stream = Pin::new(&mut *write_stream);
@@ -1517,8 +1555,37 @@ impl RTcpTunnel {
             RTcpTunnelPackage::send_package(write_stream, open_resp_package).await?;
         }
 
-        // 3. Wait for the new stream
-        let stream = self.wait_ropen_stream(&open_package.body.stream_id).await?;
+        // 4. Wait for the new stream in a detached task so a slow / never-
+        // arriving HelloStream does not stall the tunnel read loop. The
+        // permit is dropped when the task exits, releasing the quota slot.
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(e) = this.finish_open(open_package, real_key).await {
+                error!("RTcp on_open background task error: {}", e);
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn finish_open(
+        &self,
+        open_package: RTcpOpenPackage,
+        real_key: String,
+    ) -> Result<(), anyhow::Error> {
+        let stream = match self.wait_ropen_stream(&open_package.body.stream_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                // wait_ropen_stream already removes the waiting entry on
+                // timeout; no further cleanup needed here.
+                return Err(anyhow::format_err!(
+                    "wait HelloStream for {} failed: {}",
+                    real_key,
+                    e
+                ));
+            }
+        };
 
         let remote_addr = stream
             .peer_addr()
@@ -1670,25 +1737,53 @@ impl RTcpTunnel {
         );
 
         if self.can_direct {
-            let notify = Arc::new(Notify::new());
-            self.open_resp_notify
-                .lock()
-                .await
-                .insert(seq, notify.clone());
+            let (tx, rx) = oneshot::channel::<u32>();
+            self.open_resp_waiters.lock().await.insert(seq, tx);
 
             // Send open to remote stack to build a direct stream
-            self.post_open(seq, purpose, dest_port, dest_host, session_key.as_str())
-                .await?;
+            if let Err(e) = self
+                .post_open(seq, purpose, dest_port, dest_host, session_key.as_str())
+                .await
+            {
+                self.open_resp_waiters.lock().await.remove(&seq);
+                return Err(e);
+            }
 
-            // Must wait openresp package then we can build a direct stream
-            let wait_result = timeout(Duration::from_secs(60), notify.notified()).await;
-            if wait_result.is_err() {
-                self.open_resp_notify.lock().await.remove(&seq); // Remove the notify if timeout
-                error!(
-                    "Timeout: open stream {} was not found within the time limit.",
-                    real_key.as_str()
+            // Wait for OpenResp with the result code. Fail fast on a
+            // non-zero code so we don't optimistically connect + send a
+            // HelloStream that the peer has already refused (which would
+            // show up on the peer as a "late or unknown HelloStream").
+            let wait_result = timeout(Duration::from_secs(60), rx).await;
+            let result_code = match wait_result {
+                Ok(Ok(code)) => code,
+                Ok(Err(_)) => {
+                    // Sender dropped — tunnel dropped the waiter.
+                    self.open_resp_waiters.lock().await.remove(&seq);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "tunnel dropped open resp waiter",
+                    ));
+                }
+                Err(_) => {
+                    self.open_resp_waiters.lock().await.remove(&seq);
+                    error!(
+                        "Timeout: open stream {} was not found within the time limit.",
+                        real_key.as_str()
+                    );
+                    return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout"));
+                }
+            };
+
+            if result_code != 0 {
+                warn!(
+                    "RTcp open stream {} rejected by peer, result={}",
+                    real_key.as_str(),
+                    result_code
                 );
-                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("peer rejected open stream, result={}", result_code),
+                ));
             }
 
             // Build a direct stream to remote stack
@@ -1733,10 +1828,19 @@ impl RTcpTunnel {
             self.build_helper.new_wait_stream(&real_key).await;
 
             //info!("insert session_key {} to wait ropen stream map",real_key.as_str());
-            self.post_ropen(seq, purpose, dest_port, dest_host, session_key.as_str())
-                .await?;
+            if let Err(e) = self
+                .post_ropen(seq, purpose, dest_port, dest_host, session_key.as_str())
+                .await
+            {
+                // Send failed: no HelloStream will ever arrive for this key,
+                // so the waiting slot must be reclaimed now rather than
+                // relying on the 30s timeout path.
+                self.build_helper.remove_wait_stream(&real_key).await;
+                return Err(e);
+            }
 
             // wait new stream with session_key from remote stack
+            // (wait_ropen_stream reclaims the slot on timeout internally).
             let stream = self.wait_ropen_stream(&session_key.as_str()).await?;
             let aes_stream: EncryptedStream<TcpStream> =
                 EncryptedStream::new(stream, &self.get_key(), &random_bytes);

@@ -5,6 +5,12 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Duration, timeout};
 
+// Stream establishment lifecycle constants.
+// Protocol requirement: a waiting-for-HelloStream entry MUST be reclaimed
+// within this duration, regardless of whether the peer ever sends HelloStream.
+pub const STREAM_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const STREAM_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 pub(crate) enum WaitStream {
     Waiting,
     OK(TcpStream),
@@ -33,12 +39,19 @@ impl RTcpStreamBuildHelper {
         }
     }
 
+    /// Deliver an incoming HelloStream to the waiter. If no waiter is
+    /// registered (either never registered, or already reclaimed by timeout),
+    /// the late stream is shut down — the protocol requires the initiator
+    /// to have given up by now.
     pub async fn notify_ropen_stream(&self, mut stream: TcpStream, key: &str) {
         let mut wait_streams = self.wait_ropen_stream_map.lock().await;
         let wait_session = wait_streams.get_mut(key);
         if wait_session.is_none() {
             let clone_map: Vec<String> = wait_streams.keys().cloned().collect();
-            error!("No wait session for {}, map is {:?}", key, clone_map);
+            error!(
+                "No wait session for {} (late or unknown HelloStream), map is {:?}",
+                key, clone_map
+            );
 
             let _ = stream.shutdown().await;
 
@@ -60,21 +73,40 @@ impl RTcpStreamBuildHelper {
         }
     }
 
+    /// Force-remove a waiting entry. Safe to call even if the entry is
+    /// absent (e.g. already delivered). Used on the initiator side to
+    /// release the slot when building a stream is aborted before
+    /// `wait_ropen_stream` is reached (e.g. send failure, outer timeout).
+    pub async fn remove_wait_stream(&self, key: &str) {
+        let mut map = self.wait_ropen_stream_map.lock().await;
+        map.remove(key);
+    }
+
     pub async fn wait_ropen_stream(&self, key: &str) -> Result<TcpStream, std::io::Error> {
-        let timeout_duration = Duration::from_secs(30);
+        self.wait_ropen_stream_with_timeout(key, STREAM_WAIT_TIMEOUT)
+            .await
+    }
+
+    pub async fn wait_ropen_stream_with_timeout(
+        &self,
+        key: &str,
+        timeout_duration: Duration,
+    ) -> Result<TcpStream, std::io::Error> {
         let start_time = std::time::Instant::now();
 
         loop {
-            // 检查是否超时
             if start_time.elapsed() >= timeout_duration {
                 warn!(
                     "Timeout: ropen stream {} was not found within the time limit.",
                     key
                 );
+                // Protocol requirement: always reclaim the slot on timeout so
+                // the waiting table cannot grow unboundedly under a peer that
+                // initiates streams and lets them expire.
+                self.wait_ropen_stream_map.lock().await.remove(key);
                 return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout"));
             }
 
-            // 检查 map 中是否有对应的 stream
             {
                 let mut map = self.wait_ropen_stream_map.lock().await;
                 if let Some(wait_stream) = map.remove(key) {
@@ -87,15 +119,19 @@ impl RTcpStreamBuildHelper {
                             map.insert(key.to_owned(), WaitStream::Waiting);
                         }
                     }
+                } else {
+                    // Entry was removed externally (e.g. by remove_wait_stream).
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "wait stream entry removed",
+                    ));
                 }
             }
 
-            // 等待一小段时间后再次检查，避免过度占用 CPU
             let remaining_time = timeout_duration - start_time.elapsed();
-            let check_interval = std::cmp::min(Duration::from_millis(100), remaining_time);
+            let check_interval = std::cmp::min(STREAM_WAIT_POLL_INTERVAL, remaining_time);
 
             if let Err(_) = timeout(check_interval, self.notify_ropen_stream.notified()).await {
-                // 超时继续循环检查
                 continue;
             }
         }
