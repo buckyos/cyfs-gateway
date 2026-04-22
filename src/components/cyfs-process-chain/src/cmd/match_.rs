@@ -347,6 +347,541 @@ impl CommandExecutor for MatchRegexCommandExecutor {
     }
 }
 
+#[derive(Clone, Debug)]
+enum TemplatePatternSegment {
+    Template(Vec<TemplateFragment>),
+    WildcardRest,
+}
+
+#[derive(Clone, Debug)]
+enum TemplateFragment {
+    Literal(String),
+    Capture(String),
+}
+
+#[derive(Clone, Copy)]
+struct TemplateMatchDefaults {
+    separator: char,
+    ignore_case: bool,
+}
+
+pub struct MatchPathCommandParser {
+    cmd: Command,
+}
+
+impl MatchPathCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("match-path")
+            .about("Match a path-like value using segment templates. Supports optional capture.")
+            .after_help(
+                r#"
+Arguments:
+  <value>      The path-like string to match.
+  <pattern>    The template pattern to match against.
+
+Options:
+  --capture name   Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --ignore-case    Perform case-insensitive matching (default is case-sensitive)
+
+Behavior:
+  - Uses '/' as the default segment separator.
+  - Pattern is evaluated dynamically at runtime.
+  - `{name}` captures text inside a single segment and never crosses '/'.
+  - `**` matches the remaining segments and must appear as the last segment.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first template capture,
+      name[2] is the second template capture, etc.
+  - Matching is case-sensitive by default.
+
+Examples:
+  match-path $REQ.path "/kapi/{service_id}/**"
+  match-path --capture parts $REQ.path "${route_prefix}/{node}/{plane}/**"
+"#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-insensitive matching (default is case-sensitive)"),
+            )
+            .arg(
+                Arg::new("capture")
+                    .long("capture")
+                    .value_name("name")
+                    .help("Store template match results into a fresh List variable"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("The input string or variable to match"),
+            )
+            .arg(
+                Arg::new("pattern")
+                    .required(true)
+                    .help("The template pattern"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for MatchPathCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Match
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        parse_template_match_command(
+            &self.cmd,
+            "match-path",
+            str_args,
+            args,
+            TemplateMatchDefaults {
+                separator: '/',
+                ignore_case: false,
+            },
+            Some("ignore_case"),
+            None,
+        )
+    }
+}
+
+pub struct MatchHostCommandParser {
+    cmd: Command,
+}
+
+impl MatchHostCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("match-host")
+            .about("Match a host-like value using segment templates. Supports optional capture.")
+            .after_help(
+                r#"
+Arguments:
+  <value>      The host-like string to match.
+  <pattern>    The template pattern to match against.
+
+Options:
+  --capture name     Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
+
+Behavior:
+  - Uses '.' as the default segment separator.
+  - Pattern is evaluated dynamically at runtime.
+  - `{name}` captures text inside a single host label and never crosses '.'.
+  - `**` matches the remaining labels and must appear as the last segment.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first template capture,
+      name[2] is the second template capture, etc.
+  - Matching is case-insensitive by default.
+
+Examples:
+  match-host $REQ.host "{app}.${THIS_ZONE_HOST}"
+  match-host --capture host $REQ.host "{app}-${THIS_ZONE_HOST}"
+"#,
+            )
+            .arg(
+                Arg::new("no_ignore_case")
+                    .long("no-ignore-case")
+                    .action(ArgAction::SetTrue)
+                    .help("Perform case-sensitive matching (default is case-insensitive)"),
+            )
+            .arg(
+                Arg::new("capture")
+                    .long("capture")
+                    .value_name("name")
+                    .help("Store template match results into a fresh List variable"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("The input string or variable to match"),
+            )
+            .arg(
+                Arg::new("pattern")
+                    .required(true)
+                    .help("The template pattern"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for MatchHostCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Match
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        parse_template_match_command(
+            &self.cmd,
+            "match-host",
+            str_args,
+            args,
+            TemplateMatchDefaults {
+                separator: '.',
+                ignore_case: true,
+            },
+            None,
+            Some("no_ignore_case"),
+        )
+    }
+}
+
+fn parse_template_match_command(
+    cmd: &Command,
+    command_name: &str,
+    str_args: Vec<&str>,
+    args: &CommandArgs,
+    defaults: TemplateMatchDefaults,
+    ignore_case_flag: Option<&str>,
+    no_ignore_case_flag: Option<&str>,
+) -> Result<CommandExecutorRef, String> {
+    let matches = cmd.clone().try_get_matches_from(&str_args).map_err(|e| {
+        let msg = format!("Invalid {} command: {:?}, {}", command_name, str_args, e);
+        error!("{}", msg);
+        msg
+    })?;
+
+    let capture = match matches.index_of("capture") {
+        Some(index) => {
+            let name = args[index].as_literal_str().ok_or_else(|| {
+                let msg = format!("Capture name must be a literal string: {:?}", args[index]);
+                error!("{}", msg);
+                msg
+            })?;
+            Some(name.to_string())
+        }
+        None => None,
+    };
+
+    let value_index = matches.index_of("value").ok_or_else(|| {
+        let msg = format!("Value argument is required for {} command", command_name);
+        error!("{}", msg);
+        msg
+    })?;
+    let value = args[value_index].clone();
+
+    let pattern_index = matches.index_of("pattern").ok_or_else(|| {
+        let msg = format!("Pattern argument is required for {} command", command_name);
+        error!("{}", msg);
+        msg
+    })?;
+    let pattern = args[pattern_index].clone();
+
+    let ignore_case = if let Some(flag) = ignore_case_flag {
+        matches.get_flag(flag)
+    } else if let Some(flag) = no_ignore_case_flag {
+        !matches.get_flag(flag)
+    } else {
+        defaults.ignore_case
+    };
+
+    let exec = TemplateMatchCommandExecutor::new(
+        command_name.to_owned(),
+        value,
+        pattern,
+        capture,
+        defaults.separator,
+        ignore_case,
+    );
+    Ok(Arc::new(Box::new(exec)))
+}
+
+pub struct TemplateMatchCommandExecutor {
+    command_name: String,
+    capture: Option<String>,
+    value: CommandArg,
+    pattern: CommandArg,
+    separator: char,
+    ignore_case: bool,
+}
+
+impl TemplateMatchCommandExecutor {
+    pub fn new(
+        command_name: String,
+        value: CommandArg,
+        pattern: CommandArg,
+        capture: Option<String>,
+        separator: char,
+        ignore_case: bool,
+    ) -> Self {
+        Self {
+            command_name,
+            capture,
+            value,
+            pattern,
+            separator,
+            ignore_case,
+        }
+    }
+
+    async fn build_capture_list(
+        full_match: &str,
+        captures: &[String],
+    ) -> Result<CollectionValue, String> {
+        let list = MemoryListCollection::new_ref();
+        list.push(CollectionValue::String(full_match.to_owned()))
+            .await?;
+        for capture in captures {
+            list.push(CollectionValue::String(capture.clone())).await?;
+        }
+
+        Ok(CollectionValue::List(list))
+    }
+
+    fn parse_pattern(&self, pattern: &str) -> Result<Vec<TemplatePatternSegment>, String> {
+        let raw_segments: Vec<&str> = pattern.split(self.separator).collect();
+        let mut segments = Vec::with_capacity(raw_segments.len());
+        for (index, segment) in raw_segments.iter().enumerate() {
+            if *segment == "**" {
+                if index + 1 != raw_segments.len() {
+                    let msg = format!(
+                        "{} pattern '{}' contains '**' before the last segment",
+                        self.command_name, pattern
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+                segments.push(TemplatePatternSegment::WildcardRest);
+                continue;
+            }
+
+            let fragments = self.parse_segment_template(pattern, segment)?;
+            segments.push(TemplatePatternSegment::Template(fragments));
+        }
+
+        Ok(segments)
+    }
+
+    fn parse_segment_template(
+        &self,
+        pattern: &str,
+        segment: &str,
+    ) -> Result<Vec<TemplateFragment>, String> {
+        let mut fragments = Vec::new();
+        let mut literal_start = 0usize;
+        let mut cursor = 0usize;
+
+        while let Some(rel_open) = segment[cursor..].find('{') {
+            let open = cursor + rel_open;
+            if literal_start < open {
+                fragments.push(TemplateFragment::Literal(
+                    segment[literal_start..open].to_owned(),
+                ));
+            }
+
+            let close = segment[open + 1..]
+                .find('}')
+                .map(|offset| open + 1 + offset)
+                .ok_or_else(|| {
+                    let msg = format!(
+                        "Invalid {} pattern '{}': missing closing '}}' in segment '{}'",
+                        self.command_name, pattern, segment
+                    );
+                    error!("{}", msg);
+                    msg
+                })?;
+
+            let name = &segment[open + 1..close];
+            if !is_valid_template_capture_name(name) {
+                let msg = format!(
+                    "Invalid {} pattern '{}': capture name '{}' must match [A-Za-z_][A-Za-z0-9_]*",
+                    self.command_name, pattern, name
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            fragments.push(TemplateFragment::Capture(name.to_owned()));
+            cursor = close + 1;
+            literal_start = cursor;
+        }
+
+        if literal_start < segment.len() {
+            fragments.push(TemplateFragment::Literal(
+                segment[literal_start..].to_owned(),
+            ));
+        }
+
+        if fragments.is_empty() {
+            fragments.push(TemplateFragment::Literal(String::new()));
+        }
+
+        Ok(fragments)
+    }
+
+    fn match_template(&self, value: &str, pattern: &str) -> Result<Option<Vec<String>>, String> {
+        let pattern_segments = self.parse_pattern(pattern)?;
+        let value_segments: Vec<&str> = value.split(self.separator).collect();
+        let mut captures = Vec::new();
+        let mut value_index = 0usize;
+
+        for segment in pattern_segments.iter() {
+            match segment {
+                TemplatePatternSegment::WildcardRest => return Ok(Some(captures)),
+                TemplatePatternSegment::Template(fragments) => {
+                    if value_index >= value_segments.len() {
+                        return Ok(None);
+                    }
+                    let segment_captures =
+                        self.match_segment_template(fragments, value_segments[value_index])?;
+                    let Some(segment_captures) = segment_captures else {
+                        return Ok(None);
+                    };
+                    captures.extend(segment_captures);
+                    value_index += 1;
+                }
+            }
+        }
+
+        if value_index == value_segments.len() {
+            Ok(Some(captures))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn match_segment_template(
+        &self,
+        fragments: &[TemplateFragment],
+        value: &str,
+    ) -> Result<Option<Vec<String>>, String> {
+        self.match_segment_from(fragments, value, 0, 0)
+    }
+
+    fn match_segment_from(
+        &self,
+        fragments: &[TemplateFragment],
+        value: &str,
+        fragment_index: usize,
+        offset: usize,
+    ) -> Result<Option<Vec<String>>, String> {
+        if fragment_index == fragments.len() {
+            return Ok((offset == value.len()).then(Vec::new));
+        }
+
+        match &fragments[fragment_index] {
+            TemplateFragment::Literal(literal) => {
+                if !segment_starts_with(&value[offset..], literal, self.ignore_case) {
+                    return Ok(None);
+                }
+
+                self.match_segment_from(
+                    fragments,
+                    value,
+                    fragment_index + 1,
+                    offset + literal.len(),
+                )
+            }
+            TemplateFragment::Capture(_name) => {
+                if fragment_index + 1 == fragments.len() {
+                    return Ok(Some(vec![value[offset..].to_owned()]));
+                }
+
+                for end in candidate_segment_end_offsets(value, offset) {
+                    if let Some(mut rest) =
+                        self.match_segment_from(fragments, value, fragment_index + 1, end)?
+                    {
+                        let mut captures = vec![value[offset..end].to_owned()];
+                        captures.append(&mut rest);
+                        return Ok(Some(captures));
+                    }
+                }
+
+                Ok(None)
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for TemplateMatchCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let value = self.value.evaluate_string(context).await?;
+        let pattern = self.pattern.evaluate_string(context).await?;
+
+        if let Some(captures) = self.match_template(&value, &pattern)? {
+            if let Some(name) = &self.capture {
+                let capture_list = Self::build_capture_list(&value, &captures).await?;
+                context.env().set(name, capture_list, None).await?;
+            }
+
+            Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                true,
+            )))
+        } else {
+            Ok(CommandResult::error_with_value(CollectionValue::Bool(
+                false,
+            )))
+        }
+    }
+}
+
+fn is_valid_template_capture_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn segment_starts_with(value: &str, prefix: &str, ignore_case: bool) -> bool {
+    match value.get(..prefix.len()) {
+        Some(candidate) => segment_text_eq(candidate, prefix, ignore_case),
+        None => false,
+    }
+}
+
+fn segment_text_eq(left: &str, right: &str, ignore_case: bool) -> bool {
+    if ignore_case {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+fn candidate_segment_end_offsets(value: &str, start: usize) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    offsets.push(value.len());
+
+    let tail = &value[start..];
+    for (rel, _) in tail.char_indices() {
+        if rel == 0 {
+            continue;
+        }
+        offsets.push(start + rel);
+    }
+
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets.reverse();
+    offsets
+}
+
 // EQ command, like: eq REQ_HEADER.host "localhost"; eq --ignore-case REQ_HEADER.host "LOCALHOST"; eq --loose 1 "1"
 pub struct EQCommandParser {
     cmd: Command,

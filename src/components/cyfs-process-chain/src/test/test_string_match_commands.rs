@@ -401,6 +401,67 @@ const PROCESS_CHAIN_MATCH_REGEX_CAPTURE_FRESH_LIST: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_MATCH_PATH_TEMPLATE: &str = r#"
+<process_chain_lib id="match_path_template_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local route_prefix="/.cluster/klog";
+                local path="/.cluster/klog/ood1/admin/cluster-state";
+                match-path --capture cap $path "${route_prefix}/{node}/{plane}/**" || return --from lib "path_match_fail";
+                eq $cap[0] "/.cluster/klog/ood1/admin/cluster-state" || return --from lib "path_capture_0_fail";
+                eq $cap[1] "ood1" || return --from lib "path_capture_1_fail";
+                eq $cap[2] "admin" || return --from lib "path_capture_2_fail";
+                local stale=${cap?.[3] ?? "missing"};
+                eq $stale "missing" || return --from lib "path_capture_stale_index_fail";
+
+                local exact="/kapi/system_config";
+                match-path --capture cap $exact "/kapi/{service_id}" || return --from lib "path_exact_fail";
+                eq $cap[0] "/kapi/system_config" || return --from lib "path_exact_capture_0_fail";
+                eq $cap[1] "system_config" || return --from lib "path_exact_capture_1_fail";
+                local overwritten=${cap?.[2] ?? "missing"};
+                eq $overwritten "missing" || return --from lib "path_capture_overwrite_fail";
+
+                match-path "/API/Users" "/api/users" && return --from lib "path_case_sensitive_should_fail";
+                match-path --ignore-case "/API/Users" "/api/users" || return --from lib "path_ignore_case_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_MATCH_HOST_TEMPLATE: &str = r#"
+<process_chain_lib id="match_host_template_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local zone="app1.com";
+
+                match-host --capture cap "buckyos-app1.com" "{app}-${zone}" || return --from lib "host_hyphen_match_fail";
+                eq $cap[0] "buckyos-app1.com" || return --from lib "host_hyphen_capture_0_fail";
+                eq $cap[1] "buckyos" || return --from lib "host_hyphen_capture_1_fail";
+
+                match-host "www.buckyos-app1.com" "{app}-${zone}" && return --from lib "host_hyphen_should_not_match_prefixed_host";
+
+                match-host --capture cap "Api.App1.Com" "{app}.${zone}" || return --from lib "host_dot_match_fail";
+                eq $cap[0] "Api.App1.Com" || return --from lib "host_dot_capture_0_fail";
+                eq $cap[1] "Api" || return --from lib "host_dot_capture_1_fail";
+
+                match-host --no-ignore-case "Api.App1.Com" "{app}.${zone}" && return --from lib "host_case_sensitive_should_fail";
+
+                match-host --capture cap "api-stage.app1.com" "{app}-{env}.${zone}" || return --from lib "host_multi_capture_fail";
+                eq $cap[1] "api" || return --from lib "host_multi_capture_1_fail";
+                eq $cap[2] "stage" || return --from lib "host_multi_capture_2_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 #[tokio::test]
 async fn test_range_command_basic_flow() -> Result<(), String> {
     init_test_logger();
@@ -889,6 +950,53 @@ async fn test_match_regex_capture_overwrites_with_fresh_list() -> Result<(), Str
     let ret = exec
         .execute_lib("match_regex_capture_fresh_list_lib")
         .await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_match_path_template_supports_dynamic_prefix_and_wildcard_tail() -> Result<(), String>
+{
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_match_path_template");
+    hook_point
+        .load_process_chain_lib(
+            "match_path_template_lib",
+            0,
+            PROCESS_CHAIN_MATCH_PATH_TEMPLATE,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-match-path-template")?;
+    let hook_point_env = HookPointEnv::new("test-match-path-template", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("match_path_template_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_match_host_template_supports_hyphen_and_dot_forms() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_match_host_template");
+    hook_point
+        .load_process_chain_lib(
+            "match_host_template_lib",
+            0,
+            PROCESS_CHAIN_MATCH_HOST_TEMPLATE,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-match-host-template")?;
+    let hook_point_env = HookPointEnv::new("test-match-host-template", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("match_host_template_lib").await?;
     assert_eq!(ret.value(), "ok");
 
     Ok(())

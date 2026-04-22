@@ -100,6 +100,14 @@ impl CommandParserFactory {
             "match-reg",
             Arc::new(Box::new(MatchRegexCommandParser::new())),
         );
+        self.register(
+            "match-path",
+            Arc::new(Box::new(MatchPathCommandParser::new())),
+        );
+        self.register(
+            "match-host",
+            Arc::new(Box::new(MatchHostCommandParser::new())),
+        );
         self.register("eq", Arc::new(Box::new(EQCommandParser::new())));
         self.register("ne", Arc::new(Box::new(NECommandParser::new())));
         self.register("gt", Arc::new(Box::new(create_gt_parser())));

@@ -1418,6 +1418,102 @@ Examples:
   match-reg --capture parts $REQ_HEADER.host "^(.+)\.(local|dev)$"
 ```
 
+### `match-path`
+```
+Match a path-like value using segment templates. Supports optional capture.
+
+Usage: match-path [OPTIONS] <value> <pattern>
+
+Arguments:
+  <value>
+          The input string or variable to match
+
+  <pattern>
+          The template pattern to match against
+
+Options:
+      --ignore-case
+          Perform case-insensitive matching (default is case-sensitive)
+
+      --capture <name>
+          Store template match results into a fresh List variable
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>      The path-like string to match.
+  <pattern>    The template pattern to match against.
+
+Options:
+  --capture name   Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --ignore-case    Perform case-insensitive matching (default is case-sensitive)
+
+Behavior:
+  - Uses '/' as the default segment separator.
+  - Pattern is evaluated dynamically at runtime.
+  - `{name}` captures text inside a single segment and never crosses '/'.
+  - `**` matches the remaining segments and must appear as the last segment.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first template capture,
+      name[2] is the second template capture, etc.
+  - Matching is case-sensitive by default.
+
+Examples:
+  match-path $REQ.path "/kapi/{service_id}/**"
+  match-path --capture parts $REQ.path "${route_prefix}/{node}/{plane}/**"
+```
+
+### `match-host`
+```
+Match a host-like value using segment templates. Supports optional capture.
+
+Usage: match-host [OPTIONS] <value> <pattern>
+
+Arguments:
+  <value>
+          The input string or variable to match
+
+  <pattern>
+          The template pattern to match against
+
+Options:
+      --no-ignore-case
+          Perform case-sensitive matching (default is case-insensitive)
+
+      --capture <name>
+          Store template match results into a fresh List variable
+
+  -h, --help
+          Print help
+
+
+Arguments:
+  <value>      The host-like string to match.
+  <pattern>    The template pattern to match against.
+
+Options:
+  --capture name     Store template match results into a fresh List variable accessible as name[0], name[1], ...
+  --no-ignore-case   Perform case-sensitive matching (default is case-insensitive)
+
+Behavior:
+  - Uses '.' as the default segment separator.
+  - Pattern is evaluated dynamically at runtime.
+  - `{name}` captures text inside a single host label and never crosses '.'.
+  - `**` matches the remaining labels and must appear as the last segment.
+  - If --capture is provided, match results are saved into a fresh List as:
+      name[0] is the full matched text,
+      name[1] is the first template capture,
+      name[2] is the second template capture, etc.
+  - Matching is case-insensitive by default.
+
+Examples:
+  match-host $REQ.host "{app}.${THIS_ZONE_HOST}"
+  match-host --capture host $REQ.host "{app}-${THIS_ZONE_HOST}"
+```
+
 ### `range`
 ```
 Check if a variable's value is within a numeric range.

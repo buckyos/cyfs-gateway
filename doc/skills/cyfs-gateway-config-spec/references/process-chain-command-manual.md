@@ -115,6 +115,8 @@ delete --block tmp_value
 | --- | --- | --- |
 | `match` | `match [--no-ignore-case] <value> <glob>` | glob 匹配，默认大小写不敏感 |
 | `match-reg` | `match-reg [--capture name] [--no-ignore-case] <value> <regex>` | 正则匹配；可把匹配结果写入一个新的 List，并通过 `name[0]`、`name[1]`... 访问 |
+| `match-path` | `match-path [--capture name] [--ignore-case] <value> <pattern>` | path 模板匹配；默认按 `/` 分段，支持 `{name}` 捕获和尾部 `**` |
+| `match-host` | `match-host [--capture name] [--no-ignore-case] <value> <pattern>` | host 模板匹配；默认按 `.` 分 label，支持 `{name}` 捕获和尾部 `**` |
 | `eq` | `eq [--ignore-case] [--loose] <left> <right>` | 相等比较；默认强类型比较 |
 | `ne` | `ne [--ignore-case] [--loose] <left> <right>` | 不等比较 |
 | `gt` | `gt [--loose] <left> <right>` | 数值大于 |
@@ -132,6 +134,12 @@ delete --block tmp_value
   - `name[1]` 是第一个捕获组
   - `name[2]` 是第二个捕获组，以此类推
   - 未命中的可选捕获组会写成 `Null`，以保持索引稳定
+- `match-path` / `match-host` 用模板，不是 regex：
+  - `match-path` 默认按 `/` 分段，默认大小写敏感
+  - `match-host` 默认按 `.` 分 label，默认大小写不敏感
+  - `{name}` 只会在单个 segment / label 内捕获，不会跨默认分隔符
+  - `**` 匹配剩余所有 segment / label，并且必须在最后
+  - `--capture name` 同样会写一个新的 List：`name[0]` 是完整匹配文本，后续索引按模板捕获顺序排列
 - `eq` / `ne`：
   - 默认强类型比较
   - `--ignore-case` 只对字符串比较有意义
@@ -143,6 +151,8 @@ delete --block tmp_value
 ```txt
 match $REQ.path "/api/*" && call-server api;
 match-reg --capture hp $REQ.host "^([a-zA-Z0-9_]+)[-.]" || reject;
+match-path --capture cap $REQ.path "${route_prefix}/{node}/{plane}/**" || reject;
+match-host --capture cap $REQ.host "{app}.${THIS_ZONE_HOST}" || reject;
 eq --ignore-case $REQ.method "GET" && accept;
 gt --loose $REQ.content_length 1048576 && reject;
 range $REQ.target.port 1000 2000 && accept;

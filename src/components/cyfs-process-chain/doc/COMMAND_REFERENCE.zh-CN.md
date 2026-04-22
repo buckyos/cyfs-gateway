@@ -1417,6 +1417,102 @@
   match-reg --capture parts $REQ_HEADER.host "^(.+)\.(local|dev)$"
 ```
 
+### `match-path`
+```
+使用按段模板匹配 path 风格的值，支持可选捕获。
+
+用法: match-path [OPTIONS] <value> <pattern>
+
+参数:
+  <value>
+          要匹配的输入字符串或变量
+
+  <pattern>
+          要匹配的模板模式
+
+选项:
+      --ignore-case
+          执行大小写不敏感匹配（默认大小写敏感）
+
+      --capture <name>
+          把模板匹配结果写入一个新的 List 变量
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <value>      要匹配的 path 风格字符串。
+  <pattern>    要使用的模板模式。
+
+选项:
+  --capture name   将模板匹配结果写入一个新的 List 变量，可通过 name[0]、name[1] ... 访问
+  --ignore-case    执行大小写不敏感匹配（默认大小写敏感）
+
+行为:
+  - 使用 `/` 作为默认分段符。
+  - pattern 会在运行时动态求值。
+  - `{name}` 会在单个 segment 内捕获文本，不会跨越 `/`。
+  - `**` 表示匹配剩余所有 segment，并且必须出现在最后一个 segment。
+  - 如果提供 `--capture`，则匹配结果会写入一个新的 List：
+      name[0] 表示完整匹配文本，
+      name[1] 表示第一个模板捕获，
+      name[2] 表示第二个模板捕获，以此类推。
+  - 默认大小写敏感。
+
+示例:
+  match-path $REQ.path "/kapi/{service_id}/**"
+  match-path --capture parts $REQ.path "${route_prefix}/{node}/{plane}/**"
+```
+
+### `match-host`
+```
+使用按段模板匹配 host 风格的值，支持可选捕获。
+
+用法: match-host [OPTIONS] <value> <pattern>
+
+参数:
+  <value>
+          要匹配的输入字符串或变量
+
+  <pattern>
+          要匹配的模板模式
+
+选项:
+      --no-ignore-case
+          执行大小写敏感匹配（默认大小写不敏感）
+
+      --capture <name>
+          把模板匹配结果写入一个新的 List 变量
+
+  -h, --help
+          显示帮助
+
+
+参数:
+  <value>      要匹配的 host 风格字符串。
+  <pattern>    要使用的模板模式。
+
+选项:
+  --capture name     将模板匹配结果写入一个新的 List 变量，可通过 name[0]、name[1] ... 访问
+  --no-ignore-case   执行大小写敏感匹配（默认大小写不敏感）
+
+行为:
+  - 使用 `.` 作为默认分段符。
+  - pattern 会在运行时动态求值。
+  - `{name}` 会在单个 host label 内捕获文本，不会跨越 `.`。
+  - `**` 表示匹配剩余所有 label，并且必须出现在最后一个 label。
+  - 如果提供 `--capture`，则匹配结果会写入一个新的 List：
+      name[0] 表示完整匹配文本，
+      name[1] 表示第一个模板捕获，
+      name[2] 表示第二个模板捕获，以此类推。
+  - 默认大小写不敏感。
+
+示例:
+  match-host $REQ.host "{app}.${THIS_ZONE_HOST}"
+  match-host --capture host $REQ.host "{app}-${THIS_ZONE_HOST}"
+```
+
 ### `range`
 ```
 检查某个变量值是否位于数值范围内。
