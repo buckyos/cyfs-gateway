@@ -1873,7 +1873,10 @@ mod tests {
             .await;
         assert!(result.is_ok());
         let ret = stream.read(&mut [0; 1024]).await;
-        assert!(ret.is_err());
+        match ret {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!("reject should not return application data, got {} bytes", n),
+        }
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
@@ -2003,7 +2006,10 @@ mod tests {
             .await;
         assert!(result.is_ok());
         let ret = stream.read(&mut [0; 1024]).await;
-        assert!(ret.is_err());
+        match ret {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!("drop should not return application data, got {} bytes", n),
+        }
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);

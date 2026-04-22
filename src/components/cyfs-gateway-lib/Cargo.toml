@@ -26,6 +26,7 @@ once_cell.workspace = true
 fern = "*"
 chrono.workspace = true
 aes = "0.8.4"
+aes-gcm = { version = "0.10", features = ["aes", "alloc"] }
 ctr = "0.9.2"
 cipher = "0.4.4"
 futures.workspace = true

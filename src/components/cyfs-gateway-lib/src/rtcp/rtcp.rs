@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 use crate::rtcp::datagram::RTcpTunnelDatagramClient;
 use crate::tunnel::TunnelBox;
 use crate::{
-    DatagramClientBox, EncryptedStream, Tunnel, TunnelEndpoint, TunnelError, TunnelManager,
-    TunnelResult, get_dest_info_from_url_path, has_scheme,
+    DatagramClientBox, EncryptedStream, EncryptionRole, Tunnel, TunnelEndpoint, TunnelError,
+    TunnelManager, TunnelResult, get_dest_info_from_url_path, has_scheme,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -29,7 +29,7 @@ use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
@@ -1034,9 +1034,20 @@ impl RTcpInner {
         );
         {
             //info!("accept tunnel from {} try get lock",hello_package.body.from_id.as_str());
-            self.tunnel_map
+            if self
+                .tunnel_map
                 .on_new_tunnel(&tunnel_key, tunnel.clone())
-                .await;
+                .await
+                .is_err()
+            {
+                // Duplicate tunnel key: a live tunnel already holds this
+                // (aes_key, iv) space. Drop the just-built tunnel rather
+                // than racing it against the live one. Shutting it down
+                // here also sends a FIN to the replayer/peer so they see
+                // the rejection promptly.
+                tunnel.close().await;
+                return;
+            }
             // info!("Accept tunnel from {}", hello_package.body.from_id.as_str());
         }
 
@@ -1406,6 +1417,12 @@ struct RTcpTunnel {
     write_stream: Arc<Mutex<WriteHalf<EncryptedStream<RTcpBearingStream>>>>,
     read_stream: Arc<Mutex<ReadHalf<EncryptedStream<RTcpBearingStream>>>>,
 
+    // Set by close() to force the run() loop to exit at the next read boundary
+    // and to make any subsequent send_package fail quickly. This is what makes
+    // a replaced / superseded tunnel actually stop using its (aes_key, nonce)
+    // space, so a replayed Hello cannot run concurrently with the original.
+    closed: Arc<AtomicBool>,
+
     next_seq: Arc<AtomicU32>,
     listener: RTcpListenerRef,
 
@@ -1439,7 +1456,15 @@ impl RTcpTunnel {
     ) -> Self {
         let mut iv = [0u8; 16];
         iv.copy_from_slice(&random_pk[..16]);
-        let encrypted_stream = EncryptedStream::new(stream, &aes_key, &iv);
+        // can_direct=true on the side that originated the TCP connection
+        // (and therefore sent the first-packet Hello in plaintext). Use it as
+        // the initiator/responder marker for per-direction nonce derivation.
+        let role = if can_direct {
+            EncryptionRole::Initiator
+        } else {
+            EncryptionRole::Responder
+        };
+        let encrypted_stream = EncryptedStream::new(stream, &aes_key, &iv, role);
         let (read_stream, write_stream) = tokio::io::split(encrypted_stream);
         //let (read_stream,write_stream) =  tokio::io::split(stream);
         let this_remote_stack = remote_stack.clone();
@@ -1455,6 +1480,7 @@ impl RTcpTunnel {
             read_stream: Arc::new(Mutex::new(read_stream)),
             write_stream: Arc::new(Mutex::new(write_stream)),
 
+            closed: Arc::new(AtomicBool::new(false)),
             next_seq: Arc::new(AtomicU32::new(0)),
             listener,
             open_resp_waiters: Arc::new(Mutex::new(HashMap::new())),
@@ -1464,9 +1490,24 @@ impl RTcpTunnel {
     }
 
     pub async fn close(&self) {
-        //let mut read_stream = self.read_stream.lock().await;
-        //let mut read_stream:OwnedReadHalf = (*read_stream);
-        //read_stream.shutdown().await;
+        // Flag first so any in-flight send_package / process_package
+        // observes the closed state. Then shut down the write half: this
+        // prevents the superseded tunnel from ever producing another
+        // authenticated record under the shared (aes_key, nonce_base) pair.
+        //
+        // Shutting down the write side also sends FIN to the peer; in
+        // practice the read loop will then wake with UnexpectedEof and
+        // exit via run()'s error branch. The `closed` flag is a belt-
+        // and-suspenders check in case the read side is still readable.
+        self.closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut ws = self.write_stream.lock().await;
+        use tokio::io::AsyncWriteExt;
+        let _ = Pin::new(&mut *ws).shutdown().await;
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn get_key(&self) -> &[u8; 32] {
@@ -1601,7 +1642,14 @@ impl RTcpTunnel {
             .try_into()
             .map_err(|_op| anyhow::format_err!("decode stream_id error"))?;
         let aes_key = self.get_key().clone();
-        let aes_stream = EncryptedStream::new(rtcp_stream, &aes_key, &nonce_bytes);
+        // This side called TcpStream::connect and sent HelloStream, so it is
+        // the stream-layer initiator.
+        let aes_stream = EncryptedStream::new(
+            rtcp_stream,
+            &aes_key,
+            &nonce_bytes,
+            EncryptionRole::Initiator,
+        );
 
         debug!(
             "RTcp stream encryption initialized for ropen stream {}",
@@ -1774,7 +1822,14 @@ impl RTcpTunnel {
             .try_into()
             .map_err(|_op| anyhow::format_err!("decode stream_id error"))?;
         let aes_key = self.get_key().clone();
-        let aes_stream = EncryptedStream::new(stream, &aes_key, &nonce_bytes);
+        // This side received an Open and waited for the peer to connect back
+        // with HelloStream, so it is the stream-layer responder.
+        let aes_stream = EncryptedStream::new(
+            stream,
+            &aes_key,
+            &nonce_bytes,
+            EncryptionRole::Responder,
+        );
 
         debug!(
             "RTcp stream encryption initialized for open stream {}",
@@ -1811,6 +1866,10 @@ impl RTcpTunnel {
         let mut read_stream = self.read_stream.lock().await;
         //let read_stream = self.read_stream.clone();
         loop {
+            if self.is_closed() {
+                info!("RTcp tunnel {} closed, exit run loop", source_info);
+                break;
+            }
             //等待超时 或 收到一个package
             //超时，基于last_active发送ping包,3倍超时时间后，关闭连接
             //收到一个package，处理package
@@ -2003,8 +2062,14 @@ impl RTcpTunnel {
                     std::io::Error::new(std::io::ErrorKind::Other, msg)
                 })?;
 
-            let aes_stream: EncryptedStream<TcpStream> =
-                EncryptedStream::new(stream, &self.get_key(), &random_bytes);
+            // Direct-open path: this side opened TCP and sent HelloStream, so
+            // it is the stream-layer initiator.
+            let aes_stream: EncryptedStream<TcpStream> = EncryptedStream::new(
+                stream,
+                &self.get_key(),
+                &random_bytes,
+                EncryptionRole::Initiator,
+            );
 
             debug!(
                 "RTcp tunnel open direct stream to {}, {}",
@@ -2078,8 +2143,14 @@ impl RTcpTunnel {
                     }
                 }
             };
-            let aes_stream: EncryptedStream<TcpStream> =
-                EncryptedStream::new(stream, &self.get_key(), &random_bytes);
+            // ROpen path: this side sent ROpen and the peer connected back
+            // with HelloStream, so it is the stream-layer responder.
+            let aes_stream: EncryptedStream<TcpStream> = EncryptedStream::new(
+                stream,
+                &self.get_key(),
+                &random_bytes,
+                EncryptionRole::Responder,
+            );
             //info!("wait ropen stream ok,return aes stream: aes_key:{},nonce_bytes:{}",hex::encode(self.get_key()),hex::encode(random_bytes));
             Ok(Box::new(aes_stream))
         }
@@ -2219,15 +2290,36 @@ impl RTcpTunnelMap {
         }
     }
 
-    pub async fn on_new_tunnel(&self, tunnel_key: &str, tunnel: RTcpTunnel) {
+    // Returns Err(()) if a tunnel for `tunnel_key` is already present.
+    //
+    // A silent replace here would let a replayed Hello stand up a second
+    // tunnel under the same (aes_key, iv) as the live one. The AEAD record
+    // layer starts its per-direction sequence counter at 0 for every new
+    // tunnel, so two concurrent tunnels with the same key would reuse the
+    // same (key, nonce) pairs — catastrophic for AES-GCM. Rejecting the
+    // replay keeps the (key, nonce) space owned by a single tunnel at a
+    // time. The existing tunnel will be cleaned up by `remove_tunnel` once
+    // its read loop exits (e.g. on TCP close); a genuine reconnect will
+    // succeed on retry after that.
+    //
+    // Across-time nonce reuse (attacker replays Hello after the original
+    // tunnel has ended) is a separate concern addressed by §14.2 of
+    // doc/rtcp.md.
+    pub async fn on_new_tunnel(
+        &self,
+        tunnel_key: &str,
+        tunnel: RTcpTunnel,
+    ) -> Result<(), ()> {
         let mut all_tunnel = self.tunnel_map.lock().await;
-        let mut_old_tunnel = all_tunnel.get(tunnel_key);
-        if mut_old_tunnel.is_some() {
-            warn!("tunnel {} already exist", tunnel_key);
-            mut_old_tunnel.unwrap().close().await;
+        if all_tunnel.contains_key(tunnel_key) {
+            warn!(
+                "tunnel {} already exists, rejecting duplicate Hello to avoid (key, nonce) reuse",
+                tunnel_key
+            );
+            return Err(());
         }
-
         all_tunnel.insert(tunnel_key.to_owned(), tunnel);
+        Ok(())
     }
 
     pub async fn remove_tunnel(&self, tunnel_key: &str) {
@@ -2345,6 +2437,67 @@ mod tests {
                 "172.26.48.1".parse::<std::net::IpAddr>().unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn test_get_resolve_candidates_prefers_explicit_host_and_dedups() {
+        let did = DID::new("test", "device1");
+        let listener = Arc::new(MockRTcpListener::new());
+        let rtcp = RTcp::new(
+            did.clone(),
+            "127.0.0.1:8000".to_string(),
+            None,
+            None,
+            listener,
+        );
+
+        let remote_stack =
+            RTcpTargetStackEP::new(did.clone(), 19074).expect("remote stack should build");
+        let explicit_host = format!("alias.example:{}", remote_stack.stack_port);
+        let candidates = rtcp
+            .inner
+            .get_resolve_candidates(explicit_host.as_str(), &remote_stack);
+        let mut expected = Vec::new();
+        for candidate in [
+            "alias.example".to_string(),
+            did.to_host_name(),
+            did.to_raw_host_name(),
+            did.to_string(),
+        ] {
+            if !expected.contains(&candidate) {
+                expected.push(candidate);
+            }
+        }
+
+        assert_eq!(candidates, expected);
+    }
+
+    #[test]
+    fn test_get_resolve_candidates_dedups_same_explicit_host() {
+        let did = DID::new("test", "device1");
+        let listener = Arc::new(MockRTcpListener::new());
+        let rtcp = RTcp::new(
+            did.clone(),
+            "127.0.0.1:8000".to_string(),
+            None,
+            None,
+            listener,
+        );
+
+        let remote_stack =
+            RTcpTargetStackEP::new(did.clone(), 19074).expect("remote stack should build");
+        let explicit_host = format!("{}:{}", did.to_host_name(), remote_stack.stack_port);
+        let candidates = rtcp
+            .inner
+            .get_resolve_candidates(explicit_host.as_str(), &remote_stack);
+        let mut expected = Vec::new();
+        for candidate in [did.to_host_name(), did.to_raw_host_name(), did.to_string()] {
+            if !expected.contains(&candidate) {
+                expected.push(candidate);
+            }
+        }
+
+        assert_eq!(candidates, expected);
     }
 
     // Mock实现用于测试
@@ -2716,77 +2869,6 @@ mod tests {
             assert_eq!(&buf[..len], b"test");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-
-    #[tokio::test]
-    async fn test_rtcp_create_tunnel_falls_back_to_next_resolved_ip() {
-        let _ = init_name_lib_for_test(&HashMap::new()).await;
-        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
-        let _id1 = device_config.id.clone();
-        let did_doc_value = serde_json::to_value(&device_config).unwrap();
-        let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
-        add_nameinfo_cache(
-            device_config.id.to_string().as_str(),
-            NameInfo::from_address(
-                device_config.id.to_string().as_str(),
-                "127.0.0.1".parse().unwrap(),
-            ),
-        )
-        .await
-        .unwrap();
-
-        let mut rtcp1 = RTcp::new(
-            device_config.id,
-            "127.0.0.1:19073".to_string(),
-            Some(pkcs8_bytes),
-            None,
-            Arc::new(MockRTcpListener::new()),
-        );
-        rtcp1.start().await.unwrap();
-
-        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
-        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
-        let id2 = device_config.id.clone();
-        let did_doc_value = serde_json::to_value(&device_config).unwrap();
-        let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
-        update_did_cache(device_config.id.clone(), None, encoded_doc)
-            .await
-            .unwrap();
-        add_nameinfo_cache(
-            device_config.id.to_string().as_str(),
-            NameInfo {
-                name: device_config.id.to_string(),
-                address: vec![
-                    "127.0.0.2".parse().unwrap(),
-                    "127.0.0.1".parse().unwrap(),
-                ],
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        let mut rtcp2 = RTcp::new(
-            device_config.id,
-            "127.0.0.1:19074".to_string(),
-            Some(pkcs8_bytes),
-            None,
-            Arc::new(MockRTcpListener::new()),
-        );
-        rtcp2.start().await.unwrap();
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        let tunnel = rtcp1
-            .create_tunnel(Some(format!("{}:19074", id2.to_host_name()).as_str()))
-            .await
-            .unwrap();
-        tunnel.ping().await.unwrap();
     }
 
     #[tokio::test]

@@ -325,14 +325,30 @@ RTCP 当前实现里有两层加密语义：
 - `Hello` 和 `HelloStream` 首包本身不加密。
 - 一旦 tunnel 或 stream 被正式接管，后续字节都走 `EncryptedStream`。
 
+`EncryptedStream` 使用 `AES-256-GCM` AEAD 记录层，同时提供保密性和完整性。线上记录格式：
+
+```
++--------+---------------------+---------+
+| len u16| ciphertext (N)      | tag(16) |
++--------+---------------------+---------+
+```
+
+- `len` 为大端序 `u16`，等于 `N + 16`（密文长度加上 GCM tag），不包含自身 2 字节。
+- 每条记录的明文长度 `N` 不超过 `16 KiB`。
+- tag 是 16 字节 GCM 认证标签；任何篡改都会被接收端识别并使 `poll_read` 报 `InvalidData`。
+
 IV/nonce 选择规则：
 
 - tunnel 控制通道
-  - 使用 `tunnel_token.xpub` 解码后的 32 字节中的前 16 字节作为 IV。
+  - 使用 `tunnel_token.xpub` 解码后的 32 字节中的前 16 字节作为 base IV。
 - 业务 stream
-  - 使用 `streamid` 解码后的 16 字节作为 IV。
+  - 使用 `streamid` 解码后的 16 字节作为 base IV。
+- 每条记录的 96-bit GCM nonce 由以下步骤派生：
+  1. 以 base IV 和方向标签（`"rtcp-aead-nonce/A"` 或 `"rtcp-aead-nonce/B"`）做 `SHA-256`，取前 12 字节作为该方向的 `nonce_base`。
+  2. 将当前方向的 64-bit 记录序号以大端序 XOR 到 `nonce_base` 的低 8 字节，得到每条记录的唯一 nonce。
+- tunnel 的两端根据角色（initiator/responder）选择不同方向的 `nonce_base`，保证两端写方向的 (key, nonce) 空间互不重叠。
 
-业务 stream 复用的是“所属 tunnel 的同一把 AES key”，只是 IV 改成 `streamid` 对应的值。
+业务 stream 复用的是“所属 tunnel 的同一把 AES key”，只是 base IV 改成 `streamid` 对应的值，nonce 派生规则相同。
 
 ## 6. Tunnel 建立流程
 
@@ -503,26 +519,27 @@ RTCP stack 的 `device_config_path` 当前支持两类文件内容：
 
 本节记录的是“当前实现已经确认存在，但暂未完成修订”的协议问题。它们不是建议级优化，而是后续协议升级时必须正式文档化并落地的 TODO。
 
-### 14.1 TODO: 为 tunnel 与 stream 增加完整性保护
+### 14.1 tunnel 与 stream 完整性保护（已落地）
 
-当前现状：
+历史问题：
 
-- RTCP 的 tunnel 和业务 stream 当前使用 `AES-256-CTR` 做字节流加密。
-- 当前协议帧中没有 MAC，也没有 AEAD tag。
-- 因此它只提供保密性，不提供传输完整性。
+- 早期实现使用 `AES-256-CTR` 做字节流加密，没有 MAC，也没有 AEAD tag，只提供保密性。
+- 链路上的攻击者即使无法解密，也可以对密文做按位篡改，`Open` / `ROpen` / `Ping` / 业务字节都有被静默篡改的风险。
+- 两端还使用了相同的 `(key, iv)` 和独立递增的 CTR 计数器，存在 keystream 复用的隐患。
 
-风险：
+当前实现：
 
-- 链路上的攻击者即使无法解密，也可以对密文做按位篡改。
-- 对控制面来说，这意味着 `Open`、`ROpen`、`Ping`、响应包等都有被静默篡改的风险。
-- 对业务面来说，这意味着经 RTCP 转发的应用数据可能被无告警篡改。
+- tunnel 与业务 stream 已升级为 `AES-256-GCM` AEAD 记录层，同时提供保密性与完整性。详情见 §5.5。
+- 每条记录的 96-bit nonce 由 `SHA-256(iv || direction)` 派生的 `nonce_base` 与 64-bit 记录序号 XOR 得到；initiator / responder 使用不同方向的 `nonce_base`，两端写方向的 `(key, nonce)` 空间不会碰撞。
+- 任何一次解密失败都会立即把读端返回 `InvalidData`，不再向上层回吐可疑明文。
+- 读端在收到第一条被认证的 AEAD 记录之前遇到 FIN / `Ok(0)`，一律按 `UnexpectedEof` 上报；避免在没有任何认证证据的情况下把“对端悄悄断开”当作正常结束。
+- `RTcpTunnel::close()` 现在真正会关闭写半边并设置关闭标记，`run()` 循环会在下一个读边界退出；`on_new_tunnel` 不再静默替换已存在的 tunnel，而是直接拒绝重复的 `Hello`——否则新旧两条 tunnel 在同一把 `(aes_key, iv)` 上各自从序号 0 开始递增，会把 `(key, nonce)` 空间重新打开。
 
-协议 TODO：
+这是一次 **不兼容的协议升级**：新实现不能与旧的 `AES-256-CTR` 实现互通。部署升级时两端必须一起换到 AEAD 版本。
 
-- 后续协议版本需要把 tunnel 和 stream 的传输层升级为“带认证的加密”。
-- 推荐方向是直接改为 AEAD，例如 `AES-GCM` 或 `ChaCha20-Poly1305`。
-- 如果出于兼容性原因不能一步切换到 AEAD，至少也要在每个加密记录上补 `encrypt-then-MAC`。
-- 在正式完成该升级前，不应把当前 RTCP 视为“具备完整传输安全”的协议。
+仍然建议跟进：
+
+- 和 §14.2 的握手重构一起，把记录序号的初始值、方向标签都纳入正式握手确认，避免中途静默切换。
 
 ### 14.2 TODO: 为 Hello 建立抗重放与密钥确认机制
 
