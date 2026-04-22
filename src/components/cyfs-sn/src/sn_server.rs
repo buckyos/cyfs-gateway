@@ -3,16 +3,16 @@ use crate::sn_db::{self, *};
 use crate::sqlite_db::SqliteSnDB;
 use crate::v2::{
     handle_auth, handle_device, handle_did, handle_dns, handle_query, handle_user, handle_zone,
-    SnV2AuthManager,
+    parse_params, require_account_username, DeviceUpdateReq, SnV2AuthManager,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
 use cyfs_gateway_lib::{into_server_err, server_err};
 use cyfs_gateway_lib::{
-    qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer, NameServer, QAServer,
-    Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory,
-    ServerResult, StreamInfo,
+    qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer, NameServer, QAServer, Server,
+    ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult,
+    StreamInfo,
 };
 use http::{Method, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -229,7 +229,11 @@ impl SNServer {
     }
 
     fn build_query_cache_key(name: &str, record_type: RecordType) -> String {
-        format!("{}|{}", Self::normalize_query_name(name), record_type.to_string())
+        format!(
+            "{}|{}",
+            Self::normalize_query_name(name),
+            record_type.to_string()
+        )
     }
 
     async fn get_cached_query_result(
@@ -522,11 +526,7 @@ impl SNServer {
         let username = Self::normalize_registration_username(username);
         let (valid, reason, message) =
             if let Err(message) = Self::validate_registration_username(username.as_str()) {
-                (
-                    false,
-                    "invalid_username".to_string(),
-                    message.to_string(),
-                )
+                (false, "invalid_username".to_string(), message.to_string())
             } else {
                 let exists = self
                     .db
@@ -901,11 +901,8 @@ impl SNServer {
             "user {} zone_config and user_domain updated successfully",
             user_name
         );
-        self.invalidate_query_cache_for_username_and_domain(
-            user_name,
-            real_user_domain.as_deref(),
-        )
-        .await;
+        self.invalidate_query_cache_for_username_and_domain(user_name, real_user_domain.as_deref())
+            .await;
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -1041,30 +1038,81 @@ impl SNServer {
             device_info.name.clone(),
             device_info_json
         );
-        let ip_str = ip_from.to_string();
+        let device_ip = ip_from.to_string();
+        let device_info_json = device_info_json.to_string();
+        self.update_device_by_owner(
+            owner_id,
+            device_info.name.as_str(),
+            None,
+            None,
+            device_ip.as_str(),
+            device_info_json.as_str(),
+        )
+        .await?;
 
-        self.db
-            .update_device_info_by_name(
-                owner_id,
-                &device_info.name.clone(),
-                ip_str.as_str(),
-                device_info_json.to_string().as_str(),
-            )
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("{}", e)));
-
-        let resp = RPCResponse::create_by_req(
+        Ok(RPCResponse::create_by_req(
             RPCResult::Success(json!({
                 "code":0
             })),
             &req,
-        );
+        ))
+    }
 
-        let key = format!("{}_{}", owner_id, device_info.name.clone());
+    pub async fn update_device_v2(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
+        let username = require_account_username(self, &req)?;
+        let params: DeviceUpdateReq = parse_params(&req)?;
 
+        self.update_device_by_owner(
+            username.as_str(),
+            params.device_name.as_str(),
+            params.device_did.as_deref(),
+            params.mini_config_jwt.as_deref(),
+            params.device_ip.as_str(),
+            params.device_info.as_str(),
+        )
+        .await?;
+
+        Ok(RPCResponse::create_by_req(
+            RPCResult::Success(json!({ "code": 0 })),
+            &req,
+        ))
+    }
+
+    async fn update_device_by_owner(
+        &self,
+        username: &str,
+        device_name: &str,
+        device_did: Option<&str>,
+        mini_config_jwt: Option<&str>,
+        device_ip: &str,
+        device_info: &str,
+    ) -> Result<(), RPCErrors> {
+        match (device_did, mini_config_jwt) {
+            (Some(device_did), Some(mini_config_jwt)) => {
+                self.db
+                    .update_device_by_name(
+                        username,
+                        device_name,
+                        device_did,
+                        mini_config_jwt,
+                        device_ip,
+                        device_info,
+                    )
+                    .await
+                    .map_err(|e| RPCErrors::ReasonError(format!("{}", e)))?;
+            }
+            _ => {
+                self.db
+                    .update_device_info_by_name(username, device_name, device_ip, device_info)
+                    .await
+                    .map_err(|e| RPCErrors::ReasonError(format!("{}", e)))?;
+            }
+        }
+
+        let key = format!("{}_{}", username, device_name);
         info!("update device info done: for {}", key);
-        self.invalidate_query_cache_for_username(owner_id).await;
-        return Ok(resp);
+        self.invalidate_query_cache_for_username(username).await;
+        Ok(())
     }
 
     pub async fn get_device_by_public_key(
@@ -2060,7 +2108,10 @@ impl SNServer {
                     handle_device(self, Self::rewrite_rpc_method(req, "register")).await
                 }
             }
-            "device.update" => handle_device(self, Self::rewrite_rpc_method(req, "update")).await,
+            "device.update" => {
+                self.update_device_v2(Self::rewrite_rpc_method(req, "update"))
+                    .await
+            }
             "update" => {
                 self.update_device(Self::rewrite_rpc_method(req, "update"), ip_from)
                     .await
@@ -3747,7 +3798,8 @@ mod tests {
 
     #[test]
     fn test_query_cache_key_normalizes_domain_and_record_type() {
-        let key = SNServer::build_query_cache_key(" Meteormeta.Web3.Buckyos.Ai. ", RecordType::AAAA);
+        let key =
+            SNServer::build_query_cache_key(" Meteormeta.Web3.Buckyos.Ai. ", RecordType::AAAA);
         assert_eq!(key, "meteormeta.web3.buckyos.ai|AAAA");
     }
 
@@ -3796,18 +3848,16 @@ mod tests {
 
         assert!(!is_filtered_zonegate_ip("192.168.100.191".parse().unwrap()));
         assert!(!is_filtered_zonegate_ip("207.246.96.13".parse().unwrap()));
-        assert!(!is_filtered_zonegate_ip("240e:3b3:30c0:930::47f".parse().unwrap()));
+        assert!(!is_filtered_zonegate_ip(
+            "240e:3b3:30c0:930::47f".parse().unwrap()
+        ));
     }
 
     #[test]
     fn test_push_zonegate_address_for_a_record_keeps_192_filters_172_and_dedups() {
         let mut addresses = Vec::new();
 
-        push_zonegate_address(
-            &mut addresses,
-            "172.17.0.1".parse().unwrap(),
-            RecordType::A,
-        );
+        push_zonegate_address(&mut addresses, "172.17.0.1".parse().unwrap(), RecordType::A);
         push_zonegate_address(
             &mut addresses,
             "192.168.100.191".parse().unwrap(),
@@ -3923,7 +3973,10 @@ mod tests {
 
         let exported = SNServer::build_device_info_json(&device);
         assert!(exported.get("ip").is_none());
-        assert_eq!(exported.get("ips").and_then(|v| v.as_array()).cloned(), Some(vec![]));
+        assert_eq!(
+            exported.get("ips").and_then(|v| v.as_array()).cloned(),
+            Some(vec![])
+        );
         assert_eq!(
             exported.get("all_ip").and_then(|v| v.as_array()).cloned(),
             Some(vec![])
@@ -4317,7 +4370,7 @@ mod tests {
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v.get("device_name").unwrap().as_str().unwrap(), "ood1");
         assert_eq!(v.get("owner").unwrap().as_str().unwrap(), TEST_USER);
-        assert!(v.get("ip").is_some());
+        assert!(v.get("ip").is_none());
 
         // did:dev:public_key type=doc/info
         let did_dev = device_config.id.to_string();
@@ -4344,7 +4397,7 @@ mod tests {
         assert!(resp.status().is_success());
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v.get("device_name").unwrap().as_str().unwrap(), "ood1");
-        assert!(v.get("ip").is_some());
+        assert!(v.get("ip").is_none());
 
         let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
         let result = krpc
@@ -4530,6 +4583,19 @@ mod tests {
         assert!(ret.is_ok());
         let device_info = ret.unwrap();
         assert_eq!(device_info.cpu_info.unwrap(), "AMD");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
+                device_config.id.to_string()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["cpu_info"].as_str().unwrap(), "AMD");
 
         let result = krpc
             .call(
@@ -5050,6 +5116,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
+
+        let mut updated_device_info = DeviceInfo::from_device_doc(&device_config);
+        updated_device_info.cpu_info = Some("Intel".to_string());
+        let result = device_krpc
+            .call(
+                "device.update",
+                json!({
+                    "device_name": "ood1",
+                    "device_ip": "192.168.100.10",
+                    "device_info": serde_json::to_string(&updated_device_info).unwrap(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:19092/1.0/identifiers/{}?type=info",
+                device_config.id.to_string()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["cpu_info"].as_str().unwrap(), "Intel");
+        assert_eq!(v["ip"].as_str().unwrap(), "192.168.100.10");
 
         let result = device_krpc.call("device.list", json!({})).await.unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 1);

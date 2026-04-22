@@ -1,7 +1,7 @@
 use super::common::{
     device_to_json, ensure_owner_decoding_key, ok_response, parse_params, query_by_did,
     require_account_username, resolve_self_scoped_username, DeviceGetReq, DeviceRegisterReq,
-    DeviceUpdateReq, IntoRpcResult, QueryByDidReq, QueryByHostnameReq, QueryByPkReq, RpcCallResult,
+    IntoRpcResult, QueryByDidReq, QueryByHostnameReq, QueryByPkReq, RpcCallResult,
 };
 use super::errors::{parse_error, SnV2ErrorCode};
 use crate::SNServer;
@@ -49,44 +49,9 @@ pub(crate) async fn handle_device(
                 )
                 .await
                 .into_rpc()?;
-            server.invalidate_query_cache_for_username(username.as_str()).await;
-            ok_response(&req, json!({ "code": 0 }))
-        }
-        "update" => {
-            let username = require_account_username(server, &req)?;
-            let params: DeviceUpdateReq = parse_params(&req)?;
-            match (
-                params.device_did.as_deref(),
-                params.mini_config_jwt.as_deref(),
-            ) {
-                (Some(device_did), Some(mini_config_jwt)) => {
-                    server
-                        .db()
-                        .update_device_by_name(
-                            username.as_str(),
-                            params.device_name.as_str(),
-                            device_did,
-                            mini_config_jwt,
-                            params.device_ip.as_str(),
-                            params.device_info.as_str(),
-                        )
-                        .await
-                        .into_rpc()?;
-                }
-                _ => {
-                    server
-                        .db()
-                        .update_device_info_by_name(
-                            username.as_str(),
-                            params.device_name.as_str(),
-                            params.device_ip.as_str(),
-                            params.device_info.as_str(),
-                        )
-                        .await
-                        .into_rpc()?;
-                }
-            }
-            server.invalidate_query_cache_for_username(username.as_str()).await;
+            server
+                .invalidate_query_cache_for_username(username.as_str())
+                .await;
             ok_response(&req, json!({ "code": 0 }))
         }
         "get" => {
