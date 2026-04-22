@@ -425,6 +425,8 @@ Supported forms:
   - Bracket path:
       $geoByIp[$REQ.clientIp]
       ${geoByIp["1.2.3.4"].country}
+      $records[0].name
+      $matrix[1][0]
 
   - Optional/safe access:
       ${geoByIp[$REQ.clientIp]?.country}
@@ -436,6 +438,7 @@ Supported forms:
 
 Semantics:
   - `?.` / `?[...]` mark the following segment as optional.
+  - Bracket path supports both map keys and list indices.
   - Optional segment missing or type mismatch does not trigger strict missing-var error.
   - Optional missing without `??` yields empty string.
   - `??` only applies when left side is missing.

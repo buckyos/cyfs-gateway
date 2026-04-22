@@ -8,15 +8,28 @@ use std::sync::{Arc, RwLock};
 
 enum PathCollection {
     Root(EnvRef),
+    List(ListCollectionRef),
     Map(MapCollectionRef),
     Set(SetCollectionRef),           // Only for the last part of the path
     MultiMap(MultiMapCollectionRef), // Only for the last part of the path
 }
 
 impl PathCollection {
+    fn parse_list_index(key: &str) -> Result<usize, String> {
+        key.parse::<usize>().map_err(|e| {
+            let msg = format!("Invalid list index '{}': {}", key, e);
+            warn!("{}", msg);
+            msg
+        })
+    }
+
     pub async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         match self {
             PathCollection::Root(env) => env.get(key).await,
+            PathCollection::List(list) => {
+                let index = Self::parse_list_index(key)?;
+                list.get(index).await
+            }
             PathCollection::Map(map) => map.get(key).await,
             PathCollection::Set(set) => match set.contains(key).await? {
                 true => Ok(Some(CollectionValue::String(key.to_string()))),
@@ -32,6 +45,22 @@ impl PathCollection {
     pub async fn insert_new(&self, key: &str, value: CollectionValue) -> Result<bool, String> {
         match self {
             PathCollection::Root(env) => env.create(key, value).await,
+            PathCollection::List(list) => {
+                let index = Self::parse_list_index(key)?;
+                let len = list.len().await?;
+                if index > len {
+                    let msg = format!("List index out of bounds for create: {} > {}", index, len);
+                    warn!("{}", msg);
+                    return Err(msg);
+                }
+
+                if index == len {
+                    list.insert(index, value).await?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
             PathCollection::Map(map) => map.insert_new(key, value).await,
             PathCollection::Set(set) => {
                 if let CollectionValue::String(s) = value {
@@ -60,6 +89,20 @@ impl PathCollection {
     ) -> Result<Option<CollectionValue>, String> {
         match self {
             PathCollection::Root(env) => env.set(key, value).await,
+            PathCollection::List(list) => {
+                let index = Self::parse_list_index(key)?;
+                let len = list.len().await?;
+                if index < len {
+                    list.set(index, value).await
+                } else if index == len {
+                    list.insert(index, value).await?;
+                    Ok(None)
+                } else {
+                    let msg = format!("List index out of bounds for set: {} > {}", index, len);
+                    warn!("{}", msg);
+                    Err(msg)
+                }
+            }
             PathCollection::Map(map) => map.insert(key, value).await,
             PathCollection::Set(set) => {
                 if let CollectionValue::String(s) = value {
@@ -91,6 +134,10 @@ impl PathCollection {
     pub async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         match self {
             PathCollection::Root(env) => env.remove(key).await,
+            PathCollection::List(list) => {
+                let index = Self::parse_list_index(key)?;
+                list.remove(index).await
+            }
             PathCollection::Map(map) => map.remove(key).await,
             PathCollection::Set(set) => {
                 if set.contains(key).await? {
@@ -625,6 +672,8 @@ impl EnvManager {
             if let Some(value) = current.get(part).await? {
                 if let CollectionValue::Map(map) = value {
                     current = PathCollection::Map(map);
+                } else if let CollectionValue::List(list) = value {
+                    current = PathCollection::List(list);
                 } else {
                     if let CollectionValue::MultiMap(multi_map) = &value {
                         if i == sub_key_list.len() - 1 {
@@ -834,7 +883,12 @@ impl EnvManager {
 
 #[cfg(test)]
 mod tests {
-    use super::EnvManager;
+    use super::{EnvLevel, EnvManager};
+    use crate::chain::Env;
+    use crate::collection::{
+        CollectionValue, ListCollection, MapCollection, MemoryListCollection, MemoryMapCollection,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn test_parse_var_dynamic_segments() {
@@ -888,5 +942,93 @@ mod tests {
                 "country".to_string()
             ]
         );
+
+        assert_eq!(
+            EnvManager::parse_var("records[0].payload.key"),
+            vec![
+                "records".to_string(),
+                "0".to_string(),
+                "payload".to_string(),
+                "key".to_string()
+            ]
+        );
+
+        assert_eq!(
+            EnvManager::parse_var("matrix[1][0]"),
+            vec!["matrix".to_string(), "1".to_string(), "0".to_string()]
+        );
+    }
+
+    async fn make_record_entry(key: &str, name: &str) -> Arc<Box<dyn MapCollection>> {
+        let map = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+        map.insert("key", CollectionValue::String(key.to_string()))
+            .await
+            .unwrap();
+        map.insert("name", CollectionValue::String(name.to_string()))
+            .await
+            .unwrap();
+        map
+    }
+
+    #[tokio::test]
+    async fn test_list_path_supports_set_and_remove() {
+        let global = Arc::new(Env::new(EnvLevel::Global, None));
+        let chain = global.create_child_env(EnvLevel::Chain);
+        let manager = EnvManager::new(global, chain);
+
+        let records = Arc::new(Box::new(MemoryListCollection::new()) as Box<dyn ListCollection>);
+        records
+            .push(CollectionValue::Map(
+                make_record_entry("alpha", "first").await,
+            ))
+            .await
+            .unwrap();
+        records
+            .push(CollectionValue::Map(
+                make_record_entry("beta", "second").await,
+            ))
+            .await
+            .unwrap();
+        records
+            .push(CollectionValue::Map(
+                make_record_entry("gamma", "third").await,
+            ))
+            .await
+            .unwrap();
+
+        manager
+            .create("records", CollectionValue::List(records), EnvLevel::Chain)
+            .await
+            .unwrap();
+
+        manager
+            .set(
+                "records[0].key",
+                CollectionValue::String("updated".to_string()),
+                Some(EnvLevel::Chain),
+            )
+            .await
+            .unwrap();
+
+        let first_key = manager
+            .get("records[0].key", Some(EnvLevel::Chain))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_key.as_str(), Some("updated"));
+
+        let removed = manager
+            .remove("records[1]", Some(EnvLevel::Chain))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(removed.is_map(), "expected removed list item to be map");
+
+        let shifted_name = manager
+            .get("records[1].name", Some(EnvLevel::Chain))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shifted_name.as_str(), Some("third"));
     }
 }

@@ -139,6 +139,30 @@ const PROCESS_CHAIN_LIB_VAR_COLLECTION_ASSIGN: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_LIB_VAR_LIST_ACCESS: &str = r#"
+<process_chain_lib id="test_var_list_access_lib" priority="100">
+    <process_chain id="list_access_chain">
+        <block id="route">
+            <![CDATA[
+                local first_key=$records[0].key;
+                eq $first_key "alpha" || return --from lib "first_key_fail";
+
+                local indexed_name=$records[$REQ.recordIndex].name;
+                eq $indexed_name "second" || return --from lib "dynamic_index_fail";
+
+                local nested_value=$matrix[1][0];
+                eq $nested_value "m10" || return --from lib "nested_list_fail";
+
+                local missing_name=${records?.[$REQ.missingIndex]?.name ?? "missing"};
+                eq $missing_name "missing" || return --from lib "missing_index_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 async fn make_geo_entry(country: &str, isp: &str, city: &str) -> MapCollectionRef {
     let map = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
     map.insert("country", CollectionValue::String(country.to_string()))
@@ -219,6 +243,27 @@ async fn make_route_entry(target_chain: &str) -> MapCollectionRef {
     .await
     .unwrap();
     map
+}
+
+async fn make_record_entry(key: &str, name: &str) -> MapCollectionRef {
+    let map = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    map.insert("key", CollectionValue::String(key.to_string()))
+        .await
+        .unwrap();
+    map.insert("name", CollectionValue::String(name.to_string()))
+        .await
+        .unwrap();
+    map
+}
+
+async fn make_string_list(values: &[&str]) -> ListCollectionRef {
+    let list = Arc::new(Box::new(MemoryListCollection::new()) as Box<dyn ListCollection>);
+    for value in values {
+        list.push(CollectionValue::String((*value).to_string()))
+            .await
+            .unwrap();
+    }
+    list
 }
 
 async fn set_client_ip(req: &MapCollectionRef, client_ip: &str) {
@@ -1074,4 +1119,87 @@ async fn test_dynamic_map_lookup_complex_type_mismatch_returns_error() {
         "unexpected error: {}",
         err
     );
+}
+
+#[tokio::test]
+async fn test_list_index_variable_paths_support_read_and_safe_access() {
+    TermLogger::init(
+        LevelFilter::Debug,
+        Config::default(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )
+    .unwrap_or_else(|_| {
+        let _ = SimpleLogger::init(LevelFilter::Debug, Config::default());
+    });
+
+    let hook_point = HookPoint::new("test_var_list_access");
+    hook_point
+        .load_process_chain_lib(
+            "test_var_list_access_lib",
+            0,
+            PROCESS_CHAIN_LIB_VAR_LIST_ACCESS,
+        )
+        .await
+        .unwrap();
+
+    let data_dir = std::env::temp_dir().join("cyfs-process-chain-test-var-list-access");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let hook_point_env = HookPointEnv::new("test-var-list-access", data_dir);
+
+    let records = Arc::new(Box::new(MemoryListCollection::new()) as Box<dyn ListCollection>);
+    records
+        .push(CollectionValue::Map(
+            make_record_entry("alpha", "first").await,
+        ))
+        .await
+        .unwrap();
+    records
+        .push(CollectionValue::Map(
+            make_record_entry("beta", "second").await,
+        ))
+        .await
+        .unwrap();
+
+    let matrix = Arc::new(Box::new(MemoryListCollection::new()) as Box<dyn ListCollection>);
+    matrix
+        .push(CollectionValue::List(
+            make_string_list(&["m00", "m01"]).await,
+        ))
+        .await
+        .unwrap();
+    matrix
+        .push(CollectionValue::List(
+            make_string_list(&["m10", "m11"]).await,
+        ))
+        .await
+        .unwrap();
+
+    let req = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+    req.insert("recordIndex", CollectionValue::String("1".to_string()))
+        .await
+        .unwrap();
+    req.insert("missingIndex", CollectionValue::String("9".to_string()))
+        .await
+        .unwrap();
+
+    hook_point_env
+        .hook_point_env()
+        .create("records", CollectionValue::List(records))
+        .await
+        .unwrap();
+    hook_point_env
+        .hook_point_env()
+        .create("matrix", CollectionValue::List(matrix))
+        .await
+        .unwrap();
+    hook_point_env
+        .hook_point_env()
+        .create("REQ", CollectionValue::Map(req))
+        .await
+        .unwrap();
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await.unwrap();
+    let ret = exec.execute_lib("test_var_list_access_lib").await.unwrap();
+    assert_eq!(ret.value(), "ok");
 }

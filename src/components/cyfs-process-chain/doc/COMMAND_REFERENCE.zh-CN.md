@@ -427,6 +427,8 @@
   - 下标路径:
       $geoByIp[$REQ.clientIp]
       ${geoByIp["1.2.3.4"].country}
+      $records[0].name
+      $matrix[1][0]
 
   - 可选 / 安全访问:
       ${geoByIp[$REQ.clientIp]?.country}
@@ -438,6 +440,7 @@
 
 语义:
   - `?.` / `?[...]` 表示后续路径段为可选访问。
+  - 下标路径同时支持 map key 和 list 下标。
   - 可选路径段缺失，或类型不匹配时，不会触发严格 missing-var 错误。
   - 如果可选访问缺失且没有 `??`，则结果为空字符串。
   - `??` 只在左侧值缺失时生效。

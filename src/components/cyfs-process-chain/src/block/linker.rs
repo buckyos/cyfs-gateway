@@ -589,6 +589,17 @@ impl CommandArgEvaluator {
             .join(".")
     }
 
+    fn parse_list_index(segment_key: &str, current_var_path: &str) -> Result<usize, String> {
+        segment_key.parse::<usize>().map_err(|e| {
+            let msg = format!(
+                "Invalid list index '{}' while resolving '{}': {}",
+                segment_key, current_var_path, e
+            );
+            warn!("{}", msg);
+            msg
+        })
+    }
+
     #[async_recursion::async_recursion]
     async fn resolve_segment_key(
         segment: &VarPathSegment,
@@ -788,6 +799,23 @@ impl CommandArgEvaluator {
             let is_last = index == parsed.len() - 1;
 
             let next_value = match current_value {
+                Some(CollectionValue::List(list)) => {
+                    let list_index = match Self::parse_list_index(&segment_key, &current_key) {
+                        Ok(index) => index,
+                        Err(msg) => {
+                            if access.optional {
+                                return Ok(VarEvalResult::Missing {
+                                    key: Self::normalize_segment_list(&resolved_segments),
+                                    explicit: true,
+                                });
+                            }
+
+                            return Err(msg);
+                        }
+                    };
+
+                    list.get(list_index).await?
+                }
                 Some(CollectionValue::Map(map)) => map.get(&segment_key).await?,
                 Some(CollectionValue::Set(set)) => {
                     if is_last {
