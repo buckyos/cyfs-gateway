@@ -1078,6 +1078,61 @@ impl SNServer {
         ))
     }
 
+    fn is_legacy_device_update_params(params: &Value) -> bool {
+        params.get("device_id").is_some()
+            || params.get("owner_id").is_some()
+            || params
+                .get("device_info")
+                .map(|device_info| device_info.is_object())
+                .unwrap_or(false)
+    }
+
+    fn normalize_legacy_device_update_req(mut req: RPCRequest) -> Result<RPCRequest, RPCErrors> {
+        if req.params.get("owner_id").is_some() {
+            return Ok(req);
+        }
+
+        let owner_id = req
+            .params
+            .get("device_info")
+            .and_then(|device_info| {
+                device_info
+                    .get("owner_id")
+                    .or_else(|| device_info.get("owner"))
+            })
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RPCErrors::ParseRequestError("Invalid params, owner_id is none".to_string())
+            })?
+            .to_string();
+
+        req.params
+            .as_object_mut()
+            .ok_or_else(|| {
+                RPCErrors::ParseRequestError(
+                    "Invalid params, request params is not object".to_string(),
+                )
+            })?
+            .insert("owner_id".to_string(), Value::String(owner_id));
+
+        Ok(req)
+    }
+
+    pub async fn update_device_namespaced(
+        &self,
+        req: RPCRequest,
+        ip_from: IpAddr,
+    ) -> Result<RPCResponse, RPCErrors> {
+        if Self::is_legacy_device_update_params(&req.params) {
+            let req = Self::normalize_legacy_device_update_req(req)?;
+            self.update_device(Self::rewrite_rpc_method(req, "update"), ip_from)
+                .await
+        } else {
+            self.update_device_v2(Self::rewrite_rpc_method(req, "update"))
+                .await
+        }
+    }
+
     async fn update_device_by_owner(
         &self,
         username: &str,
@@ -2108,10 +2163,7 @@ impl SNServer {
                     handle_device(self, Self::rewrite_rpc_method(req, "register")).await
                 }
             }
-            "device.update" => {
-                self.update_device_v2(Self::rewrite_rpc_method(req, "update"))
-                    .await
-            }
+            "device.update" => self.update_device_namespaced(req, ip_from).await,
             "update" => {
                 self.update_device(Self::rewrite_rpc_method(req, "update"), ip_from)
                     .await
@@ -4596,6 +4648,37 @@ mod tests {
         assert!(resp.status().is_success());
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v["cpu_info"].as_str().unwrap(), "AMD");
+
+        let mut legacy_namespaced_device_info = DeviceInfo::from_device_doc(&device_config);
+        legacy_namespaced_device_info.cpu_info = Some("Zen5".to_string());
+        let mut legacy_namespaced_device_info_json =
+            serde_json::to_value(&legacy_namespaced_device_info).unwrap();
+        legacy_namespaced_device_info_json
+            .as_object_mut()
+            .unwrap()
+            .insert("owner_id".to_string(), Value::String(TEST_USER.to_string()));
+        let result = krpc
+            .call(
+                "device.update",
+                json!({
+                    "device_id": device_config.name,
+                    "device_info": legacy_namespaced_device_info_json
+                }),
+            )
+            .await;
+        assert!(result.is_ok());
+
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
+                device_config.id.to_string()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["cpu_info"].as_str().unwrap(), "Zen5");
 
         let result = krpc
             .call(
