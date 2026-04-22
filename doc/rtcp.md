@@ -571,6 +571,55 @@ RTCP stack 的 `device_config_path` 当前支持两类文件内容：
 - 协议还应明确每 tunnel / 每 peer 的并发建流上限和速率限制要求。
 - 在实现上，超时清理与资源配额应视为协议一致性要求，而不是可选优化。
 
+### 14.4 TODO: 支持 remote 嵌套的 bootstrap stream URL
+
+`tunnel框架.md` 里已经给出了 RTCP 更完整的 URL 设计方向：不仅 target 可以嵌套，remote 的建立过程本身也可以嵌套。例如：
+
+```text
+rtcp://socks%3A%2F%2Faaa%3Abbb%40pub.proxy.com%2Fremote.com@remote.com:2981/google.com:443/
+```
+
+它表达的是：
+
+1. 先按 `socks://aaa:bbb@pub.proxy.com/remote.com` 拿到底层 byte stream。
+2. 再在这条底层 stream 上建立外层 RTCP tunnel。
+3. 外层 RTCP 的真实 remote 身份仍然是 `remote.com:2981`。
+4. tunnel 建好后，再让 remote 侧继续访问 `google.com:443`。
+
+当前现状：
+
+- RTCP 当前只支持“target 嵌套”，也就是 `dest_port == 0` 时把 `dest_host` 当完整 URL 继续解释。
+- `create_tunnel()` 当前接收的 `tunnel_stack_id` 仍然只能解析成 `<did>[:port]`。
+- 建 tunnel 的底层传输当前固定是 `TcpStream::connect(remote_ip:port)`，没有经过 tunnel 框架去创建 bootstrap stream。
+- 因此，`params@remote` 这一段在 RTCP 里还没有成为正式语义。
+
+协议 / 框架 TODO：
+
+- 正式定义 RTCP authority 的语法，把“bootstrap stream URL”和“outer remote identity”区分开。
+- 规定 bootstrap URL 必须整体 percent-encoding，并放在 `params@remote` 段中。
+- `create_tunnel()` 后续需要先解析并解码 `params`，再通过 `TunnelManager` 或等价入口创建底层 stream，而不是直接 TCP connect。
+- 在 bootstrap stream 建好后，`Hello` / `HelloStream` 的线协议可以继续复用当前格式，但其承载连接不再假定是裸 TCP 直连。
+- 未携带 `params` 时，仍保持当前“直接连接 `remote_ip:rtcp_port`”的兼容语义。
+
+### 14.5 TODO: 为 remote 嵌套后的建流流程重新绑定 transport 语义
+
+remote 嵌套一旦成立，当前 `Open` / `ROpen` 的建流方式也必须一起升级，否则 tunnel 虽然能建立，后续 stream 仍然会退回“直接连 peer IP + RTCP port”的旧模型。
+
+当前现状：
+
+- `Open` 路径下，请求方收到 `OpenResp` 后，会直接以“当前 tunnel 对端 IP + 对端 RTCP 端口”再建立一条新的 TCP 连接。
+- `ROpen` 路径下，对端会根据 `Hello.my_port` 回连新的 TCP 连接。
+- 这套流程默认假设两端之间始终存在可直接互连的 RTCP TCP 端口。
+- 一旦 tunnel 是经 SOCKS、上层 tunnel 或其他 bootstrap stream 建出来的，这个假设就不再成立。
+
+协议 / 框架 TODO：
+
+- 需要把“为某个 `streamid` 获取底层 transport”的动作，从“直接连对端 IP/port”抽象成可替换的 builder 行为。
+- 对于 remote 嵌套场景，`Open` / `ROpen` 后续创建 stream 时，应继续复用或重新派生同一类 bootstrap 机制，而不是绕过它。
+- 协议文档需要明确 outer remote identity、bootstrap transport 和最终 target 三者的边界，避免把“不可信中转”误当成 RTCP 对端身份。
+- tunnel 复用键和 stream 建立键后续也需要纳入 bootstrap 语义；否则同一 remote 经不同 bootstrap 路径建立的连接可能被错误复用。
+- 在这部分机制定稿前，文档应继续把“remote 嵌套”视为设计方向，而不是当前可依赖能力。
+
 ## 15. 最小实现心智模型
 
 如果只记住 RTCP 的核心机制，可以简化成下面四句话：

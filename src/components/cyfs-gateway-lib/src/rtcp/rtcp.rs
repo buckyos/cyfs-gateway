@@ -177,7 +177,7 @@ impl RTcpInner {
         }
 
         debug!(
-            "try resolve target device {} exchange key by TXT records of {}",
+            "try resolve remote device {} exchange key by TXT records of {}",
             remote_did.to_string(),
             web_host
         );
@@ -224,7 +224,7 @@ impl RTcpInner {
                 let dev_did = DID::new("dev", x);
                 if let Some(exchange_key) = dev_did.get_ed25519_auth_key() {
                     debug!(
-                        "resolve target device {} exchange key by {} TXT DEV",
+                        "resolve remote device {} exchange key by {} TXT DEV",
                         remote_did.to_string(),
                         web_host
                     );
@@ -240,7 +240,7 @@ impl RTcpInner {
                     let dev_did = DID::new("dev", x);
                     if let Some(exchange_key) = dev_did.get_ed25519_auth_key() {
                         debug!(
-                            "resolve target device {} exchange key by {} TXT PKX",
+                            "resolve remote device {} exchange key by {} TXT PKX",
                             remote_did.to_string(),
                             web_host
                         );
@@ -261,7 +261,7 @@ impl RTcpInner {
 
     async fn resolve_exchange_key(remote_did: &DID) -> Result<[u8; 32], String> {
         debug!(
-            "resolve exchange key for target device {}",
+            "resolve exchange key for remote device {}",
             remote_did.to_string()
         );
 
@@ -377,7 +377,7 @@ impl RTcpInner {
     }
 
     async fn resolve_ips_by_did_info_http_fallback(
-        target_did: &DID,
+        remote_did: &DID,
     ) -> Result<Vec<std::net::IpAddr>, String> {
         let fallback_urls = Self::did_info_fallback_base_urls();
         let client = reqwest::Client::builder()
@@ -391,7 +391,7 @@ impl RTcpInner {
             let url = format!(
                 "{}/1.0/identifiers/{}?type=info",
                 base,
-                target_did.to_string()
+                remote_did.to_string()
             );
 
             let response = client.get(url.as_str()).send().await;
@@ -427,8 +427,8 @@ impl RTcpInner {
             let ips = Self::extract_ips_from_info_json(&info_json);
             if !ips.is_empty() {
                 debug!(
-                    "resolve target device {} ips by did-info fallback {} => {:?}",
-                    target_did.to_string(),
+                    "resolve remote device {} ips by did-info fallback {} => {:?}",
+                    remote_did.to_string(),
                     base,
                     ips
                 );
@@ -445,9 +445,9 @@ impl RTcpInner {
         }
     }
 
-    async fn resolve_ips_by_did_info(target_did: &DID) -> Result<Vec<std::net::IpAddr>, String> {
+    async fn resolve_ips_by_did_info(remote_did: &DID) -> Result<Vec<std::net::IpAddr>, String> {
         let mut errors = Vec::new();
-        match resolve_did(target_did, Some("info")).await {
+        match resolve_did(remote_did, Some("info")).await {
             Ok(info_doc) => {
                 let info_json = info_doc
                     .to_json_value()
@@ -463,7 +463,7 @@ impl RTcpInner {
             }
         }
 
-        match Self::resolve_ips_by_did_info_http_fallback(target_did).await {
+        match Self::resolve_ips_by_did_info_http_fallback(remote_did).await {
             Ok(ips) if !ips.is_empty() => Ok(ips),
             Ok(_) => {
                 if errors.is_empty() {
@@ -490,7 +490,7 @@ impl RTcpInner {
     fn get_resolve_candidates(
         &self,
         tunnel_stack_id: &str,
-        target: &RTcpTargetStackEP,
+        remote_stack: &RTcpTargetStackEP,
     ) -> Vec<String> {
         let mut candidates = Vec::new();
         let mut seen = HashSet::new();
@@ -503,9 +503,9 @@ impl RTcpInner {
 
         for candidate in [
             host_from_stack_id,
-            target.did.to_host_name(),
-            target.did.to_raw_host_name(),
-            target.did.to_string(),
+            remote_stack.did.to_host_name(),
+            remote_stack.did.to_raw_host_name(),
+            remote_stack.did.to_string(),
         ] {
             if seen.insert(candidate.clone()) {
                 candidates.push(candidate);
@@ -557,23 +557,23 @@ impl RTcpInner {
     // return (tunnel_token,aes_key,my_public_bytes)
     async fn generate_tunnel_token(
         &self,
-        target_hostname: String,
+        remote_hostname: String,
     ) -> Result<(String, [u8; 32], [u8; 32]), TunnelError> {
         if self.this_device_ed25519_sk.is_none() {
             return Err(TunnelError::DocumentError(
                 "this device ed25519 sk is none".to_string(),
             ));
         }
-        let remote_did = DID::from_str(target_hostname.as_str()).map_err(|op| {
-            TunnelError::DocumentError(format!("invalid target device is not did: {}", op))
+        let remote_did = DID::from_str(remote_hostname.as_str()).map_err(|op| {
+            TunnelError::DocumentError(format!("invalid remote device is not did: {}", op))
         })?;
 
         let exchange_key = Self::resolve_exchange_key(&remote_did)
             .await
             .map_err(|op| {
                 let msg = format!(
-                    "cann't resolve target device {} ed25519 exchange key: {}",
-                    target_hostname.as_str(),
+                    "cann't resolve remote device {} ed25519 exchange key: {}",
+                    remote_hostname.as_str(),
                     op
                 );
                 error!("{}", msg);
@@ -992,16 +992,16 @@ impl RTcpInner {
             return;
         }
 
-        let target = RTcpTargetStackEP::new(source_did, hello_package.body.my_port);
-        if target.is_err() {
-            error!("parser remote did error:{}", target.err().unwrap());
+        let remote_stack = RTcpTargetStackEP::new(source_did, hello_package.body.my_port);
+        if remote_stack.is_err() {
+            error!("parser remote did error:{}", remote_stack.err().unwrap());
             return;
         }
-        let target = target.unwrap();
+        let remote_stack = remote_stack.unwrap();
         let tunnel = RTcpTunnel::new(
             self.stream_helper.clone(),
             self.this_device_did.clone(),
-            &target,
+            &remote_stack,
             false,
             stream,
             aes_key,
@@ -1042,28 +1042,28 @@ impl RTcpInner {
         // lookup existing tunnel and resue it
         if tunnel_stack_id.is_none() {
             return Err(TunnelError::ReasonError(
-                "rtcp target stack id is none".to_string(),
+                "rtcp remote stack id is none".to_string(),
             ));
         }
         let tunnel_stack_id = tunnel_stack_id.unwrap();
-        let target = parse_rtcp_stack_id(tunnel_stack_id);
-        if target.is_none() {
+        let remote_stack = parse_rtcp_stack_id(tunnel_stack_id);
+        if remote_stack.is_none() {
             return Err(TunnelError::ConnectError(format!(
-                "invalid target url:{:?}",
-                target
+                "invalid remote stack id:{:?}",
+                remote_stack
             )));
         }
-        let target: RTcpTargetStackEP = target.unwrap();
-        let target_id_str = target.did.to_string();
+        let remote_stack: RTcpTargetStackEP = remote_stack.unwrap();
+        let remote_device_id = remote_stack.did.to_string();
 
         let tunnel_key = format!(
             "{}_{}",
             self.this_device_did.to_string(),
-            target_id_str.as_str()
+            remote_device_id.as_str()
         );
         debug!(
             "will create tunnel to {} ,tunnel key is {},try reuse",
-            target_id_str.as_str(),
+            remote_device_id.as_str(),
             tunnel_key.as_str()
         );
 
@@ -1076,12 +1076,12 @@ impl RTcpInner {
             return Ok(Box::new(tunnel.unwrap().clone()));
         }
 
-        // 1） resolve target auth-key and ip (rtcp base on tcp,so need ip)
+        // 1） resolve remote auth-key and ip (rtcp base on tcp, so need ip)
 
-        let resolve_candidates = self.get_resolve_candidates(tunnel_stack_id, &target);
+        let resolve_candidates = self.get_resolve_candidates(tunnel_stack_id, &remote_stack);
         debug!(
-            "resolve target device {} ip with candidates: {:?}",
-            target_id_str, resolve_candidates
+            "resolve remote device {} ip with candidates: {:?}",
+            remote_device_id, resolve_candidates
         );
 
         let mut candidate_ips = Vec::new();
@@ -1098,26 +1098,26 @@ impl RTcpInner {
                         }
                     }
                     debug!(
-                        "resolve target device {} ips by {} => {:?}",
-                        target_id_str, candidate, newly_resolved
+                        "resolve remote device {} ips by {} => {:?}",
+                        remote_device_id, candidate, newly_resolved
                     );
                 }
                 Err(err) => {
                     let err_msg = format!("{} => {}", candidate, err);
                     debug!(
-                        "resolve target device {} failed: {}",
-                        target_id_str, err_msg
+                        "resolve remote device {} failed: {}",
+                        remote_device_id, err_msg
                     );
                     resolve_errors.push(err_msg);
                 }
             }
         }
 
-        match Self::resolve_ips_by_did_info(&target.did).await {
+        match Self::resolve_ips_by_did_info(&remote_stack.did).await {
             Ok(ips) if !ips.is_empty() => {
                 debug!(
-                    "resolve target device {} ips by did-info => {:?}",
-                    target_id_str, ips
+                    "resolve remote device {} ips by did-info => {:?}",
+                    remote_device_id, ips
                 );
                 for ip in ips {
                     if seen_ips.insert(ip) {
@@ -1135,8 +1135,8 @@ impl RTcpInner {
                     resolve_errors.push(format!("did-info => {}", err));
                 } else {
                     debug!(
-                        "resolve target device {} extra ips by did-info failed: {}",
-                        target_id_str, err
+                        "resolve remote device {} extra ips by did-info failed: {}",
+                        remote_device_id, err
                     );
                 }
             }
@@ -1144,20 +1144,20 @@ impl RTcpInner {
 
         if candidate_ips.is_empty() {
             let msg = format!(
-                "cann't resolve target device {} ip, tried {:?}, errors: {:?}",
-                target_id_str, resolve_candidates, resolve_errors
+                "cann't resolve remote device {} ip, tried {:?}, errors: {:?}",
+                remote_device_id, resolve_candidates, resolve_errors
             );
             error!("{}", msg);
             return Err(TunnelError::DocumentError(msg));
         }
-        let port = target.stack_port;
+        let port = remote_stack.stack_port;
         let mut connect_errors = Vec::new();
         for device_ip in candidate_ips {
             let remote_addr = format!("{}:{}", device_ip, port);
 
             debug!(
-                "Will open tunnel to {}, target addr is {}",
-                target_id_str.as_str(),
+                "Will open tunnel to {}, remote addr is {}",
+                remote_device_id.as_str(),
                 remote_addr.as_str()
             );
             //TODO:通过tunnel框架创建stream
@@ -1168,7 +1168,7 @@ impl RTcpInner {
                     if connect_err.kind() == std::io::ErrorKind::ConnectionRefused {
                         warn!(
                             "connect to {} refused when opening tunnel to {} (did resolved, but rtcp port {} is unreachable/refused)",
-                            remote_addr, target_id_str, port
+                            remote_addr, remote_device_id, port
                         );
                     } else {
                         warn!("connect to {} error: {}", remote_addr, connect_err);
@@ -1179,10 +1179,10 @@ impl RTcpInner {
             };
 
             let (tunnel_token, aes_key, random_pk) = self
-                .generate_tunnel_token(target_id_str.clone())
+                .generate_tunnel_token(remote_device_id.clone())
                 .await
                 .map_err(|e| {
-                    let msg = format!("generate tunnel token error: {}, {}", target_id_str, e);
+                    let msg = format!("generate tunnel token error: {}, {}", remote_device_id, e);
                     error!("{}", msg);
                     e
                 })?;
@@ -1191,7 +1191,7 @@ impl RTcpInner {
             let hello_package = RTcpHelloPackage::new(
                 0,
                 self.this_device_did.to_string(),
-                target_id_str.clone(),
+                remote_device_id.clone(),
                 addr.port(),
                 Some(tunnel_token),
                 self.this_device_doc_jwt.clone(),
@@ -1207,7 +1207,7 @@ impl RTcpInner {
             let tunnel = RTcpTunnel::new(
                 self.stream_helper.clone(),
                 self.this_device_did.clone(),
-                &target,
+                &remote_stack,
                 true,
                 tunnel_stream,
                 aes_key,
@@ -1241,8 +1241,8 @@ impl RTcpInner {
         }
 
         Err(TunnelError::ConnectError(format!(
-            "connect to target {} failed after trying all candidates: {}",
-            target_id_str,
+            "connect to remote {} failed after trying all candidates: {}",
+            remote_device_id,
             connect_errors.join("; ")
         )))
     }
@@ -1251,7 +1251,7 @@ impl RTcpInner {
 #[derive(Clone)]
 struct RTcpTunnel {
     build_helper: RTcpStreamBuildHelper,
-    target: RTcpTargetStackEP,
+    remote_stack: RTcpTargetStackEP,
     can_direct: bool,
     peer_addr: SocketAddr,
     this_device: DID,
@@ -1270,7 +1270,7 @@ impl RTcpTunnel {
     pub fn new(
         build_helper: RTcpStreamBuildHelper,
         this_device: DID,
-        target: &RTcpTargetStackEP,
+        remote_stack: &RTcpTargetStackEP,
         can_direct: bool,
         stream: TcpStream,
         aes_key: [u8; 32],
@@ -1283,12 +1283,12 @@ impl RTcpTunnel {
         let encrypted_stream = EncryptedStream::new(stream, &aes_key, &iv);
         let (read_stream, write_stream) = tokio::io::split(encrypted_stream);
         //let (read_stream,write_stream) =  tokio::io::split(stream);
-        let this_target = target.clone();
+        let this_remote_stack = remote_stack.clone();
 
-        //this_target.target_port = 0;
+        //this_remote_stack.stack_port = 0;
         Self {
             build_helper,
-            target: this_target,
+            remote_stack: this_remote_stack,
             can_direct, //Considering the limit of port mapping, the default configuration is configured as "NoDirect" mode
             peer_addr: peer_addr,
             this_device: this_device,
@@ -1366,13 +1366,13 @@ impl RTcpTunnel {
         );
 
         // 1. open stream to remote and send hello stream
-        let mut target_addr = self.peer_addr.clone();
-        target_addr.set_port(self.target.stack_port);
-        let rtcp_stream = tokio::net::TcpStream::connect(target_addr).await;
+        let mut remote_stack_addr = self.peer_addr.clone();
+        remote_stack_addr.set_port(self.remote_stack.stack_port);
+        let rtcp_stream = tokio::net::TcpStream::connect(remote_stack_addr).await;
         if rtcp_stream.is_err() {
             error!(
                 "open rtcp stream to remote {} error:{}",
-                target_addr,
+                remote_stack_addr,
                 rtcp_stream.err().unwrap()
             );
             let ropen_resp_package = RTcpROpenRespPackage::new(ropen_package.seq, 2);
@@ -1454,8 +1454,8 @@ impl RTcpTunnel {
     ) -> Result<(), anyhow::Error> {
         //TODO: bug?
         let end_point = TunnelEndpoint {
-            device_id: self.target.did.to_string(),
-            port: self.target.stack_port,
+            device_id: self.remote_stack.did.to_string(),
+            port: self.remote_stack.stack_port,
         };
         self.listener
             .on_new_stream(
@@ -1479,8 +1479,8 @@ impl RTcpTunnel {
         stream: Box<dyn AsyncStream>,
     ) -> Result<(), anyhow::Error> {
         let end_point = TunnelEndpoint {
-            device_id: self.target.did.to_string(),
-            port: self.target.stack_port,
+            device_id: self.remote_stack.did.to_string(),
+            port: self.remote_stack.stack_port,
         };
         self.listener
             .on_new_datagram(
@@ -1565,7 +1565,7 @@ impl RTcpTunnel {
     }
 
     pub async fn run(self) {
-        let source_info = self.target.did.to_string();
+        let source_info = self.remote_stack.did.to_string();
         let mut read_stream = self.read_stream.lock().await;
         //let read_stream = self.read_stream.clone();
         loop {
@@ -1676,7 +1676,7 @@ impl RTcpTunnel {
                 .await
                 .insert(seq, notify.clone());
 
-            // Send open to target to build a direct stream
+            // Send open to remote stack to build a direct stream
             self.post_open(seq, purpose, dest_port, dest_host, session_key.as_str())
                 .await?;
 
@@ -1691,17 +1691,17 @@ impl RTcpTunnel {
                 return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout"));
             }
 
-            // Build a direct stream to target
-            let mut target_addr = self.peer_addr.clone();
-            target_addr.set_port(self.target.stack_port);
+            // Build a direct stream to remote stack
+            let mut remote_stack_addr = self.peer_addr.clone();
+            remote_stack_addr.set_port(self.remote_stack.stack_port);
             //TODO:通过tunnel框架创建stream
-            let ret = tokio::net::TcpStream::connect(target_addr).await;
+            let ret = tokio::net::TcpStream::connect(remote_stack_addr).await;
             if ret.is_err() {
                 let e = ret.err().unwrap();
                 error!(
                     "RTcp tunnel open direct stream to {}, {} error: {}",
-                    target_addr,
-                    self.target.did.to_string(),
+                    remote_stack_addr,
+                    self.remote_stack.did.to_string(),
                     e
                 );
                 return Err(e);
@@ -1712,7 +1712,7 @@ impl RTcpTunnel {
             RTcpTunnelPackage::send_hello_stream(&mut stream, session_key.as_str())
                 .await
                 .map_err(|e| {
-                    let msg = format!("send hello stream error: {}, {}", target_addr, e);
+                    let msg = format!("send hello stream error: {}, {}", remote_stack_addr, e);
                     error!("{}", msg);
                     std::io::Error::new(std::io::ErrorKind::Other, msg)
                 })?;
@@ -1722,13 +1722,13 @@ impl RTcpTunnel {
 
             debug!(
                 "RTcp tunnel open direct stream to {}, {}",
-                target_addr,
-                self.target.did.to_string()
+                remote_stack_addr,
+                self.remote_stack.did.to_string()
             );
 
             Ok(Box::new(aes_stream))
         } else {
-            //send ropen to target
+            //send ropen to remote stack
 
             self.build_helper.new_wait_stream(&real_key).await;
 
@@ -1736,7 +1736,7 @@ impl RTcpTunnel {
             self.post_ropen(seq, purpose, dest_port, dest_host, session_key.as_str())
                 .await?;
 
-            // wait new stream with session_key from target
+            // wait new stream with session_key from remote stack
             let stream = self.wait_ropen_stream(&session_key.as_str()).await?;
             let aes_stream: EncryptedStream<TcpStream> =
                 EncryptedStream::new(stream, &self.get_key(), &random_bytes);
