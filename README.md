@@ -9,3 +9,6 @@ cd src
 uv run ./buckyos-build.py
 uv run ./buckyos-install.py
 ```
+
+
+<!-- Fix #135 -->
