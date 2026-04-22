@@ -1,7 +1,7 @@
 use super::cmd::*;
 use crate::block::{CommandArg, CommandArgEvaluator, CommandArgs};
 use crate::chain::{Context, ParserContext};
-use crate::collection::{CollectionValue, MemoryListCollection, MemoryMapCollection, NumberValue};
+use crate::collection::{CollectionValue, MemoryListCollection, NumberValue};
 use clap::{Arg, ArgAction, Command};
 use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
@@ -1149,7 +1149,7 @@ impl CommandExecutor for StringSliceCommand {
 }
 
 // split <value> <delimiter>
-// This command splits a string into segments and optionally captures them into name[0], name[1], ...
+// This command splits a string into segments and optionally stores them in a fresh List capture.
 pub struct StringSplitCommandParser {
     cmd: Command,
 }
@@ -1165,7 +1165,7 @@ Arguments:
   <delimiter>   The delimiter string used to split the input.
 
 Options:
-  --capture <name>   Store segments into a fresh map variable as name[0], name[1], ...
+  --capture <name>   Store segments into a fresh List variable accessible as name[0], name[1], ...
   --skip-empty       Drop empty segments from the result
 
 Behavior:
@@ -1173,7 +1173,7 @@ Behavior:
   - Returns a List of string segments.
   - By default, empty segments are preserved, including leading or trailing ones.
   - If --skip-empty is set, empty segments are removed from both the returned list and captured slots.
-  - If --capture is set, <name> is replaced with a fresh map whose keys are "0", "1", ...
+  - If --capture is set, <name> is replaced with a fresh List containing the split segments.
   - <name> must be a literal variable name or path.
   - Empty delimiter is invalid and returns a runtime error.
 
@@ -1187,7 +1187,7 @@ Examples:
                 Arg::new("capture")
                     .long("capture")
                     .value_name("name")
-                    .help("Store split segments into a fresh map variable"),
+                    .help("Store split segments into a fresh List variable"),
             )
             .arg(
                 Arg::new("skip_empty")
@@ -1317,19 +1317,6 @@ impl StringSplitCommand {
 
         Ok(CollectionValue::List(list))
     }
-
-    async fn build_capture_map(segments: &[String]) -> Result<CollectionValue, String> {
-        let map = MemoryMapCollection::new_ref();
-        for (index, segment) in segments.iter().enumerate() {
-            map.insert(
-                index.to_string().as_str(),
-                CollectionValue::String(segment.clone()),
-            )
-            .await?;
-        }
-
-        Ok(CollectionValue::Map(map))
-    }
 }
 
 #[async_trait::async_trait]
@@ -1340,8 +1327,8 @@ impl CommandExecutor for StringSplitCommand {
         let segments = Self::split_segments(&value, &delimiter, self.skip_empty)?;
 
         if let Some(name) = &self.capture {
-            let capture_map = Self::build_capture_map(&segments).await?;
-            context.env().set(name, capture_map, None).await?;
+            let capture_list = Self::build_list(&segments).await?;
+            context.env().set(name, capture_list, None).await?;
         }
 
         debug!(

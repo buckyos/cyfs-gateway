@@ -242,17 +242,19 @@ const PROCESS_CHAIN_SPLIT_CAPTURE: &str = r#"
             <![CDATA[
                 local delimiter="/";
                 split --capture parts --skip-empty "/.cluster/klog/ood1/admin/" $delimiter;
-                eq $parts[0] ".cluster" || return --from lib "split_capture_0_fail";
-                eq $parts[1] "klog" || return --from lib "split_capture_1_fail";
-                eq $parts[2] "ood1" || return --from lib "split_capture_2_fail";
-                eq $parts[3] "admin" || return --from lib "split_capture_3_fail";
+                eq $(list-remove $parts 0) ".cluster" || return --from lib "split_capture_0_fail";
+                eq $(list-remove $parts 0) "klog" || return --from lib "split_capture_1_fail";
+                eq $(list-remove $parts 0) "ood1" || return --from lib "split_capture_2_fail";
+                eq $(list-remove $parts 0) "admin" || return --from lib "split_capture_3_fail";
+                list-pop $parts && return --from lib "split_capture_tail_should_be_empty";
 
                 split --capture parts "svc:9000" ":";
-                eq $parts[0] "svc" || return --from lib "split_capture_overwrite_0_fail";
-                eq $parts[1] "9000" || return --from lib "split_capture_overwrite_1_fail";
+                eq $(list-remove $parts 0) "svc" || return --from lib "split_capture_overwrite_0_fail";
+                eq $(list-remove $parts 0) "9000" || return --from lib "split_capture_overwrite_1_fail";
+                list-pop $parts && return --from lib "split_capture_overwrite_tail_should_be_empty";
 
-                local stale=${parts?.["2"] ?? "missing"};
-                eq $stale "missing" || return --from lib "split_capture_stale_slot_fail";
+                local stale=${parts?.[2] ?? "missing"};
+                eq $stale "missing" || return --from lib "split_capture_stale_index_fail";
 
                 return --from lib "ok";
             ]]>
@@ -678,7 +680,7 @@ async fn test_split_returns_list_and_respects_skip_empty() -> Result<(), String>
 }
 
 #[tokio::test]
-async fn test_split_capture_populates_fresh_slots() -> Result<(), String> {
+async fn test_split_capture_populates_fresh_list() -> Result<(), String> {
     init_test_logger();
 
     let hook_point = HookPoint::new("test_split_capture");

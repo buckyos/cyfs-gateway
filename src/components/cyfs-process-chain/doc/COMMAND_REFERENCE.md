@@ -275,7 +275,7 @@ Arguments:
 
 Options:
       --capture <name>
-          Store split segments into a fresh map variable
+          Store split segments into a fresh List variable
 
       --skip-empty
           Drop empty segments from the result
@@ -289,7 +289,7 @@ Arguments:
   <delimiter>   The delimiter string used to split the input.
 
 Options:
-  --capture <name>   Store segments into a fresh map variable as name[0], name[1], ...
+  --capture <name>   Store segments into a fresh List variable accessible as name[0], name[1], ...
   --skip-empty       Drop empty segments from the result
 
 Behavior:
@@ -297,7 +297,7 @@ Behavior:
   - Returns a List of string segments.
   - By default, empty segments are preserved, including leading or trailing ones.
   - If --skip-empty is set, empty segments are removed from both the returned list and captured slots.
-  - If --capture is set, <name> is replaced with a fresh map whose keys are "0", "1", ...
+  - If --capture is set, <name> is replaced with a fresh List containing the split segments.
   - <name> must be a literal variable name or path.
   - Empty delimiter is invalid and returns a runtime error.
 

@@ -277,7 +277,7 @@
 
 选项:
       --capture <name>
-          把拆分结果写入一个新的 map 变量
+          把拆分结果写入一个新的 List 变量
 
       --skip-empty
           丢弃空片段
@@ -291,7 +291,7 @@
   <delimiter>   用于拆分输入的分隔符字符串。
 
 选项:
-  --capture <name>   把片段写入一个新的 map 变量，形式为 name[0]、name[1]...
+  --capture <name>   把片段写入一个新的 List 变量，可通过 name[0]、name[1]... 访问
   --skip-empty       从返回结果和 capture 槽位中都移除空片段
 
 行为:
@@ -299,7 +299,7 @@
   - 返回一个由字符串片段组成的 List。
   - 默认保留空片段，包括开头或结尾产生的空片段。
   - 指定 --skip-empty 后，会同时从返回的 List 和 capture 槽位中移除空片段。
-  - 指定 --capture 后，会用一个新的 map 替换 <name>，其 key 为 "0"、"1"...
+  - 指定 --capture 后，会用一个新的 List 替换 <name>，其中包含拆分得到的所有片段。
   - <name> 必须是字面量变量名或变量路径。
   - 空分隔符是非法输入，会返回运行时错误。
 
