@@ -51,6 +51,14 @@ pub enum CommandArg {
     // Examples: true/false/null/123/12.5
     TypedLiteral(String, CollectionValue),
 
+    // Fresh List collection literal, constructed at runtime from the contained args.
+    // Example: [1, "two", $REQ.port]
+    ListLiteral(Vec<CommandArg>),
+
+    // Fresh Map collection literal with static string keys and dynamic values.
+    // Example: {"kind": "app", app_id: $REQ.appId}
+    MapLiteral(Vec<(String, CommandArg)>),
+
     // A command arg that is a variable, like $VAR_NAME ${VAR_NAME}
     Var(String), // A reference to a variable, like $VAR_NAME
 
@@ -246,6 +254,8 @@ impl CommandArg {
             | CommandArg::TypedLiteral(s, _) => s.as_str(),
             CommandArg::Var(s) => s.as_str(),
             CommandArg::CommandSubstitution(_) => "[command substitution]",
+            CommandArg::ListLiteral(_) => "[list literal]",
+            CommandArg::MapLiteral(_) => "[map literal]",
         }
     }
 

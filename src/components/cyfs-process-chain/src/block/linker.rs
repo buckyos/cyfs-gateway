@@ -6,7 +6,7 @@ use super::exec::BlockExecuter;
 use super::parser::BlockParser;
 use crate::chain::{Context, MissingVarPolicy, ParserContextRef};
 use crate::cmd::CommandParserFactory;
-use crate::collection::CollectionValue;
+use crate::collection::{CollectionValue, MemoryListCollection, MemoryMapCollection};
 
 pub struct BlockCommandLinker {
     context: ParserContextRef,
@@ -926,6 +926,21 @@ impl CommandArgEvaluator {
             CommandArg::Literal(value) => CollectionValue::String(value.clone()),
             CommandArg::StringLiteral(value) => CollectionValue::String(value.clone()),
             CommandArg::TypedLiteral(_, value) => value.clone(),
+            CommandArg::ListLiteral(items) => {
+                let list = MemoryListCollection::new_ref();
+                for item in items {
+                    list.push(Self::evaluate(item, context).await?).await?;
+                }
+                CollectionValue::List(list)
+            }
+            CommandArg::MapLiteral(entries) => {
+                let map = MemoryMapCollection::new_ref();
+                for (key, value) in entries {
+                    map.insert(key, Self::evaluate(value, context).await?)
+                        .await?;
+                }
+                CollectionValue::Map(map)
+            }
             CommandArg::Var(var) => {
                 debug!("Resolving variable: {}", var);
                 let policy = context.env().policy();

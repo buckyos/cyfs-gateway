@@ -6,6 +6,7 @@ mod test_break;
 mod test_capture;
 mod test_coercion;
 mod test_collection;
+mod test_collection_literal;
 mod test_compare_commands;
 mod test_env;
 mod test_eq;

@@ -586,6 +586,39 @@
   - 尚不支持：`??` 右侧直接使用命令替换 `$(...)`。
 ```
 
+### Map / List 字面量
+```
+这些是用于构造 fresh collection value 的 DSL 表达式规则，不是独立命令。
+
+支持形式:
+  - List literal:
+      []
+      ["a", 1, $REQ.port]
+      [{"node": $REQ.nodeId}, ["raft", "inter"], null]
+
+  - Map literal:
+      {"kind": "app", "app_id": $REQ.appId}
+      {kind: "service", target: $TARGET_SERVICE_INFO}
+      {"meta": {"region.code": $REQ.regionCode}, "ports": [$REQ.port, 3180]}
+
+语义:
+  - `[...]` 会构造一个新的 List collection。
+  - `{...}` 会构造一个新的 Map collection。
+  - v1 里 map key 只支持静态字符串 key：
+      裸标识符 key，例如 `kind`
+      或带引号的 key，例如 `"region.code"` / `'region.code'`
+  - value 可以是字符串字面量、typed literal、变量、命令替换，或嵌套的 map/list literal。
+  - 每次表达式求值都会创建 fresh collection instance。
+  - 这些 literal 复用的是现有 collection runtime type，不会引入独立的 `Object` 类型。
+  - v1 里 literal 需要写在同一条 statement line 内。
+  - 暂不支持 Set literal。
+
+典型用法:
+  - local route={"kind": "app", "target": $TARGET_APP_INFO}
+  - return --from block {"kind": "service", "service_id": $SERVICE_ID}
+  - local segments=["klog", $node_name, $plane]
+```
+
 ### `assign`
 ```
 管理变量定义与默认作用域偏好。

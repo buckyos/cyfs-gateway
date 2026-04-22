@@ -582,6 +582,39 @@ Default RHS support:
   - Not supported yet: command substitution `$(...)` on RHS of `??`.
 ```
 
+### Map And List Literals
+```
+These are DSL expression rules for constructing fresh collection values.
+
+Supported forms:
+  - List literal:
+      []
+      ["a", 1, $REQ.port]
+      [{"node": $REQ.nodeId}, ["raft", "inter"], null]
+
+  - Map literal:
+      {"kind": "app", "app_id": $REQ.appId}
+      {kind: "service", target: $TARGET_SERVICE_INFO}
+      {"meta": {"region.code": $REQ.regionCode}, "ports": [$REQ.port, 3180]}
+
+Semantics:
+  - `[...]` constructs a fresh List collection.
+  - `{...}` constructs a fresh Map collection.
+  - Map keys are static string keys in v1:
+      bare identifier keys like `kind`
+      or quoted keys like `"region.code"` / `'region.code'`
+  - Values may be string literals, typed literals, variables, command substitutions, or nested map/list literals.
+  - A fresh collection instance is created each time the expression is evaluated.
+  - These literals reuse the existing collection runtime types; they do not introduce a separate `Object` type.
+  - In v1, the literal must stay within a single statement line.
+  - Set literal is not supported yet.
+
+Typical use:
+  - local route={"kind": "app", "target": $TARGET_APP_INFO}
+  - return --from block {"kind": "service", "service_id": $SERVICE_ID}
+  - local segments=["klog", $node_name, $plane]
+```
+
 ### `assign`
 ```
 Manage variable definitions and scope preferences.

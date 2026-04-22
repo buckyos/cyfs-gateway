@@ -89,6 +89,116 @@ impl BlockParser {
         }
     }
 
+    fn parse_map_literal_key(input: &str) -> IResult<&str, String> {
+        let double_quoted = delimited(
+            char('"'),
+            map(
+                opt(escaped_transform(
+                    is_not("\\\""),
+                    '\\',
+                    alt((
+                        value("\\", tag("\\")),
+                        value("\"", tag("\"")),
+                        value("\n", tag("n")),
+                        value("\t", tag("t")),
+                        value("\r", tag("r")),
+                        value(" ", tag(" ")),
+                    )),
+                )),
+                |s: Option<String>| s.unwrap_or_default(),
+            ),
+            char('"'),
+        );
+
+        let single_quoted = delimited(
+            char('\''),
+            map(opt(is_not("'")), |s: Option<&str>| {
+                s.unwrap_or("").to_string()
+            }),
+            char('\''),
+        );
+
+        let bare_key = map(
+            recognize(pair(
+                alt((alpha1, tag("_"))),
+                many0(alt((alphanumeric1, tag("_"), tag("-"), tag(".")))),
+            )),
+            |s: &str| s.to_string(),
+        );
+
+        preceded(space0, alt((double_quoted, single_quoted, bare_key))).parse(input)
+    }
+
+    fn parse_list_literal(input: &str) -> IResult<&str, CommandArg> {
+        let (mut rest, _) = preceded(space0, char('[')).parse(input)?;
+        let mut items = Vec::new();
+
+        loop {
+            let (next, _) = space0.parse(rest)?;
+            rest = next;
+
+            if let Some(next) = rest.strip_prefix(']') {
+                return Ok((next, CommandArg::ListLiteral(items)));
+            }
+
+            let (next, value) = Self::parse_arg(rest)?;
+            items.push(value);
+
+            let (next, _) = space0.parse(next)?;
+            rest = next;
+
+            if let Some(next) = rest.strip_prefix(',') {
+                let (next, _) = space0.parse(next)?;
+                rest = next;
+
+                if let Some(next) = rest.strip_prefix(']') {
+                    return Ok((next, CommandArg::ListLiteral(items)));
+                }
+
+                continue;
+            }
+
+            let (next, _) = char(']').parse(rest)?;
+            return Ok((next, CommandArg::ListLiteral(items)));
+        }
+    }
+
+    fn parse_map_literal(input: &str) -> IResult<&str, CommandArg> {
+        let (mut rest, _) = preceded(space0, char('{')).parse(input)?;
+        let mut entries = Vec::new();
+
+        loop {
+            let (next, _) = space0.parse(rest)?;
+            rest = next;
+
+            if let Some(next) = rest.strip_prefix('}') {
+                return Ok((next, CommandArg::MapLiteral(entries)));
+            }
+
+            let (next, key) = Self::parse_map_literal_key(rest)?;
+            let (next, _) = preceded(space0, char(':')).parse(next)?;
+            let (next, value) = Self::parse_arg(next)?;
+            entries.push((key, value));
+
+            let (next, _) = space0.parse(next)?;
+            rest = next;
+
+            if let Some(next) = rest.strip_prefix(',') {
+                let (next, _) = space0.parse(next)?;
+                rest = next;
+
+                if let Some(next) = rest.strip_prefix('}') {
+                    return Ok((next, CommandArg::MapLiteral(entries)));
+                }
+
+                continue;
+            }
+
+            let (next, _) = char('}').parse(rest)?;
+            return Ok((next, CommandArg::MapLiteral(entries)));
+        }
+    }
+
     pub fn new(id: &str) -> Self {
         Self { id: id.to_owned() }
     }
@@ -1177,7 +1287,12 @@ impl BlockParser {
             // End of current arg token, only when not inside dynamic/bracket segment
             if paren_depth == 0
                 && bracket_depth == 0
-                && (ch.is_whitespace() || ch == ';' || ch == ')')
+                && (ch.is_whitespace()
+                    || ch == ';'
+                    || ch == ')'
+                    || ch == ','
+                    || ch == ']'
+                    || ch == '}')
             {
                 break;
             }
@@ -1436,7 +1551,7 @@ impl BlockParser {
                 nom::Err::Error(nom::error::Error::from_error_kind(input, ErrorKind::Tag))
             })?;
 
-            if ch.is_whitespace() || ch == ';' {
+            if ch.is_whitespace() || ch == ';' || ch == ',' || ch == ']' || ch == '}' {
                 break;
             }
 
@@ -1517,6 +1632,8 @@ impl BlockParser {
                 Self::parse_command_subst,         // $(...)
                 Self::parse_var_braced,            // ${VAR}
                 Self::parse_var_dollar,            // $VAR
+                Self::parse_map_literal,           // {...}
+                Self::parse_list_literal,          // [...]
                 Self::parse_interpolated_unquoted, // a.($b).($c)
                 Self::parse_literal,               // "..." or '...' or unquoted
                 Self::parse_option,                // -o or --option
@@ -1592,6 +1709,53 @@ mod tests {
         let (input, arg) = BlockParser::parse_literal("tcp://127.0.0.1:8083").unwrap();
         assert_eq!(input, "");
         assert_eq!(arg.as_literal_str().unwrap(), "tcp://127.0.0.1:8083");
+    }
+
+    #[test]
+    fn test_parse_collection_literals() {
+        let (input, arg) =
+            BlockParser::parse_arg(r#"{"kind": "app", app_id: $REQ.appId, "tags": ["a", 2]}"#)
+                .unwrap();
+        assert_eq!(input, "");
+
+        match arg {
+            CommandArg::MapLiteral(entries) => {
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0].0, "kind");
+                assert_eq!(entries[1].0, "app_id");
+                assert_eq!(entries[2].0, "tags");
+
+                assert!(matches!(entries[0].1, CommandArg::StringLiteral(_)));
+                assert!(matches!(entries[1].1, CommandArg::Var(_)));
+
+                match &entries[2].1 {
+                    CommandArg::ListLiteral(items) => {
+                        assert_eq!(items.len(), 2);
+                        assert!(matches!(items[0], CommandArg::StringLiteral(_)));
+                        assert!(matches!(items[1], CommandArg::TypedLiteral(_, _)));
+                    }
+                    other => panic!("expected list literal, got {:?}", other),
+                }
+            }
+            other => panic!("expected map literal, got {:?}", other),
+        }
+
+        let (input, arg) =
+            BlockParser::parse_arg(r#"[{"node": $REQ.node}, ["raft", "inter"], null]"#).unwrap();
+        assert_eq!(input, "");
+
+        match arg {
+            CommandArg::ListLiteral(items) => {
+                assert_eq!(items.len(), 3);
+                assert!(matches!(items[0], CommandArg::MapLiteral(_)));
+                assert!(matches!(items[1], CommandArg::ListLiteral(_)));
+                assert!(matches!(
+                    items[2],
+                    CommandArg::TypedLiteral(_, CollectionValue::Null)
+                ));
+            }
+            other => panic!("expected list literal, got {:?}", other),
+        }
     }
 
     #[test]
