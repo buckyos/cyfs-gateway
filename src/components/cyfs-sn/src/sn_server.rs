@@ -1014,6 +1014,11 @@ impl SNServer {
             return Err(RPCErrors::ParseRequestError("device not found".to_string()));
         }
         let (old_device_info, _) = old_device_info.unwrap();
+        if old_device_info.id != device_info.id {
+            return Err(RPCErrors::ParseRequestError(
+                "device did mismatch".to_string(),
+            ));
+        }
 
         let session_token = req.token.clone();
         if session_token.is_none() {
@@ -1030,7 +1035,15 @@ impl SNServer {
                 error!("Failed to decode device public key: {:?}", e);
                 RPCErrors::ParseRequestError(e.to_string())
             })?;
-        rpc_session_token.verify_by_key(&verify_public_key)?;
+        if let Err(verify_err) = rpc_session_token.verify_by_key(&verify_public_key) {
+            Self::verify_legacy_device_update_trusted_token(&rpc_session_token)?;
+            warn!(
+                "accept legacy device update with trusted verify-hub token for {}_{} after device signature verify failed: {}",
+                owner_id,
+                device_info.name,
+                verify_err
+            );
+        }
 
         info!(
             "start update {}_{} ==> {:?}",
@@ -1056,6 +1069,87 @@ impl SNServer {
             })),
             &req,
         ))
+    }
+
+    fn verify_legacy_device_update_trusted_token(
+        rpc_session_token: &RPCSessionToken,
+    ) -> Result<(), RPCErrors> {
+        if !rpc_session_token.is_self_verify() {
+            return Err(RPCErrors::InvalidToken(
+                "legacy device.update token is not self verified jwt".to_string(),
+            ));
+        }
+
+        match rpc_session_token.iss.as_deref() {
+            Some("verify-hub") => {}
+            Some(other) => {
+                return Err(RPCErrors::InvalidToken(format!(
+                    "legacy device.update token issuer mismatch: {}",
+                    other
+                )))
+            }
+            None => {
+                return Err(RPCErrors::InvalidToken(
+                    "legacy device.update token issuer missing".to_string(),
+                ))
+            }
+        }
+
+        match rpc_session_token.appid.as_deref() {
+            Some("node-daemon") => {}
+            Some(other) => {
+                return Err(RPCErrors::InvalidToken(format!(
+                    "legacy device.update token appid mismatch: {}",
+                    other
+                )))
+            }
+            None => {
+                return Err(RPCErrors::InvalidToken(
+                    "legacy device.update token appid missing".to_string(),
+                ))
+            }
+        }
+
+        match rpc_session_token.aud.as_deref() {
+            Some("node-daemon") => {}
+            Some(other) => {
+                return Err(RPCErrors::InvalidToken(format!(
+                    "legacy device.update token aud mismatch: {}",
+                    other
+                )))
+            }
+            None => {
+                return Err(RPCErrors::InvalidToken(
+                    "legacy device.update token aud missing".to_string(),
+                ))
+            }
+        }
+
+        match rpc_session_token.sub.as_deref() {
+            Some("kernel") => {}
+            Some(other) => {
+                return Err(RPCErrors::InvalidToken(format!(
+                    "legacy device.update token sub mismatch: {}",
+                    other
+                )))
+            }
+            None => {
+                return Err(RPCErrors::InvalidToken(
+                    "legacy device.update token sub missing".to_string(),
+                ))
+            }
+        }
+
+        let now = buckyos_kit::buckyos_get_unix_timestamp();
+        match rpc_session_token.exp {
+            Some(exp) if exp > now => Ok(()),
+            Some(_) => Err(RPCErrors::InvalidToken(
+                "legacy device.update token expired".to_string(),
+            )),
+            None => Err(RPCErrors::InvalidToken(
+                "legacy device.update token exp missing".to_string(),
+            )),
+        }
     }
 
     pub async fn update_device_v2(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
@@ -4680,7 +4774,54 @@ mod tests {
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v["cpu_info"].as_str().unwrap(), "Zen5");
 
-        let result = krpc
+        let verify_hub_legacy_token = RPCSessionToken {
+            token_type: RPCSessionTokenType::JWT,
+            token: None,
+            aud: Some("node-daemon".to_string()),
+            exp: Some(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 600,
+            ),
+            iss: Some("verify-hub".to_string()),
+            jti: Some("legacy-update-test".to_string()),
+            session: Some(1),
+            sub: Some("kernel".to_string()),
+            appid: Some("node-daemon".to_string()),
+            extra: HashMap::new(),
+        }
+        .generate_jwt(Some("verify-hub".to_string()), &user_encoding_key)
+        .unwrap();
+        let verify_hub_krpc = kRPC::new("http://127.0.0.1:19091", Some(verify_hub_legacy_token));
+        let mut verify_hub_device_info = DeviceInfo::from_device_doc(&device_config);
+        verify_hub_device_info.cpu_info = Some("Zen6".to_string());
+        let result = verify_hub_krpc
+            .call(
+                "device.update",
+                json!({
+                    "device_id": device_config.name,
+                    "owner_id": TEST_USER,
+                    "device_info": verify_hub_device_info
+                }),
+            )
+            .await;
+        assert!(result.is_ok());
+
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
+                device_config.id.to_string()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["cpu_info"].as_str().unwrap(), "Zen6");
+
+        let result = verify_hub_krpc
             .call(
                 "query_by_did",
                 json!({
@@ -4690,7 +4831,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let result = krpc
+        let result = verify_hub_krpc
             .call(
                 "query_by_hostname",
                 json!({
