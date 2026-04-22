@@ -51,7 +51,8 @@ result:u32
 
 use anyhow::Result;
 use name_lib::DID;
-use percent_encoding::percent_decode_str;
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use url::Url;
 
 pub const DEFAULT_RTCP_STACK_PORT: u16 = 2980;
 
@@ -118,10 +119,47 @@ pub(crate) fn parse_rtcp_stack_id(stack_id: &str) -> Option<RTcpTargetStackEP> {
     })
 }
 
+// Build the RTCP stack-id form used by nested-remote tunnels:
+//   <percent-encoded bootstrap URL>@did[:port]
+// Callers should use this instead of reimplementing the percent-encoding and
+// authority concatenation rules by hand.
+pub fn build_rtcp_nested_remote_stack_id(
+    bootstrap_stream_url: &Url,
+    remote_host: &str,
+    remote_port: Option<u16>,
+) -> String {
+    let encoded_bootstrap =
+        utf8_percent_encode(bootstrap_stream_url.as_str(), NON_ALPHANUMERIC).to_string();
+    match remote_port {
+        Some(port) => format!("{}@{}:{}", encoded_bootstrap, remote_host, port),
+        None => format!("{}@{}", encoded_bootstrap, remote_host),
+    }
+}
+
+// Build a full nested-remote RTCP URL:
+//   rtcp://<percent-encoded bootstrap URL>@did[:port][/stream_id]
+// `stream_id` is appended as the outer RTCP path and should be the plain
+// stream identifier used by RTCP open_stream semantics.
+pub fn build_rtcp_nested_remote_url(
+    bootstrap_stream_url: &Url,
+    remote_host: &str,
+    remote_port: Option<u16>,
+    stream_id: Option<&str>,
+) -> Result<Url> {
+    let stack_id =
+        build_rtcp_nested_remote_stack_id(bootstrap_stream_url, remote_host, remote_port);
+    let url = match stream_id {
+        Some(stream_id) if !stream_id.is_empty() => {
+            format!("rtcp://{}/{}", stack_id, stream_id.trim_start_matches('/'))
+        }
+        _ => format!("rtcp://{}", stack_id),
+    };
+    Url::parse(&url).map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
     #[test]
     fn parse_plain_did_with_port() {
@@ -150,5 +188,37 @@ mod tests {
     #[test]
     fn parse_rejects_empty_params() {
         assert!(parse_rtcp_stack_id("@remote.com:2981").is_none());
+    }
+
+    #[test]
+    fn build_nested_remote_stack_id_round_trip() {
+        let bootstrap = Url::parse("rtcp://relay.example.com:2993/bootstrap:1").unwrap();
+        let stack_id =
+            build_rtcp_nested_remote_stack_id(&bootstrap, "target.example.com", Some(2994));
+        let ep = parse_rtcp_stack_id(&stack_id).expect("parse");
+        assert_eq!(ep.stack_port, 2994);
+        assert_eq!(
+            ep.bootstrap_stream_url.as_deref(),
+            Some("rtcp://relay.example.com:2993/bootstrap:1")
+        );
+    }
+
+    #[test]
+    fn build_nested_remote_url_with_stream_id() {
+        let bootstrap = Url::parse("rtcp://relay.example.com:2993/bootstrap:1").unwrap();
+        let url = build_rtcp_nested_remote_url(
+            &bootstrap,
+            "target.example.com",
+            Some(2994),
+            Some("test:80"),
+        )
+        .unwrap();
+        let ep = parse_rtcp_stack_id(url.authority()).expect("parse");
+        assert_eq!(ep.stack_port, 2994);
+        assert_eq!(
+            ep.bootstrap_stream_url.as_deref(),
+            Some("rtcp://relay.example.com:2993/bootstrap:1")
+        );
+        assert_eq!(url.path(), "/test:80");
     }
 }
