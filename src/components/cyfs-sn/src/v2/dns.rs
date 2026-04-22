@@ -84,6 +84,7 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                     .await
                     .into_rpc()?;
             }
+            server.invalidate_query_cache_for_username(username.as_str()).await;
             ok_response(
                 &req,
                 json!({ "code": 0, "device_name": device.device_name }),
@@ -121,6 +122,7 @@ pub(crate) async fn handle_dns(server: &SNServer, req: RPCRequest) -> RpcCallRes
                 )
                 .await
                 .into_rpc()?;
+            server.invalidate_query_cache_for_username(username.as_str()).await;
             ok_response(&req, json!({ "code": 0 }))
         }
         "list_records" => {

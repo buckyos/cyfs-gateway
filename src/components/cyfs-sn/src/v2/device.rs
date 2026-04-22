@@ -49,6 +49,7 @@ pub(crate) async fn handle_device(
                 )
                 .await
                 .into_rpc()?;
+            server.invalidate_query_cache_for_username(username.as_str()).await;
             ok_response(&req, json!({ "code": 0 }))
         }
         "update" => {
@@ -85,6 +86,7 @@ pub(crate) async fn handle_device(
                         .into_rpc()?;
                 }
             }
+            server.invalidate_query_cache_for_username(username.as_str()).await;
             ok_response(&req, json!({ "code": 0 }))
         }
         "get" => {

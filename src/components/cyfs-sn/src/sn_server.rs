@@ -36,11 +36,14 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     result::Result,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{Duration, Instant};
 
 const CLEAR_STATE_ACTIVE_CODE: &str = "zX6cV7bN8mK9lJ0hG1fD";
 const RESERVED_USER_NAMES_FILE_ENV: &str = "BUCKYOS_SN_RESERVED_NAMES_FILE";
 const RESERVED_USER_NAMES_FILE: &str = "reserved_user_names.txt";
+const SN_QUERY_POSITIVE_TTL_SECS: u64 = 60;
+const SN_QUERY_NEGATIVE_TTL_SECS: u64 = 15;
 
 fn is_filtered_zonegate_ip(ip: IpAddr) -> bool {
     match ip {
@@ -155,6 +158,19 @@ pub struct SNServer {
     device_jwt: Vec<String>,
     db: SnDBRef,
     v2_auth: Arc<SnV2AuthManager>,
+    query_cache: Arc<RwLock<HashMap<String, SnQueryCacheEntry>>>,
+}
+
+#[derive(Clone, Debug)]
+enum SnQueryCacheValue {
+    Hit(NameInfo),
+    Miss,
+}
+
+#[derive(Clone, Debug)]
+struct SnQueryCacheEntry {
+    expires_at: Instant,
+    value: SnQueryCacheValue,
 }
 
 impl SNServer {
@@ -206,6 +222,109 @@ impl SNServer {
 
     fn normalize_registration_username(username: &str) -> String {
         username.trim().to_lowercase()
+    }
+
+    fn normalize_query_name(name: &str) -> String {
+        name.trim().trim_end_matches('.').to_ascii_lowercase()
+    }
+
+    fn build_query_cache_key(name: &str, record_type: RecordType) -> String {
+        format!("{}|{}", Self::normalize_query_name(name), record_type.to_string())
+    }
+
+    async fn get_cached_query_result(
+        &self,
+        name: &str,
+        record_type: RecordType,
+    ) -> Option<ServerResult<NameInfo>> {
+        let key = Self::build_query_cache_key(name, record_type);
+        let mut cache = self.query_cache.write().await;
+        let Some(entry) = cache.get(key.as_str()).cloned() else {
+            return None;
+        };
+
+        if Instant::now() >= entry.expires_at {
+            cache.remove(key.as_str());
+            return None;
+        }
+
+        match entry.value {
+            SnQueryCacheValue::Hit(name_info) => Some(Ok(name_info)),
+            SnQueryCacheValue::Miss => Some(Err(server_err!(
+                ServerErrorCode::NotFound,
+                "cached miss for {}",
+                Self::normalize_query_name(name)
+            ))),
+        }
+    }
+
+    async fn cache_query_hit(&self, name: &str, record_type: RecordType, name_info: &NameInfo) {
+        let key = Self::build_query_cache_key(name, record_type);
+        let entry = SnQueryCacheEntry {
+            expires_at: Instant::now() + Duration::from_secs(SN_QUERY_POSITIVE_TTL_SECS),
+            value: SnQueryCacheValue::Hit(name_info.clone()),
+        };
+        self.query_cache.write().await.insert(key, entry);
+    }
+
+    async fn cache_query_miss(&self, name: &str, record_type: RecordType) {
+        let key = Self::build_query_cache_key(name, record_type);
+        let entry = SnQueryCacheEntry {
+            expires_at: Instant::now() + Duration::from_secs(SN_QUERY_NEGATIVE_TTL_SECS),
+            value: SnQueryCacheValue::Miss,
+        };
+        self.query_cache.write().await.insert(key, entry);
+    }
+
+    fn build_user_query_cache_domains(
+        &self,
+        username: &str,
+        user_domain: Option<&str>,
+    ) -> Vec<String> {
+        let mut domains = vec![format!("{}.web3.{}", username, self.server_host)];
+        if let Some(user_domain) = user_domain {
+            let normalized = Self::normalize_query_name(user_domain);
+            if !normalized.is_empty() {
+                domains.push(normalized);
+            }
+        }
+        domains
+    }
+
+    async fn invalidate_query_cache_domains(&self, domains: &[String]) {
+        if domains.is_empty() {
+            return;
+        }
+
+        let mut cache = self.query_cache.write().await;
+        cache.retain(|key, _| {
+            let Some((cached_domain, _)) = key.split_once('|') else {
+                return true;
+            };
+            !domains.iter().any(|domain| {
+                cached_domain == domain || cached_domain.ends_with(format!(".{}", domain).as_str())
+            })
+        });
+    }
+
+    pub(crate) async fn invalidate_query_cache_for_username(&self, username: &str) {
+        let user_domain = self
+            .db
+            .get_user_info(username)
+            .await
+            .ok()
+            .and_then(|user| user.and_then(|u| u.user_domain));
+        let domains = self.build_user_query_cache_domains(username, user_domain.as_deref());
+        self.invalidate_query_cache_domains(&domains).await;
+    }
+
+    pub(crate) async fn invalidate_query_cache_for_username_and_domain(
+        &self,
+        username: &str,
+        user_domain: Option<&str>,
+    ) {
+        let domains = self.build_user_query_cache_domains(username, user_domain);
+        self.invalidate_query_cache_domains(&domains).await;
     }
 
     fn reserved_user_names_file() -> PathBuf {
@@ -387,6 +506,7 @@ impl SNServer {
             device_jwt: server_config.device_jwt,
             db,
             v2_auth,
+            query_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -550,7 +670,7 @@ impl SNServer {
                 user_name.as_str(),
                 public_key,
                 zone_config_jwt,
-                real_user_domain,
+                real_user_domain.clone(),
             )
             .await;
         if ret.is_err() {
@@ -570,6 +690,11 @@ impl SNServer {
             "user {} registered success, public_key: {}, active_code: {}",
             user_name, public_key, active_code
         );
+        self.invalidate_query_cache_for_username_and_domain(
+            user_name.as_str(),
+            real_user_domain.as_deref(),
+        )
+        .await;
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -685,6 +810,7 @@ impl SNServer {
         }
 
         info!("device {}_{} registered success", user_name, device_name);
+        self.invalidate_query_cache_for_username(user_name).await;
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -775,6 +901,11 @@ impl SNServer {
             "user {} zone_config and user_domain updated successfully",
             user_name
         );
+        self.invalidate_query_cache_for_username_and_domain(
+            user_name,
+            real_user_domain.as_deref(),
+        )
+        .await;
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -841,6 +972,7 @@ impl SNServer {
             })?;
 
         info!("user {} zone_config cleared successfully", user_name);
+        self.invalidate_query_cache_for_username(user_name).await;
 
         Ok(RPCResponse::create_by_req(
             RPCResult::Success(json!({ "code": 0 })),
@@ -931,6 +1063,7 @@ impl SNServer {
         let key = format!("{}_{}", owner_id, device_info.name.clone());
 
         info!("update device info done: for {}", key);
+        self.invalidate_query_cache_for_username(owner_id).await;
         return Ok(resp);
     }
 
@@ -1513,6 +1646,7 @@ impl SNServer {
         }
 
         info!("add dns record {} {} success", user_name, domain);
+        self.invalidate_query_cache_for_username(user_name).await;
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -1644,6 +1778,7 @@ impl SNServer {
         }
 
         info!("remove dns record {} {} success", user_name, domain);
+        self.invalidate_query_cache_for_username(user_name).await;
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -2874,11 +3009,45 @@ impl NameServer for SNServer {
         record_type: Option<RecordType>,
         from_ip: Option<IpAddr>,
     ) -> ServerResult<NameInfo> {
+        let record_type = record_type.unwrap_or_default();
+        if let Some(cached) = self.get_cached_query_result(name, record_type).await {
+            return cached;
+        }
+
+        let result = self.query_uncached(name, record_type, from_ip).await;
+        match &result {
+            Ok(name_info) => self.cache_query_hit(name, record_type, name_info).await,
+            Err(err) if err.code() == ServerErrorCode::NotFound => {
+                self.cache_query_miss(name, record_type).await
+            }
+            Err(_) => {}
+        }
+
+        result
+    }
+
+    async fn query_did(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+        from_ip: Option<IpAddr>,
+    ) -> ServerResult<EncodedDocument> {
+        self.query_did_v2(did, doc_type, from_ip).await
+    }
+}
+
+impl SNServer {
+    async fn query_uncached(
+        &self,
+        name: &str,
+        record_type: RecordType,
+        from_ip: Option<IpAddr>,
+    ) -> ServerResult<NameInfo> {
         info!(
             "sn server process name query: {} record_type: {:?}",
-            name, record_type
+            name,
+            Some(record_type)
         );
-        let record_type = record_type.unwrap_or_default();
         let from_ip = from_ip.unwrap_or(self.server_ip);
         let mut is_support = false;
         if record_type == RecordType::A
@@ -3088,15 +3257,6 @@ impl NameServer for SNServer {
                 name.to_string()
             ));
         }
-    }
-
-    async fn query_did(
-        &self,
-        did: &DID,
-        doc_type: Option<&str>,
-        from_ip: Option<IpAddr>,
-    ) -> ServerResult<EncodedDocument> {
-        self.query_did_v2(did, doc_type, from_ip).await
     }
 }
 
@@ -3468,6 +3628,35 @@ mod tests {
     const TEST_ROOT_USER: &str = "testroot";
     const TEST_LEGACY_USER: &str = "testlegacy";
 
+    async fn create_test_sn_server() -> SNServer {
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let sqlite_db = Arc::new(
+            SqliteSnDB::new_by_path(db.path().to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        sqlite_db.initialize_database().await.unwrap();
+        sqlite_db
+            .insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
+            .await
+            .unwrap();
+        let db = sqlite_db as SnDBRef;
+
+        let config = SNServerConfig {
+            id: "test-cache".to_string(),
+            host: "buckyos.ai".to_string(),
+            ip: "127.0.0.1".to_string(),
+            boot_jwt: String::new(),
+            owner_pkx: String::new(),
+            device_jwt: vec![],
+            aliases: vec![],
+            v2_auth_data_dir: None,
+            db_type: Some("sqlite".to_string()),
+            db_params: None,
+        };
+        SNServer::new(config, db).await
+    }
+
     #[test]
     fn test_split_host_name() {
         let req_host = "home.lzc.web3.buckyos.io".to_string();
@@ -3554,6 +3743,50 @@ mod tests {
         let err = SNServer::validate_registration_username("premiumname").unwrap_err();
         assert_eq!(err, "username is reserved by server");
         std::env::remove_var(RESERVED_USER_NAMES_FILE_ENV);
+    }
+
+    #[test]
+    fn test_query_cache_key_normalizes_domain_and_record_type() {
+        let key = SNServer::build_query_cache_key(" Meteormeta.Web3.Buckyos.Ai. ", RecordType::AAAA);
+        assert_eq!(key, "meteormeta.web3.buckyos.ai|AAAA");
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_query_cache_domains_removes_matching_domain_and_subdomains() {
+        let server = create_test_sn_server().await;
+        let mut cache = server.query_cache.write().await;
+        let expires_at = Instant::now() + Duration::from_secs(60);
+        cache.insert(
+            "meteormeta.web3.buckyos.ai|A".to_string(),
+            SnQueryCacheEntry {
+                expires_at,
+                value: SnQueryCacheValue::Miss,
+            },
+        );
+        cache.insert(
+            "home.meteormeta.web3.buckyos.ai|TXT".to_string(),
+            SnQueryCacheEntry {
+                expires_at,
+                value: SnQueryCacheValue::Miss,
+            },
+        );
+        cache.insert(
+            "other.web3.buckyos.ai|A".to_string(),
+            SnQueryCacheEntry {
+                expires_at,
+                value: SnQueryCacheValue::Miss,
+            },
+        );
+        drop(cache);
+
+        server
+            .invalidate_query_cache_domains(&vec!["meteormeta.web3.buckyos.ai".to_string()])
+            .await;
+
+        let cache = server.query_cache.read().await;
+        assert!(!cache.contains_key("meteormeta.web3.buckyos.ai|A"));
+        assert!(!cache.contains_key("home.meteormeta.web3.buckyos.ai|TXT"));
+        assert!(cache.contains_key("other.web3.buckyos.ai|A"));
     }
 
     #[test]

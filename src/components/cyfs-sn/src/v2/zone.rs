@@ -50,6 +50,7 @@ pub(crate) async fn handle_zone(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     .await
                     .into_rpc()?;
             }
+            server.invalidate_query_cache_for_username(username.as_str()).await;
             ok_response(&req, json!({ "code": 0 }))
         }
         _ => Err(RPCErrors::UnknownMethod(req.method)),
