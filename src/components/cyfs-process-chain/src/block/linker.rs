@@ -80,6 +80,12 @@ impl BlockCommandLinker {
     }
 
     fn link_case_statement(&self, case_statement: &mut CaseStatement) -> Result<(), String> {
+        if let Some(subject) = case_statement.subject.as_mut() {
+            if let Some(exp) = subject.as_command_substitution_mut() {
+                self.link_expression(exp)?;
+            }
+        }
+
         for branch in &mut case_statement.branches {
             for (_, expr, _) in &mut branch.condition {
                 self.link_expression(expr)?;

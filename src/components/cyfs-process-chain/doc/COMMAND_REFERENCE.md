@@ -2302,11 +2302,21 @@ Syntax:
           ...
   end
 
+  case <subject> as <name> then
+      when <condition> then
+          ...
+      else
+          ...
+  end
+
 Behavior:
   - Branches are evaluated in order.
   - The first `when` whose condition succeeds is selected.
   - If no branch matches, `else` runs when present; otherwise the statement is a no-op.
+  - In `case <subject> as <name> then`, `<subject>` is evaluated once before branch dispatch and exposed as a block-local alias variable.
+  - The alias is available in both `when` conditions and branch bodies, and the outer block variable is restored after the case statement finishes.
   - `when` conditions reuse the same expression-chain syntax as `if`.
+  - Subject form only binds the alias; it does not auto-inject the subject into `when` commands.
   - Control actions such as `return` / `error` / `exit` / `goto` are not allowed in `when` conditions.
 
 Examples:
@@ -2317,6 +2327,13 @@ Examples:
           return --from lib "api_path";
       else
           return --from lib "default";
+  end
+
+  case $REQ.path as path then
+      when match $path "/api/*" then
+          return --from lib "api";
+      when strip-prefix $path "/kapi" then
+          return --from lib "kapi";
   end
 ```
 

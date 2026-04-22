@@ -640,7 +640,7 @@ impl BlockParser {
         Ok((line, cursor))
     }
 
-    fn parse_case_header(line: &str) -> Result<(), String> {
+    fn parse_case_header(line: &str) -> Result<(Option<CommandArg>, Option<String>), String> {
         let line = line.trim();
         let body = line
             .strip_prefix("case")
@@ -653,21 +653,39 @@ impl BlockParser {
         })?;
         let body = body.trim_end();
 
-        if !body.is_empty() {
+        if body.is_empty() {
+            return Ok((None, None));
+        }
+
+        let (rest, subject) = Self::parse_arg(body).map_err(|e| {
+            let msg = format!("Parse 'case' subject error: '{}', {:?}", line, e);
+            error!("{}", msg);
+            msg
+        })?;
+
+        let rest = rest.trim();
+        let binding = rest.strip_prefix("as ").ok_or_else(|| {
             let msg = format!(
-                "'case' header does not support a subject yet, expected 'case then': '{}'",
+                "'case' subject form requires 'as <name>' after the subject: '{}'",
                 line
             );
+            error!("{}", msg);
+            msg
+        })?;
+
+        let binding = binding.trim();
+        if !Self::is_valid_loop_var_name(binding) {
+            let msg = format!("Invalid case binding variable '{}'", binding);
             error!("{}", msg);
             return Err(msg);
         }
 
-        Ok(())
+        Ok((Some(subject), Some(binding.to_string())))
     }
 
     fn parse_case_statement(lines: &[String], index: usize) -> Result<(Line, usize), String> {
         let case_source = lines[index].trim().to_string();
-        Self::parse_case_header(case_source.as_str())?;
+        let (subject, binding_var) = Self::parse_case_header(case_source.as_str())?;
 
         let mut branches = Vec::new();
         let mut else_lines = None;
@@ -766,6 +784,8 @@ impl BlockParser {
         }
 
         let statement = Statement::new_case(CaseStatement {
+            subject,
+            binding_var,
             branches,
             else_lines,
         });
@@ -2036,8 +2056,30 @@ mod tests {
 
         let statement = &block.lines[0].statements[0];
         let case_statement = statement.case_statement.as_ref().unwrap();
+        assert!(case_statement.subject.is_none());
+        assert!(case_statement.binding_var.is_none());
         assert_eq!(case_statement.branches.len(), 2);
         assert!(case_statement.else_lines.is_some());
+    }
+
+    #[test]
+    fn test_parse_case_statement_with_subject_alias() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            case $REQ.path as path then
+                when match $path "/api/*" then
+                    return --from lib "api";
+                end
+        "#;
+
+        let block = parser.parse(block_str).unwrap();
+        assert_eq!(block.lines.len(), 1);
+
+        let statement = &block.lines[0].statements[0];
+        let case_statement = statement.case_statement.as_ref().unwrap();
+        assert!(matches!(case_statement.subject, Some(CommandArg::Var(_))));
+        assert_eq!(case_statement.binding_var.as_deref(), Some("path"));
+        assert_eq!(case_statement.branches.len(), 1);
     }
 
     #[test]

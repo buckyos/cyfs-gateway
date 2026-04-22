@@ -515,6 +515,65 @@ impl BlockExecuter {
         source: &str,
         context: &Context,
     ) -> Result<CommandResult, String> {
+        if let (Some(subject), Some(binding_var)) = (
+            case_statement.subject.as_ref(),
+            case_statement.binding_var.as_deref(),
+        ) {
+            let subject_value = subject.evaluate(context).await?;
+            let snapshots = vec![Self::snapshot_block_var(binding_var, context).await?];
+
+            let execute_result: Result<CommandResult, String> = async {
+                context
+                    .env()
+                    .set(binding_var, subject_value, Some(EnvLevel::Block))
+                    .await?;
+
+                Self::execute_case_branches(case_statement, line_no, source, context).await
+            }
+            .await;
+
+            let restore_result = Self::restore_block_vars(&snapshots, context).await;
+            return match (execute_result, restore_result) {
+                (Ok(result), Ok(())) => Ok(result),
+                (Err(exec_err), Ok(())) => Err(Self::wrap_runtime_error(
+                    context,
+                    ProcessChainErrorCode::RuntimeExpressionExecute,
+                    "Failed to execute case statement",
+                    Some(line_no),
+                    Some(source),
+                    None,
+                    exec_err,
+                )),
+                (Ok(_), Err(restore_err)) => Err(Self::wrap_runtime_error(
+                    context,
+                    ProcessChainErrorCode::RuntimeExpressionExecute,
+                    "Failed to restore case subject binding",
+                    Some(line_no),
+                    Some(source),
+                    None,
+                    restore_err,
+                )),
+                (Err(exec_err), Err(restore_err)) => Err(Self::wrap_runtime_error(
+                    context,
+                    ProcessChainErrorCode::RuntimeExpressionExecute,
+                    "Failed to execute case statement and restore subject binding",
+                    Some(line_no),
+                    Some(source),
+                    None,
+                    format!("exec_error={}, restore_error={}", exec_err, restore_err),
+                )),
+            };
+        }
+
+        Self::execute_case_branches(case_statement, line_no, source, context).await
+    }
+
+    async fn execute_case_branches(
+        case_statement: &CaseStatement,
+        line_no: usize,
+        source: &str,
+        context: &Context,
+    ) -> Result<CommandResult, String> {
         for branch in &case_statement.branches {
             let cond_result = Self::execute_expression_chain(
                 &branch.condition,

@@ -99,6 +99,42 @@ async fn test_case_when_supports_existing_predicate_commands() -> Result<(), Str
 }
 
 #[tokio::test]
+async fn test_case_subject_alias_binds_once_and_restores_scope() -> Result<(), String> {
+    init_test_logger();
+
+    let script = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            local path="outer";
+            local calls="";
+            case $(capture --value calls $(append $calls "1")) as path then
+                when eq $path "1" then
+                    eq $path "1" || return --from lib "alias_body_fail";
+                    local path="inner";
+                else
+                    return --from lib "subject_match_fail";
+                end
+
+            eq $calls "1" || return --from lib "subject_eval_count_fail";
+            eq $path "outer" || return --from lib "alias_restore_fail";
+            return --from lib "ok";
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+    assert_eq!(
+        execute_with_req(script, "user.example.com", "/misc").await?,
+        "ok"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_case_missing_when_rejected() -> Result<(), String> {
     init_test_logger();
 
@@ -128,6 +164,44 @@ async fn test_case_missing_when_rejected() -> Result<(), String> {
     };
     assert!(
         err.contains("requires a 'when ... then' branch"),
+        "unexpected error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_case_subject_requires_as_binding() -> Result<(), String> {
+    init_test_logger();
+
+    let script = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            case $REQ.path then
+                when match $REQ.path "/api/*" then
+                    return --from lib "api";
+                end
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+    let hook_point = HookPoint::new("test_case_subject_requires_as");
+    let err = match hook_point
+        .load_process_chain_lib("test_case_lib", 0, script)
+        .await
+    {
+        Ok(_) => {
+            return Err("load_process_chain_lib should fail for missing as binding".to_string());
+        }
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("requires 'as <name>'"),
         "unexpected error: {}",
         err
     );

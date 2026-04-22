@@ -2284,11 +2284,21 @@ EXAMPLES:
           ...
   end
 
+  case <subject> as <name> then
+      when <condition> then
+          ...
+      else
+          ...
+  end
+
 行为:
   - 按顺序依次计算各个分支。
   - 第一个成功的 `when` 分支会被选中。
   - 如果都未命中，则执行 `else`；如果没有 `else`，该语句不做任何事。
+  - 在 `case <subject> as <name> then` 形式中，`<subject>` 会在分支分派前只求值一次，并绑定为一个 block-local alias 变量。
+  - 这个 alias 在 `when` 条件和命中的分支 body 里都可用，case 结束后会恢复外层同名 block 变量。
   - `when` 条件复用与 `if` 相同的 expression-chain 语法。
+  - subject 形式只负责绑定 alias，不会自动把 subject 注入到 `when` 命令参数里。
   - `return` / `error` / `exit` / `goto` 这类 control action 不允许出现在 `when` 条件中。
 
 示例:
@@ -2299,6 +2309,13 @@ EXAMPLES:
           return --from lib "api_path";
       else
           return --from lib "default";
+  end
+
+  case $REQ.path as path then
+      when match $path "/api/*" then
+          return --from lib "api";
+      when strip-prefix $path "/kapi" then
+          return --from lib "kapi";
   end
 ```
 

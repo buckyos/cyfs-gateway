@@ -527,6 +527,8 @@ pub struct CaseBranch {
 
 #[derive(Debug, Clone)]
 pub struct CaseStatement {
+    pub subject: Option<CommandArg>,
+    pub binding_var: Option<String>,
     pub branches: Vec<CaseBranch>,
     pub else_lines: Option<Vec<Line>>,
 }
