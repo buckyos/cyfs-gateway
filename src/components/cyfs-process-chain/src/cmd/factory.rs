@@ -110,6 +110,7 @@ impl CommandParserFactory {
         );
         self.register("eq", Arc::new(Box::new(EQCommandParser::new())));
         self.register("ne", Arc::new(Box::new(NECommandParser::new())));
+        self.register("oneof", Arc::new(Box::new(OneOfCommandParser::new())));
         self.register("gt", Arc::new(Box::new(create_gt_parser())));
         self.register("ge", Arc::new(Box::new(create_ge_parser())));
         self.register("lt", Arc::new(Box::new(create_lt_parser())));

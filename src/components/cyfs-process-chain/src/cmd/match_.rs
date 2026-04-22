@@ -807,8 +807,12 @@ impl EQCommandExecutor {
         }
     }
 
-    fn compare_strict(&self, left: &CollectionValue, right: &CollectionValue) -> bool {
-        if self.ignore_case {
+    fn compare_strict_with_options(
+        ignore_case: bool,
+        left: &CollectionValue,
+        right: &CollectionValue,
+    ) -> bool {
+        if ignore_case {
             if let (CollectionValue::String(lhs), CollectionValue::String(rhs)) = (left, right) {
                 return lhs.eq_ignore_ascii_case(rhs);
             }
@@ -817,9 +821,13 @@ impl EQCommandExecutor {
         left == right
     }
 
-    fn compare_loose(&self, left: &CollectionValue, right: &CollectionValue) -> bool {
+    fn compare_loose_with_options(
+        ignore_case: bool,
+        left: &CollectionValue,
+        right: &CollectionValue,
+    ) -> bool {
         if let (CollectionValue::String(lhs), CollectionValue::String(rhs)) = (left, right) {
-            return if self.ignore_case {
+            return if ignore_case {
                 lhs.eq_ignore_ascii_case(rhs)
             } else {
                 lhs == rhs
@@ -849,6 +857,27 @@ impl EQCommandExecutor {
         }
 
         left == right
+    }
+
+    pub fn compare_values(
+        ignore_case: bool,
+        loose: bool,
+        left: &CollectionValue,
+        right: &CollectionValue,
+    ) -> bool {
+        if loose {
+            Self::compare_loose_with_options(ignore_case, left, right)
+        } else {
+            Self::compare_strict_with_options(ignore_case, left, right)
+        }
+    }
+
+    fn compare_strict(&self, left: &CollectionValue, right: &CollectionValue) -> bool {
+        Self::compare_strict_with_options(self.ignore_case, left, right)
+    }
+
+    fn compare_loose(&self, left: &CollectionValue, right: &CollectionValue) -> bool {
+        Self::compare_loose_with_options(self.ignore_case, left, right)
     }
 }
 
@@ -1003,23 +1032,7 @@ impl CommandExecutor for NECommandExecutor {
         let value1 = self.value1.evaluate(context).await?;
         let value2 = self.value2.evaluate(context).await?;
 
-        let eq = if self.loose {
-            EQCommandExecutor {
-                ignore_case: self.ignore_case,
-                loose: true,
-                value1: self.value1.clone(),
-                value2: self.value2.clone(),
-            }
-            .compare_loose(&value1, &value2)
-        } else {
-            EQCommandExecutor {
-                ignore_case: self.ignore_case,
-                loose: false,
-                value1: self.value1.clone(),
-                value2: self.value2.clone(),
-            }
-            .compare_strict(&value1, &value2)
-        };
+        let eq = EQCommandExecutor::compare_values(self.ignore_case, self.loose, &value1, &value2);
 
         if !eq {
             Ok(CommandResult::success_with_value(CollectionValue::Bool(
@@ -1030,6 +1043,156 @@ impl CommandExecutor for NECommandExecutor {
                 false,
             )))
         }
+    }
+}
+
+pub struct OneOfCommandParser {
+    cmd: Command,
+}
+
+impl OneOfCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("oneof")
+            .about("Check whether a value equals any candidate value.")
+            .after_help(
+                r#"
+Check whether a value equals any candidate.
+
+Arguments:
+  <value>           The value to compare.
+  <candidate>...    One or more candidate values.
+
+Options:
+  --ignore-case     Perform case-insensitive comparison (string-string only)
+  --loose           Enable loose comparison for string/number
+
+Behavior:
+  - Comparison semantics are identical to `eq`.
+  - Candidates are evaluated from left to right.
+  - Succeeds on the first matching candidate.
+  - Returns error if no candidate matches.
+
+Examples:
+  oneof $REQ.path "/login" "/logout" "/refresh"
+  oneof --ignore-case $REQ.method "get" "head"
+  oneof --loose $REQ.port 80 "443"
+"#,
+            )
+            .arg(
+                Arg::new("ignore_case")
+                    .long("ignore-case")
+                    .short('i')
+                    .action(ArgAction::SetTrue)
+                    .help("Enable case-insensitive comparison"),
+            )
+            .arg(
+                Arg::new("loose")
+                    .long("loose")
+                    .short('l')
+                    .action(ArgAction::SetTrue)
+                    .help("Enable loose comparison for string/number"),
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("The value to compare"),
+            )
+            .arg(
+                Arg::new("candidates")
+                    .required(true)
+                    .num_args(1..)
+                    .help("One or more candidate values"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for OneOfCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Match
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid oneof command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let ignore_case = matches.get_flag("ignore_case");
+        let loose = matches.get_flag("loose");
+
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = "Value argument is required for oneof command".to_string();
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        let candidates = matches
+            .indices_of("candidates")
+            .ok_or_else(|| {
+                let msg = "At least one candidate is required for oneof command".to_string();
+                error!("{}", msg);
+                msg
+            })?
+            .map(|index| args[index].clone())
+            .collect();
+
+        let cmd = OneOfCommandExecutor {
+            ignore_case,
+            loose,
+            value,
+            candidates,
+        };
+
+        Ok(Arc::new(Box::new(cmd)))
+    }
+}
+
+pub struct OneOfCommandExecutor {
+    pub ignore_case: bool,
+    pub loose: bool,
+    pub value: CommandArg,
+    pub candidates: Vec<CommandArg>,
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for OneOfCommandExecutor {
+    async fn exec(&self, context: &Context) -> Result<CommandResult, String> {
+        let value = self.value.evaluate(context).await?;
+
+        for candidate in &self.candidates {
+            let candidate_value = candidate.evaluate(context).await?;
+            if EQCommandExecutor::compare_values(
+                self.ignore_case,
+                self.loose,
+                &value,
+                &candidate_value,
+            ) {
+                return Ok(CommandResult::success_with_value(CollectionValue::Bool(
+                    true,
+                )));
+            }
+        }
+
+        Ok(CommandResult::error_with_value(CollectionValue::Bool(
+            false,
+        )))
     }
 }
 

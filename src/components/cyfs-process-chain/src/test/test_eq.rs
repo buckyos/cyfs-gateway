@@ -113,6 +113,46 @@ const PROCESS_CHAIN_EQ_LOOSE: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_ONEOF_STRICT: &str = r#"
+<process_chain_lib id="oneof_strict_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local i=1;
+                local b=true;
+                local z=null;
+
+                oneof "admin" "user" "admin" || return --from lib "strict_string_match_fail";
+                oneof $i "1" 2 && return --from lib "strict_cross_type_should_fail";
+                oneof $b false true || return --from lib "strict_bool_match_fail";
+                oneof $z "" 0 null || return --from lib "strict_null_match_fail";
+                oneof "guest" "user" "admin" && return --from lib "strict_unmatched_should_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_ONEOF_LOOSE: &str = r#"
+<process_chain_lib id="oneof_loose_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                oneof --loose 1 "1" 2 || return --from lib "loose_num_string_fail";
+                oneof --loose "1.5" 1.5 2 || return --from lib "loose_float_string_fail";
+                oneof --loose --ignore-case "HEAD" "get" "head" || return --from lib "loose_ignore_case_fail";
+                oneof --loose true "true" false && return --from lib "loose_bool_string_should_fail";
+                oneof --loose "guest" 1 true && return --from lib "loose_unmatched_should_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 #[tokio::test]
 async fn test_eq_strict_typed_comparison() -> Result<(), String> {
     init_test_logger();
@@ -138,6 +178,32 @@ async fn test_eq_ignore_case_only_applies_to_strings() -> Result<(), String> {
 async fn test_eq_loose_comparison() -> Result<(), String> {
     init_test_logger();
     let ret = execute_lib(PROCESS_CHAIN_EQ_LOOSE, "eq_loose_lib", "test-eq-loose").await?;
+    assert_eq!(ret, "ok");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_oneof_strict_typed_comparison() -> Result<(), String> {
+    init_test_logger();
+    let ret = execute_lib(
+        PROCESS_CHAIN_ONEOF_STRICT,
+        "oneof_strict_lib",
+        "test-oneof-strict",
+    )
+    .await?;
+    assert_eq!(ret, "ok");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_oneof_loose_and_ignore_case_comparison() -> Result<(), String> {
+    init_test_logger();
+    let ret = execute_lib(
+        PROCESS_CHAIN_ONEOF_LOOSE,
+        "oneof_loose_lib",
+        "test-oneof-loose",
+    )
+    .await?;
     assert_eq!(ret, "ok");
     Ok(())
 }

@@ -1464,6 +1464,29 @@
   if $REQ.role !== "admin" then ...
 ```
 
+### `oneof`
+```
+检查一个值是否等于任一候选值。
+
+用法: oneof [OPTIONS] <value> <candidate>...
+
+选项:
+  -i, --ignore-case   大小写不敏感比较，仅用于 string-string
+  -l, --loose         启用 string/number 宽松比较
+
+行为:
+  - 比较语义与 `eq` 完全一致。
+  - `<value>` 和所有候选值都会在运行时动态求值。
+  - 候选值按从左到右顺序测试。
+  - 命中第一个匹配项时返回 success。
+  - 如果没有任何候选值匹配，则返回 error。
+
+示例:
+  oneof $REQ.path "/login" "/logout" "/refresh"
+  oneof --ignore-case $REQ.method "get" "head"
+  oneof --loose $REQ.port 80 "443"
+```
+
 ### `gt` / `ge` / `lt` / `le`
 ```
 数值比较命令。

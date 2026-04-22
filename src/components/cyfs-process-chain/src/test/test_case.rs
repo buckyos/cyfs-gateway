@@ -99,6 +99,39 @@ async fn test_case_when_supports_existing_predicate_commands() -> Result<(), Str
 }
 
 #[tokio::test]
+async fn test_case_when_supports_oneof_predicate() -> Result<(), String> {
+    init_test_logger();
+
+    let script = r#"
+<root>
+<process_chain id="main">
+    <block id="entry">
+        <![CDATA[
+            case $REQ.path as path then
+                when oneof $path "/login" "/logout" "/refresh" then
+                    return --from lib "auth_path";
+                else
+                    return --from lib "default";
+                end
+        ]]>
+    </block>
+</process_chain>
+</root>
+"#;
+
+    assert_eq!(
+        execute_with_req(script, "user.example.com", "/logout").await?,
+        "auth_path"
+    );
+    assert_eq!(
+        execute_with_req(script, "user.example.com", "/misc").await?,
+        "default"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_case_subject_alias_binds_once_and_restores_scope() -> Result<(), String> {
     init_test_logger();
 

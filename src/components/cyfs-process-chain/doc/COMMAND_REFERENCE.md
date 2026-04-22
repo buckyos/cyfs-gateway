@@ -1463,6 +1463,29 @@ Examples:
   if $REQ.role !== "admin" then ...
 ```
 
+### `oneof`
+```
+Check whether a value equals any candidate value.
+
+Usage: oneof [OPTIONS] <value> <candidate>...
+
+Options:
+  -i, --ignore-case   Case-insensitive for string-string only
+  -l, --loose         Enable loose comparison for string/number
+
+Behavior:
+  - Comparison semantics are identical to `eq`.
+  - `<value>` and all candidates are evaluated dynamically at runtime.
+  - Candidates are tested from left to right.
+  - Succeeds on the first matching candidate.
+  - Returns error if no candidate matches.
+
+Examples:
+  oneof $REQ.path "/login" "/logout" "/refresh"
+  oneof --ignore-case $REQ.method "get" "head"
+  oneof --loose $REQ.port 80 "443"
+```
+
 ### `gt` / `ge` / `lt` / `le`
 ```
 Numeric comparison commands.
