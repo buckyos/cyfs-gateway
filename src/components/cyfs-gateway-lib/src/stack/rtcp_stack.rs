@@ -1186,6 +1186,9 @@ impl Stack for RtcpStack {
 
     async fn start(&self) -> StackResult<()> {
         let mut rtcp = { self.rtcp.lock().unwrap().take().unwrap() };
+        // Provide the tunnel framework entry point so create_tunnel can build
+        // bootstrap streams when the stack id carries a `params@remote` prefix.
+        rtcp.set_tunnel_manager(self.tunnel_manager.clone());
         rtcp.start()
             .await
             .map_err(|e| stack_err!(StackErrorCode::IoError, "start rtcp failed: {:?}", e))?;

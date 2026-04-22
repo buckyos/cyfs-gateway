@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 use crate::rtcp::datagram::RTcpTunnelDatagramClient;
 use crate::tunnel::TunnelBox;
 use crate::{
-    DatagramClientBox, EncryptedStream, Tunnel, TunnelEndpoint, TunnelError, TunnelResult,
-    get_dest_info_from_url_path, has_scheme,
+    DatagramClientBox, EncryptedStream, Tunnel, TunnelEndpoint, TunnelError, TunnelManager,
+    TunnelResult, get_dest_info_from_url_path, has_scheme,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -90,6 +90,17 @@ impl RTcp {
         }
     }
 
+    // Provides the tunnel framework entry point that create_tunnel uses when the
+    // RTCP stack id carries a `params@remote` bootstrap URL. Must be called
+    // before the stack is cloned into an Arc, otherwise the setter is a no-op.
+    pub fn set_tunnel_manager(&mut self, tunnel_manager: TunnelManager) {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.tunnel_manager = Some(tunnel_manager);
+        } else {
+            warn!("set_tunnel_manager ignored: rtcp already shared");
+        }
+    }
+
     pub async fn start(&mut self) -> TunnelResult<()> {
         let inner = self.inner.clone();
         let handle = inner.start().await?;
@@ -116,6 +127,10 @@ struct RTcpInner {
     this_device_ed25519_sk: Option<EncodingKey>,
     this_device_x25519_sk: Option<StaticSecret>,
     this_device_doc_jwt: Option<String>,
+    // Used by create_tunnel to build a bootstrap stream through the tunnel
+    // framework when the stack id carries a `params@remote` prefix. None means
+    // only direct TCP bootstrap is available (backward compatible path).
+    tunnel_manager: Option<TunnelManager>,
 }
 
 impl Drop for RTcpInner {
@@ -550,6 +565,7 @@ impl RTcpInner {
             this_device_ed25519_sk: this_device_ed25519_sk, //for sign tunnel token
             this_device_x25519_sk: this_device_x25519_sk,   //for decode tunnel token from remote
             this_device_doc_jwt,
+            tunnel_manager: None,
         };
         return result;
     }
@@ -1003,7 +1019,8 @@ impl RTcpInner {
             self.this_device_did.clone(),
             &remote_stack,
             false,
-            stream,
+            Box::new(stream) as RTcpBearingStream,
+            Some(source_addr),
             aes_key,
             random_pk,
             self.listener.clone(),
@@ -1074,6 +1091,105 @@ impl RTcpInner {
         if tunnel.is_some() {
             debug!("Reuse tunnel {}", tunnel_key.as_str());
             return Ok(Box::new(tunnel.unwrap().clone()));
+        }
+
+        // `params@remote` bootstrap: build the tunnel's bearing stream through
+        // the tunnel framework instead of opening a direct TCP connection.
+        if let Some(bootstrap_url) = remote_stack.bootstrap_stream_url.as_ref() {
+            let tunnel_manager = self.tunnel_manager.clone().ok_or_else(|| {
+                TunnelError::ReasonError(
+                    "rtcp bootstrap URL present but tunnel_manager is not set".to_string(),
+                )
+            })?;
+            let bootstrap_url_parsed = Url::parse(bootstrap_url).map_err(|e| {
+                TunnelError::ReasonError(format!(
+                    "invalid bootstrap stream url '{}': {}",
+                    bootstrap_url, e
+                ))
+            })?;
+
+            let bearing = tunnel_manager
+                .open_stream_by_url(&bootstrap_url_parsed)
+                .await
+                .map_err(|e| {
+                    let msg = format!(
+                        "open bootstrap stream '{}' for {} failed: {}",
+                        bootstrap_url, remote_device_id, e
+                    );
+                    error!("{}", msg);
+                    TunnelError::ConnectError(msg)
+                })?;
+
+            let (tunnel_token, aes_key, random_pk) = self
+                .generate_tunnel_token(remote_device_id.clone())
+                .await
+                .map_err(|e| {
+                    let msg = format!(
+                        "generate tunnel token error: {}, {}",
+                        remote_device_id, e
+                    );
+                    error!("{}", msg);
+                    e
+                })?;
+
+            let addr: SocketAddr = self.bind_addr.parse().unwrap();
+            let hello_package = RTcpHelloPackage::new(
+                0,
+                self.this_device_did.to_string(),
+                remote_device_id.clone(),
+                addr.port(),
+                Some(tunnel_token),
+                self.this_device_doc_jwt.clone(),
+            );
+
+            let mut bearing: RTcpBearingStream = bearing;
+            RTcpTunnelPackage::send_package(Pin::new(&mut bearing), hello_package)
+                .await
+                .map_err(|e| {
+                    let msg = format!(
+                        "send hello over bootstrap stream '{}' for {} failed: {}",
+                        bootstrap_url, remote_device_id, e
+                    );
+                    error!("{}", msg);
+                    TunnelError::ConnectError(msg)
+                })?;
+
+            // peer_addr is None for bootstrap-backed tunnels: Open/ROpen reconnect
+            // paths that assume "direct TCP to peer_addr:stack_port" are disabled
+            // on such tunnels until the framework gains the ability to rebuild
+            // them over the same bootstrap (see section 14.5 of doc/rtcp.md).
+            let tunnel = RTcpTunnel::new(
+                self.stream_helper.clone(),
+                self.this_device_did.clone(),
+                &remote_stack,
+                true,
+                bearing,
+                None,
+                aes_key,
+                random_pk,
+                self.listener.clone(),
+            );
+            all_tunnel.insert(tunnel_key.clone(), tunnel.clone());
+            info!(
+                "create tunnel {} ok via bootstrap url {}",
+                tunnel_key.as_str(),
+                bootstrap_url
+            );
+            drop(all_tunnel);
+
+            let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
+            let tunnel_map = self.tunnel_map.clone();
+            task::spawn(async move {
+                debug!(
+                    "RTcp tunnel {} established (bootstrap), tunnel running",
+                    tunnel_key.as_str()
+                );
+                tunnel.run().await;
+                tunnel_map.remove_tunnel(&tunnel_key).await;
+                info!("RTcp tunnel {} end", tunnel_key.as_str());
+            });
+
+            return result;
         }
 
         // 1） resolve remote auth-key and ip (rtcp base on tcp, so need ip)
@@ -1204,12 +1320,14 @@ impl RTcpInner {
                 continue;
             }
 
+            let peer_addr = tunnel_stream.peer_addr().ok();
             let tunnel = RTcpTunnel::new(
                 self.stream_helper.clone(),
                 self.this_device_did.clone(),
                 &remote_stack,
                 true,
-                tunnel_stream,
+                Box::new(tunnel_stream) as RTcpBearingStream,
+                peer_addr,
                 aes_key,
                 random_pk,
                 self.listener.clone(),
@@ -1254,16 +1372,26 @@ impl RTcpInner {
 // streams and never completing them.
 const MAX_PENDING_INBOUND_OPENS: usize = 64;
 
+// Alias for the RTCP tunnel bearing stream. It's a boxed trait object so the
+// tunnel can be carried by either a direct TcpStream (the classic path) or by
+// an arbitrary stream produced by the tunnel framework (the `params@remote`
+// bootstrap path).
+type RTcpBearingStream = Box<dyn AsyncStream>;
+
 #[derive(Clone)]
 struct RTcpTunnel {
     build_helper: RTcpStreamBuildHelper,
     remote_stack: RTcpTargetStackEP,
     can_direct: bool,
-    peer_addr: SocketAddr,
+    // None when the tunnel was bootstrapped through a nested stream URL and no
+    // longer corresponds to a directly-reachable RTCP TCP peer. In that case
+    // the legacy "reconnect peer_addr:stack_port" paths used by Open/ROpen are
+    // not available; see section 14.5 of doc/rtcp.md.
+    peer_addr: Option<SocketAddr>,
     this_device: DID,
     aes_key: [u8; 32],
-    write_stream: Arc<Mutex<WriteHalf<EncryptedStream<TcpStream>>>>,
-    read_stream: Arc<Mutex<ReadHalf<EncryptedStream<TcpStream>>>>,
+    write_stream: Arc<Mutex<WriteHalf<EncryptedStream<RTcpBearingStream>>>>,
+    read_stream: Arc<Mutex<ReadHalf<EncryptedStream<RTcpBearingStream>>>>,
 
     next_seq: Arc<AtomicU32>,
     listener: RTcpListenerRef,
@@ -1284,12 +1412,12 @@ impl RTcpTunnel {
         this_device: DID,
         remote_stack: &RTcpTargetStackEP,
         can_direct: bool,
-        stream: TcpStream,
+        stream: RTcpBearingStream,
+        peer_addr: Option<SocketAddr>,
         aes_key: [u8; 32],
         random_pk: [u8; 32],
         listener: RTcpListenerRef,
     ) -> Self {
-        let peer_addr = stream.peer_addr().unwrap();
         let mut iv = [0u8; 16];
         iv.copy_from_slice(&random_pk[..16]);
         let encrypted_stream = EncryptedStream::new(stream, &aes_key, &iv);
@@ -1380,7 +1508,23 @@ impl RTcpTunnel {
         );
 
         // 1. open stream to remote and send hello stream
-        let mut remote_stack_addr = self.peer_addr.clone();
+        // Bootstrap-backed tunnels (peer_addr == None) can't be reached via a
+        // direct TCP reconnect; ROpen over such tunnels is not yet supported —
+        // tracked as TODO 14.5 in doc/rtcp.md.
+        let peer_addr = match self.peer_addr {
+            Some(addr) => addr,
+            None => {
+                warn!(
+                    "ropen rejected: tunnel has no direct peer address (bootstrap-backed)"
+                );
+                let ropen_resp_package = RTcpROpenRespPackage::new(ropen_package.seq, 2);
+                let mut write_stream = self.write_stream.lock().await;
+                let write_stream = Pin::new(&mut *write_stream);
+                RTcpTunnelPackage::send_package(write_stream, ropen_resp_package).await?;
+                return Ok(());
+            }
+        };
+        let mut remote_stack_addr = peer_addr;
         remote_stack_addr.set_port(self.remote_stack.stack_port);
         let rtcp_stream = tokio::net::TcpStream::connect(remote_stack_addr).await;
         if rtcp_stream.is_err() {
@@ -1786,8 +1930,17 @@ impl RTcpTunnel {
                 ));
             }
 
-            // Build a direct stream to remote stack
-            let mut remote_stack_addr = self.peer_addr.clone();
+            // Build a direct stream to remote stack.
+            // Bootstrap-backed tunnels (peer_addr == None) can't take this
+            // path; Open over such tunnels is not yet supported — tracked as
+            // TODO 14.5 in doc/rtcp.md.
+            let peer_addr = self.peer_addr.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "open stream on bootstrap-backed rtcp tunnel not yet supported",
+                )
+            })?;
+            let mut remote_stack_addr = peer_addr;
             remote_stack_addr.set_port(self.remote_stack.stack_port);
             //TODO:通过tunnel框架创建stream
             let ret = tokio::net::TcpStream::connect(remote_stack_addr).await;
