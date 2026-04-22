@@ -10,6 +10,7 @@ use super::map::*;
 use super::match_::*;
 use super::string::*;
 use super::type_::*;
+use super::uri::*;
 use super::value::*;
 use super::var::*;
 use std::collections::HashMap;
@@ -162,6 +163,8 @@ impl CommandParserFactory {
             "ends-with",
             Arc::new(Box::new(StringEndsWithCommandParser::new())),
         );
+
+        // uri commands
         self.register(
             "url_encode",
             Arc::new(Box::new(UrlEncodeCommandParser::new())),

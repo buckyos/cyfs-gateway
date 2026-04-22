@@ -511,6 +511,58 @@
   strlen $REQ.path
 ```
 
+## uri URI
+
+### `url_encode`
+```
+对字符串执行 percent-encode，便于安全嵌入 URL。
+
+用法: url_encode <string>
+
+参数:
+  <string>
+          要做 percent-encode 的输入字符串
+
+选项:
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 对保留 URL 字符执行 percent-encoding。
+  - RFC 3986 的 unreserved 字符保持不变。
+  - 不会修改环境或变量。
+
+示例:
+  url_encode "https://example.com/callback?a=1&b=2"
+  url_encode $REQ.url
+```
+
+### `url_decode`
+```
+解码 percent-encoded URL 字符串。
+
+用法: url_decode <string>
+
+参数:
+  <string>
+          要做 percent-decode 的输入字符串
+
+选项:
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 解码 `%XX` 转义序列。
+  - 当转义序列非法，或解码后不是合法 UTF-8 时，返回运行时错误。
+  - 不会修改环境或变量。
+
+示例:
+  url_decode "https%3A%2F%2Fexample.com%2Fcallback%3Fa%3D1%26b%3D2"
+  url_decode $encoded_url
+```
+
 ### `parse-authority` / `parse-auth`
 ```
 将 authority 字符串解析为 typed Map。

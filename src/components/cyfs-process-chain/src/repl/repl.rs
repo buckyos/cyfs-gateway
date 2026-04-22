@@ -297,11 +297,15 @@ impl ProcessChainREPL {
 
     fn gen_doc(&self) -> String {
         let mut doc = String::new();
-        let commands = COMMAND_PARSER_FACTORY.get_group_list();
+        let mut groups: Vec<_> = COMMAND_PARSER_FACTORY
+            .get_group_list()
+            .into_iter()
+            .collect();
+        groups.sort_by_key(|(group, _)| group.as_str());
 
         doc.push_str("# Command reference documentation\n\n");
 
-        for (group, cmds) in commands {
+        for (group, cmds) in groups {
             doc.push_str(&format!("## {}\n\n", group.as_str()));
 
             for cmd in cmds {
@@ -317,6 +321,8 @@ impl ProcessChainREPL {
 
         let external_commands = self.env.parser_context().get_external_command_list();
         if !external_commands.is_empty() {
+            let mut external_commands = external_commands;
+            external_commands.sort();
             doc.push_str("## External Commands\n\n");
             for cmd in external_commands {
                 if let Some(ext_cmd) = self.env.parser_context().get_external_command(&cmd) {

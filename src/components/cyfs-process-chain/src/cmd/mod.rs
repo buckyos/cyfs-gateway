@@ -13,6 +13,7 @@ mod match_;
 mod string;
 mod template;
 mod type_;
+mod uri;
 mod value;
 mod var;
 

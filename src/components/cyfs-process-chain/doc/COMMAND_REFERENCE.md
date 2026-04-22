@@ -507,6 +507,58 @@ Examples:
   strlen $REQ.path
 ```
 
+## uri
+
+### `url_encode`
+```
+Percent-encode a string so it can be safely embedded in a URL.
+
+Usage: url_encode <string>
+
+Arguments:
+  <string>
+          Input string to percent-encode
+
+Options:
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Encodes reserved URL characters using percent-encoding.
+  - Leaves RFC 3986 unreserved characters unchanged.
+  - Does not modify environment or variables.
+
+Examples:
+  url_encode "https://example.com/callback?a=1&b=2"
+  url_encode $REQ.url
+```
+
+### `url_decode`
+```
+Decode a percent-encoded URL string.
+
+Usage: url_decode <string>
+
+Arguments:
+  <string>
+          Input string to percent-decode
+
+Options:
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Decodes `%XX` escape sequences.
+  - Returns a runtime error for malformed escape sequences or invalid UTF-8.
+  - Does not modify environment or variables.
+
+Examples:
+  url_decode "https%3A%2F%2Fexample.com%2Fcallback%3Fa%3D1%26b%3D2"
+  url_decode $encoded_url
+```
+
 ### `parse-authority` / `parse-auth`
 ```
 Parse an authority string into a typed Map.
