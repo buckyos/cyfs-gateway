@@ -188,8 +188,20 @@ impl CommandParserFactory {
             Arc::new(Box::new(ParseUriCommandParser::new())),
         );
         self.register(
+            "parse-query",
+            Arc::new(Box::new(ParseQueryCommandParser::new())),
+        );
+        self.register(
             "build-uri",
             Arc::new(Box::new(BuildUriCommandParser::new())),
+        );
+        self.register(
+            "build-query",
+            Arc::new(Box::new(BuildQueryCommandParser::new())),
+        );
+        self.register(
+            "query-get",
+            Arc::new(Box::new(QueryGetCommandParser::new())),
         );
 
         // collection commands

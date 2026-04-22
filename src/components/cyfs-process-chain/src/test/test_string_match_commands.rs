@@ -304,6 +304,82 @@ const PROCESS_CHAIN_BUILD_URI_ERROR: &str = r#"
 </process_chain_lib>
 "#;
 
+const PROCESS_CHAIN_PARSE_QUERY_RETURN: &str = r#"
+<process_chain_lib id="parse_query_return_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                return --from lib $(parse-query "?redirect_url=%2Fdashboard&tag=alpha&tag=beta&tag=alpha&empty=&space=hello+world");
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_BUILD_QUERY_SUCCESS: &str = r#"
+<process_chain_lib id="build_query_success_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local simple=$(build-query {
+                    "redirect_url": "/dashboard",
+                    "page": 2,
+                    "exact": true,
+                    "note": "hello world"
+                });
+                eq $simple "redirect_url=%2Fdashboard&page=2&exact=true&note=hello+world" || return --from lib "build_query_map_fail";
+
+                capture --value tags $(parse-query "tag=alpha&tag=beta");
+                local repeated=$(build-query $tags);
+                eq $repeated "tag=alpha&tag=beta" || return --from lib "build_query_multimap_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_QUERY_GET_SUCCESS: &str = r#"
+<process_chain_lib id="query_get_success_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local redirect=$(query-get "?redirect_url=%2Fdashboard&tag=alpha" "redirect_url");
+                eq $redirect "/dashboard" || return --from lib "query_get_raw_fail";
+
+                capture --value params $(parse-query "tag=alpha&tag=beta&tag=alpha&space=hello+world");
+
+                local first_tag=$(query-get $params "tag");
+                eq $first_tag "alpha" || return --from lib "query_get_first_fail";
+
+                capture --value tags $(query-get --all $params "tag");
+                eq $tags[0] "alpha" || return --from lib "query_get_all_first_fail";
+                eq $tags[1] "beta" || return --from lib "query_get_all_second_fail";
+
+                local space=$(query-get $params "space");
+                eq $space "hello world" || return --from lib "query_get_space_fail";
+
+                return --from lib "ok";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
+const PROCESS_CHAIN_QUERY_GET_ERROR: &str = r#"
+<process_chain_lib id="query_get_error_lib" priority="100">
+    <process_chain id="main">
+        <block id="entry">
+            <![CDATA[
+                local missing=$(query-get "tag=alpha" "missing");
+                return --from lib "unexpected";
+            ]]>
+        </block>
+    </process_chain>
+</process_chain_lib>
+"#;
+
 const PROCESS_CHAIN_STRIP_PREFIX_DYNAMIC: &str = r#"
 <process_chain_lib id="strip_prefix_dynamic_lib" priority="100">
     <process_chain id="main">
@@ -1486,6 +1562,114 @@ async fn test_build_uri_rejects_missing_authority_for_special_scheme() -> Result
         .ok_or_else(|| "build-uri without host on https should fail".to_string())?;
     assert!(
         err.contains("requires host or authority"),
+        "unexpected error: {}",
+        err
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_parse_query_returns_typed_multimap() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_parse_query_return");
+    hook_point
+        .load_process_chain_lib(
+            "parse_query_return_lib",
+            0,
+            PROCESS_CHAIN_PARSE_QUERY_RETURN,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-parse-query-return")?;
+    let hook_point_env = HookPointEnv::new("test-parse-query-return", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("parse_query_return_lib").await?;
+    let params = ret.value_ref().try_as_multi_map()?.clone();
+
+    assert_eq!(
+        params.get("redirect_url").await?,
+        Some("/dashboard".to_string())
+    );
+    assert_eq!(params.get("empty").await?, Some(String::new()));
+    assert_eq!(params.get("space").await?, Some("hello world".to_string()));
+
+    let tags = params
+        .get_many("tag")
+        .await?
+        .ok_or_else(|| "expected tag values".to_string())?;
+    assert_eq!(
+        tags.get_all().await?,
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_build_query_supports_map_and_multimap_inputs() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_build_query_success");
+    hook_point
+        .load_process_chain_lib(
+            "build_query_success_lib",
+            0,
+            PROCESS_CHAIN_BUILD_QUERY_SUCCESS,
+        )
+        .await?;
+
+    let data_dir = new_test_data_dir("test-build-query-success")?;
+    let hook_point_env = HookPointEnv::new("test-build-query-success", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("build_query_success_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_query_get_supports_raw_query_and_multimap_reads() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_query_get_success");
+    hook_point
+        .load_process_chain_lib("query_get_success_lib", 0, PROCESS_CHAIN_QUERY_GET_SUCCESS)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-query-get-success")?;
+    let hook_point_env = HookPointEnv::new("test-query-get-success", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let ret = exec.execute_lib("query_get_success_lib").await?;
+    assert_eq!(ret.value(), "ok");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_query_get_reports_missing_key() -> Result<(), String> {
+    init_test_logger();
+
+    let hook_point = HookPoint::new("test_query_get_error");
+    hook_point
+        .load_process_chain_lib("query_get_error_lib", 0, PROCESS_CHAIN_QUERY_GET_ERROR)
+        .await?;
+
+    let data_dir = new_test_data_dir("test-query-get-error")?;
+    let hook_point_env = HookPointEnv::new("test-query-get-error", data_dir);
+
+    let exec = hook_point_env.link_hook_point(&hook_point).await?;
+    let err = exec
+        .execute_lib("query_get_error_lib")
+        .await
+        .err()
+        .ok_or_else(|| "query-get missing key should fail".to_string())?;
+    assert!(
+        err.contains("Query key 'missing' not found"),
         "unexpected error: {}",
         err
     );

@@ -662,6 +662,104 @@ Examples:
   build-uri $parsed
 ```
 
+### `parse-query`
+```
+Parse a URL query string into a typed MultiMap.
+
+Usage: parse-query <value>
+
+Arguments:
+  <value>
+          Input query string to parse
+
+Options:
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Parses the input using `application/x-www-form-urlencoded` rules.
+  - A leading `?` is ignored when present.
+  - `+` is decoded as space.
+  - Returns a fresh MultiMap whose keys and values are decoded strings.
+  - Missing `=` is treated as an empty value.
+  - Duplicate identical values under the same key are deduplicated by MultiMap set semantics.
+  - Malformed percent-encoding or invalid UTF-8 returns error.
+
+Examples:
+  parse-query "redirect_url=%2Fdashboard&tag=alpha&tag=beta"
+  parse-query $parsed.query
+```
+
+### `build-query`
+```
+Build a URL query string from a typed Map or MultiMap.
+
+Usage: build-query <params>
+
+Arguments:
+  <params>
+          Map or MultiMap describing the query parameters
+
+Options:
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Accepts a typed Map or MultiMap.
+  - Uses `application/x-www-form-urlencoded` encoding.
+  - Returns a query string without a leading `?`.
+  - For Map values, String/Number/Bool/Null are supported.
+  - Map Null values are serialized as empty values (`key=`).
+  - For MultiMap values, each key may serialize to multiple `key=value` pairs.
+  - The output is normalized by collection iteration order, not original raw pair order.
+
+Examples:
+  build-query {
+    "redirect_url": "/dashboard",
+    "page": 2,
+    "exact": true
+  }
+
+  capture --value params $(parse-query "tag=alpha&tag=beta")
+  build-query $params
+```
+
+### `query-get`
+```
+Read one or more values from a raw query string or parsed query MultiMap.
+
+Usage: query-get [OPTIONS] <query> <key>
+
+Arguments:
+  <query>
+          Raw query string or parsed query MultiMap
+
+  <key>
+          Query key to read
+
+Options:
+      --all
+          Return all values as a List
+
+  -h, --help
+          Print help
+
+
+Behavior:
+  - Accepts either a raw query string (with optional leading `?`) or a typed MultiMap from `parse-query`.
+  - By default, returns the first value for the key as a String.
+  - With `--all`, returns all values for the key as a List of Strings.
+  - Missing key returns a runtime error.
+  - Raw query input is parsed using the same rules as `parse-query`.
+
+Examples:
+  query-get "redirect_url=%2Fdashboard" "redirect_url"
+  capture --value params $(parse-query "tag=alpha&tag=beta")
+  query-get --all $params "tag"
+```
+
 ## debug
 
 ### `echo`

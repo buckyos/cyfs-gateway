@@ -666,6 +666,104 @@
   build-uri $parsed
 ```
 
+### `parse-query`
+```
+将 URL query 字符串解析为 typed MultiMap。
+
+用法: parse-query <value>
+
+参数:
+  <value>
+          要解析的 query 字符串
+
+选项:
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 按 `application/x-www-form-urlencoded` 规则解析输入。
+  - 如果存在前导 `?`，会自动忽略。
+  - `+` 会被解码为空格。
+  - 返回一个 fresh MultiMap，key 和 value 都是解码后的字符串。
+  - 缺少 `=` 时按空 value 处理。
+  - 同一 key 下完全重复的 value 会被 MultiMap 的 set 语义去重。
+  - percent-encoding 非法或 UTF-8 非法时返回 error。
+
+示例:
+  parse-query "redirect_url=%2Fdashboard&tag=alpha&tag=beta"
+  parse-query $parsed.query
+```
+
+### `build-query`
+```
+根据 typed Map 或 MultiMap 构造 URL query 字符串。
+
+用法: build-query <params>
+
+参数:
+  <params>
+          描述 query 参数的 Map 或 MultiMap
+
+选项:
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 接受 typed Map 或 MultiMap。
+  - 使用 `application/x-www-form-urlencoded` 编码。
+  - 返回不带前导 `?` 的 query 字符串。
+  - 对 Map value，支持 String/Number/Bool/Null。
+  - Map 中的 Null value 会被序列化成空值（`key=`）。
+  - 对 MultiMap，同一 key 可以序列化出多个 `key=value` 对。
+  - 输出会按集合遍历顺序规范化，不保证保留原始 raw pair 顺序。
+
+示例:
+  build-query {
+    "redirect_url": "/dashboard",
+    "page": 2,
+    "exact": true
+  }
+
+  capture --value params $(parse-query "tag=alpha&tag=beta")
+  build-query $params
+```
+
+### `query-get`
+```
+从 raw query 字符串或已解析的 query MultiMap 中读取一个或多个值。
+
+用法: query-get [OPTIONS] <query> <key>
+
+参数:
+  <query>
+          raw query 字符串，或 `parse-query` 返回的 typed MultiMap
+
+  <key>
+          要读取的 query key
+
+选项:
+      --all
+          以 List 形式返回该 key 的所有值
+
+  -h, --help
+          显示帮助
+
+
+行为:
+  - 接受 raw query 字符串（可带前导 `?`），或 `parse-query` 返回的 typed MultiMap。
+  - 默认返回该 key 的第一个值，类型为 String。
+  - 使用 `--all` 时，返回该 key 的所有值，类型为 List<String>。
+  - key 不存在时返回运行时错误。
+  - raw query 输入按与 `parse-query` 相同的规则解析。
+
+示例:
+  query-get "redirect_url=%2Fdashboard" "redirect_url"
+  capture --value params $(parse-query "tag=alpha&tag=beta")
+  query-get --all $params "tag"
+```
+
 ## debug 调试
 
 ### `echo`

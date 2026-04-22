@@ -1,11 +1,14 @@
 use super::cmd::*;
 use crate::block::{CommandArg, CommandArgs};
 use crate::chain::{Context, ParserContext};
-use crate::collection::{CollectionValue, MemoryMapCollection, NumberValue};
+use crate::collection::{
+    CollectionValue, MemoryListCollection, MemoryMapCollection, MemoryMultiMapCollection,
+    MultiMapCollection, NumberValue,
+};
 use clap::{Arg, Command};
 use http::uri::Authority;
 use std::sync::Arc;
-use url::{Position, Url};
+use url::{Position, Url, form_urlencoded};
 
 fn percent_encode_url_component(input: &str) -> String {
     let mut encoded = String::with_capacity(input.len());
@@ -64,6 +67,10 @@ fn percent_decode_url_component(input: &str) -> Result<String, String> {
         error!("{}", msg);
         msg
     })
+}
+
+fn percent_decode_query_component(input: &str) -> Result<String, String> {
+    percent_decode_url_component(&input.replace('+', " "))
 }
 
 pub struct UrlEncodeCommandParser {
@@ -623,6 +630,122 @@ impl CommandExecutor for ParseUriCommand {
     }
 }
 
+pub struct ParseQueryCommandParser {
+    cmd: Command,
+}
+
+impl ParseQueryCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("parse-query")
+            .about("Parse a URL query string into a typed MultiMap.")
+            .after_help(
+                r#"
+Arguments:
+  <value>     The raw query string or variable to parse. A leading `?` is allowed.
+
+Behavior:
+  - Parses the input using `application/x-www-form-urlencoded` rules.
+  - A leading `?` is ignored when present.
+  - `+` is decoded as space.
+  - Returns a fresh MultiMap whose keys and values are decoded strings.
+  - Missing `=` is treated as an empty value.
+  - Duplicate identical values under the same key are deduplicated by MultiMap set semantics.
+  - Malformed percent-encoding or invalid UTF-8 returns error.
+
+Examples:
+  parse-query "redirect_url=%2Fdashboard&tag=alpha&tag=beta"
+  parse-query $parsed.query
+"#,
+            )
+            .arg(
+                Arg::new("value")
+                    .required(true)
+                    .help("Input query string to parse"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for ParseQueryCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Uri
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid parse-query command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let value_index = matches.index_of("value").ok_or_else(|| {
+            let msg = format!("Value is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let value = args[value_index].clone();
+
+        Ok(Arc::new(Box::new(ParseQueryCommand::new(value))))
+    }
+}
+
+pub struct ParseQueryCommand {
+    value: CommandArg,
+}
+
+impl ParseQueryCommand {
+    pub fn new(value: CommandArg) -> Self {
+        Self { value }
+    }
+
+    fn strip_prefix(raw: &str) -> &str {
+        raw.strip_prefix('?').unwrap_or(raw)
+    }
+
+    async fn parse_query_to_multi_map(raw: &str) -> Result<CollectionValue, String> {
+        let params =
+            Arc::new(Box::new(MemoryMultiMapCollection::new()) as Box<dyn MultiMapCollection>);
+        let query = Self::strip_prefix(raw);
+
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+
+            let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = percent_decode_query_component(raw_key)?;
+            let value = percent_decode_query_component(raw_value)?;
+            params.insert(&key, &value).await?;
+        }
+
+        Ok(CollectionValue::MultiMap(params))
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for ParseQueryCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let value = self.value.evaluate_string(context).await?;
+        let parsed = Self::parse_query_to_multi_map(&value).await?;
+        info!("parse-query parsed raw='{}'", value);
+        Ok(super::CommandResult::success_with_value(parsed))
+    }
+}
+
 pub struct BuildUriCommandParser {
     cmd: Command,
 }
@@ -888,5 +1011,336 @@ impl CommandExecutor for BuildUriCommand {
         let built = url.to_string();
         info!("build-uri built '{}'", built);
         Ok(super::CommandResult::success_with_string(built))
+    }
+}
+
+pub struct BuildQueryCommandParser {
+    cmd: Command,
+}
+
+impl BuildQueryCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("build-query")
+            .about("Build a URL query string from a typed Map or MultiMap.")
+            .after_help(
+                r#"
+Arguments:
+  <params>     A Map or MultiMap describing the query parameters.
+
+Behavior:
+  - Accepts a typed Map or MultiMap.
+  - Uses `application/x-www-form-urlencoded` encoding.
+  - Returns a query string without a leading `?`.
+  - For Map values, String/Number/Bool/Null are supported.
+  - Map Null values are serialized as empty values (`key=`).
+  - For MultiMap values, each key may serialize to multiple `key=value` pairs.
+  - The output is normalized by collection iteration order, not original raw pair order.
+
+Examples:
+  build-query {
+    "redirect_url": "/dashboard",
+    "page": 2,
+    "exact": true
+  }
+
+  capture --value params $(parse-query "tag=alpha&tag=beta")
+  build-query $params
+"#,
+            )
+            .arg(
+                Arg::new("params")
+                    .required(true)
+                    .help("Map or MultiMap describing the query parameters"),
+            );
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for BuildQueryCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Uri
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid build-query command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let params_index = matches.index_of("params").ok_or_else(|| {
+            let msg = format!("Query params are required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let params = args[params_index].clone();
+
+        Ok(Arc::new(Box::new(BuildQueryCommand::new(params))))
+    }
+}
+
+pub struct BuildQueryCommand {
+    params: CommandArg,
+}
+
+impl BuildQueryCommand {
+    pub fn new(params: CommandArg) -> Self {
+        Self { params }
+    }
+
+    fn stringify_map_value(key: &str, value: CollectionValue) -> Result<String, String> {
+        match value {
+            CollectionValue::String(value) => Ok(value),
+            CollectionValue::Number(value) => Ok(value.to_string()),
+            CollectionValue::Bool(value) => Ok(value.to_string()),
+            CollectionValue::Null => Ok(String::new()),
+            value => {
+                let msg = format!(
+                    "Invalid query value for key '{}': expected String/Number/Bool/Null, found {}",
+                    key,
+                    value.get_type()
+                );
+                error!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+
+    async fn build_from_map(map: &crate::collection::MapCollectionRef) -> Result<String, String> {
+        let mut pairs = Vec::new();
+        let mut cursor = map.cursor_owned().await?;
+        while let Some((key, value)) = cursor.next().await? {
+            let value = Self::stringify_map_value(&key, value)?;
+            pairs.push((key, value));
+        }
+
+        let mut serializer = form_urlencoded::Serializer::new(String::new());
+        for (key, value) in pairs {
+            serializer.append_pair(&key, &value);
+        }
+
+        Ok(serializer.finish())
+    }
+
+    async fn build_from_multi_map(
+        multi_map: &crate::collection::MultiMapCollectionRef,
+    ) -> Result<String, String> {
+        let mut pairs = Vec::new();
+        let mut cursor = multi_map.cursor_owned().await?;
+        while let Some((key, values)) = cursor.next().await? {
+            for value in values {
+                pairs.push((key.clone(), value));
+            }
+        }
+
+        let mut serializer = form_urlencoded::Serializer::new(String::new());
+        for (key, value) in pairs {
+            serializer.append_pair(&key, &value);
+        }
+
+        Ok(serializer.finish())
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for BuildQueryCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let params = self.params.evaluate(context).await?;
+        let built = match params {
+            CollectionValue::Map(map) => Self::build_from_map(&map).await?,
+            CollectionValue::MultiMap(multi_map) => Self::build_from_multi_map(&multi_map).await?,
+            value => {
+                let msg = format!(
+                    "build-query expects a Map or MultiMap, found {}",
+                    value.get_type()
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        info!("build-query built '{}'", built);
+        Ok(super::CommandResult::success_with_string(built))
+    }
+}
+
+pub struct QueryGetCommandParser {
+    cmd: Command,
+}
+
+impl QueryGetCommandParser {
+    pub fn new() -> Self {
+        let cmd = Command::new("query-get")
+            .about("Read one or more values from a raw query string or parsed query MultiMap.")
+            .after_help(
+                r#"
+Arguments:
+  <query>     Raw query string or parsed query MultiMap.
+  <key>       Query key to read.
+
+Options:
+  --all       Return all values for the key as a List.
+
+Behavior:
+  - Accepts either a raw query string (with optional leading `?`) or a typed MultiMap from `parse-query`.
+  - By default, returns the first value for the key as a String.
+  - With `--all`, returns all values for the key as a List of Strings.
+  - Missing key returns error.
+  - Raw query input is parsed using the same rules as `parse-query`.
+
+Examples:
+  query-get "redirect_url=%2Fdashboard" "redirect_url"
+  capture --value params $(parse-query "tag=alpha&tag=beta")
+  query-get --all $params "tag"
+"#,
+            )
+            .arg(
+                Arg::new("all")
+                    .long("all")
+                    .help("Return all values as a List")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("query")
+                    .required(true)
+                    .help("Raw query string or parsed query MultiMap"),
+            )
+            .arg(Arg::new("key").required(true).help("Query key to read"));
+
+        Self { cmd }
+    }
+}
+
+impl CommandParser for QueryGetCommandParser {
+    fn group(&self) -> CommandGroup {
+        CommandGroup::Uri
+    }
+
+    fn help(&self, _name: &str, help_type: CommandHelpType) -> String {
+        command_help(help_type, &self.cmd)
+    }
+
+    fn parse(
+        &self,
+        _context: &ParserContext,
+        str_args: Vec<&str>,
+        args: &CommandArgs,
+    ) -> Result<CommandExecutorRef, String> {
+        let matches = self
+            .cmd
+            .clone()
+            .try_get_matches_from(&str_args)
+            .map_err(|e| {
+                let msg = format!("Invalid query-get command: {:?}, {}", str_args, e);
+                error!("{}", msg);
+                msg
+            })?;
+
+        let query_index = matches.index_of("query").ok_or_else(|| {
+            let msg = format!("Query source is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let query = args[query_index].clone();
+
+        let key_index = matches.index_of("key").ok_or_else(|| {
+            let msg = format!("Query key is required, but got: {:?}", args);
+            error!("{}", msg);
+            msg
+        })?;
+        let key = args[key_index].clone();
+
+        Ok(Arc::new(Box::new(QueryGetCommand::new(
+            query,
+            key,
+            matches.get_flag("all"),
+        ))))
+    }
+}
+
+pub struct QueryGetCommand {
+    query: CommandArg,
+    key: CommandArg,
+    all: bool,
+}
+
+impl QueryGetCommand {
+    pub fn new(query: CommandArg, key: CommandArg, all: bool) -> Self {
+        Self { query, key, all }
+    }
+
+    async fn list_from_values(values: Vec<String>) -> Result<CollectionValue, String> {
+        let list = MemoryListCollection::new_ref();
+        for value in values {
+            list.push(CollectionValue::String(value)).await?;
+        }
+        Ok(CollectionValue::List(list))
+    }
+
+    async fn get_from_multi_map(
+        &self,
+        multi_map: &crate::collection::MultiMapCollectionRef,
+        key: &str,
+    ) -> Result<super::CommandResult, String> {
+        if self.all {
+            let Some(values) = multi_map.get_many(key).await? else {
+                let msg = format!("Query key '{}' not found", key);
+                error!("{}", msg);
+                return Err(msg);
+            };
+            let values = values.dump().await?;
+            return Ok(super::CommandResult::success_with_value(
+                Self::list_from_values(values).await?,
+            ));
+        }
+
+        let Some(value) = multi_map.get(key).await? else {
+            let msg = format!("Query key '{}' not found", key);
+            error!("{}", msg);
+            return Err(msg);
+        };
+
+        Ok(super::CommandResult::success_with_string(value))
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandExecutor for QueryGetCommand {
+    async fn exec(&self, context: &Context) -> Result<super::CommandResult, String> {
+        let query = self.query.evaluate(context).await?;
+        let key = self.key.evaluate_string(context).await?;
+
+        let multi_map = match query {
+            CollectionValue::String(raw) => {
+                ParseQueryCommand::parse_query_to_multi_map(&raw).await?
+            }
+            CollectionValue::MultiMap(multi_map) => CollectionValue::MultiMap(multi_map),
+            value => {
+                let msg = format!(
+                    "query-get expects a raw query String or MultiMap, found {}",
+                    value.get_type()
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+        };
+
+        let multi_map = multi_map.try_as_multi_map()?.clone();
+        info!("query-get reading key='{}' all={}", key, self.all);
+        self.get_from_multi_map(&multi_map, &key).await
     }
 }
