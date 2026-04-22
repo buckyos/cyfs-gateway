@@ -7,10 +7,9 @@ use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_
 use crate::tunnel_connector::TunnelConnector;
 use crate::{
     GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestProcessChainVars,
-    HttpResponseHeaderMap, HttpServer,
-    JsExternalsManagerRef, ProcessChainConfigs, Server, ServerConfig, ServerContext,
-    ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerManagerWeakRef,
-    ServerResult, StreamInfo, TunnelManager, get_external_commands,
+    HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef, ProcessChainConfigs, Server,
+    ServerConfig, ServerContext, ServerContextRef, ServerError, ServerErrorCode, ServerFactory,
+    ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager, get_external_commands,
 };
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
 use http::Version;
@@ -236,13 +235,16 @@ impl ProcessChainHttpServer {
     }
 
     fn upstream_sni_host(request_url: &Url) -> ServerResult<String> {
-        request_url.host_str().map(|h| h.to_string()).ok_or_else(|| {
-            server_err!(
-                ServerErrorCode::InvalidConfig,
-                "Missing SNI host for upstream: {}",
-                request_url
-            )
-        })
+        request_url
+            .host_str()
+            .map(|h| h.to_string())
+            .ok_or_else(|| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "Missing SNI host for upstream: {}",
+                    request_url
+                )
+            })
     }
 
     async fn connect_upstream_candidates(
@@ -257,7 +259,12 @@ impl ProcessChainHttpServer {
 
         let mut errors = Vec::new();
         for addr in candidates {
-            match timeout(Self::HTTPS_UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            match timeout(
+                Self::HTTPS_UPSTREAM_CONNECT_TIMEOUT,
+                TcpStream::connect(addr),
+            )
+            .await
+            {
                 Ok(Ok(stream)) => return Ok((stream, addr)),
                 Ok(Err(err)) => errors.push(format!("{} ({})", addr, err)),
                 Err(_) => errors.push(format!("{} (connect timeout)", addr)),
@@ -586,14 +593,14 @@ impl ProcessChainHttpServer {
                 *upstream_req.headers_mut() = header;
 
                 let resp = sender.send_request(upstream_req).await.map_err(|e| {
-                        server_err!(
-                            ServerErrorCode::InvalidConfig,
-                            "Failed to request https upstream {} via {}: {}",
-                            sni_host,
-                            connected_addr,
-                            e
-                        )
-                    })?;
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Failed to request https upstream {} via {}: {}",
+                        sni_host,
+                        connected_addr,
+                        e
+                    )
+                })?;
                 let resp = resp.map(|body| {
                     body.map_err(|e| {
                         ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
@@ -2893,9 +2900,10 @@ mod tests {
         let unreachable_v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
         let closed_v4: SocketAddr = "127.0.0.1:9".parse().unwrap();
 
-        let err = ProcessChainHttpServer::connect_upstream_candidates(vec![unreachable_v6, closed_v4])
-            .await
-            .unwrap_err();
+        let err =
+            ProcessChainHttpServer::connect_upstream_candidates(vec![unreachable_v6, closed_v4])
+                .await
+                .unwrap_err();
 
         let msg = err.msg().to_string();
         assert!(msg.contains("Failed to connect upstream candidates"));

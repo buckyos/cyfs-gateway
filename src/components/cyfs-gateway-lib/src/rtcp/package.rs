@@ -4,7 +4,6 @@ use std::convert::TryInto;
 use std::fmt::Debug;
 use std::pin::Pin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CmdType {
@@ -611,10 +610,13 @@ impl RTcpTunnelPackage {
         Ok(())
     }
 
-    pub async fn send_hello_stream(
-        stream: &mut TcpStream,
+    pub async fn send_hello_stream<S>(
+        stream: &mut S,
         session_key: &str,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), anyhow::Error>
+    where
+        S: tokio::io::AsyncWrite + Unpin + ?Sized,
+    {
         // First hello package len is 0
         let total_len = 0;
         let mut write_buf: Vec<u8> = Vec::new();

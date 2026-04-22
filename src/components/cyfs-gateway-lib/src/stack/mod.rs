@@ -103,12 +103,9 @@ pub async fn stream_forward(
         if let Some(info) = info {
             let src_addr = info.src_addr.as_deref();
             let dst_addr = info.dst_addr.as_deref();
-            let _ = proxy_protocol::write_proxy_v2_preamble(
-                &mut forward_stream,
-                src_addr,
-                dst_addr,
-            )
-            .await?;
+            let _ =
+                proxy_protocol::write_proxy_v2_preamble(&mut forward_stream, src_addr, dst_addr)
+                    .await?;
         }
     }
 

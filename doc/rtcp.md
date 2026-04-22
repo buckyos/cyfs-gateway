@@ -571,7 +571,7 @@ RTCP stack 的 `device_config_path` 当前支持两类文件内容：
 当前现状：已经修正
 
 
-### 14.4 支持 remote 嵌套的 bootstrap stream URL
+### 14.4 支持 remote 嵌套的 bootstrap stream URL (已落地)
 
 `tunnel框架.md` 里已经给出了 RTCP 更完整的 URL 设计方向：不仅 target 可以嵌套，remote 的建立过程本身也可以嵌套。例如：
 
@@ -600,25 +600,33 @@ RTCP authority 的语法：
 - `RTcpTunnel` 的承载流从 `EncryptedStream<TcpStream>` 统一改成 `EncryptedStream<Box<dyn AsyncStream>>`，兼容裸 TCP 和由 tunnel 框架产生的任意 stream；但 `Hello` / `HelloStream` 的线协议格式不变。
 - Bootstrap 建立的 tunnel 不再持有直连的 `peer_addr`；后续的 `Open` / `ROpen` 直连路径对这类 tunnel 会显式拒绝（待 14.5 补齐）。
 
-### 14.5 TODO: 为 remote 嵌套后的建流流程重新绑定 transport 语义
+### 14.5 为 remote 嵌套后的建流流程重新绑定 transport 语义（已落地）
 
-remote 嵌套一旦成立，当前 `Open` / `ROpen` 的建流方式也必须一起升级，否则 tunnel 虽然能建立，后续 stream 仍然会退回“直接连 peer IP + RTCP port”的旧模型。
+remote 嵌套场景下，`Open` / `ROpen` 的建流动作必须与 tunnel 承载保持一致，否则 tunnel 即便能建立，后续 stream 仍然会退回“直接连 peer IP + RTCP port”的旧模型。
 
-当前现状：
+历史问题：
 
-- `Open` 路径下，请求方收到 `OpenResp` 后，会直接以“当前 tunnel 对端 IP + 对端 RTCP 端口”再建立一条新的 TCP 连接。
+- `Open` 路径下，请求方收到 `OpenResp` 后，会以“当前 tunnel 对端 IP + 对端 RTCP 端口”建立新的 TCP 连接。
 - `ROpen` 路径下，对端会根据 `Hello.my_port` 回连新的 TCP 连接。
-- 这套流程默认假设两端之间始终存在可直接互连的 RTCP TCP 端口。
-- 一旦 tunnel 是经 SOCKS、上层 tunnel 或其他 bootstrap stream 建出来的（14.4 场景），这个假设就不再成立。
-- 当前实现对这类 bootstrap-backed tunnel 的处理方式是：`Open` 路径直接返回 `Unsupported` 错误；`ROpen` 路径直接回 `ROpenResp(result=2)`。即行为上拒绝而不是静默错连，但仍然不是正式可用的 stream 建立机制。
+- 这套流程默认假设两端之间始终存在可直接互连的 RTCP TCP 端口；一旦 tunnel 是经 SOCKS、上层 tunnel 或其他 bootstrap stream 建出来的（14.4 场景），这个假设就不再成立。
+- 早期实现对这类 bootstrap-backed tunnel 的处理方式是：`Open` 路径直接返回 `Unsupported` 错误；`ROpen` 路径直接回 `ROpenResp(result=2)`。行为上是拒绝，不是正式可用的 stream 建立机制。
 
-协议 / 框架 TODO：
+当前实现：
 
-- 需要把“为某个 `streamid` 获取底层 transport”的动作，从“直接连对端 IP/port”抽象成可替换的 builder 行为。
-- 对于 remote 嵌套场景，`Open` / `ROpen` 后续创建 stream 时，应继续复用或重新派生同一类 bootstrap 机制，而不是绕过它。
-- 协议文档需要明确 outer remote identity、bootstrap transport 和最终 target 三者的边界，避免把“不可信中转”误当成 RTCP 对端身份。
-- tunnel 复用键和 stream 建立键后续也需要纳入 bootstrap 语义；否则同一 remote 经不同 bootstrap 路径建立的连接可能被错误复用。
-- 在这部分机制定稿前，文档应继续把“remote 嵌套”视为设计方向，而不是当前可依赖能力。
+- `RTcpTunnel` 在建立时额外持有一个 `bootstrap` 上下文（bootstrap URL + `TunnelManager`），direct tunnel 为 `None`，bootstrap-backed tunnel 为 `Some(...)`。
+- 引入统一的 `build_reconnect_stream` 入口：
+  - direct tunnel：按旧语义 `TcpStream::connect(peer_addr:stack_port)`。
+  - bootstrap-backed tunnel：调用 `tunnel_manager.open_stream_by_url(bootstrap_url)`，复用与 tunnel 承载流同一份 bootstrap 机制来拉出新的底层 stream。
+- `Open` / `ROpen` 的后续建流都改走这个入口：不再假设“peer 必然可直连”，也不再静默退回直连。
+- 对这条新 stream 的加密处理保持不变：AES key 复用 tunnel key，IV 使用 `streamid` 解出的 16 字节，方向仍按“谁 connect+发 HelloStream 谁是 initiator”区分。
+- `send_hello_stream` 由接收 `&mut TcpStream` 改为接收任意 `AsyncWrite + Unpin`，以便直接在 bootstrap-backed stream 上发送 HelloStream。
+- tunnel 复用键在 §14.4 已加入 `|bootstrap=<url>` 后缀；direct tunnel 与 bootstrap-backed tunnel、以及不同 bootstrap 路径之间不会互相复用。
+
+遗留语义：
+
+- bootstrap-backed stream 的 `peer_addr` / `local_addr` 不对应任何真实 TCP 端点，当前用 `0.0.0.0:0` 占位上报给 `on_new_stream` / `on_new_datagram`，这些字段在 bootstrap 场景下仅供日志辨认，不可直接作为路由依据。
+- 外层 RTCP remote 身份仍然是 `<did>[:port]`；bootstrap URL 仅用于承载传输，不参与对端身份认证——身份仍由 `Hello + tunnel_token` 确认。
+- 对方如果也需要走嵌套出站，需要在自己那一侧单独配置，bootstrap URL 不会随协议自动传递。
 
 ## 15. 最小实现心智模型
 

@@ -196,9 +196,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
                             this.header_filled += bytes_read;
                             if this.header_filled == LEN_FIELD {
                                 let record_len = u16::from_be_bytes(this.header_buf) as usize;
-                                if record_len < TAG_LEN
-                                    || record_len > MAX_PLAINTEXT + TAG_LEN
-                                {
+                                if record_len < TAG_LEN || record_len > MAX_PLAINTEXT + TAG_LEN {
                                     return Poll::Ready(Err(io_err(
                                         std::io::ErrorKind::InvalidData,
                                         "invalid AEAD record length",
@@ -240,10 +238,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for EncryptedStream<S> {
                                         )));
                                     }
                                 }
-                                match this.cipher.decrypt(
-                                    Nonce::from_slice(&nonce),
-                                    this.body_buf.as_slice(),
-                                ) {
+                                match this
+                                    .cipher
+                                    .decrypt(Nonce::from_slice(&nonce), this.body_buf.as_slice())
+                                {
                                     Ok(pt) => {
                                         this.plaintext = pt;
                                         this.plaintext_pos = 0;
@@ -370,10 +368,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EncryptedStream<S> {
         Pin::new(&mut this.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         ready!(Self::drain_pending(this, cx))?;
         this.shutdown_started = true;

@@ -362,20 +362,19 @@ impl QuicConnectionHandler {
                                     };
                                 let (stream, proxy_source_addr) =
                                     probe_proxy_protocol_stream(stream).await?;
-                                let request_source_addr =
-                                    proxy_source_addr.unwrap_or(remote_addr);
+                                let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
                                 let stream_info = StreamInfo::with_addrs(
                                     Some(remote_addr.to_string()),
                                     proxy_source_addr.map(|a| a.to_string()),
                                 )
                                 .with_dst_addr(Some(local_addr.to_string()))
                                 .with_device_info(
-                                    device_info.as_ref().and_then(|v| {
-                                        v.mac().map(|m| m.to_string())
-                                    }),
-                                    device_info.as_ref().and_then(|v| {
-                                        v.hostname().map(|h| h.to_string())
-                                    }),
+                                    device_info
+                                        .as_ref()
+                                        .and_then(|v| v.mac().map(|m| m.to_string())),
+                                    device_info
+                                        .as_ref()
+                                        .and_then(|v| v.hostname().map(|h| h.to_string())),
                                     device_info
                                         .as_ref()
                                         .map(|v| v.today_online_seconds().to_string()),
@@ -619,19 +618,18 @@ impl QuicConnectionHandler {
                                             )
                                             .with_dst_addr(Some(local_addr.to_string()))
                                             .with_device_info(
-                                                device_info.as_ref().and_then(|v| {
-                                                    v.mac().map(|m| m.to_string())
-                                                }),
+                                                device_info
+                                                    .as_ref()
+                                                    .and_then(|v| v.mac().map(|m| m.to_string())),
                                                 device_info.as_ref().and_then(|v| {
                                                     v.hostname().map(|h| h.to_string())
                                                 }),
-                                                device_info.as_ref().map(|v| {
-                                                    v.today_online_seconds().to_string()
-                                                }),
+                                                device_info
+                                                    .as_ref()
+                                                    .map(|v| v.today_online_seconds().to_string()),
                                             );
-                                            if let Err(e) = server
-                                                .serve_connection(stream, info)
-                                                .await
+                                            if let Err(e) =
+                                                server.serve_connection(stream, info).await
                                             {
                                                 log::error!("server error: {}", e);
                                             }

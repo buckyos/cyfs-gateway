@@ -276,13 +276,10 @@ pub async fn write_proxy_v2_preamble(
             SocketAddr::V6(_) => SocketAddr::new(IpAddr::from([0u8; 16]), 0),
         });
     let header = encode_proxy_v2_header(src, dst);
-    stream
-        .write_all(&header)
-        .await
-        .map_err(into_stack_err!(
-            StackErrorCode::StreamError,
-            "write proxy protocol header failed"
-        ))?;
+    stream.write_all(&header).await.map_err(into_stack_err!(
+        StackErrorCode::StreamError,
+        "write proxy protocol header failed"
+    ))?;
     Ok(true)
 }
 
