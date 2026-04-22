@@ -4,6 +4,7 @@ mod test_block_hook_point;
 mod test_block_process_chain;
 mod test_break;
 mod test_capture;
+mod test_case;
 mod test_coercion;
 mod test_collection;
 mod test_collection_literal;

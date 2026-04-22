@@ -520,6 +520,18 @@ pub struct IfStatement {
 }
 
 #[derive(Debug, Clone)]
+pub struct CaseBranch {
+    pub condition: ExpressionChain,
+    pub lines: Vec<Line>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CaseStatement {
+    pub branches: Vec<CaseBranch>,
+    pub else_lines: Option<Vec<Line>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ForStatement {
     pub key_var: String,
     pub value_var: Option<String>,
@@ -553,6 +565,7 @@ pub struct MatchResultStatement {
 pub struct Statement {
     pub expressions: ExpressionChain,
     pub if_statement: Option<IfStatement>,
+    pub case_statement: Option<CaseStatement>,
     pub for_statement: Option<ForStatement>,
     pub match_result_statement: Option<MatchResultStatement>,
 }
@@ -562,6 +575,7 @@ impl Statement {
         Self {
             expressions,
             if_statement: None,
+            case_statement: None,
             for_statement: None,
             match_result_statement: None,
         }
@@ -571,6 +585,17 @@ impl Statement {
         Self {
             expressions: Vec::new(),
             if_statement: Some(if_statement),
+            case_statement: None,
+            for_statement: None,
+            match_result_statement: None,
+        }
+    }
+
+    pub fn new_case(case_statement: CaseStatement) -> Self {
+        Self {
+            expressions: Vec::new(),
+            if_statement: None,
+            case_statement: Some(case_statement),
             for_statement: None,
             match_result_statement: None,
         }
@@ -580,6 +605,7 @@ impl Statement {
         Self {
             expressions: Vec::new(),
             if_statement: None,
+            case_statement: None,
             for_statement: Some(for_statement),
             match_result_statement: None,
         }
@@ -589,6 +615,7 @@ impl Statement {
         Self {
             expressions: Vec::new(),
             if_statement: None,
+            case_statement: None,
             for_statement: None,
             match_result_statement: Some(match_result_statement),
         }

@@ -2270,6 +2270,38 @@ EXAMPLES:
 这些是 DSL 语法级结构，不是独立命令。它们在 statement 层解析，因此不会出现在命令注册表中。
 ```
 
+### `case` / `when` / `else` / `end`
+```
+按 first-match-wins 语义进行分支。
+
+语法:
+  case then
+      when <condition> then
+          ...
+      when <condition> then
+          ...
+      else
+          ...
+  end
+
+行为:
+  - 按顺序依次计算各个分支。
+  - 第一个成功的 `when` 分支会被选中。
+  - 如果都未命中，则执行 `else`；如果没有 `else`，该语句不做任何事。
+  - `when` 条件复用与 `if` 相同的 expression-chain 语法。
+  - `return` / `error` / `exit` / `goto` 这类 control action 不允许出现在 `when` 条件中。
+
+示例:
+  case then
+      when match-reg $REQ.host "^admin\\." then
+          return --from lib "host_admin";
+      when strip-prefix $REQ.path "/api" then
+          return --from lib "api_path";
+      else
+          return --from lib "default";
+  end
+```
+
 ### `if` / `elif` / `else` / `end`
 ```
 根据布尔条件或谓词条件分支。

@@ -1,5 +1,5 @@
 use super::block::{
-    Block, CommandArg, CommandItem, Expression, ForStatement, IfStatement, Line,
+    Block, CaseStatement, CommandArg, CommandItem, Expression, ForStatement, IfStatement, Line,
     MatchResultStatement, Statement,
 };
 use super::exec::BlockExecuter;
@@ -39,6 +39,10 @@ impl BlockCommandLinker {
             self.link_if_statement(if_statement)?;
             return Ok(());
         }
+        if let Some(case_statement) = statement.case_statement.as_mut() {
+            self.link_case_statement(case_statement)?;
+            return Ok(());
+        }
         if let Some(for_statement) = statement.for_statement.as_mut() {
             self.link_for_statement(for_statement)?;
             return Ok(());
@@ -67,6 +71,25 @@ impl BlockCommandLinker {
         }
 
         if let Some(else_lines) = if_statement.else_lines.as_mut() {
+            for line in else_lines {
+                self.link_line(line)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn link_case_statement(&self, case_statement: &mut CaseStatement) -> Result<(), String> {
+        for branch in &mut case_statement.branches {
+            for (_, expr, _) in &mut branch.condition {
+                self.link_expression(expr)?;
+            }
+            for line in &mut branch.lines {
+                self.link_line(line)?;
+            }
+        }
+
+        if let Some(else_lines) = case_statement.else_lines.as_mut() {
             for line in else_lines {
                 self.link_line(line)?;
             }

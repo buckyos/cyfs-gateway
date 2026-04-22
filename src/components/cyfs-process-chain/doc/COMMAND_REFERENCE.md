@@ -2288,6 +2288,38 @@ These are DSL syntax forms, not standalone commands. They are parsed at the
 statement level, so they do not appear in the command registry.
 ```
 
+### `case` / `when` / `else` / `end`
+```
+Branch with first-match-wins semantics.
+
+Syntax:
+  case then
+      when <condition> then
+          ...
+      when <condition> then
+          ...
+      else
+          ...
+  end
+
+Behavior:
+  - Branches are evaluated in order.
+  - The first `when` whose condition succeeds is selected.
+  - If no branch matches, `else` runs when present; otherwise the statement is a no-op.
+  - `when` conditions reuse the same expression-chain syntax as `if`.
+  - Control actions such as `return` / `error` / `exit` / `goto` are not allowed in `when` conditions.
+
+Examples:
+  case then
+      when match-reg $REQ.host "^admin\\." then
+          return --from lib "host_admin";
+      when strip-prefix $REQ.path "/api" then
+          return --from lib "api_path";
+      else
+          return --from lib "default";
+  end
+```
+
 ### `if` / `elif` / `else` / `end`
 ```
 Branch on a boolean/predicate condition.

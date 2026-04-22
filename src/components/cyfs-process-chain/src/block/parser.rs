@@ -23,6 +23,7 @@ pub struct BlockParser {
 enum LineControlKeyword {
     Else,
     Elif,
+    When,
     End,
     Ok,
     Err,
@@ -352,6 +353,8 @@ impl BlockParser {
             debug!("Parsing line {}: {}", index, line);
             let (parsed_line, next_index) = if Self::is_if_header(line) {
                 Self::parse_if_statement(lines, index)?
+            } else if Self::is_case_header(line) {
+                Self::parse_case_statement(lines, index)?
             } else if Self::is_for_header(line) {
                 Self::parse_for_statement(lines, index)?
             } else if Self::is_match_result_header(line) {
@@ -372,6 +375,9 @@ impl BlockParser {
         let line = line.trim();
         if line == "else" {
             return Some(LineControlKeyword::Else);
+        }
+        if line.starts_with("when ") && line.ends_with(" then") {
+            return Some(LineControlKeyword::When);
         }
         if line == "end" {
             return Some(LineControlKeyword::End);
@@ -395,6 +401,11 @@ impl BlockParser {
     fn is_if_header(line: &str) -> bool {
         let line = line.trim();
         line.starts_with("if ") && line.ends_with(" then")
+    }
+
+    fn is_case_header(line: &str) -> bool {
+        let line = line.trim();
+        line.starts_with("case") && line.ends_with("then")
     }
 
     fn is_for_header(line: &str) -> bool {
@@ -623,6 +634,143 @@ impl BlockParser {
         });
         let line = Line {
             source: if_source,
+            statements: vec![statement],
+        };
+
+        Ok((line, cursor))
+    }
+
+    fn parse_case_header(line: &str) -> Result<(), String> {
+        let line = line.trim();
+        let body = line
+            .strip_prefix("case")
+            .ok_or_else(|| format!("Invalid 'case' header: '{}'", line))?
+            .trim_start();
+        let body = body.strip_suffix("then").ok_or_else(|| {
+            let msg = format!("'case' header must end with 'then': '{}'", line);
+            error!("{}", msg);
+            msg
+        })?;
+        let body = body.trim_end();
+
+        if !body.is_empty() {
+            let msg = format!(
+                "'case' header does not support a subject yet, expected 'case then': '{}'",
+                line
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        Ok(())
+    }
+
+    fn parse_case_statement(lines: &[String], index: usize) -> Result<(Line, usize), String> {
+        let case_source = lines[index].trim().to_string();
+        Self::parse_case_header(case_source.as_str())?;
+
+        let mut branches = Vec::new();
+        let mut else_lines = None;
+        let mut cursor = index + 1;
+
+        if cursor >= lines.len() {
+            let msg = format!(
+                "Missing 'when'/'end' for case statement starting at line {}: '{}'",
+                index + 1,
+                case_source
+            );
+            error!("{}", msg);
+            return Err(msg);
+        }
+
+        let first_control_line = lines[cursor].trim();
+        let mut current_condition = match Self::line_control_keyword(first_control_line) {
+            Some(LineControlKeyword::When) => Self::parse_if_condition(first_control_line, "when")?,
+            Some(other) => {
+                let msg = format!(
+                    "Case statement requires a 'when ... then' branch at line {}, got '{}'",
+                    cursor + 1,
+                    Self::line_control_keyword_name(other)
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+            None => {
+                let msg = format!(
+                    "Case statement requires a 'when ... then' branch at line {}",
+                    cursor + 1
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+        };
+        cursor += 1;
+
+        loop {
+            let (branch_lines, next_cursor) = Self::parse_lines(lines, cursor, true)?;
+            branches.push(CaseBranch {
+                condition: current_condition,
+                lines: branch_lines,
+            });
+
+            if next_cursor >= lines.len() {
+                let msg = format!(
+                    "Missing 'end' for case statement starting at line {}: '{}'",
+                    index + 1,
+                    case_source
+                );
+                error!("{}", msg);
+                return Err(msg);
+            }
+
+            let control_line = lines[next_cursor].trim();
+            match Self::line_control_keyword(control_line) {
+                Some(LineControlKeyword::When) => {
+                    current_condition = Self::parse_if_condition(control_line, "when")?;
+                    cursor = next_cursor + 1;
+                }
+                Some(LineControlKeyword::Else) => {
+                    let (parsed_else_lines, end_cursor) =
+                        Self::parse_lines(lines, next_cursor + 1, true)?;
+
+                    if end_cursor >= lines.len() || lines[end_cursor].trim() != "end" {
+                        let msg = format!(
+                            "Missing 'end' after else branch for case starting at line {}",
+                            index + 1
+                        );
+                        error!("{}", msg);
+                        return Err(msg);
+                    }
+
+                    else_lines = Some(parsed_else_lines);
+                    cursor = end_cursor + 1;
+                    break;
+                }
+                Some(LineControlKeyword::End) => {
+                    cursor = next_cursor + 1;
+                    break;
+                }
+                Some(other) => {
+                    let msg = format!(
+                        "Unexpected control keyword '{}' in case statement at line {}",
+                        Self::line_control_keyword_name(other),
+                        next_cursor + 1
+                    );
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+                None => unreachable!(
+                    "parse_lines(stop_at_control_keywords=true) must stop at a control keyword"
+                ),
+            }
+        }
+
+        let statement = Statement::new_case(CaseStatement {
+            branches,
+            else_lines,
+        });
+        let line = Line {
+            source: case_source,
             statements: vec![statement],
         };
 
@@ -866,6 +1014,7 @@ impl BlockParser {
         match keyword {
             LineControlKeyword::Else => "else",
             LineControlKeyword::Elif => "elif",
+            LineControlKeyword::When => "when",
             LineControlKeyword::End => "end",
             LineControlKeyword::Ok => "ok",
             LineControlKeyword::Err => "err",
@@ -1866,6 +2015,29 @@ mod tests {
         let assign = statement.expressions[0].1.as_command().unwrap();
         assert_eq!(assign.command.name, "assign");
         assert!(matches!(assign.command.args[2], CommandArg::MapLiteral(_)));
+    }
+
+    #[test]
+    fn test_parse_case_statement() {
+        let parser = BlockParser::new("test_block");
+        let block_str = r#"
+            case then
+                when match-reg $REQ.host "^admin\\." then
+                    return --from lib "admin";
+                when strip-prefix $REQ.path "/api" then
+                    return --from lib "api";
+                else
+                    return --from lib "default";
+                end
+        "#;
+
+        let block = parser.parse(block_str).unwrap();
+        assert_eq!(block.lines.len(), 1);
+
+        let statement = &block.lines[0].statements[0];
+        let case_statement = statement.case_statement.as_ref().unwrap();
+        assert_eq!(case_statement.branches.len(), 2);
+        assert!(case_statement.else_lines.is_some());
     }
 
     #[test]
