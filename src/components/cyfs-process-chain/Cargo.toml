@@ -38,6 +38,11 @@ trust-dns-resolver = "*"
 indexmap = { version = "2.13.0", features = ["serde"] }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 rcgen.workspace = true
 tokio-rustls.workspace = true
 rustls = { version = "0.23", features = ["ring", "tls12", "std"] }
+
+[[bench]]
+name = "process_chain_runtime"
+harness = false
