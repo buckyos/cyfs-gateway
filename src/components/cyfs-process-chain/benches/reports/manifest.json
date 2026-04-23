@@ -12,5 +12,19 @@
     "benchmark_count": 52,
     "top_hotspot_full_id": "phase3/execute_fork_hot/capture_status_value/L",
     "top_hotspot_median_ns": 384618.57190402475
+  },
+  {
+    "generated_at": "2026-04-23T05:41:02-07:00",
+    "report_mode": "compare",
+    "baseline_name": "main-local",
+    "compare_to": "main-local",
+    "branch": "beta2.2",
+    "commit": "9c342e70d1d12954409b963933bfac25f155cfb9",
+    "short_commit": "9c342e7",
+    "report_path": "records/20260423T054102-0700__main-local__9c342e7.md",
+    "snapshot_path": "records/20260423T054102-0700__main-local__9c342e7.json",
+    "benchmark_count": 52,
+    "top_hotspot_full_id": "phase3/execute_fork_hot/capture_status_value/L",
+    "top_hotspot_median_ns": 387099.4206682673
   }
 ]
