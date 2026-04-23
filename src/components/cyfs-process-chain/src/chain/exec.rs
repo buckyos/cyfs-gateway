@@ -265,7 +265,7 @@ impl ProcessChainLibExecutor {
             chain_index += 1;
         }
 
-        info!(
+        debug!(
             "process_chain_final_result lib={} kind={} value={:?}",
             self.process_chain_lib.get_id(),
             command_result_kind(&final_result),

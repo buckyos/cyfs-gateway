@@ -3240,7 +3240,7 @@ impl SNServer {
         record_type: RecordType,
         from_ip: Option<IpAddr>,
     ) -> ServerResult<NameInfo> {
-        info!(
+        debug!(
             "sn server process name query: {} record_type: {:?}",
             name,
             Some(record_type)
@@ -3322,7 +3322,7 @@ impl SNServer {
             //             name.to_string()
             //         ));
             //     }
-            info!(
+            debug!(
                 "host {} owner by user {}, sub_host: {}, record_type: {:?}",
                 req_real_name, username, sub_host, record_type
             );
@@ -3378,7 +3378,7 @@ impl SNServer {
 
                         let mut result_name_info = NameInfo::from_address_vec(name, address_vec);
                         result_name_info.ttl = Some(ttl);
-                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        debug!("=>{} result_name_info: {:?}", name, result_name_info);
                         return Ok(result_name_info);
                     }
                     let address_vec = self
@@ -3387,7 +3387,7 @@ impl SNServer {
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        debug!("=>{} result_name_info: {:?}", name, result_name_info);
                         Ok(result_name_info)
                     } else {
                         Err(server_err!(
@@ -3406,7 +3406,7 @@ impl SNServer {
                 }
             }
         } else {
-            info!("get user subhost from host: {} failed", req_real_name);
+            debug!("get user subhost from host: {} failed", req_real_name);
             let real_domain_name = name[0..name.len() - 1].to_string();
             match record_type {
                 RecordType::TXT => {
@@ -3435,7 +3435,7 @@ impl SNServer {
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        debug!("=>{} result_name_info: {:?}", name, result_name_info);
                         return Ok(result_name_info);
                     }
                 }
