@@ -33,7 +33,7 @@ use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -1069,22 +1069,23 @@ impl RTcpInner {
 
         // First check if the tunnel already exists, then we can reuse it
         let tunnels = self.tunnel_map.tunnel_map().clone();
-        let mut all_tunnel = tunnels.lock().await;
-        let tunnel = all_tunnel.get(tunnel_key.as_str());
-        if tunnel.is_some() {
-            debug!("Reuse tunnel {}", tunnel_key.as_str());
-            return Ok(Box::new(tunnel.unwrap().clone()));
+        {
+            let all_tunnel = tunnels.read().await;
+            if let Some(tunnel) = all_tunnel.get(tunnel_key.as_str()) {
+                debug!("Reuse tunnel {}", tunnel_key.as_str());
+                return Ok(Box::new(tunnel.clone()));
+            }
+            let tunnel_map_size = all_tunnel.len();
+            let sample_keys: Vec<String> = all_tunnel.keys().take(5).cloned().collect();
+            debug!(
+                "reuse miss for tunnel_key={}, map_size={}",
+                tunnel_key, tunnel_map_size
+            );
+            trace!(
+                "reuse miss details for tunnel_key={}, sample_keys={:?}",
+                tunnel_key, sample_keys
+            );
         }
-        let tunnel_map_size = all_tunnel.len();
-        let sample_keys: Vec<String> = all_tunnel.keys().take(5).cloned().collect();
-        debug!(
-            "reuse miss for tunnel_key={}, map_size={}",
-            tunnel_key, tunnel_map_size
-        );
-        trace!(
-            "reuse miss details for tunnel_key={}, sample_keys={:?}",
-            tunnel_key, sample_keys
-        );
 
         // 1） resolve target auth-key and ip (rtcp base on tcp,so need ip)
 
@@ -1224,13 +1225,23 @@ impl RTcpInner {
                 random_pk,
                 self.listener.clone(),
             );
-            all_tunnel.insert(tunnel_key.clone(), tunnel.clone());
-            info!(
-                "create tunnel {} ok, remote addr is {}",
-                tunnel_key.as_str(),
-                remote_addr.as_str()
-            );
-            drop(all_tunnel);
+            {
+                let mut all_tunnel = tunnels.write().await;
+                if let Some(existing_tunnel) = all_tunnel.get(tunnel_key.as_str()) {
+                    debug!(
+                        "Reuse tunnel {} after fresh tunnel build; discard new tunnel for {}",
+                        tunnel_key.as_str(),
+                        remote_addr.as_str()
+                    );
+                    return Ok(Box::new(existing_tunnel.clone()));
+                }
+                all_tunnel.insert(tunnel_key.clone(), tunnel.clone());
+                info!(
+                    "create tunnel {} ok, remote addr is {}",
+                    tunnel_key.as_str(),
+                    remote_addr.as_str()
+                );
+            }
 
             let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
             let tunnel_map = self.tunnel_map.clone();
@@ -1946,22 +1957,22 @@ pub type RTcpListenerRef = Arc<dyn RTcpListener>;
 
 #[derive(Clone)]
 struct RTcpTunnelMap {
-    tunnel_map: Arc<Mutex<HashMap<String, RTcpTunnel>>>,
+    tunnel_map: Arc<RwLock<HashMap<String, RTcpTunnel>>>,
 }
 
 impl RTcpTunnelMap {
     pub fn new() -> Self {
         RTcpTunnelMap {
-            tunnel_map: Arc::new(Mutex::new(HashMap::new())),
+            tunnel_map: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    pub fn tunnel_map(&self) -> Arc<Mutex<HashMap<String, RTcpTunnel>>> {
+    pub fn tunnel_map(&self) -> Arc<RwLock<HashMap<String, RTcpTunnel>>> {
         self.tunnel_map.clone()
     }
 
     pub async fn get_tunnel(&self, tunnel_key: &str) -> Option<RTcpTunnel> {
-        let all_tunnel = self.tunnel_map.lock().await;
+        let all_tunnel = self.tunnel_map.read().await;
         if let Some(tunnel) = all_tunnel.get(tunnel_key) {
             Some(tunnel.clone())
         } else {
@@ -1970,7 +1981,7 @@ impl RTcpTunnelMap {
     }
 
     pub async fn on_new_tunnel(&self, tunnel_key: &str, tunnel: RTcpTunnel) {
-        let mut all_tunnel = self.tunnel_map.lock().await;
+        let mut all_tunnel = self.tunnel_map.write().await;
         let size_before = all_tunnel.len();
         let mut_old_tunnel = all_tunnel.get(tunnel_key);
         if mut_old_tunnel.is_some() {
@@ -1988,7 +1999,7 @@ impl RTcpTunnelMap {
     }
 
     pub async fn remove_tunnel(&self, tunnel_key: &str) {
-        let mut all_tunnel = self.tunnel_map.lock().await;
+        let mut all_tunnel = self.tunnel_map.write().await;
         let size_before = all_tunnel.len();
         all_tunnel.remove(tunnel_key);
         debug!(
