@@ -16,6 +16,7 @@ pub(crate) enum CmdType {
     ROpenResp = 6,
     Open = 7,
     OpenResp = 8,
+    HelloAckConfirm = 9,
 }
 
 impl From<u8> for CmdType {
@@ -29,6 +30,7 @@ impl From<u8> for CmdType {
             6 => CmdType::ROpenResp,
             7 => CmdType::Open,
             8 => CmdType::OpenResp,
+            9 => CmdType::HelloAckConfirm,
             _ => CmdType::UnknownProtocol,
         }
     }
@@ -58,6 +60,18 @@ pub(crate) struct TunnelTokenPayload {
     pub from: String,
     pub xpub: String,
     pub exp: u64,
+    // Hex-encoded random nonce (16 random bytes -> 32 hex chars).
+    //
+    // Responder keeps a short-lived per-(from_id, nonce) cache and rejects
+    // any repeat while the token is still within its validity window. This
+    // closes the replay gap documented in §14.2 of doc/rtcp.md: without the
+    // nonce, a captured Hello could be replayed verbatim until the 60s
+    // token expiry plus clock leeway elapsed.
+    //
+    // Optional for backwards-compat deserialization only; new tokens
+    // always set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -114,20 +128,32 @@ impl RTcpHelloPackage {
     }
 }
 
+// HelloAck is the server's first AEAD-encrypted record in the §14.2
+// 3-message handshake. It carries a fresh 16-byte challenge that the
+// initiator must echo back in HelloAckConfirm. A replayer that does not
+// hold the ephemeral X25519 secret cannot derive the AEAD key, so it
+// cannot even decrypt `challenge`, let alone produce a valid confirm.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct RTcpHelloAckBody {
-    test_result: bool,
+    // Hex-encoded 16 random bytes.
+    pub challenge: String,
+    // Responder's DID hostname. Binds the ack to this specific responder
+    // so the initiator can cross-check it against the `to` it asked for.
+    pub responder_id: String,
 }
 pub(crate) type RTcpHelloAckPackage = RTcpTunnelPackageImpl<RTcpHelloAckBody>;
 
 impl RTcpHelloAckPackage {
-    pub fn new(seq: u32, test_result: bool) -> Self {
+    pub fn new(seq: u32, challenge: String, responder_id: String) -> Self {
         RTcpHelloAckPackage {
             len: 0,
             json_pos: 0,
             cmd: CmdType::HelloAck.into(),
             seq: seq,
-            body: RTcpHelloAckBody { test_result },
+            body: RTcpHelloAckBody {
+                challenge,
+                responder_id,
+            },
         }
     }
 
@@ -143,6 +169,46 @@ impl RTcpHelloAckPackage {
             len: 0,
             json_pos: 0,
             cmd: CmdType::HelloAck.into(),
+            seq: seq,
+            body: body.unwrap(),
+        };
+        Ok(package)
+    }
+}
+
+// HelloAckConfirm closes the §14.2 handshake: initiator proves it holds
+// the AEAD key by echoing the responder's challenge. The echo is sent
+// inside an AEAD record, so both confidentiality of the challenge and
+// integrity of the echo are authenticated by the record layer.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct RTcpHelloAckConfirmBody {
+    pub challenge_echo: String,
+}
+pub(crate) type RTcpHelloAckConfirmPackage = RTcpTunnelPackageImpl<RTcpHelloAckConfirmBody>;
+
+impl RTcpHelloAckConfirmPackage {
+    pub fn new(seq: u32, challenge_echo: String) -> Self {
+        RTcpHelloAckConfirmPackage {
+            len: 0,
+            json_pos: 0,
+            cmd: CmdType::HelloAckConfirm.into(),
+            seq: seq,
+            body: RTcpHelloAckConfirmBody { challenge_echo },
+        }
+    }
+
+    pub fn from_json(seq: u32, json_value: serde_json::Value) -> Result<Self, std::io::Error> {
+        let body = serde_json::from_value::<RTcpHelloAckConfirmBody>(json_value);
+        if body.is_err() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "parse package error",
+            ));
+        }
+        let package = RTcpHelloAckConfirmPackage {
+            len: 0,
+            json_pos: 0,
+            cmd: CmdType::HelloAckConfirm.into(),
             seq: seq,
             body: body.unwrap(),
         };
@@ -432,6 +498,7 @@ pub(crate) enum RTcpTunnelPackage {
     HelloStream(String),
     Hello(RTcpHelloPackage),
     HelloAck(RTcpHelloAckPackage),
+    HelloAckConfirm(RTcpHelloAckConfirmPackage),
     Ping(RTcpPingPackage),
     Pong(RTcpPongPackage),
     ROpen(RTcpROpenPackage),
@@ -530,6 +597,11 @@ impl RTcpTunnelPackage {
                 CmdType::HelloAck => {
                     let result_package = RTcpHelloAckPackage::from_json(seq, package_value)?;
                     return Ok(RTcpTunnelPackage::HelloAck(result_package));
+                }
+                CmdType::HelloAckConfirm => {
+                    let result_package =
+                        RTcpHelloAckConfirmPackage::from_json(seq, package_value)?;
+                    return Ok(RTcpTunnelPackage::HelloAckConfirm(result_package));
                 }
                 CmdType::Ping => {
                     let result_package: RTcpTunnelPackageImpl<RTcpPingBody> =

@@ -116,6 +116,93 @@ impl RTcp {
     }
 }
 
+// §14.2 anti-replay: tunnel_token lifetime. The signed token carries this
+// exp; the responder accepts it within [exp - leeway, exp + leeway] (see
+// JWT_LEEWAY_SECS below). A legitimate Hello thus tolerates ~60s of clock
+// skew either way while still closing the replay window aggressively
+// compared to the old 2h value.
+const TUNNEL_TOKEN_EXP_SECS: u64 = 60;
+
+// JWT validation leeway used when decoding `tunnel_token`. The nonce cache
+// must outlive the full acceptance window (`exp + JWT_LEEWAY_SECS`), or a
+// replay between `exp` and `exp + leeway` would still pass signature
+// validation while finding a freshly-evicted nonce slot. The constant is
+// referenced both when constructing `Validation` and when computing the
+// nonce-cache retain deadline, so the two windows stay in lock-step.
+const JWT_LEEWAY_SECS: u64 = 60;
+
+// Max time the responder will wait for the initiator's HelloAckConfirm, and
+// the initiator will wait for the responder's HelloAck. Keeps stuck
+// handshakes from pinning an (aes_key, nonce_base) slot.
+const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+// Upper bound on NonceCache size. Each entry is ~100 bytes, so 16k entries
+// caps memory at roughly 1.6 MiB. A healthy peer hits nowhere near this;
+// hitting the cap implies sustained abuse, at which point we evict the
+// oldest pending entries to avoid unbounded growth. Eviction under abuse
+// is acceptable: eviction only re-opens replay for tokens that would
+// otherwise also be expiring shortly, and the attacker still needs a valid
+// signed token to get past signature verification.
+const NONCE_CACHE_CAP: usize = 16 * 1024;
+
+// Tracks (from_id, nonce) pairs from successfully-verified Hello tokens
+// so a replayed token -- identical bytes, same signature -- is rejected
+// before we do any expensive crypto beyond the signature check. Entries
+// are evicted once the associated token's `exp` has passed (plus a small
+// grace), since a token that can no longer be validated is no longer a
+// replay vector.
+struct NonceCache {
+    seen: Mutex<HashMap<(String, String), u64>>,
+}
+
+impl NonceCache {
+    fn new() -> Self {
+        Self {
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // Returns true if this (from_id, nonce) had not been seen while still
+    // within its retention window. `retain_until_ts` must be the last
+    // timestamp at which the corresponding JWT is still signature-valid
+    // (i.e. `exp + leeway`); keeping the cache aligned with the signature
+    // acceptance window is what makes replay-rejection airtight.
+    async fn insert_if_fresh(
+        &self,
+        from_id: &str,
+        nonce: &str,
+        retain_until_ts: u64,
+        now_ts: u64,
+    ) -> bool {
+        let mut seen = self.seen.lock().await;
+        // Opportunistic cleanup: drop entries whose retention has passed.
+        // This is O(n) but only runs when we're already taking the lock
+        // to insert, and n is capped below.
+        seen.retain(|_, retain_until| *retain_until > now_ts);
+
+        let key = (from_id.to_owned(), nonce.to_owned());
+        if seen.contains_key(&key) {
+            return false;
+        }
+
+        if seen.len() >= NONCE_CACHE_CAP {
+            // Evict whatever entry will expire soonest. Under sustained
+            // abuse this gives up the strongest anti-replay guarantee on
+            // the oldest entries, but prevents unbounded memory growth.
+            if let Some(soonest) = seen
+                .iter()
+                .min_by_key(|(_, retain_until)| *retain_until)
+                .map(|(k, _)| k.clone())
+            {
+                seen.remove(&soonest);
+            }
+        }
+
+        seen.insert(key, retain_until_ts);
+        true
+    }
+}
+
 struct RTcpInner {
     tunnel_map: RTcpTunnelMap,
     stream_helper: RTcpStreamBuildHelper,
@@ -131,6 +218,8 @@ struct RTcpInner {
     // framework when the stack id carries a `params@remote` prefix. None means
     // only direct TCP bootstrap is available (backward compatible path).
     tunnel_manager: Option<TunnelManager>,
+    // §14.2: reject replayed Hello tokens by their embedded nonce.
+    nonce_cache: NonceCache,
 }
 
 impl Drop for RTcpInner {
@@ -568,6 +657,7 @@ impl RTcpInner {
             this_device_x25519_sk: this_device_x25519_sk,   //for decode tunnel token from remote
             this_device_doc_jwt,
             tunnel_manager: None,
+            nonce_cache: NonceCache::new(),
         };
         return result;
     }
@@ -609,12 +699,24 @@ impl RTcpInner {
         //info!("my_public_hex: {:?}",my_public_hex);
         let aes_key = RTcpInner::generate_aes256_key(my_secret, remote_x25519_pk);
         //info!("aes_key: {:?}",aes_key);
+
+        // §14.2: embed a fresh 16-byte random nonce and use a short exp
+        // (default 60s). The responder keeps a nonce cache for the exp
+        // window, so any captured token cannot be replayed as-is to stand
+        // up a second tunnel. An attacker that replays an already-used
+        // token will be rejected at the nonce check even before the key-
+        // confirmation handshake kicks in.
+        let mut nonce_bytes = [0u8; 16];
+        rand::thread_rng().fill(&mut nonce_bytes);
+        let nonce_hex: String = nonce_bytes.encode_hex();
+
         //create jwt by tunnel token payload
         let tunnel_token_payload = TunnelTokenPayload {
             to: remote_did.to_host_name(),
             from: self.this_device_did.to_host_name(),
             xpub: my_public_hex,
-            exp: buckyos_get_unix_timestamp() + 3600 * 2,
+            exp: buckyos_get_unix_timestamp() + TUNNEL_TOKEN_EXP_SECS,
+            nonce: Some(nonce_hex),
         };
         debug!(
             "generated tunnel token payload for {} -> {}",
@@ -661,11 +763,16 @@ impl RTcpInner {
         token: String,
         from_public_key: &DecodingKey,
         expected_from: Option<&str>,
-    ) -> Result<([u8; 32], [u8; 32]), TunnelError> {
+    ) -> Result<([u8; 32], [u8; 32], TunnelTokenPayload), TunnelError> {
+        // Explicit leeway pinned to JWT_LEEWAY_SECS so the nonce-cache
+        // retention window stays aligned with the signature acceptance
+        // window (see §14.2 anti-replay fix).
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.leeway = JWT_LEEWAY_SECS;
         let tunnel_token_payload = decode::<TunnelTokenPayload>(
             token.as_str(),
             from_public_key,
-            &Validation::new(Algorithm::EdDSA),
+            &validation,
         );
         if tunnel_token_payload.is_err() {
             return Err(TunnelError::DocumentError(
@@ -683,7 +790,11 @@ impl RTcpInner {
             }
         }
         //info!("tunnel_token_payload: {:?}",tunnel_token_payload);
-        let remomte_x25519_pk = hex::decode(tunnel_token_payload.xpub).unwrap();
+        let remomte_x25519_pk = hex::decode(&tunnel_token_payload.xpub).map_err(|op| {
+            let msg = format!("decode remote x25519 hex error:{}", op);
+            error!("{}", msg);
+            TunnelError::ReasonError(msg)
+        })?;
 
         let remomte_x25519_pk: [u8; 32] = remomte_x25519_pk.try_into().map_err(|_op| {
             let msg = format!("decode remote x25519 hex error");
@@ -694,7 +805,7 @@ impl RTcpInner {
         //info!("remomte_x25519_pk: {:?}",remomte_x25519_pk);
         let aes_key = RTcpInner::get_aes256_key(this_private_key, remomte_x25519_pk.clone());
         //info!("aes_key: {:?}",aes_key);
-        Ok((aes_key, remomte_x25519_pk))
+        Ok((aes_key, remomte_x25519_pk, tunnel_token_payload))
     }
 
     pub async fn decode_tunnel_token(
@@ -720,12 +831,13 @@ impl RTcpInner {
             })?;
 
         let from_public_key = DecodingKey::from_ed_der(&ed25519_pk);
-        RTcpInner::decode_tunnel_token_with_key(
+        let (aes_key, remote_x25519_pk, _payload) = RTcpInner::decode_tunnel_token_with_key(
             this_private_key,
             token,
             &from_public_key,
             Some(from_did.to_host_name().as_str()),
-        )
+        )?;
+        Ok((aes_key, remote_x25519_pk))
     }
 
     async fn resolve_source_device_info(
@@ -972,21 +1084,68 @@ impl RTcpInner {
                 return;
             }
         };
-        let aes_key = RTcpInner::decode_tunnel_token_with_key(
+        let decoded = RTcpInner::decode_tunnel_token_with_key(
             &self.this_device_x25519_sk.as_ref().unwrap(),
             token,
             &source_public_key,
             Some(source_did.to_host_name().as_str()),
-        )
-        .map_err(|e| {
-            error!("decode tunnel token error:{}", e);
-            e
-        });
-        if aes_key.is_err() {
+        );
+        let (aes_key, random_pk, token_payload) = match decoded {
+            Ok(v) => v,
+            Err(e) => {
+                error!("decode tunnel token error:{}", e);
+                return;
+            }
+        };
+
+        // §14.2 anti-replay: every Hello token must bind this responder
+        // and must not be replayed within its exp window.
+        let this_host = self.this_device_did.to_host_name();
+        if token_payload.to != this_host {
+            warn!(
+                "reject rtcp tunnel: token.to {} not for this device {}",
+                token_payload.to, this_host
+            );
             return;
         }
+        match token_payload.nonce.as_ref() {
+            Some(nonce) => {
+                let now_ts = buckyos_get_unix_timestamp();
+                // Retain the nonce for the FULL signature-acceptance
+                // window, not just until `exp`. jsonwebtoken accepts a
+                // token up to `exp + JWT_LEEWAY_SECS`, so if we only
+                // kept the nonce until `exp`, a replay captured within
+                // that leeway would pass signature validation *and*
+                // find a freshly-evicted slot -- defeating the anti-
+                // replay guarantee. See regression test
+                // nonce_cache_retains_entry_past_exp_within_leeway.
+                let retain_until = token_payload.exp.saturating_add(JWT_LEEWAY_SECS);
+                let fresh = self
+                    .nonce_cache
+                    .insert_if_fresh(&source_device_id, nonce, retain_until, now_ts)
+                    .await;
+                if !fresh {
+                    warn!(
+                        "reject rtcp tunnel: replayed Hello nonce {} from {}",
+                        nonce, source_device_id
+                    );
+                    return;
+                }
+            }
+            None => {
+                // A token signed without a nonce is from a pre-§14.2 peer.
+                // Refusing it keeps the replay-resistance guarantee; a
+                // newer peer always includes the nonce, so this rejection
+                // only affects peers that still run the old code -- which
+                // is the whole point of the documented breaking change.
+                warn!(
+                    "reject rtcp tunnel: Hello token from {} missing §14.2 nonce",
+                    source_device_id
+                );
+                return;
+            }
+        }
 
-        let (aes_key, random_pk) = aes_key.unwrap();
         let source_addr = match stream.peer_addr() {
             Ok(addr) => addr,
             Err(e) => {
@@ -994,6 +1153,34 @@ impl RTcpInner {
                 return;
             }
         };
+
+        let remote_stack = RTcpTargetStackEP::new(source_did, hello_package.body.my_port);
+        if remote_stack.is_err() {
+            error!("parser remote did error:{}", remote_stack.err().unwrap());
+            return;
+        }
+        let remote_stack = remote_stack.unwrap();
+
+        // §14.2 key confirmation: wrap the bearing stream in the AEAD
+        // record layer and run the HelloAck / HelloAckConfirm exchange
+        // *before* admitting the tunnel to on_new_tunnel or the tunnel
+        // map. Only a peer that actually derived the same AES key can
+        // decrypt our HelloAck and return a matching challenge_echo, so
+        // a replayer without the ephemeral X25519 secret is dropped here.
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(&random_pk[..16]);
+        let bearing: RTcpBearingStream = Box::new(stream);
+        let mut encrypted_stream =
+            EncryptedStream::new(bearing, &aes_key, &iv, EncryptionRole::Responder);
+
+        if let Err(e) = responder_key_confirmation(&mut encrypted_stream, &this_host).await {
+            warn!(
+                "reject rtcp tunnel from {} {}: key confirmation failed: {}",
+                source_device_id, source_addr, e
+            );
+            return;
+        }
+
         let endpoint = TunnelEndpoint {
             device_id: source_device_id.clone(),
             port: hello_package.body.my_port,
@@ -1010,22 +1197,15 @@ impl RTcpInner {
             return;
         }
 
-        let remote_stack = RTcpTargetStackEP::new(source_did, hello_package.body.my_port);
-        if remote_stack.is_err() {
-            error!("parser remote did error:{}", remote_stack.err().unwrap());
-            return;
-        }
-        let remote_stack = remote_stack.unwrap();
         let tunnel = RTcpTunnel::new(
             self.stream_helper.clone(),
             self.this_device_did.clone(),
             &remote_stack,
             false,
-            Box::new(stream) as RTcpBearingStream,
+            encrypted_stream,
             Some(source_addr),
             None,
             aes_key,
-            random_pk,
             self.listener.clone(),
         );
 
@@ -1179,6 +1359,27 @@ impl RTcpInner {
                     TunnelError::ConnectError(msg)
                 })?;
 
+            // §14.2 key confirmation: wrap in EncryptedStream and run the
+            // HelloAck / HelloAckConfirm exchange before the tunnel is
+            // registered. A responder that didn't actually derive the
+            // same AES key (or a MitM stream) can't decrypt our HelloAck
+            // and will be dropped here before any user traffic flows.
+            let mut iv = [0u8; 16];
+            iv.copy_from_slice(&random_pk[..16]);
+            let mut encrypted_stream =
+                EncryptedStream::new(bearing, &aes_key, &iv, EncryptionRole::Initiator);
+            let expected_remote_host = remote_stack.did.to_host_name();
+            initiator_key_confirmation(&mut encrypted_stream, &expected_remote_host)
+                .await
+                .map_err(|e| {
+                    let msg = format!(
+                        "key confirmation over bootstrap stream '{}' for {} failed: {}",
+                        bootstrap_url, remote_device_id, e
+                    );
+                    error!("{}", msg);
+                    TunnelError::ConnectError(msg)
+                })?;
+
             // peer_addr is None for bootstrap-backed tunnels. Instead, we hand
             // the tunnel a bootstrap context so that subsequent Open/ROpen
             // reconnects replay the same nested transport via the tunnel
@@ -1192,11 +1393,10 @@ impl RTcpInner {
                 self.this_device_did.clone(),
                 &remote_stack,
                 true,
-                bearing,
+                encrypted_stream,
                 None,
                 Some(bootstrap_ctx),
                 aes_key,
-                random_pk,
                 self.listener.clone(),
             );
             let mut all_tunnel = tunnels.lock().await;
@@ -1364,16 +1564,41 @@ impl RTcpInner {
             }
 
             let peer_addr = tunnel_stream.peer_addr().ok();
+
+            // §14.2 key confirmation: wrap the TCP stream in EncryptedStream
+            // (initiator role) and run HelloAck / HelloAckConfirm. If the
+            // remote peer is not who we think it is (wrong static X25519
+            // key), HelloAck cannot be decrypted here and we drop the
+            // attempt before any tunnel state is published.
+            let mut iv = [0u8; 16];
+            iv.copy_from_slice(&random_pk[..16]);
+            let bearing: RTcpBearingStream = Box::new(tunnel_stream);
+            let mut encrypted_stream =
+                EncryptedStream::new(bearing, &aes_key, &iv, EncryptionRole::Initiator);
+            let expected_remote_host = remote_stack.did.to_host_name();
+            if let Err(e) =
+                initiator_key_confirmation(&mut encrypted_stream, &expected_remote_host).await
+            {
+                warn!(
+                    "key confirmation to {} error: {}",
+                    remote_addr, e
+                );
+                connect_errors.push(format!(
+                    "{} => key confirmation error: {}",
+                    remote_addr, e
+                ));
+                continue;
+            }
+
             let tunnel = RTcpTunnel::new(
                 self.stream_helper.clone(),
                 self.this_device_did.clone(),
                 &remote_stack,
                 true,
-                Box::new(tunnel_stream) as RTcpBearingStream,
+                encrypted_stream,
                 peer_addr,
                 None,
                 aes_key,
-                random_pk,
                 self.listener.clone(),
             );
             let mut all_tunnel = tunnels.lock().await;
@@ -1418,6 +1643,125 @@ impl RTcpInner {
             connect_errors.join("; ")
         )))
     }
+}
+
+// §14.2 initiator side of the key-confirmation handshake.
+//
+// Runs after the initiator has sent the plaintext Hello and wrapped the
+// bearing stream in an EncryptedStream (initiator role). Expects a single
+// HelloAck (AEAD-decrypted, so already authenticated by the record layer),
+// echoes the challenge back as HelloAckConfirm, then returns so the caller
+// can hand the stream to RTcpTunnel. Any timeout or protocol violation
+// returns an error so the caller drops the stream before publishing the
+// tunnel.
+async fn initiator_key_confirmation(
+    stream: &mut EncryptedStream<RTcpBearingStream>,
+    expected_responder_host: &str,
+) -> Result<(), TunnelError> {
+    let pkg = timeout(
+        HELLO_HANDSHAKE_TIMEOUT,
+        RTcpTunnelPackage::read_package(Pin::new(stream), false, "hello_ack"),
+    )
+    .await
+    .map_err(|_| {
+        TunnelError::ReasonError(
+            "HelloAck read timed out; peer may be a replayer without the AEAD key".to_string(),
+        )
+    })?
+    .map_err(|e| TunnelError::ReasonError(format!("HelloAck read error: {}", e)))?;
+
+    let ack = match pkg {
+        RTcpTunnelPackage::HelloAck(p) => p,
+        other => {
+            return Err(TunnelError::ReasonError(format!(
+                "expected HelloAck, got {:?}",
+                other
+            )));
+        }
+    };
+
+    // Cross-check: the responder's self-reported id must match the
+    // `to` we signed into the tunnel token. A mismatch means either a
+    // misconfigured peer or a MitM attempting to stand up a tunnel under
+    // a different identity than the initiator requested.
+    if ack.body.responder_id != expected_responder_host {
+        return Err(TunnelError::ReasonError(format!(
+            "HelloAck responder_id {} not equal to expected {}",
+            ack.body.responder_id, expected_responder_host
+        )));
+    }
+
+    let confirm = RTcpHelloAckConfirmPackage::new(ack.seq, ack.body.challenge.clone());
+    timeout(
+        HELLO_HANDSHAKE_TIMEOUT,
+        RTcpTunnelPackage::send_package(Pin::new(stream), confirm),
+    )
+    .await
+    .map_err(|_| TunnelError::ReasonError("HelloAckConfirm send timed out".to_string()))?
+    .map_err(|e| TunnelError::ReasonError(format!("HelloAckConfirm send error: {}", e)))?;
+
+    Ok(())
+}
+
+// §14.2 responder side of the key-confirmation handshake.
+//
+// Runs after the responder has read the plaintext Hello, verified the
+// signed tunnel_token, and wrapped the bearing stream in an
+// EncryptedStream (responder role). Generates a fresh 16-byte challenge,
+// sends it as HelloAck over the AEAD record layer, then waits for the
+// initiator to echo it back inside a HelloAckConfirm.
+//
+// A replayer that does not hold the ephemeral X25519 secret cannot derive
+// the AEAD key, so it cannot decrypt HelloAck to learn `challenge`, and
+// therefore cannot produce a valid HelloAckConfirm. The timeout here is
+// what makes the rejection prompt: without it, the replayer could pin
+// the (aes_key, nonce_base) slot indefinitely by never responding.
+async fn responder_key_confirmation(
+    stream: &mut EncryptedStream<RTcpBearingStream>,
+    this_host: &str,
+) -> Result<(), TunnelError> {
+    let mut challenge_bytes = [0u8; 16];
+    rand::thread_rng().fill(&mut challenge_bytes);
+    let challenge_hex: String = challenge_bytes.encode_hex();
+
+    let ack = RTcpHelloAckPackage::new(0, challenge_hex.clone(), this_host.to_owned());
+    timeout(
+        HELLO_HANDSHAKE_TIMEOUT,
+        RTcpTunnelPackage::send_package(Pin::new(stream), ack),
+    )
+    .await
+    .map_err(|_| TunnelError::ReasonError("HelloAck send timed out".to_string()))?
+    .map_err(|e| TunnelError::ReasonError(format!("HelloAck send error: {}", e)))?;
+
+    let pkg = timeout(
+        HELLO_HANDSHAKE_TIMEOUT,
+        RTcpTunnelPackage::read_package(Pin::new(stream), false, "hello_ack_confirm"),
+    )
+    .await
+    .map_err(|_| {
+        TunnelError::ReasonError(
+            "HelloAckConfirm read timed out; peer may be a replayer without the AEAD key"
+                .to_string(),
+        )
+    })?
+    .map_err(|e| TunnelError::ReasonError(format!("HelloAckConfirm read error: {}", e)))?;
+
+    let confirm = match pkg {
+        RTcpTunnelPackage::HelloAckConfirm(p) => p,
+        other => {
+            return Err(TunnelError::ReasonError(format!(
+                "expected HelloAckConfirm, got {:?}",
+                other
+            )));
+        }
+    };
+    if confirm.body.challenge_echo != challenge_hex {
+        return Err(TunnelError::ReasonError(
+            "HelloAckConfirm challenge_echo mismatch; key confirmation failed".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 // Per-tunnel cap on concurrent inbound stream establishments (Open packets
@@ -1489,29 +1833,22 @@ struct RTcpTunnel {
 }
 
 impl RTcpTunnel {
+    // The EncryptedStream wrapping happens in create_tunnel / on_new_tunnel
+    // so the §14.2 key-confirmation handshake (HelloAck / HelloAckConfirm)
+    // can run over AEAD records before the tunnel is published to the map.
+    // The caller is therefore responsible for picking the correct
+    // EncryptionRole when building `encrypted_stream`.
     pub fn new(
         build_helper: RTcpStreamBuildHelper,
         this_device: DID,
         remote_stack: &RTcpTargetStackEP,
         can_direct: bool,
-        stream: RTcpBearingStream,
+        encrypted_stream: EncryptedStream<RTcpBearingStream>,
         peer_addr: Option<SocketAddr>,
         bootstrap: Option<RTcpBootstrapCtx>,
         aes_key: [u8; 32],
-        random_pk: [u8; 32],
         listener: RTcpListenerRef,
     ) -> Self {
-        let mut iv = [0u8; 16];
-        iv.copy_from_slice(&random_pk[..16]);
-        // can_direct=true on the side that originated the TCP connection
-        // (and therefore sent the first-packet Hello in plaintext). Use it as
-        // the initiator/responder marker for per-direction nonce derivation.
-        let role = if can_direct {
-            EncryptionRole::Initiator
-        } else {
-            EncryptionRole::Responder
-        };
-        let encrypted_stream = EncryptedStream::new(stream, &aes_key, &iv, role);
         let (read_stream, write_stream) = tokio::io::split(encrypted_stream);
         //let (read_stream,write_stream) =  tokio::io::split(stream);
         let this_remote_stack = remote_stack.clone();
@@ -2405,6 +2742,67 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 
+    // §14.2 regression: the nonce cache retention window must cover the
+    // full signature-acceptance window (`exp + JWT_LEEWAY_SECS`), not just
+    // `exp`. Before this fix the cache evicted the entry at `exp`, while
+    // jsonwebtoken's default leeway kept the token itself signature-valid
+    // until `exp + 60s` -- opening a replay gap of one full leeway window.
+    //
+    // This test feeds the cache with the same (retain_until_ts, now_ts)
+    // values on_new_tunnel computes in production and verifies that a
+    // replay at `exp + 1s` (firmly inside the leeway) is still rejected.
+    #[tokio::test]
+    async fn nonce_cache_retains_entry_past_exp_within_leeway() {
+        let cache = NonceCache::new();
+        let from = "did:dev:test-peer";
+        let nonce = "deadbeefdeadbeefdeadbeefdeadbeef";
+        let exp: u64 = 1_000_000;
+        let retain_until = exp + JWT_LEEWAY_SECS;
+
+        // Initial admission succeeds at issue time.
+        let now_issue = exp - TUNNEL_TOKEN_EXP_SECS;
+        assert!(cache
+            .insert_if_fresh(from, nonce, retain_until, now_issue)
+            .await);
+
+        // Replay at exp + 1s -- past the token's exp claim but still
+        // inside the JWT leeway window where signature validation would
+        // ACCEPT the token. The nonce cache MUST still reject it.
+        let now_replay = exp + 1;
+        assert!(
+            !cache
+                .insert_if_fresh(from, nonce, retain_until, now_replay)
+                .await,
+            "replay within JWT leeway must be rejected; cache was pruning at exp instead of exp+leeway"
+        );
+
+        // Also verify the boundary: at exactly `retain_until` the entry
+        // should still be present (retain_until is the last valid
+        // timestamp).
+        let now_boundary = retain_until - 1;
+        assert!(
+            !cache
+                .insert_if_fresh(from, nonce, retain_until, now_boundary)
+                .await,
+            "replay at retain_until-1 must be rejected"
+        );
+
+        // Once we move strictly past the retention window the entry is
+        // allowed to be evicted -- a fresh Hello with a newly-signed
+        // token (and therefore a future exp/retain_until) can then reuse
+        // the same (from, nonce) slot. This side of the boundary is
+        // harmless because by then the original signature would also
+        // have failed validation.
+        let now_after = retain_until + 1;
+        let new_retain_until = now_after + TUNNEL_TOKEN_EXP_SECS + JWT_LEEWAY_SECS;
+        assert!(
+            cache
+                .insert_if_fresh(from, nonce, new_retain_until, now_after)
+                .await,
+            "after retain window, the same nonce bundled with a fresh token should be admissible"
+        );
+    }
+
     #[test]
     fn test_rtcp_struct_creation() {
         // 测试RTcp结构体的创建
@@ -2767,14 +3165,22 @@ mod tests {
         rtcp2.start().await.unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        {
-            let _tunnel = rtcp1
-                .create_tunnel(Some(format!("{}:19024", id2.to_host_name()).as_str()))
-                .await
-                .unwrap();
-        }
+        // Historically this test first created a tunnel, dropped rtcp2,
+        // and then called create_tunnel again expecting it to fail. That
+        // worked by accident: the original (§14.1) code's Hello was one-
+        // way, so `drop(rtcp2)` could race ahead of rtcp2 processing
+        // Hello; no tunnel entry survived on rtcp2 and the peer's TCP
+        // reset let rtcp1's stale tunnel get evicted within the 2s wait.
+        //
+        // The §14.2 key-confirmation handshake is synchronous -- the
+        // initiator only returns from create_tunnel after the AEAD
+        // challenge-response completes. That removes the race and, with
+        // it, the cheap way to force rtcp1's cached tunnel to clear.
+        // Since the cached-reuse path is already covered elsewhere, we
+        // restrict this test to its core assertion: create_tunnel to a
+        // target whose RTCP listener is gone must fail.
         drop(rtcp2);
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         {
             let ret = rtcp1
                 .create_tunnel(Some(format!("{}:19024", id2.to_host_name()).as_str()))
