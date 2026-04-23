@@ -1075,6 +1075,16 @@ impl RTcpInner {
             debug!("Reuse tunnel {}", tunnel_key.as_str());
             return Ok(Box::new(tunnel.unwrap().clone()));
         }
+        let tunnel_map_size = all_tunnel.len();
+        let sample_keys: Vec<String> = all_tunnel.keys().take(5).cloned().collect();
+        debug!(
+            "reuse miss for tunnel_key={}, map_size={}",
+            tunnel_key, tunnel_map_size
+        );
+        trace!(
+            "reuse miss details for tunnel_key={}, sample_keys={:?}",
+            tunnel_key, sample_keys
+        );
 
         // 1） resolve target auth-key and ip (rtcp base on tcp,so need ip)
 
@@ -1361,19 +1371,28 @@ impl RTcpTunnel {
 
     async fn on_ropen(&self, ropen_package: RTcpROpenPackage) -> Result<(), anyhow::Error> {
         debug!(
-            "RTcp tunnel ropen request: {:?}:{}, {:?}",
-            ropen_package.body.dest_host, ropen_package.body.dest_port, ropen_package.body.purpose
+            "RTcp tunnel ropen request: stream_id={}, {:?}:{}, {:?}, peer_addr={}",
+            ropen_package.body.stream_id,
+            ropen_package.body.dest_host,
+            ropen_package.body.dest_port,
+            ropen_package.body.purpose,
+            self.peer_addr
         );
 
         // 1. open stream to remote and send hello stream
         let mut target_addr = self.peer_addr.clone();
         target_addr.set_port(self.target.stack_port);
+        debug!(
+            "RTcp tunnel ropen connecting back to {} for stream_id={}",
+            target_addr, ropen_package.body.stream_id
+        );
         let rtcp_stream = tokio::net::TcpStream::connect(target_addr).await;
         if rtcp_stream.is_err() {
             error!(
-                "open rtcp stream to remote {} error:{}",
+                "open rtcp stream to remote {} error:{} for stream_id={}",
                 target_addr,
-                rtcp_stream.err().unwrap()
+                rtcp_stream.err().unwrap(),
+                ropen_package.body.stream_id
             );
             let ropen_resp_package = RTcpROpenRespPackage::new(ropen_package.seq, 2);
             let mut write_stream = self.write_stream.lock().await;
@@ -1390,6 +1409,10 @@ impl RTcpTunnel {
             let ropen_resp_package = RTcpROpenRespPackage::new(ropen_package.seq, 0);
             RTcpTunnelPackage::send_package(write_stream, ropen_resp_package).await?;
         }
+        debug!(
+            "RTcp tunnel ropen ack sent: stream_id={}, seq={}",
+            ropen_package.body.stream_id, ropen_package.seq
+        );
 
         let mut rtcp_stream = rtcp_stream.unwrap();
 
@@ -1453,6 +1476,14 @@ impl RTcpTunnel {
         stream: Box<dyn AsyncStream>,
     ) -> Result<(), anyhow::Error> {
         //TODO: bug?
+        debug!(
+            "RTcp tunnel dispatch stream ropen: dest_host={:?}, dest_port={}, remote_addr={}, local_addr={}, target_did={}",
+            dest_host,
+            dest_port,
+            remote_addr,
+            local_addr,
+            self.target.did.to_string()
+        );
         let end_point = TunnelEndpoint {
             device_id: self.target.did.to_string(),
             port: self.target.stack_port,
@@ -1478,6 +1509,14 @@ impl RTcpTunnel {
         local_addr: SocketAddr,
         stream: Box<dyn AsyncStream>,
     ) -> Result<(), anyhow::Error> {
+        debug!(
+            "RTcp tunnel dispatch datagram ropen: dest_host={:?}, dest_port={}, remote_addr={}, local_addr={}, target_did={}",
+            dest_host,
+            dest_port,
+            remote_addr,
+            local_addr,
+            self.target.did.to_string()
+        );
         let end_point = TunnelEndpoint {
             device_id: self.target.did.to_string(),
             port: self.target.stack_port,
@@ -1611,6 +1650,15 @@ impl RTcpTunnel {
         dest_host: Option<String>,
         session_key: &str,
     ) -> Result<(), std::io::Error> {
+        debug!(
+            "post ropen: seq={}, session_key={}, target_did={}, dest_host={:?}, dest_port={}, purpose={:?}",
+            seq,
+            session_key,
+            self.target.did.to_string(),
+            dest_host,
+            dest_port,
+            purpose
+        );
         let ropen_package =
             RTcpROpenPackage::new(seq, session_key.to_string(), purpose, dest_port, dest_host);
         let mut write_stream = self.write_stream.lock().await;
@@ -1621,7 +1669,14 @@ impl RTcpTunnel {
                 let msg = format!("send ropen package error:{}", e);
                 error!("{}", msg);
                 std::io::Error::new(std::io::ErrorKind::Other, msg)
-            })
+            })?;
+        debug!(
+            "post ropen sent: seq={}, session_key={}, target_did={}",
+            seq,
+            session_key,
+            self.target.did.to_string()
+        );
+        Ok(())
     }
 
     async fn post_open(
@@ -1647,7 +1702,35 @@ impl RTcpTunnel {
 
     async fn wait_ropen_stream(&self, session_key: &str) -> Result<TcpStream, std::io::Error> {
         let real_key = format!("{}_{}", self.this_device.to_string(), session_key);
-        self.build_helper.wait_ropen_stream(&real_key).await
+        debug!(
+            "wait ropen stream begin: real_key={}, target_did={}",
+            real_key,
+            self.target.did.to_string()
+        );
+        let stream = self.build_helper.wait_ropen_stream(&real_key).await;
+        match &stream {
+            Ok(tcp_stream) => {
+                let peer = tcp_stream
+                    .peer_addr()
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|_| "<unknown>".to_string());
+                debug!(
+                    "wait ropen stream success: real_key={}, target_did={}, peer_addr={}",
+                    real_key,
+                    self.target.did.to_string(),
+                    peer
+                );
+            }
+            Err(err) => {
+                warn!(
+                    "wait ropen stream failed: real_key={}, target_did={}, err={}",
+                    real_key,
+                    self.target.did.to_string(),
+                    err
+                );
+            }
+        }
+        stream
     }
 
     async fn request_open_stream(
@@ -1663,7 +1746,10 @@ impl RTcpTunnel {
         let seq = self.next_seq();
 
         debug!(
-            "RTcp tunnel open stream to {}:{}, can_direct:{}",
+            "RTcp tunnel open stream request: target_did={}, seq={}, session_key={}, dest_host={}, dest_port={}, can_direct:{}",
+            self.target.did.to_string(),
+            seq,
+            session_key,
             dest_host.clone().unwrap_or("127.0.0.1".to_string()),
             dest_port,
             self.can_direct
@@ -1730,6 +1816,11 @@ impl RTcpTunnel {
             //send ropen to target
 
             self.build_helper.new_wait_stream(&real_key).await;
+            trace!(
+                "registered wait ropen stream: real_key={}, target_did={}",
+                real_key,
+                self.target.did.to_string()
+            );
 
             //info!("insert session_key {} to wait ropen stream map",real_key.as_str());
             self.post_ropen(seq, purpose, dest_port, dest_host, session_key.as_str())
@@ -1880,6 +1971,7 @@ impl RTcpTunnelMap {
 
     pub async fn on_new_tunnel(&self, tunnel_key: &str, tunnel: RTcpTunnel) {
         let mut all_tunnel = self.tunnel_map.lock().await;
+        let size_before = all_tunnel.len();
         let mut_old_tunnel = all_tunnel.get(tunnel_key);
         if mut_old_tunnel.is_some() {
             warn!("tunnel {} already exist", tunnel_key);
@@ -1887,11 +1979,24 @@ impl RTcpTunnelMap {
         }
 
         all_tunnel.insert(tunnel_key.to_owned(), tunnel);
+        debug!(
+            "insert tunnel into map: tunnel_key={}, size_before={}, size_after={}",
+            tunnel_key,
+            size_before,
+            all_tunnel.len()
+        );
     }
 
     pub async fn remove_tunnel(&self, tunnel_key: &str) {
         let mut all_tunnel = self.tunnel_map.lock().await;
+        let size_before = all_tunnel.len();
         all_tunnel.remove(tunnel_key);
+        debug!(
+            "remove tunnel from map: tunnel_key={}, size_before={}, size_after={}",
+            tunnel_key,
+            size_before,
+            all_tunnel.len()
+        );
     }
 }
 #[cfg(test)]
