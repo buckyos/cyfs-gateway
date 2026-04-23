@@ -963,6 +963,25 @@ mod tests {
         map
     }
 
+    async fn make_route_config(prefix: &str, target: &str) -> Arc<Box<dyn MapCollection>> {
+        let route = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+        route
+            .insert("prefix", CollectionValue::String(prefix.to_string()))
+            .await
+            .unwrap();
+        route
+            .insert("target", CollectionValue::String(target.to_string()))
+            .await
+            .unwrap();
+
+        let config = Arc::new(Box::new(MemoryMapCollection::new()) as Box<dyn MapCollection>);
+        config
+            .insert("route", CollectionValue::Map(route))
+            .await
+            .unwrap();
+        config
+    }
+
     #[tokio::test]
     async fn test_list_path_supports_set_and_remove() {
         let global = Arc::new(Env::new(EnvLevel::Global, None));
@@ -1023,5 +1042,268 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(shifted_name.as_str(), Some("third"));
+    }
+
+    #[tokio::test]
+    async fn test_simple_root_key_implicit_set_follows_tracked_level() {
+        let global = Arc::new(Env::new(EnvLevel::Global, None));
+        let chain = global.create_child_env(EnvLevel::Chain);
+        let manager = EnvManager::new(global, chain);
+
+        manager
+            .create(
+                "shared",
+                CollectionValue::String("global".to_string()),
+                EnvLevel::Global,
+            )
+            .await
+            .unwrap();
+        manager
+            .create(
+                "shared",
+                CollectionValue::String("chain".to_string()),
+                EnvLevel::Chain,
+            )
+            .await
+            .unwrap();
+        manager
+            .create(
+                "shared",
+                CollectionValue::String("block".to_string()),
+                EnvLevel::Block,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manager.get_var_level("shared"), EnvLevel::Block);
+
+        manager
+            .set(
+                "shared",
+                CollectionValue::String("block-updated".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .get("shared", Some(EnvLevel::Block))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("block-updated")
+        );
+        assert_eq!(
+            manager
+                .get("shared", Some(EnvLevel::Chain))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("chain")
+        );
+        assert_eq!(
+            manager
+                .get("shared", Some(EnvLevel::Global))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("global")
+        );
+
+        manager
+            .set(
+                "shared",
+                CollectionValue::String("chain-updated".to_string()),
+                Some(EnvLevel::Chain),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.get_var_level("shared"), EnvLevel::Chain);
+
+        manager
+            .set(
+                "shared",
+                CollectionValue::String("chain-implicit".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .get("shared", Some(EnvLevel::Block))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("block-updated")
+        );
+        assert_eq!(
+            manager
+                .get("shared", Some(EnvLevel::Chain))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("chain-implicit")
+        );
+        assert_eq!(
+            manager
+                .get("shared", Some(EnvLevel::Global))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("global")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_path_set_follows_tracked_root_level_and_preserves_other_levels() {
+        let global = Arc::new(Env::new(EnvLevel::Global, None));
+        let chain = global.create_child_env(EnvLevel::Chain);
+        let manager = EnvManager::new(global, chain);
+
+        manager
+            .create(
+                "config",
+                CollectionValue::Map(make_route_config("global-prefix", "global-target").await),
+                EnvLevel::Global,
+            )
+            .await
+            .unwrap();
+        manager
+            .create(
+                "config",
+                CollectionValue::Map(make_route_config("chain-prefix", "chain-target").await),
+                EnvLevel::Chain,
+            )
+            .await
+            .unwrap();
+        manager
+            .create(
+                "config",
+                CollectionValue::Map(make_route_config("block-prefix", "block-target").await),
+                EnvLevel::Block,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(manager.get_var_level("config"), EnvLevel::Block);
+
+        manager
+            .set(
+                "config.route.prefix",
+                CollectionValue::String("block-prefix-updated".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .get("config.route.prefix", Some(EnvLevel::Block))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("block-prefix-updated")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.prefix", Some(EnvLevel::Chain))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("chain-prefix")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.prefix", Some(EnvLevel::Global))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("global-prefix")
+        );
+
+        manager
+            .set(
+                "config.route.target",
+                CollectionValue::String("chain-target-updated".to_string()),
+                Some(EnvLevel::Chain),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.get_var_level("config"), EnvLevel::Chain);
+
+        manager
+            .set(
+                "config.route.prefix",
+                CollectionValue::String("chain-prefix-implicit".to_string()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .get("config.route.prefix", Some(EnvLevel::Block))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("block-prefix-updated")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.target", Some(EnvLevel::Block))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("block-target")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.prefix", Some(EnvLevel::Chain))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("chain-prefix-implicit")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.target", Some(EnvLevel::Chain))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("chain-target-updated")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.prefix", Some(EnvLevel::Global))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("global-prefix")
+        );
+        assert_eq!(
+            manager
+                .get("config.route.target", Some(EnvLevel::Global))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("global-target")
+        );
     }
 }
