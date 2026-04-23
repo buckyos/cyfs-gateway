@@ -1,0 +1,16 @@
+[
+  {
+    "generated_at": "2026-04-23T05:21:50-07:00",
+    "report_mode": "baseline",
+    "baseline_name": "main-local",
+    "compare_to": null,
+    "branch": "beta2.2",
+    "commit": "32cff73edd8575ca441e4248cf91e866c358666e",
+    "short_commit": "32cff73",
+    "report_path": "records/20260423T052150-0700__main-local__32cff73.md",
+    "snapshot_path": "records/20260423T052150-0700__main-local__32cff73.json",
+    "benchmark_count": 52,
+    "top_hotspot_full_id": "phase3/execute_fork_hot/capture_status_value/L",
+    "top_hotspot_median_ns": 384618.57190402475
+  }
+]

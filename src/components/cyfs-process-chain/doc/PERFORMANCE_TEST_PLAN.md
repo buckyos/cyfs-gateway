@@ -710,13 +710,33 @@ cargo bench -p cyfs-process-chain --bench process_chain_runtime -- --baseline ma
 
 ## 16. 报告格式建议
 
-每一轮正式 benchmark 建议输出一份独立 Markdown 报告，放在：
+每一轮正式 benchmark 建议输出一份独立报告，并把 Markdown 报告和机器可读快照都放在：
 
 ```text
-src/components/cyfs-process-chain/doc/reports/
+src/components/cyfs-process-chain/benches/reports/
 ```
 
-建议模板如下。
+建议目录结构：
+
+```text
+src/components/cyfs-process-chain/benches/reports/
+  README.md
+  INDEX.md
+  manifest.json
+  generate_report.py
+  records/
+    20260423T053000-0700__main-local__32cff73.md
+    20260423T053000-0700__main-local__32cff73.json
+```
+
+说明：
+
+- `records/*.md` 负责人工 review 和时间线浏览
+- `records/*.json` 负责后续自动对照和脚本分析
+- `INDEX.md` 维护报告时间线入口
+- `manifest.json` 维护结构化元数据索引
+
+建议在每次正式 benchmark 后，立即把 `target/criterion` 结果固化成一份报告，而不是只保留本机临时输出。
 
 ### 16.1 报告头
 
@@ -743,6 +763,27 @@ src/components/cyfs-process-chain/doc/reports/
 - 是否存在明显非线性扩展
 - 是否出现回归
 - 下一轮优化建议
+
+### 16.4 报告生成命令
+
+保存 baseline 后生成报告：
+
+```bash
+cd /home/bucky/work/cyfs-gateway
+python3 src/components/cyfs-process-chain/benches/reports/generate_report.py \
+  --baseline-name main-local \
+  --benchmark-command 'CARGO_INCREMENTAL=0 cargo bench -p cyfs-process-chain --bench process_chain_runtime -- --save-baseline main-local'
+```
+
+与 baseline 对比后生成报告：
+
+```bash
+cd /home/bucky/work/cyfs-gateway
+python3 src/components/cyfs-process-chain/benches/reports/generate_report.py \
+  --baseline-name main-local \
+  --compare-to main-local \
+  --benchmark-command 'CARGO_INCREMENTAL=0 cargo bench -p cyfs-process-chain --bench process_chain_runtime -- --baseline main-local'
+```
 
 ## 17. 第一轮落地顺序
 
