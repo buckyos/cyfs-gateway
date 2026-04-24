@@ -746,6 +746,11 @@ impl EnvExternal for MapReduceVariableEnv {
         Ok(ret)
     }
 
+    async fn get_existing(&self, id: &str) -> Result<(bool, Option<CollectionValue>), String> {
+        let ret = self.get(id).await?;
+        Ok((ret.is_some(), ret))
+    }
+
     async fn set(
         &self,
         id: &str,
@@ -771,6 +776,35 @@ impl EnvExternal for MapReduceVariableEnv {
         Ok(ret)
     }
 
+    async fn set_existing(
+        &self,
+        id: &str,
+        value: CollectionValue,
+    ) -> Result<(bool, Option<CollectionValue>), String> {
+        let current_env = self.current_env();
+        if current_env.get(id).await?.is_none() {
+            return Ok((false, None));
+        }
+
+        let ret = current_env.set(id, value.clone()).await?;
+        match &ret {
+            Some(old_value) => {
+                debug!(
+                    "MapReduceEnv variable '{}' set to new value: {:?}, prev: {:?}",
+                    id, value, old_value
+                );
+            }
+            None => {
+                debug!(
+                    "MapReduceEnv variable '{}' created with value: {:?}",
+                    id, value
+                );
+            }
+        }
+
+        Ok((true, ret))
+    }
+
     async fn remove(&self, id: &str) -> Result<Option<CollectionValue>, String> {
         let ret = self.current_env().remove(id).await?;
 
@@ -787,6 +821,11 @@ impl EnvExternal for MapReduceVariableEnv {
         }
 
         Ok(ret)
+    }
+
+    async fn remove_existing(&self, id: &str) -> Result<(bool, Option<CollectionValue>), String> {
+        let ret = self.remove(id).await?;
+        Ok((ret.is_some(), ret))
     }
 }
 

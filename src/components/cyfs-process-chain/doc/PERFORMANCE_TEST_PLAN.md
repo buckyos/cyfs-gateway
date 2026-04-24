@@ -477,6 +477,7 @@ harness = false
 | `literal_and_access` | T4 | `test_collection_literal.rs` | map/list literal + path access | P1 |
 | `invoke_helper_return` | T4 | `test_invoke.rs` | helper/invoke + typed payload read | P1 |
 | `capture_status_value` | T4 | `capture.rs` 与相关测试模式 | `capture --value --status --ok` | P1 |
+| `map_reduce_external_vars` | T4 | `map.rs` / `test_collection.rs` | `map` 遍历中读取 `__key/__value` external env | P1 |
 
 ### 10.4 P2: JS external
 

@@ -60,10 +60,11 @@ CASE_ORDER = {
     "literal_and_access": 15,
     "invoke_helper_return": 16,
     "capture_status_value": 17,
-    "js_register_bool": 18,
-    "js_execute_bool": 19,
-    "js_execute_map_result": 20,
-    "js_execute_set_result": 21,
+    "map_reduce_external_vars": 18,
+    "js_register_bool": 19,
+    "js_execute_bool": 20,
+    "js_execute_map_result": 21,
+    "js_execute_set_result": 22,
 }
 
 CASE_NOTES = {
@@ -85,6 +86,7 @@ CASE_NOTES = {
     "literal_and_access": "literal creation + structured access",
     "invoke_helper_return": "helper invoke + payload access",
     "capture_status_value": "capture value + status bookkeeping",
+    "map_reduce_external_vars": "map-reduce external env variable reads",
     "js_register_bool": "JS external registration cold path",
     "js_execute_bool": "minimal JS bool call",
     "js_execute_map_result": "JS typed map wrapper conversion",

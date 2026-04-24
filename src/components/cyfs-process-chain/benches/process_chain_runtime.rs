@@ -6,17 +6,18 @@ use common::{
     HOST_CLASSIFY_PIPELINE_CASE, IF_ELIF_PIPELINE_CASE, INVOKE_HELPER_RETURN_CASE,
     JS_EXECUTE_BOOL_CASE, JS_EXECUTE_MAP_RESULT_CASE, JS_EXECUTE_SET_RESULT_CASE,
     JS_REGISTER_BOOL_CASE, LIST_PATH_READ_CASE, LITERAL_AND_ACCESS_CASE,
-    MATCH_CAPTURE_PIPELINE_CASE, MATCH_RESULT_FLOW_CASE, PHASE2_SCALES, PHASE2_SMALL_SCALE,
-    ROUTE_PREFIX_PIPELINE_CASE, SCALE_SMALL, URI_QUERY_PIPELINE_CASE, VAR_READ_FLAT_CASE,
-    VAR_READ_PATH_CASE, black_box_result, build_bench_data_dir,
-    build_capture_status_value_linked_fixture, build_case_when_pipeline_linked_fixture,
-    build_empty_return_link_fixture, build_empty_return_linked_fixture,
-    build_first_ok_all_fail_linked_fixture, build_first_ok_first_success_linked_fixture,
-    build_first_ok_last_success_linked_fixture, build_first_ok_success_linked_fixture,
-    build_host_classify_pipeline_linked_fixture, build_if_elif_pipeline_linked_fixture,
-    build_invoke_helper_return_linked_fixture, build_js_execute_bool_linked_fixture,
-    build_js_execute_map_result_linked_fixture, build_js_execute_set_result_linked_fixture,
-    build_list_path_read_linked_fixture, build_literal_and_access_linked_fixture,
+    MAP_REDUCE_EXTERNAL_VARS_CASE, MATCH_CAPTURE_PIPELINE_CASE, MATCH_RESULT_FLOW_CASE,
+    PHASE2_SCALES, PHASE2_SMALL_SCALE, ROUTE_PREFIX_PIPELINE_CASE, SCALE_SMALL,
+    URI_QUERY_PIPELINE_CASE, VAR_READ_FLAT_CASE, VAR_READ_PATH_CASE, black_box_result,
+    build_bench_data_dir, build_capture_status_value_linked_fixture,
+    build_case_when_pipeline_linked_fixture, build_empty_return_link_fixture,
+    build_empty_return_linked_fixture, build_first_ok_all_fail_linked_fixture,
+    build_first_ok_first_success_linked_fixture, build_first_ok_last_success_linked_fixture,
+    build_first_ok_success_linked_fixture, build_host_classify_pipeline_linked_fixture,
+    build_if_elif_pipeline_linked_fixture, build_invoke_helper_return_linked_fixture,
+    build_js_execute_bool_linked_fixture, build_js_execute_map_result_linked_fixture,
+    build_js_execute_set_result_linked_fixture, build_list_path_read_linked_fixture,
+    build_literal_and_access_linked_fixture, build_map_reduce_external_vars_linked_fixture,
     build_match_capture_pipeline_linked_fixture, build_match_result_flow_linked_fixture,
     build_route_prefix_pipeline_linked_fixture, build_uri_query_pipeline_linked_fixture,
     build_var_read_flat_linked_fixture, build_var_read_path_linked_fixture, disable_logging,
@@ -461,6 +462,22 @@ fn bench_execute_phase3_structured_values(c: &mut Criterion) {
             scale.label,
             &exec,
             "execute capture_status_value via forked executor",
+        );
+    }
+
+    for scale in PHASE2_SCALES {
+        let scope = phase2_scope(MAP_REDUCE_EXTERNAL_VARS_CASE, scale.label);
+        let fixture = rt
+            .block_on(build_map_reduce_external_vars_linked_fixture(&scope, scale))
+            .expect("build map_reduce_external_vars fixture");
+        let exec = prepare_exec(&fixture).expect("prepare map_reduce_external_vars exec");
+        bench_fork_exec(
+            &mut group,
+            &rt,
+            MAP_REDUCE_EXTERNAL_VARS_CASE,
+            scale.label,
+            &exec,
+            "execute map_reduce_external_vars via forked executor",
         );
     }
 

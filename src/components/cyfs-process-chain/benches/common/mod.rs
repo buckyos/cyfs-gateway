@@ -28,6 +28,7 @@ pub(crate) const MATCH_RESULT_FLOW_CASE: &str = "match_result_flow";
 pub(crate) const LITERAL_AND_ACCESS_CASE: &str = "literal_and_access";
 pub(crate) const INVOKE_HELPER_RETURN_CASE: &str = "invoke_helper_return";
 pub(crate) const CAPTURE_STATUS_VALUE_CASE: &str = "capture_status_value";
+pub(crate) const MAP_REDUCE_EXTERNAL_VARS_CASE: &str = "map_reduce_external_vars";
 pub(crate) const JS_REGISTER_BOOL_CASE: &str = "js_register_bool";
 pub(crate) const JS_EXECUTE_BOOL_CASE: &str = "js_execute_bool";
 pub(crate) const JS_EXECUTE_MAP_RESULT_CASE: &str = "js_execute_map_result";
@@ -51,6 +52,7 @@ const MATCH_RESULT_FLOW_LIB_ID: &str = "match_result_flow_lib";
 const LITERAL_AND_ACCESS_LIB_ID: &str = "literal_and_access_lib";
 const INVOKE_HELPER_RETURN_LIB_ID: &str = "invoke_helper_return_lib";
 const CAPTURE_STATUS_VALUE_LIB_ID: &str = "capture_status_value_lib";
+const MAP_REDUCE_EXTERNAL_VARS_LIB_ID: &str = "map_reduce_external_vars_lib";
 const JS_EXECUTE_BOOL_LIB_ID: &str = "js_execute_bool_lib";
 const JS_EXECUTE_MAP_RESULT_LIB_ID: &str = "js_execute_map_result_lib";
 const JS_EXECUTE_SET_RESULT_LIB_ID: &str = "js_execute_set_result_lib";
@@ -349,6 +351,14 @@ pub(crate) async fn build_capture_status_value_linked_fixture(
 ) -> Result<LinkedFixture, String> {
     let xml = build_capture_status_value_xml(scale.structured_entries);
     build_script_linked_fixture(case_name, CAPTURE_STATUS_VALUE_LIB_ID, &xml).await
+}
+
+pub(crate) async fn build_map_reduce_external_vars_linked_fixture(
+    case_name: &str,
+    scale: BenchScale,
+) -> Result<LinkedFixture, String> {
+    let xml = build_map_reduce_external_vars_xml(scale.structured_entries);
+    build_script_linked_fixture(case_name, MAP_REDUCE_EXTERNAL_VARS_LIB_ID, &xml).await
 }
 
 pub(crate) async fn build_js_execute_bool_linked_fixture(
@@ -791,6 +801,28 @@ fn build_capture_status_value_xml(entry_count: usize) -> String {
     entry_body.push_str(&format!(
         "                return --from lib $(append $value{last_index:02} \"|\" $status{last_index:02} \"|\" $ok{last_index:02});"
     ));
+
+    build_process_chain_xml("", &entry_body)
+}
+
+fn build_map_reduce_external_vars_xml(entry_count: usize) -> String {
+    let entry_count = entry_count.max(4);
+    let last_index = entry_count - 1;
+    let mut entry_body = String::from("                map-create --block routes;\n");
+
+    for index in 0..entry_count {
+        entry_body.push_str(&format!(
+            "                map-add routes \"k{index:02}\" \"v{index:02}\";\n"
+        ));
+    }
+
+    entry_body.push_str(
+        "                capture --value last $(map $routes $(append $__key \":\" $__value \":\" $__key \":\" $__value));\n",
+    );
+    entry_body.push_str(&format!(
+        "                eq $last \"k{last_index:02}:v{last_index:02}:k{last_index:02}:v{last_index:02}\" || return --from lib \"map_reduce_external_vars_fail\";\n"
+    ));
+    entry_body.push_str("                return --from lib $last;");
 
     build_process_chain_xml("", &entry_body)
 }

@@ -25,6 +25,37 @@ pub trait EnvExternal: Any + Send + Sync {
     /// Remove the variable with the given key from the environment.
     /// If the key does not exist, return None.
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String>;
+
+    /// Gets a value only when this external environment handles the key.
+    async fn get_existing(&self, key: &str) -> Result<(bool, Option<CollectionValue>), String> {
+        if self.contains(key).await? {
+            Ok((true, self.get(key).await?))
+        } else {
+            Ok((false, None))
+        }
+    }
+
+    /// Sets a value only when this external environment already handles the key.
+    async fn set_existing(
+        &self,
+        key: &str,
+        value: CollectionValue,
+    ) -> Result<(bool, Option<CollectionValue>), String> {
+        if self.contains(key).await? {
+            Ok((true, self.set(key, value).await?))
+        } else {
+            Ok((false, None))
+        }
+    }
+
+    /// Removes a value only when this external environment handles the key.
+    async fn remove_existing(&self, key: &str) -> Result<(bool, Option<CollectionValue>), String> {
+        if self.contains(key).await? {
+            Ok((true, self.remove(key).await?))
+        } else {
+            Ok((false, None))
+        }
+    }
 }
 
 pub type EnvExternalRef = Arc<Box<dyn EnvExternal>>;
@@ -105,8 +136,8 @@ impl EnvExternalManager {
     pub async fn get(&self, key: &str) -> Result<(bool, Option<CollectionValue>), String> {
         let lock = self.external.read().await;
         for item in lock.iter() {
-            if item.value.contains(key).await? {
-                let value = item.value.get(key).await?;
+            let (handled, value) = item.value.get_existing(key).await?;
+            if handled {
                 return Ok((true, value));
             }
         }
@@ -123,8 +154,8 @@ impl EnvExternalManager {
     ) -> Result<(bool, Option<CollectionValue>), String> {
         let lock = self.external.read().await;
         for item in lock.iter() {
-            if item.value.contains(key).await? {
-                let old_value = item.value.set(key, value.clone()).await?;
+            let (handled, old_value) = item.value.set_existing(key, value.clone()).await?;
+            if handled {
                 return Ok((true, old_value));
             }
         }
@@ -138,8 +169,8 @@ impl EnvExternalManager {
     pub async fn remove(&self, key: &str) -> Result<(bool, Option<CollectionValue>), String> {
         let lock = self.external.read().await;
         for item in lock.iter() {
-            if item.value.contains(key).await? {
-                let old_value = item.value.remove(key).await?;
+            let (handled, old_value) = item.value.remove_existing(key).await?;
+            if handled {
                 return Ok((true, old_value));
             }
         }

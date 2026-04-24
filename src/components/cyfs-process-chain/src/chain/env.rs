@@ -321,6 +321,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_env_get_reads_external_when_key_exists_only_in_external() {
+        let env = Env::new(EnvLevel::Block, None);
+        let external =
+            TestExternalEnv::with_value("remote", CollectionValue::String("value".to_string()));
+
+        env.env_external_manager()
+            .add_external("test", external_ref(external))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            env.get("remote").await.unwrap().unwrap().as_str(),
+            Some("value")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_env_remove_removes_external_when_key_exists_only_in_external() {
+        let env = Env::new(EnvLevel::Block, None);
+        let external =
+            TestExternalEnv::with_value("remote", CollectionValue::String("old".to_string()));
+
+        env.env_external_manager()
+            .add_external("test", external_ref(external.clone()))
+            .await
+            .unwrap();
+
+        let old = env.remove("remote").await.unwrap().unwrap();
+
+        assert_eq!(old.as_str(), Some("old"));
+        assert!(external.value("remote").is_none());
+        assert!(env.get("remote").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn test_env_set_prefers_local_value_over_external() {
         let env = Env::new(EnvLevel::Block, None);
         let external =
