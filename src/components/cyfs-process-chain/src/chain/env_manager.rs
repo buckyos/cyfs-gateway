@@ -216,6 +216,13 @@ pub struct EnvManager {
 }
 
 impl EnvManager {
+    fn is_simple_root_key(key: &str) -> bool {
+        !key.is_empty()
+            && key
+                .chars()
+                .all(|ch| !matches!(ch, '.' | '[' | ']' | '\\' | '(' | ')') && !ch.is_whitespace())
+    }
+
     pub fn get_log_level(&self) -> Level {
         let global_level = self.global.log_level();
         let chain_level = self.chain.log_level();
@@ -494,31 +501,39 @@ impl EnvManager {
         parts
     }
 
-    pub fn get_var_level(&self, key: &str) -> EnvLevel {
-        // Use the first part of the key to determine the level
-        let key_list = Self::parse_var(key);
-        let key = key_list[0].as_str();
-
+    fn get_var_level_for_root(&self, key: &str) -> EnvLevel {
         let tracker = self.var_level_tracker.read().unwrap();
         tracker.get(key).cloned().unwrap_or_default()
     }
 
+    pub fn get_var_level(&self, key: &str) -> EnvLevel {
+        if Self::is_simple_root_key(key) {
+            return self.get_var_level_for_root(key);
+        }
+
+        let key_list = Self::parse_var(key);
+        self.get_var_level_for_root(key_list[0].as_str())
+    }
+
     // Get the exact tracked level entry for a variable.
     // Returns None when there is no tracker entry (different from get_var_level defaulting).
-    pub fn var_level_entry(&self, key: &str) -> Option<EnvLevel> {
-        let key_list = Self::parse_var(key);
-        let key = key_list[0].as_str();
-
+    fn var_level_entry_for_root(&self, key: &str) -> Option<EnvLevel> {
         let tracker = self.var_level_tracker.read().unwrap();
         tracker.get(key).cloned()
     }
 
+    pub fn var_level_entry(&self, key: &str) -> Option<EnvLevel> {
+        if Self::is_simple_root_key(key) {
+            return self.var_level_entry_for_root(key);
+        }
+
+        let key_list = Self::parse_var(key);
+        self.var_level_entry_for_root(key_list[0].as_str())
+    }
+
     // Restore tracked level entry precisely.
     // Some(level) => set entry, None => remove entry.
-    pub fn restore_var_level_entry(&self, key: &str, level: Option<EnvLevel>) {
-        let key_list = Self::parse_var(key);
-        let key = key_list[0].as_str();
-
+    fn restore_var_level_entry_for_root(&self, key: &str, level: Option<EnvLevel>) {
         let mut tracker = self.var_level_tracker.write().unwrap();
         match level {
             Some(level) => {
@@ -547,11 +562,17 @@ impl EnvManager {
         }
     }
 
-    pub fn change_var_level(&self, key: &str, level: Option<EnvLevel>) {
-        // Use the first part of the key to determine the level
-        let key_list = Self::parse_var(key);
-        let key = key_list[0].as_str();
+    pub fn restore_var_level_entry(&self, key: &str, level: Option<EnvLevel>) {
+        if Self::is_simple_root_key(key) {
+            self.restore_var_level_entry_for_root(key, level);
+            return;
+        }
 
+        let key_list = Self::parse_var(key);
+        self.restore_var_level_entry_for_root(key_list[0].as_str(), level);
+    }
+
+    fn change_var_level_for_root(&self, key: &str, level: Option<EnvLevel>) {
         let level = level.unwrap_or_default();
         let mut tracker = self.var_level_tracker.write().unwrap();
         match tracker.entry(key.to_string()) {
@@ -581,6 +602,27 @@ impl EnvManager {
                 }
             }
         }
+    }
+
+    pub fn change_var_level(&self, key: &str, level: Option<EnvLevel>) {
+        if Self::is_simple_root_key(key) {
+            self.change_var_level_for_root(key, level);
+            return;
+        }
+
+        let key_list = Self::parse_var(key);
+        self.change_var_level_for_root(key_list[0].as_str(), level);
+    }
+
+    fn should_change_var_level_for_root(&self, key: &str, level: EnvLevel) -> bool {
+        match self.var_level_entry_for_root(key) {
+            Some(current_level) => current_level != level,
+            None => level != EnvLevel::default(),
+        }
+    }
+
+    fn resolve_level(&self, key: &str, level: Option<EnvLevel>) -> EnvLevel {
+        level.unwrap_or_else(|| self.get_var_level_for_root(key))
     }
 
     /*
@@ -635,15 +677,22 @@ impl EnvManager {
         value: CollectionValue,
         level: EnvLevel,
     ) -> Result<bool, String> {
+        if Self::is_simple_root_key(key) {
+            let ret = self.get_env(level).create(key, value).await?;
+            if ret && self.should_change_var_level_for_root(key, level) {
+                self.change_var_level_for_root(key, Some(level));
+            }
+
+            return Ok(ret);
+        }
+
         let key_list = Self::parse_var(key);
-        let key_refs: Vec<&str> = key_list.iter().map(|s| s.as_str()).collect();
+        let root_key = key_list[0].as_str();
 
-        // let level = level.unwrap_or_default();
-        let ret = self.create_inner(level, &key_refs, value).await?;
+        let ret = self.create_inner(level, &key_list, value).await?;
 
-        if ret {
-            // Track the variable's level
-            self.change_var_level(key, Some(level));
+        if ret && self.should_change_var_level_for_root(root_key, level) {
+            self.change_var_level_for_root(root_key, Some(level));
         }
 
         Ok(ret)
@@ -653,19 +702,13 @@ impl EnvManager {
     // The middle part of the key_list must be a map collection
     async fn get_parent_collection_by_path(
         &self,
-        key_list: &[&str],
+        key_list: &[String],
         level: EnvLevel,
     ) -> Result<Option<PathCollection>, String> {
-        let env = match level {
-            EnvLevel::Global => self.global.clone(),
-            EnvLevel::Chain => self.chain.clone(),
-            EnvLevel::Block => self.block.clone(),
-        };
-
-        let mut current = PathCollection::Root(env);
+        let mut current = PathCollection::Root(self.get_env(level).clone());
         let sub_key_list = &key_list[0..key_list.len() - 1];
         for (i, part) in sub_key_list.iter().enumerate() {
-            if let Some(value) = current.get(part).await? {
+            if let Some(value) = current.get(part.as_str()).await? {
                 if let CollectionValue::Map(map) = value {
                     current = PathCollection::Map(map);
                 } else if let CollectionValue::List(list) = value {
@@ -698,7 +741,7 @@ impl EnvManager {
     async fn create_inner(
         &self,
         level: EnvLevel,
-        key_list: &[&str],
+        key_list: &[String],
         value: CollectionValue,
     ) -> Result<bool, String> {
         let Some(coll) = self.get_parent_collection_by_path(key_list, level).await? else {
@@ -710,7 +753,7 @@ impl EnvManager {
             warn!("{}", msg);
             return Err(msg);
         };
-        let key = key_list.last().unwrap();
+        let key = key_list.last().unwrap().as_str();
         coll.insert_new(key, value).await
     }
 
@@ -764,15 +807,25 @@ impl EnvManager {
             key,
             value
         );
-        let key_list = Self::parse_var(key);
-        let key_refs: Vec<&str> = key_list.iter().map(|s| s.as_str()).collect();
-        let level = match level {
-            Some(l) => l,
-            None => self.get_var_level(key_refs[0]),
-        };
 
-        let ret = self.set_inner(level, &key_refs, value).await?;
-        self.change_var_level(key_refs[0], Some(level));
+        if Self::is_simple_root_key(key) {
+            let level = self.resolve_level(key, level);
+            let ret = self.get_env(level).set(key, value).await?;
+            if self.should_change_var_level_for_root(key, level) {
+                self.change_var_level_for_root(key, Some(level));
+            }
+
+            return Ok(ret);
+        }
+
+        let key_list = Self::parse_var(key);
+        let root_key = key_list[0].as_str();
+        let level = self.resolve_level(root_key, level);
+
+        let ret = self.set_inner(level, &key_list, value).await?;
+        if self.should_change_var_level_for_root(root_key, level) {
+            self.change_var_level_for_root(root_key, Some(level));
+        }
 
         Ok(ret)
     }
@@ -780,7 +833,7 @@ impl EnvManager {
     async fn set_inner(
         &self,
         level: EnvLevel,
-        key_list: &[&str],
+        key_list: &[String],
         value: CollectionValue,
     ) -> Result<Option<CollectionValue>, String> {
         let parent = self.get_parent_collection_by_path(key_list, level).await?;
@@ -794,7 +847,7 @@ impl EnvManager {
         }
 
         let coll = parent.unwrap();
-        let key = key_list.last().unwrap();
+        let key = key_list.last().unwrap().as_str();
         coll.insert(key, value).await
     }
 
@@ -803,20 +856,21 @@ impl EnvManager {
         key: &str,
         level: Option<EnvLevel>,
     ) -> Result<Option<CollectionValue>, String> {
-        let key_list = Self::parse_var(key);
-        let key_refs: Vec<&str> = key_list.iter().map(|s| s.as_str()).collect();
-        let level = match level {
-            Some(l) => l,
-            None => self.get_var_level(key_refs[0]),
-        };
+        if Self::is_simple_root_key(key) {
+            let level = self.resolve_level(key, level);
+            return self.get_env(level).get(key).await;
+        }
 
-        self.get_inner(level, &key_refs).await
+        let key_list = Self::parse_var(key);
+        let level = self.resolve_level(key_list[0].as_str(), level);
+
+        self.get_inner(level, &key_list).await
     }
 
     async fn get_inner(
         &self,
         level: EnvLevel,
-        key_list: &[&str],
+        key_list: &[String],
     ) -> Result<Option<CollectionValue>, String> {
         log!(
             self.get_log_level(),
@@ -834,7 +888,7 @@ impl EnvManager {
         }
 
         let coll = parent.unwrap();
-        let key = key_list.last().unwrap();
+        let key = key_list.last().unwrap().as_str();
         coll.get(key).await
     }
 
@@ -843,20 +897,21 @@ impl EnvManager {
         key: &str,
         level: Option<EnvLevel>,
     ) -> Result<Option<CollectionValue>, String> {
-        let key_list = Self::parse_var(key);
-        let key_refs: Vec<&str> = key_list.iter().map(|s| s.as_str()).collect();
-        let level = match level {
-            Some(l) => l,
-            None => self.get_var_level(key_refs[0]),
-        };
+        if Self::is_simple_root_key(key) {
+            let level = self.resolve_level(key, level);
+            return self.get_env(level).remove(key).await;
+        }
 
-        self.remove_inner(level, &key_refs).await
+        let key_list = Self::parse_var(key);
+        let level = self.resolve_level(key_list[0].as_str(), level);
+
+        self.remove_inner(level, &key_list).await
     }
 
     async fn remove_inner(
         &self,
         level: EnvLevel,
-        key_list: &[&str],
+        key_list: &[String],
     ) -> Result<Option<CollectionValue>, String> {
         let parent = self.get_parent_collection_by_path(key_list, level).await?;
         if parent.is_none() {
@@ -869,7 +924,7 @@ impl EnvManager {
         }
 
         let coll = parent.unwrap();
-        let key = key_list.last().unwrap();
+        let key = key_list.last().unwrap().as_str();
         coll.remove(key).await
     }
 }
