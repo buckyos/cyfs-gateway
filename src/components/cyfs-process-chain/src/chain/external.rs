@@ -1,6 +1,7 @@
 use crate::collection::CollectionValue;
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::RwLock as AsyncRwLock;
 
 #[async_trait::async_trait]
@@ -35,11 +36,17 @@ struct EnvExternalItem {
 
 pub struct EnvExternalManager {
     external: AsyncRwLock<Vec<EnvExternalItem>>,
+    external_count: AtomicUsize,
 }
 
 impl EnvExternalManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns true when at least one external environment is registered.
+    pub fn has_external(&self) -> bool {
+        self.external_count.load(Ordering::Acquire) > 0
     }
 
     pub async fn add_external(&self, id: &str, value: EnvExternalRef) -> Result<(), String> {
@@ -54,6 +61,7 @@ impl EnvExternalManager {
             id: id.to_owned(),
             value,
         });
+        self.external_count.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -61,6 +69,7 @@ impl EnvExternalManager {
         let mut lock = self.external.write().await;
         if let Some(pos) = lock.iter().position(|item| item.id == id) {
             let item = lock.remove(pos);
+            self.external_count.fetch_sub(1, Ordering::Release);
             Ok(Some(item.value))
         } else {
             let msg = format!("External environment with id '{}' not found", id);
@@ -143,6 +152,7 @@ impl Default for EnvExternalManager {
     fn default() -> Self {
         Self {
             external: AsyncRwLock::new(Vec::new()),
+            external_count: AtomicUsize::new(0),
         }
     }
 }

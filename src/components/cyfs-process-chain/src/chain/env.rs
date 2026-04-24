@@ -89,6 +89,11 @@ impl Env {
             return Ok(true);
         }
 
+        // If there is no external environment, return false directly
+        if !self.external.has_external() {
+            return Ok(false);
+        }
+
         // If external environment is set, check it
         if self.external.contains(key).await? {
             return Ok(true);
@@ -129,6 +134,11 @@ impl Env {
         key: &str,
         value: CollectionValue,
     ) -> Result<Option<CollectionValue>, String> {
+        // If there is no external environment, set in local environment directly
+        if !self.external.has_external() {
+            return self.values.insert(key, value).await;
+        }
+
         if self.values.contains_key(key).await? {
             return self.values.insert(key, value).await;
         } else {
@@ -157,9 +167,11 @@ impl Env {
         }
 
         // If external environment is set, check it
-        let (handled, value) = self.external.get(key).await?;
-        if handled {
-            return Ok(value);
+        if self.external.has_external() {
+            let (handled, value) = self.external.get(key).await?;
+            if handled {
+                return Ok(value);
+            }
         }
 
         // Then check parent environment if exists
@@ -182,6 +194,11 @@ impl Env {
             return Ok(Some(value));
         }
 
+        // If there is no external environment, return None directly
+        if !self.external.has_external() {
+            return Ok(None);
+        }
+
         // If the key does not exist in the local environment, check external environment
         let (handled, old_value) = self.external.remove(key).await?;
         if handled {
@@ -199,5 +216,135 @@ impl Env {
     pub async fn flush(&self) -> Result<(), String> {
         // Flush the current environment's values
         self.values.flush().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Env, EnvLevel};
+    use crate::chain::{EnvExternal, EnvExternalRef};
+    use crate::collection::CollectionValue;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
+
+    #[derive(Clone, Default)]
+    struct TestExternalEnv {
+        values: Arc<RwLock<HashMap<String, CollectionValue>>>,
+    }
+
+    impl TestExternalEnv {
+        fn with_value(key: &str, value: CollectionValue) -> Self {
+            let env = Self::default();
+            env.values.write().unwrap().insert(key.to_string(), value);
+            env
+        }
+
+        fn value(&self, key: &str) -> Option<CollectionValue> {
+            self.values.read().unwrap().get(key).cloned()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EnvExternal for TestExternalEnv {
+        async fn contains(&self, key: &str) -> Result<bool, String> {
+            Ok(self.values.read().unwrap().contains_key(key))
+        }
+
+        async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+            Ok(self.value(key))
+        }
+
+        async fn set(
+            &self,
+            key: &str,
+            value: CollectionValue,
+        ) -> Result<Option<CollectionValue>, String> {
+            Ok(self.values.write().unwrap().insert(key.to_string(), value))
+        }
+
+        async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+            Ok(self.values.write().unwrap().remove(key))
+        }
+    }
+
+    fn external_ref(external: TestExternalEnv) -> EnvExternalRef {
+        Arc::new(Box::new(external) as Box<dyn EnvExternal>)
+    }
+
+    #[tokio::test]
+    async fn test_env_set_without_external_replaces_local_value() {
+        let env = Env::new(EnvLevel::Block, None);
+
+        assert_eq!(
+            env.set("value", CollectionValue::String("first".to_string()))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            env.set("value", CollectionValue::String("second".to_string()))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            Some("first")
+        );
+        assert_eq!(
+            env.get("value").await.unwrap().unwrap().as_str(),
+            Some("second")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_env_set_updates_external_when_key_exists_only_in_external() {
+        let env = Env::new(EnvLevel::Block, None);
+        let external =
+            TestExternalEnv::with_value("remote", CollectionValue::String("old".to_string()));
+
+        env.env_external_manager()
+            .add_external("test", external_ref(external.clone()))
+            .await
+            .unwrap();
+
+        let old = env
+            .set("remote", CollectionValue::String("new".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(old.as_str(), Some("old"));
+        assert_eq!(external.value("remote").unwrap().as_str(), Some("new"));
+        assert_eq!(
+            env.get("remote").await.unwrap().unwrap().as_str(),
+            Some("new")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_env_set_prefers_local_value_over_external() {
+        let env = Env::new(EnvLevel::Block, None);
+        let external =
+            TestExternalEnv::with_value("shared", CollectionValue::String("remote".to_string()));
+
+        env.env_external_manager()
+            .add_external("test", external_ref(external.clone()))
+            .await
+            .unwrap();
+        env.create("shared", CollectionValue::String("local".to_string()))
+            .await
+            .unwrap();
+
+        let old = env
+            .set("shared", CollectionValue::String("local-new".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(old.as_str(), Some("local"));
+        assert_eq!(
+            env.get("shared").await.unwrap().unwrap().as_str(),
+            Some("local-new")
+        );
+        assert_eq!(external.value("shared").unwrap().as_str(), Some("remote"));
     }
 }
