@@ -1,9 +1,37 @@
 use super::types::*;
 use crate::block::{BlockExecuter, CommandArgs, Expression};
-use crate::chain::{Context, EnvLevel, ParserContext};
+use crate::chain::{Context, EnvLevel, EnvManager, ParserContext};
 use crate::collection::CollectionValue;
 use clap::{Arg, Command};
 use std::sync::Arc;
+
+struct CaptureTarget {
+    key: String,
+    simple_root: bool,
+}
+
+impl CaptureTarget {
+    fn new(key: String) -> Self {
+        let simple_root = EnvManager::is_simple_root_key(&key);
+        Self { key, simple_root }
+    }
+
+    async fn set(&self, context: &Context, value: CollectionValue) -> Result<(), String> {
+        if self.simple_root {
+            context
+                .env()
+                .set_simple_root_at_explicit_level(&self.key, value, EnvLevel::Block)
+                .await?;
+        } else {
+            context
+                .env()
+                .set(&self.key, value, Some(EnvLevel::Block))
+                .await?;
+        }
+
+        Ok(())
+    }
+}
 
 pub struct CaptureCommandParser {
     cmd: Command,
@@ -14,7 +42,7 @@ impl CaptureCommandParser {
         matches: &clap::ArgMatches,
         args: &CommandArgs,
         name: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<CaptureTarget>, String> {
         if let Some(index) = matches.index_of(name) {
             let arg = &args[index];
             if !arg.is_literal() && !arg.is_var() {
@@ -22,7 +50,7 @@ impl CaptureCommandParser {
                 error!("{}", msg);
                 return Err(msg);
             }
-            Ok(Some(arg.as_str().to_string()))
+            Ok(Some(CaptureTarget::new(arg.as_str().to_string())))
         } else {
             Ok(None)
         }
@@ -182,13 +210,13 @@ impl CommandParser for CaptureCommandParser {
 }
 
 pub struct CaptureCommandExecutor {
-    value_var: Option<String>,
-    status_var: Option<String>,
-    ok_var: Option<String>,
-    error_var: Option<String>,
-    control_var: Option<String>,
-    control_kind_var: Option<String>,
-    from_var: Option<String>,
+    value_var: Option<CaptureTarget>,
+    status_var: Option<CaptureTarget>,
+    ok_var: Option<CaptureTarget>,
+    error_var: Option<CaptureTarget>,
+    control_var: Option<CaptureTarget>,
+    control_kind_var: Option<CaptureTarget>,
+    from_var: Option<CaptureTarget>,
     sub_command: Box<Expression>,
 }
 
@@ -198,10 +226,7 @@ impl CommandExecutor for CaptureCommandExecutor {
         let ret = BlockExecuter::execute_expression(&self.sub_command, context).await?;
 
         if let Some(value_var) = &self.value_var {
-            context
-                .env()
-                .set(value_var, ret.value_ref().clone(), Some(EnvLevel::Block))
-                .await?;
+            value_var.set(context, ret.value_ref().clone()).await?;
         }
 
         if let Some(status_var) = &self.status_var {
@@ -213,46 +238,26 @@ impl CommandExecutor for CaptureCommandExecutor {
                 "control"
             };
 
-            context
-                .env()
-                .set(
-                    status_var,
-                    CollectionValue::String(status.to_string()),
-                    Some(EnvLevel::Block),
-                )
+            status_var
+                .set(context, CollectionValue::String(status.to_string()))
                 .await?;
         }
 
         if let Some(ok_var) = &self.ok_var {
-            context
-                .env()
-                .set(
-                    ok_var,
-                    CollectionValue::Bool(ret.is_success()),
-                    Some(EnvLevel::Block),
-                )
+            ok_var
+                .set(context, CollectionValue::Bool(ret.is_success()))
                 .await?;
         }
 
         if let Some(error_var) = &self.error_var {
-            context
-                .env()
-                .set(
-                    error_var,
-                    CollectionValue::Bool(ret.is_error()),
-                    Some(EnvLevel::Block),
-                )
+            error_var
+                .set(context, CollectionValue::Bool(ret.is_error()))
                 .await?;
         }
 
         if let Some(control_var) = &self.control_var {
-            context
-                .env()
-                .set(
-                    control_var,
-                    CollectionValue::Bool(ret.is_control()),
-                    Some(EnvLevel::Block),
-                )
+            control_var
+                .set(context, CollectionValue::Bool(ret.is_control()))
                 .await?;
         }
 
@@ -265,10 +270,7 @@ impl CommandExecutor for CaptureCommandExecutor {
                 None => CollectionValue::Null,
             };
 
-            context
-                .env()
-                .set(control_kind_var, control_kind, Some(EnvLevel::Block))
-                .await?;
+            control_kind_var.set(context, control_kind).await?;
         }
 
         if let Some(from_var) = &self.from_var {
@@ -279,10 +281,7 @@ impl CommandExecutor for CaptureCommandExecutor {
                 _ => CollectionValue::Null,
             };
 
-            context
-                .env()
-                .set(from_var, from, Some(EnvLevel::Block))
-                .await?;
+            from_var.set(context, from).await?;
         }
 
         Ok(ret)

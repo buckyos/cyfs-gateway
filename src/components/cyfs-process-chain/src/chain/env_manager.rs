@@ -216,7 +216,7 @@ pub struct EnvManager {
 }
 
 impl EnvManager {
-    fn is_simple_root_key(key: &str) -> bool {
+    pub(crate) fn is_simple_root_key(key: &str) -> bool {
         !key.is_empty()
             && key
                 .chars()
@@ -810,12 +810,7 @@ impl EnvManager {
 
         if Self::is_simple_root_key(key) {
             let level = self.resolve_level(key, level);
-            let ret = self.get_env(level).set(key, value).await?;
-            if self.should_change_var_level_for_root(key, level) {
-                self.change_var_level_for_root(key, Some(level));
-            }
-
-            return Ok(ret);
+            return self.set_simple_root_at_level(key, value, level).await;
         }
 
         let key_list = Self::parse_var(key);
@@ -826,6 +821,36 @@ impl EnvManager {
         if self.should_change_var_level_for_root(root_key, level) {
             self.change_var_level_for_root(root_key, Some(level));
         }
+
+        Ok(ret)
+    }
+
+    pub(crate) async fn set_simple_root_at_level(
+        &self,
+        key: &str,
+        value: CollectionValue,
+        level: EnvLevel,
+    ) -> Result<Option<CollectionValue>, String> {
+        debug_assert!(Self::is_simple_root_key(key));
+
+        let ret = self.get_env(level).set(key, value).await?;
+        if self.should_change_var_level_for_root(key, level) {
+            self.change_var_level_for_root(key, Some(level));
+        }
+
+        Ok(ret)
+    }
+
+    pub(crate) async fn set_simple_root_at_explicit_level(
+        &self,
+        key: &str,
+        value: CollectionValue,
+        level: EnvLevel,
+    ) -> Result<Option<CollectionValue>, String> {
+        debug_assert!(Self::is_simple_root_key(key));
+
+        let ret = self.get_env(level).set(key, value).await?;
+        self.change_var_level_for_root(key, Some(level));
 
         Ok(ret)
     }
