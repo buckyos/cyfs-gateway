@@ -27,20 +27,35 @@ RTCP 的默认监听端口是 `2980/TCP`。
 
 ## 2. 角色与连接模型
 
-RTCP 区分两类 TCP 连接：
+RTCP 区分两类承载连接：
 
 - `Tunnel`：长连接控制通道，用来收发 `Hello`、`Ping`、`Open`、`ROpen` 等控制包。
-- `Stream`：为某个业务流单独建立的新 TCP 连接。建立后立即切到对称加密，承载真实业务字节流或 datagram 字节流。
+- `Stream`：为某个业务流单独建立的新 stream leg。direct tunnel 下它是新的 TCP 连接；bootstrap-backed tunnel 下它是通过 tunnel 框架拿到的新底层 stream。建立后立即切到对称加密，承载真实业务字节流或 datagram 字节流。
 
-一个 tunnel 建立后，两端都可以基于该 tunnel 再创建新的 stream。但两端对“谁来主动建立 stream 的 TCP 连接”判断不同：
+一个 tunnel 建立后，两端都可以基于该 tunnel 再创建新的 stream。但两端对“谁来主动建立 stream leg”判断不同：
 
 - 主动发起 tunnel 的一侧：`can_direct = true`，后续优先走 `Open`。
 - 被动接受 tunnel 的一侧：`can_direct = false`，后续优先走 `ROpen`。
 
 这不是协议层的对等性差异，而是当前实现里的建流策略差异。
 
-## 3. Tunnel URL
-rtcp://remote_peer/target_stream_id
+### 2.1 Tunnel URL 与 stack id
+
+RTCP 在 tunnel 框架里使用的 URL 形态是：
+
+```text
+rtcp://<stack-id>/<target-stream-id>
+```
+
+其中 `<stack-id>` 由 `parse_rtcp_stack_id()` 解析，当前支持两种形式：
+
+- `<did>[:port]`：直连目标 RTCP stack，未写端口时使用默认 `2980`。
+- `<percent-encoded bootstrap URL>@<did>[:port]`：先用 bootstrap URL 通过 tunnel 框架拿到底层 byte stream，再在这条 stream 上建立外层 RTCP tunnel。
+
+`<target-stream-id>` 由 `open_stream()` / `create_datagram_client()` 解释：
+
+- 如果 percent-decode 后是带 scheme 的完整 URL，则按 `dest_port = 0`、`dest_host = <完整 URL>` 发送给对端。
+- 否则按 path 第一段解析 `host:port`、`:port` 或 `[ipv6]:port`。
 
 ## 3. 线协议总览
 
@@ -90,9 +105,9 @@ RTCP 在线上有两种首部格式。
 
 说明：
 
-- `HelloStream` 只能出现在一条新 TCP 连接的第一个包；后续再出现会被拒绝。
+- `HelloStream` 只能出现在一条新 stream leg 的第一个包；后续再出现会被拒绝。
 - 当前实现中 `stream_id` 实际上是 `16` 个随机字节的十六进制字符串，因此线上固定是 `32` 字节 ASCII。
-- `HelloStream` 只用来把这条新 TCP 连接绑定到某个待建立的业务流；它不是 JSON 包。
+- `HelloStream` 只用来把这条新 stream leg 绑定到某个待建立的业务流；它不是 JSON 包。
 
 ## 4. 命令字与包体字段
 
@@ -105,7 +120,7 @@ RTCP 在线上有两种首部格式。
 | 9 | `HelloAckConfirm` | tunnel 握手 | §14.2 发起端 echo challenge，证明持有 AES key |
 | 3 | `Ping` | tunnel 内 | 存活探测 |
 | 4 | `Pong` | tunnel 内 | `Ping` 的响应 |
-| 5 | `ROpen` | tunnel 内 | 请求对端反向建立一条 stream TCP 连接 |
+| 5 | `ROpen` | tunnel 内 | 请求对端反向建立一条 stream leg |
 | 6 | `ROpenResp` | tunnel 内 | `ROpen` 的响应 |
 | 7 | `Open` | tunnel 内 | 请求对端准备接收一条由本端主动建立的 stream |
 | 8 | `OpenResp` | tunnel 内 | `Open` 的响应 |
@@ -172,6 +187,7 @@ RTCP 在线上有两种首部格式。
 - `nonce`
   - 16 字节随机数，16 进制编码。
   - 接收端维护 `(from_id, nonce)` 的短期 cache（容量上限 16 KiB）；每条记录的保留期固定为 `exp + JWT_LEEWAY_SECS`，与签名接受窗口的上界对齐，杜绝“签名仍合法但 nonce 已被清理”的重放缝隙。
+  - 新实现必须携带该字段；缺失 `nonce` 会被接收端视为旧协议 token 并拒绝。
 
 ### 4.3 HelloAck / HelloAckConfirm
 
@@ -197,7 +213,7 @@ RTCP 在线上有两种首部格式。
 - 两者都是 §14.2 key-confirmation handshake 的组成部分，发送时点在 `Hello` 已落地并且双方都把承载流包成 `EncryptedStream` 之后。
 - `HelloAck`
   - 接收端收到合法 `Hello`、完成 token 验签和 nonce 校验后，随机生成 16 字节 challenge，写入这条包并作为 tunnel AES 流的第一条 AEAD 记录发出。
-  - `responder_id` 用于发起端确认自己连上的确实是预期的对端；当前实现要求它必须等于发起端 Hello 里写入的 `to_id`，否则终止握手。
+  - `responder_id` 用于发起端确认自己连上的确实是预期的对端；当前实现要求它必须等于发起端 `create_tunnel()` 解析出的目标 DID hostname，否则终止握手。
 - `HelloAckConfirm`
   - 发起端能解密 `HelloAck` 就意味着它确实持有与自己 ephemeral X25519 私钥对应的共享密钥；将 challenge 原样回写出去即完成持有证明。
   - 接收端读到 AEAD 记录解密成功，并且 `challenge_echo` 与自己发出的 challenge 完全一致，才会真正接纳 tunnel。
@@ -257,13 +273,12 @@ RTCP 在线上有两种首部格式。
   - 可选。
   - `0` 或缺省表示普通字节流 `Stream`。
   - `1` 表示 `Datagram` 模式。
-  - `2` 表示Raw Stream,不用加密
-  - `3` 表示Raw Datagram,不用加密
+  - 当前代码只定义了 `Stream = 0` 和 `Datagram = 1`；不存在不加密的 raw stream/raw datagram 协议枚举。
 - `dest_port`
   - 目标端口。
 - `dest_host`
   - 目标主机。
-  - 可以是 IP、域名，也可以在 `dest_port == 0` 时直接塞一个完整 URL。
+  - 可选。可以是 IP、域名，也可以在 `dest_port == 0` 时直接塞一个完整 URL。
 
 当前上层实现对目标地址的解释规则是：
 
@@ -281,14 +296,14 @@ RTCP 在线上有两种首部格式。
 当前实现中的 `result` 约定：
 
 - `0`：成功。
-- `2`：仅在 `ROpen` 路径下使用，表示对端无法建立反向 TCP 连接。
+- `1`：当前仅在 `OpenResp` 使用，表示接收端 pending `Open` 配额已满。
+- `2`：当前仅在 `ROpenResp` 使用，表示对端无法建立反向 stream leg。
 
 注意：
 
-- `OpenResp.result` 当前并不会被调用方读取，收到包后只负责按 `seq` 唤醒等待者。
-- `ROpenResp.result` 当前也没有被调用方消费。
-
-因此，从“现状”看，这两个响应包更像是一个同步点，而不是完整的错误回传机制。
+- `OpenResp.result` 和 `ROpenResp.result` 都会按 `seq` 投递给等待者。
+- 调用方收到非零 `result` 会快速失败，并释放等待 `HelloStream` 的槽位。
+- 这些响应码仍不是完整的错误模型；目前只覆盖“成功 / pending Open 配额满 / reconnect 失败”这几类实现内错误。
 
 ## 5. 认证、密钥交换与加密
 
@@ -306,7 +321,9 @@ RTCP 当前实现同时使用长期设备密钥和短期会话密钥。
 发起侧 `create_tunnel()` 时执行：
 
 1. 解析目标设备 DID。
-2. 解析目标设备的 Ed25519 exchange key。
+2. 解析目标设备的 Ed25519 exchange key：
+   - 默认走 `resolve_ed25519_exchange_key(remote_did)`。
+   - 如果是 `did:web` 且 DID doc 路径失败，当前实现会 fallback 到 web host 的 TXT 记录，依次尝试 `DEV=` JWT 和 `PKX=` 字段提取设备公钥。
 3. 把目标 Ed25519 公钥转换成 X25519 公钥。
 4. 生成一次性 X25519 密钥对 `my_secret / my_public`。
 5. 用 `my_secret` 和目标 X25519 公钥做 DH。
@@ -412,7 +429,7 @@ IV/nonce 选择规则：
 - `Hello` 之后还有一次 `HelloAck` / `HelloAckConfirm` 的往返，必须成功才算 tunnel 建立；详见 §14.2。
 - **TCP 三次握手成功不等于 tunnel 建立成功**。当前实现的建链完成点是“协议层 key-confirmation 成功”，不是 `TcpStream::connect()` 返回。
 - `can_direct` 的设置时机也在 key-confirmation 之后，而不是刚拿到一条 TCP 连接时。
-- `to_id` 会被校验：token payload 里的 `to` 必须等于本机 did hostname，否则接收端直接拒绝 tunnel。
+- `Hello.to_id` 本身仍只用于日志；真正被接收端严格校验的是 token payload 里的 `to`，它必须等于本机 did hostname，否则接收端直接拒绝 tunnel。
 - 对端后续回连端口来自 `Hello.my_port`，不是当前 TCP 连接的源端口。
 
 ## 7. Open 流程
@@ -425,19 +442,22 @@ IV/nonce 选择规则：
 
 1. A 生成 `streamid = hex(random[16])`。
 2. A 生成新的 `seq`，向 tunnel 发送 `Open(streamid, purpose, dest_host, dest_port)`。
-3. B 收到 `Open` 后，先登记一个等待项，键为 `<B.this_device_id>_<streamid>`。
-4. B 回 `OpenResp(seq, result=0)`。
-5. A 收到 `OpenResp` 后，以“当前 tunnel 对端 IP + 对端 RTCP 端口”再建立一条新的 TCP 连接。
-6. A 在这条新连接上发送 `HelloStream(streamid)`。
-7. B 的 RTCP listener 收到该新连接，读到 `HelloStream(streamid)`，查找刚才登记的等待项。
-8. A 和 B 两边都把这条新 TCP 包装成 `EncryptedStream`，AES key 复用 tunnel key，IV 使用 `streamid` 解出的 16 字节。
+3. B 收到 `Open` 后，先检查 pending inbound `Open` 配额；配额可用时登记一个等待项，键为 `<B.this_device_id>_<streamid>`。
+4. B 回 `OpenResp(seq, result=0)`；如果配额已满则回 `OpenResp(seq, result=1)` 并结束本次 Open。
+5. A 收到 `OpenResp(result=0)` 后，通过 `build_reconnect_stream()` 建立一条新的 stream leg。
+6. A 在这条新 stream leg 上发送 `HelloStream(streamid)`。
+7. B 的 RTCP listener 收到该新 stream leg，读到 `HelloStream(streamid)`，查找刚才登记的等待项。
+8. A 和 B 两边都把这条新 stream leg 包装成 `EncryptedStream`，AES key 复用 tunnel key，IV 使用 `streamid` 解出的 16 字节。
 9. B 把 stream 交给上层 `on_new_stream()` 或 `on_new_datagram()`。
 
 ### 7.2 关键点
 
-- `OpenResp` 只是告诉 A“可以开始建立新 TCP 连接了”。
-- 新 stream 连接不是复用 tunnel，而是重新建一个 TCP 连接。
-- 新 stream 的目标地址不是重新做一次 DID 解析，而是复用已有 tunnel 对端的 IP。
+- B 会先尝试占用一个 pending inbound `Open` 配额；每个 tunnel 最多 `64` 个等待 `HelloStream` 的 inbound `Open`。
+- 如果配额满，B 返回 `OpenResp(result=1)`，A 立即失败，不再建立 `HelloStream`。
+- `OpenResp(result=0)` 表示 B 已经登记等待项，A 可以开始建立新的 stream leg。
+- 新 stream 不复用 tunnel 控制连接；direct tunnel 会重新建 TCP 连接，bootstrap-backed tunnel 会复用同一份 bootstrap URL 通过 tunnel 框架再拉一条底层 stream。
+- direct tunnel 的新 stream 目标地址不是重新做一次 DID 解析，而是复用已有 tunnel 对端的 IP，并把端口改成对端 RTCP stack port。
+- B 等待 `HelloStream` 的上限是 `30s`；超时后等待项会被清理，迟到或未知的 `HelloStream` 会被关闭。
 
 ## 8. ROpen 流程
 
@@ -450,20 +470,24 @@ IV/nonce 选择规则：
 1. B 生成 `streamid = hex(random[16])`。
 2. B 在本地登记等待项，键为 `<B.this_device_id>_<streamid>`。
 3. B 向 tunnel 发送 `ROpen(streamid, purpose, dest_host, dest_port)`。
-4. A 收到 `ROpen` 后，用“当前 tunnel 对端 IP + `Hello.my_port`”建立一条新的 TCP 连接回到 B。
+4. A 收到 `ROpen` 后，通过 `build_reconnect_stream()` 建立一条新的 stream leg：
+   - direct tunnel：用“当前 tunnel 对端 IP + `Hello.my_port`”建立 TCP 连接回到 B。
+   - bootstrap-backed tunnel：复用同一份 bootstrap URL，通过 tunnel 框架建立新的底层 stream。
 5. 若回连失败，A 回 `ROpenResp(seq, result=2)`。
 6. 若回连成功，A 先回 `ROpenResp(seq, result=0)`。
-7. A 在新 TCP 上发送 `HelloStream(streamid)`。
-8. B 的 listener 收到新连接并匹配等待项。
-9. A 和 B 两边都把这条新 TCP 包装成 `EncryptedStream`，AES key 复用 tunnel key，IV 使用 `streamid`。
+7. A 在新 stream leg 上发送 `HelloStream(streamid)`。
+8. B 的 listener 收到新 stream leg 并匹配等待项。
+9. A 和 B 两边都把这条新 stream leg 包装成 `EncryptedStream`，AES key 复用 tunnel key，IV 使用 `streamid`。
 10. A 把 stream 交给本地上层，去连接自己这一侧的真实服务。
 
 ### 8.2 和 Open 的本质区别
 
-两者的业务目标相同，区别只在“谁来主动建立新的 stream TCP 连接”：
+两者的业务目标相同，区别只在“谁来主动建立新的 stream leg”：
 
 - `Open`：由请求方自己去连对端 RTCP 端口。
 - `ROpen`：由对端反向连回来。
+- `ROpenResp` 会与本地 `HelloStream` 等待并发竞争：如果先收到非零响应，本地立即失败并清理等待项；如果先收到 `HelloStream`，则按成功路径继续。
+- 等待 `HelloStream` 的上限同样是 `30s`。
 
 ## 9. Datagram 模式
 
@@ -509,6 +533,8 @@ RTCP 自身只负责**连接竞速**；候选展开、地址排序、历史 RTT 
 - `name_client::record_connection_outcome(local_ip, remote_addr, outcome)` 负责沉淀每条 attempt 的结果（成功 RTT / `Unreachable` / `Timeout`），作为下一次 `resolve_ips` 排序的依据。
 
 RTCP 不再在 `rtcp.rs` 里维护候选名拼接、DID info 字段解析或 HTTP fallback 代码。
+
+注意：这里说的是“地址解析”。目标设备 exchange key 的解析仍在 `rtcp.rs` 中有一条 `did:web` TXT fallback 路径，详见 §5.2。
 
 ### 10.2 并发竞速策略
 
@@ -583,11 +609,12 @@ RTCP stack 的 `device_config_path` 当前支持两类文件内容：
 为了避免文档误导，下面这些点要特别说明：
 
 - `HelloAck` 已参与建链流程（§14.2），不再是“定义存在、实现未使用”的字段；同时新增了 `HelloAckConfirm` 作为发起端的 key-confirmation 回包。
-- `Hello.to_id` 会被严格校验；token payload 中的 `to` 必须等于本机 did hostname。
-- `OpenResp.result` 和 `ROpenResp.result` 当前没有形成完整错误语义。
+- `Hello.to_id` 本身不作为身份校验依据；token payload 中的 `to` 会被严格校验，必须等于本机 did hostname。
+- `OpenResp.result` / `ROpenResp.result` 已经会被等待者读取并触发快速失败，但错误码集合仍然很小，不是完整错误模型。
 - `Pong.timestamp` 当前固定为 `0`，不是对 `Ping.timestamp` 的镜像。
 - tunnel 和 stream 的首包 `Hello` / `HelloStream` 都是明文；真正加密从 `EncryptedStream` 接管后开始（`HelloAck` / `HelloAckConfirm` 已经走加密）。
 - Datagram 不是 UDP 打洞，而是“在加密 TCP stream 里封装 datagram”。
+- `purpose` 当前只支持 `Stream = 0` 和 `Datagram = 1`，没有 raw/no-encryption 模式。
 
 ## 14. 安全注意事项与协议 TODO
 
@@ -655,9 +682,25 @@ RTCP stack 的 `device_config_path` 当前支持两类文件内容：
 - 60s 的 `TUNNEL_TOKEN_EXP_SECS` + 60s 的显式 `JWT_LEEWAY_SECS`，意味着两端时钟最多允许约 2 分钟偏差；如果部署环境时钟漂移更大，需要在上层配置 NTP 或显式调整 `JWT_LEEWAY_SECS`（同时记得 nonce-cache 的保留期也会随之放大，这是期望的，不要只改签名验证侧）。
 - `HelloAck.responder_id` 虽然用 AEAD 加密，但它只是“提示字段”，对初始化 tunnel 的身份认证并非必需——真正的身份锚点是：AES key 来自对端静态 X25519 私钥，而该私钥由 DID 公钥体系提供。保留 `responder_id` 便于日志排查和多身份部署下的 sanity check。
 
-### 14.3 TODO: 规范 stream 建立超时与清理语义
+### 14.3 stream 建立超时、配额与清理语义（已落地）
 
-当前现状：已经修正
+历史问题：
+
+- `Open` / `ROpen` 发出后，等待 `HelloStream` 的槽位如果没有被对端完成，可能长时间占用。
+- 早期 `OpenResp` / `ROpenResp` 更接近同步点，调用侧没有可靠消费非零结果码。
+- 对端如果持续发送 `Open` 但不完成新连接，会拖住 tunnel 读循环或积累等待项。
+
+当前实现：
+
+- `RTcpStreamBuildHelper::wait_ropen_stream()` 使用固定 `STREAM_WAIT_TIMEOUT = 30s`。
+- 等待超时会删除等待项；迟到或未知的 `HelloStream` 会被 `notify_ropen_stream()` 关闭。
+- `Open` 的接收侧不在 tunnel 读循环里阻塞等待 `HelloStream`，而是在登记等待项并返回 `OpenResp(result=0)` 后，用后台 task 完成后续接管。
+- 每个 tunnel 最多允许 `MAX_PENDING_INBOUND_OPENS = 64` 个并发 inbound `Open` 等待项；超过时直接返回 `OpenResp(result=1)`。
+- `OpenResp.result` / `ROpenResp.result` 都会通过 oneshot waiter 交给发起侧：
+  - `OpenResp(non-zero)`：发起侧立即失败，不再建立 `HelloStream`。
+  - `ROpenResp(non-zero)`：发起侧立即失败并清理等待项。
+  - `ROpenResp(0)`：表示对端已接受并正在发送 `HelloStream`，发起侧继续等待。
+- 发送 `Open` / `ROpen` 失败时，本地会主动移除对应 waiter，避免依赖 30 秒超时回收。
 
 
 ### 14.4 支持 remote 嵌套的 bootstrap stream URL (已落地)
@@ -687,7 +730,7 @@ RTCP authority 的语法：
 - `create_tunnel()` 在检测到 bootstrap URL 时，走 `TunnelManager::open_stream_by_url()` 拿到 byte stream 作为 tunnel 承载连接，而不是 `TcpStream::connect(remote_ip:port)`；然后在这条 stream 上正常发送 `Hello`。
 - 不带 `params` 时，仍然走“解析 DID → 解析 IP → 直连 RTCP 端口”的旧路径，保持兼容。
 - `RTcpTunnel` 的承载流从 `EncryptedStream<TcpStream>` 统一改成 `EncryptedStream<Box<dyn AsyncStream>>`，兼容裸 TCP 和由 tunnel 框架产生的任意 stream；但 `Hello` / `HelloStream` 的线协议格式不变。
-- Bootstrap 建立的 tunnel 不再持有直连的 `peer_addr`；后续的 `Open` / `ROpen` 直连路径对这类 tunnel 会显式拒绝（待 14.5 补齐）。
+- Bootstrap 建立的 tunnel 不再持有直连的 `peer_addr`；后续 `Open` / `ROpen` 通过 §14.5 的 `bootstrap` 上下文复用同一份 bootstrap URL 建立新的 stream leg。
 
 ### 14.5 为 remote 嵌套后的建流流程重新绑定 transport 语义（已落地）
 
@@ -723,5 +766,5 @@ remote 嵌套场景下，`Open` / `ROpen` 的建流动作必须与 tunnel 承载
 
 1. 先用 `Hello + tunnel_token` 在一个 TCP 连接上建立加密 tunnel。
 2. tunnel 只传控制消息，不直接承载业务流。
-3. 每次业务访问都要再新建一条 TCP 连接，并用 `HelloStream(streamid)` 把它绑定到 tunnel 中的某个 `Open/ROpen` 请求。
+3. 每次业务访问都要再新建一条 stream leg：direct tunnel 是新的 TCP 连接，bootstrap-backed tunnel 是通过同一 bootstrap URL 拉出的新底层 stream；随后用 `HelloStream(streamid)` 绑定到 tunnel 中的某个 `Open/ROpen` 请求。
 4. tunnel 和所有业务 stream 都复用同一把 AES key，但每条业务 stream 用自己的 `streamid` 作为 IV。
