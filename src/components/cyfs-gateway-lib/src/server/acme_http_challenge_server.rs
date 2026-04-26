@@ -1,6 +1,6 @@
 use crate::{
-    AcmeCertManagerRef, HttpServer, Server, ServerConfig, ServerContext, ServerContextRef,
-    ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo, server_err,
+    CertManagerRef, HttpServer, Server, ServerConfig, ServerContext, ServerContextRef, ServerError,
+    ServerErrorCode, ServerFactory, ServerResult, StreamInfo, server_err,
 };
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
@@ -11,12 +11,12 @@ use std::sync::Arc;
 
 pub struct AcmeHttpChallengeServer {
     id: String,
-    acme_mgr: AcmeCertManagerRef,
+    cert_manager: CertManagerRef,
 }
 
 impl AcmeHttpChallengeServer {
-    pub fn new(id: String, acme_mgr: AcmeCertManagerRef) -> Self {
-        AcmeHttpChallengeServer { id, acme_mgr }
+    pub fn new(id: String, cert_manager: CertManagerRef) -> Self {
+        AcmeHttpChallengeServer { id, cert_manager }
     }
 
     fn extract_token_from_path(&self, path: &str) -> Option<String> {
@@ -42,7 +42,7 @@ impl HttpServer for AcmeHttpChallengeServer {
 
         // 提取ACME挑战token
         if let Some(token) = self.extract_token_from_path(path) {
-            if let Some(key_auth) = self.acme_mgr.get_auth_of_token(token.as_str()) {
+            if let Some(key_auth) = self.cert_manager.get_http01_auth(token.as_str()) {
                 let response = Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", "application/octet-stream")
@@ -105,12 +105,12 @@ impl ServerConfig for AcmeHttpChallengeServerConfig {
 
 #[derive(Clone)]
 pub struct AcmeHttpChallengeServerContext {
-    pub acme_mgr: AcmeCertManagerRef,
+    pub cert_manager: CertManagerRef,
 }
 
 impl AcmeHttpChallengeServerContext {
-    pub fn new(acme_mgr: AcmeCertManagerRef) -> Self {
-        Self { acme_mgr }
+    pub fn new(cert_manager: CertManagerRef) -> Self {
+        Self { cert_manager }
     }
 }
 
@@ -154,7 +154,7 @@ impl ServerFactory for AcmeHttpChallengeServerFactory {
                 ServerErrorCode::InvalidConfig,
                 "invalid acme response server context"
             ))?;
-        let server = AcmeHttpChallengeServer::new(config.id.clone(), context.acme_mgr.clone());
+        let server = AcmeHttpChallengeServer::new(config.id.clone(), context.cert_manager.clone());
         Ok(vec![Server::Http(Arc::new(server))])
     }
 }

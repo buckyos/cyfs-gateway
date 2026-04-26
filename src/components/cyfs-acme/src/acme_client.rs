@@ -5,7 +5,7 @@ use base64::Engine;
 use openssl::{
     pkey::{PKey, Private},
     rsa::Rsa,
-    x509::{extension::SubjectAlternativeName, X509NameBuilder, X509ReqBuilder},
+    x509::{X509NameBuilder, X509ReqBuilder, extension::SubjectAlternativeName},
 };
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
 use reqwest;
@@ -340,12 +340,7 @@ impl AcmeOrderSession {
             self.update_status(OrderStatus::Processing);
             let cert_url = self
                 .client
-                .finalize_order(
-                    &finalize_url,
-                    order_url.as_deref(),
-                    directory.clone(),
-                    &csr,
-                )
+                .finalize_order(&finalize_url, order_url.as_deref(), directory.clone(), &csr)
                 .await?;
 
             // 下载证书

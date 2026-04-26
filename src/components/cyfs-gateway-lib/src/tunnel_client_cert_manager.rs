@@ -1,7 +1,7 @@
 use crate::{TunnelError, TunnelResult, normalize_config_file_path};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use cyfs_acme::{AcmeCertManagerRef, AcmeItem, CertMaterial, CertStubState, ChallengeType};
+use cyfs_acme::{CertManagerRef, CertMaterial, CertRequest, CertStatusState, ChallengeType};
 use openssl::pkey::PKey;
 use openssl::x509::X509;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -22,6 +22,7 @@ pub enum TunnelClientCertConfig {
         domain: String,
         acme_type: ChallengeType,
         dns_provider: Option<String>,
+        cert_provider: Option<String>,
     },
 }
 
@@ -84,13 +85,14 @@ enum TunnelClientCertEntry {
         domain: String,
         acme_type: ChallengeType,
         dns_provider: Option<String>,
+        cert_provider: Option<String>,
     },
 }
 
 #[derive(Clone, Default)]
 struct TunnelClientCertSnapshot {
     entries: HashMap<String, TunnelClientCertEntry>,
-    acme_manager: Option<AcmeCertManagerRef>,
+    cert_manager: Option<CertManagerRef>,
 }
 
 pub struct TunnelClientCertManager {
@@ -111,11 +113,12 @@ impl TunnelClientCertManager {
     pub fn prepare_reload(
         &self,
         configs: Option<&HashMap<String, TunnelClientCertConfig>>,
-        acme_manager: AcmeCertManagerRef,
+        cert_manager: CertManagerRef,
         base_dir: &Path,
     ) -> Result<()> {
         let mut entries = HashMap::new();
-        let mut acme_domains = HashMap::<String, (ChallengeType, Option<String>)>::new();
+        let mut acme_domains =
+            HashMap::<String, (ChallengeType, Option<String>, Option<String>)>::new();
 
         if let Some(configs) = configs {
             for (alias, config) in configs {
@@ -135,6 +138,7 @@ impl TunnelClientCertManager {
                         domain,
                         acme_type,
                         dns_provider,
+                        cert_provider,
                     } => {
                         validate_acme_entry(
                             alias,
@@ -144,7 +148,13 @@ impl TunnelClientCertManager {
                         )?;
 
                         if let Some(previous) = acme_domains.get(domain) {
-                            if previous != &(acme_type.clone(), dns_provider.clone()) {
+                            if previous
+                                != &(
+                                    acme_type.clone(),
+                                    dns_provider.clone(),
+                                    cert_provider.clone(),
+                                )
+                            {
                                 return Err(anyhow!(
                                     "tunnel_client_certs.{} conflicts with another alias on ACME domain {}",
                                     alias,
@@ -152,17 +162,23 @@ impl TunnelClientCertManager {
                                 ));
                             }
                         } else {
-                            acme_domains
-                                .insert(domain.clone(), (acme_type.clone(), dns_provider.clone()));
+                            acme_domains.insert(
+                                domain.clone(),
+                                (
+                                    acme_type.clone(),
+                                    dns_provider.clone(),
+                                    cert_provider.clone(),
+                                ),
+                            );
                         }
 
                         let data = dns_provider
                             .as_ref()
                             .map(|provider| json!({ "dns_provider": provider }));
-                        acme_manager.add_acme_item(AcmeItem::new(
+                        cert_manager.add_request(CertRequest::client(
                             domain.clone(),
+                            cert_provider.clone(),
                             acme_type.clone(),
-                            None,
                             data,
                         ))?;
 
@@ -170,6 +186,7 @@ impl TunnelClientCertManager {
                             domain: domain.clone(),
                             acme_type: acme_type.clone(),
                             dns_provider: dns_provider.clone(),
+                            cert_provider: cert_provider.clone(),
                         }
                     }
                 };
@@ -180,7 +197,7 @@ impl TunnelClientCertManager {
 
         *self.prepared_snapshot.lock().unwrap() = Some(Arc::new(TunnelClientCertSnapshot {
             entries,
-            acme_manager: Some(acme_manager),
+            cert_manager: Some(cert_manager),
         }));
         Ok(())
     }
@@ -210,37 +227,36 @@ impl TunnelClientCertManager {
                 domain,
                 acme_type: _,
                 dns_provider: _,
+                cert_provider,
             } => {
-                let acme_manager = snapshot.acme_manager.as_ref().ok_or_else(|| {
+                let cert_manager = snapshot.cert_manager.as_ref().ok_or_else(|| {
                     TunnelError::InvalidState(format!(
-                        "tunnel client certificate alias {} has no active ACME manager",
+                        "tunnel client certificate alias {} has no active cert manager",
                         alias
                     ))
                 })?;
-                let cert_stub = acme_manager.get_cert_by_host(domain).ok_or_else(|| {
-                    TunnelError::InvalidState(format!(
-                        "tunnel client certificate alias {} is not registered in ACME manager",
-                        alias
-                    ))
-                })?;
-
-                if let Some(material) = cert_stub.get_material() {
+                if let Some(material) = cert_manager
+                    .resolve_client_cert(cert_provider.as_deref(), domain)
+                    .map_err(|e| TunnelError::InvalidState(e.to_string()))?
+                {
                     return Ok(material.into());
                 }
 
-                let last_error = cert_stub.get_last_error();
-                let state = cert_stub.get_state();
-                let msg = match state {
-                    CertStubState::Pending => format!(
+                let status = cert_manager
+                    .get_status(cert_provider.as_deref(), domain)
+                    .map_err(|e| TunnelError::InvalidState(e.to_string()))?;
+                let msg = match status.state {
+                    CertStatusState::Pending => format!(
                         "tunnel client certificate alias {} is pending ACME issuance{}",
                         alias,
-                        last_error
+                        status
+                            .last_error
                             .as_ref()
                             .map(|err| format!(": {}", err))
                             .unwrap_or_default()
                     ),
-                    CertStubState::Expired => {
-                        if let Some(last_error) = last_error {
+                    CertStatusState::Expired => {
+                        if let Some(last_error) = status.last_error {
                             format!(
                                 "tunnel client certificate alias {} is expired: {}",
                                 alias, last_error
@@ -249,8 +265,19 @@ impl TunnelClientCertManager {
                             format!("tunnel client certificate alias {} is expired", alias)
                         }
                     }
-                    CertStubState::Ready | CertStubState::Renewing => {
+                    CertStatusState::Ready | CertStatusState::Renewing => {
                         format!("tunnel client certificate alias {} is not ready", alias)
+                    }
+                    CertStatusState::Error | CertStatusState::Unknown => {
+                        format!(
+                            "tunnel client certificate alias {} is not ready{}",
+                            alias,
+                            status
+                                .last_error
+                                .as_ref()
+                                .map(|err| format!(": {}", err))
+                                .unwrap_or_default()
+                        )
                     }
                 };
 
@@ -277,7 +304,13 @@ impl TunnelClientCertManager {
                     domain,
                     acme_type: _,
                     dns_provider: _,
-                } => build_acme_status(alias, domain, snapshot.acme_manager.as_ref()),
+                    cert_provider,
+                } => build_acme_status(
+                    alias,
+                    domain,
+                    cert_provider.as_deref(),
+                    snapshot.cert_manager.as_ref(),
+                ),
             })
             .collect()
     }
@@ -286,45 +319,38 @@ impl TunnelClientCertManager {
 fn build_acme_status(
     alias: &str,
     domain: &str,
-    acme_manager: Option<&AcmeCertManagerRef>,
+    cert_provider: Option<&str>,
+    cert_manager: Option<&CertManagerRef>,
 ) -> TunnelClientCertStatus {
-    let Some(acme_manager) = acme_manager else {
+    let Some(cert_manager) = cert_manager else {
         return TunnelClientCertStatus {
             alias: alias.to_string(),
             source: TunnelClientCertSource::Acme,
             state: TunnelClientCertState::Error,
             domain: Some(domain.to_string()),
             expires: None,
-            last_error: Some("missing active ACME manager".to_string()),
+            last_error: Some("missing active cert manager".to_string()),
         };
     };
 
-    let Some(cert_stub) = acme_manager.get_cert_by_host(domain) else {
-        return TunnelClientCertStatus {
-            alias: alias.to_string(),
-            source: TunnelClientCertSource::Acme,
-            state: TunnelClientCertState::Error,
-            domain: Some(domain.to_string()),
-            expires: None,
-            last_error: Some("alias not registered in ACME manager".to_string()),
-        };
+    let status = match cert_manager.get_status(cert_provider, domain) {
+        Ok(status) => status,
+        Err(e) => {
+            return TunnelClientCertStatus {
+                alias: alias.to_string(),
+                source: TunnelClientCertSource::Acme,
+                state: TunnelClientCertState::Error,
+                domain: Some(domain.to_string()),
+                expires: None,
+                last_error: Some(e.to_string()),
+            };
+        }
     };
-
-    let material = cert_stub.get_material();
-    let last_error = cert_stub.get_last_error();
-    let state = if material.is_some() {
-        TunnelClientCertState::Ready
-    } else {
-        match cert_stub.get_state() {
-            CertStubState::Pending => {
-                if last_error.is_some() {
-                    TunnelClientCertState::Error
-                } else {
-                    TunnelClientCertState::Pending
-                }
-            }
-            CertStubState::Expired => TunnelClientCertState::Error,
-            CertStubState::Ready | CertStubState::Renewing => TunnelClientCertState::Error,
+    let state = match status.state {
+        CertStatusState::Ready | CertStatusState::Renewing => TunnelClientCertState::Ready,
+        CertStatusState::Pending => TunnelClientCertState::Pending,
+        CertStatusState::Expired | CertStatusState::Error | CertStatusState::Unknown => {
+            TunnelClientCertState::Error
         }
     };
 
@@ -333,8 +359,8 @@ fn build_acme_status(
         source: TunnelClientCertSource::Acme,
         state,
         domain: Some(domain.to_string()),
-        expires: material.map(|material| material.expires),
-        last_error,
+        expires: status.expires,
+        last_error: status.last_error,
     }
 }
 
@@ -502,17 +528,22 @@ fn clone_private_key(key: &PrivateKeyDer<'static>) -> PrivateKeyDer<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cyfs_acme::{AcmeCertManager, CertManagerConfig};
+    use cyfs_acme::{AcmeCertManager, AcmeCertProvider, CertManager, CertManagerConfig};
     use rcgen::generate_simple_self_signed;
     use tempfile::tempdir;
 
-    async fn create_test_acme_manager(dir: &Path) -> AcmeCertManagerRef {
+    async fn create_test_acme_manager(dir: &Path) -> CertManagerRef {
         let config = CertManagerConfig {
             keystore_path: dir.join("acme-store").to_string_lossy().to_string(),
             ..Default::default()
         };
 
-        AcmeCertManager::create(config).await.unwrap()
+        let acme_manager = AcmeCertManager::create(config).await.unwrap();
+        let cert_manager = CertManager::new();
+        cert_manager
+            .add_provider(AcmeCertProvider::new("default", acme_manager))
+            .unwrap();
+        cert_manager
     }
 
     fn write_test_cert_files(
@@ -704,9 +735,10 @@ mod tests {
                     domain: "client.example.com".to_string(),
                     acme_type: ChallengeType::Http01,
                     dns_provider: None,
+                    cert_provider: None,
                 },
             )]),
-            acme_manager: None,
+            cert_manager: None,
         }));
 
         manager.discard_prepared();
@@ -738,9 +770,10 @@ mod tests {
                     domain: "client.example.com".to_string(),
                     acme_type: ChallengeType::Http01,
                     dns_provider: None,
+                    cert_provider: None,
                 },
             )]),
-            acme_manager: None,
+            cert_manager: None,
         }));
         manager.commit_prepared();
 
@@ -753,13 +786,13 @@ mod tests {
         assert_eq!(status.domain.as_deref(), Some("client.example.com"));
         assert_eq!(
             status.last_error.as_deref(),
-            Some("missing active ACME manager")
+            Some("missing active cert manager")
         );
 
         let err = manager.resolve_material("acme_alias").unwrap_err();
         assert!(
             err.to_string()
-                .contains("tunnel client certificate alias acme_alias has no active ACME manager")
+                .contains("tunnel client certificate alias acme_alias has no active cert manager")
         );
     }
 }

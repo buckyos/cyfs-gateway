@@ -763,6 +763,21 @@ impl GatewayConfigParser {
             None => None,
         };
 
+        let cert_providers = json_value
+            .get("cert_providers")
+            .map(|value| {
+                serde_json::from_value::<CertProvidersConfig>(value.clone()).map_err(|e| {
+                    config_err!(
+                        ConfigErrorCode::InvalidConfig,
+                        "invalid cert_providers config: {:?}\n{}",
+                        e,
+                        serde_json::to_string_pretty(value)
+                            .unwrap_or_else(|_| "<invalid json>".to_string())
+                    )
+                })
+            })
+            .transpose()?;
+
         let tls_ca: Option<TlsCA> = match json_value.get("tls_ca") {
             Some(config) => match serde_json::from_value::<TlsCA>(config.clone()) {
                 Ok(config) => Some(config),
@@ -927,6 +942,7 @@ impl GatewayConfigParser {
             raw_config,
             limiters_config,
             acme_config,
+            cert_providers,
             tls_ca,
             tunnel_client_certs,
             stacks,
@@ -954,8 +970,23 @@ pub struct AcmeConfig {
     pub dns_providers: Option<HashMap<String, serde_json::Value>>,
     pub check_interval: Option<u64>,
     pub renew_before_expiry: Option<u64>,
-    #[serde(default)]
-    pub issuers: HashMap<String, AcmeIssuerConfig>,
+}
+
+pub type CertProvidersConfig = HashMap<String, CertProviderConfig>;
+
+#[derive(Deserialize, Clone, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum CertProviderConfig {
+    Acme(AcmeProviderConfig),
+}
+
+#[derive(Deserialize, Clone, Eq, PartialEq)]
+pub struct AcmeProviderConfig {
+    pub account: Option<String>,
+    pub issuer: Option<String>,
+    pub keystore_path: Option<String>,
+    pub check_interval: Option<u64>,
+    pub renew_before_expiry: Option<u64>,
 }
 
 #[derive(Deserialize, Clone, Eq, PartialEq)]
@@ -1002,6 +1033,7 @@ pub struct GatewayConfig {
     pub raw_config: serde_json::Value,
     pub limiters_config: Option<Vec<LimiterConfig>>,
     pub acme_config: Option<AcmeConfig>,
+    pub cert_providers: Option<CertProvidersConfig>,
     pub tls_ca: Option<TlsCA>,
     pub tunnel_client_certs: Option<HashMap<String, TunnelClientCertConfig>>,
     pub stacks: Vec<Arc<dyn StackConfig>>,
@@ -1148,6 +1180,25 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_acme_issuers_rejected() {
+        let parser = super::GatewayConfigParser::new();
+        assert!(parser
+            .parse(json!({
+                "acme": {
+                    "account": "admin@example.com",
+                    "issuers": {
+                        "staging": {
+                            "issuer": "https://acme-staging-v02.api.letsencrypt.org/directory",
+                            "check_interval": 60,
+                            "renew_before_expiry": 120
+                        }
+                    }
+                }
+            }))
+            .is_err());
     }
 
     #[test]

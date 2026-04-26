@@ -1625,10 +1625,7 @@ servers:
 
         let request_url = format!("http://127.0.0.1:{tls_port}/");
         let allowed_client = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(format!(
-                "socks5://127.0.0.1:{allowed_socks_port}"
-            ))
-            .unwrap())
+            .proxy(reqwest::Proxy::all(format!("socks5://127.0.0.1:{allowed_socks_port}")).unwrap())
             .build()
             .unwrap();
         let allowed_response = allowed_client
@@ -1642,10 +1639,7 @@ servers:
         assert_eq!(backend_hits.load(Ordering::SeqCst), 1);
 
         let denied_client = reqwest::Client::builder()
-            .proxy(reqwest::Proxy::all(format!(
-                "socks5://127.0.0.1:{denied_socks_port}"
-            ))
-            .unwrap())
+            .proxy(reqwest::Proxy::all(format!("socks5://127.0.0.1:{denied_socks_port}")).unwrap())
             .build()
             .unwrap();
         let ret = tokio::time::timeout(

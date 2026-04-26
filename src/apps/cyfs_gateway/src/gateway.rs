@@ -17,7 +17,7 @@ use crate::gateway_control_server::{
     GATEWAY_CONTROL_SERVER_KEY,
 };
 use crate::socks::SocksTunnelBuilder;
-use crate::{merge, AcmeConfig, TlsCA};
+use crate::{merge, AcmeConfig, AcmeProviderConfig, CertProviderConfig, TlsCA};
 use anyhow::{anyhow, Result};
 use buckyos_kit::*;
 use chrono::Utc;
@@ -248,7 +248,7 @@ fn build_server_context(
     js_externals: JsExternalsManagerRef,
     tunnel_manager: TunnelManager,
     global_collection_manager: GlobalCollectionManagerRef,
-    acme_mgr: AcmeCertManagerRef,
+    cert_manager: CertManagerRef,
     inner_dns_record_manager: InnerDnsRecordManagerRef,
     control_handler: Weak<dyn GatewayControlCmdHandler>,
     control_token_verifier: Arc<dyn CyfsTokenVerifier>,
@@ -275,7 +275,7 @@ fn build_server_context(
             global_collection_manager,
             SocksTunnelBuilder::new_ref(tunnel_manager),
         ))),
-        "acme_response" => Some(Arc::new(AcmeHttpChallengeServerContext::new(acme_mgr))),
+        "acme_response" => Some(Arc::new(AcmeHttpChallengeServerContext::new(cert_manager))),
         "local_dns" => Some(Arc::new(LocalDnsServerContext::new(None))),
         "control_server" => Some(Arc::new(GatewayControlServerContext::new(
             control_handler,
@@ -295,7 +295,7 @@ fn build_stack_context(
     global_process_chains: Option<GlobalProcessChainsRef>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
     js_externals: Option<JsExternalsManagerRef>,
-    acme_manager: AcmeCertManagerRef,
+    cert_manager: CertManagerRef,
     self_cert_mgr: SelfCertMgrRef,
 ) -> StackResult<Arc<dyn StackContext>> {
     match protocol {
@@ -331,7 +331,7 @@ fn build_stack_context(
             tunnel_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
-            acme_manager.clone(),
+            cert_manager.clone(),
             self_cert_mgr.clone(),
             global_process_chains.clone(),
             global_collection_manager.clone(),
@@ -342,7 +342,7 @@ fn build_stack_context(
             tunnel_manager.clone(),
             limiter_manager.clone(),
             stat_manager.clone(),
-            acme_manager,
+            cert_manager,
             self_cert_mgr,
             global_process_chains.clone(),
             global_collection_manager.clone(),
@@ -561,55 +561,144 @@ pub(crate) async fn run_server_tempalte_pkg(
     Ok(output)
 }
 
-async fn build_acme_mgr_from_config(
-    acme_config: &Option<AcmeConfig>,
-) -> Result<AcmeCertManagerRef> {
-    fn parse_acme_duration(value: Option<u64>) -> Option<chrono::Duration> {
-        value.and_then(|seconds| chrono::Duration::new(seconds as i64, 0))
-    }
+fn parse_acme_duration(value: Option<u64>) -> Option<chrono::Duration> {
+    value.and_then(|seconds| chrono::Duration::new(seconds as i64, 0))
+}
 
+fn build_acme_cert_config(
+    provider_id: &str,
+    provider_config: Option<&AcmeProviderConfig>,
+    acme_config: &Option<AcmeConfig>,
+) -> CertManagerConfig {
     let mut cert_config = CertManagerConfig::default();
-    let data_dir = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+    let data_dir = {
+        let base = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+        if provider_id == "default" {
+            base
+        } else {
+            base.join(provider_id)
+        }
+    };
     let dns_provider_dir = get_buckyos_system_etc_dir()
         .join("cyfs_gateway")
         .join("acme_dns_provider");
+
     cert_config.keystore_path = data_dir.to_string_lossy().to_string();
+    cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
+
     if let Some(acme_config) = acme_config.clone() {
         cert_config.account = acme_config.account;
-        if acme_config.issuer.is_some() {
-            cert_config.acme_server = acme_config.issuer.unwrap();
+        if let Some(issuer) = acme_config.issuer {
+            cert_config.acme_server = issuer;
         }
         cert_config.dns_providers = acme_config.dns_providers;
         if let Some(check_interval) = parse_acme_duration(acme_config.check_interval) {
             cert_config.check_interval = check_interval;
         }
-
         if let Some(renew_before_expiry) = parse_acme_duration(acme_config.renew_before_expiry) {
             cert_config.renew_before_expiry = renew_before_expiry;
         }
+    }
 
-        for (name, issuer_config) in acme_config.issuers {
-            cert_config.issuers.insert(
-                name,
-                CertManagerIssuerConfig {
-                    account: issuer_config.account.or_else(|| cert_config.account.clone()),
-                    acme_server: issuer_config
-                        .issuer
-                        .unwrap_or_else(|| cert_config.acme_server.clone()),
-                    check_interval: parse_acme_duration(issuer_config.check_interval)
-                        .unwrap_or(cert_config.check_interval),
-                    renew_before_expiry: parse_acme_duration(
-                        issuer_config.renew_before_expiry,
-                    )
-                    .unwrap_or(cert_config.renew_before_expiry),
-                },
-            );
+    if let Some(provider_config) = provider_config {
+        if let Some(account) = provider_config.account.clone() {
+            cert_config.account = Some(account);
+        }
+        if let Some(issuer) = provider_config.issuer.clone() {
+            cert_config.acme_server = issuer;
+        }
+        if let Some(keystore_path) = provider_config.keystore_path.clone() {
+            cert_config.keystore_path = keystore_path;
+        }
+        if let Some(check_interval) = parse_acme_duration(provider_config.check_interval) {
+            cert_config.check_interval = check_interval;
+        }
+        if let Some(renew_before_expiry) = parse_acme_duration(provider_config.renew_before_expiry)
+        {
+            cert_config.renew_before_expiry = renew_before_expiry;
         }
     }
-    cert_config.dns_provider_path = Some(dns_provider_dir.to_string_lossy().to_string());
 
-    let cert_manager = AcmeCertManager::create(cert_config).await?;
-    Ok(cert_manager)
+    cert_config
+}
+
+struct BuiltCertManager {
+    manager: CertManagerRef,
+    acme_managers: Vec<AcmeCertManagerRef>,
+}
+
+fn cert_needs_default_acme_provider(cert: &StackCertConfig) -> bool {
+    cert.cert_provider.is_none()
+        && !(cert.cert_path.is_some() && cert.key_path.is_some())
+        && cert.domain != "*"
+}
+
+fn stack_needs_default_acme_provider(stack: &Arc<dyn StackConfig>) -> bool {
+    match stack.stack_protocol() {
+        StackProtocol::Tls => stack
+            .as_ref()
+            .as_any()
+            .downcast_ref::<TlsStackConfig>()
+            .map(|config| config.certs.iter().any(cert_needs_default_acme_provider))
+            .unwrap_or(false),
+        StackProtocol::Quic => stack
+            .as_ref()
+            .as_any()
+            .downcast_ref::<QuicStackConfig>()
+            .map(|config| config.certs.iter().any(cert_needs_default_acme_provider))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn gateway_needs_default_acme_provider(config: &GatewayConfig) -> bool {
+    config.stacks.iter().any(stack_needs_default_acme_provider)
+}
+
+async fn build_cert_manager_from_config(config: &GatewayConfig) -> Result<BuiltCertManager> {
+    let cert_manager = CertManager::new();
+    let mut acme_managers = Vec::new();
+    let needs_default_provider = gateway_needs_default_acme_provider(config);
+    let mut has_default_provider = false;
+
+    if let Some(providers) = config.cert_providers.as_ref() {
+        for (provider_id, provider_config) in providers {
+            match provider_config {
+                CertProviderConfig::Acme(provider_config) => {
+                    if provider_id == "default" {
+                        has_default_provider = true;
+                    }
+                    let cert_config = build_acme_cert_config(
+                        provider_id,
+                        Some(provider_config),
+                        &config.acme_config,
+                    );
+                    let acme_manager = AcmeCertManager::create(cert_config).await?;
+                    cert_manager
+                        .add_provider(AcmeCertProvider::new(provider_id, acme_manager.clone()))?;
+                    acme_managers.push(acme_manager);
+                }
+            }
+        }
+    } else if config.acme_config.is_some() || needs_default_provider {
+        has_default_provider = true;
+        let cert_config = build_acme_cert_config("default", None, &config.acme_config);
+        let acme_manager = AcmeCertManager::create(cert_config).await?;
+        cert_manager.add_provider(AcmeCertProvider::new("default", acme_manager.clone()))?;
+        acme_managers.push(acme_manager);
+    }
+
+    if needs_default_provider && !has_default_provider {
+        let cert_config = build_acme_cert_config("default", None, &config.acme_config);
+        let acme_manager = AcmeCertManager::create(cert_config).await?;
+        cert_manager.add_provider(AcmeCertProvider::new("default", acme_manager.clone()))?;
+        acme_managers.push(acme_manager);
+    }
+
+    Ok(BuiltCertManager {
+        manager: cert_manager,
+        acme_managers,
+    })
 }
 
 async fn build_self_cert_mgr_from_config(tls_ca: &Option<TlsCA>) -> Result<SelfCertMgrRef> {
@@ -627,14 +716,41 @@ async fn build_self_cert_mgr_from_config(tls_ca: &Option<TlsCA>) -> Result<SelfC
 fn prepare_tunnel_client_cert_manager(
     tunnel_manager: &TunnelManager,
     config: &GatewayConfig,
-    acme_manager: AcmeCertManagerRef,
+    cert_manager: CertManagerRef,
     base_dir: &Path,
 ) -> Result<TunnelClientCertManagerRef> {
     let manager = tunnel_manager.client_cert_manager();
     manager
-        .prepare_reload(config.tunnel_client_certs.as_ref(), acme_manager, base_dir)
+        .prepare_reload(config.tunnel_client_certs.as_ref(), cert_manager, base_dir)
         .map_err(|e| anyhow!("prepare tunnel_client_certs failed: {}", e))?;
     Ok(manager)
+}
+
+fn register_local_dns_provider(
+    acme_managers: &[AcmeCertManagerRef],
+    inner_dns_record_manager: &InnerDnsRecordManagerRef,
+) {
+    for acme_manager in acme_managers {
+        let record_manager = inner_dns_record_manager.clone();
+        acme_manager.register_dns_provider(
+            "local",
+            move |op: String, domain: String, key_hash: String| {
+                let record_manager = record_manager.clone();
+                async move {
+                    if op == "add_challenge" {
+                        record_manager
+                            .add_record(domain, "TXT", key_hash)
+                            .map_err(|e| anyhow!(e.to_string()))
+                    } else if op == "del_challenge" {
+                        record_manager.remove_record(domain, "TXT");
+                        Ok(())
+                    } else {
+                        Err(anyhow!("Unsupported op: {}", op))
+                    }
+                }
+            },
+        );
+    }
 }
 
 struct PreparedTunnelClientCertGuard {
@@ -807,27 +923,10 @@ impl GatewayFactory {
             AcmeSnProviderFactory::new(sn_acme_data),
         );
 
-        let cert_manager = build_acme_mgr_from_config(&config.acme_config).await?;
+        let built_cert_manager = build_cert_manager_from_config(&config).await?;
+        let cert_manager = built_cert_manager.manager;
         let inner_dns_record_manager = InnerDnsRecordManager::new();
-        let record_manager = inner_dns_record_manager.clone();
-        cert_manager.register_dns_provider(
-            "local",
-            move |op: String, domain: String, key_hash: String| {
-                let record_manager = record_manager.clone();
-                async move {
-                    if op == "add_challenge" {
-                        record_manager
-                            .add_record(domain, "TXT", key_hash)
-                            .map_err(|e| anyhow!(e.to_string()))
-                    } else if op == "del_challenge" {
-                        record_manager.remove_record(domain, "TXT");
-                        Ok(())
-                    } else {
-                        Err(anyhow!("Unsupported op: {}", op))
-                    }
-                }
-            },
-        );
+        register_local_dns_provider(&built_cert_manager.acme_managers, &inner_dns_record_manager);
 
         let self_cert_manager = build_self_cert_mgr_from_config(&config.tls_ca).await?;
 
@@ -2862,27 +2961,10 @@ impl Gateway {
         limiter_manager.retain(Box::new(move |id, _| exist_limters.contains(id)));
         let limiter_manager = Arc::new(limiter_manager);
 
-        let cert_manager = build_acme_mgr_from_config(&config.acme_config).await?;
+        let built_cert_manager = build_cert_manager_from_config(&config).await?;
+        let cert_manager = built_cert_manager.manager;
         let inner_dns_record_manager = InnerDnsRecordManager::new();
-        let record_manager = inner_dns_record_manager.clone();
-        cert_manager.register_dns_provider(
-            "local",
-            move |op: String, domain: String, key_hash: String| {
-                let record_manager = record_manager.clone();
-                async move {
-                    if op == "add_challenge" {
-                        record_manager
-                            .add_record(domain, "TXT", key_hash)
-                            .map_err(|e| anyhow!(e.to_string()))
-                    } else if op == "del_challenge" {
-                        record_manager.remove_record(domain, "TXT");
-                        Ok(())
-                    } else {
-                        Err(anyhow!("Unsupported op: {}", op))
-                    }
-                }
-            },
-        );
+        register_local_dns_provider(&built_cert_manager.acme_managers, &inner_dns_record_manager);
 
         let self_cert_manager = build_self_cert_mgr_from_config(&config.tls_ca).await?;
 

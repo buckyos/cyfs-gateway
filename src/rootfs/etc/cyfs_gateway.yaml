@@ -42,6 +42,19 @@
 #      device_config_path: ***
 #   check_interval: 43200          # certificate check interval (seconds), default 12h
 #   renew_before_expiry: 2592000   # renew ahead of expiry (seconds), default 30d
+#
+# cert_providers:                  # certificate application providers (optional)
+#   letsencrypt:
+#     type: acme
+#     account: "admin@example.com"  # overrides acme.account
+#     issuer: "https://acme-v02.api.letsencrypt.org/directory"
+#     check_interval: 43200
+#     renew_before_expiry: 2592000
+#   zerossl:
+#     type: acme
+#     account: "ops@example.com"
+#     issuer: "https://acme.zerossl.com/v2/DV90"
+# Note: DNS-01 provider credentials remain under acme.dns_providers.
 
 # tls_ca:             # self-signed/CA certificate config (optional)
 #   cert_path: ./ca.crt
@@ -142,6 +155,7 @@ stacks:
     #       cert_path: ./cert.pem
     #       key_path: ./key.pem
     #     - domain: example.org # ACME certificate
+    #       cert_provider: letsencrypt # optional if only one cert provider is configured
     #       acme_type: optional, default tls-alpn-01, supports dns-01 | http-01 | tls-alpn-01
     #     - domain: * # local default certificate; all connections through this stack use certs generated from the local root, configured via tls_ca
     #   hook_point: { }
@@ -158,6 +172,7 @@ stacks:
     #       cert_path: ./cert.pem
     #       key_path: ./key.pem
     #     - domain: example.org # ACME certificate
+    #       cert_provider: letsencrypt # optional if only one cert provider is configured
     #       acme_type: optional, default tls-alpn-01, supports dns-01 | http-01 | tls-alpn-01
     #     - domain: * # local default certificate; all connections through this stack use certs generated from the local root, configured via tls_ca
     #   hook_point: { }

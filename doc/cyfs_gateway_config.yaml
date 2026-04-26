@@ -22,10 +22,35 @@
 #      device_config_path: ***
 #   check_interval: 43200          # 证书检查周期（秒），默认 12h
 #   renew_before_expiry: 2592000   # 提前续期时间（秒），默认 30d
+#   issuers:                       # 可选：命名 issuer；stack cert 和 tunnel_client_certs 可通过 acme_issuer 选择
+#     staging:
+#       account: "mailto:staging@example.com"
+#       issuer: "https://acme-staging-v02.api.letsencrypt.org/directory"
+#       check_interval: 43200
+#       renew_before_expiry: 2592000
 
 # tls_ca:             # 自签名/CA 证书配置（可选）
 #   cert_path: ./ca.crt
 #   key_path: ./ca.key
+
+# tunnel_client_certs: # 出站 TLS/QUIC 隧道客户端证书（可选）
+#   partner_a:
+#     type: local
+#     cert_path: ./certs/partner_a/fullchain.pem
+#     key_path: ./certs/partner_a/key.pem
+#   wildcard_dns:
+#     type: acme
+#     domain: "*.partner.example.com"
+#     acme_type: dns-01
+#     dns_provider: aliyun
+#   device_http:
+#     type: acme
+#     domain: "client-http.example.com"
+#     acme_type: http-01
+#   # 注意：
+#   # - type: acme 复用顶层 acme 配置
+#   # - wildcard 仅允许 dns-01
+#   # - http-01 / tls-alpn-01 需要正确暴露入站 challenge 路径
 
 # 限流器配置（可选，空对象表示不启用）
 # limiters:
@@ -113,6 +138,9 @@ stacks:
   #       key_path: ./key.pem
   #     - domain: example.org #配置 acme证书
   #       acme_type: 可缺省，默认使用tls-alpn-01，支持dns-01 | http-01 | tls-alpn-01
+  #       acme_issuer: staging   # 可选，使用顶层 acme.issuers 中的命名 issuer
+  #       data:
+  #         dns_provider: aliyun # dns-01 时通过 data 传入 challenge solver 参数
   #     - domain: * #本地缺省证书，所有通过该stack的连接都会使用本地根证书生成对应的证书，根证书可以通过tls_ca字段配置
   #   hook_point: { }
 
@@ -127,6 +155,9 @@ stacks:
   #       key_path: ./key.pem
   #     - domain: example.org #配置 acme证书
   #       acme_type: 可缺省，默认使用tls-alpn-01，支持dns-01 | http-01 | tls-alpn-01
+  #       acme_issuer: staging   # 可选，使用顶层 acme.issuers 中的命名 issuer
+  #       data:
+  #         dns_provider: aliyun # dns-01 时通过 data 传入 challenge solver 参数
   #     - domain: * #本地缺省证书，所有通过该stack的连接都会使用本地根证书生成对应的证书，根证书可以通过tls_ca字段配置
   #   hook_point: { }
 
@@ -191,6 +222,11 @@ servers:
   # local_dns_example:
   #   type: local_dns
   #   file_path: ./local_dns.toml
+
+  # acme_response_example:
+  #   type: acme_response
+  #   # 用于 http-01 challenge 的内建响应 server
+  #   # 需要配合 tcp/tls/http 路由把 /.well-known/acme-challenge/ 暴露到公网
 
   # sn_example:
   #   type: sn
