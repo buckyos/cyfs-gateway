@@ -1643,6 +1643,53 @@ impl SNServer {
         return None;
     }
 
+    async fn user_exists_for_host_resolution(&self, username: &str) -> bool {
+        match self.db.get_user_info(username).await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                warn!(
+                    "get user info error for host resolution {}: {}",
+                    username, e
+                );
+                false
+            }
+        }
+    }
+
+    // Resolve web3 hosts using DB state only for dash-separated names. This avoids
+    // treating usernames like "wqs-vps-us" as legacy "subhost-username" hosts.
+    async fn resolve_user_subhost_from_host(&self, host: &str) -> Option<(String, String)> {
+        let end_string = format!(".web3.{}", self.server_host);
+        if !host.ends_with(&end_string) {
+            return None;
+        }
+
+        let sub_name = host[0..host.len() - end_string.len()].to_string();
+        if sub_name.contains(".") {
+            let username = sub_name.split(".").last()?.to_string();
+            return Some((sub_name, username));
+        }
+
+        if !sub_name.contains("-") {
+            return Some((sub_name.clone(), sub_name));
+        }
+
+        if self.user_exists_for_host_resolution(&sub_name).await {
+            return Some((sub_name.clone(), sub_name));
+        }
+
+        let parts: Vec<&str> = sub_name.split("-").collect();
+        for start in 1..parts.len() {
+            let username = parts[start..].join("-");
+            if self.user_exists_for_host_resolution(&username).await {
+                return Some((sub_name.clone(), username));
+            }
+        }
+
+        SNServer::get_user_subhost_from_host(host, &self.server_host)
+    }
+
     async fn get_user_zonegate_address_by_domain(
         &self,
         domain: &str,
@@ -2402,7 +2449,7 @@ impl SNServer {
     }
 
     pub(crate) async fn query_device_by_hostname_v2(&self, req_host: &str) -> Option<OODInfo> {
-        let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
+        let get_result = self.resolve_user_subhost_from_host(req_host).await;
         if get_result.is_some() {
             let (sub_host, username) = get_result.unwrap();
             let user_info = self.db.get_user_info(username.as_str()).await;
@@ -3306,7 +3353,7 @@ impl SNServer {
             }
         }
 
-        let get_result = SNServer::get_user_subhost_from_host(&req_real_name, &self.server_host);
+        let get_result = self.resolve_user_subhost_from_host(&req_real_name).await;
         if get_result.is_some() {
             let (sub_host, username) = get_result.unwrap();
 
@@ -3901,6 +3948,58 @@ mod tests {
             SNServer::get_user_subhost_from_host(&req_host, &server_host).unwrap();
         assert_eq!(sub_host, "alice".to_string());
         assert_eq!(username, "alice".to_string());
+    }
+
+    async fn register_test_user(server: &SNServer, username: &str) {
+        server
+            .db
+            .register_user_directly(username, "pk", "{}", None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_subhost_prefers_full_dash_username() {
+        let server = create_test_sn_server().await;
+        register_test_user(&server, "wqs-vps-us").await;
+        register_test_user(&server, "us").await;
+
+        let (sub_host, username) = server
+            .resolve_user_subhost_from_host("wqs-vps-us.web3.buckyos.ai")
+            .await
+            .unwrap();
+
+        assert_eq!(sub_host, "wqs-vps-us");
+        assert_eq!(username, "wqs-vps-us");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_subhost_keeps_legacy_dash_subhost() {
+        let server = create_test_sn_server().await;
+        register_test_user(&server, "lzc").await;
+
+        let (sub_host, username) = server
+            .resolve_user_subhost_from_host("buckyos-filebrowser-lzc.web3.buckyos.ai")
+            .await
+            .unwrap();
+
+        assert_eq!(sub_host, "buckyos-filebrowser-lzc");
+        assert_eq!(username, "lzc");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_subhost_uses_longest_existing_dash_suffix() {
+        let server = create_test_sn_server().await;
+        register_test_user(&server, "wqs-vps-us").await;
+        register_test_user(&server, "us").await;
+
+        let (sub_host, username) = server
+            .resolve_user_subhost_from_host("home-wqs-vps-us.web3.buckyos.ai")
+            .await
+            .unwrap();
+
+        assert_eq!(sub_host, "home-wqs-vps-us");
+        assert_eq!(username, "wqs-vps-us");
     }
 
     #[test]
