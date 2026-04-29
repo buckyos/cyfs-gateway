@@ -43,6 +43,7 @@ use serde_json::{json, Map, Value};
 use sfo_js::object::builtins::JsArray;
 use sfo_js::{JsEngine, JsPkg, JsPkgManager, JsPkgManagerRef, JsString, JsValue, NativeFunction};
 use sha2::Digest;
+use std::fs;
 use tokio::fs::create_dir_all;
 use url::Url;
 
@@ -576,6 +577,44 @@ fn build_cert_provider_store_root(provider_id: &str) -> PathBuf {
     }
 }
 
+fn load_js_extend_cert_provider_params(
+    provider_id: &str,
+    provider_config: &JsExtendCertProviderConfig,
+) -> Result<Value> {
+    if let Some(params_path) = provider_config.params_path.as_ref() {
+        let content = fs::read_to_string(params_path).map_err(|err| {
+            anyhow!(
+                "read js_extend cert provider {} params_path {} failed: {}",
+                provider_id,
+                params_path,
+                err
+            )
+        })?;
+        let params = serde_yaml_ng::from_str::<Value>(&content).map_err(|err| {
+            anyhow!(
+                "parse js_extend cert provider {} params_path {} failed: {}",
+                provider_id,
+                params_path,
+                err
+            )
+        })?;
+        if !params.is_object() {
+            return Err(anyhow!(
+                "js_extend cert provider {} params_path {} must contain a JSON object",
+                provider_id,
+                params_path
+            ));
+        }
+        return Ok(params);
+    }
+
+    if provider_config.params.is_null() {
+        Ok(json!({}))
+    } else {
+        Ok(provider_config.params.clone())
+    }
+}
+
 fn build_acme_cert_config(
     provider_id: &str,
     provider_config: Option<&AcmeProviderConfig>,
@@ -649,7 +688,7 @@ fn build_js_extend_cert_provider_config(
             .unwrap_or(defaults.check_interval),
         renew_before_expiry: parse_acme_duration(provider_config.renew_before_expiry)
             .unwrap_or(defaults.renew_before_expiry),
-        params: provider_config.params.clone(),
+        params: load_js_extend_cert_provider_params(provider_id, provider_config)?,
     })
 }
 
@@ -4182,7 +4221,7 @@ mod tests {
     use super::super::gateway::*;
     use chrono::Utc;
     use kRPC::RPCSessionToken;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::io::{Read, Write};
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -4238,6 +4277,41 @@ mod tests {
                 .unwrap();
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_build_js_extend_cert_provider_config_loads_params_path() {
+        let mut params_file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            params_file,
+            "endpoint: https://ca.example.com\ntoken: secret\n"
+        )
+        .unwrap();
+
+        let provider_config = JsExtendCertProviderConfig {
+            script_path: None,
+            script_name: Some("my-ca".to_string()),
+            check_interval: None,
+            renew_before_expiry: None,
+            params_path: Some(params_file.path().to_string_lossy().to_string()),
+            params: Value::Null,
+        };
+
+        let runtime_config =
+            build_js_extend_cert_provider_config("custom-js", &provider_config).unwrap();
+        assert_eq!(runtime_config.params["endpoint"], "https://ca.example.com");
+        assert_eq!(runtime_config.params["token"], "secret");
+
+        let mut invalid_params_file = tempfile::NamedTempFile::new().unwrap();
+        write!(invalid_params_file, "[]").unwrap();
+
+        let invalid_provider_config = JsExtendCertProviderConfig {
+            params_path: Some(invalid_params_file.path().to_string_lossy().to_string()),
+            ..provider_config
+        };
+        assert!(
+            build_js_extend_cert_provider_config("custom-js", &invalid_provider_config).is_err()
+        );
     }
 
     #[tokio::test]

@@ -998,6 +998,7 @@ pub struct JsExtendCertProviderConfig {
     pub script_name: Option<String>,
     pub check_interval: Option<u64>,
     pub renew_before_expiry: Option<u64>,
+    pub params_path: Option<String>,
     #[serde(default)]
     pub params: serde_json::Value,
 }
@@ -1008,6 +1009,18 @@ impl JsExtendCertProviderConfig {
             return Err(
                 "js_extend cert provider requires exactly one of script_path or script_name"
                     .to_string(),
+            );
+        }
+        if self
+            .params_path
+            .as_ref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            return Err("js_extend cert provider params_path must not be empty".to_string());
+        }
+        if self.params_path.is_some() && !self.params.is_null() {
+            return Err(
+                "js_extend cert provider requires at most one of params or params_path".to_string(),
             );
         }
         Ok(())
@@ -1256,7 +1269,55 @@ mod tests {
                 assert_eq!(config.script_path, None);
                 assert_eq!(config.check_interval, Some(60));
                 assert_eq!(config.renew_before_expiry, Some(120));
+                assert_eq!(config.params_path, None);
                 assert_eq!(config.params["token"], "secret");
+            }
+            _ => panic!("expected js_extend provider"),
+        }
+
+        let config = parser
+            .parse(json!({
+                "cert_providers": {
+                    "custom-js": {
+                        "type": "js_extend",
+                        "script_name": "my-ca",
+                        "params_path": "./params.yaml"
+                    }
+                }
+            }))
+            .unwrap();
+
+        let providers = config.cert_providers.unwrap();
+        let provider = providers.get("custom-js").unwrap();
+        match provider {
+            CertProviderConfig::JsExtend(config) => {
+                config.validate().unwrap();
+                assert_eq!(config.params_path.as_deref(), Some("./params.yaml"));
+                assert!(config.params.is_null());
+            }
+            _ => panic!("expected js_extend provider"),
+        }
+
+        let config = parser
+            .parse(json!({
+                "cert_providers": {
+                    "custom-js": {
+                        "type": "js_extend",
+                        "script_name": "my-ca",
+                        "params_path": "./params.yaml",
+                        "params": {
+                            "token": "secret"
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+
+        let providers = config.cert_providers.unwrap();
+        let provider = providers.get("custom-js").unwrap();
+        match provider {
+            CertProviderConfig::JsExtend(config) => {
+                assert!(config.validate().is_err());
             }
             _ => panic!("expected js_extend provider"),
         }
