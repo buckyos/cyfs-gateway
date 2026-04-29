@@ -1,3 +1,4 @@
+use crate::forward::{ForwardFailureRegistry, ForwardPlan, NextUpstreamCondition};
 use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
 use crate::stack::get_limit_info;
 use crate::stack::limiter::Limiter;
@@ -295,30 +296,174 @@ impl UdpDatagramHandler {
 
                     let cmd = list[0].as_str();
                     match cmd {
-                        "forward" => {
+                        "forward" | "forward-group" => {
                             if list.len() < 2 {
                                 return Err(stack_err!(
                                     StackErrorCode::InvalidConfig,
-                                    "invalid server command"
+                                    "invalid {} command",
+                                    list[0]
                                 ));
                             }
 
-                            let target = list[1].as_str();
-                            let url = Url::parse(target).map_err(into_stack_err!(
-                                StackErrorCode::InvalidConfig,
-                                "invalid forward url {}",
-                                target
-                            ))?;
-                            let forward = self
-                                .env
-                                .tunnel_manager
-                                .create_datagram_client_by_url(&url)
-                                .await
-                                .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
-                            forward.send_datagram(&data[..len]).await.map_err(|e| {
-                                println!("send datagram error: {}", e);
-                                stack_err!(StackErrorCode::TunnelError)
-                            })?;
+                            let (target, forward) = if cmd == "forward" {
+                                let target = list[1].to_string();
+                                let url = Url::parse(target.as_str()).map_err(into_stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid forward url {}",
+                                    target
+                                ))?;
+                                let forward = self
+                                    .env
+                                    .tunnel_manager
+                                    .create_datagram_client_by_url(&url)
+                                    .await
+                                    .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
+                                forward.send_datagram(&data[..len]).await.map_err(|e| {
+                                    println!("send datagram error: {}", e);
+                                    stack_err!(StackErrorCode::TunnelError)
+                                })?;
+                                (target, forward)
+                            } else {
+                                let plan =
+                                    ForwardPlan::decode(list[1].as_str()).map_err(|e| {
+                                        stack_err!(
+                                            StackErrorCode::InvalidConfig,
+                                            "invalid forward plan: {}",
+                                            e
+                                        )
+                                    })?;
+                                let registry = ForwardFailureRegistry::global();
+                                let group_key = plan.failure_state_key();
+                                let policy = &plan.next_upstream;
+                                let candidate_count = plan.candidates.len();
+                                let max_attempts = if !policy.is_enabled() {
+                                    candidate_count.min(1).max(1)
+                                } else if policy.tries == 0 {
+                                    candidate_count
+                                } else {
+                                    (policy.tries as usize).min(candidate_count)
+                                };
+                                let mut last_err: Option<StackError> = None;
+                                let mut chosen: Option<(String, Box<dyn DatagramClientBox>)> = None;
+                                for (idx, candidate) in plan.candidates.iter().enumerate() {
+                                    if idx >= max_attempts {
+                                        break;
+                                    }
+                                    let url = match Url::parse(candidate.url.as_str()) {
+                                        Ok(u) => u,
+                                        Err(e) => {
+                                            last_err = Some(stack_err!(
+                                                StackErrorCode::InvalidConfig,
+                                                "invalid forward url {}: {}",
+                                                candidate.url,
+                                                e
+                                            ));
+                                            registry.record_failure(
+                                                &group_key,
+                                                &candidate.url,
+                                                candidate.max_fails,
+                                                candidate.fail_timeout,
+                                            );
+                                            if !policy.is_enabled()
+                                                || !policy.allows(NextUpstreamCondition::Error)
+                                                || idx + 1 >= max_attempts
+                                            {
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                    };
+                                    match self
+                                        .env
+                                        .tunnel_manager
+                                        .create_datagram_client_by_url(&url)
+                                        .await
+                                    {
+                                        Ok(client) => {
+                                            match client.send_datagram(&data[..len]).await {
+                                                Ok(_) => {
+                                                    registry.record_success(
+                                                        &group_key,
+                                                        &candidate.url,
+                                                    );
+                                                    chosen =
+                                                        Some((candidate.url.clone(), client));
+                                                    break;
+                                                }
+                                                Err(e) => {
+                                                    let err = stack_err!(
+                                                        StackErrorCode::TunnelError,
+                                                        "send to {} failed: {}",
+                                                        candidate.url,
+                                                        e
+                                                    );
+                                                    log::debug!(
+                                                        "forward-group {}: udp candidate {} idx={} send failed: {}",
+                                                        group_key,
+                                                        candidate.url,
+                                                        idx,
+                                                        err
+                                                    );
+                                                    registry.record_failure(
+                                                        &group_key,
+                                                        &candidate.url,
+                                                        candidate.max_fails,
+                                                        candidate.fail_timeout,
+                                                    );
+                                                    last_err = Some(err);
+                                                    if !policy.is_enabled()
+                                                        || !policy.allows(
+                                                            NextUpstreamCondition::Error,
+                                                        )
+                                                        || idx + 1 >= max_attempts
+                                                    {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let err = stack_err!(
+                                                StackErrorCode::TunnelError,
+                                                "create datagram client {} failed: {}",
+                                                candidate.url,
+                                                e
+                                            );
+                                            log::debug!(
+                                                "forward-group {}: udp candidate {} idx={} create failed: {}",
+                                                group_key,
+                                                candidate.url,
+                                                idx,
+                                                err
+                                            );
+                                            registry.record_failure(
+                                                &group_key,
+                                                &candidate.url,
+                                                candidate.max_fails,
+                                                candidate.fail_timeout,
+                                            );
+                                            last_err = Some(err);
+                                            if !policy.is_enabled()
+                                                || !policy.allows(NextUpstreamCondition::Error)
+                                                || idx + 1 >= max_attempts
+                                            {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                let (target, forward) = chosen.ok_or_else(|| {
+                                    last_err.unwrap_or_else(|| {
+                                        stack_err!(
+                                            StackErrorCode::TunnelError,
+                                            "forward-group {} exhausted datagram candidates",
+                                            group_key
+                                        )
+                                    })
+                                })?;
+                                (target, forward)
+                            };
+                            let target = target.as_str();
                             speed_stat.add_read_data_size(len as u64);
 
                             let forward_recv = forward.clone();

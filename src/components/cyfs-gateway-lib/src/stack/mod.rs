@@ -44,6 +44,9 @@ pub enum StackErrorCode {
 }
 pub type StackResult<T> = sfo_result::Result<T, StackErrorCode>;
 pub type StackError = sfo_result::Error<StackErrorCode>;
+use crate::forward::{
+    ForwardFailureRegistry, ForwardPlan, NextUpstreamCondition, NextUpstreamPolicy,
+};
 use crate::{DatagramClientBox, TunnelManager};
 pub use sfo_result::err as stack_err;
 pub use sfo_result::into_err as into_stack_err;
@@ -118,6 +121,139 @@ pub async fn stream_forward(
     Ok(())
 }
 
+/// Walk the candidate list of a `ForwardPlan` until we successfully open a
+/// stream tunnel, then run `copy_bidirectional`. Retries are connection-stage
+/// only — once a candidate has been opened we never silently fail over.
+///
+/// Implements §6.4 of `forward机制升级需求.md`.
+pub async fn stream_forward_group(
+    stream: Box<dyn AsyncStream>,
+    plan: &ForwardPlan,
+    tunnel_manager: &TunnelManager,
+    info: Option<&crate::StreamInfo>,
+) -> StackResult<()> {
+    let registry = ForwardFailureRegistry::global();
+    let group_key = plan.failure_state_key();
+    let policy = &plan.next_upstream;
+    let max_attempts = policy_max_attempts(policy, plan.candidates.len());
+
+    let mut last_err: Option<StackError> = None;
+    let mut last_target_url: Option<String> = None;
+    let mut chosen: Option<(usize, Box<dyn AsyncStream>, String, bool)> = None;
+
+    for (idx, candidate) in plan.candidates.iter().enumerate() {
+        if idx >= max_attempts {
+            break;
+        }
+
+        let url = match Url::parse(&candidate.url) {
+            Ok(u) => u,
+            Err(e) => {
+                let err = stack_err!(
+                    StackErrorCode::InvalidConfig,
+                    "invalid forward url {}: {}",
+                    candidate.url,
+                    e
+                );
+                last_err = Some(err);
+                last_target_url = Some(candidate.url.clone());
+                registry.record_failure(
+                    &group_key,
+                    &candidate.url,
+                    candidate.max_fails,
+                    candidate.fail_timeout,
+                );
+                if !should_continue(policy, idx, max_attempts, NextUpstreamCondition::Error) {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let emit_proxy_v2 = url
+            .query_pairs()
+            .any(|(k, v)| k == "proxy_protocol" && v.eq_ignore_ascii_case("v2"));
+
+        match tunnel_manager.open_stream_by_url(&url).await {
+            Ok(forward_stream) => {
+                registry.record_success(&group_key, &candidate.url);
+                chosen = Some((idx, forward_stream, candidate.url.clone(), emit_proxy_v2));
+                break;
+            }
+            Err(e) => {
+                let err = stack_err!(
+                    StackErrorCode::TunnelError,
+                    "open upstream {} failed: {}",
+                    candidate.url,
+                    e
+                );
+                log::debug!(
+                    "forward-group {}: candidate {} (idx {}) failed to open: {}",
+                    group_key,
+                    candidate.url,
+                    idx,
+                    err
+                );
+                registry.record_failure(
+                    &group_key,
+                    &candidate.url,
+                    candidate.max_fails,
+                    candidate.fail_timeout,
+                );
+                last_err = Some(err);
+                last_target_url = Some(candidate.url.clone());
+                if !should_continue(policy, idx, max_attempts, NextUpstreamCondition::Error) {
+                    break;
+                }
+            }
+        }
+    }
+
+    let (idx, mut forward_stream, target_url, emit_proxy_v2) = match chosen {
+        Some(v) => v,
+        None => {
+            return Err(last_err.unwrap_or_else(|| {
+                stack_err!(
+                    StackErrorCode::TunnelError,
+                    "forward-group {} exhausted candidates",
+                    group_key
+                )
+            }));
+        }
+    };
+
+    log::debug!(
+        "forward-group {}: selected candidate idx={} url={}",
+        group_key,
+        idx,
+        target_url
+    );
+
+    let mut stream = stream;
+    if emit_proxy_v2 {
+        if let Some(info) = info {
+            let src_addr = info.src_addr.as_deref();
+            let dst_addr = info.dst_addr.as_deref();
+            let _ = proxy_protocol::write_proxy_v2_preamble(
+                &mut forward_stream,
+                src_addr,
+                dst_addr,
+            )
+            .await?;
+        }
+    }
+
+    tokio::io::copy_bidirectional(&mut stream, forward_stream.as_mut())
+        .await
+        .map_err(into_stack_err!(
+            StackErrorCode::StreamError,
+            "target {target_url}"
+        ))?;
+
+    let _ = last_target_url; // suppress unused
+    Ok(())
+}
+
 pub async fn datagram_forward(
     datagram: Box<dyn DatagramClientBox>,
     target: &str,
@@ -137,6 +273,129 @@ pub async fn datagram_forward(
         .await
         .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
     Ok(())
+}
+
+/// Walk the candidate list of a `ForwardPlan` for datagram forwarding.
+/// Connection-stage retry only: once a datagram client has been created, a
+/// failure inside `copy_datagram_bidirectional` is propagated, never retried
+/// transparently. Implements §6.5.
+pub async fn datagram_forward_group(
+    datagram: Box<dyn DatagramClientBox>,
+    plan: &ForwardPlan,
+    tunnel_manager: &TunnelManager,
+) -> StackResult<()> {
+    let registry = ForwardFailureRegistry::global();
+    let group_key = plan.failure_state_key();
+    let policy = &plan.next_upstream;
+    let max_attempts = policy_max_attempts(policy, plan.candidates.len());
+
+    let mut last_err: Option<StackError> = None;
+    let mut chosen: Option<(usize, Box<dyn DatagramClientBox>, String)> = None;
+
+    for (idx, candidate) in plan.candidates.iter().enumerate() {
+        if idx >= max_attempts {
+            break;
+        }
+        let url = match Url::parse(&candidate.url) {
+            Ok(u) => u,
+            Err(e) => {
+                let err = stack_err!(
+                    StackErrorCode::InvalidConfig,
+                    "invalid forward url {}: {}",
+                    candidate.url,
+                    e
+                );
+                last_err = Some(err);
+                registry.record_failure(
+                    &group_key,
+                    &candidate.url,
+                    candidate.max_fails,
+                    candidate.fail_timeout,
+                );
+                if !should_continue(policy, idx, max_attempts, NextUpstreamCondition::Error) {
+                    break;
+                }
+                continue;
+            }
+        };
+        match tunnel_manager.create_datagram_client_by_url(&url).await {
+            Ok(client) => {
+                registry.record_success(&group_key, &candidate.url);
+                chosen = Some((idx, client, candidate.url.clone()));
+                break;
+            }
+            Err(e) => {
+                let err = stack_err!(
+                    StackErrorCode::TunnelError,
+                    "create datagram client {} failed: {}",
+                    candidate.url,
+                    e
+                );
+                log::debug!(
+                    "forward-group {}: datagram candidate {} (idx {}) failed: {}",
+                    group_key,
+                    candidate.url,
+                    idx,
+                    err
+                );
+                registry.record_failure(
+                    &group_key,
+                    &candidate.url,
+                    candidate.max_fails,
+                    candidate.fail_timeout,
+                );
+                last_err = Some(err);
+                if !should_continue(policy, idx, max_attempts, NextUpstreamCondition::Error) {
+                    break;
+                }
+            }
+        }
+    }
+
+    let (_idx, forward_datagram, _target) = match chosen {
+        Some(v) => v,
+        None => {
+            return Err(last_err.unwrap_or_else(|| {
+                stack_err!(
+                    StackErrorCode::TunnelError,
+                    "forward-group {} exhausted datagram candidates",
+                    group_key
+                )
+            }));
+        }
+    };
+
+    copy_datagram_bidirectional(datagram, forward_datagram)
+        .await
+        .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
+    Ok(())
+}
+
+fn policy_max_attempts(policy: &NextUpstreamPolicy, candidate_count: usize) -> usize {
+    if !policy.is_enabled() {
+        return candidate_count.min(1).max(1);
+    }
+    let tries = policy.tries as usize;
+    if tries == 0 {
+        candidate_count
+    } else {
+        tries.min(candidate_count)
+    }
+}
+
+fn should_continue(
+    policy: &NextUpstreamPolicy,
+    attempted_idx: usize,
+    max_attempts: usize,
+    cond: NextUpstreamCondition,
+) -> bool {
+    if !policy.is_enabled() {
+        return false;
+    }
+    if !policy.allows(cond) {
+        return false;
+    }
+    attempted_idx + 1 < max_attempts
 }
 
 #[allow(unreachable_code)]

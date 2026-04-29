@@ -1,7 +1,8 @@
 use super::{
     Stack, get_limit_info, get_source_addr_from_req_env, probe_proxy_protocol_stream,
-    stream_forward,
+    stream_forward, stream_forward_group,
 };
+use crate::forward::ForwardPlan;
 
 #[cfg(target_os = "linux")]
 use super::{has_root_privileges, set_socket_opt};
@@ -259,6 +260,38 @@ impl TcpConnectionHandler {
                             stream_forward(
                                 stream,
                                 target,
+                                &self.env.tunnel_manager,
+                                Some(&stream_info),
+                            )
+                            .await?;
+                        }
+                        "forward-group" => {
+                            if list.len() < 2 {
+                                return Err(stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid forward-group command"
+                                ));
+                            }
+                            let plan =
+                                ForwardPlan::decode(list[1].as_str()).map_err(|e| {
+                                    stack_err!(
+                                        StackErrorCode::InvalidConfig,
+                                        "invalid forward plan: {}",
+                                        e
+                                    )
+                                })?;
+                            let stream = if limiter.is_some() {
+                                let (read_limit, write_limit) =
+                                    limiter.as_ref().unwrap().new_limit_session();
+                                let limit_stream =
+                                    LimitStream::new(stream, read_limit, write_limit);
+                                Box::new(limit_stream)
+                            } else {
+                                stream
+                            };
+                            stream_forward_group(
+                                stream,
+                                &plan,
                                 &self.env.tunnel_manager,
                                 Some(&stream_info),
                             )

@@ -10,7 +10,11 @@ use crate::global_process_chains::{
 };
 use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
-use crate::stack::{TlsCertResolver, get_limit_info, probe_proxy_protocol_stream, stream_forward};
+use crate::forward::ForwardPlan;
+use crate::stack::{
+    TlsCertResolver, get_limit_info, probe_proxy_protocol_stream, stream_forward,
+    stream_forward_group,
+};
 use crate::{
     ComposedSpeedStat, ConnectionController, ConnectionInfo, ConnectionManagerRef, DumpStream,
     GlobalCollectionManagerRef, HandleConnectionController, IoDumpStackConfig,
@@ -334,13 +338,26 @@ impl QuicConnectionHandler {
                     let speed_stat = ComposedSpeedStat::new(speed_groups);
                     let cmd = list[0].as_str();
                     match cmd {
-                        "forward" => {
+                        "forward" | "forward-group" => {
                             if list.len() < 2 {
                                 return Err(stack_err!(
                                     StackErrorCode::InvalidConfig,
-                                    "invalid forward command"
+                                    "invalid {} command",
+                                    list[0]
                                 ));
                             }
+                            let is_group = list[0].as_str() == "forward-group";
+                            let plan: Option<ForwardPlan> = if is_group {
+                                Some(ForwardPlan::decode(list[1].as_str()).map_err(|e| {
+                                    stack_err!(
+                                        StackErrorCode::InvalidConfig,
+                                        "invalid forward plan: {}",
+                                        e
+                                    )
+                                })?)
+                            } else {
+                                None
+                            };
                             let speed_stat = speed_stat.clone();
                             loop {
                                 let (send, recv) = connection
@@ -383,7 +400,10 @@ impl QuicConnectionHandler {
                                 let stat_stream =
                                     StatStream::new_with_tracker(stream, speed_stat.clone());
                                 let speed = stat_stream.get_speed_stat();
-                                let target = list[1].clone();
+                                let target_or_plan: Result<String, ForwardPlan> = match &plan {
+                                    Some(p) => Err(p.clone()),
+                                    None => Ok(list[1].clone()),
+                                };
                                 let stream: Box<dyn AsyncStream> = if limiter.is_some() {
                                     let (read_limit, write_limit) =
                                         limiter.as_ref().unwrap().new_limit_session();
@@ -396,14 +416,27 @@ impl QuicConnectionHandler {
                                 let tunnel_manager = self.env.tunnel_manager.clone();
                                 let forward_info = stream_info.clone();
                                 let handle = tokio::spawn(async move {
-                                    if let Err(e) = stream_forward(
-                                        stream,
-                                        target.as_str(),
-                                        &tunnel_manager,
-                                        Some(&forward_info),
-                                    )
-                                    .await
-                                    {
+                                    let result = match target_or_plan {
+                                        Ok(target) => {
+                                            stream_forward(
+                                                stream,
+                                                target.as_str(),
+                                                &tunnel_manager,
+                                                Some(&forward_info),
+                                            )
+                                            .await
+                                        }
+                                        Err(plan) => {
+                                            stream_forward_group(
+                                                stream,
+                                                &plan,
+                                                &tunnel_manager,
+                                                Some(&forward_info),
+                                            )
+                                            .await
+                                        }
+                                    };
+                                    if let Err(e) = result {
                                         log::error!("stream forward error: {}", e);
                                     }
                                 });

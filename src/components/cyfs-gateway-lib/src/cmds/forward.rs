@@ -1,9 +1,15 @@
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 use cyfs_process_chain::*;
 use url::Url;
+
+use crate::forward::{
+    BalanceMethod, FORWARD_CMD, FORWARD_GROUP_CMD, ForwardFailureRegistry, ForwardPlan,
+    ForwardSelector, ForwardTarget, NextUpstreamPolicy, parse_duration_str,
+};
 
 #[derive(Clone, Debug)]
 struct UpstreamNode {
@@ -15,6 +21,7 @@ pub struct Forward {
     name: String,
     cmd: Command,
     rr_counter: AtomicUsize,
+    selector: ForwardSelector,
 }
 
 impl Forward {
@@ -30,6 +37,8 @@ Examples:
     forward ip_hash tcp:///127.0.0.1:80,weight=3 tcp:///127.0.0.1:81,weight=1
     forward round_robin --map $UPSTREAMS
     forward ip_hash --map $UPSTREAMS
+    forward round_robin --map $PRIMARY --backup-map $BACKUP \
+            --next-upstream error,timeout --tries 3
                 "#,
             )
             .arg(
@@ -38,6 +47,62 @@ Examples:
                     .help("Map collection variable containing <url, weight> pairs")
                     .required(false)
                     .num_args(1),
+            )
+            .arg(
+                Arg::new("backup_map")
+                    .long("backup-map")
+                    .help("Map collection of <url, weight> backup peers (group forward)")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("next_upstream")
+                    .long("next-upstream")
+                    .help("Conditions to retry on, e.g. 'error,timeout' or 'off'")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("tries")
+                    .long("tries")
+                    .help("Maximum number of candidate attempts (group forward)")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("next_upstream_timeout")
+                    .long("next-upstream-timeout")
+                    .help("Total timeout budget across all candidate attempts")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("max_fails")
+                    .long("max-fails")
+                    .help("Default per-candidate max_fails before ejection")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("fail_timeout")
+                    .long("fail-timeout")
+                    .help("Default per-candidate fail_timeout, e.g. 10s")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("group")
+                    .long("group")
+                    .help("Logical name of the upstream group (used for failure state)")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("force_group")
+                    .long("force-group")
+                    .help("Always emit forward-group, even for single-URL plans")
+                    .required(false)
+                    .action(ArgAction::SetTrue),
             )
             .arg(
                 Arg::new("dest_urls")
@@ -49,6 +114,7 @@ Examples:
             name: "forward".to_string(),
             cmd,
             rr_counter: AtomicUsize::new(0),
+            selector: ForwardSelector::new(),
         }
     }
 
@@ -238,20 +304,22 @@ Examples:
         Ok(dest_urls)
     }
 
-    fn collect_map_upstreams_arg(
+    fn collect_map_arg(
         args: &[CollectionValue],
         matches: &clap::ArgMatches,
+        flag: &str,
     ) -> Result<Option<MapCollectionRef>, String> {
-        let Some(index) = matches.index_of("upstream_map") else {
+        let Some(index) = matches.index_of(flag) else {
             return Ok(None);
         };
 
         let arg = args
             .get(index)
-            .ok_or_else(|| format!("Missing upstream map argument at position {}", index))?;
+            .ok_or_else(|| format!("Missing {} argument at position {}", flag, index))?;
         let map = arg.as_map().ok_or_else(|| {
             format!(
-                "Invalid --map argument: expected map collection, got {}",
+                "Invalid --{} argument: expected map collection, got {}",
+                flag.replace('_', "-"),
                 arg.get_type()
             )
         })?;
@@ -395,6 +463,172 @@ Examples:
             )),
         }
     }
+
+    fn group_options_present(matches: &clap::ArgMatches) -> bool {
+        matches.contains_id("backup_map")
+            || matches.contains_id("next_upstream")
+            || matches.contains_id("tries")
+            || matches.contains_id("next_upstream_timeout")
+            || matches.contains_id("max_fails")
+            || matches.contains_id("fail_timeout")
+            || matches.contains_id("group")
+            || matches.get_flag("force_group")
+    }
+
+    fn parse_optional_str(matches: &clap::ArgMatches, name: &str) -> Option<String> {
+        matches.get_one::<String>(name).cloned()
+    }
+
+    fn build_next_upstream_policy(
+        matches: &clap::ArgMatches,
+    ) -> Result<NextUpstreamPolicy, String> {
+        let conds_spec = Self::parse_optional_str(matches, "next_upstream");
+        let tries_spec = Self::parse_optional_str(matches, "tries");
+        let timeout_spec = Self::parse_optional_str(matches, "next_upstream_timeout");
+
+        let (conditions, off_explicit) = match &conds_spec {
+            Some(s) => NextUpstreamPolicy::parse_conditions(s)?,
+            None => (Vec::new(), false),
+        };
+
+        let tries = match tries_spec {
+            Some(s) => s
+                .parse::<u32>()
+                .map_err(|e| format!("invalid --tries '{}': {}", s, e))?,
+            None => {
+                if conditions.is_empty() {
+                    1
+                } else {
+                    // Default to "try every candidate at most once" when retry is enabled.
+                    0
+                }
+            }
+        };
+
+        let timeout = match timeout_spec {
+            Some(s) => Some(parse_duration_str(&s)?),
+            None => None,
+        };
+
+        if off_explicit {
+            return Ok(NextUpstreamPolicy::off());
+        }
+
+        Ok(NextUpstreamPolicy {
+            conditions,
+            tries,
+            timeout,
+        })
+    }
+
+    async fn build_targets_from_map(
+        map: &MapCollectionRef,
+        backup: bool,
+        max_fails: u32,
+        fail_timeout: Duration,
+    ) -> Result<Vec<ForwardTarget>, String> {
+        let nodes = Self::parse_upstream_map(map).await?;
+        Ok(nodes
+            .into_iter()
+            .map(|n| ForwardTarget {
+                url: n.url,
+                weight: n.weight,
+                backup,
+                max_fails,
+                fail_timeout,
+            })
+            .collect())
+    }
+
+    fn build_targets_from_inline(
+        nodes: Vec<UpstreamNode>,
+        backup: bool,
+        max_fails: u32,
+        fail_timeout: Duration,
+    ) -> Vec<ForwardTarget> {
+        nodes
+            .into_iter()
+            .map(|n| ForwardTarget {
+                url: n.url,
+                weight: n.weight,
+                backup,
+                max_fails,
+                fail_timeout,
+            })
+            .collect()
+    }
+
+    async fn build_group_plan(
+        &self,
+        context: &Context,
+        matches: &clap::ArgMatches,
+        algo: &str,
+        inline_nodes: Vec<UpstreamNode>,
+        primary_map: Option<MapCollectionRef>,
+        backup_map: Option<MapCollectionRef>,
+    ) -> Result<ForwardPlan, String> {
+        let max_fails = match Self::parse_optional_str(matches, "max_fails") {
+            Some(s) => s
+                .parse::<u32>()
+                .map_err(|e| format!("invalid --max-fails '{}': {}", s, e))?,
+            None => 1,
+        };
+        let fail_timeout = match Self::parse_optional_str(matches, "fail_timeout") {
+            Some(s) => parse_duration_str(&s)?,
+            None => Duration::from_secs(10),
+        };
+
+        let mut candidates = Vec::new();
+        candidates.extend(Self::build_targets_from_inline(
+            inline_nodes,
+            false,
+            max_fails,
+            fail_timeout,
+        ));
+        if let Some(map) = primary_map {
+            candidates.extend(
+                Self::build_targets_from_map(&map, false, max_fails, fail_timeout).await?,
+            );
+        }
+        if let Some(map) = backup_map {
+            candidates.extend(
+                Self::build_targets_from_map(&map, true, max_fails, fail_timeout).await?,
+            );
+        }
+
+        if candidates.is_empty() {
+            return Err("forward requires at least one upstream or --map".to_string());
+        }
+
+        let balance = BalanceMethod::parse(algo)?;
+        let next_upstream = Self::build_next_upstream_policy(matches)?;
+        let group = Self::parse_optional_str(matches, "group");
+
+        let mut plan = ForwardPlan {
+            group,
+            balance,
+            next_upstream,
+            candidates,
+        };
+        plan.validate()?;
+
+        // Apply selector to produce an attempt-ordered candidate list.
+        let source_ip = match plan.balance {
+            BalanceMethod::IpHash => Self::extract_source_ip(context).await,
+            BalanceMethod::RoundRobin => None,
+        };
+        let registry = ForwardFailureRegistry::global();
+        let ordered = self.selector.select(&plan, registry, source_ip);
+        plan.candidates = ordered;
+
+        // Cap tries to the number of candidates we actually have.
+        let cap = plan.candidates.len() as u32;
+        if plan.next_upstream.tries == 0 || plan.next_upstream.tries > cap {
+            plan.next_upstream.tries = cap.max(1);
+        }
+
+        Ok(plan)
+    }
 }
 
 #[async_trait::async_trait]
@@ -422,13 +656,32 @@ impl ExternalCommand for Forward {
 
         let (_algo, upstream_specs) = Self::split_algo_and_upstreams(dest_urls)?;
         let has_map = matches.index_of("upstream_map").is_some();
+        let has_backup_map = matches.index_of("backup_map").is_some();
 
-        if upstream_specs.is_empty() && !has_map {
+        if upstream_specs.is_empty() && !has_map && !has_backup_map {
             return Err("forward requires at least one upstream or --map".to_string());
         }
 
         if upstream_specs.len() > 1 {
             Self::parse_upstreams(upstream_specs)?;
+        }
+
+        if let Some(s) = matches.get_one::<String>("next_upstream") {
+            NextUpstreamPolicy::parse_conditions(s)?;
+        }
+        if let Some(s) = matches.get_one::<String>("tries") {
+            s.parse::<u32>()
+                .map_err(|e| format!("invalid --tries '{}': {}", s, e))?;
+        }
+        if let Some(s) = matches.get_one::<String>("next_upstream_timeout") {
+            parse_duration_str(s)?;
+        }
+        if let Some(s) = matches.get_one::<String>("max_fails") {
+            s.parse::<u32>()
+                .map_err(|e| format!("invalid --max-fails '{}': {}", s, e))?;
+        }
+        if let Some(s) = matches.get_one::<String>("fail_timeout") {
+            parse_duration_str(s)?;
         }
 
         Ok(())
@@ -453,14 +706,50 @@ impl ExternalCommand for Forward {
             })?;
 
         let dest_urls = Self::collect_inline_upstream_specs(args, &matches)?;
-        let upstream_map = Self::collect_map_upstreams_arg(args, &matches)?;
+        let primary_map = Self::collect_map_arg(args, &matches, "upstream_map")?;
+        let backup_map = Self::collect_map_arg(args, &matches, "backup_map")?;
 
         let (algo, inline_upstream_specs) = Self::split_algo_and_upstreams(dest_urls)?;
-        let mut upstreams = Vec::new();
-        if !inline_upstream_specs.is_empty() {
-            upstreams.extend(Self::parse_upstreams(inline_upstream_specs)?);
+        let inline_nodes = if inline_upstream_specs.is_empty() {
+            Vec::new()
+        } else {
+            Self::parse_upstreams(inline_upstream_specs)?
+        };
+
+        let want_group = Self::group_options_present(&matches);
+        let force_group = matches.get_flag("force_group");
+
+        if want_group {
+            let plan = self
+                .build_group_plan(
+                    context,
+                    &matches,
+                    algo.as_str(),
+                    inline_nodes,
+                    primary_map,
+                    backup_map,
+                )
+                .await?;
+            // Single-URL group plans degrade to plain `forward "<url>"` for
+            // backward compatibility with executors that haven't been
+            // upgraded yet, unless --force-group is set.
+            if plan.is_single_url() && !force_group {
+                let url = plan.candidates[0].url.clone();
+                return Ok(CommandResult::return_with_string(
+                    CommandControlLevel::Lib,
+                    format!(r#"{} "{}""#, FORWARD_CMD, url),
+                ));
+            }
+            let encoded = plan.encode()?;
+            return Ok(CommandResult::return_with_string(
+                CommandControlLevel::Lib,
+                format!(r#"{} "{}""#, FORWARD_GROUP_CMD, encoded),
+            ));
         }
-        if let Some(map) = upstream_map {
+
+        // Legacy single-URL selection path.
+        let mut upstreams = inline_nodes;
+        if let Some(map) = primary_map {
             upstreams.extend(Self::parse_upstream_map(&map).await?);
         }
 
@@ -477,7 +766,7 @@ impl ExternalCommand for Forward {
 
         Ok(CommandResult::return_with_string(
             CommandControlLevel::Lib,
-            format!(r#"forward "{}""#, selected),
+            format!(r#"{} "{}""#, FORWARD_CMD, selected),
         ))
     }
 }
@@ -537,6 +826,39 @@ mod tests {
         ]);
 
         forward.check(&args).unwrap();
+    }
+
+    #[test]
+    fn test_check_accepts_group_flags() {
+        let forward = Forward::new();
+        let args = CommandArgs::new(vec![
+            CommandArg::Literal("forward".to_string()),
+            CommandArg::Literal("--map".to_string()),
+            CommandArg::Var("$UPSTREAMS".to_string()),
+            CommandArg::Literal("--backup-map".to_string()),
+            CommandArg::Var("$BACKUP".to_string()),
+            CommandArg::Literal("--next-upstream".to_string()),
+            CommandArg::Literal("error,timeout".to_string()),
+            CommandArg::Literal("--tries".to_string()),
+            CommandArg::Literal("3".to_string()),
+            CommandArg::Literal("--fail-timeout".to_string()),
+            CommandArg::Literal("10s".to_string()),
+        ]);
+
+        forward.check(&args).unwrap();
+    }
+
+    #[test]
+    fn test_check_rejects_unknown_next_upstream_condition() {
+        let forward = Forward::new();
+        let args = CommandArgs::new(vec![
+            CommandArg::Literal("forward".to_string()),
+            CommandArg::Literal("tcp:///127.0.0.1:80".to_string()),
+            CommandArg::Literal("--next-upstream".to_string()),
+            CommandArg::Literal("error,foo".to_string()),
+        ]);
+
+        assert!(forward.check(&args).is_err());
     }
 
     #[test]

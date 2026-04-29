@@ -4,6 +4,7 @@ use super::http_compression::{
 };
 use super::{into_server_err, server_err};
 use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
+use crate::forward::{ForwardFailureRegistry, ForwardPlan, NextUpstreamCondition};
 use crate::tunnel_connector::TunnelConnector;
 use crate::{
     GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestProcessChainVars,
@@ -664,6 +665,188 @@ impl ProcessChainHttpServer {
         }
     }
 
+    /// Walk the candidates of a `ForwardPlan`, performing a connection-stage
+    /// probe on each (TCP connect / TLS handshake / tunnel open) and
+    /// forwarding the request through the first reachable candidate. Body
+    /// is never replayed: once we commit to a candidate, failures from that
+    /// point on are propagated as the final response. (§6.3 of the design doc.)
+    async fn handle_forward_group_upstream(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+        plan: &ForwardPlan,
+        info: &StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let registry = ForwardFailureRegistry::global();
+        let group_key = plan.failure_state_key();
+        let policy = &plan.next_upstream;
+        let candidate_count = plan.candidates.len();
+        let max_attempts = if !policy.is_enabled() {
+            candidate_count.min(1).max(1)
+        } else if policy.tries == 0 {
+            candidate_count
+        } else {
+            (policy.tries as usize).min(candidate_count)
+        };
+
+        let mut last_err: Option<ServerError> = None;
+        let mut chosen_url: Option<String> = None;
+
+        for (idx, candidate) in plan.candidates.iter().enumerate() {
+            if idx >= max_attempts {
+                break;
+            }
+            match self.probe_upstream_candidate(&candidate.url).await {
+                Ok(()) => {
+                    registry.record_success(&group_key, &candidate.url);
+                    chosen_url = Some(candidate.url.clone());
+                    log::debug!(
+                        "forward-group {}: http selected candidate idx={} url={}",
+                        group_key,
+                        idx,
+                        candidate.url
+                    );
+                    break;
+                }
+                Err(e) => {
+                    log::debug!(
+                        "forward-group {}: http candidate {} (idx {}) probe failed: {}",
+                        group_key,
+                        candidate.url,
+                        idx,
+                        e
+                    );
+                    registry.record_failure(
+                        &group_key,
+                        &candidate.url,
+                        candidate.max_fails,
+                        candidate.fail_timeout,
+                    );
+                    last_err = Some(e);
+                    if !policy.is_enabled()
+                        || !policy.allows(NextUpstreamCondition::Error)
+                        || idx + 1 >= max_attempts
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let target_url = match chosen_url {
+            Some(u) => u,
+            None => {
+                return Err(last_err.unwrap_or_else(|| {
+                    server_err!(
+                        ServerErrorCode::TunnelError,
+                        "forward-group {} exhausted candidates",
+                        group_key
+                    )
+                }));
+            }
+        };
+
+        self.handle_forward_upstream(req, &target_url, info).await
+    }
+
+    /// Test reachability of an upstream URL with a connection-stage probe.
+    /// Successful probes are immediately closed; we don't reuse the
+    /// connection for the actual request. The cost is one extra TCP /
+    /// tunnel open on the first request to a recovered upstream, in
+    /// exchange for the safety of never sending the body twice.
+    async fn probe_upstream_candidate(&self, target_url: &str) -> ServerResult<()> {
+        let url = Url::parse(target_url).map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "invalid forward url {}: {}",
+                target_url,
+                e
+            )
+        })?;
+        match url.scheme() {
+            "http" => {
+                let host = url.host_str().ok_or_else(|| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "missing upstream host in url: {}",
+                        url
+                    )
+                })?;
+                let port = url.port_or_known_default().ok_or_else(|| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "missing upstream port in url: {}",
+                        url
+                    )
+                })?;
+                let _ = Self::connect_upstream_with_fallback(host, port).await?;
+                Ok(())
+            }
+            "https" => {
+                let host = url.host_str().ok_or_else(|| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "missing upstream host in url: {}",
+                        url
+                    )
+                })?;
+                let port = url.port_or_known_default().ok_or_else(|| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "missing upstream port in url: {}",
+                        url
+                    )
+                })?;
+                let sni_host = Self::upstream_sni_host(&url)?;
+                let (tcp_stream, connected_addr) =
+                    Self::connect_upstream_with_fallback(host, port).await?;
+                let tls_config = ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| {
+                    server_err!(ServerErrorCode::InvalidConfig, "Invalid tls config: {}", e)
+                })?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertificateVerifier))
+                .with_no_client_auth();
+                let tls_connector = TlsConnector::from(Arc::new(tls_config));
+                let server_name = ServerName::try_from(sni_host.clone()).map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "invalid upstream host for tls {}: {}",
+                        sni_host,
+                        e
+                    )
+                })?;
+                let _tls_stream = tls_connector
+                    .connect(server_name, tcp_stream)
+                    .await
+                    .map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "tls handshake probe failed for {} via {}: {}",
+                            sni_host,
+                            connected_addr,
+                            e
+                        )
+                    })?;
+                Ok(())
+            }
+            _ => {
+                let _stream =
+                    self.tunnel_manager.open_stream_by_url(&url).await.map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::TunnelError,
+                            "open tunnel probe to {} failed: {}",
+                            url,
+                            e
+                        )
+                    })?;
+                Ok(())
+            }
+        }
+    }
+
     fn parse_redirect_status_code(status: Option<&str>) -> ServerResult<StatusCode> {
         let status_code = match status {
             Some(status) => {
@@ -1204,6 +1387,30 @@ impl HttpServer for ProcessChainHttpServer {
                             })?;
                             let resp = self
                                 .handle_forward_upstream(post_req, target_url, &info)
+                                .await;
+                            return self
+                                .apply_post_chain_result(resp, &req_info, Some(&info))
+                                .await;
+                        }
+                        "forward-group" => {
+                            if list.len() < 2 {
+                                return Err(server_err!(
+                                    ServerErrorCode::InvalidConfig,
+                                    "invalid forward-group command"
+                                ));
+                            }
+                            let plan = ForwardPlan::decode(list[1].as_str()).map_err(|e| {
+                                server_err!(
+                                    ServerErrorCode::InvalidConfig,
+                                    "invalid forward plan: {}",
+                                    e
+                                )
+                            })?;
+                            let post_req = req_map.into_request().map_err(|e| {
+                                server_err!(ServerErrorCode::ProcessChainError, "{}", e)
+                            })?;
+                            let resp = self
+                                .handle_forward_group_upstream(post_req, &plan, &info)
                                 .await;
                             return self
                                 .apply_post_chain_result(resp, &req_info, Some(&info))
