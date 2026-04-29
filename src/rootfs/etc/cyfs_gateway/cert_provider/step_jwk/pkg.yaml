@@ -1,0 +1,3 @@
+name: step_jwk
+description: Smallstep step-ca JWK cert provider for js_extend_cert_provider
+main: main.js
