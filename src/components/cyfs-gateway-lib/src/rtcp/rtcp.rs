@@ -1838,7 +1838,14 @@ struct RTcpTunnel {
     // Direct reconnect target for tunnels carried by a direct TCP socket. None
     // when the tunnel was bootstrapped through a nested stream URL and the
     // bootstrap transport must be replayed instead of opening TCP to peer_addr.
-    peer_addr: Option<SocketAddr>,
+    //
+    // The inner address is mutated by build_reconnect_stream when a fresh
+    // OpenStream successfully races to a different IP than the one that won
+    // the original tunnel handshake. This is what gives every OpenStream a
+    // chance to re-select among the device's currently advertised IPs (see
+    // doc/arch/gateway/服务的多链路选择.md §6.5 / §17.1) instead of being
+    // permanently locked to whichever IP the first race picked.
+    peer_addr: Option<Arc<std::sync::Mutex<SocketAddr>>>,
     // When set, Open/ROpen reconnect paths build new stream legs via
     // `tunnel_manager.open_stream_by_url(bootstrap_stream_url)` instead of a
     // direct TCP connect. This is the transport rebinding mandated by
@@ -1905,6 +1912,8 @@ impl RTcpTunnel {
         let this_remote_stack = remote_stack.clone();
 
         //this_remote_stack.stack_port = 0;
+        let peer_addr = peer_addr.map(|addr| Arc::new(std::sync::Mutex::new(addr)));
+
         Self {
             build_helper,
             remote_stack: this_remote_stack,
@@ -2048,22 +2057,205 @@ impl RTcpTunnel {
             return Ok((stream, placeholder, placeholder));
         }
 
-        let peer_addr = self.peer_addr.ok_or_else(|| {
+        let peer_addr_handle = self.peer_addr.as_ref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "rtcp tunnel has neither a direct peer address nor a bootstrap transport",
             )
         })?;
-        let mut remote_stack_addr = peer_addr;
-        remote_stack_addr.set_port(self.remote_stack.stack_port);
-        let tcp_stream = tokio::net::TcpStream::connect(remote_stack_addr).await?;
-        let remote_addr = tcp_stream.peer_addr()?;
-        let local_addr = tcp_stream.local_addr()?;
-        Ok((
-            Box::new(tcp_stream) as Box<dyn AsyncStream>,
-            remote_addr,
-            local_addr,
+
+        // §6.5 of doc/arch/gateway/服务的多链路选择.md: every OpenStream is a
+        // chance to re-select among the device's currently advertised IPs.
+        // Re-resolve here so newly published IPs (e.g. a fresh DeviceInfo
+        // upload) become reachable without tearing down the control tunnel,
+        // and reorder so the previously-winning IP is tried first. The
+        // resolve_ips lookup is cache-backed in name_client and degrades to
+        // the cached `peer_addr` if it fails, so we never lose the fast path
+        // when DNS hiccups.
+        let last_addr = *peer_addr_handle.lock().unwrap();
+        let candidates =
+            self.collect_reconnect_candidates(last_addr).await;
+
+        self.race_reconnect_candidates(peer_addr_handle, candidates)
+            .await
+    }
+
+    // Build the ordered candidate list used by build_reconnect_stream.
+    // Always returns at least the cached `last_addr` so that a DNS hiccup
+    // can never strip the only known good path.
+    async fn collect_reconnect_candidates(&self, last_addr: SocketAddr) -> Vec<SocketAddr> {
+        let port = self.remote_stack.stack_port;
+        let resolve_name = self.remote_stack.did.to_string();
+        let resolved = match resolve_ips(resolve_name.as_str()).await {
+            Ok(ips) => ips,
+            Err(e) => {
+                debug!(
+                    "rtcp reconnect resolve_ips({}) failed: {} -- falling back to cached peer addr {}",
+                    resolve_name, e, last_addr
+                );
+                Vec::new()
+            }
+        };
+
+        let mut candidates: Vec<SocketAddr> = resolved
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
+
+        // Last-successful IP must be tried first (§6.5: "后续 OpenStream
+        // 优先尝试上一次成功 IP").
+        if let Some(pos) = candidates.iter().position(|a| *a == last_addr) {
+            if pos != 0 {
+                candidates.remove(pos);
+                candidates.insert(0, last_addr);
+            }
+        } else {
+            candidates.insert(0, last_addr);
+        }
+
+        candidates
+    }
+
+    // Happy-Eyeballs across the candidate IP list with `DIRECT_CONNECT_ATTEMPT_DELAY`
+    // (250ms) stagger. Updates the tunnel's tracked peer_addr to whichever
+    // candidate wins, so the next OpenStream prefers it. Records per-IP
+    // outcomes into the addr-rtt history so resolve_ips can rank future
+    // candidates.
+    async fn race_reconnect_candidates(
+        &self,
+        peer_addr_handle: &Arc<std::sync::Mutex<SocketAddr>>,
+        candidates: Vec<SocketAddr>,
+    ) -> Result<(Box<dyn AsyncStream>, SocketAddr, SocketAddr), std::io::Error> {
+        if candidates.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "rtcp tunnel has no reconnect candidates",
+            ));
+        }
+
+        let mut attempts = FuturesUnordered::new();
+        let mut next_index = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+
+        attempts.push(Self::connect_reconnect_addr(candidates[next_index]));
+        next_index += 1;
+
+        loop {
+            let attempt_result = if next_index < candidates.len() {
+                tokio::select! {
+                    result = attempts.next(), if !attempts.is_empty() => result,
+                    _ = tokio::time::sleep(DIRECT_CONNECT_ATTEMPT_DELAY) => {
+                        attempts.push(Self::connect_reconnect_addr(candidates[next_index]));
+                        next_index += 1;
+                        continue;
+                    }
+                }
+            } else if !attempts.is_empty() {
+                attempts.next().await
+            } else {
+                None
+            };
+
+            match attempt_result {
+                Some(Ok((tcp_stream, remote_addr, local_addr, rtt))) => {
+                    Self::record_reconnect_outcome(
+                        local_addr,
+                        remote_addr,
+                        ConnectionOutcome::Success {
+                            rtt,
+                            layer: MeasurementLayer::Tcp,
+                        },
+                    );
+                    if let Ok(mut slot) = peer_addr_handle.lock() {
+                        *slot = remote_addr;
+                    }
+                    return Ok((
+                        Box::new(tcp_stream) as Box<dyn AsyncStream>,
+                        remote_addr,
+                        local_addr,
+                    ));
+                }
+                Some(Err((addr, err))) => {
+                    errors.push(format!("{} => {}", addr, err));
+                }
+                None => break,
+            }
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!(
+                "rtcp reconnect to {} failed after trying all candidates: {}",
+                self.remote_stack.did.to_string(),
+                errors.join("; ")
+            ),
         ))
+    }
+
+    async fn connect_reconnect_addr(
+        addr: SocketAddr,
+    ) -> Result<(TcpStream, SocketAddr, SocketAddr, Duration), (SocketAddr, std::io::Error)> {
+        let started_at = Instant::now();
+        let connect_result =
+            timeout(DIRECT_TCP_CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
+        let tcp_stream = match connect_result {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                let outcome = match e.kind() {
+                    std::io::ErrorKind::ConnectionRefused => ConnectionOutcome::Refused,
+                    _ => ConnectionOutcome::Unreachable,
+                };
+                Self::record_reconnect_outcome_for_failed_connect(addr, outcome);
+                return Err((addr, e));
+            }
+            Err(_) => {
+                Self::record_reconnect_outcome_for_failed_connect(
+                    addr,
+                    ConnectionOutcome::Timeout {
+                        elapsed: started_at.elapsed(),
+                    },
+                );
+                return Err((
+                    addr,
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("tcp connect timed out after {:?}", DIRECT_TCP_CONNECT_TIMEOUT),
+                    ),
+                ));
+            }
+        };
+        let rtt = started_at.elapsed();
+        let remote_addr = tcp_stream.peer_addr().unwrap_or(addr);
+        let local_addr = match tcp_stream.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => return Err((addr, e)),
+        };
+        Ok((tcp_stream, remote_addr, local_addr, rtt))
+    }
+
+    fn record_reconnect_outcome(
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        outcome: ConnectionOutcome,
+    ) {
+        if let Err(e) = record_connection_outcome(local_addr.ip(), remote_addr, outcome) {
+            debug!(
+                "record rtcp reconnect outcome {} -> {} failed: {}",
+                local_addr, remote_addr, e
+            );
+        }
+    }
+
+    // Failed-connect path has no usable local_addr; addr-rtt history is keyed
+    // on (local_ip, remote_addr), so without a local_ip we can only log.
+    fn record_reconnect_outcome_for_failed_connect(
+        remote_addr: SocketAddr,
+        outcome: ConnectionOutcome,
+    ) {
+        debug!(
+            "rtcp reconnect attempt to {} failed: {:?}",
+            remote_addr, outcome
+        );
     }
 
     async fn on_ropen(&self, ropen_package: RTcpROpenPackage) -> Result<(), anyhow::Error> {
