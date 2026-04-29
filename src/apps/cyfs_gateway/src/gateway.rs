@@ -17,7 +17,9 @@ use crate::gateway_control_server::{
     GATEWAY_CONTROL_SERVER_KEY,
 };
 use crate::socks::SocksTunnelBuilder;
-use crate::{merge, AcmeConfig, AcmeProviderConfig, CertProviderConfig, TlsCA};
+use crate::{
+    merge, AcmeConfig, AcmeProviderConfig, CertProviderConfig, JsExtendCertProviderConfig, TlsCA,
+};
 use anyhow::{anyhow, Result};
 use buckyos_kit::*;
 use chrono::Utc;
@@ -565,20 +567,22 @@ fn parse_acme_duration(value: Option<u64>) -> Option<chrono::Duration> {
     value.and_then(|seconds| chrono::Duration::new(seconds as i64, 0))
 }
 
+fn build_cert_provider_store_root(provider_id: &str) -> PathBuf {
+    let base = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
+    if provider_id == "default" {
+        base
+    } else {
+        base.join(provider_id)
+    }
+}
+
 fn build_acme_cert_config(
     provider_id: &str,
     provider_config: Option<&AcmeProviderConfig>,
     acme_config: &Option<AcmeConfig>,
 ) -> CertManagerConfig {
     let mut cert_config = CertManagerConfig::default();
-    let data_dir = {
-        let base = get_buckyos_service_data_dir("cyfs_gateway").join("certs");
-        if provider_id == "default" {
-            base
-        } else {
-            base.join(provider_id)
-        }
-    };
+    let data_dir = build_cert_provider_store_root(provider_id);
     let dns_provider_dir = get_buckyos_system_etc_dir()
         .join("cyfs_gateway")
         .join("acme_dns_provider");
@@ -620,6 +624,33 @@ fn build_acme_cert_config(
     }
 
     cert_config
+}
+
+fn build_js_extend_cert_provider_config(
+    provider_id: &str,
+    provider_config: &JsExtendCertProviderConfig,
+) -> Result<JsExtendCertProviderRuntimeConfig> {
+    provider_config
+        .validate()
+        .map_err(|err| anyhow!("invalid js_extend cert provider {}: {}", provider_id, err))?;
+
+    let defaults = CertManagerConfig::default();
+    let cert_provider_dir = get_buckyos_system_etc_dir()
+        .join("cyfs_gateway")
+        .join("cert_provider");
+
+    Ok(JsExtendCertProviderRuntimeConfig {
+        id: provider_id.to_string(),
+        script_path: provider_config.script_path.clone().map(PathBuf::from),
+        script_name: provider_config.script_name.clone(),
+        script_pkg_dir: Some(cert_provider_dir),
+        store_root: build_cert_provider_store_root(provider_id),
+        check_interval: parse_acme_duration(provider_config.check_interval)
+            .unwrap_or(defaults.check_interval),
+        renew_before_expiry: parse_acme_duration(provider_config.renew_before_expiry)
+            .unwrap_or(defaults.renew_before_expiry),
+        params: provider_config.params.clone(),
+    })
 }
 
 struct BuiltCertManager {
@@ -677,6 +708,15 @@ async fn build_cert_manager_from_config(config: &GatewayConfig) -> Result<BuiltC
                     cert_manager
                         .add_provider(AcmeCertProvider::new(provider_id, acme_manager.clone()))?;
                     acme_managers.push(acme_manager);
+                }
+                CertProviderConfig::JsExtend(provider_config) => {
+                    if provider_id == "default" {
+                        has_default_provider = true;
+                    }
+                    let provider = JsExtendCertProvider::new(
+                        build_js_extend_cert_provider_config(provider_id, provider_config)?,
+                    )?;
+                    cert_manager.add_provider(provider)?;
                 }
             }
         }

@@ -978,6 +978,8 @@ pub type CertProvidersConfig = HashMap<String, CertProviderConfig>;
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum CertProviderConfig {
     Acme(AcmeProviderConfig),
+    #[serde(rename = "js_extend")]
+    JsExtend(JsExtendCertProviderConfig),
 }
 
 #[derive(Deserialize, Clone, Eq, PartialEq)]
@@ -987,6 +989,29 @@ pub struct AcmeProviderConfig {
     pub keystore_path: Option<String>,
     pub check_interval: Option<u64>,
     pub renew_before_expiry: Option<u64>,
+}
+
+#[derive(Deserialize, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct JsExtendCertProviderConfig {
+    pub script_path: Option<String>,
+    pub script_name: Option<String>,
+    pub check_interval: Option<u64>,
+    pub renew_before_expiry: Option<u64>,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+impl JsExtendCertProviderConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.script_path.is_some() == self.script_name.is_some() {
+            return Err(
+                "js_extend cert provider requires exactly one of script_path or script_name"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, Clone, Eq, PartialEq)]
@@ -1046,6 +1071,7 @@ pub struct GatewayConfig {
 
 #[cfg(test)]
 mod tests {
+    use super::CertProviderConfig;
     use crate::merge;
     use cyfs_gateway_lib::{ChallengeType, RtcpStackConfig, TunnelClientCertConfig};
     use serde_json::json;
@@ -1195,6 +1221,53 @@ mod tests {
                             "check_interval": 60,
                             "renew_before_expiry": 120
                         }
+                    }
+                }
+            }))
+            .is_err());
+    }
+
+    #[test]
+    fn test_parse_js_extend_cert_provider_config() {
+        let parser = super::GatewayConfigParser::new();
+        let config = parser
+            .parse(json!({
+                "cert_providers": {
+                    "custom-js": {
+                        "type": "js_extend",
+                        "script_name": "my-ca",
+                        "check_interval": 60,
+                        "renew_before_expiry": 120,
+                        "params": {
+                            "endpoint": "https://ca.example.com",
+                            "token": "secret"
+                        }
+                    }
+                }
+            }))
+            .unwrap();
+
+        let providers = config.cert_providers.unwrap();
+        let provider = providers.get("custom-js").unwrap();
+        match provider {
+            CertProviderConfig::JsExtend(config) => {
+                config.validate().unwrap();
+                assert_eq!(config.script_name.as_deref(), Some("my-ca"));
+                assert_eq!(config.script_path, None);
+                assert_eq!(config.check_interval, Some(60));
+                assert_eq!(config.renew_before_expiry, Some(120));
+                assert_eq!(config.params["token"], "secret");
+            }
+            _ => panic!("expected js_extend provider"),
+        }
+
+        assert!(parser
+            .parse(json!({
+                "cert_providers": {
+                    "custom-js": {
+                        "type": "js_extend",
+                        "script_name": "my-ca",
+                        "store_path": "/tmp/certs"
                     }
                 }
             }))

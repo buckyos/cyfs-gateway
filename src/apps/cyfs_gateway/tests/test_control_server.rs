@@ -10,6 +10,7 @@ mod tests {
     use serde_json::{json, Value};
     use sfo_js::JsPkgManager;
     use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -66,6 +67,14 @@ mod tests {
         }
     }
 
+    fn unused_local_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
     #[tokio::test]
     async fn test_cmd_server() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -74,8 +83,11 @@ mod tests {
             temp_dir.path().to_string_lossy().to_string(),
         );
         init_logging("cyfs_gateway", false);
+        let control_port = unused_local_port();
         let mut cmd_config: serde_json::Value =
             serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
+        cmd_config["stacks"]["__control_server__"]["bind"] =
+            Value::String(format!("127.0.0.1:{control_port}"));
 
         // Load config from json
         let parser = Arc::new(GatewayConfigParser::new());
@@ -174,7 +186,8 @@ mod tests {
         };
         gateway.start(params).await.unwrap();
 
-        let cmd_client = GatewayControlClient::new("http://127.0.0.1:13451".to_string(), None);
+        let cmd_client =
+            GatewayControlClient::new(format!("http://127.0.0.1:{control_port}"), None);
         let ret = cmd_client.get_system_info().await;
         assert!(ret.is_ok());
         let system_info = ret.unwrap();
