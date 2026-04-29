@@ -7,8 +7,9 @@ use cyfs_process_chain::*;
 use url::Url;
 
 use crate::forward::{
-    BalanceMethod, FORWARD_CMD, FORWARD_GROUP_CMD, ForwardFailureRegistry, ForwardPlan,
-    ForwardSelector, ForwardTarget, NextUpstreamPolicy, parse_duration_str,
+    BalanceMethod, DEFAULT_MAX_BODY_BUFFER_BYTES, FORWARD_CMD, FORWARD_GROUP_CMD,
+    ForwardFailureRegistry, ForwardPlan, ForwardSelector, ForwardTarget, NextUpstreamPolicy,
+    ProviderPolicy, parse_duration_str, parse_size_str,
 };
 
 #[derive(Clone, Debug)]
@@ -39,6 +40,11 @@ Examples:
     forward ip_hash --map $UPSTREAMS
     forward round_robin --map $PRIMARY --backup-map $BACKUP \
             --next-upstream error,timeout --tries 3
+    forward hash --hash-key "$cookie_session_id" --map $UPSTREAMS
+    forward consistent_hash --hash-key "$user_id" --map $UPSTREAMS
+    forward least_time --map $UPSTREAMS --next-upstream error,timeout --tries 3
+    forward --map $POOL --next-upstream error,timeout,http_5xx --tries 3 \
+            --max-body-buffer 64KB
                 "#,
             )
             .arg(
@@ -103,6 +109,34 @@ Examples:
                     .help("Always emit forward-group, even for single-URL plans")
                     .required(false)
                     .action(ArgAction::SetTrue),
+            )
+            .arg(
+                Arg::new("hash_key")
+                    .long("hash-key")
+                    .help("Captured value used by hash / consistent_hash balance methods")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("max_body_buffer")
+                    .long("max-body-buffer")
+                    .help("Max request body bytes to buffer for HTTP-status retry, e.g. 64KB")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("server_map")
+                    .long("server-map")
+                    .help("Map collection of <server_id, route-map> for provider-first plans")
+                    .required(false)
+                    .num_args(1),
+            )
+            .arg(
+                Arg::new("provider_retry_scope")
+                    .long("provider-retry-scope")
+                    .help("Provider failover scope: routes_only (default) or across_servers")
+                    .required(false)
+                    .num_args(1),
             )
             .arg(
                 Arg::new("dest_urls")
@@ -175,7 +209,10 @@ Examples:
         }
 
         let first = dest_urls[0].as_str();
-        if first == "round_robin" || first == "ip_hash" {
+        if matches!(
+            first,
+            "round_robin" | "rr" | "ip_hash" | "hash" | "consistent_hash" | "least_time"
+        ) {
             return Ok((first.to_string(), dest_urls[1..].to_vec()));
         }
 
@@ -472,6 +509,10 @@ Examples:
             || matches.contains_id("max_fails")
             || matches.contains_id("fail_timeout")
             || matches.contains_id("group")
+            || matches.contains_id("hash_key")
+            || matches.contains_id("max_body_buffer")
+            || matches.contains_id("server_map")
+            || matches.contains_id("provider_retry_scope")
             || matches.get_flag("force_group")
     }
 
@@ -485,6 +526,7 @@ Examples:
         let conds_spec = Self::parse_optional_str(matches, "next_upstream");
         let tries_spec = Self::parse_optional_str(matches, "tries");
         let timeout_spec = Self::parse_optional_str(matches, "next_upstream_timeout");
+        let body_buf_spec = Self::parse_optional_str(matches, "max_body_buffer");
 
         let (conditions, off_explicit) = match &conds_spec {
             Some(s) => NextUpstreamPolicy::parse_conditions(s)?,
@@ -514,10 +556,21 @@ Examples:
             return Ok(NextUpstreamPolicy::off());
         }
 
+        let any_http_status = conditions.iter().any(|c| c.is_http_status());
+        // When HTTP-status retry is enabled, default to a small body
+        // buffer so the executor can replay safely. Callers can opt
+        // out by setting `--max-body-buffer 0`.
+        let max_body_buffer_bytes = match body_buf_spec {
+            Some(s) => parse_size_str(&s)?,
+            None if any_http_status => DEFAULT_MAX_BODY_BUFFER_BYTES,
+            None => 0,
+        };
+
         Ok(NextUpstreamPolicy {
             conditions,
             tries,
             timeout,
+            max_body_buffer_bytes,
         })
     }
 
@@ -536,6 +589,7 @@ Examples:
                 backup,
                 max_fails,
                 fail_timeout,
+                server_id: None,
             })
             .collect())
     }
@@ -554,6 +608,7 @@ Examples:
                 backup,
                 max_fails,
                 fail_timeout,
+                server_id: None,
             })
             .collect()
     }
@@ -600,22 +655,72 @@ Examples:
             return Err("forward requires at least one upstream or --map".to_string());
         }
 
-        let balance = BalanceMethod::parse(algo)?;
+        // Resolve the balance method. For hash variants the executor
+        // needs the value of `--hash-key` so the captured key is what
+        // routes the request — `algo` is just a marker.
+        let balance = match algo {
+            "hash" => {
+                let key = Self::parse_optional_str(matches, "hash_key")
+                    .ok_or_else(|| {
+                        "hash balance method requires --hash-key".to_string()
+                    })?;
+                BalanceMethod::Hash { key }
+            }
+            "consistent_hash" => {
+                let key = Self::parse_optional_str(matches, "hash_key")
+                    .ok_or_else(|| {
+                        "consistent_hash balance method requires --hash-key".to_string()
+                    })?;
+                BalanceMethod::ConsistentHash { key }
+            }
+            _ => BalanceMethod::parse(algo)?,
+        };
+
         let next_upstream = Self::build_next_upstream_policy(matches)?;
         let group = Self::parse_optional_str(matches, "group");
+        let provider_policy = match Self::parse_optional_str(matches, "provider_retry_scope") {
+            Some(s) => match s.as_str() {
+                "routes_only" => ProviderPolicy {
+                    retry_scope: crate::forward::ProviderRouteRetry::RoutesOnly,
+                },
+                "across_servers" => ProviderPolicy {
+                    retry_scope: crate::forward::ProviderRouteRetry::AcrossServers,
+                },
+                _ => {
+                    return Err(format!(
+                        "invalid --provider-retry-scope '{}': expected routes_only or across_servers",
+                        s
+                    ));
+                }
+            },
+            None => ProviderPolicy::default(),
+        };
+
+        let hash_key_value = match &balance {
+            BalanceMethod::Hash { .. } | BalanceMethod::ConsistentHash { .. } => {
+                Self::parse_optional_str(matches, "hash_key")
+            }
+            _ => None,
+        };
 
         let mut plan = ForwardPlan {
             group,
             balance,
             next_upstream,
             candidates,
+            hash_key_value,
+            servers: Vec::new(),
+            provider_policy,
         };
         plan.validate()?;
 
         // Apply selector to produce an attempt-ordered candidate list.
-        let source_ip = match plan.balance {
+        // `LeastTime` plans are not RTT-sorted here: that step lives in
+        // the executor where a `TunnelManager` is available. The
+        // selector treats `LeastTime` as a no-op for ordering.
+        let source_ip = match &plan.balance {
             BalanceMethod::IpHash => Self::extract_source_ip(context).await,
-            BalanceMethod::RoundRobin => None,
+            _ => None,
         };
         let registry = ForwardFailureRegistry::global();
         let ordered = self.selector.select(&plan, registry, source_ip);
@@ -683,6 +788,17 @@ impl ExternalCommand for Forward {
         if let Some(s) = matches.get_one::<String>("fail_timeout") {
             parse_duration_str(s)?;
         }
+        if let Some(s) = matches.get_one::<String>("max_body_buffer") {
+            parse_size_str(s)?;
+        }
+        if let Some(s) = matches.get_one::<String>("provider_retry_scope") {
+            if !matches!(s.as_str(), "routes_only" | "across_servers") {
+                return Err(format!(
+                    "invalid --provider-retry-scope '{}': expected routes_only or across_servers",
+                    s
+                ));
+            }
+        }
 
         Ok(())
     }
@@ -716,7 +832,8 @@ impl ExternalCommand for Forward {
             Self::parse_upstreams(inline_upstream_specs)?
         };
 
-        let want_group = Self::group_options_present(&matches);
+        let want_group = Self::group_options_present(&matches)
+            || matches!(algo.as_str(), "hash" | "consistent_hash" | "least_time");
         let force_group = matches.get_flag("force_group");
 
         if want_group {
@@ -856,6 +973,54 @@ mod tests {
             CommandArg::Literal("tcp:///127.0.0.1:80".to_string()),
             CommandArg::Literal("--next-upstream".to_string()),
             CommandArg::Literal("error,foo".to_string()),
+        ]);
+
+        assert!(forward.check(&args).is_err());
+    }
+
+    #[test]
+    fn test_check_accepts_status_retry_flags() {
+        let forward = Forward::new();
+        let args = CommandArgs::new(vec![
+            CommandArg::Literal("forward".to_string()),
+            CommandArg::Literal("--map".to_string()),
+            CommandArg::Var("$UPSTREAMS".to_string()),
+            CommandArg::Literal("--next-upstream".to_string()),
+            CommandArg::Literal("error,timeout,http_5xx,non_idempotent".to_string()),
+            CommandArg::Literal("--tries".to_string()),
+            CommandArg::Literal("3".to_string()),
+            CommandArg::Literal("--max-body-buffer".to_string()),
+            CommandArg::Literal("128KB".to_string()),
+        ]);
+
+        forward.check(&args).unwrap();
+    }
+
+    #[test]
+    fn test_check_accepts_hash_and_least_time_algos() {
+        let forward = Forward::new();
+        for algo in ["hash", "consistent_hash", "least_time"] {
+            let args = CommandArgs::new(vec![
+                CommandArg::Literal("forward".to_string()),
+                CommandArg::Literal(algo.to_string()),
+                CommandArg::Literal("--map".to_string()),
+                CommandArg::Var("$UPSTREAMS".to_string()),
+                CommandArg::Literal("--hash-key".to_string()),
+                CommandArg::Literal("user-42".to_string()),
+            ]);
+            forward.check(&args).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_check_rejects_invalid_provider_retry_scope() {
+        let forward = Forward::new();
+        let args = CommandArgs::new(vec![
+            CommandArg::Literal("forward".to_string()),
+            CommandArg::Literal("--map".to_string()),
+            CommandArg::Var("$UPSTREAMS".to_string()),
+            CommandArg::Literal("--provider-retry-scope".to_string()),
+            CommandArg::Literal("invalid".to_string()),
         ]);
 
         assert!(forward.check(&args).is_err());

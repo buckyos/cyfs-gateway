@@ -4,7 +4,10 @@ use super::http_compression::{
 };
 use super::{into_server_err, server_err};
 use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
-use crate::forward::{ForwardFailureRegistry, ForwardPlan, NextUpstreamCondition};
+use crate::forward::{
+    BalanceMethod, ForwardFailureRegistry, ForwardPlan, HttpMethodClass, NextUpstreamCondition,
+    apply_least_time_via_tunnel_mgr,
+};
 use crate::tunnel_connector::TunnelConnector;
 use crate::{
     GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestProcessChainVars,
@@ -667,10 +670,68 @@ impl ProcessChainHttpServer {
 
     /// Walk the candidates of a `ForwardPlan`, performing a connection-stage
     /// probe on each (TCP connect / TLS handshake / tunnel open) and
-    /// forwarding the request through the first reachable candidate. Body
-    /// is never replayed: once we commit to a candidate, failures from that
-    /// point on are propagated as the final response. (§6.3 of the design doc.)
+    /// forwarding the request through the first reachable candidate.
+    ///
+    /// Stage 2 (§6.3): connection-stage failure → next candidate.
+    /// Stage 3 (§6.3 + §8 阶段3): when the policy enables HTTP-status retry
+    /// (`http_5xx`, `http_502`, etc.), the request body is buffered up to
+    /// `policy.max_body_buffer_bytes` and replayed against the next
+    /// candidate. Buffering is suppressed for non-idempotent methods
+    /// unless the policy explicitly opts in via `non_idempotent`. If the
+    /// body exceeds the buffer cap we fall back to "send once" semantics
+    /// for the chosen candidate so an oversized POST doesn't quietly
+    /// behave differently — the caller sees the upstream's actual
+    /// response.
+    /// Stage 4 (§8 阶段4): when `plan.balance == LeastTime` we ask
+    /// tunnel_mgr for an RTT-sorted candidate order before iterating.
     async fn handle_forward_group_upstream(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+        plan: &ForwardPlan,
+        info: &StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        // Stage 4: RTT-aware reordering before iteration.
+        let mut plan_local;
+        let plan: &ForwardPlan = if matches!(plan.balance, BalanceMethod::LeastTime) {
+            plan_local = plan.clone();
+            apply_least_time_via_tunnel_mgr(&mut plan_local, &self.tunnel_manager).await;
+            &plan_local
+        } else {
+            plan
+        };
+
+        let policy = &plan.next_upstream;
+
+        // Stage 3: decide whether HTTP-status retry is possible for
+        // this request. Conditions:
+        //   - policy enables some HTTP status condition,
+        //   - tries > 1,
+        //   - method is idempotent OR policy explicitly opted in via
+        //     `non_idempotent`,
+        //   - max_body_buffer_bytes > 0.
+        let method_class = HttpMethodClass::classify(req.method().as_str());
+        let method_replay_allowed =
+            method_class.is_idempotent() || policy.allow_non_idempotent();
+        let http_status_retry_armed = policy.is_enabled()
+            && policy.any_http_status()
+            && method_replay_allowed
+            && policy.max_body_buffer_bytes > 0;
+
+        if http_status_retry_armed {
+            return self
+                .handle_forward_group_with_status_retry(req, plan, info)
+                .await;
+        }
+
+        // Stage 2 path: connection-stage retry only, body forwarded
+        // once after probing the chosen candidate.
+        self.handle_forward_group_connect_only(req, plan, info).await
+    }
+
+    /// Connection-stage retry only. The original Stage 2 behaviour: pick
+    /// a reachable candidate via probe, then forward the request body
+    /// through it exactly once.
+    async fn handle_forward_group_connect_only(
         &self,
         req: http::Request<BoxBody<Bytes, ServerError>>,
         plan: &ForwardPlan,
@@ -701,19 +762,14 @@ impl ProcessChainHttpServer {
                     chosen_url = Some(candidate.url.clone());
                     log::debug!(
                         "forward-group {}: http selected candidate idx={} url={}",
-                        group_key,
-                        idx,
-                        candidate.url
+                        group_key, idx, candidate.url
                     );
                     break;
                 }
                 Err(e) => {
                     log::debug!(
                         "forward-group {}: http candidate {} (idx {}) probe failed: {}",
-                        group_key,
-                        candidate.url,
-                        idx,
-                        e
+                        group_key, candidate.url, idx, e
                     );
                     registry.record_failure(
                         &group_key,
@@ -746,6 +802,190 @@ impl ProcessChainHttpServer {
         };
 
         self.handle_forward_upstream(req, &target_url, info).await
+    }
+
+    /// Status-aware retry. Buffers the body up to
+    /// `policy.max_body_buffer_bytes`, then walks candidates until one
+    /// returns a non-retryable status. Connection-stage failures and
+    /// matching upstream HTTP statuses both consume an attempt.
+    async fn handle_forward_group_with_status_retry(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+        plan: &ForwardPlan,
+        info: &StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let registry = ForwardFailureRegistry::global();
+        let group_key = plan.failure_state_key();
+        let policy = &plan.next_upstream;
+        let candidate_count = plan.candidates.len();
+        let max_attempts = if !policy.is_enabled() {
+            candidate_count.min(1).max(1)
+        } else if policy.tries == 0 {
+            candidate_count
+        } else {
+            (policy.tries as usize).min(candidate_count)
+        };
+
+        let (req_parts, body) = req.into_parts();
+        let buffered_body = match Self::buffer_body(body, policy.max_body_buffer_bytes).await? {
+            Some(b) => b,
+            None => {
+                // Body exceeded the configured cap. We can no longer
+                // safely replay; degrade to the connect-only path with
+                // a placeholder empty body — we already consumed the
+                // original. To avoid silently dropping the body we
+                // surface a 413-style error so callers notice this is a
+                // configuration issue (cap too small), not a black
+                // hole.
+                log::warn!(
+                    "forward-group {}: body exceeded max_body_buffer_bytes={}, status-retry disabled",
+                    group_key,
+                    policy.max_body_buffer_bytes
+                );
+                return Err(server_err!(
+                    ServerErrorCode::BadRequest,
+                    "request body exceeded forward group max_body_buffer_bytes={}",
+                    policy.max_body_buffer_bytes
+                ));
+            }
+        };
+
+        let mut last_err: Option<ServerError> = None;
+        let mut last_status_resp: Option<http::Response<BoxBody<Bytes, ServerError>>> = None;
+
+        for (idx, candidate) in plan.candidates.iter().enumerate() {
+            if idx >= max_attempts {
+                break;
+            }
+            match self.probe_upstream_candidate(&candidate.url).await {
+                Err(e) => {
+                    log::debug!(
+                        "forward-group {}: http candidate {} (idx {}) probe failed: {}",
+                        group_key, candidate.url, idx, e
+                    );
+                    registry.record_failure(
+                        &group_key,
+                        &candidate.url,
+                        candidate.max_fails,
+                        candidate.fail_timeout,
+                    );
+                    last_err = Some(e);
+                    if !policy.allows(NextUpstreamCondition::Error)
+                        || idx + 1 >= max_attempts
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                Ok(()) => {
+                    registry.record_success(&group_key, &candidate.url);
+                    log::debug!(
+                        "forward-group {}: http selected candidate idx={} url={} (status-retry armed)",
+                        group_key, idx, candidate.url
+                    );
+
+                    let body = Self::full_body(buffered_body.clone());
+                    let mut attempt_req = http::Request::from_parts(req_parts.clone(), body);
+                    Self::set_content_length(&mut attempt_req);
+
+                    match self
+                        .handle_forward_upstream(attempt_req, &candidate.url, info)
+                        .await
+                    {
+                        Ok(r) => {
+                            let status = r.status().as_u16();
+                            if policy.matches_http_status(status) && idx + 1 < max_attempts {
+                                log::debug!(
+                                    "forward-group {}: candidate {} returned {}, retrying next candidate",
+                                    group_key, candidate.url, status
+                                );
+                                registry.record_failure(
+                                    &group_key,
+                                    &candidate.url,
+                                    candidate.max_fails,
+                                    candidate.fail_timeout,
+                                );
+                                last_status_resp = Some(r);
+                                continue;
+                            }
+                            return Ok(r);
+                        }
+                        Err(e) => {
+                            log::debug!(
+                                "forward-group {}: candidate {} request failed: {}",
+                                group_key, candidate.url, e
+                            );
+                            registry.record_failure(
+                                &group_key,
+                                &candidate.url,
+                                candidate.max_fails,
+                                candidate.fail_timeout,
+                            );
+                            last_err = Some(e);
+                            if !policy.allows(NextUpstreamCondition::Error)
+                                || idx + 1 >= max_attempts
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(r) = last_status_resp {
+            return Ok(r);
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            server_err!(
+                ServerErrorCode::TunnelError,
+                "forward-group {} exhausted candidates",
+                group_key
+            )
+        }))
+    }
+
+    /// Buffer at most `cap` bytes of the request body. Returns
+    /// `Ok(Some(bytes))` if the body fit within the cap, `Ok(None)`
+    /// if it exceeded the cap (in which case retry is no longer safe
+    /// for this request).
+    async fn buffer_body(
+        body: BoxBody<Bytes, ServerError>,
+        cap: u64,
+    ) -> ServerResult<Option<Bytes>> {
+        let cap = cap as usize;
+        let collected = body.collect().await.map_err(|e| {
+            server_err!(
+                ServerErrorCode::StreamError,
+                "buffering request body failed: {:?}",
+                e
+            )
+        })?;
+        let bytes = collected.to_bytes();
+        if bytes.len() > cap {
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
+    fn full_body(bytes: Bytes) -> BoxBody<Bytes, ServerError> {
+        Full::new(bytes).map_err(|e| match e {}).boxed()
+    }
+
+    fn set_content_length(req: &mut http::Request<BoxBody<Bytes, ServerError>>) {
+        use hyper::body::Body;
+        let len = req
+            .body()
+            .size_hint()
+            .exact()
+            .unwrap_or(0);
+        if let Ok(v) = http::HeaderValue::from_str(&len.to_string()) {
+            req.headers_mut().insert(http::header::CONTENT_LENGTH, v);
+        }
+        // Replayable bodies can't keep Transfer-Encoding: chunked.
+        req.headers_mut().remove(http::header::TRANSFER_ENCODING);
     }
 
     /// Test reachability of an upstream URL with a connection-stage probe.

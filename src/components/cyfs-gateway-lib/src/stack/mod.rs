@@ -46,6 +46,7 @@ pub type StackResult<T> = sfo_result::Result<T, StackErrorCode>;
 pub type StackError = sfo_result::Error<StackErrorCode>;
 use crate::forward::{
     ForwardFailureRegistry, ForwardPlan, NextUpstreamCondition, NextUpstreamPolicy,
+    apply_least_time_via_tunnel_mgr,
 };
 use crate::{DatagramClientBox, TunnelManager};
 pub use sfo_result::err as stack_err;
@@ -132,6 +133,20 @@ pub async fn stream_forward_group(
     tunnel_manager: &TunnelManager,
     info: Option<&crate::StreamInfo>,
 ) -> StackResult<()> {
+    // Stage 4: re-order plan candidates by RTT before iterating when
+    // the plan asked for least-time selection. Best-effort: any failure
+    // in tunnel_mgr leaves the original order untouched.
+    let mut plan_local;
+    let plan: &ForwardPlan = if matches!(
+        plan.balance,
+        crate::forward::BalanceMethod::LeastTime
+    ) {
+        plan_local = plan.clone();
+        apply_least_time_via_tunnel_mgr(&mut plan_local, tunnel_manager).await;
+        &plan_local
+    } else {
+        plan
+    };
     let registry = ForwardFailureRegistry::global();
     let group_key = plan.failure_state_key();
     let policy = &plan.next_upstream;
@@ -284,6 +299,17 @@ pub async fn datagram_forward_group(
     plan: &ForwardPlan,
     tunnel_manager: &TunnelManager,
 ) -> StackResult<()> {
+    let mut plan_local;
+    let plan: &ForwardPlan = if matches!(
+        plan.balance,
+        crate::forward::BalanceMethod::LeastTime
+    ) {
+        plan_local = plan.clone();
+        apply_least_time_via_tunnel_mgr(&mut plan_local, tunnel_manager).await;
+        &plan_local
+    } else {
+        plan
+    };
     let registry = ForwardFailureRegistry::global();
     let group_key = plan.failure_state_key();
     let policy = &plan.next_upstream;
