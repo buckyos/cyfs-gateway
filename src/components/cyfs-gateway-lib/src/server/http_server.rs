@@ -9,6 +9,7 @@ use crate::forward::{
     apply_least_time_via_tunnel_mgr,
 };
 use crate::tunnel_connector::TunnelConnector;
+use crate::tunnel_url_status::TunnelFailureReason;
 use crate::{
     GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestProcessChainVars,
     HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef, ProcessChainConfigs, Server,
@@ -251,17 +252,44 @@ impl ProcessChainHttpServer {
             })
     }
 
+    /// Connect outcome carrying the bucket needed for tunnel_mgr history
+    /// classification (§6.7.3). Used by `connect_upstream_with_fallback`
+    /// so callers can write the right `TunnelFailureReason` without
+    /// re-parsing error strings.
+    fn classify_connect_errors(errors: &[(String, String, bool)]) -> TunnelFailureReason {
+        // errors: (addr, message, is_timeout)
+        // Prefer the most specific bucket. ConnectRefused beats Timeout
+        // beats anything else, since refusal is a definitive signal that
+        // the host exists but isn't listening.
+        let mut saw_refused = false;
+        let mut saw_timeout = false;
+        for (_, msg, is_timeout) in errors {
+            if *is_timeout {
+                saw_timeout = true;
+            } else if msg.to_ascii_lowercase().contains("refused") {
+                saw_refused = true;
+            }
+        }
+        if saw_refused {
+            TunnelFailureReason::ConnectRefused
+        } else if saw_timeout {
+            TunnelFailureReason::ConnectTimeout
+        } else {
+            TunnelFailureReason::PreConnectRoute
+        }
+    }
+
     async fn connect_upstream_candidates(
         candidates: Vec<SocketAddr>,
-    ) -> ServerResult<(TcpStream, SocketAddr)> {
+    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String)> {
         if candidates.is_empty() {
-            return Err(server_err!(
-                ServerErrorCode::InvalidConfig,
-                "No upstream socket addresses resolved"
+            return Err((
+                TunnelFailureReason::PreConnectDns,
+                "No upstream socket addresses resolved".to_string(),
             ));
         }
 
-        let mut errors = Vec::new();
+        let mut errors: Vec<(String, String, bool)> = Vec::new();
         for addr in candidates {
             match timeout(
                 Self::HTTPS_UPSTREAM_CONNECT_TIMEOUT,
@@ -270,36 +298,50 @@ impl ProcessChainHttpServer {
             .await
             {
                 Ok(Ok(stream)) => return Ok((stream, addr)),
-                Ok(Err(err)) => errors.push(format!("{} ({})", addr, err)),
-                Err(_) => errors.push(format!("{} (connect timeout)", addr)),
+                Ok(Err(err)) => errors.push((addr.to_string(), err.to_string(), false)),
+                Err(_) => errors.push((addr.to_string(), "connect timeout".to_string(), true)),
             }
         }
 
-        Err(server_err!(
-            ServerErrorCode::InvalidConfig,
-            "Failed to connect upstream candidates: {}",
-            errors.join(", ")
-        ))
+        let reason = Self::classify_connect_errors(&errors);
+        let msg = errors
+            .into_iter()
+            .map(|(a, m, _)| format!("{} ({})", a, m))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err((reason, msg))
     }
 
     async fn connect_upstream_with_fallback(
         connect_host: &str,
         connect_port: u16,
-    ) -> ServerResult<(TcpStream, SocketAddr)> {
-        let candidates: Vec<SocketAddr> = lookup_host((connect_host, connect_port))
-            .await
-            .map_err(|e| {
-                server_err!(
-                    ServerErrorCode::InvalidConfig,
-                    "Failed to resolve upstream {}:{}: {}",
-                    connect_host,
-                    connect_port,
-                    e
-                )
-            })?
-            .collect();
-
+    ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String)> {
+        let candidates: Vec<SocketAddr> = match lookup_host((connect_host, connect_port)).await {
+            Ok(it) => it.collect(),
+            Err(e) => {
+                return Err((
+                    TunnelFailureReason::PreConnectDns,
+                    format!("resolve {}:{} failed: {}", connect_host, connect_port, e),
+                ));
+            }
+        };
         Self::connect_upstream_candidates(candidates).await
+    }
+
+    /// Best-effort: parse a candidate URL string into a `Url` suitable
+    /// as the tunnel_mgr history key. Returns `None` if parsing fails;
+    /// callers fall back to skipping history writeback in that case
+    /// (we never want history bookkeeping to mask the real error).
+    fn upstream_history_key(target_url: &str) -> Option<Url> {
+        Url::parse(target_url).ok()
+    }
+
+    fn connect_err_to_server_err(
+        prefix: &str,
+        err: (TunnelFailureReason, String),
+    ) -> ServerError {
+        let (_reason, msg) = err;
+        server_err!(ServerErrorCode::InvalidConfig, "{}: {}", prefix, msg)
     }
 
     pub fn builder() -> ProcessChainHttpServerBuilder {
@@ -457,6 +499,13 @@ impl ProcessChainHttpServer {
             )
         })?;
         debug!("handle_upstream url: {}", request_url);
+        // Per §6.7 we report the outcome of every business attempt to
+        // tunnel_mgr against the *candidate* URL (target_url), not the
+        // joined request_url with the user's path. Otherwise every
+        // distinct path becomes a separate history entry. Skip writeback
+        // when the candidate URL fails to parse — that's a config error,
+        // not a reachability signal.
+        let history_key = Self::upstream_history_key(target_url);
         let scheme = request_url.scheme();
         match scheme {
             "http" => {
@@ -483,14 +532,42 @@ impl ProcessChainHttpServer {
 
                 *upstream_req.headers_mut() = header;
 
-                let resp = client.request(upstream_req).await.map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "Failed to request upstream {}: {}",
-                        request_url,
-                        e
-                    )
-                })?;
+                // hyper-util's transparent connector aggregates connect
+                // and request errors into one type, so direct-http
+                // history is coarser than direct-https below: failure
+                // here always lands in the `TunnelOpen` bucket. This is
+                // accepted for first cut (most http upstreams are loopback);
+                // a custom HttpConnector would let us split connect /
+                // send phases later.
+                let started = std::time::Instant::now();
+                let resp = match client.request(upstream_req).await {
+                    Ok(r) => {
+                        if let Some(key) = history_key.as_ref() {
+                            self.tunnel_manager
+                                .record_business_success(key, Some(started.elapsed()))
+                                .await;
+                        }
+                        r
+                    }
+                    Err(e) => {
+                        if let Some(key) = history_key.as_ref() {
+                            let detail = e.to_string();
+                            self.tunnel_manager
+                                .record_business_failure(
+                                    key,
+                                    TunnelFailureReason::TunnelOpen,
+                                    Some(&detail),
+                                )
+                                .await;
+                        }
+                        return Err(server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "Failed to request upstream {}: {}",
+                            request_url,
+                            e
+                        ));
+                    }
+                };
                 let resp = resp.map(|body| {
                     body.map_err(|e| {
                         ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
@@ -527,8 +604,28 @@ impl ProcessChainHttpServer {
                 // SNI must target the upstream host, not the inbound Host header.
                 let sni_host = Self::upstream_sni_host(&request_url)?;
 
+                // Wall-clock timer for "connection establishment" — TCP
+                // connect through hyper handshake. send_request /
+                // upstream app processing is excluded so RTT history
+                // reflects path quality, not application latency.
+                let started = std::time::Instant::now();
+
                 let (tcp_stream, connected_addr) =
-                    Self::connect_upstream_with_fallback(connect_host, connect_port).await?;
+                    match Self::connect_upstream_with_fallback(connect_host, connect_port).await {
+                        Ok(v) => v,
+                        Err((reason, msg)) => {
+                            if let Some(key) = history_key.as_ref() {
+                                self.tunnel_manager
+                                    .record_business_failure(key, reason, Some(&msg))
+                                    .await;
+                            }
+                            return Err(server_err!(
+                                ServerErrorCode::InvalidConfig,
+                                "Failed to connect upstream candidates: {}",
+                                msg
+                            ));
+                        }
+                    };
 
                 let tls_config = ClientConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),
@@ -549,29 +646,64 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
-                let tls_stream = tls_connector
+                let tls_stream = match tls_connector
                     .connect(server_name, tcp_stream)
                     .await
-                    .map_err(|e| {
-                        server_err!(
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if let Some(key) = history_key.as_ref() {
+                            let detail = e.to_string();
+                            self.tunnel_manager
+                                .record_business_failure(
+                                    key,
+                                    TunnelFailureReason::TlsHandshake,
+                                    Some(&detail),
+                                )
+                                .await;
+                        }
+                        return Err(server_err!(
                             ServerErrorCode::InvalidConfig,
                             "Failed tls handshake with upstream {} via {}: {}",
                             sni_host,
                             connected_addr,
                             e
-                        )
-                    })?;
+                        ));
+                    }
+                };
 
                 let (mut sender, conn) =
-                    hyper::client::conn::http1::handshake(TokioIo::new(tls_stream))
-                        .await
-                        .map_err(|e| {
-                            server_err!(
+                    match hyper::client::conn::http1::handshake(TokioIo::new(tls_stream)).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if let Some(key) = history_key.as_ref() {
+                                let detail = e.to_string();
+                                self.tunnel_manager
+                                    .record_business_failure(
+                                        key,
+                                        TunnelFailureReason::TunnelOpen,
+                                        Some(&detail),
+                                    )
+                                    .await;
+                            }
+                            return Err(server_err!(
                                 ServerErrorCode::StreamError,
                                 "Failed to build https client connection: {}",
                                 e
-                            )
-                        })?;
+                            ));
+                        }
+                    };
+
+                // Connection establishment succeeded — record reachable
+                // with the elapsed RTT before we even attempt the
+                // request. send_request failures from here on are
+                // upstream app health, not URL reachability (§6.7.2),
+                // so they are NOT mirrored back to tunnel_mgr.
+                if let Some(key) = history_key.as_ref() {
+                    self.tunnel_manager
+                        .record_business_success(key, Some(started.elapsed()))
+                        .await;
+                }
                 tokio::spawn(async move {
                     if let Err(e) = conn.await {
                         debug!("https upstream connection closed with error: {}", e);
@@ -728,9 +860,21 @@ impl ProcessChainHttpServer {
         self.handle_forward_group_connect_only(req, plan, info).await
     }
 
-    /// Connection-stage retry only. The original Stage 2 behaviour: pick
-    /// a reachable candidate via probe, then forward the request body
-    /// through it exactly once.
+    /// Connection-stage retry only. Original Stage 2 spirit, but the
+    /// request body must be forwarded inside the same attempt iteration:
+    /// if the post-probe `handle_forward_upstream` fails at TCP / TLS /
+    /// tunnel-open it would otherwise terminate the request (no next
+    /// upstream, no record_failure on the candidate). Per §6.3 we now
+    /// roll forward and update the group failure state.
+    ///
+    /// We can do this safely without buffering the body only because we
+    /// haven't yet read it on a previous candidate. Once
+    /// `handle_forward_upstream` consumes the body, the request is gone
+    /// and we cannot retry — that path therefore cannot be retried more
+    /// than once. To keep this property explicit, we move `req` into an
+    /// `Option` and `take()` it on the first real send; subsequent
+    /// iterations after a partial-send failure will see `None` and bail
+    /// with the recorded error.
     async fn handle_forward_group_connect_only(
         &self,
         req: http::Request<BoxBody<Bytes, ServerError>>,
@@ -748,27 +892,121 @@ impl ProcessChainHttpServer {
         } else {
             (policy.tries as usize).min(candidate_count)
         };
+        let deadline = policy.timeout.map(|d| std::time::Instant::now() + d);
 
         let mut last_err: Option<ServerError> = None;
-        let mut chosen_url: Option<String> = None;
+        let mut req_slot = Some(req);
 
         for (idx, candidate) in plan.candidates.iter().enumerate() {
             if idx >= max_attempts {
                 break;
             }
-            match self.probe_upstream_candidate(&candidate.url).await {
-                Ok(()) => {
-                    registry.record_success(&group_key, &candidate.url);
-                    chosen_url = Some(candidate.url.clone());
-                    log::debug!(
-                        "forward-group {}: http selected candidate idx={} url={}",
-                        group_key, idx, candidate.url
-                    );
+            if let Some(d) = deadline {
+                if std::time::Instant::now() >= d {
+                    last_err.get_or_insert_with(|| {
+                        server_err!(
+                            ServerErrorCode::TunnelError,
+                            "forward-group {} next_upstream timeout exceeded before idx={}",
+                            group_key,
+                            idx
+                        )
+                    });
                     break;
                 }
+            }
+            // 1. Probe stage. Failure here means we never touched the
+            // request body, so retry is unconditionally safe. Wrap with
+            // remaining-budget timeout so a slow probe cannot blow past
+            // policy.timeout.
+            let probe_fut = self.probe_upstream_candidate(&candidate.url);
+            let probe_res: ServerResult<()> = match deadline {
+                Some(d) => {
+                    let remaining = d.saturating_duration_since(std::time::Instant::now());
+                    match timeout(remaining, probe_fut).await {
+                        Ok(r) => r,
+                        Err(_) => Err(server_err!(
+                            ServerErrorCode::TunnelError,
+                            "forward-group {} probe of {} timed out (next_upstream budget {}ms)",
+                            group_key,
+                            candidate.url,
+                            policy.timeout.unwrap_or_default().as_millis()
+                        )),
+                    }
+                }
+                None => probe_fut.await,
+            };
+            if let Err(e) = probe_res {
+                log::debug!(
+                    "forward-group {}: http candidate {} (idx {}) probe failed: {}",
+                    group_key, candidate.url, idx, e
+                );
+                registry.record_failure(
+                    &group_key,
+                    &candidate.url,
+                    candidate.max_fails,
+                    candidate.fail_timeout,
+                );
+                last_err = Some(e);
+                if !policy.is_enabled()
+                    || !policy.allows(NextUpstreamCondition::Error)
+                    || idx + 1 >= max_attempts
+                {
+                    break;
+                }
+                continue;
+            }
+            registry.record_success(&group_key, &candidate.url);
+            log::debug!(
+                "forward-group {}: http selected candidate idx={} url={}",
+                group_key, idx, candidate.url
+            );
+
+            // 2. Real forward. The request body is consumed here. If
+            // this fails before any bytes leave the proxy (TCP / TLS /
+            // tunnel open), the request body has not yet been read by
+            // hyper's request driver — but we cannot tell that from the
+            // outside. To stay safe per §6.3 ("non-idempotent methods
+            // default to connection-stage retry only"), we only consider
+            // the failure retryable if `req_slot` is still populated by
+            // a fresh request — which it always is on the very first
+            // forward attempt. After that, we must surface the error.
+            let attempt_req = match req_slot.take() {
+                Some(r) => r,
+                None => {
+                    // We already burned the body on a prior candidate;
+                    // can't retry safely. Surface the last error.
+                    return Err(last_err.unwrap_or_else(|| {
+                        server_err!(
+                            ServerErrorCode::TunnelError,
+                            "forward-group {} request body already consumed",
+                            group_key
+                        )
+                    }));
+                }
+            };
+            let upstream_fut =
+                self.handle_forward_upstream(attempt_req, &candidate.url, info);
+            let upstream_res = match deadline {
+                Some(d) => {
+                    let remaining = d.saturating_duration_since(std::time::Instant::now());
+                    match timeout(remaining, upstream_fut).await {
+                        Ok(r) => r,
+                        Err(_) => Err(server_err!(
+                            ServerErrorCode::TunnelError,
+                            "forward-group {} forward to {} timed out (next_upstream budget {}ms)",
+                            group_key,
+                            candidate.url,
+                            policy.timeout.unwrap_or_default().as_millis()
+                        )),
+                    }
+                }
+                None => upstream_fut.await,
+            };
+            match upstream_res {
+                Ok(resp) => return Ok(resp),
                 Err(e) => {
                     log::debug!(
-                        "forward-group {}: http candidate {} (idx {}) probe failed: {}",
+                        "forward-group {}: http candidate {} (idx {}) request failed: {}",
                         group_key, candidate.url, idx, e
                     );
                     registry.record_failure(
@@ -778,30 +1016,27 @@ impl ProcessChainHttpServer {
                         candidate.fail_timeout,
                     );
                     last_err = Some(e);
+                    // Body was consumed by handle_forward_upstream —
+                    // `req_slot` stays `None`, so the next loop
+                    // iteration's `req_slot.take()` returns and bails.
                     if !policy.is_enabled()
                         || !policy.allows(NextUpstreamCondition::Error)
                         || idx + 1 >= max_attempts
                     {
                         break;
                     }
+                    continue;
                 }
             }
         }
 
-        let target_url = match chosen_url {
-            Some(u) => u,
-            None => {
-                return Err(last_err.unwrap_or_else(|| {
-                    server_err!(
-                        ServerErrorCode::TunnelError,
-                        "forward-group {} exhausted candidates",
-                        group_key
-                    )
-                }));
-            }
-        };
-
-        self.handle_forward_upstream(req, &target_url, info).await
+        Err(last_err.unwrap_or_else(|| {
+            server_err!(
+                ServerErrorCode::TunnelError,
+                "forward-group {} exhausted candidates",
+                group_key
+            )
+        }))
     }
 
     /// Status-aware retry. Buffers the body up to
@@ -852,12 +1087,43 @@ impl ProcessChainHttpServer {
 
         let mut last_err: Option<ServerError> = None;
         let mut last_status_resp: Option<http::Response<BoxBody<Bytes, ServerError>>> = None;
+        let deadline = policy.timeout.map(|d| std::time::Instant::now() + d);
 
         for (idx, candidate) in plan.candidates.iter().enumerate() {
             if idx >= max_attempts {
                 break;
             }
-            match self.probe_upstream_candidate(&candidate.url).await {
+            if let Some(d) = deadline {
+                if std::time::Instant::now() >= d {
+                    last_err.get_or_insert_with(|| {
+                        server_err!(
+                            ServerErrorCode::TunnelError,
+                            "forward-group {} next_upstream timeout exceeded before idx={}",
+                            group_key,
+                            idx
+                        )
+                    });
+                    break;
+                }
+            }
+            let probe_fut = self.probe_upstream_candidate(&candidate.url);
+            let probe_res: ServerResult<()> = match deadline {
+                Some(d) => {
+                    let remaining = d.saturating_duration_since(std::time::Instant::now());
+                    match timeout(remaining, probe_fut).await {
+                        Ok(r) => r,
+                        Err(_) => Err(server_err!(
+                            ServerErrorCode::TunnelError,
+                            "forward-group {} probe of {} timed out (next_upstream budget {}ms)",
+                            group_key,
+                            candidate.url,
+                            policy.timeout.unwrap_or_default().as_millis()
+                        )),
+                    }
+                }
+                None => probe_fut.await,
+            };
+            match probe_res {
                 Err(e) => {
                     log::debug!(
                         "forward-group {}: http candidate {} (idx {}) probe failed: {}",
@@ -888,10 +1154,26 @@ impl ProcessChainHttpServer {
                     let mut attempt_req = http::Request::from_parts(req_parts.clone(), body);
                     Self::set_content_length(&mut attempt_req);
 
-                    match self
-                        .handle_forward_upstream(attempt_req, &candidate.url, info)
-                        .await
-                    {
+                    let upstream_fut =
+                        self.handle_forward_upstream(attempt_req, &candidate.url, info);
+                    let upstream_res = match deadline {
+                        Some(d) => {
+                            let remaining =
+                                d.saturating_duration_since(std::time::Instant::now());
+                            match timeout(remaining, upstream_fut).await {
+                                Ok(r) => r,
+                                Err(_) => Err(server_err!(
+                                    ServerErrorCode::TunnelError,
+                                    "forward-group {} forward to {} timed out (next_upstream budget {}ms)",
+                                    group_key,
+                                    candidate.url,
+                                    policy.timeout.unwrap_or_default().as_millis()
+                                )),
+                            }
+                        }
+                        None => upstream_fut.await,
+                    };
+                    match upstream_res {
                         Ok(r) => {
                             let status = r.status().as_u16();
                             if policy.matches_http_status(status) && idx + 1 < max_attempts {
@@ -1018,7 +1300,11 @@ impl ProcessChainHttpServer {
                         url
                     )
                 })?;
-                let _ = Self::connect_upstream_with_fallback(host, port).await?;
+                let _ = Self::connect_upstream_with_fallback(host, port)
+                    .await
+                    .map_err(|e| {
+                        Self::connect_err_to_server_err("Failed to connect upstream candidates", e)
+                    })?;
                 Ok(())
             }
             "https" => {
@@ -1038,7 +1324,14 @@ impl ProcessChainHttpServer {
                 })?;
                 let sni_host = Self::upstream_sni_host(&url)?;
                 let (tcp_stream, connected_addr) =
-                    Self::connect_upstream_with_fallback(host, port).await?;
+                    Self::connect_upstream_with_fallback(host, port)
+                        .await
+                        .map_err(|e| {
+                            Self::connect_err_to_server_err(
+                                "Failed to connect upstream candidates",
+                                e,
+                            )
+                        })?;
                 let tls_config = ClientConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),
                 ))
@@ -3347,13 +3640,11 @@ mod tests {
         let unreachable_v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
         let closed_v4: SocketAddr = "127.0.0.1:9".parse().unwrap();
 
-        let err =
+        let (_reason, msg) =
             ProcessChainHttpServer::connect_upstream_candidates(vec![unreachable_v6, closed_v4])
                 .await
                 .unwrap_err();
 
-        let msg = err.msg().to_string();
-        assert!(msg.contains("Failed to connect upstream candidates"));
         assert!(msg.contains("2001:db8::1"));
         assert!(msg.contains("127.0.0.1:9"));
     }

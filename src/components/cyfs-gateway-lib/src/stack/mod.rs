@@ -126,7 +126,12 @@ pub async fn stream_forward(
 /// stream tunnel, then run `copy_bidirectional`. Retries are connection-stage
 /// only — once a candidate has been opened we never silently fail over.
 ///
-/// Implements §6.4 of `forward机制升级需求.md`.
+/// Implements §6.4 of `forward机制升级需求.md`. Honors `policy.timeout`
+/// as a wall-clock budget that caps the total cost of all candidate
+/// attempts (§6.3 "next_upstream_tries 和 next_upstream_timeout 必须限
+/// 制单次请求的最大尝试成本"). The timer starts before the first
+/// attempt and any remaining slice is passed to `tokio::time::timeout`
+/// per attempt, so a slow candidate cannot blow past the budget.
 pub async fn stream_forward_group(
     stream: Box<dyn AsyncStream>,
     plan: &ForwardPlan,
@@ -151,6 +156,7 @@ pub async fn stream_forward_group(
     let group_key = plan.failure_state_key();
     let policy = &plan.next_upstream;
     let max_attempts = policy_max_attempts(policy, plan.candidates.len());
+    let deadline = policy.timeout.map(|d| std::time::Instant::now() + d);
 
     let mut last_err: Option<StackError> = None;
     let mut last_target_url: Option<String> = None;
@@ -159,6 +165,23 @@ pub async fn stream_forward_group(
     for (idx, candidate) in plan.candidates.iter().enumerate() {
         if idx >= max_attempts {
             break;
+        }
+        // Bail before issuing the next attempt if we're already out of
+        // budget — even if `tries` would still allow another. This keeps
+        // a long candidate list from amortizing a tight timeout into
+        // many failed but cheap attempts that still over-shoot.
+        if let Some(d) = deadline {
+            if std::time::Instant::now() >= d {
+                last_err.get_or_insert_with(|| {
+                    stack_err!(
+                        StackErrorCode::TunnelError,
+                        "forward-group {} next_upstream timeout exceeded before idx={}",
+                        group_key,
+                        idx
+                    )
+                });
+                break;
+            }
         }
 
         let url = match Url::parse(&candidate.url) {
@@ -189,7 +212,27 @@ pub async fn stream_forward_group(
             .query_pairs()
             .any(|(k, v)| k == "proxy_protocol" && v.eq_ignore_ascii_case("v2"));
 
-        match tunnel_manager.open_stream_by_url(&url).await {
+        let attempt = tunnel_manager.open_stream_by_url(&url);
+        let result = match deadline {
+            Some(d) => {
+                let remaining = d.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(remaining, attempt).await {
+                    Ok(r) => r.map_err(|e| {
+                        crate::TunnelError::ConnectError(e.to_string())
+                    }),
+                    Err(_) => Err(crate::TunnelError::ConnectError(format!(
+                        "next_upstream timeout exceeded ({}ms budget) on {}",
+                        policy.timeout.unwrap_or_default().as_millis(),
+                        candidate.url,
+                    ))),
+                }
+            }
+            None => attempt
+                .await
+                .map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
+        };
+
+        match result {
             Ok(forward_stream) => {
                 registry.record_success(&group_key, &candidate.url);
                 chosen = Some((idx, forward_stream, candidate.url.clone(), emit_proxy_v2));
@@ -293,7 +336,8 @@ pub async fn datagram_forward(
 /// Walk the candidate list of a `ForwardPlan` for datagram forwarding.
 /// Connection-stage retry only: once a datagram client has been created, a
 /// failure inside `copy_datagram_bidirectional` is propagated, never retried
-/// transparently. Implements §6.5.
+/// transparently. Implements §6.5. Honors `policy.timeout` as a wall-clock
+/// budget (see `stream_forward_group`).
 pub async fn datagram_forward_group(
     datagram: Box<dyn DatagramClientBox>,
     plan: &ForwardPlan,
@@ -314,6 +358,7 @@ pub async fn datagram_forward_group(
     let group_key = plan.failure_state_key();
     let policy = &plan.next_upstream;
     let max_attempts = policy_max_attempts(policy, plan.candidates.len());
+    let deadline = policy.timeout.map(|d| std::time::Instant::now() + d);
 
     let mut last_err: Option<StackError> = None;
     let mut chosen: Option<(usize, Box<dyn DatagramClientBox>, String)> = None;
@@ -321,6 +366,19 @@ pub async fn datagram_forward_group(
     for (idx, candidate) in plan.candidates.iter().enumerate() {
         if idx >= max_attempts {
             break;
+        }
+        if let Some(d) = deadline {
+            if std::time::Instant::now() >= d {
+                last_err.get_or_insert_with(|| {
+                    stack_err!(
+                        StackErrorCode::TunnelError,
+                        "forward-group {} next_upstream timeout exceeded before idx={}",
+                        group_key,
+                        idx
+                    )
+                });
+                break;
+            }
         }
         let url = match Url::parse(&candidate.url) {
             Ok(u) => u,
@@ -344,7 +402,26 @@ pub async fn datagram_forward_group(
                 continue;
             }
         };
-        match tunnel_manager.create_datagram_client_by_url(&url).await {
+        let attempt = tunnel_manager.create_datagram_client_by_url(&url);
+        let result = match deadline {
+            Some(d) => {
+                let remaining = d.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(remaining, attempt).await {
+                    Ok(r) => r.map_err(|e| {
+                        crate::TunnelError::ConnectError(e.to_string())
+                    }),
+                    Err(_) => Err(crate::TunnelError::ConnectError(format!(
+                        "next_upstream timeout exceeded ({}ms budget) on {}",
+                        policy.timeout.unwrap_or_default().as_millis(),
+                        candidate.url,
+                    ))),
+                }
+            }
+            None => attempt
+                .await
+                .map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
+        };
+        match result {
             Ok(client) => {
                 registry.record_success(&group_key, &candidate.url);
                 chosen = Some((idx, client, candidate.url.clone()));

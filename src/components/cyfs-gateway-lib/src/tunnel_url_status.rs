@@ -64,6 +64,50 @@ impl TunnelUrlStatusSource {
     }
 }
 
+/// Unified failure-reason classification used by both business-connect
+/// writeback (§6.7.3 of `forward机制升级需求.md`) and protocol probers.
+/// Prober failure_reason strings should start with the canonical
+/// `as_str()` prefix so that grep/dashboards can compare business and
+/// probe signals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelFailureReason {
+    PreConnectDns,
+    PreConnectRoute,
+    ConnectRefused,
+    ConnectTimeout,
+    TlsHandshake,
+    TunnelOpen,
+    UnsupportedScheme,
+    Other,
+}
+
+impl TunnelFailureReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TunnelFailureReason::PreConnectDns => "pre_connect_dns",
+            TunnelFailureReason::PreConnectRoute => "pre_connect_route",
+            TunnelFailureReason::ConnectRefused => "connect_refused",
+            TunnelFailureReason::ConnectTimeout => "connect_timeout",
+            TunnelFailureReason::TlsHandshake => "tls_handshake",
+            TunnelFailureReason::TunnelOpen => "tunnel_open",
+            TunnelFailureReason::UnsupportedScheme => "unsupported_scheme",
+            TunnelFailureReason::Other => "other",
+        }
+    }
+
+    /// Compose a `failure_reason` string suitable for `TunnelUrlStatus`.
+    /// Always prefixed with the canonical category so dashboards can
+    /// `starts_with` to bucket entries; an optional detail follows after
+    /// `: `.
+    pub fn format_reason(&self, detail: Option<&str>) -> String {
+        match detail {
+            Some(d) if !d.is_empty() => format!("{}: {}", self.as_str(), d),
+            _ => self.as_str().to_string(),
+        }
+    }
+}
+
 /// Sort policy applied to batch query results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelUrlSortPolicy {

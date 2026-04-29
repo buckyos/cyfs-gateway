@@ -4,10 +4,10 @@ use crate::quic_tunnel::QuicTunnelBuilder;
 use crate::socks::SocksTunnelBuilder;
 use crate::tls_tunnel::TlsTunnelBuilder;
 use crate::tunnel_url_status::{
-    TunnelProbeOptions, TunnelProbeResult, TunnelStatusStoreConfig, TunnelUrlHistory,
-    TunnelUrlState, TunnelUrlStatus, TunnelUrlStatusSource, mask_tunnel_url, normalize_tunnel_url,
-    protocol_category_for_scheme, reachable_status, redact_url_for_persist, sort_urls,
-    unknown_status, unreachable_status, unsupported_status,
+    TunnelFailureReason, TunnelProbeOptions, TunnelProbeResult, TunnelStatusStoreConfig,
+    TunnelUrlHistory, TunnelUrlState, TunnelUrlStatus, TunnelUrlStatusSource, mask_tunnel_url,
+    normalize_tunnel_url, protocol_category_for_scheme, reachable_status, redact_url_for_persist,
+    sort_urls, unknown_status, unreachable_status, unsupported_status,
 };
 use crate::{TunnelBox, TunnelBuilder, TunnelError, TunnelResult};
 use buckyos_kit::{AsyncStream, buckyos_get_unix_timestamp};
@@ -282,25 +282,60 @@ impl TunnelManager {
 
     //$tunnel_schema://$tunnel_stack_id/$target_stream_id
     pub async fn open_stream_by_url(&self, url: &Url) -> TunnelResult<Box<dyn AsyncStream>> {
-        let builder = self.get_tunnel_builder_by_protocol(url.scheme()).await?;
+        // Per §6.7 we record an outcome on every failure branch
+        // (including pre-connect) so dashboards reflect the same view
+        // an active prober would. RTT is measured wall-clock from here
+        // until the stream is actually usable.
+        let started = std::time::Instant::now();
+
+        let builder = match self.get_tunnel_builder_by_protocol(url.scheme()).await {
+            Ok(b) => b,
+            Err(e) => {
+                let detail = e.to_string();
+                self.record_business_failure(
+                    url,
+                    TunnelFailureReason::UnsupportedScheme,
+                    Some(&detail),
+                )
+                .await;
+                return Err(e);
+            }
+        };
         let auth_str = url.authority();
-        let tunnel = if auth_str.is_empty() {
-            builder.create_tunnel(None).await?
+        let tunnel_res = if auth_str.is_empty() {
+            builder.create_tunnel(None).await
         } else {
-            builder.create_tunnel(Some(auth_str)).await?
+            builder.create_tunnel(Some(auth_str)).await
+        };
+        let tunnel = match tunnel_res {
+            Ok(t) => t,
+            Err(e) => {
+                let detail = format!("create_tunnel failed: {}", e);
+                self.record_business_failure(
+                    url,
+                    classify_create_tunnel_error(&e),
+                    Some(&detail),
+                )
+                .await;
+                error!("Create tunnel for {} failed: {}", url, e);
+                return Err(e);
+            }
         };
         let path = url.path();
         debug!("Open stream by url.path: {}", path);
-        let res = tunnel.open_stream(path).await;
-        match res {
+        match tunnel.open_stream(path).await {
             Ok(stream) => {
-                self.record_business_connect(url, true, None).await;
+                self.record_business_success(url, Some(started.elapsed())).await;
                 Ok(stream)
             }
             Err(e) => {
-                let reason = format!("open stream failed: {}", e);
-                self.record_business_connect(url, false, Some(reason.clone()))
-                    .await;
+                let detail = format!("open_stream failed: {}", e);
+                self.record_business_failure(
+                    url,
+                    TunnelFailureReason::TunnelOpen,
+                    Some(&detail),
+                )
+                .await;
                 error!("Open stream by url {} failed: {}", url, e);
                 Err(TunnelError::ConnectError(format!(
                     "Open stream by url failed: {}",
@@ -314,23 +349,54 @@ impl TunnelManager {
         &self,
         url: &Url,
     ) -> TunnelResult<Box<dyn DatagramClientBox>> {
-        let builder = self.get_tunnel_builder_by_protocol(url.scheme()).await?;
-        let auth_str = url.authority();
-        let tunnel = if auth_str.is_empty() {
-            builder.create_tunnel(None).await?
-        } else {
-            builder.create_tunnel(Some(auth_str)).await?
+        let started = std::time::Instant::now();
+
+        let builder = match self.get_tunnel_builder_by_protocol(url.scheme()).await {
+            Ok(b) => b,
+            Err(e) => {
+                let detail = e.to_string();
+                self.record_business_failure(
+                    url,
+                    TunnelFailureReason::UnsupportedScheme,
+                    Some(&detail),
+                )
+                .await;
+                return Err(e);
+            }
         };
-        let res = tunnel.create_datagram_client(url.path()).await;
-        match res {
+        let auth_str = url.authority();
+        let tunnel_res = if auth_str.is_empty() {
+            builder.create_tunnel(None).await
+        } else {
+            builder.create_tunnel(Some(auth_str)).await
+        };
+        let tunnel = match tunnel_res {
+            Ok(t) => t,
+            Err(e) => {
+                let detail = format!("create_tunnel failed: {}", e);
+                self.record_business_failure(
+                    url,
+                    classify_create_tunnel_error(&e),
+                    Some(&detail),
+                )
+                .await;
+                error!("Create tunnel for {} failed: {}", url, e);
+                return Err(e);
+            }
+        };
+        match tunnel.create_datagram_client(url.path()).await {
             Ok(client) => {
-                self.record_business_connect(url, true, None).await;
+                self.record_business_success(url, Some(started.elapsed())).await;
                 Ok(client)
             }
             Err(e) => {
-                let reason = format!("create datagram client failed: {}", e);
-                self.record_business_connect(url, false, Some(reason.clone()))
-                    .await;
+                let detail = format!("create_datagram_client failed: {}", e);
+                self.record_business_failure(
+                    url,
+                    TunnelFailureReason::TunnelOpen,
+                    Some(&detail),
+                )
+                .await;
                 error!("Create datagram client by url failed: {}", e);
                 Err(TunnelError::ConnectError(format!(
                     "Create datagram client by url failed: {}",
@@ -543,26 +609,47 @@ impl TunnelManager {
     // Internal helpers
     // ------------------------------------------------------------------
 
-    async fn record_business_connect(&self, url: &Url, success: bool, reason: Option<String>) {
+    /// Business-connect success. Per `forward机制升级需求.md` §6.7.2 the
+    /// RTT recorded here is the wall-clock time from "began the attempt"
+    /// to "tunnel/stream/datagram client successfully open" — measured
+    /// by the caller and passed in. Pass `None` only when the attempt
+    /// reused an already-established tunnel (so the timing wouldn't
+    /// reflect a fresh connect and would pollute RTT history).
+    pub async fn record_business_success(
+        &self,
+        url: &Url,
+        rtt: Option<std::time::Duration>,
+    ) {
         let normalized = normalize_tunnel_url(url);
         let now = now_ms();
-        let status = if success {
-            reachable_status(
-                url,
-                &normalized,
-                now,
-                TunnelUrlStatusSource::BusinessConnect,
-                None,
-            )
-        } else {
-            unreachable_status(
-                url,
-                &normalized,
-                now,
-                TunnelUrlStatusSource::BusinessConnect,
-                reason.unwrap_or_else(|| "business_connect_failed".to_string()),
-            )
-        };
+        let status = reachable_status(
+            url,
+            &normalized,
+            now,
+            TunnelUrlStatusSource::BusinessConnect,
+            rtt.map(|d| d.as_millis().min(u64::MAX as u128) as u64),
+        );
+        self.record_status_observation(status).await;
+    }
+
+    /// Business-connect failure. `reason` is the canonical category from
+    /// §6.7.3; `detail` is the underlying error string (may be `None` if
+    /// the category is self-explanatory, e.g. `UnsupportedScheme`).
+    pub async fn record_business_failure(
+        &self,
+        url: &Url,
+        reason: TunnelFailureReason,
+        detail: Option<&str>,
+    ) {
+        let normalized = normalize_tunnel_url(url);
+        let now = now_ms();
+        let status = unreachable_status(
+            url,
+            &normalized,
+            now,
+            TunnelUrlStatusSource::BusinessConnect,
+            reason.format_reason(detail),
+        );
         self.record_status_observation(status).await;
     }
 
@@ -828,6 +915,33 @@ impl TunnelManager {
 pub(crate) fn now_ms() -> u64 {
     // buckyos_get_unix_timestamp returns seconds; convert to millis.
     buckyos_get_unix_timestamp().saturating_mul(1_000)
+}
+
+/// Best-effort substring classifier for `TunnelError` produced by
+/// `TunnelBuilder::create_tunnel`. The detail string is preserved
+/// verbatim by the caller; this only picks the canonical category prefix
+/// that dashboards group by. When in doubt, falls back to `TunnelOpen`
+/// — the conservative bucket for "we got past scheme lookup but never
+/// finished bringing the tunnel up". Refinement should happen by having
+/// individual `TunnelBuilder` impls surface a typed error rather than by
+/// growing this list of substring matches.
+pub(crate) fn classify_create_tunnel_error(err: &TunnelError) -> TunnelFailureReason {
+    let msg = err.to_string().to_ascii_lowercase();
+    if msg.contains("timed out") || msg.contains("timeout") {
+        TunnelFailureReason::ConnectTimeout
+    } else if msg.contains("refused") {
+        TunnelFailureReason::ConnectRefused
+    } else if msg.contains("dns") || msg.contains("name resolution")
+        || msg.contains("name or service not known")
+    {
+        TunnelFailureReason::PreConnectDns
+    } else if msg.contains("no route") || msg.contains("network unreachable")
+        || msg.contains("host unreachable") || msg.contains("not found")
+    {
+        TunnelFailureReason::PreConnectRoute
+    } else {
+        TunnelFailureReason::TunnelOpen
+    }
 }
 
 /// Serialize URL histories to JSON and write atomically (temp + rename).
