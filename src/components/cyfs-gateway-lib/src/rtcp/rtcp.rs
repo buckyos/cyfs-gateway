@@ -5,6 +5,10 @@ use std::collections::HashMap;
 
 use crate::rtcp::datagram::RTcpTunnelDatagramClient;
 use crate::tunnel::TunnelBox;
+use crate::tunnel_url_status::{
+    TunnelProbeOptions, TunnelUrlStatus, TunnelUrlStatusSource, normalize_tunnel_url,
+    reachable_status, unreachable_status,
+};
 use crate::{
     DatagramClientBox, EncryptedStream, EncryptionRole, Tunnel, TunnelEndpoint, TunnelError,
     TunnelManager, TunnelResult, get_dest_info_from_url_path, has_scheme,
@@ -113,6 +117,14 @@ impl RTcp {
         tunnel_stack_id: Option<&str>,
     ) -> TunnelResult<Box<dyn TunnelBox>> {
         self.inner.create_tunnel(tunnel_stack_id).await
+    }
+
+    pub async fn probe_url(
+        &self,
+        url: &Url,
+        options: &TunnelProbeOptions,
+    ) -> TunnelResult<TunnelUrlStatus> {
+        self.inner.probe_url(url, options).await
     }
 }
 
@@ -1496,6 +1508,131 @@ impl RTcpInner {
             connect_errors.join("; ")
         )))
     }
+
+    fn compute_tunnel_key(&self, remote_stack: &RTcpTargetStackEP) -> String {
+        match remote_stack.bootstrap_stream_url.as_ref() {
+            Some(bootstrap_url) => format!(
+                "{}_{}|bootstrap={}",
+                self.this_device_did.to_string(),
+                remote_stack.did.to_string(),
+                bootstrap_url
+            ),
+            None => format!(
+                "{}_{}",
+                self.this_device_did.to_string(),
+                remote_stack.did.to_string()
+            ),
+        }
+    }
+
+    pub async fn probe_url(
+        &self,
+        url: &Url,
+        options: &TunnelProbeOptions,
+    ) -> TunnelResult<TunnelUrlStatus> {
+        let normalized = normalize_tunnel_url(url);
+        let now = crate::tunnel_mgr::now_ms();
+        let stack_id = url.authority();
+        if stack_id.is_empty() {
+            return Ok(unreachable_status(
+                url,
+                &normalized,
+                now,
+                TunnelUrlStatusSource::FreshProbe,
+                "rtcp url has no remote stack id".to_string(),
+            ));
+        }
+        let remote_stack = match parse_rtcp_stack_id(stack_id) {
+            Some(s) => s,
+            None => {
+                return Ok(unreachable_status(
+                    url,
+                    &normalized,
+                    now,
+                    TunnelUrlStatusSource::FreshProbe,
+                    format!("invalid rtcp stack id '{}'", stack_id),
+                ));
+            }
+        };
+        let tunnel_key = self.compute_tunnel_key(&remote_stack);
+        let timeout_dur = Duration::from_millis(options.timeout_ms_or_default());
+
+        // 1. Existing tunnel: ping it (force_probe just bypasses the
+        //    manager-level cache freshness check; we still ping the same
+        //    tunnel rather than building a second one).
+        if let Some(tunnel) = self.tunnel_map.get_tunnel(&tunnel_key).await {
+            if !tunnel.is_closed() {
+                match tunnel.ping_rtt(timeout_dur).await {
+                    Ok(d) => {
+                        let mut s = reachable_status(
+                            url,
+                            &normalized,
+                            now,
+                            TunnelUrlStatusSource::ExistingTunnel,
+                            Some(d.as_millis() as u64),
+                        );
+                        s.runtime_tunnel_key = Some(tunnel_key);
+                        return Ok(s);
+                    }
+                    Err(e) => {
+                        let mut s = unreachable_status(
+                            url,
+                            &normalized,
+                            now,
+                            TunnelUrlStatusSource::ExistingTunnel,
+                            format!("ping_rtt: {}", e),
+                        );
+                        s.runtime_tunnel_key = Some(tunnel_key);
+                        return Ok(s);
+                    }
+                }
+            }
+        }
+
+        // 2. No existing tunnel: try to build one and ping it.
+        let create_started = Instant::now();
+        match self.create_tunnel(Some(stack_id)).await {
+            Ok(_tunnel_box) => {
+                let create_rtt = create_started.elapsed();
+                if let Some(tunnel) = self.tunnel_map.get_tunnel(&tunnel_key).await {
+                    if let Ok(d) = tunnel.ping_rtt(timeout_dur).await {
+                        let mut s = reachable_status(
+                            url,
+                            &normalized,
+                            now,
+                            TunnelUrlStatusSource::FreshProbe,
+                            Some(d.as_millis() as u64),
+                        );
+                        s.runtime_tunnel_key = Some(tunnel_key);
+                        return Ok(s);
+                    }
+                }
+                // Tunnel was built but the follow-up RTT ping failed.
+                // Treat this as Reachable (tunnel exists) using the
+                // create-time elapsed as a coarse RTT signal.
+                let mut s = reachable_status(
+                    url,
+                    &normalized,
+                    now,
+                    TunnelUrlStatusSource::FreshProbe,
+                    Some(create_rtt.as_millis() as u64),
+                );
+                s.runtime_tunnel_key = Some(tunnel_key);
+                Ok(s)
+            }
+            Err(e) => {
+                let mut s = unreachable_status(
+                    url,
+                    &normalized,
+                    now,
+                    TunnelUrlStatusSource::FreshProbe,
+                    format!("create_tunnel: {}", e),
+                );
+                s.runtime_tunnel_key = Some(tunnel_key);
+                Ok(s)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1721,6 +1858,13 @@ struct RTcpTunnel {
 
     // Per-tunnel concurrency quota for inbound Open requests.
     inbound_open_slots: Arc<Semaphore>,
+
+    // Pong waiters for RTT-aware probes. `ping_rtt` registers a waiter
+    // keyed by the ping seq before sending; when the matching Pong
+    // arrives, `process_package` notifies the waiter. The classic
+    // `ping()` path still uses seq 0 with no waiter, so its Pongs are
+    // simply dropped here (preserving existing behaviour).
+    pong_waiters: Arc<Mutex<HashMap<u32, oneshot::Sender<()>>>>,
 }
 
 impl RTcpTunnel {
@@ -1762,6 +1906,7 @@ impl RTcpTunnel {
             open_resp_waiters: Arc::new(Mutex::new(HashMap::new())),
             ropen_resp_waiters: Arc::new(Mutex::new(HashMap::new())),
             inbound_open_slots: Arc::new(Semaphore::new(MAX_PENDING_INBOUND_OPENS)),
+            pong_waiters: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1840,7 +1985,15 @@ impl RTcpTunnel {
 
                 Ok(())
             }
-            RTcpTunnelPackage::Pong(_pong_package) => Ok(()),
+            RTcpTunnelPackage::Pong(pong_package) => {
+                // Deliver to a registered RTT waiter if one exists for this
+                // seq. Pongs from the classic `ping()` (seq 0, no waiter)
+                // simply drop here.
+                if let Some(sender) = self.pong_waiters.lock().await.remove(&pong_package.seq) {
+                    let _ = sender.send(());
+                }
+                Ok(())
+            }
             pkg_type @ _ => {
                 error!("Unsupport tunnel package type: {:?}", pkg_type);
                 Ok(())
@@ -2528,6 +2681,66 @@ impl Tunnel for RTcpTunnel {
     }
 }
 
+impl RTcpTunnel {
+    // RTT-aware ping. Sends a Ping with a fresh seq and waits for the
+    // matching Pong on a per-seq oneshot. Distinct from `Tunnel::ping`,
+    // which only flushes a control packet without measuring response.
+    pub(crate) async fn ping_rtt(
+        &self,
+        timeout_dur: Duration,
+    ) -> Result<Duration, std::io::Error> {
+        if self.is_closed() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "rtcp tunnel closed",
+            ));
+        }
+        // The classic ping path uses seq 0; pick a non-zero seq here so
+        // a stray Pong from `ping()` cannot satisfy our waiter.
+        let mut seq = self.next_seq();
+        if seq == 0 {
+            seq = self.next_seq();
+        }
+
+        let (tx, rx) = oneshot::channel::<()>();
+        self.pong_waiters.lock().await.insert(seq, tx);
+
+        let timestamp = buckyos_get_unix_timestamp();
+        let ping_package = RTcpPingPackage::new(seq, timestamp);
+        let send_result = {
+            let mut write_stream = self.write_stream.lock().await;
+            let write_stream = Pin::new(&mut *write_stream);
+            RTcpTunnelPackage::send_package(write_stream, ping_package).await
+        };
+        if let Err(e) = send_result {
+            self.pong_waiters.lock().await.remove(&seq);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("send ping failed: {}", e),
+            ));
+        }
+
+        let started = std::time::Instant::now();
+        match timeout(timeout_dur, rx).await {
+            Ok(Ok(())) => Ok(started.elapsed()),
+            Ok(Err(_)) => {
+                self.pong_waiters.lock().await.remove(&seq);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "tunnel dropped pong waiter",
+                ))
+            }
+            Err(_) => {
+                self.pong_waiters.lock().await.remove(&seq);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "rtcp ping timeout",
+                ))
+            }
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait RTcpListener: 'static + Send + Sync {
     async fn on_new_tunnel(
@@ -3011,6 +3224,103 @@ mod tests {
             assert!(ret.is_ok());
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // Brings up two RTCP stacks, probes the URL `rtcp://<id2>:19064`, and
+    // verifies the prober returns a measured RTT via the new ping_rtt
+    // path. Then re-probes and asserts the second call hits the existing
+    // tunnel (source = ExistingTunnel).
+    #[tokio::test]
+    async fn test_rtcp_probe_url_measures_rtt_and_reuses_tunnel() {
+        use crate::tunnel_url_status::TunnelProbeOptions;
+
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let device_config =
+            DeviceConfig::new_by_jwk("probe1", serde_json::from_value(jwk).unwrap());
+        let _id1 = device_config.id.clone();
+        let did_doc_value = serde_json::to_value(&device_config).unwrap();
+        let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
+        update_did_cache(device_config.id.clone(), None, encoded_doc)
+            .await
+            .unwrap();
+        add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(
+                device_config.id.to_string().as_str(),
+                "127.0.0.1".parse().unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let mut rtcp1 = RTcp::new(
+            device_config.id,
+            "127.0.0.1:19063".to_string(),
+            Some(pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        rtcp1.start().await.unwrap();
+
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let device_config =
+            DeviceConfig::new_by_jwk("probe2", serde_json::from_value(jwk).unwrap());
+        let id2 = device_config.id.clone();
+        let did_doc_value = serde_json::to_value(&device_config).unwrap();
+        let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
+        update_did_cache(device_config.id.clone(), None, encoded_doc)
+            .await
+            .unwrap();
+        add_nameinfo_cache(
+            device_config.id.to_string().as_str(),
+            NameInfo::from_address(
+                device_config.id.to_string().as_str(),
+                "127.0.0.1".parse().unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let mut rtcp2 = RTcp::new(
+            device_config.id,
+            "127.0.0.1:19064".to_string(),
+            Some(pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        rtcp2.start().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let url = Url::parse(
+            format!("rtcp://{}:19064/", id2.to_host_name()).as_str(),
+        )
+        .unwrap();
+
+        let opts = TunnelProbeOptions::default();
+        let s1 = rtcp1.probe_url(&url, &opts).await.unwrap();
+        assert_eq!(
+            s1.state,
+            crate::tunnel_url_status::TunnelUrlState::Reachable,
+            "first probe should be reachable, got {:?} reason={:?}",
+            s1.state,
+            s1.failure_reason,
+        );
+        assert!(s1.rtt_ms.is_some(), "rtt must be measured");
+        assert!(s1.runtime_tunnel_key.is_some());
+
+        let s2 = rtcp1.probe_url(&url, &opts).await.unwrap();
+        assert_eq!(
+            s2.source,
+            crate::tunnel_url_status::TunnelUrlStatusSource::ExistingTunnel,
+            "second probe should reuse existing tunnel"
+        );
+        assert!(s2.rtt_ms.is_some());
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     #[tokio::test]

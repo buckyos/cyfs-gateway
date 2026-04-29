@@ -24,6 +24,10 @@ use crate::stack::{
     datagram_forward, get_limit_info, get_source_addr_from_req_env, probe_proxy_protocol_stream,
     stream_forward,
 };
+use crate::tunnel_url_status::{
+    TunnelProbeOptions, TunnelUrlProber, TunnelUrlProberRef, TunnelUrlStatus,
+    TunnelUrlStatusSource, normalize_tunnel_url, reachable_status, unreachable_status,
+};
 use crate::{
     ConnectionInfo, ConnectionManagerRef, DatagramInfo, DumpStream, GlobalCollectionManagerRef,
     HandleConnectionController, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
@@ -947,11 +951,15 @@ impl RTcpListener for Listener {
 
 struct RtcpTunnelBuilder {
     rtcp: Arc<RTcp>,
+    prober: Arc<RtcpUrlProber>,
 }
 
 impl RtcpTunnelBuilder {
     pub fn new(rtcp: Arc<RTcp>) -> Self {
-        RtcpTunnelBuilder { rtcp }
+        let prober = Arc::new(RtcpUrlProber {
+            rtcp: rtcp.clone(),
+        });
+        RtcpTunnelBuilder { rtcp, prober }
     }
 }
 
@@ -962,6 +970,25 @@ impl TunnelBuilder for RtcpTunnelBuilder {
         tunnel_stack_id: Option<&str>,
     ) -> TunnelResult<Box<dyn TunnelBox>> {
         self.rtcp.create_tunnel(tunnel_stack_id).await
+    }
+
+    fn url_prober(&self) -> Option<TunnelUrlProberRef> {
+        Some(self.prober.clone())
+    }
+}
+
+struct RtcpUrlProber {
+    rtcp: Arc<RTcp>,
+}
+
+#[async_trait::async_trait]
+impl TunnelUrlProber for RtcpUrlProber {
+    async fn probe_url(
+        &self,
+        url: &Url,
+        options: &TunnelProbeOptions,
+    ) -> TunnelResult<TunnelUrlStatus> {
+        self.rtcp.probe_url(url, options).await
     }
 }
 
@@ -1062,19 +1089,52 @@ impl RtcpStack {
 
         let tunnel_manager = self.tunnel_manager.clone();
         tokio::task::spawn(async move {
+            // Pin the keep_tunnel URL so its URL history is never evicted
+            // by LRU pressure -- it is a configured, long-lived URL.
+            tunnel_manager.pin_tunnel_url(&tunnel_url).await;
             loop {
                 let last_ok;
+                let normalized = normalize_tunnel_url(&tunnel_url);
+                let now = crate::tunnel_mgr::now_ms();
                 match tunnel_manager.get_tunnel(&tunnel_url, None).await {
                     Err(err) => {
                         warn!("Error getting tunnel: {}", err);
+                        let status = unreachable_status(
+                            &tunnel_url,
+                            &normalized,
+                            now,
+                            TunnelUrlStatusSource::KeepAlive,
+                            format!("get_tunnel: {}", err),
+                        );
+                        tunnel_manager.record_status_observation(status).await;
                         last_ok = false;
                     }
                     Ok(tunnel) => match tunnel.ping().await {
                         Err(err) => {
                             warn!("Error pinging tunnel: {}", err);
+                            let status = unreachable_status(
+                                &tunnel_url,
+                                &normalized,
+                                now,
+                                TunnelUrlStatusSource::KeepAlive,
+                                format!("ping: {}", err),
+                            );
+                            tunnel_manager.record_status_observation(status).await;
                             last_ok = false;
                         }
                         Ok(_) => {
+                            // The classic ping() does not measure RTT;
+                            // record reachable without an RTT value. The
+                            // prober's `force_probe` path can populate
+                            // RTT explicitly when needed.
+                            let status = reachable_status(
+                                &tunnel_url,
+                                &normalized,
+                                now,
+                                TunnelUrlStatusSource::KeepAlive,
+                                None,
+                            );
+                            tunnel_manager.record_status_observation(status).await;
                             last_ok = true;
                         }
                     },
