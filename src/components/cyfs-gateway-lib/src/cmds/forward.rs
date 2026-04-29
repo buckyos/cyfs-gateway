@@ -8,8 +8,8 @@ use url::Url;
 
 use crate::forward::{
     BalanceMethod, DEFAULT_MAX_BODY_BUFFER_BYTES, FORWARD_CMD, FORWARD_GROUP_CMD,
-    ForwardFailureRegistry, ForwardPlan, ForwardSelector, ForwardTarget, NextUpstreamPolicy,
-    ProviderPolicy, parse_duration_str, parse_size_str,
+    ForwardFailureRegistry, ForwardPlan, ForwardSelector, ForwardServer, ForwardTarget,
+    NextUpstreamPolicy, ProviderPolicy, parse_duration_str, parse_size_str,
 };
 
 #[derive(Clone, Debug)]
@@ -594,6 +594,57 @@ Examples:
             .collect())
     }
 
+    /// Build a provider-first server list from a `--server-map` map.
+    /// Outer keys are server ids; the corresponding values must be
+    /// nested `<url, weight>` map collections describing that server's
+    /// routes (§5 of `forward机制升级需求.md`).
+    async fn build_servers_from_map(
+        map: &MapCollectionRef,
+        max_fails: u32,
+        fail_timeout: Duration,
+    ) -> Result<Vec<ForwardServer>, String> {
+        let mut entries = map.dump().await?;
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut servers = Vec::with_capacity(entries.len());
+        for (server_id, route_value) in entries {
+            let route_map = route_value.as_map().ok_or_else(|| {
+                format!(
+                    "Invalid --server-map entry for '{}': expected nested map of <url, weight>, got {}",
+                    server_id,
+                    route_value.get_type()
+                )
+            })?;
+            let nodes = Self::parse_upstream_map(route_map).await?;
+            if nodes.is_empty() {
+                return Err(format!(
+                    "Invalid --server-map entry for '{}': route map is empty",
+                    server_id
+                ));
+            }
+            let routes = nodes
+                .into_iter()
+                .map(|n| ForwardTarget {
+                    url: n.url,
+                    weight: n.weight,
+                    backup: false,
+                    max_fails,
+                    fail_timeout,
+                    server_id: Some(server_id.clone()),
+                })
+                .collect();
+            servers.push(ForwardServer {
+                id: server_id,
+                weight: 1,
+                backup: false,
+                routes,
+                max_fails,
+                fail_timeout,
+            });
+        }
+        Ok(servers)
+    }
+
     fn build_targets_from_inline(
         nodes: Vec<UpstreamNode>,
         backup: bool,
@@ -621,6 +672,7 @@ Examples:
         inline_nodes: Vec<UpstreamNode>,
         primary_map: Option<MapCollectionRef>,
         backup_map: Option<MapCollectionRef>,
+        server_map: Option<MapCollectionRef>,
     ) -> Result<ForwardPlan, String> {
         let max_fails = match Self::parse_optional_str(matches, "max_fails") {
             Some(s) => s
@@ -633,7 +685,22 @@ Examples:
             None => Duration::from_secs(10),
         };
 
+        let servers = match server_map {
+            Some(map) => {
+                Self::build_servers_from_map(&map, max_fails, fail_timeout).await?
+            }
+            None => Vec::new(),
+        };
+
+        // Provider-first plan: server-map expands into the flat candidate
+        // list (with server_id retained for retry-scope decisions). Inline
+        // nodes / --map / --backup-map remain available alongside servers
+        // and are concatenated after server-derived candidates so the
+        // executor still sees a single attempt order.
         let mut candidates = Vec::new();
+        if !servers.is_empty() {
+            candidates.extend(ForwardPlan::candidates_from_servers(&servers));
+        }
         candidates.extend(Self::build_targets_from_inline(
             inline_nodes,
             false,
@@ -652,7 +719,7 @@ Examples:
         }
 
         if candidates.is_empty() {
-            return Err("forward requires at least one upstream or --map".to_string());
+            return Err("forward requires at least one upstream, --map or --server-map".to_string());
         }
 
         // Resolve the balance method. For hash variants the executor
@@ -709,7 +776,7 @@ Examples:
             next_upstream,
             candidates,
             hash_key_value,
-            servers: Vec::new(),
+            servers,
             provider_policy,
         };
         plan.validate()?;
@@ -824,6 +891,7 @@ impl ExternalCommand for Forward {
         let dest_urls = Self::collect_inline_upstream_specs(args, &matches)?;
         let primary_map = Self::collect_map_arg(args, &matches, "upstream_map")?;
         let backup_map = Self::collect_map_arg(args, &matches, "backup_map")?;
+        let server_map = Self::collect_map_arg(args, &matches, "server_map")?;
 
         let (algo, inline_upstream_specs) = Self::split_algo_and_upstreams(dest_urls)?;
         let inline_nodes = if inline_upstream_specs.is_empty() {
@@ -845,6 +913,7 @@ impl ExternalCommand for Forward {
                     inline_nodes,
                     primary_map,
                     backup_map,
+                    server_map,
                 )
                 .await?;
             // Single-URL group plans degrade to plain `forward "<url>"` for

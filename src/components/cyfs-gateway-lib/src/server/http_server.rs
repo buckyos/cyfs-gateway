@@ -8,7 +8,6 @@ use crate::forward::{
     BalanceMethod, ForwardFailureRegistry, ForwardPlan, HttpMethodClass, NextUpstreamCondition,
     apply_least_time_via_tunnel_mgr,
 };
-use crate::tunnel_connector::TunnelConnector;
 use crate::tunnel_url_status::TunnelFailureReason;
 use crate::{
     GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestProcessChainVars,
@@ -22,8 +21,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Request, StatusCode, http};
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use regex::Regex;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -336,14 +334,6 @@ impl ProcessChainHttpServer {
         Url::parse(target_url).ok()
     }
 
-    fn connect_err_to_server_err(
-        prefix: &str,
-        err: (TunnelFailureReason, String),
-    ) -> ServerError {
-        let (_reason, msg) = err;
-        server_err!(ServerErrorCode::InvalidConfig, "{}: {}", prefix, msg)
-    }
-
     pub fn builder() -> ProcessChainHttpServerBuilder {
         ProcessChainHttpServerBuilder {
             id: None,
@@ -480,7 +470,47 @@ impl ProcessChainHttpServer {
         target_url: &str,
         info: &StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        let org_url = req.uri().to_string();
+        let mut slot = Some(req);
+        self.forward_to_candidate(&mut slot, target_url, info).await
+    }
+
+    /// Forward the request held by `req_slot` to `target_url`.
+    ///
+    /// Per §6.3 of `forward机制升级需求.md` the caller must distinguish
+    /// connect-stage failures (retryable on next candidate) from
+    /// after-body-consumed failures (not retryable). This is signalled
+    /// through `req_slot`:
+    /// - `Ok(resp)`: `*req_slot == None`. The body has been sent.
+    /// - `Err(_)` with `*req_slot == Some(_)`: failure occurred during
+    ///   DNS / TCP / TLS / http1 handshake / tunnel open. The body is
+    ///   intact and the caller may retry against another candidate.
+    /// - `Err(_)` with `*req_slot == None`: failure occurred after the
+    ///   body started transmitting. Not retryable.
+    async fn forward_to_candidate(
+        &self,
+        req_slot: &mut Option<http::Request<BoxBody<Bytes, ServerError>>>,
+        target_url: &str,
+        info: &StreamInfo,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let (org_url, mut header, method, version, host_header) = {
+            let req_ref = req_slot
+                .as_ref()
+                .expect("forward_to_candidate: req_slot must be Some on entry");
+            let mut h = req_ref.headers().clone();
+            Self::inject_forward_headers(&mut h, info);
+            let host = req_ref
+                .headers()
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            (
+                req_ref.uri().to_string(),
+                h,
+                req_ref.method().clone(),
+                req_ref.version(),
+                host,
+            )
+        };
         // Trim URL boundary slashes so we don't end up with "//" when target_url ends with '/'
         // and org_url starts with '/'.
         let raw_url = if target_url.ends_with('/') || org_url.starts_with('/') {
@@ -509,11 +539,85 @@ impl ProcessChainHttpServer {
         let scheme = request_url.scheme();
         match scheme {
             "http" => {
-                let client: Client<_, BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>> =
-                    Client::builder(TokioExecutor::new()).build_http();
-                let mut header = req.headers().clone();
-                Self::inject_forward_headers(&mut header, info);
-                let method = req.method().clone();
+                let connect_host = request_url.host_str().ok_or_else(|| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Missing upstream host in url: {}",
+                        request_url
+                    )
+                })?;
+                let connect_port = request_url.port_or_known_default().ok_or_else(|| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Missing upstream port in url: {}",
+                        request_url
+                    )
+                })?;
+
+                // Pre-flight TCP connect to validate reachability before
+                // the body is consumed. Failure here keeps `req_slot`
+                // intact so the caller can retry on another candidate
+                // per §6.3.
+                let started = std::time::Instant::now();
+                let (tcp_stream, connected_addr) =
+                    match Self::connect_upstream_with_fallback(connect_host, connect_port).await {
+                        Ok(v) => v,
+                        Err((reason, msg)) => {
+                            if let Some(key) = history_key.as_ref() {
+                                self.tunnel_manager
+                                    .record_business_failure(key, reason, Some(&msg))
+                                    .await;
+                            }
+                            return Err(server_err!(
+                                ServerErrorCode::InvalidConfig,
+                                "Failed to connect upstream candidates: {}",
+                                msg
+                            ));
+                        }
+                    };
+
+                let (mut sender, conn) =
+                    match hyper::client::conn::http1::handshake(TokioIo::new(tcp_stream)).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if let Some(key) = history_key.as_ref() {
+                                let detail = e.to_string();
+                                self.tunnel_manager
+                                    .record_business_failure(
+                                        key,
+                                        TunnelFailureReason::TunnelOpen,
+                                        Some(&detail),
+                                    )
+                                    .await;
+                            }
+                            return Err(server_err!(
+                                ServerErrorCode::StreamError,
+                                "Failed to build http client connection to {}: {}",
+                                connected_addr,
+                                e
+                            ));
+                        }
+                    };
+
+                if let Some(key) = history_key.as_ref() {
+                    self.tunnel_manager
+                        .record_business_success(key, Some(started.elapsed()))
+                        .await;
+                }
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        debug!("http upstream connection closed with error: {}", e);
+                    }
+                });
+
+                let _ = version;
+                let _ = host_header;
+                // Connection up — taking the body now is the
+                // commitment point. Any subsequent failure is
+                // post-body and non-retryable.
+                let req = req_slot
+                    .take()
+                    .expect("forward_to_candidate: req_slot drained mid-flight");
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -529,45 +633,16 @@ impl ProcessChainHttpServer {
                             e
                         )
                     })?;
+                *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                *upstream_req.headers_mut() = header;
-
-                // hyper-util's transparent connector aggregates connect
-                // and request errors into one type, so direct-http
-                // history is coarser than direct-https below: failure
-                // here always lands in the `TunnelOpen` bucket. This is
-                // accepted for first cut (most http upstreams are loopback);
-                // a custom HttpConnector would let us split connect /
-                // send phases later.
-                let started = std::time::Instant::now();
-                let resp = match client.request(upstream_req).await {
-                    Ok(r) => {
-                        if let Some(key) = history_key.as_ref() {
-                            self.tunnel_manager
-                                .record_business_success(key, Some(started.elapsed()))
-                                .await;
-                        }
-                        r
-                    }
-                    Err(e) => {
-                        if let Some(key) = history_key.as_ref() {
-                            let detail = e.to_string();
-                            self.tunnel_manager
-                                .record_business_failure(
-                                    key,
-                                    TunnelFailureReason::TunnelOpen,
-                                    Some(&detail),
-                                )
-                                .await;
-                        }
-                        return Err(server_err!(
-                            ServerErrorCode::InvalidConfig,
-                            "Failed to request upstream {}: {}",
-                            request_url,
-                            e
-                        ));
-                    }
-                };
+                let resp = sender.send_request(upstream_req).await.map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "Failed to request upstream {}: {}",
+                        request_url,
+                        e
+                    )
+                })?;
                 let resp = resp.map(|body| {
                     body.map_err(|e| {
                         ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
@@ -577,10 +652,7 @@ impl ProcessChainHttpServer {
                 Ok(resp)
             }
             "https" => {
-                let mut header = req.headers().clone();
-                Self::inject_forward_headers(&mut header, info);
-                let method = req.method().clone();
-                let upstream_http_version = match req.version() {
+                let upstream_http_version = match version {
                     http::Version::HTTP_10 => http::Version::HTTP_10,
                     http::Version::HTTP_11 => http::Version::HTTP_11,
                     _ => http::Version::HTTP_11,
@@ -710,6 +782,10 @@ impl ProcessChainHttpServer {
                     }
                 });
 
+                let _ = host_header;
+                let req = req_slot
+                    .take()
+                    .expect("forward_to_candidate: req_slot drained mid-flight");
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -726,7 +802,7 @@ impl ProcessChainHttpServer {
                             e
                         )
                     })?;
-                *upstream_req.headers_mut() = header;
+                *upstream_req.headers_mut() = std::mem::take(&mut header);
 
                 let resp = sender.send_request(upstream_req).await.map_err(|e| {
                     server_err!(
@@ -746,25 +822,57 @@ impl ProcessChainHttpServer {
                 Ok(resp)
             }
             _ => {
-                let tunnel_connector = TunnelConnector {
-                    target_stream_url: target_url.to_string(),
-                    tunnel_manager: self.tunnel_manager.clone(),
+                // Pre-flight: open the tunnel stream first so a tunnel
+                // open failure leaves `req_slot` intact for the caller
+                // to retry on another candidate. tunnel_manager itself
+                // writes URL history on the underlying open per §6.7.
+                let tunnel_url = Url::parse(target_url).map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "invalid forward url {}: {}",
+                        target_url,
+                        e
+                    )
+                })?;
+                let stream = match self.tunnel_manager.open_stream_by_url(&tunnel_url).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Err(server_err!(
+                            ServerErrorCode::TunnelError,
+                            "Failed to open tunnel to {}: {}",
+                            target_url,
+                            e
+                        ));
+                    }
                 };
 
-                let client: Client<
-                    TunnelConnector,
-                    BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>,
-                > = Client::builder(TokioExecutor::new()).build(tunnel_connector);
+                let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(
+                    crate::tunnel_connector::TunnelStreamConnection::new(stream),
+                ))
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(server_err!(
+                            ServerErrorCode::StreamError,
+                            "Failed to build tunnel client connection to {}: {}",
+                            target_url,
+                            e
+                        ));
+                    }
+                };
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        debug!("tunnel upstream connection closed with error: {}", e);
+                    }
+                });
 
-                let mut header = req.headers().clone();
-                Self::inject_forward_headers(&mut header, info);
-                let mut host_name = "localhost".to_string();
-                let hname = req.headers().get("host");
-                if hname.is_some() {
-                    host_name = hname.unwrap().to_str().unwrap().to_string();
-                }
+                let _ = version;
+                let req = req_slot
+                    .take()
+                    .expect("forward_to_candidate: req_slot drained mid-flight");
+                let host_name = host_header.unwrap_or_else(|| "localhost".to_string());
                 let fake_url = format!("http://{}{}", host_name, org_url);
-                let method = req.method().clone();
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -774,18 +882,19 @@ impl ProcessChainHttpServer {
                     .uri(fake_url)
                     .body(body)
                     .map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::BadRequest,
-                        "Failed to build upstream_req: {}",
-                        e
-                    )
-                })?;
+                        server_err!(
+                            ServerErrorCode::BadRequest,
+                            "Failed to build upstream_req: {}",
+                            e
+                        )
+                    })?;
+                *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                *upstream_req.headers_mut() = header;
-                let resp = client.request(upstream_req).await.map_err(|e| {
+                let resp = sender.send_request(upstream_req).await.map_err(|e| {
                     server_err!(
                         ServerErrorCode::TunnelError,
-                        "Failed to request upstream: {}",
+                        "Failed to request upstream {}: {}",
+                        target_url,
                         e
                     )
                 })?;
@@ -795,7 +904,7 @@ impl ProcessChainHttpServer {
                     })
                     .boxed()
                 });
-                return Ok(resp);
+                Ok(resp)
             }
         }
     }
@@ -860,21 +969,11 @@ impl ProcessChainHttpServer {
         self.handle_forward_group_connect_only(req, plan, info).await
     }
 
-    /// Connection-stage retry only. Original Stage 2 spirit, but the
-    /// request body must be forwarded inside the same attempt iteration:
-    /// if the post-probe `handle_forward_upstream` fails at TCP / TLS /
-    /// tunnel-open it would otherwise terminate the request (no next
-    /// upstream, no record_failure on the candidate). Per §6.3 we now
-    /// roll forward and update the group failure state.
-    ///
-    /// We can do this safely without buffering the body only because we
-    /// haven't yet read it on a previous candidate. Once
-    /// `handle_forward_upstream` consumes the body, the request is gone
-    /// and we cannot retry — that path therefore cannot be retried more
-    /// than once. To keep this property explicit, we move `req` into an
-    /// `Option` and `take()` it on the first real send; subsequent
-    /// iterations after a partial-send failure will see `None` and bail
-    /// with the recorded error.
+    /// Connection-stage retry only (§6.3). The body is sent only after
+    /// `forward_to_candidate` confirms the connection is up; failures
+    /// before that point leave `req_slot` populated so we can retry on
+    /// the next candidate. Once a candidate has consumed the body we
+    /// surface its result without further retry.
     async fn handle_forward_group_connect_only(
         &self,
         req: http::Request<BoxBody<Bytes, ServerError>>,
@@ -901,6 +1000,12 @@ impl ProcessChainHttpServer {
             if idx >= max_attempts {
                 break;
             }
+            if req_slot.is_none() {
+                // Body already consumed by a prior candidate but the
+                // upstream-side failure was non-retryable. Surface what
+                // we have rather than loop without a request.
+                break;
+            }
             if let Some(d) = deadline {
                 if std::time::Instant::now() >= d {
                     last_err.get_or_insert_with(|| {
@@ -914,99 +1019,40 @@ impl ProcessChainHttpServer {
                     break;
                 }
             }
-            // 1. Probe stage. Failure here means we never touched the
-            // request body, so retry is unconditionally safe. Wrap with
-            // remaining-budget timeout so a slow probe cannot blow past
-            // policy.timeout.
-            let probe_fut = self.probe_upstream_candidate(&candidate.url);
-            let probe_res: ServerResult<()> = match deadline {
-                Some(d) => {
-                    let remaining = d.saturating_duration_since(std::time::Instant::now());
-                    match timeout(remaining, probe_fut).await {
-                        Ok(r) => r,
-                        Err(_) => Err(server_err!(
-                            ServerErrorCode::TunnelError,
-                            "forward-group {} probe of {} timed out (next_upstream budget {}ms)",
-                            group_key,
-                            candidate.url,
-                            policy.timeout.unwrap_or_default().as_millis()
-                        )),
-                    }
-                }
-                None => probe_fut.await,
-            };
-            if let Err(e) = probe_res {
-                log::debug!(
-                    "forward-group {}: http candidate {} (idx {}) probe failed: {}",
-                    group_key, candidate.url, idx, e
-                );
-                registry.record_failure(
-                    &group_key,
-                    &candidate.url,
-                    candidate.max_fails,
-                    candidate.fail_timeout,
-                );
-                last_err = Some(e);
-                if !policy.is_enabled()
-                    || !policy.allows(NextUpstreamCondition::Error)
-                    || idx + 1 >= max_attempts
-                {
-                    break;
-                }
-                continue;
-            }
-            registry.record_success(&group_key, &candidate.url);
-            log::debug!(
-                "forward-group {}: http selected candidate idx={} url={}",
-                group_key, idx, candidate.url
-            );
 
-            // 2. Real forward. The request body is consumed here. If
-            // this fails before any bytes leave the proxy (TCP / TLS /
-            // tunnel open), the request body has not yet been read by
-            // hyper's request driver — but we cannot tell that from the
-            // outside. To stay safe per §6.3 ("non-idempotent methods
-            // default to connection-stage retry only"), we only consider
-            // the failure retryable if `req_slot` is still populated by
-            // a fresh request — which it always is on the very first
-            // forward attempt. After that, we must surface the error.
-            let attempt_req = match req_slot.take() {
-                Some(r) => r,
-                None => {
-                    // We already burned the body on a prior candidate;
-                    // can't retry safely. Surface the last error.
-                    return Err(last_err.unwrap_or_else(|| {
-                        server_err!(
-                            ServerErrorCode::TunnelError,
-                            "forward-group {} request body already consumed",
-                            group_key
-                        )
-                    }));
-                }
-            };
-            let upstream_fut =
-                self.handle_forward_upstream(attempt_req, &candidate.url, info);
-            let upstream_res = match deadline {
+            let attempt_fut =
+                self.forward_to_candidate(&mut req_slot, &candidate.url, info);
+            let (attempt_res, attempt_cond) = match deadline {
                 Some(d) => {
                     let remaining = d.saturating_duration_since(std::time::Instant::now());
-                    match timeout(remaining, upstream_fut).await {
-                        Ok(r) => r,
-                        Err(_) => Err(server_err!(
-                            ServerErrorCode::TunnelError,
-                            "forward-group {} forward to {} timed out (next_upstream budget {}ms)",
-                            group_key,
-                            candidate.url,
-                            policy.timeout.unwrap_or_default().as_millis()
-                        )),
+                    match timeout(remaining, attempt_fut).await {
+                        Ok(r) => (r, NextUpstreamCondition::Error),
+                        Err(_) => (
+                            Err(server_err!(
+                                ServerErrorCode::TunnelError,
+                                "forward-group {} forward to {} timed out (next_upstream budget {}ms)",
+                                group_key,
+                                candidate.url,
+                                policy.timeout.unwrap_or_default().as_millis()
+                            )),
+                            NextUpstreamCondition::Timeout,
+                        ),
                     }
                 }
-                None => upstream_fut.await,
+                None => (attempt_fut.await, NextUpstreamCondition::Error),
             };
-            match upstream_res {
-                Ok(resp) => return Ok(resp),
+            match attempt_res {
+                Ok(resp) => {
+                    registry.record_success(&group_key, &candidate.url);
+                    log::debug!(
+                        "forward-group {}: http selected candidate idx={} url={}",
+                        group_key, idx, candidate.url
+                    );
+                    return Ok(resp);
+                }
                 Err(e) => {
                     log::debug!(
-                        "forward-group {}: http candidate {} (idx {}) request failed: {}",
+                        "forward-group {}: http candidate {} (idx {}) failed: {}",
                         group_key, candidate.url, idx, e
                     );
                     registry.record_failure(
@@ -1016,11 +1062,13 @@ impl ProcessChainHttpServer {
                         candidate.fail_timeout,
                     );
                     last_err = Some(e);
-                    // Body was consumed by handle_forward_upstream —
-                    // `req_slot` stays `None`, so the next loop
-                    // iteration's `req_slot.take()` returns and bails.
+                    if req_slot.is_none() {
+                        // Body was consumed before/during this attempt;
+                        // we cannot replay on another candidate.
+                        break;
+                    }
                     if !policy.is_enabled()
-                        || !policy.allows(NextUpstreamCondition::Error)
+                        || !policy.allows(attempt_cond)
                         || idx + 1 >= max_attempts
                     {
                         break;
@@ -1106,28 +1154,60 @@ impl ProcessChainHttpServer {
                     break;
                 }
             }
-            let probe_fut = self.probe_upstream_candidate(&candidate.url);
-            let probe_res: ServerResult<()> = match deadline {
+            let body = Self::full_body(buffered_body.clone());
+            let mut attempt_req = http::Request::from_parts(req_parts.clone(), body);
+            Self::set_content_length(&mut attempt_req);
+            let mut req_slot = Some(attempt_req);
+
+            let attempt_fut =
+                self.forward_to_candidate(&mut req_slot, &candidate.url, info);
+            let (attempt_res, attempt_cond) = match deadline {
                 Some(d) => {
                     let remaining = d.saturating_duration_since(std::time::Instant::now());
-                    match timeout(remaining, probe_fut).await {
-                        Ok(r) => r,
-                        Err(_) => Err(server_err!(
-                            ServerErrorCode::TunnelError,
-                            "forward-group {} probe of {} timed out (next_upstream budget {}ms)",
-                            group_key,
-                            candidate.url,
-                            policy.timeout.unwrap_or_default().as_millis()
-                        )),
+                    match timeout(remaining, attempt_fut).await {
+                        Ok(r) => (r, NextUpstreamCondition::Error),
+                        Err(_) => (
+                            Err(server_err!(
+                                ServerErrorCode::TunnelError,
+                                "forward-group {} forward to {} timed out (next_upstream budget {}ms)",
+                                group_key,
+                                candidate.url,
+                                policy.timeout.unwrap_or_default().as_millis()
+                            )),
+                            NextUpstreamCondition::Timeout,
+                        ),
                     }
                 }
-                None => probe_fut.await,
+                None => (attempt_fut.await, NextUpstreamCondition::Error),
             };
-            match probe_res {
+            match attempt_res {
+                Ok(r) => {
+                    let status = r.status().as_u16();
+                    if policy.matches_http_status(status) && idx + 1 < max_attempts {
+                        log::debug!(
+                            "forward-group {}: candidate {} returned {}, retrying next candidate",
+                            group_key, candidate.url, status
+                        );
+                        registry.record_failure(
+                            &group_key,
+                            &candidate.url,
+                            candidate.max_fails,
+                            candidate.fail_timeout,
+                        );
+                        last_status_resp = Some(r);
+                        continue;
+                    }
+                    registry.record_success(&group_key, &candidate.url);
+                    log::debug!(
+                        "forward-group {}: http selected candidate idx={} url={} (status-retry armed)",
+                        group_key, idx, candidate.url
+                    );
+                    return Ok(r);
+                }
                 Err(e) => {
                     log::debug!(
-                        "forward-group {}: http candidate {} (idx {}) probe failed: {}",
-                        group_key, candidate.url, idx, e
+                        "forward-group {}: candidate {} request failed: {}",
+                        group_key, candidate.url, e
                     );
                     registry.record_failure(
                         &group_key,
@@ -1136,82 +1216,10 @@ impl ProcessChainHttpServer {
                         candidate.fail_timeout,
                     );
                     last_err = Some(e);
-                    if !policy.allows(NextUpstreamCondition::Error)
-                        || idx + 1 >= max_attempts
-                    {
+                    if !policy.allows(attempt_cond) || idx + 1 >= max_attempts {
                         break;
                     }
                     continue;
-                }
-                Ok(()) => {
-                    registry.record_success(&group_key, &candidate.url);
-                    log::debug!(
-                        "forward-group {}: http selected candidate idx={} url={} (status-retry armed)",
-                        group_key, idx, candidate.url
-                    );
-
-                    let body = Self::full_body(buffered_body.clone());
-                    let mut attempt_req = http::Request::from_parts(req_parts.clone(), body);
-                    Self::set_content_length(&mut attempt_req);
-
-                    let upstream_fut =
-                        self.handle_forward_upstream(attempt_req, &candidate.url, info);
-                    let upstream_res = match deadline {
-                        Some(d) => {
-                            let remaining =
-                                d.saturating_duration_since(std::time::Instant::now());
-                            match timeout(remaining, upstream_fut).await {
-                                Ok(r) => r,
-                                Err(_) => Err(server_err!(
-                                    ServerErrorCode::TunnelError,
-                                    "forward-group {} forward to {} timed out (next_upstream budget {}ms)",
-                                    group_key,
-                                    candidate.url,
-                                    policy.timeout.unwrap_or_default().as_millis()
-                                )),
-                            }
-                        }
-                        None => upstream_fut.await,
-                    };
-                    match upstream_res {
-                        Ok(r) => {
-                            let status = r.status().as_u16();
-                            if policy.matches_http_status(status) && idx + 1 < max_attempts {
-                                log::debug!(
-                                    "forward-group {}: candidate {} returned {}, retrying next candidate",
-                                    group_key, candidate.url, status
-                                );
-                                registry.record_failure(
-                                    &group_key,
-                                    &candidate.url,
-                                    candidate.max_fails,
-                                    candidate.fail_timeout,
-                                );
-                                last_status_resp = Some(r);
-                                continue;
-                            }
-                            return Ok(r);
-                        }
-                        Err(e) => {
-                            log::debug!(
-                                "forward-group {}: candidate {} request failed: {}",
-                                group_key, candidate.url, e
-                            );
-                            registry.record_failure(
-                                &group_key,
-                                &candidate.url,
-                                candidate.max_fails,
-                                candidate.fail_timeout,
-                            );
-                            last_err = Some(e);
-                            if !policy.allows(NextUpstreamCondition::Error)
-                                || idx + 1 >= max_attempts
-                            {
-                                break;
-                            }
-                            continue;
-                        }
-                    }
                 }
             }
         }
@@ -1270,115 +1278,6 @@ impl ProcessChainHttpServer {
         req.headers_mut().remove(http::header::TRANSFER_ENCODING);
     }
 
-    /// Test reachability of an upstream URL with a connection-stage probe.
-    /// Successful probes are immediately closed; we don't reuse the
-    /// connection for the actual request. The cost is one extra TCP /
-    /// tunnel open on the first request to a recovered upstream, in
-    /// exchange for the safety of never sending the body twice.
-    async fn probe_upstream_candidate(&self, target_url: &str) -> ServerResult<()> {
-        let url = Url::parse(target_url).map_err(|e| {
-            server_err!(
-                ServerErrorCode::InvalidConfig,
-                "invalid forward url {}: {}",
-                target_url,
-                e
-            )
-        })?;
-        match url.scheme() {
-            "http" => {
-                let host = url.host_str().ok_or_else(|| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "missing upstream host in url: {}",
-                        url
-                    )
-                })?;
-                let port = url.port_or_known_default().ok_or_else(|| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "missing upstream port in url: {}",
-                        url
-                    )
-                })?;
-                let _ = Self::connect_upstream_with_fallback(host, port)
-                    .await
-                    .map_err(|e| {
-                        Self::connect_err_to_server_err("Failed to connect upstream candidates", e)
-                    })?;
-                Ok(())
-            }
-            "https" => {
-                let host = url.host_str().ok_or_else(|| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "missing upstream host in url: {}",
-                        url
-                    )
-                })?;
-                let port = url.port_or_known_default().ok_or_else(|| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "missing upstream port in url: {}",
-                        url
-                    )
-                })?;
-                let sni_host = Self::upstream_sni_host(&url)?;
-                let (tcp_stream, connected_addr) =
-                    Self::connect_upstream_with_fallback(host, port)
-                        .await
-                        .map_err(|e| {
-                            Self::connect_err_to_server_err(
-                                "Failed to connect upstream candidates",
-                                e,
-                            )
-                        })?;
-                let tls_config = ClientConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                ))
-                .with_safe_default_protocol_versions()
-                .map_err(|e| {
-                    server_err!(ServerErrorCode::InvalidConfig, "Invalid tls config: {}", e)
-                })?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoCertificateVerifier))
-                .with_no_client_auth();
-                let tls_connector = TlsConnector::from(Arc::new(tls_config));
-                let server_name = ServerName::try_from(sni_host.clone()).map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "invalid upstream host for tls {}: {}",
-                        sni_host,
-                        e
-                    )
-                })?;
-                let _tls_stream = tls_connector
-                    .connect(server_name, tcp_stream)
-                    .await
-                    .map_err(|e| {
-                        server_err!(
-                            ServerErrorCode::InvalidConfig,
-                            "tls handshake probe failed for {} via {}: {}",
-                            sni_host,
-                            connected_addr,
-                            e
-                        )
-                    })?;
-                Ok(())
-            }
-            _ => {
-                let _stream =
-                    self.tunnel_manager.open_stream_by_url(&url).await.map_err(|e| {
-                        server_err!(
-                            ServerErrorCode::TunnelError,
-                            "open tunnel probe to {} failed: {}",
-                            url,
-                            e
-                        )
-                    })?;
-                Ok(())
-            }
-        }
-    }
 
     fn parse_redirect_status_code(status: Option<&str>) -> ServerResult<StatusCode> {
         let status_code = match status {

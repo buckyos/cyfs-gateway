@@ -213,23 +213,30 @@ pub async fn stream_forward_group(
             .any(|(k, v)| k == "proxy_protocol" && v.eq_ignore_ascii_case("v2"));
 
         let attempt = tunnel_manager.open_stream_by_url(&url);
-        let result = match deadline {
+        let (result, cond) = match deadline {
             Some(d) => {
                 let remaining = d.saturating_duration_since(std::time::Instant::now());
                 match tokio::time::timeout(remaining, attempt).await {
-                    Ok(r) => r.map_err(|e| {
-                        crate::TunnelError::ConnectError(e.to_string())
-                    }),
-                    Err(_) => Err(crate::TunnelError::ConnectError(format!(
-                        "next_upstream timeout exceeded ({}ms budget) on {}",
-                        policy.timeout.unwrap_or_default().as_millis(),
-                        candidate.url,
-                    ))),
+                    Ok(r) => (
+                        r.map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
+                        NextUpstreamCondition::Error,
+                    ),
+                    Err(_) => (
+                        Err(crate::TunnelError::ConnectError(format!(
+                            "next_upstream timeout exceeded ({}ms budget) on {}",
+                            policy.timeout.unwrap_or_default().as_millis(),
+                            candidate.url,
+                        ))),
+                        NextUpstreamCondition::Timeout,
+                    ),
                 }
             }
-            None => attempt
-                .await
-                .map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
+            None => (
+                attempt
+                    .await
+                    .map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
+                NextUpstreamCondition::Error,
+            ),
         };
 
         match result {
@@ -260,7 +267,7 @@ pub async fn stream_forward_group(
                 );
                 last_err = Some(err);
                 last_target_url = Some(candidate.url.clone());
-                if !should_continue(policy, idx, max_attempts, NextUpstreamCondition::Error) {
+                if !should_continue(policy, idx, max_attempts, cond) {
                     break;
                 }
             }
@@ -403,23 +410,30 @@ pub async fn datagram_forward_group(
             }
         };
         let attempt = tunnel_manager.create_datagram_client_by_url(&url);
-        let result = match deadline {
+        let (result, cond) = match deadline {
             Some(d) => {
                 let remaining = d.saturating_duration_since(std::time::Instant::now());
                 match tokio::time::timeout(remaining, attempt).await {
-                    Ok(r) => r.map_err(|e| {
-                        crate::TunnelError::ConnectError(e.to_string())
-                    }),
-                    Err(_) => Err(crate::TunnelError::ConnectError(format!(
-                        "next_upstream timeout exceeded ({}ms budget) on {}",
-                        policy.timeout.unwrap_or_default().as_millis(),
-                        candidate.url,
-                    ))),
+                    Ok(r) => (
+                        r.map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
+                        NextUpstreamCondition::Error,
+                    ),
+                    Err(_) => (
+                        Err(crate::TunnelError::ConnectError(format!(
+                            "next_upstream timeout exceeded ({}ms budget) on {}",
+                            policy.timeout.unwrap_or_default().as_millis(),
+                            candidate.url,
+                        ))),
+                        NextUpstreamCondition::Timeout,
+                    ),
                 }
             }
-            None => attempt
-                .await
-                .map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
+            None => (
+                attempt
+                    .await
+                    .map_err(|e| crate::TunnelError::ConnectError(e.to_string())),
+                NextUpstreamCondition::Error,
+            ),
         };
         match result {
             Ok(client) => {
@@ -448,7 +462,7 @@ pub async fn datagram_forward_group(
                     candidate.fail_timeout,
                 );
                 last_err = Some(err);
-                if !should_continue(policy, idx, max_attempts, NextUpstreamCondition::Error) {
+                if !should_continue(policy, idx, max_attempts, cond) {
                     break;
                 }
             }
