@@ -1,7 +1,7 @@
 use crate::tunnel_mgr::ProtocolCategory;
 use crate::{TunnelError, TunnelResult, get_protocol_category};
 use async_trait::async_trait;
-use std::cmp::Ordering;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use url::Url;
 
@@ -15,7 +15,8 @@ const DEFAULT_PROBE_CONCURRENCY: usize = 32;
 const DEFAULT_RECENT_RTT_CAP: usize = 8;
 
 /// Snapshot state of a Tunnel URL at a point in time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TunnelUrlState {
     Reachable,
     Unreachable,
@@ -37,7 +38,8 @@ impl TunnelUrlState {
 }
 
 /// Where the status observation came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TunnelUrlStatusSource {
     ExistingTunnel,
     KeepAlive,
@@ -78,7 +80,7 @@ impl Default for TunnelUrlSortPolicy {
 }
 
 /// One observation of a Tunnel URL status.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelUrlStatus {
     pub url: String,
     pub normalized_url: String,
@@ -102,7 +104,7 @@ pub struct TunnelUrlStatus {
 }
 
 /// Long-running history record for a single normalized URL.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelUrlHistory {
     pub normalized_url: String,
     pub scheme: String,
@@ -210,8 +212,14 @@ pub struct TunnelStatusStoreConfig {
 
 impl Default for TunnelStatusStoreConfig {
     fn default() -> Self {
+        // Persistence defaults to ON so a Gateway restart can reuse
+        // recent RTT/success-rate data (per requirement §8.1 + §16
+        // verification "URL history 默认落盘"). With `persist_path =
+        // None` the flush/load steps are no-ops, so callers must set a
+        // path to actually use disk; flipping the default still matters
+        // because production wiring respects the flag.
         Self {
-            enable_persist: false,
+            enable_persist: true,
             persist_path: None,
             flush_interval_ms: 5_000,
             max_history_entries: DEFAULT_MAX_MEMORY_HISTORY_ENTRIES,
@@ -223,6 +231,39 @@ impl Default for TunnelStatusStoreConfig {
             probe_concurrency: DEFAULT_PROBE_CONCURRENCY,
         }
     }
+}
+
+/// Redact userinfo from a normalized URL string. Persisted snapshots
+/// must not retain plaintext credentials (§11 + §8.1). The output keeps
+/// the scheme/host/path/query stable so it remains a valid lookup key
+/// for non-userinfo URLs; URLs with userinfo will load back keyed by
+/// the redacted form, which is the intended trade-off (we lose
+/// per-identity caching across restarts but never leak credentials).
+pub fn redact_url_for_persist(s: &str) -> String {
+    // Find scheme separator.
+    let scheme_end = match s.find("://") {
+        Some(i) => i + 3,
+        None => return s.to_string(),
+    };
+    let after_scheme = &s[scheme_end..];
+    // Authority ends at first `/`, `?`, or `#`.
+    let auth_end = after_scheme
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..auth_end];
+    let rest = &after_scheme[auth_end..];
+    let host_part = match authority.rfind('@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    let mut out = String::with_capacity(s.len());
+    out.push_str(&s[..scheme_end]);
+    if authority != host_part {
+        out.push_str("***@");
+    }
+    out.push_str(host_part);
+    out.push_str(rest);
+    out
 }
 
 impl TunnelStatusStoreConfig {
@@ -285,29 +326,38 @@ pub fn normalize_tunnel_url(url: &Url) -> String {
     // semantics differ across schemes.
     let path = url.path();
 
-    // Query: sort by key, preserve value order under a single key.
+    // Query: sort by raw key, preserve original percent-encoding so that
+    // values containing `%26` / `%3D` / nested URLs round-trip unchanged.
+    // Splitting the raw query string (vs. `query_pairs()` which decodes)
+    // is what makes this reversible — the requirement explicitly asks
+    // for stable ordering without breaking nested-URL semantics.
     let query_canon = match url.query() {
-        Some(_) => {
-            let mut pairs: Vec<(String, String)> = url
-                .query_pairs()
-                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        Some(raw) if raw.is_empty() => String::from("?"),
+        Some(raw) => {
+            let mut parts: Vec<(usize, &str, &str)> = raw
+                .split('&')
+                .enumerate()
+                .map(|(idx, part)| {
+                    let (k, v) = match part.find('=') {
+                        Some(i) => (&part[..i], &part[i..]), // include '='
+                        None => (part, ""),
+                    };
+                    (idx, k, v)
+                })
                 .collect();
-            pairs.sort_by(|a, b| a.0.cmp(&b.0));
-            if pairs.is_empty() {
-                // Preserve a literal empty query "?" if present.
-                String::from("?")
-            } else {
-                let mut buf = String::from("?");
-                for (i, (k, v)) in pairs.iter().enumerate() {
-                    if i > 0 {
-                        buf.push('&');
-                    }
-                    buf.push_str(k);
-                    buf.push('=');
-                    buf.push_str(v);
+            // Stable sort by raw key bytes; entries with the same key keep
+            // their original input order via the index tiebreaker.
+            parts.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()).then_with(|| a.0.cmp(&b.0)));
+            let mut buf = String::with_capacity(raw.len() + 1);
+            buf.push('?');
+            for (i, (_, k, v)) in parts.iter().enumerate() {
+                if i > 0 {
+                    buf.push('&');
                 }
-                buf
+                buf.push_str(k);
+                buf.push_str(v);
             }
+            buf
         }
         None => String::new(),
     };
@@ -448,6 +498,13 @@ pub fn reachable_status(
 /// resulting URL order. Statuses themselves are not mutated. The
 /// `caller_priorities` slice is parallel to `statuses` (positional, before
 /// any sort happened); missing entries are treated as `u32::MAX`.
+///
+/// To stay total-ordered across mixed-scheme inputs, RTT-aware policies
+/// group entries by scheme using each scheme's first-appearance index in
+/// the input. Within a scheme group the comparator falls through to RTT;
+/// across groups callers see their original scheme order preserved. This
+/// avoids the transitivity violation that arises from emitting `Equal`
+/// for every cross-scheme pair while still ranking same-scheme pairs.
 pub fn sort_urls(
     statuses: &[TunnelUrlStatus],
     policy: TunnelUrlSortPolicy,
@@ -461,27 +518,42 @@ pub fn sort_urls(
             .unwrap_or(u32::MAX)
     };
 
+    // Build a stable scheme → first-appearance-index map. Comparing two
+    // entries by their scheme group (rather than scheme name) keeps the
+    // output deterministic and tied to caller-supplied input order.
+    let mut scheme_first: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for (i, s) in statuses.iter().enumerate() {
+        scheme_first.entry(s.scheme.as_str()).or_insert(i);
+    }
+    let scheme_group = |i: usize| -> usize {
+        scheme_first
+            .get(statuses[i].scheme.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    };
+    // Sort key for RTT under a Reachable state: Some(rtt) < None < non-Reachable.
+    // Wrapped into u128 so the whole tuple stays a total Ord without
+    // needing custom comparator branches.
+    let rtt_sort_key = |i: usize| -> u128 {
+        match (statuses[i].state, statuses[i].rtt_ms) {
+            (TunnelUrlState::Reachable, Some(rtt)) => rtt as u128,
+            (TunnelUrlState::Reachable, None) => (u64::MAX as u128) + 1,
+            _ => (u64::MAX as u128) + 2,
+        }
+    };
+
     match policy {
         TunnelUrlSortPolicy::None => {}
         TunnelUrlSortPolicy::ReachableFirst => {
-            idx.sort_by(|&a, &b| {
-                state_rank(statuses[a].state)
-                    .cmp(&state_rank(statuses[b].state))
-                    .then_with(|| a.cmp(&b))
-            });
+            idx.sort_by_key(|&i| (state_rank(statuses[i].state) as u32, i as u32));
         }
         TunnelUrlSortPolicy::RttAscending => {
             idx.sort_by(|&a, &b| {
                 state_rank(statuses[a].state)
                     .cmp(&state_rank(statuses[b].state))
-                    .then_with(|| {
-                        let same_scheme = statuses[a].scheme == statuses[b].scheme;
-                        if same_scheme && statuses[a].state == TunnelUrlState::Reachable {
-                            cmp_optional_rtt(statuses[a].rtt_ms, statuses[b].rtt_ms)
-                        } else {
-                            Ordering::Equal
-                        }
-                    })
+                    .then_with(|| scheme_group(a).cmp(&scheme_group(b)))
+                    .then_with(|| rtt_sort_key(a).cmp(&rtt_sort_key(b)))
                     .then_with(|| a.cmp(&b))
             });
         }
@@ -490,14 +562,8 @@ pub fn sort_urls(
                 priority_for(a)
                     .cmp(&priority_for(b))
                     .then_with(|| state_rank(statuses[a].state).cmp(&state_rank(statuses[b].state)))
-                    .then_with(|| {
-                        let same_scheme = statuses[a].scheme == statuses[b].scheme;
-                        if same_scheme && statuses[a].state == TunnelUrlState::Reachable {
-                            cmp_optional_rtt(statuses[a].rtt_ms, statuses[b].rtt_ms)
-                        } else {
-                            Ordering::Equal
-                        }
-                    })
+                    .then_with(|| scheme_group(a).cmp(&scheme_group(b)))
+                    .then_with(|| rtt_sort_key(a).cmp(&rtt_sort_key(b)))
                     .then_with(|| a.cmp(&b))
             });
         }
@@ -520,16 +586,6 @@ fn state_rank(s: TunnelUrlState) -> u8 {
         TunnelUrlState::Unknown | TunnelUrlState::Probing => 1,
         TunnelUrlState::Unreachable => 2,
         TunnelUrlState::Unsupported => 3,
-    }
-}
-
-// `Reachable + rtt = Some` < `Reachable + rtt = None`
-fn cmp_optional_rtt(a: Option<u64>, b: Option<u64>) -> Ordering {
-    match (a, b) {
-        (Some(x), Some(y)) => x.cmp(&y),
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
     }
 }
 
@@ -568,6 +624,19 @@ mod tests {
         let a = normalize_tunnel_url(&parse("rtcp://h/?b=2&a=1"));
         let b = normalize_tunnel_url(&parse("rtcp://h/?a=1&b=2"));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn normalize_preserves_query_percent_encoding() {
+        // Values containing `%26`, `%3D`, or nested URLs must round-trip
+        // unchanged — decoding+rejoining would corrupt nested URL boundaries
+        // (e.g. `relay=rtcp%3A%2F%2Fpeer%2F%3A80` would become
+        // `relay=rtcp://peer/:80` with extra `&`/`=` characters appearing
+        // inside the value, breaking the canonical key).
+        let raw = "rtcp://h/?relay=rtcp%3A%2F%2Fpeer%2F%3A80&token=a%26b%3Dc";
+        let n = normalize_tunnel_url(&parse(raw));
+        assert!(n.contains("relay=rtcp%3A%2F%2Fpeer%2F%3A80"));
+        assert!(n.contains("token=a%26b%3Dc"));
     }
 
     #[test]
@@ -628,12 +697,40 @@ mod tests {
             dummy_status("rtcp://c/", TunnelUrlState::Reachable, Some(20)),
         ];
         let order = sort_urls(&st, TunnelUrlSortPolicy::RttAscending, None, true);
-        // All Reachable -> rank tie. Cross-scheme RTT doesn't break the tie,
-        // so original input order wins as the final tiebreaker. With sort
-        // key returning Equal on cross-scheme, stable sort preserves the
-        // input order: a (50), b (10), c (20). RTT only matters between
-        // same-scheme pairs, where stable sort still preserves ordering.
-        assert_eq!(order[0], "rtcp://a/");
+        // Cross-scheme uses caller order via first-appearance index:
+        // rtcp appears first so its group sorts before tcp. Within rtcp,
+        // RTT decides: c (20) < a (50). The tcp entry's lower RTT does
+        // not let it overtake any rtcp entry (cross-scheme RTT is
+        // intentionally not comparable here).
+        assert_eq!(order, vec!["rtcp://c/", "rtcp://a/", "tcp://b/"]);
+    }
+
+    #[test]
+    fn sort_rtt_ascending_is_total_order_under_mixed_scheme() {
+        // Regression: a non-total comparator can violate transitivity for
+        // mixed-scheme inputs, leading sort_by to leave reachable URLs in
+        // an unstable interleaved order. Verify that repeating the sort on
+        // the previous output yields the same sequence.
+        let st = vec![
+            dummy_status("rtcp://r1/", TunnelUrlState::Reachable, Some(80)),
+            dummy_status("tcp://t1/", TunnelUrlState::Reachable, Some(5)),
+            dummy_status("rtcp://r2/", TunnelUrlState::Reachable, Some(10)),
+            dummy_status("tcp://t2/", TunnelUrlState::Reachable, Some(15)),
+            dummy_status("rtcp://r3/", TunnelUrlState::Reachable, Some(30)),
+        ];
+        let order1 = sort_urls(&st, TunnelUrlSortPolicy::RttAscending, None, true);
+        // Build a permuted statuses list matching `order1` and verify the
+        // sort is idempotent — a hallmark of total ordering.
+        let mut by_url: std::collections::HashMap<String, TunnelUrlStatus> = st
+            .into_iter()
+            .map(|s| (s.normalized_url.clone(), s))
+            .collect();
+        let permuted: Vec<TunnelUrlStatus> = order1
+            .iter()
+            .map(|u| by_url.remove(u).unwrap())
+            .collect();
+        let order2 = sort_urls(&permuted, TunnelUrlSortPolicy::RttAscending, None, true);
+        assert_eq!(order1, order2);
     }
 
     #[test]
@@ -673,6 +770,19 @@ mod tests {
         // b has higher priority (lower number) so it wins despite higher RTT
         assert_eq!(order[0], "rtcp://b/");
         assert_eq!(order[1], "rtcp://a/");
+    }
+
+    #[test]
+    fn redact_strips_userinfo() {
+        assert_eq!(
+            redact_url_for_persist("socks://u:p@127.0.0.1:1080/example.com:443"),
+            "socks://***@127.0.0.1:1080/example.com:443"
+        );
+        // No userinfo → unchanged.
+        assert_eq!(
+            redact_url_for_persist("rtcp://device.dev.did/:80"),
+            "rtcp://device.dev.did/:80"
+        );
     }
 
     #[test]

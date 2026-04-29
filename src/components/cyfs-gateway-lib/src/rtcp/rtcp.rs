@@ -1590,12 +1590,28 @@ impl RTcpInner {
         }
 
         // 2. No existing tunnel: try to build one and ping it.
-        let create_started = Instant::now();
         match self.create_tunnel(Some(stack_id)).await {
             Ok(_tunnel_box) => {
-                let create_rtt = create_started.elapsed();
-                if let Some(tunnel) = self.tunnel_map.get_tunnel(&tunnel_key).await {
-                    if let Ok(d) = tunnel.ping_rtt(timeout_dur).await {
+                // Tunnel-instance presence alone is not proof of reachability:
+                // the requirement (§9.3) demands a ping/pong-confirmed RTT
+                // before we mark the URL Reachable. Build-then-ping fail
+                // must surface as Unreachable with the ping reason.
+                let tunnel = match self.tunnel_map.get_tunnel(&tunnel_key).await {
+                    Some(t) => t,
+                    None => {
+                        let mut s = unreachable_status(
+                            url,
+                            &normalized,
+                            now,
+                            TunnelUrlStatusSource::FreshProbe,
+                            "tunnel created but not registered in tunnel_map".to_string(),
+                        );
+                        s.runtime_tunnel_key = Some(tunnel_key);
+                        return Ok(s);
+                    }
+                };
+                match tunnel.ping_rtt(timeout_dur).await {
+                    Ok(d) => {
                         let mut s = reachable_status(
                             url,
                             &normalized,
@@ -1604,21 +1620,20 @@ impl RTcpInner {
                             Some(d.as_millis() as u64),
                         );
                         s.runtime_tunnel_key = Some(tunnel_key);
-                        return Ok(s);
+                        Ok(s)
+                    }
+                    Err(e) => {
+                        let mut s = unreachable_status(
+                            url,
+                            &normalized,
+                            now,
+                            TunnelUrlStatusSource::FreshProbe,
+                            format!("ping_rtt after create: {}", e),
+                        );
+                        s.runtime_tunnel_key = Some(tunnel_key);
+                        Ok(s)
                     }
                 }
-                // Tunnel was built but the follow-up RTT ping failed.
-                // Treat this as Reachable (tunnel exists) using the
-                // create-time elapsed as a coarse RTT signal.
-                let mut s = reachable_status(
-                    url,
-                    &normalized,
-                    now,
-                    TunnelUrlStatusSource::FreshProbe,
-                    Some(create_rtt.as_millis() as u64),
-                );
-                s.runtime_tunnel_key = Some(tunnel_key);
-                Ok(s)
             }
             Err(e) => {
                 let mut s = unreachable_status(

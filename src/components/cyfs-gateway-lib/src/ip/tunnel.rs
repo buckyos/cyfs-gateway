@@ -1,6 +1,11 @@
 use super::udp::UdpClient;
 use crate::TunnelResult;
 use crate::tunnel::*;
+use crate::tunnel_mgr::now_ms;
+use crate::tunnel_url_status::{
+    TunnelProbeOptions, TunnelUrlProber, TunnelUrlProberRef, TunnelUrlStatus,
+    TunnelUrlStatusSource, normalize_tunnel_url, reachable_status, unreachable_status,
+};
 use async_trait::async_trait;
 use buckyos_kit::AsyncStream;
 use name_client::resolve_ip;
@@ -11,6 +16,7 @@ use rustls_platform_verifier::BuilderVerifierExt;
 use std::io::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio_rustls::TlsConnector;
 use url::Url;
 
@@ -235,11 +241,20 @@ impl Tunnel for IPTunnel {
     }
 }
 
-pub struct IPTunnelBuilder {}
+pub struct IPTunnelBuilder {
+    // `udp` reuses this builder. UDP has no generic reachability, so we
+    // skip the prober for that scheme and let TunnelManager fall back to
+    // `Unsupported`.
+    enable_prober: bool,
+}
 
 impl IPTunnelBuilder {
     pub fn new() -> IPTunnelBuilder {
-        IPTunnelBuilder {}
+        IPTunnelBuilder { enable_prober: true }
+    }
+
+    pub fn new_no_prober() -> IPTunnelBuilder {
+        IPTunnelBuilder { enable_prober: false }
     }
 }
 
@@ -248,4 +263,95 @@ impl TunnelBuilder for IPTunnelBuilder {
     async fn create_tunnel(&self, target_id: Option<&str>) -> TunnelResult<Box<dyn TunnelBox>> {
         Ok(Box::new(IPTunnel::new(target_id)))
     }
+
+    fn url_prober(&self) -> Option<TunnelUrlProberRef> {
+        if !self.enable_prober {
+            return None;
+        }
+        Some(Arc::new(TcpUrlProber {}))
+    }
+}
+
+/// Lightweight TCP connect probe. Resolves the target host, attempts a
+/// TCP handshake within `options.timeout_ms`, then drops the socket.
+/// RTT is the connect duration — *not* business first-byte latency, and
+/// not directly comparable to RTCP ping RTT (per requirement §10.1).
+pub struct TcpUrlProber;
+
+#[async_trait]
+impl TunnelUrlProber for TcpUrlProber {
+    async fn probe_url(
+        &self,
+        url: &Url,
+        options: &TunnelProbeOptions,
+    ) -> TunnelResult<TunnelUrlStatus> {
+        let normalized = normalize_tunnel_url(url);
+        let now = now_ms();
+        let (host, port) = match extract_host_port(url) {
+            Some(p) => p,
+            None => {
+                return Ok(unreachable_status(
+                    url,
+                    &normalized,
+                    now,
+                    TunnelUrlStatusSource::FreshProbe,
+                    "tcp url has no resolvable host:port".to_string(),
+                ));
+            }
+        };
+        let timeout_dur = Duration::from_millis(options.timeout_ms_or_default());
+        let started = Instant::now();
+        let connect = async {
+            let ip = resolve_ip(host.as_str())
+                .await
+                .map_err(|e| format!("resolve {}: {}", host, e))?;
+            let addr = format!("{}:{}", ip, port);
+            tokio::net::TcpStream::connect(&addr)
+                .await
+                .map_err(|e| format!("connect {}: {}", addr, e))
+        };
+        match tokio::time::timeout(timeout_dur, connect).await {
+            Ok(Ok(_stream)) => Ok(reachable_status(
+                url,
+                &normalized,
+                now,
+                TunnelUrlStatusSource::FreshProbe,
+                Some(started.elapsed().as_millis() as u64),
+            )),
+            Ok(Err(reason)) => Ok(unreachable_status(
+                url,
+                &normalized,
+                now,
+                TunnelUrlStatusSource::FreshProbe,
+                reason,
+            )),
+            Err(_) => Ok(unreachable_status(
+                url,
+                &normalized,
+                now,
+                TunnelUrlStatusSource::FreshProbe,
+                "tcp_connect_timeout".to_string(),
+            )),
+        }
+    }
+}
+
+/// Extract `(host, port)` from a tunnel URL. The path encodes the target
+/// for IP-style schemes (e.g. `tcp:///host:port` or `tcp://bind/:port`).
+/// Falls back to the URL authority when the path is empty.
+pub fn extract_host_port(url: &Url) -> Option<(String, u16)> {
+    let path = url.path().trim_start_matches('/');
+    if !path.is_empty() {
+        if let Ok((h, p)) = get_dest_info_from_url_path(path) {
+            let host = h.unwrap_or_else(|| {
+                url.host_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "127.0.0.1".to_string())
+            });
+            return Some((host, p));
+        }
+    }
+    let host = url.host_str()?;
+    let port = url.port()?;
+    Some((host.to_string(), port))
 }

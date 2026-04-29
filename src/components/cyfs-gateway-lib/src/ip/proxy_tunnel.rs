@@ -6,6 +6,10 @@ use buckyos_kit::AsyncStream;
 use percent_encoding::percent_decode;
 use tokio::io::AsyncWriteExt;
 
+use std::sync::Arc;
+
+use crate::ip::TcpUrlProber;
+use crate::tunnel_url_status::TunnelUrlProberRef;
 use crate::{DatagramClientBox, Tunnel, TunnelBox, TunnelBuilder, TunnelError, TunnelResult};
 
 #[derive(Clone)]
@@ -121,6 +125,13 @@ impl TunnelBuilder for ProxyTcpTunnelBuilder {
             .map_err(|e| TunnelError::InvalidState(format!("invalid ptcp source addr: {}", e)))?;
 
         Ok(Box::new(ProxyTcpTunnel::new(source_addr)))
+    }
+
+    fn url_prober(&self) -> Option<TunnelUrlProberRef> {
+        // ptcp targets are real TCP endpoints; the same connect-style
+        // probe applies. The PROXY v1 header is added at business time,
+        // not during probing — probing only verifies reachability.
+        Some(Arc::new(TcpUrlProber {}))
     }
 }
 

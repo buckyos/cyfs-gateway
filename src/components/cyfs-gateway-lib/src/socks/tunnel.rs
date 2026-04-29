@@ -1,9 +1,16 @@
 use super::udp::SocksUdpClient;
 use crate::ip::UdpClient;
 use crate::tunnel::*;
+use crate::tunnel_mgr::now_ms;
+use crate::tunnel_url_status::{
+    TunnelProbeOptions, TunnelUrlProber, TunnelUrlProberRef, TunnelUrlStatus,
+    TunnelUrlStatusSource, normalize_tunnel_url, reachable_status, unreachable_status,
+};
 use crate::{TunnelError, TunnelResult};
+use async_trait::async_trait;
 use buckyos_kit::AsyncStream;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio_socks::tcp::Socks5Stream;
 use url::Url;
 
@@ -227,7 +234,7 @@ impl SocksTunnelBuilder {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl TunnelBuilder for SocksTunnelBuilder {
     async fn create_tunnel(
         &self,
@@ -239,5 +246,116 @@ impl TunnelBuilder for SocksTunnelBuilder {
         );
         let tunnel = SocksTunnel::new(tunnel_stack_id).await?;
         Ok(Box::new(tunnel))
+    }
+
+    fn url_prober(&self) -> Option<TunnelUrlProberRef> {
+        Some(Arc::new(SocksUrlProber {}))
+    }
+}
+
+/// SOCKS5 CONNECT probe: connects through the SOCKS server in the URL
+/// authority, asks it to CONNECT to the target encoded in the URL path,
+/// then drops the stream. Verifies both proxy availability and target
+/// reachability through the proxy (per requirement §10.3).
+struct SocksUrlProber;
+
+#[async_trait]
+impl TunnelUrlProber for SocksUrlProber {
+    async fn probe_url(
+        &self,
+        url: &Url,
+        options: &TunnelProbeOptions,
+    ) -> TunnelResult<TunnelUrlStatus> {
+        let normalized = normalize_tunnel_url(url);
+        let now = now_ms();
+        let auth = url.authority();
+        if auth.is_empty() {
+            return Ok(unreachable_status(
+                url,
+                &normalized,
+                now,
+                TunnelUrlStatusSource::FreshProbe,
+                "socks url has no proxy authority".to_string(),
+            ));
+        }
+        let server = match SocksServerInfo::from_target(auth) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(unreachable_status(
+                    url,
+                    &normalized,
+                    now,
+                    TunnelUrlStatusSource::FreshProbe,
+                    format!("socks server parse: {}", e),
+                ));
+            }
+        };
+        let path = url.path().trim_start_matches('/');
+        let (dest_host, dest_port) = match get_dest_info_from_url_path(path) {
+            Ok((Some(h), p)) => (h, p),
+            Ok((None, _)) => {
+                return Ok(unreachable_status(
+                    url,
+                    &normalized,
+                    now,
+                    TunnelUrlStatusSource::FreshProbe,
+                    "socks target requires explicit host".to_string(),
+                ));
+            }
+            Err(e) => {
+                return Ok(unreachable_status(
+                    url,
+                    &normalized,
+                    now,
+                    TunnelUrlStatusSource::FreshProbe,
+                    format!("socks target parse: {}", e),
+                ));
+            }
+        };
+        let timeout_dur = Duration::from_millis(options.timeout_ms_or_default());
+        let started = Instant::now();
+        let probe = async {
+            match &server.auth {
+                SocksAuth::UsernamePassword(u, p) => {
+                    Socks5Stream::connect_with_password(
+                        (server.host.as_str(), server.port),
+                        (dest_host.as_str(), dest_port),
+                        u,
+                        p,
+                    )
+                    .await
+                }
+                SocksAuth::None => {
+                    Socks5Stream::connect(
+                        (server.host.as_str(), server.port),
+                        (dest_host.as_str(), dest_port),
+                    )
+                    .await
+                }
+            }
+        };
+        match tokio::time::timeout(timeout_dur, probe).await {
+            Ok(Ok(_stream)) => Ok(reachable_status(
+                url,
+                &normalized,
+                now,
+                TunnelUrlStatusSource::FreshProbe,
+                Some(started.elapsed().as_millis() as u64),
+            )),
+            Ok(Err(e)) => Ok(unreachable_status(
+                url,
+                &normalized,
+                now,
+                TunnelUrlStatusSource::FreshProbe,
+                format!("socks_connect: {}", e),
+            )),
+            Err(_) => Ok(unreachable_status(
+                url,
+                &normalized,
+                now,
+                TunnelUrlStatusSource::FreshProbe,
+                "socks_connect_timeout".to_string(),
+            )),
+        }
     }
 }

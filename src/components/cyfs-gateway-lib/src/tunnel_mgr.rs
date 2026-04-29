@@ -6,8 +6,8 @@ use crate::tls_tunnel::TlsTunnelBuilder;
 use crate::tunnel_url_status::{
     TunnelProbeOptions, TunnelProbeResult, TunnelStatusStoreConfig, TunnelUrlHistory,
     TunnelUrlState, TunnelUrlStatus, TunnelUrlStatusSource, mask_tunnel_url, normalize_tunnel_url,
-    protocol_category_for_scheme, reachable_status, sort_urls, unknown_status, unreachable_status,
-    unsupported_status,
+    protocol_category_for_scheme, reachable_status, redact_url_for_persist, sort_urls,
+    unknown_status, unreachable_status, unsupported_status,
 };
 use crate::{TunnelBox, TunnelBuilder, TunnelError, TunnelResult};
 use buckyos_kit::{AsyncStream, buckyos_get_unix_timestamp};
@@ -15,11 +15,14 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use log::*;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
 use url::Url;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProtocolCategory {
     Stream,
     Datagram,
@@ -63,6 +66,7 @@ struct TunnelManagerInner {
     in_flight_probes: AsyncMutex<HashMap<String, SharedProbeFuture>>,
     probe_limiter: Arc<Semaphore>,
     config: StdMutex<TunnelStatusStoreConfig>,
+    flush_task_running: AtomicBool,
 }
 
 impl Default for TunnelManager {
@@ -84,17 +88,135 @@ impl TunnelManager {
             in_flight_probes: AsyncMutex::new(HashMap::new()),
             probe_limiter: limiter,
             config: StdMutex::new(config),
+            flush_task_running: AtomicBool::new(false),
         };
         let this = Self {
             inner: Arc::new(inner),
         };
         this.register_tunnel_builder("tcp", Arc::new(IPTunnelBuilder::new()));
         this.register_tunnel_builder("ptcp", Arc::new(ProxyTcpTunnelBuilder::new()));
-        this.register_tunnel_builder("udp", Arc::new(IPTunnelBuilder::new()));
+        // UDP has no generic reachability semantics (per §10.2): keep
+        // create_tunnel working but skip url_prober so queries return
+        // Unsupported instead of pretending success.
+        this.register_tunnel_builder("udp", Arc::new(IPTunnelBuilder::new_no_prober()));
         this.register_tunnel_builder("quic", Arc::new(QuicTunnelBuilder::new()));
         this.register_tunnel_builder("tls", Arc::new(TlsTunnelBuilder::new()));
         this.register_tunnel_builder("socks", Arc::new(SocksTunnelBuilder::new()));
+        // Best-effort: load any persisted history and start the flush
+        // task. Both are no-ops when persistence is off or no path is
+        // set, per the requirement that disabling persistence must not
+        // affect business behavior (§8.1).
+        this.bootstrap_persistence();
         this
+    }
+
+    fn bootstrap_persistence(&self) {
+        let cfg = self.inner.config.lock().unwrap().clone();
+        if !cfg.enable_persist {
+            return;
+        }
+        let path = match cfg.persist_path.clone() {
+            Some(p) if !p.is_empty() => PathBuf::from(p),
+            _ => return,
+        };
+        // Synchronous load on construction. Errors are logged but never
+        // propagated so a corrupted snapshot can't keep the gateway from
+        // starting.
+        if let Err(e) = self.load_from_disk_sync(&path) {
+            warn!(
+                "tunnel_mgr: failed to load tunnel url history from {}: {}",
+                path.display(),
+                e
+            );
+        }
+        // Spawn the periodic flush. Held by Weak so the manager can drop
+        // cleanly without a stop-channel; the loop exits when no strong
+        // references remain.
+        if !self.inner.flush_task_running.swap(true, Ordering::SeqCst) {
+            let weak = Arc::downgrade(&self.inner);
+            let interval = std::time::Duration::from_millis(cfg.flush_interval_ms.max(500));
+            tokio::spawn(async move {
+                Self::flush_loop(weak, path, interval).await;
+            });
+        }
+    }
+
+    async fn flush_loop(weak: Weak<TunnelManagerInner>, path: PathBuf, interval: std::time::Duration) {
+        loop {
+            tokio::time::sleep(interval).await;
+            let inner = match weak.upgrade() {
+                Some(i) => i,
+                None => return,
+            };
+            let entries: Vec<TunnelUrlHistory> =
+                inner.tunnel_history.read().await.values().cloned().collect();
+            if let Err(e) = write_history_to_disk(&path, &entries).await {
+                warn!(
+                    "tunnel_mgr: flush to {} failed: {}",
+                    path.display(),
+                    e
+                );
+            } else {
+                debug!(
+                    "tunnel_mgr: flushed {} url history entries to {}",
+                    entries.len(),
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn load_from_disk_sync(&self, path: &Path) -> std::io::Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let contents = std::fs::read(path)?;
+        if contents.is_empty() {
+            return Ok(());
+        }
+        let entries: Vec<TunnelUrlHistory> = serde_json::from_slice(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // We're called during `with_config`, so this Arc is fresh and
+        // nobody else holds a lock. `try_write` avoids the runtime
+        // assertion that `blocking_write` triggers when invoked under
+        // an async context.
+        let mut hist = self
+            .inner
+            .tunnel_history
+            .try_write()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        for mut entry in entries {
+            // Loaded statuses are stale by definition: callers must
+            // decide via TTL whether to reuse them. We mark `cached` so
+            // the next query treats this as a hint, not fresh.
+            entry.current.cached = true;
+            entry.persisted_at_ms = Some(entry.updated_at_ms);
+            hist.insert(entry.normalized_url.clone(), entry);
+        }
+        Ok(())
+    }
+
+    /// Force-flush current history to the configured persistence path.
+    /// No-op when persistence is disabled. Useful for tests and for
+    /// graceful shutdown paths.
+    pub async fn flush_persisted_history(&self) -> std::io::Result<()> {
+        let cfg = self.inner.config.lock().unwrap().clone();
+        if !cfg.enable_persist {
+            return Ok(());
+        }
+        let path = match cfg.persist_path {
+            Some(p) if !p.is_empty() => PathBuf::from(p),
+            _ => return Ok(()),
+        };
+        let entries: Vec<TunnelUrlHistory> = self
+            .inner
+            .tunnel_history
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect();
+        write_history_to_disk(&path, &entries).await
     }
 
     pub fn register_tunnel_builder(&self, protocol: &str, builder: Arc<dyn TunnelBuilder>) {
@@ -479,11 +601,12 @@ impl TunnelManager {
         timeout_ms: u64,
     ) -> TunnelUrlStatus {
         match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), fut).await {
-            Ok(s) => {
-                let mut s = s;
-                s.cached = true;
-                s
-            }
+            // Probe completed within this caller's timeout. Return the
+            // fresh status as-is — `cached` stays false. (Cache hits are
+            // handled earlier in `history_status_if_fresh`, which sets
+            // `cached = true`. The post-timeout fallback below is the
+            // only place where this method itself sets `cached`.)
+            Ok(s) => s,
             Err(_) => {
                 // Probe still running; return the cached/unknown status with
                 // a `cached = true` flag if we have any history, otherwise
@@ -597,17 +720,35 @@ impl TunnelManager {
 
         // Insert into the in-flight map atomically; if someone else beat us
         // to it, drop our future and use theirs (this can happen when two
-        // callers race past the freshness check).
-        {
+        // callers race past the freshness check). Either branch must
+        // honor the caller-supplied timeout, so route both through
+        // `await_in_flight` (which falls back to history/Probing on
+        // timeout, per requirement §8 step 5).
+        let raced_existing = {
             let mut map = self.inner.in_flight_probes.lock().await;
             if let Some(existing) = map.get(normalized).cloned() {
-                drop(map);
-                return existing.await;
+                Some(existing)
+            } else {
+                map.insert(normalized.to_string(), shared.clone());
+                None
             }
-            map.insert(normalized.to_string(), shared.clone());
+        };
+        let now = now_ms();
+        if let Some(existing) = raced_existing {
+            return self
+                .await_in_flight(existing, normalized, url, now, timeout_ms)
+                .await;
         }
-
-        shared.await
+        // Drive the probe future to completion in the background. Without
+        // this, if every caller times out and drops their await, the
+        // `Shared` future would stop being polled and history would never
+        // be updated.
+        let driver = shared.clone();
+        tokio::spawn(async move {
+            let _ = driver.await;
+        });
+        self.await_in_flight(shared, normalized, url, now, timeout_ms)
+            .await
     }
 
     async fn remove_in_flight(&self, normalized: &str) {
@@ -687,6 +828,47 @@ impl TunnelManager {
 pub(crate) fn now_ms() -> u64 {
     // buckyos_get_unix_timestamp returns seconds; convert to millis.
     buckyos_get_unix_timestamp().saturating_mul(1_000)
+}
+
+/// Serialize URL histories to JSON and write atomically (temp + rename).
+/// Userinfo and any per-status URL field are redacted before write so a
+/// stolen snapshot does not leak credentials. The redaction also rewrites
+/// the lookup key, so credential-bearing entries collapse together on
+/// reload — accepted trade-off per §11.
+async fn write_history_to_disk(
+    path: &Path,
+    entries: &[TunnelUrlHistory],
+) -> std::io::Result<()> {
+    let mut sanitized: Vec<TunnelUrlHistory> = entries
+        .iter()
+        .map(|h| {
+            let mut h = h.clone();
+            h.normalized_url = redact_url_for_persist(&h.normalized_url);
+            h.current.url = redact_url_for_persist(&h.current.url);
+            h.current.normalized_url = redact_url_for_persist(&h.current.normalized_url);
+            if let Some(ref mut s) = h.last_reachable {
+                s.url = redact_url_for_persist(&s.url);
+                s.normalized_url = redact_url_for_persist(&s.normalized_url);
+            }
+            if let Some(ref mut s) = h.last_unreachable {
+                s.url = redact_url_for_persist(&s.url);
+                s.normalized_url = redact_url_for_persist(&s.normalized_url);
+            }
+            h
+        })
+        .collect();
+    sanitized.sort_by(|a, b| a.normalized_url.cmp(&b.normalized_url));
+    let json = serde_json::to_vec_pretty(&sanitized)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+    }
+    let tmp = path.with_extension("tmp");
+    tokio::fs::write(&tmp, &json).await?;
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1130,6 +1312,102 @@ mod tests {
             .expect("history entry for failed business connect");
         assert_eq!(h.current.state, TunnelUrlState::Unreachable);
         assert_eq!(h.current.source, TunnelUrlStatusSource::BusinessConnect);
+    }
+
+    #[tokio::test]
+    async fn persistence_round_trip_through_disk() {
+        // Configure persistence with a temp path. Record a status,
+        // flush, and prove a fresh manager pointed at the same file
+        // recovers the entry (marked `cached`).
+        let tmp = std::env::temp_dir().join(format!(
+            "tunnel_url_history_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let mut cfg = TunnelStatusStoreConfig::default();
+        cfg.enable_persist = true;
+        cfg.persist_path = Some(tmp.to_string_lossy().into_owned());
+        let mgr1 = TunnelManager::with_config(cfg.clone());
+        let u = url("rtcp://device.dev.did/:80");
+        let normalized = normalize_tunnel_url(&u);
+        mgr1.record_status_observation(reachable_status(
+            &u,
+            &normalized,
+            now_ms(),
+            TunnelUrlStatusSource::KeepAlive,
+            Some(42),
+        ))
+        .await;
+        mgr1.flush_persisted_history().await.expect("flush");
+        drop(mgr1);
+
+        // Reload into a new manager.
+        let mgr2 = TunnelManager::with_config(cfg);
+        let entries = mgr2.list_tunnel_url_history().await;
+        let h = entries
+            .into_iter()
+            .find(|h| h.normalized_url == normalized)
+            .expect("entry restored from disk");
+        assert_eq!(h.current.state, TunnelUrlState::Reachable);
+        assert!(h.current.cached, "loaded entries marked cached");
+        assert_eq!(h.current.rtt_ms, Some(42));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn persistence_disabled_skips_disk() {
+        let tmp = std::env::temp_dir().join(format!(
+            "tunnel_url_history_disabled_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let mut cfg = TunnelStatusStoreConfig::default();
+        cfg.enable_persist = false;
+        cfg.persist_path = Some(tmp.to_string_lossy().into_owned());
+        let mgr = TunnelManager::with_config(cfg);
+        let u = url("rtcp://device.dev.did/:80");
+        let normalized = normalize_tunnel_url(&u);
+        mgr.record_status_observation(reachable_status(
+            &u,
+            &normalized,
+            now_ms(),
+            TunnelUrlStatusSource::KeepAlive,
+            Some(7),
+        ))
+        .await;
+        mgr.flush_persisted_history().await.expect("flush noop");
+        assert!(!tmp.exists(), "no file should be written when disabled");
+    }
+
+    #[tokio::test]
+    async fn persistence_redacts_userinfo_on_disk() {
+        let tmp = std::env::temp_dir().join(format!(
+            "tunnel_url_history_redact_{}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let mut cfg = TunnelStatusStoreConfig::default();
+        cfg.enable_persist = true;
+        cfg.persist_path = Some(tmp.to_string_lossy().into_owned());
+        let mgr = TunnelManager::with_config(cfg);
+        let u = url("socks://user:pw@127.0.0.1:1080/example.com:443");
+        let normalized = normalize_tunnel_url(&u);
+        mgr.record_status_observation(reachable_status(
+            &u,
+            &normalized,
+            now_ms(),
+            TunnelUrlStatusSource::FreshProbe,
+            Some(12),
+        ))
+        .await;
+        mgr.flush_persisted_history().await.expect("flush");
+        let on_disk = std::fs::read_to_string(&tmp).expect("read flushed file");
+        assert!(
+            !on_disk.contains("user:pw"),
+            "raw userinfo must not appear on disk: {}",
+            on_disk
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[tokio::test]
