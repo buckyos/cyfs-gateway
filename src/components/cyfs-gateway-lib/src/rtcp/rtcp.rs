@@ -1707,10 +1707,9 @@ async fn initiator_key_confirmation(
     let ack = match pkg {
         RTcpTunnelPackage::HelloAck(p) => p,
         other => {
-            return Err(InitiatorKeyConfirmationError::Failed(TunnelError::ReasonError(format!(
-                "expected HelloAck, got {:?}",
-                other
-            ))));
+            return Err(InitiatorKeyConfirmationError::Failed(
+                TunnelError::ReasonError(format!("expected HelloAck, got {:?}", other)),
+            ));
         }
     };
 
@@ -1719,10 +1718,12 @@ async fn initiator_key_confirmation(
     // misconfigured peer or a MitM attempting to stand up a tunnel under
     // a different identity than the initiator requested.
     if ack.body.responder_id != expected_responder_host {
-        return Err(InitiatorKeyConfirmationError::Failed(TunnelError::ReasonError(format!(
-            "HelloAck responder_id {} not equal to expected {}",
-            ack.body.responder_id, expected_responder_host
-        ))));
+        return Err(InitiatorKeyConfirmationError::Failed(
+            TunnelError::ReasonError(format!(
+                "HelloAck responder_id {} not equal to expected {}",
+                ack.body.responder_id, expected_responder_host
+            )),
+        ));
     }
 
     let confirm = RTcpHelloAckConfirmPackage::new(ack.seq, ack.body.challenge.clone());
@@ -2700,10 +2701,7 @@ impl RTcpTunnel {
     // RTT-aware ping. Sends a Ping with a fresh seq and waits for the
     // matching Pong on a per-seq oneshot. Distinct from `Tunnel::ping`,
     // which only flushes a control packet without measuring response.
-    pub(crate) async fn ping_rtt(
-        &self,
-        timeout_dur: Duration,
-    ) -> Result<Duration, std::io::Error> {
+    pub(crate) async fn ping_rtt(&self, timeout_dur: Duration) -> Result<Duration, std::io::Error> {
         if self.is_closed() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -3310,10 +3308,7 @@ mod tests {
         rtcp2.start().await.unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let url = Url::parse(
-            format!("rtcp://{}:19064/", id2.to_host_name()).as_str(),
-        )
-        .unwrap();
+        let url = Url::parse(format!("rtcp://{}:19064/", id2.to_host_name()).as_str()).unwrap();
 
         let opts = TunnelProbeOptions::default();
         let s1 = rtcp1.probe_url(&url, &opts).await.unwrap();

@@ -3445,6 +3445,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_chain_http_server_uses_forward_plan_from_process_chain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed_listener.local_addr().unwrap();
+        drop(closed_listener);
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let hit_count = Arc::new(AtomicUsize::new(0));
+        let upstream_hit_count = hit_count.clone();
+        tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let service =
+                hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| {
+                    let upstream_hit_count = upstream_hit_count.clone();
+                    async move {
+                        upstream_hit_count.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(req.uri().path(), "/plan");
+                        let _ = req.collect().await;
+                        Ok::<_, ServerError>(
+                            http::Response::builder()
+                                .status(StatusCode::OK)
+                                .body(
+                                    Full::new(Bytes::from("forward plan success"))
+                                        .map_err(|e| match e {})
+                                        .boxed(),
+                                )
+                                .unwrap(),
+                        )
+                    }
+                });
+
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        forward round_robin --next-upstream "error,timeout" --tries 2 http://{} http://{};
+        "#,
+            closed_addr, upstream_addr
+        );
+
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+
+        let result = ProcessChainHttpServer::builder()
+            .id("test_forward_group_plan")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .server_mgr(Arc::downgrade(&mock_server_mgr))
+            .tunnel_manager(TunnelManager::new())
+            .build()
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "forward group plan server should build: {:?}",
+            result.err()
+        );
+        let http_server = Arc::new(result.unwrap());
+
+        let (client, server) = tokio::io::duplex(128);
+
+        tokio::spawn(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/plan")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from("forward plan success"));
+        assert_eq!(hit_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn test_process_chain_http_server_forward_err() {
         init_logging("test", false);
         let mock_server_mgr = Arc::new(ServerManager::new());

@@ -324,14 +324,13 @@ impl UdpDatagramHandler {
                                 })?;
                                 (target, forward)
                             } else {
-                                let plan =
-                                    ForwardPlan::decode(list[1].as_str()).map_err(|e| {
-                                        stack_err!(
-                                            StackErrorCode::InvalidConfig,
-                                            "invalid forward plan: {}",
-                                            e
-                                        )
-                                    })?;
+                                let plan = ForwardPlan::decode(list[1].as_str()).map_err(|e| {
+                                    stack_err!(
+                                        StackErrorCode::InvalidConfig,
+                                        "invalid forward plan: {}",
+                                        e
+                                    )
+                                })?;
                                 let registry = ForwardFailureRegistry::global();
                                 let group_key = plan.failure_state_key();
                                 let policy = &plan.next_upstream;
@@ -382,12 +381,9 @@ impl UdpDatagramHandler {
                                         Ok(client) => {
                                             match client.send_datagram(&data[..len]).await {
                                                 Ok(_) => {
-                                                    registry.record_success(
-                                                        &group_key,
-                                                        &candidate.url,
-                                                    );
-                                                    chosen =
-                                                        Some((candidate.url.clone(), client));
+                                                    registry
+                                                        .record_success(&group_key, &candidate.url);
+                                                    chosen = Some((candidate.url.clone(), client));
                                                     break;
                                                 }
                                                 Err(e) => {
@@ -412,9 +408,8 @@ impl UdpDatagramHandler {
                                                     );
                                                     last_err = Some(err);
                                                     if !policy.is_enabled()
-                                                        || !policy.allows(
-                                                            NextUpstreamCondition::Error,
-                                                        )
+                                                        || !policy
+                                                            .allows(NextUpstreamCondition::Error)
                                                         || idx + 1 >= max_attempts
                                                     {
                                                         break;

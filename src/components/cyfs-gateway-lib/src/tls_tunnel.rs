@@ -167,8 +167,8 @@ impl TunnelUrlProber for TlsUrlProber {
             .with_no_client_auth();
             config.enable_early_data = true;
             let connector = TlsConnector::from(Arc::new(config));
-            let domain = ServerName::try_from(host.clone())
-                .map_err(|e| format!("server_name: {}", e))?;
+            let domain =
+                ServerName::try_from(host.clone()).map_err(|e| format!("server_name: {}", e))?;
             let _tls = connector
                 .connect(domain, tcp)
                 .await

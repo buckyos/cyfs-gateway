@@ -250,11 +250,15 @@ pub struct IPTunnelBuilder {
 
 impl IPTunnelBuilder {
     pub fn new() -> IPTunnelBuilder {
-        IPTunnelBuilder { enable_prober: true }
+        IPTunnelBuilder {
+            enable_prober: true,
+        }
     }
 
     pub fn new_no_prober() -> IPTunnelBuilder {
-        IPTunnelBuilder { enable_prober: false }
+        IPTunnelBuilder {
+            enable_prober: false,
+        }
     }
 }
 

@@ -20,9 +20,7 @@ use url::Url;
 use super::plan::{BalanceMethod, ForwardPlan};
 use super::selector::apply_least_time_order;
 use crate::tunnel_mgr::TunnelManager;
-use crate::tunnel_url_status::{
-    TunnelProbeOptions, TunnelUrlSortPolicy, normalize_tunnel_url,
-};
+use crate::tunnel_url_status::{TunnelProbeOptions, TunnelUrlSortPolicy, normalize_tunnel_url};
 
 /// Reorder `plan.candidates` to favor candidates with the lowest
 /// observed RTT according to tunnel_mgr URL history.
@@ -119,9 +117,7 @@ mod tests {
     use super::*;
     use crate::forward::ForwardTarget;
     use crate::tunnel_mgr::TunnelManager;
-    use crate::tunnel_url_status::{
-        TunnelUrlState, TunnelUrlStatusSource, reachable_status,
-    };
+    use crate::tunnel_url_status::{TunnelUrlState, TunnelUrlStatusSource, reachable_status};
 
     #[tokio::test]
     async fn no_op_when_not_least_time() {

@@ -142,10 +142,7 @@ pub async fn stream_forward_group(
     // the plan asked for least-time selection. Best-effort: any failure
     // in tunnel_mgr leaves the original order untouched.
     let mut plan_local;
-    let plan: &ForwardPlan = if matches!(
-        plan.balance,
-        crate::forward::BalanceMethod::LeastTime
-    ) {
+    let plan: &ForwardPlan = if matches!(plan.balance, crate::forward::BalanceMethod::LeastTime) {
         plan_local = plan.clone();
         apply_least_time_via_tunnel_mgr(&mut plan_local, tunnel_manager).await;
         &plan_local
@@ -299,12 +296,9 @@ pub async fn stream_forward_group(
         if let Some(info) = info {
             let src_addr = info.src_addr.as_deref();
             let dst_addr = info.dst_addr.as_deref();
-            let _ = proxy_protocol::write_proxy_v2_preamble(
-                &mut forward_stream,
-                src_addr,
-                dst_addr,
-            )
-            .await?;
+            let _ =
+                proxy_protocol::write_proxy_v2_preamble(&mut forward_stream, src_addr, dst_addr)
+                    .await?;
         }
     }
 
@@ -351,10 +345,7 @@ pub async fn datagram_forward_group(
     tunnel_manager: &TunnelManager,
 ) -> StackResult<()> {
     let mut plan_local;
-    let plan: &ForwardPlan = if matches!(
-        plan.balance,
-        crate::forward::BalanceMethod::LeastTime
-    ) {
+    let plan: &ForwardPlan = if matches!(plan.balance, crate::forward::BalanceMethod::LeastTime) {
         plan_local = plan.clone();
         apply_least_time_via_tunnel_mgr(&mut plan_local, tunnel_manager).await;
         &plan_local

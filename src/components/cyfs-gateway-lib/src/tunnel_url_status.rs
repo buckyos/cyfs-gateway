@@ -190,9 +190,7 @@ impl TunnelUrlHistory {
                 self.failure_count = self.failure_count.saturating_add(1);
                 self.last_unreachable = Some(status.clone());
             }
-            TunnelUrlState::Unsupported
-            | TunnelUrlState::Unknown
-            | TunnelUrlState::Probing => {}
+            TunnelUrlState::Unsupported | TunnelUrlState::Unknown | TunnelUrlState::Probing => {}
         }
         self.current = status;
     }
@@ -391,7 +389,11 @@ pub fn normalize_tunnel_url(url: &Url) -> String {
                 .collect();
             // Stable sort by raw key bytes; entries with the same key keep
             // their original input order via the index tiebreaker.
-            parts.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()).then_with(|| a.0.cmp(&b.0)));
+            parts.sort_by(|a, b| {
+                a.1.as_bytes()
+                    .cmp(b.1.as_bytes())
+                    .then_with(|| a.0.cmp(&b.0))
+            });
             let mut buf = String::with_capacity(raw.len() + 1);
             buf.push('?');
             for (i, (_, k, v)) in parts.iter().enumerate() {
@@ -443,9 +445,12 @@ pub fn protocol_category_for_scheme(scheme: &str) -> Option<ProtocolCategory> {
 }
 
 /// Build a fresh status for an `Unknown` (no probe attempted) state.
-pub fn unknown_status(url: &Url, normalized: &str, now_ms: u64, source: TunnelUrlStatusSource)
-    -> TunnelUrlStatus
-{
+pub fn unknown_status(
+    url: &Url,
+    normalized: &str,
+    now_ms: u64,
+    source: TunnelUrlStatusSource,
+) -> TunnelUrlStatus {
     TunnelUrlStatus {
         url: mask_tunnel_url(url),
         normalized_url: normalized.to_string(),
@@ -565,8 +570,7 @@ pub fn sort_urls(
     // Build a stable scheme → first-appearance-index map. Comparing two
     // entries by their scheme group (rather than scheme name) keeps the
     // output deterministic and tied to caller-supplied input order.
-    let mut scheme_first: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
+    let mut scheme_first: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for (i, s) in statuses.iter().enumerate() {
         scheme_first.entry(s.scheme.as_str()).or_insert(i);
     }
@@ -769,10 +773,8 @@ mod tests {
             .into_iter()
             .map(|s| (s.normalized_url.clone(), s))
             .collect();
-        let permuted: Vec<TunnelUrlStatus> = order1
-            .iter()
-            .map(|u| by_url.remove(u).unwrap())
-            .collect();
+        let permuted: Vec<TunnelUrlStatus> =
+            order1.iter().map(|u| by_url.remove(u).unwrap()).collect();
         let order2 = sort_urls(&permuted, TunnelUrlSortPolicy::RttAscending, None, true);
         assert_eq!(order1, order2);
     }
@@ -832,9 +834,18 @@ mod tests {
     #[test]
     fn ttl_for_state() {
         let cfg = TunnelStatusStoreConfig::default();
-        assert_eq!(cfg.ttl_for(TunnelUrlState::Reachable), DEFAULT_REACHABLE_TTL_MS);
-        assert_eq!(cfg.ttl_for(TunnelUrlState::Unreachable), DEFAULT_UNREACHABLE_TTL_MS);
+        assert_eq!(
+            cfg.ttl_for(TunnelUrlState::Reachable),
+            DEFAULT_REACHABLE_TTL_MS
+        );
+        assert_eq!(
+            cfg.ttl_for(TunnelUrlState::Unreachable),
+            DEFAULT_UNREACHABLE_TTL_MS
+        );
         assert_eq!(cfg.ttl_for(TunnelUrlState::Unknown), DEFAULT_UNKNOWN_TTL_MS);
-        assert_eq!(cfg.ttl_for(TunnelUrlState::Unsupported), DEFAULT_UNSUPPORTED_TTL_MS);
+        assert_eq!(
+            cfg.ttl_for(TunnelUrlState::Unsupported),
+            DEFAULT_UNSUPPORTED_TTL_MS
+        );
     }
 }

@@ -147,10 +147,7 @@ fn group_by_server_id(targets: &mut Vec<ForwardTarget>) {
     }
 }
 
-fn pick_weighted_round_robin(
-    targets: &[ForwardTarget],
-    rr_counter: &AtomicUsize,
-) -> Option<usize> {
+fn pick_weighted_round_robin(targets: &[ForwardTarget], rr_counter: &AtomicUsize) -> Option<usize> {
     if targets.is_empty() {
         return None;
     }
@@ -418,10 +415,7 @@ mod tests {
         plan.balance = BalanceMethod::LeastTime;
         apply_least_time_order(
             &mut plan,
-            &[
-                "rtcp://fast/".to_string(),
-                "rtcp://slow/".to_string(),
-            ],
+            &["rtcp://fast/".to_string(), "rtcp://slow/".to_string()],
         );
         let reg = ForwardFailureRegistry::new();
         let selector = ForwardSelector::new();

@@ -599,8 +599,7 @@ impl RTcpTunnelPackage {
                     return Ok(RTcpTunnelPackage::HelloAck(result_package));
                 }
                 CmdType::HelloAckConfirm => {
-                    let result_package =
-                        RTcpHelloAckConfirmPackage::from_json(seq, package_value)?;
+                    let result_package = RTcpHelloAckConfirmPackage::from_json(seq, package_value)?;
                     return Ok(RTcpTunnelPackage::HelloAckConfirm(result_package));
                 }
                 CmdType::Ping => {

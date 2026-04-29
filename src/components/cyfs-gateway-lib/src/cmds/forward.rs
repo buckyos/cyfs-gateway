@@ -686,9 +686,7 @@ Examples:
         };
 
         let servers = match server_map {
-            Some(map) => {
-                Self::build_servers_from_map(&map, max_fails, fail_timeout).await?
-            }
+            Some(map) => Self::build_servers_from_map(&map, max_fails, fail_timeout).await?,
             None => Vec::new(),
         };
 
@@ -708,18 +706,18 @@ Examples:
             fail_timeout,
         ));
         if let Some(map) = primary_map {
-            candidates.extend(
-                Self::build_targets_from_map(&map, false, max_fails, fail_timeout).await?,
-            );
+            candidates
+                .extend(Self::build_targets_from_map(&map, false, max_fails, fail_timeout).await?);
         }
         if let Some(map) = backup_map {
-            candidates.extend(
-                Self::build_targets_from_map(&map, true, max_fails, fail_timeout).await?,
-            );
+            candidates
+                .extend(Self::build_targets_from_map(&map, true, max_fails, fail_timeout).await?);
         }
 
         if candidates.is_empty() {
-            return Err("forward requires at least one upstream, --map or --server-map".to_string());
+            return Err(
+                "forward requires at least one upstream, --map or --server-map".to_string(),
+            );
         }
 
         // Resolve the balance method. For hash variants the executor
@@ -728,16 +726,13 @@ Examples:
         let balance = match algo {
             "hash" => {
                 let key = Self::parse_optional_str(matches, "hash_key")
-                    .ok_or_else(|| {
-                        "hash balance method requires --hash-key".to_string()
-                    })?;
+                    .ok_or_else(|| "hash balance method requires --hash-key".to_string())?;
                 BalanceMethod::Hash { key }
             }
             "consistent_hash" => {
-                let key = Self::parse_optional_str(matches, "hash_key")
-                    .ok_or_else(|| {
-                        "consistent_hash balance method requires --hash-key".to_string()
-                    })?;
+                let key = Self::parse_optional_str(matches, "hash_key").ok_or_else(|| {
+                    "consistent_hash balance method requires --hash-key".to_string()
+                })?;
                 BalanceMethod::ConsistentHash { key }
             }
             _ => BalanceMethod::parse(algo)?,

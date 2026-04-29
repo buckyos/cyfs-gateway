@@ -18,10 +18,14 @@ pub enum BalanceMethod {
     IpHash,
     /// `hash $key`. Uses the literal string `key` to pick a candidate by
     /// weighted modulo. The key value is captured at process-chain time.
-    Hash { key: String },
+    Hash {
+        key: String,
+    },
     /// `consistent_hash $key`. Like `Hash`, but tolerates candidate set
     /// changes by mapping into a hashed ring.
-    ConsistentHash { key: String },
+    ConsistentHash {
+        key: String,
+    },
     /// Pick the candidate with the lowest observed RTT according to the
     /// `tunnel_mgr` URL history (§4.1, §6.7). Selection happens at the
     /// executor when it has access to a `TunnelManager`.
@@ -118,7 +122,10 @@ impl NextUpstreamCondition {
 
     /// True if this condition triggers retry on a connect-stage failure.
     pub fn is_connect_failure(&self) -> bool {
-        matches!(self, NextUpstreamCondition::Error | NextUpstreamCondition::Timeout)
+        matches!(
+            self,
+            NextUpstreamCondition::Error | NextUpstreamCondition::Timeout
+        )
     }
 
     /// True if this condition triggers retry on an HTTP response
@@ -390,16 +397,14 @@ impl ForwardPlan {
     }
 
     pub fn is_single_url(&self) -> bool {
-        self.candidates.len() == 1
-            && !self.next_upstream.is_enabled()
-            && !self.candidates[0].backup
+        self.candidates.len() == 1 && !self.next_upstream.is_enabled() && !self.candidates[0].backup
     }
 
     /// Encode to a single token suitable for embedding in a chain return string.
     /// Format: base64(JSON). The receiver uses `decode` to recover the plan.
     pub fn encode(&self) -> Result<String, String> {
-        let json = serde_json::to_string(self)
-            .map_err(|e| format!("encode forward plan: {}", e))?;
+        let json =
+            serde_json::to_string(self).map_err(|e| format!("encode forward plan: {}", e))?;
         Ok(base64::engine::general_purpose::STANDARD_NO_PAD.encode(json.as_bytes()))
     }
 
@@ -634,9 +639,15 @@ mod tests {
     #[test]
     fn parse_duration_basic() {
         assert_eq!(parse_duration_str("10s").unwrap(), Duration::from_secs(10));
-        assert_eq!(parse_duration_str("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(
+            parse_duration_str("500ms").unwrap(),
+            Duration::from_millis(500)
+        );
         assert_eq!(parse_duration_str("2m").unwrap(), Duration::from_secs(120));
-        assert_eq!(parse_duration_str("250").unwrap(), Duration::from_millis(250));
+        assert_eq!(
+            parse_duration_str("250").unwrap(),
+            Duration::from_millis(250)
+        );
         assert!(parse_duration_str("-1s").is_err());
         assert!(parse_duration_str("abc").is_err());
     }

@@ -52,8 +52,7 @@ pub fn get_protocol_category(str_protocol: &str) -> TunnelResult<ProtocolCategor
 // `Shared` allows multiple awaiters of the same probe future. The single
 // task that polls it first does the network work and holds the semaphore
 // permit; subsequent awaiters just receive the cloned `TunnelUrlStatus`.
-type SharedProbeFuture =
-    futures::future::Shared<BoxFuture<'static, TunnelUrlStatus>>;
+type SharedProbeFuture = futures::future::Shared<BoxFuture<'static, TunnelUrlStatus>>;
 
 #[derive(Clone)]
 pub struct TunnelManager {
@@ -141,21 +140,26 @@ impl TunnelManager {
         }
     }
 
-    async fn flush_loop(weak: Weak<TunnelManagerInner>, path: PathBuf, interval: std::time::Duration) {
+    async fn flush_loop(
+        weak: Weak<TunnelManagerInner>,
+        path: PathBuf,
+        interval: std::time::Duration,
+    ) {
         loop {
             tokio::time::sleep(interval).await;
             let inner = match weak.upgrade() {
                 Some(i) => i,
                 None => return,
             };
-            let entries: Vec<TunnelUrlHistory> =
-                inner.tunnel_history.read().await.values().cloned().collect();
+            let entries: Vec<TunnelUrlHistory> = inner
+                .tunnel_history
+                .read()
+                .await
+                .values()
+                .cloned()
+                .collect();
             if let Err(e) = write_history_to_disk(&path, &entries).await {
-                warn!(
-                    "tunnel_mgr: flush to {} failed: {}",
-                    path.display(),
-                    e
-                );
+                warn!("tunnel_mgr: flush to {} failed: {}", path.display(), e);
             } else {
                 debug!(
                     "tunnel_mgr: flushed {} url history entries to {}",
@@ -311,12 +315,8 @@ impl TunnelManager {
             Ok(t) => t,
             Err(e) => {
                 let detail = format!("create_tunnel failed: {}", e);
-                self.record_business_failure(
-                    url,
-                    classify_create_tunnel_error(&e),
-                    Some(&detail),
-                )
-                .await;
+                self.record_business_failure(url, classify_create_tunnel_error(&e), Some(&detail))
+                    .await;
                 error!("Create tunnel for {} failed: {}", url, e);
                 return Err(e);
             }
@@ -325,17 +325,14 @@ impl TunnelManager {
         debug!("Open stream by url.path: {}", path);
         match tunnel.open_stream(path).await {
             Ok(stream) => {
-                self.record_business_success(url, Some(started.elapsed())).await;
+                self.record_business_success(url, Some(started.elapsed()))
+                    .await;
                 Ok(stream)
             }
             Err(e) => {
                 let detail = format!("open_stream failed: {}", e);
-                self.record_business_failure(
-                    url,
-                    TunnelFailureReason::TunnelOpen,
-                    Some(&detail),
-                )
-                .await;
+                self.record_business_failure(url, TunnelFailureReason::TunnelOpen, Some(&detail))
+                    .await;
                 error!("Open stream by url {} failed: {}", url, e);
                 Err(TunnelError::ConnectError(format!(
                     "Open stream by url failed: {}",
@@ -374,29 +371,22 @@ impl TunnelManager {
             Ok(t) => t,
             Err(e) => {
                 let detail = format!("create_tunnel failed: {}", e);
-                self.record_business_failure(
-                    url,
-                    classify_create_tunnel_error(&e),
-                    Some(&detail),
-                )
-                .await;
+                self.record_business_failure(url, classify_create_tunnel_error(&e), Some(&detail))
+                    .await;
                 error!("Create tunnel for {} failed: {}", url, e);
                 return Err(e);
             }
         };
         match tunnel.create_datagram_client(url.path()).await {
             Ok(client) => {
-                self.record_business_success(url, Some(started.elapsed())).await;
+                self.record_business_success(url, Some(started.elapsed()))
+                    .await;
                 Ok(client)
             }
             Err(e) => {
                 let detail = format!("create_datagram_client failed: {}", e);
-                self.record_business_failure(
-                    url,
-                    TunnelFailureReason::TunnelOpen,
-                    Some(&detail),
-                )
-                .await;
+                self.record_business_failure(url, TunnelFailureReason::TunnelOpen, Some(&detail))
+                    .await;
                 error!("Create datagram client by url failed: {}", e);
                 Err(TunnelError::ConnectError(format!(
                     "Create datagram client by url failed: {}",
@@ -427,8 +417,9 @@ impl TunnelManager {
 
         // 1. Try fresh history (unless force_probe).
         if !options.force_probe {
-            if let Some(status) =
-                self.history_status_if_fresh(&normalized, &options, now_ms).await
+            if let Some(status) = self
+                .history_status_if_fresh(&normalized, &options, now_ms)
+                .await
             {
                 return Ok(status);
             }
@@ -438,7 +429,9 @@ impl TunnelManager {
         let in_flight = self.maybe_get_in_flight(&normalized).await;
         if let Some(fut) = in_flight {
             let timeout_ms = options.timeout_ms_or_default();
-            return Ok(self.await_in_flight(fut, &normalized, url, now_ms, timeout_ms).await);
+            return Ok(self
+                .await_in_flight(fut, &normalized, url, now_ms, timeout_ms)
+                .await);
         }
 
         // 3. Start a fresh probe.
@@ -594,7 +587,8 @@ impl TunnelManager {
                     &normalized,
                     now,
                     source,
-                    reason.clone()
+                    reason
+                        .clone()
                         .unwrap_or_else(|| "tunnel_level_failure".to_string()),
                 )
             };
@@ -615,11 +609,7 @@ impl TunnelManager {
     /// by the caller and passed in. Pass `None` only when the attempt
     /// reused an already-established tunnel (so the timing wouldn't
     /// reflect a fresh connect and would pollute RTT history).
-    pub async fn record_business_success(
-        &self,
-        url: &Url,
-        rtt: Option<std::time::Duration>,
-    ) {
+    pub async fn record_business_success(&self, url: &Url, rtt: Option<std::time::Duration>) {
         let normalized = normalize_tunnel_url(url);
         let now = now_ms();
         let status = reachable_status(
@@ -710,12 +700,8 @@ impl TunnelManager {
                     s.cached = true;
                     s
                 } else {
-                    let mut s = unknown_status(
-                        url,
-                        normalized,
-                        now_ms,
-                        TunnelUrlStatusSource::CachedProbe,
-                    );
+                    let mut s =
+                        unknown_status(url, normalized, now_ms, TunnelUrlStatusSource::CachedProbe);
                     s.state = TunnelUrlState::Probing;
                     s
                 }
@@ -843,10 +829,7 @@ impl TunnelManager {
         map.remove(normalized);
     }
 
-    fn merge_into_history(
-        hist: &mut HashMap<String, TunnelUrlHistory>,
-        status: TunnelUrlStatus,
-    ) {
+    fn merge_into_history(hist: &mut HashMap<String, TunnelUrlHistory>, status: TunnelUrlStatus) {
         let key = status.normalized_url.clone();
         if let Some(entry) = hist.get_mut(&key) {
             entry.merge(status);
@@ -931,12 +914,15 @@ pub(crate) fn classify_create_tunnel_error(err: &TunnelError) -> TunnelFailureRe
         TunnelFailureReason::ConnectTimeout
     } else if msg.contains("refused") {
         TunnelFailureReason::ConnectRefused
-    } else if msg.contains("dns") || msg.contains("name resolution")
+    } else if msg.contains("dns")
+        || msg.contains("name resolution")
         || msg.contains("name or service not known")
     {
         TunnelFailureReason::PreConnectDns
-    } else if msg.contains("no route") || msg.contains("network unreachable")
-        || msg.contains("host unreachable") || msg.contains("not found")
+    } else if msg.contains("no route")
+        || msg.contains("network unreachable")
+        || msg.contains("host unreachable")
+        || msg.contains("not found")
     {
         TunnelFailureReason::PreConnectRoute
     } else {
@@ -949,10 +935,7 @@ pub(crate) fn classify_create_tunnel_error(err: &TunnelError) -> TunnelFailureRe
 /// stolen snapshot does not leak credentials. The redaction also rewrites
 /// the lookup key, so credential-bearing entries collapse together on
 /// reload — accepted trade-off per §11.
-async fn write_history_to_disk(
-    path: &Path,
-    entries: &[TunnelUrlHistory],
-) -> std::io::Result<()> {
+async fn write_history_to_disk(path: &Path, entries: &[TunnelUrlHistory]) -> std::io::Result<()> {
     let mut sanitized: Vec<TunnelUrlHistory> = entries
         .iter()
         .map(|h| {
@@ -1210,10 +1193,7 @@ mod tests {
             delay_ms: 0,
             call_count: calls.clone(),
         });
-        mgr.register_tunnel_builder(
-            "tcp",
-            Arc::new(ProberBuilder { prober }),
-        );
+        mgr.register_tunnel_builder("tcp", Arc::new(ProberBuilder { prober }));
 
         let u = url("tcp://127.0.0.1:18001/");
         let s1 = mgr
@@ -1244,10 +1224,7 @@ mod tests {
             delay_ms: 0,
             call_count: calls.clone(),
         });
-        mgr.register_tunnel_builder(
-            "tcp",
-            Arc::new(ProberBuilder { prober }),
-        );
+        mgr.register_tunnel_builder("tcp", Arc::new(ProberBuilder { prober }));
 
         let u = url("tcp://127.0.0.1:18002/");
         let _ = mgr
@@ -1273,10 +1250,7 @@ mod tests {
             delay_ms: 0,
             call_count: calls.clone(),
         });
-        mgr.register_tunnel_builder(
-            "tcp",
-            Arc::new(ProberBuilder { prober }),
-        );
+        mgr.register_tunnel_builder("tcp", Arc::new(ProberBuilder { prober }));
 
         let u = url("tcp://127.0.0.1:18003/");
         let _ = mgr
@@ -1302,10 +1276,7 @@ mod tests {
             delay_ms: 0,
             call_count: calls.clone(),
         });
-        mgr.register_tunnel_builder(
-            "tcp",
-            Arc::new(ProberBuilder { prober: tcp_prober }),
-        );
+        mgr.register_tunnel_builder("tcp", Arc::new(ProberBuilder { prober: tcp_prober }));
 
         let urls = vec![
             url("tcp://127.0.0.1:18010/"),
@@ -1316,10 +1287,7 @@ mod tests {
             sort: TunnelUrlSortPolicy::ReachableFirst,
             ..Default::default()
         };
-        let res = mgr
-            .query_tunnel_url_statuses(&urls, opts)
-            .await
-            .unwrap();
+        let res = mgr.query_tunnel_url_statuses(&urls, opts).await.unwrap();
         assert_eq!(res.statuses.len(), 3);
         // udp is unsupported, must sink to last
         assert_eq!(
@@ -1339,10 +1307,7 @@ mod tests {
             delay_ms: 100,
             call_count: calls.clone(),
         });
-        mgr.register_tunnel_builder(
-            "tcp",
-            Arc::new(ProberBuilder { prober }),
-        );
+        mgr.register_tunnel_builder("tcp", Arc::new(ProberBuilder { prober }));
 
         let u = url("tcp://127.0.0.1:18020/");
         let mgr1 = mgr.clone();
@@ -1350,12 +1315,14 @@ mod tests {
         let u1 = u.clone();
         let u2 = u.clone();
         let h1 = tokio::spawn(async move {
-            mgr1.query_tunnel_url_status(&u1, TunnelProbeOptions::default()).await
+            mgr1.query_tunnel_url_status(&u1, TunnelProbeOptions::default())
+                .await
         });
         // small delay to ensure h1 starts the probe first
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let h2 = tokio::spawn(async move {
-            mgr2.query_tunnel_url_status(&u2, TunnelProbeOptions::default()).await
+            mgr2.query_tunnel_url_status(&u2, TunnelProbeOptions::default())
+                .await
         });
         let r1 = h1.await.unwrap().unwrap();
         let r2 = h2.await.unwrap().unwrap();
@@ -1379,10 +1346,7 @@ mod tests {
             delay_ms: 0,
             call_count: calls.clone(),
         });
-        mgr.register_tunnel_builder(
-            "tcp",
-            Arc::new(ProberBuilder { prober }),
-        );
+        mgr.register_tunnel_builder("tcp", Arc::new(ProberBuilder { prober }));
 
         let pin_url = url("tcp://127.0.0.1:18030/");
         mgr.pin_tunnel_url(&pin_url).await;
@@ -1433,10 +1397,8 @@ mod tests {
         // Configure persistence with a temp path. Record a status,
         // flush, and prove a fresh manager pointed at the same file
         // recovers the entry (marked `cached`).
-        let tmp = std::env::temp_dir().join(format!(
-            "tunnel_url_history_{}.json",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("tunnel_url_history_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let mut cfg = TunnelStatusStoreConfig::default();
         cfg.enable_persist = true;

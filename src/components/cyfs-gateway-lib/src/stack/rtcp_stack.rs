@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
 use url::Url;
 
+use crate::forward::ForwardPlan;
 use crate::global_process_chains::{
     GlobalProcessChainsRef, create_process_chain_executor, execute_chain,
 };
 use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
-use crate::forward::ForwardPlan;
 use crate::stack::{
     datagram_forward, datagram_forward_group, get_limit_info, get_source_addr_from_req_env,
     probe_proxy_protocol_stream, stream_forward, stream_forward_group,
@@ -1019,9 +1019,7 @@ struct RtcpTunnelBuilder {
 
 impl RtcpTunnelBuilder {
     pub fn new(rtcp: Arc<RTcp>) -> Self {
-        let prober = Arc::new(RtcpUrlProber {
-            rtcp: rtcp.clone(),
-        });
+        let prober = Arc::new(RtcpUrlProber { rtcp: rtcp.clone() });
         RtcpTunnelBuilder { rtcp, prober }
     }
 }

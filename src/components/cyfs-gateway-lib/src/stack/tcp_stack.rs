@@ -272,14 +272,13 @@ impl TcpConnectionHandler {
                                     "invalid forward-group command"
                                 ));
                             }
-                            let plan =
-                                ForwardPlan::decode(list[1].as_str()).map_err(|e| {
-                                    stack_err!(
-                                        StackErrorCode::InvalidConfig,
-                                        "invalid forward plan: {}",
-                                        e
-                                    )
-                                })?;
+                            let plan = ForwardPlan::decode(list[1].as_str()).map_err(|e| {
+                                stack_err!(
+                                    StackErrorCode::InvalidConfig,
+                                    "invalid forward plan: {}",
+                                    e
+                                )
+                            })?;
                             let stream = if limiter.is_some() {
                                 let (read_limit, write_limit) =
                                     limiter.as_ref().unwrap().new_limit_session();
