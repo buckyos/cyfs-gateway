@@ -1,16 +1,68 @@
-use crate::ExternalCmd;
-use crate::gateway_control_server::{ControlErrorCode, ControlResult, LoginReq};
+use crate::{TunnelProbeOptions, TunnelUrlSortPolicy};
 use chrono::Utc;
-use cyfs_gateway_lib::{TunnelProbeOptions, TunnelUrlSortPolicy};
-use log::*;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 pub use sfo_result::err as cmd_err;
 pub use sfo_result::into_err as into_cmd_err;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Mutex;
-//TODO： CmdClient / CmdServer 的名字太通用了，叫gateway_control_panel_client / gateway_control_panel 更好一些？
+
 pub const CONTROL_SERVER: &str = "http://127.0.0.1:13451";
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ControlErrorCode {
+    Failed,
+    RpcError,
+    InvalidData,
+    NoGateway,
+    UnknownCmd,
+    Expired,
+    InvalidUserName,
+    InvalidPassword,
+    InvalidToken,
+    CreateTokenFailed,
+    NotSupportLogin,
+    ReadFileFailed,
+    RunJsFailed,
+    InvalidConfigType,
+    ConfigNotFound,
+    InvalidParams,
+    SerializeFailed,
+    InvalidMethod,
+}
+
+pub type ControlResult<T> = sfo_result::Result<T, ControlErrorCode>;
+pub type ControlError = sfo_result::Error<ControlErrorCode>;
+
+#[derive(Deserialize, Serialize)]
+pub struct LoginReq {
+    pub user_name: String,
+    pub password: String,
+    pub timestamp: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ExternalCmd {
+    pub name: String,
+    pub description: String,
+}
+
+#[async_trait::async_trait]
+pub trait GatewayControlCmdHandler: Send + Sync + 'static {
+    async fn handle(&self, method: &str, params: Value) -> ControlResult<Value>;
+}
+
+#[async_trait::async_trait]
+pub trait CyfsTokenFactory: Send + Sync + 'static {
+    async fn create(&self, use_name: &str, password: &str, timestamp: u64)
+    -> ControlResult<String>;
+}
+
+#[async_trait::async_trait]
+pub trait CyfsTokenVerifier: Send + Sync + 'static {
+    async fn verify_and_renew(&self, token: &str) -> ControlResult<Option<String>>;
+}
 
 pub struct GatewayControlClient {
     url: String,

@@ -1,8 +1,9 @@
 use crate::config_loader::ServerConfigParser;
-use crate::gateway_control_client::cmd_err;
 use bytes::Bytes;
 use cyfs_gateway_lib::{
-    ConfigErrorCode, ConfigResult, Server, ServerConfig, ServerError, StreamInfo, config_err,
+    ConfigErrorCode, ConfigResult, ControlErrorCode, ControlResult, CyfsTokenFactory,
+    CyfsTokenVerifier, GatewayControlCmdHandler, LoginReq, Server, ServerConfig, ServerError,
+    StreamInfo, cmd_err, config_err,
 };
 use cyfs_gateway_lib::{HttpServer, ServerContext, ServerContextRef, ServerFactory};
 use cyfs_gateway_lib::{ServerErrorCode, ServerResult, server_err};
@@ -12,30 +13,6 @@ use log::*;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Number, Value};
 use std::sync::{Arc, Weak};
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum ControlErrorCode {
-    Failed,
-    RpcError,
-    InvalidData,
-    NoGateway,
-    UnknownCmd,
-    Expired,
-    InvalidUserName,
-    InvalidPassword,
-    InvalidToken,
-    CreateTokenFailed,
-    NotSupportLogin,
-    ReadFileFailed,
-    RunJsFailed,
-    InvalidConfigType,
-    ConfigNotFound,
-    InvalidParams,
-    SerializeFailed,
-    InvalidMethod,
-}
-pub type ControlResult<T> = sfo_result::Result<T, ControlErrorCode>;
-pub type ControlError = sfo_result::Error<ControlErrorCode>;
 
 pub const GATEWAY_CONTROL_SERVER_CONFIG: &str = include_str!("gateway_control_server.yaml");
 pub const GATEWAY_CONTROL_SERVER_KEY: &str = "__control_server__";
@@ -159,22 +136,6 @@ impl<D: for<'de> Deserializer<'de>> ServerConfigParser<D> for GatewayControlServ
     }
 }
 
-#[async_trait::async_trait]
-pub trait GatewayControlCmdHandler: Send + Sync + 'static {
-    async fn handle(&self, method: &str, params: Value) -> ControlResult<Value>;
-}
-
-#[async_trait::async_trait]
-pub trait CyfsTokenFactory: Send + Sync + 'static {
-    async fn create(&self, use_name: &str, password: &str, timestamp: u64)
-    -> ControlResult<String>;
-}
-
-#[async_trait::async_trait]
-pub trait CyfsTokenVerifier: Send + Sync + 'static {
-    async fn verify_and_renew(&self, token: &str) -> ControlResult<Option<String>>;
-}
-
 pub struct GatewayControlServer {
     config: GatewayControlServerConfig,
     handler: Weak<dyn GatewayControlCmdHandler>,
@@ -196,13 +157,6 @@ impl GatewayControlServer {
             token_verifier,
         }
     }
-}
-
-#[derive(Deserialize, Serialize)]
-pub struct LoginReq {
-    pub user_name: String,
-    pub password: String,
-    pub timestamp: u64,
 }
 
 #[derive(Deserialize)]

@@ -6,7 +6,6 @@ mod config_loader;
 mod config_merger;
 mod debug;
 mod gateway;
-mod gateway_control_client;
 mod gateway_control_server;
 mod process_chain_doc;
 mod socks;
@@ -16,8 +15,12 @@ use acme_sn_provider::*;
 pub use config_loader::*;
 pub use config_merger::*;
 pub use gateway::*;
-pub use gateway_control_client::*;
 pub use gateway_control_server::*;
+pub use cyfs_gateway_lib::{
+    CONTROL_SERVER, ControlError, ControlErrorCode, ControlResult, CyfsTokenFactory,
+    CyfsTokenVerifier, ExternalCmd, GatewayControlClient, GatewayControlCmdHandler, LoginReq,
+    cmd_err, into_cmd_err,
+};
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};

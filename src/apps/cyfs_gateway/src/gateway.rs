@@ -8,10 +8,6 @@ use std::time::Instant;
 
 use crate::acme_sn_provider::AcmeSnProviderFactory;
 use crate::config_loader::GatewayConfigParserRef;
-use crate::gateway_control_client::{cmd_err, into_cmd_err};
-use crate::gateway_control_server::{
-    ControlErrorCode, ControlResult, CyfsTokenFactory, CyfsTokenVerifier, GatewayControlCmdHandler,
-};
 use crate::gateway_control_server::{
     GATEWAY_CONTROL_SERVER_CONFIG, GATEWAY_CONTROL_SERVER_KEY, GatewayControlServerConfigParser,
     GatewayControlServerContext,
@@ -2972,12 +2968,6 @@ impl Gateway {
         *self.limiter_manager.lock().unwrap() = limiter_manager;
         Ok(())
     }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ExternalCmd {
-    pub name: String,
-    pub description: String,
 }
 
 #[derive(Deserialize)]
