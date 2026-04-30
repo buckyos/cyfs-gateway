@@ -3163,6 +3163,60 @@ struct DeviceConnInfo {
     current_session_online_seconds: u64,
 }
 
+#[derive(Deserialize)]
+struct QueryTunnelUrlStatusesParams {
+    urls: Vec<String>,
+    force_probe: Option<bool>,
+    max_age_ms: Option<u64>,
+    timeout_ms: Option<u64>,
+    sort: Option<String>,
+    include_unsupported: Option<bool>,
+    caller_priorities: Option<Vec<u32>>,
+}
+
+impl QueryTunnelUrlStatusesParams {
+    fn into_probe_options(self) -> ControlResult<(Vec<Url>, TunnelProbeOptions)> {
+        let urls = self
+            .urls
+            .iter()
+            .map(|url| {
+                Url::parse(url).map_err(|e| {
+                    cmd_err!(
+                        ControlErrorCode::InvalidParams,
+                        "invalid tunnel url {}: {}",
+                        url,
+                        e
+                    )
+                })
+            })
+            .collect::<ControlResult<Vec<_>>>()?;
+        let sort = match self.sort.as_deref().unwrap_or("none") {
+            "none" => TunnelUrlSortPolicy::None,
+            "reachable_first" => TunnelUrlSortPolicy::ReachableFirst,
+            "rtt_ascending" => TunnelUrlSortPolicy::RttAscending,
+            "caller_priority_then_rtt" => TunnelUrlSortPolicy::CallerPriorityThenRtt,
+            sort => {
+                return Err(cmd_err!(
+                    ControlErrorCode::InvalidParams,
+                    "invalid tunnel url status sort policy: {}",
+                    sort
+                ));
+            }
+        };
+
+        let options = TunnelProbeOptions {
+            force_probe: self.force_probe.unwrap_or(false),
+            max_age_ms: self.max_age_ms,
+            timeout_ms: self.timeout_ms,
+            sort,
+            include_unsupported: self.include_unsupported.unwrap_or(true),
+            caller_priorities: self.caller_priorities,
+        };
+
+        Ok((urls, options))
+    }
+}
+
 #[async_trait::async_trait]
 impl GatewayControlCmdHandler for GatewayCmdHandler {
     async fn handle(&self, method: &str, params: Value) -> ControlResult<Value> {
@@ -3556,6 +3610,20 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 device_infos.sort_by(|a, b| a.ip.cmp(&b.ip));
                 Ok(serde_json::to_value(device_infos)
                     .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
+            }
+            "query_tunnel_url_statuses" | "tunnels_probe" | "/tunnels/probe" => {
+                let params = serde_json::from_value::<QueryTunnelUrlStatusesParams>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                let (urls, options) = params.into_probe_options()?;
+                let result = gateway
+                    .tunnel_manager()
+                    .query_tunnel_url_statuses(&urls, options)
+                    .await
+                    .map_err(|e| cmd_err!(ControlErrorCode::Failed, "{}", e))?;
+                Ok(json!({
+                    "statuses": result.statuses,
+                    "sorted_urls": result.sorted_urls,
+                }))
             }
             "add_rule" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)

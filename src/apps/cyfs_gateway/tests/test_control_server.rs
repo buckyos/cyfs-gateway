@@ -196,5 +196,36 @@ mod tests {
         let ret = cmd_client.get_config_by_id(None).await;
         ret.as_ref().unwrap();
         assert!(ret.is_ok());
+
+        let urls = vec![
+            "udp://127.0.0.1:9/".to_string(),
+            "unknown://127.0.0.1:9/".to_string(),
+        ];
+        let ret = cmd_client
+            .query_tunnel_url_statuses(
+                &urls,
+                TunnelProbeOptions {
+                    sort: TunnelUrlSortPolicy::ReachableFirst,
+                    include_unsupported: false,
+                    ..Default::default()
+                },
+            )
+            .await;
+        ret.as_ref().unwrap();
+        let tunnel_statuses = ret.unwrap();
+        assert_eq!(
+            tunnel_statuses
+                .get("statuses")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            tunnel_statuses
+                .get("sorted_urls")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
     }
 }

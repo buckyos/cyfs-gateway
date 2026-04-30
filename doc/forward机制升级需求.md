@@ -1,5 +1,20 @@
 # CYFS Gateway forward 机制升级需求
 
+> **实现状态（2026-04-29）：本需求已完成落地。**
+>
+> 主要实现位置：
+>
+> - 数据模型（`ForwardPlan` / `ForwardTarget` / `NextUpstreamPolicy` / `BalanceMethod` / `ForwardServer` / `ProviderPolicy`）：[plan.rs](src/components/cyfs-gateway-lib/src/forward/plan.rs)
+> - selector（primary/backup 排序、fail_timeout 跳过、provider 邻接、least_time 重排）：[selector.rs](src/components/cyfs-gateway-lib/src/forward/selector.rs)
+> - group 内失败状态（§6.6，进程内、不落盘）：[failure_state.rs](src/components/cyfs-gateway-lib/src/forward/failure_state.rs)
+> - least_time / RTT 排序（消费 tunnel_mgr 历史，§4.1 / §8 阶段 4）：[least_time.rs](src/components/cyfs-gateway-lib/src/forward/least_time.rs)
+> - process-chain `forward` 命令（兼容单 URL 与 group 形态，支持 `--map` / `--backup-map` / `--server-map` / `--next-upstream` / `--tries` / `--next-upstream-timeout` / `--max-fails` / `--fail-timeout` / `--hash-key` / `--max-body-buffer` / `--provider-retry-scope` 等）：[cmds/forward.rs](src/components/cyfs-gateway-lib/src/cmds/forward.rs)
+> - stream / datagram 执行层连接阶段 next_upstream（§6.4 / §6.5）：[stack/mod.rs](src/components/cyfs-gateway-lib/src/stack/mod.rs)
+> - HTTP 入口连接阶段 retry 与受限的状态码 retry + 请求体缓冲（§6.3 / 阶段 3）：[server/http_server.rs](src/components/cyfs-gateway-lib/src/server/http_server.rs)
+> - tunnel_mgr URL history 业务回写（§6.7：`open_stream_by_url` / datagram client 创建时调用 `record_business_success` / `record_business_failure`，并按 §6.7.3 分类失败原因）：[tunnel_mgr.rs](src/components/cyfs-gateway-lib/src/tunnel_mgr.rs)
+>
+> 后续章节保留为最初的需求与设计说明；与实现存在偏差的细节（例如最终命令参数名）在对应节点处标注或以代码为准。
+
 ## 1. 背景
 
 当前 `forward` 命令已经支持多个 upstream URL、权重、`round_robin` 和 `ip_hash`，但执行语义仍是：
@@ -552,42 +567,30 @@ build ordered candidate list -> executor applies next_upstream policy
 
 ## 8. 分阶段落地
 
-### 阶段 1：数据模型和单 URL 兼容
+### 阶段 1：数据模型和单 URL 兼容 — 已完成
 
-- 定义 `ForwardPlan`、`ForwardTarget`、`NextUpstreamPolicy`。
-- 保留并测试 `forward <url>`。
-- group forward 先能解析 primary / backup / weight / max_fails / fail_timeout。
-- selector 能根据失败历史避开 candidate。
+- 定义 `ForwardPlan`、`ForwardTarget`、`NextUpstreamPolicy`，见 [plan.rs](src/components/cyfs-gateway-lib/src/forward/plan.rs)。
+- 保留并测试 `forward <url>`，单 URL 经 `ForwardPlan::single_url()` 退化为 `tries=1`、`next_upstream=off`。
+- group forward 已支持 primary / backup / weight / max_fails / fail_timeout 解析。
+- selector 已根据 `ForwardFailureRegistry` 在 `fail_timeout` 窗口内跳过候选。
 
-### 阶段 2：连接阶段 next upstream
+### 阶段 2：连接阶段 next upstream — 已完成
 
-- stream stack 支持 candidate list 的连接阶段 retry。
-- HTTP tunnel upstream 支持连接阶段 retry。
-- HTTP direct upstream 支持 connect / TLS handshake 阶段 retry。
-- executor 更新 failure state。
+- stream stack 在 `stream_forward_group()` 中按候选顺序 retry，连接成功后开始 `copy_bidirectional`，建立后不再透明切换。
+- datagram stack 在 `datagram_forward_group()` 中支持创建 datagram client 阶段 retry，session 建立后不再切换。
+- HTTP tunnel / direct upstream 在 `handle_forward_group()` 中支持连接 / TLS handshake / tunnel open 阶段 retry。
+- executor 在每次尝试结束时更新 group 内失败状态。
 
-### 阶段 3：HTTP proxy_next_upstream 增强
+### 阶段 3：HTTP proxy_next_upstream 增强 — 已完成
 
-- 支持受限的 HTTP 状态码 retry。
-- 增加 body replay 策略和大小限制。
-- 区分幂等和非幂等请求默认策略。
+- `handle_forward_group_with_status_retry()` 支持受限的 5xx 状态码 retry。
+- `--max-body-buffer` 控制请求体缓冲上限，超过即禁用状态码 retry。
+- 通过 `HttpMethodClass` 区分幂等 / 非幂等方法，非幂等默认只在连接建立前 retry。
+- `next_upstream_timeout` 限制单次请求的总尝试预算。
 
-### 阶段 4：高级选择策略
+### 阶段 4：高级选择策略 — 已完成（基础部分）
 
-- `hash $key` / consistent hash。
-- provider-first 的 `server -> routes` 扩展。
-- RTT / least-time / cost-aware 策略，通过 tunnel_mgr 的批量 query 接口消费 URL history，不在 forward 内部重复维护 RTT 表。
-- Gateway Probe API（由 tunnel_mgr 提供，详见 `tunnel_mgr基于url状态查询需求.md`）与 selector 统计联动。
-
-## 9. 非目标
-
-第一阶段不做：
-
-- 自动发现 direct IP。
-- 自动发现 relay。
-- direct 失败后隐式扩散到任意 relay。
-- 复杂业务成本判断。
-- 流已经转发后的透明迁移。
-- 不受限制的 HTTP request body replay。
-
-这些能力如果需要，应由调度器、应用层或后续显式需求提供，而不是塞进 forward 的默认行为。
+- `hash $key`、`consistent_hash` 已纳入 `BalanceMethod` 并在解析阶段校验。
+- provider-first 的 `server -> routes` 扩展：`ForwardServer` / `ProviderPolicy` 已实现，`--server-map` 支持构造 provider-first plan，`--provider-retry-scope` 默认 `routes_only`，`across_servers` 需显式声明（与 §5 "默认不允许跨 provider retry" 一致）。
+- RTT / least-time 策略：`apply_least_time_via_tunnel_mgr()` 在执行入口以受限预算（默认 50ms）查询 tunnel_mgr URL history 后对候选重排，超时或失败退化为原顺序，不在 forward 内部维护独立 RTT 表。
+- Gateway Probe API 与 selector 通过 tunnel_mgr 共享同一份 URL history，详见 [tunnel_mgr基于url状态查询需求.md](doc/tunnel_mgr基于url状态查询需求.md)。

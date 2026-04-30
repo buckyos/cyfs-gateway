@@ -1,6 +1,7 @@
 use crate::ExternalCmd;
 use crate::gateway_control_server::{ControlErrorCode, ControlResult, LoginReq};
 use chrono::Utc;
+use cyfs_gateway_lib::{TunnelProbeOptions, TunnelUrlSortPolicy};
 use log::*;
 use serde_json::{Value, json};
 pub use sfo_result::err as cmd_err;
@@ -218,6 +219,29 @@ impl GatewayControlClient {
             .await
             .map_err(into_cmd_err!(ControlErrorCode::RpcError))?;
         Ok(result)
+    }
+
+    pub async fn query_tunnel_url_statuses(
+        &self,
+        urls: &[String],
+        options: TunnelProbeOptions,
+    ) -> ControlResult<Value> {
+        let sort = match options.sort {
+            TunnelUrlSortPolicy::None => "none",
+            TunnelUrlSortPolicy::ReachableFirst => "reachable_first",
+            TunnelUrlSortPolicy::RttAscending => "rtt_ascending",
+            TunnelUrlSortPolicy::CallerPriorityThenRtt => "caller_priority_then_rtt",
+        };
+        let params = json!({
+            "urls": urls,
+            "force_probe": options.force_probe,
+            "max_age_ms": options.max_age_ms,
+            "timeout_ms": options.timeout_ms,
+            "sort": sort,
+            "include_unsupported": options.include_unsupported,
+            "caller_priorities": options.caller_priorities,
+        });
+        self.call("query_tunnel_url_statuses", params).await
     }
 
     pub async fn collection_list(&self) -> ControlResult<Value> {
