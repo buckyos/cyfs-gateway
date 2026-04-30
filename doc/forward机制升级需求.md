@@ -13,11 +13,11 @@
 > - HTTP 入口连接阶段 retry 与受限的状态码 retry + 请求体缓冲（§6.3 / 阶段 3）：[server/http_server.rs](src/components/cyfs-gateway-lib/src/server/http_server.rs)
 > - tunnel_mgr URL history 业务回写（§6.7：`open_stream_by_url` / datagram client 创建时调用 `record_business_success` / `record_business_failure`，并按 §6.7.3 分类失败原因）：[tunnel_mgr.rs](src/components/cyfs-gateway-lib/src/tunnel_mgr.rs)
 >
-> 后续章节保留为最初的需求与设计说明；与实现存在偏差的细节（例如最终命令参数名）在对应节点处标注或以代码为准。
+> 下文保留需求背景，同时已按当前实现修正用户可见命令、内部模型和执行边界。
 
 ## 1. 背景
 
-当前 `forward` 命令已经支持多个 upstream URL、权重、`round_robin` 和 `ip_hash`，但执行语义仍是：
+升级前，`forward` 命令已经支持多个 upstream URL、权重、`round_robin` 和 `ip_hash`，但执行语义仍是：
 
 ```text
 process-chain 执行 forward 命令
@@ -26,9 +26,9 @@ forward 从候选 upstream 中选择一个 URL
 HTTP server / stream stack / datagram stack 只消费这个单一 URL
 ```
 
-这意味着 group forward 当前本质上是“请求前选择一个 URL”。如果该 URL 在执行阶段连接失败，gateway 不会在同一次 forward 中尝试下一个候选 URL，只能依赖客户端重试，或依赖下一次请求重新进入 selector 后避开失败 URL。
+这意味着升级前的 group forward 本质上是“请求前选择一个 URL”。如果该 URL 在执行阶段连接失败，gateway 不会在同一次 forward 中尝试下一个候选 URL，只能依赖客户端重试，或依赖下一次请求重新进入 selector 后避开失败 URL。
 
-升级目标是把 group forward 从“只返回一个 URL 的 selector”升级为“Nginx upstream 风格的候选组 + 执行阶段 next upstream”，同时保留现有单 URL forward 的简单语义和兼容性。
+本次升级已经把 group forward 从“只返回一个 URL 的 selector”升级为“Nginx upstream 风格的候选组 + 执行阶段 next upstream”，同时保留现有单 URL forward 的简单语义和兼容性。
 
 ## 2. 设计原则
 
@@ -85,20 +85,21 @@ upstream group
   next_upstream
 ```
 
-第一阶段不追求“最优路径”或主动 RTT 选择，先实现 Nginx OSS 级别的成熟语义：
+当前实现已经覆盖 Nginx OSS 级别的成熟语义，并补齐了受限的 RTT 排序：
 
 - weighted round robin
-- ip_hash / hash key
+- ip_hash / hash key / consistent_hash
 - backup peer
 - max_fails / fail_timeout
 - next_upstream on error / timeout
 - max tries / retry timeout budget
+- least_time：执行入口用 tunnel_mgr URL history 做短预算重排，失败或超时退回原顺序
 
-`least_time`、RTT-first、cost-first 等策略可作为后续增强，不进入第一阶段核心需求。
+cost-first 等更复杂策略仍属于后续增强。
 
 ### 4.2 配置形态
 
-建议的逻辑模型：
+逻辑模型仍是 upstream group：
 
 ```yaml
 upstreams:
@@ -129,29 +130,45 @@ upstreams:
         fail_timeout: 10s
 ```
 
-对应 process-chain 动作可以是：
+当前 process-chain 不存在“按名字引用预定义 upstream”的 `forward --group <name>` 形态。`--group` 已落地为失败状态分组名，不是 upstream registry lookup。当前用户可见构造方式是把 peer 放入 process-chain map，然后调用 `forward` 生成内部 `ForwardPlan`：
 
 ```text
-forward --group control-panel
+map-create primary_peers;
+map-create backup_peers;
+
+map-add primary_peers "rtcp://ood1.example.zone/:3202" 100;
+map-add primary_peers "rtcp://ood2.example.zone/:3202" 100;
+map-add backup_peers "rtcp://rtcp%3A%2F%2Fsn.example.org%2F@ood1.example.zone/:3202" 100;
+
+forward round_robin --map $primary_peers \
+                    --backup-map $backup_peers \
+                    --group control-panel \
+                    --next-upstream error,timeout \
+                    --tries 3 \
+                    --fail-timeout 10s;
 ```
 
-或在 process-chain 中引用已构造的 group collection：
+`forward` 命令返回给执行层的结果不再只是单一 URL，而是：
 
 ```text
-forward --group $TARGET_UPSTREAM
+forward-group "<base64-json-forward-plan>"
 ```
 
-具体命令名可在实现阶段确定，但返回给执行层的内部结果应不再只是单一 URL，而是一个 `ForwardPlan`。
+单 URL 或未启用 group 选项的旧多 URL 语法仍可以退化为 `forward "<selected-url>"`，保持兼容。
 
 ### 4.3 ForwardPlan
 
-内部统一表示建议为：
+内部统一表示当前为：
 
 ```rust
 struct ForwardPlan {
-    candidates: Vec<ForwardTarget>,
+    group: Option<String>,
     balance: BalanceMethod,
     next_upstream: NextUpstreamPolicy,
+    candidates: Vec<ForwardTarget>,
+    hash_key_value: Option<String>,
+    servers: Vec<ForwardServer>,
+    provider_policy: ProviderPolicy,
 }
 
 struct ForwardTarget {
@@ -160,6 +177,7 @@ struct ForwardTarget {
     backup: bool,
     max_fails: u32,
     fail_timeout: Duration,
+    server_id: Option<String>,
 }
 ```
 
@@ -171,6 +189,8 @@ ForwardPlan {
   next_upstream: off,
 }
 ```
+
+编码格式是 `base64(JSON)`，由 `ForwardPlan::encode()` / `ForwardPlan::decode()` 处理；process-chain 用户不直接拼 JSON。
 
 ### 4.4 选择和失败处理
 
@@ -190,7 +210,37 @@ group forward 分两步：
 
 Nginx upstream 默认是一层无状态服务池。当前 cyfs-gateway 的服务转发也基本符合这个模型：多个 provider 被看作等价服务实例，有状态 app service 通常是单 provider。
 
-如果未来需要明确支持有状态服务，可以在 Nginx upstream 模型上做最小扩展：
+当前实现已经提供 provider-first 的基础模型：`ForwardServer` 表示一个逻辑 provider，`routes` 表示这个 provider 的多条传输路径。用户解释是：
+
+```text
+Nginx upstream: hash key -> server
+CYFS Gateway extension: hash key -> server -> route
+```
+
+process-chain 中的当前落地入口是 `--server-map`：外层 map 是 `server_id -> route-map`，内层 route-map 是 `url -> weight`。
+
+```text
+map-create node_a_routes;
+map-add node_a_routes "rtcp://node-a.example.zone/:7001" 100;
+map-add node_a_routes "rtcp://rtcp%3A%2F%2Fsn.example.org%2F@node-a.example.zone/:7001" 100;
+
+map-create node_b_routes;
+map-add node_b_routes "rtcp://node-b.example.zone/:7001" 100;
+
+map-create servers;
+map-add servers node-a $node_a_routes;
+map-add servers node-b $node_b_routes;
+
+forward consistent_hash --hash-key "$cookie_session_id" \
+        --server-map $servers \
+        --next-upstream error,timeout \
+        --tries 3 \
+        --provider-retry-scope routes_only;
+```
+
+上面的命令会构造 provider-first plan，并让同一个 `server_id` 的 routes 在尝试顺序中保持相邻。`--provider-retry-scope routes_only|across_servers` 当前会被解析并序列化进 `ForwardPlan`，但执行层尚未按该字段硬性截断 provider 边界；实际 retry 仍按 selector 产出的扁平候选顺序和 `--tries` 预算前进。因此它目前更接近 provider-first 排序/建模能力，而不是完整的“禁止跨 provider retry”执行保证。
+
+对应的内部模型是：
 
 ```yaml
 upstreams:
@@ -222,16 +272,9 @@ upstreams:
           - url: rtcp://node-b.example.zone/
 ```
 
-该扩展的用户解释是：
+设计目标仍然是：默认不允许 route 失败后自动换 provider。是否能换 provider 必须由服务显式声明，因为 gateway 无法应用无关地判断有状态请求能否迁移。按当前实现，如果有状态服务需要严格避免跨 provider retry，应使用单 provider 候选、合适的 hash / consistent_hash key、较小的 `--tries`，或等待执行层补齐 `ProviderPolicy` 的硬边界 enforcement。
 
-```text
-Nginx upstream: hash key -> server
-CYFS Gateway extension: hash key -> server -> route
-```
-
-默认不允许 route 失败后自动换 provider。是否能换 provider 必须由服务显式声明，因为 gateway 无法应用无关地判断有状态请求能否迁移。
-
-第一阶段可以不实现 provider-first，只要求 group forward 的数据模型不要阻塞后续扩展。
+需要注意：当前 `--server-map` 入口是面向 process-chain 的基础形态，只表达 `server_id -> url/weight routes`；更复杂的 per-route `backup`、per-server `backup` 等字段存在于内部 `ForwardServer` / `ForwardTarget` 模型中，但还没有作为结构化 `forward --plan` 用户命令暴露。
 
 ## 6. 消费 forward 语义的实现注意事项
 
@@ -242,25 +285,19 @@ CYFS Gateway extension: hash key -> server -> route
 - 单 URL：继续输出 `forward "<url>"`。
 - group：输出可被执行层识别的 group forward / ForwardPlan。
 
-为了兼容已有执行层，第一阶段可以新增独立动作，例如：
+当前实现使用独立动作：
 
 ```text
-forward-group "<serialized-plan-id-or-json>"
+forward-group "<base64-json-forward-plan>"
 ```
 
-也可以扩展 `forward` 返回多个参数，例如：
-
-```text
-forward "url1" "url2" --next-upstream error,timeout
-```
-
-无论具体语法如何，执行层不能再只读取 `list[1]` 后丢弃剩余候选。
+HTTP server、stream stack、datagram stack 都已识别 `forward-group` 并通过 `ForwardPlan::decode()` 还原候选组。普通 `forward "<url>"` 仍只携带单 URL；不会通过 `forward "url1" "url2"` 这种返回形式传递候选组。
 
 ### 6.2 process-chain 中动态构造 ForwardPlan
 
-`ForwardPlan` 不能只支持静态配置。BuckyOS 的 gateway 场景里，转发目标通常是在 process-chain 中根据请求、`SERVICE_INFO`、`NODE_ROUTE_MAP`、未来的 `ROUTES` 动态构造出来的。
+`ForwardPlan` 不能只支持静态配置。BuckyOS 的 gateway 场景里，转发目标通常是在 process-chain 中根据请求、`SERVICE_INFO`、`ROUTES` 以及兼容用的 `NODE_ROUTE_MAP` 动态构造出来的。
 
-当前 `tests/buckyos/boot_gateway.yaml` 已经使用了这种模式：
+旧的 `boot_gateway.yaml` 曾使用这种模式：
 
 ```yaml
 forward_to_service:
@@ -291,17 +328,17 @@ forward_to_service:
 交给 forward 选择
 ```
 
-升级后的 group forward 应保留这个构造习惯，只是把 `url -> weight` map 扩展为 `ForwardPlan`。
+升级后的 group forward 保留了这个构造习惯：process-chain 仍构造 `url -> weight` map，`forward` 命令负责把 map 转成 `ForwardPlan` 并编码为 `forward-group`。
 
 #### 6.2.1 最小兼容构造
 
-第一阶段可以继续支持简单 map：
+当前继续支持简单 map：
 
 ```text
 map-create target_peer_map;
 map-add target_peer_map "rtcp://ood1.example.zone/:3202" 100;
 map-add target_peer_map "rtcp://ood2.example.zone/:3202" 100;
-forward --group-map $target_peer_map --next-upstream error,timeout --tries 3;
+forward round_robin --map $target_peer_map --next-upstream error,timeout --tries 3;
 ```
 
 该形态等价于所有 peer 都是 primary，只包含 `url` 和 `weight`。它适合从当前 `selector + node_route_map` 平滑迁移。
@@ -318,7 +355,7 @@ map-add primary_peers "rtcp://ood1.example.zone/:3202" 100;
 map-add primary_peers "rtcp://ood2.example.zone/:3202" 100;
 map-add backup_peers "rtcp://relay-a/ood1.example.zone/:3202" 100;
 
-forward --group-map $primary_peers \
+forward round_robin --map $primary_peers \
         --backup-map $backup_peers \
         --next-upstream error,timeout \
         --tries 3 \
@@ -327,40 +364,32 @@ forward --group-map $primary_peers \
 
 这是一种对 process-chain 友好的形态：不要求脚本构造复杂嵌套对象，但已经能覆盖 `primary + backup + next_upstream`。
 
-#### 6.2.3 结构化 ForwardPlan 构造
+#### 6.2.3 结构化 ForwardPlan 与 provider-first 构造
 
-如果 process-chain collection 支持把 map 作为 value，推荐支持更完整的结构化 plan：
+当前没有 `forward --plan $forward_plan` 这种用户命令。`ForwardPlan` 的 JSON/base64 是 `forward` 命令内部生成、执行层内部消费的协议，不要求 process-chain 脚本拼结构化 JSON。
+
+如果 process-chain collection 支持把 map 作为 value，当前已落地的结构化入口是 `--server-map`：
 
 ```text
-map-create forward_plan;
-map-create forward_peers;
-map-create peer_ood1_direct;
-map-create peer_ood1_relay;
+map-create node_a_routes;
+map-add node_a_routes "rtcp://node-a.example.zone/:7001" 100;
+map-add node_a_routes "rtcp://rtcp%3A%2F%2Fsn.example.org%2F@node-a.example.zone/:7001" 100;
 
-map-add peer_ood1_direct url "rtcp://ood1.example.zone/:3202";
-map-add peer_ood1_direct weight 100;
-map-add peer_ood1_direct backup false;
-map-add peer_ood1_direct max_fails 1;
-map-add peer_ood1_direct fail_timeout "10s";
+map-create node_b_routes;
+map-add node_b_routes "rtcp://node-b.example.zone/:7001" 100;
 
-map-add peer_ood1_relay url "rtcp://relay-a/ood1.example.zone/:3202";
-map-add peer_ood1_relay weight 100;
-map-add peer_ood1_relay backup true;
-map-add peer_ood1_relay max_fails 1;
-map-add peer_ood1_relay fail_timeout "10s";
+map-create servers;
+map-add servers node-a $node_a_routes;
+map-add servers node-b $node_b_routes;
 
-map-add forward_peers ood1_direct $peer_ood1_direct;
-map-add forward_peers ood1_relay $peer_ood1_relay;
-
-map-add forward_plan balance "round_robin";
-map-add forward_plan next_upstream "error,timeout";
-map-add forward_plan tries 3;
-map-add forward_plan peers $forward_peers;
-
-forward --plan $forward_plan;
+forward hash --hash-key "$cookie_session_id" \
+        --server-map $servers \
+        --next-upstream error,timeout \
+        --tries 3 \
+        --provider-retry-scope routes_only;
 ```
 
-如果当前 collection 实现不适合嵌套 map，执行层应至少支持 `--group-map` / `--backup-map` 这种扁平 map 输入，避免要求用户在 process-chain 中拼接 JSON 字符串。
+如果只需要无状态服务池或 BuckyOS 当前的 service forwarding，使用 `--map` / `--backup-map` 这种扁平 map 输入即可。
 
 #### 6.2.4 从 service selector 和 routes 构造
 
@@ -411,14 +440,15 @@ forward_to_service:
         end
       end
 
-      forward --group-map $primary_peers \
+      forward round_robin --map $primary_peers \
               --backup-map $backup_peers \
+              --group "service:${SERVICE_ID}" \
               --next-upstream error,timeout \
               --tries 3;
     end
 ```
 
-上面的语法是目标形态，具体命令参数可在实现阶段调整；需求重点是执行层必须支持 process-chain 动态构造 group，而不是只支持预定义 upstream 名称。
+上面的语法是当前实现形态；需求重点是执行层支持 process-chain 动态构造 group，而不是只支持预定义 upstream 名称。
 
 ### 6.3 HTTP server
 
@@ -428,11 +458,11 @@ HTTP 入口消费 group forward 时需要特别保守：
 - 不应在请求体已经发送给上游后默认重试。
 - 如果要支持 502 / 503 / 504 后 retry，需要确认请求体可重放，或设置明确的 body buffer 限制。
 - 对非幂等方法，如 `POST`、`PUT`、`PATCH`，默认只做连接建立前 retry。
-- `next_upstream_tries` 和 `next_upstream_timeout` 必须限制单次请求的最大尝试成本。
+- `--tries` 和 `--next-upstream-timeout` 必须限制单次请求的最大尝试成本。
 
 ### 6.4 Stream stack
 
-TCP / TLS / RTCP / QUIC stream 入口消费 group forward 时，第一阶段只要求支持连接阶段 retry：
+TCP / TLS / RTCP / QUIC stream 入口消费 group forward 时，当前支持连接阶段 retry：
 
 ```text
 open target stream failed -> try next candidate
@@ -444,11 +474,11 @@ copy_bidirectional started -> no transparent retry
 
 ### 6.5 Datagram stack
 
-UDP / RUDP datagram forward 的 retry 语义比 stream 更复杂。第一阶段建议：
+UDP / RUDP datagram forward 的 retry 语义比 stream 更复杂。当前实现边界是：
 
 - 支持创建 datagram client 失败时尝试下一个 candidate。
 - datagram session 建立后不自动切换 candidate。
-- 如果未来支持 datagram route migration，需要单独定义 session 迁移、乱序和重复包语义。
+- datagram route migration 尚未定义；如需支持，需要单独定义 session 迁移、乱序和重复包语义。
 
 ### 6.6 失败历史
 
@@ -513,7 +543,7 @@ unsupported_scheme
 - **forward group 内部 failure state（6.6）**：服务于本 group 的 `max_fails / fail_timeout` 剔除，作用域 group + candidate，进程内存即可，不落盘。
 - **tunnel_mgr URL history（6.7）**：服务于全局 URL 健康视图、Probe API 复用、应用调度器排序，作用域是 normalized URL，按 `tunnel_mgr基于url状态查询需求.md` 第 8.1 节默认落盘。
 
-forward selector 在第一阶段不依赖 tunnel_mgr 的 history 做选择；在阶段 4 引入 RTT / least-time / cost-aware 策略时，再通过 tunnel_mgr 的批量 query 接口消费 history，而不是各自维护一份独立的 RTT 表。
+普通 selector 不依赖 tunnel_mgr history；`least_time` 策略已在执行入口通过 tunnel_mgr 的批量 query 接口消费 URL history 做短预算重排，而不是维护独立 RTT 表。cost-aware 策略仍属后续扩展。
 
 #### 6.7.5 回写不能阻塞业务路径
 
@@ -544,26 +574,26 @@ forward round_robin url1 url2
 forward ip_hash --map $UPSTREAMS
 ```
 
-可以继续作为兼容语法，但语义需要逐步升级：
+继续作为兼容语法，但是否进入 group 语义取决于是否声明 group 选项或使用 hash / consistent_hash / least_time 等需要计划化的算法：
 
-当前：
+未启用 group 选项时：
 
 ```text
 select one url -> return forward "<url>"
 ```
 
-目标：
+启用 `--backup-map` / `--next-upstream` / `--tries` / `--group` / `--server-map` 等 group 选项时：
 
 ```text
-build ordered candidate list -> executor applies next_upstream policy
+build ordered ForwardPlan -> return forward-group "<base64-json-forward-plan>" -> executor applies next_upstream policy
 ```
 
 兼容策略：
 
 1. 单 URL 行为不变。
 2. 旧多 URL 语法在未声明 `next_upstream` 时，可以继续只选择一个 URL。
-3. 新 group forward 显式启用执行阶段 retry。
-4. 旧语法可以逐步映射到默认 group，但不能突然改变不可重试请求的行为。
+3. group forward 显式启用执行阶段 retry。
+4. `--force-group` 可强制单 URL plan 也输出 `forward-group`；默认单 URL group plan 会退化为普通 `forward "<url>"`，保持老执行层兼容。
 
 ## 8. 分阶段落地
 
@@ -591,6 +621,6 @@ build ordered candidate list -> executor applies next_upstream policy
 ### 阶段 4：高级选择策略 — 已完成（基础部分）
 
 - `hash $key`、`consistent_hash` 已纳入 `BalanceMethod` 并在解析阶段校验。
-- provider-first 的 `server -> routes` 扩展：`ForwardServer` / `ProviderPolicy` 已实现，`--server-map` 支持构造 provider-first plan，`--provider-retry-scope` 默认 `routes_only`，`across_servers` 需显式声明（与 §5 "默认不允许跨 provider retry" 一致）。
+- provider-first 的 `server -> routes` 扩展：`ForwardServer` / `ProviderPolicy` 已建模，`--server-map` 支持构造带 `server_id` 的 plan，selector 会保持同一 provider 的 routes 相邻；`--provider-retry-scope` 已解析和序列化，但执行层尚未按 provider 边界硬截断 retry。
 - RTT / least-time 策略：`apply_least_time_via_tunnel_mgr()` 在执行入口以受限预算（默认 50ms）查询 tunnel_mgr URL history 后对候选重排，超时或失败退化为原顺序，不在 forward 内部维护独立 RTT 表。
 - Gateway Probe API 与 selector 通过 tunnel_mgr 共享同一份 URL history，详见 [tunnel_mgr基于url状态查询需求.md](doc/tunnel_mgr基于url状态查询需求.md)。
