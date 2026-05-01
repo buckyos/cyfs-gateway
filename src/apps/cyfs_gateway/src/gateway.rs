@@ -3129,6 +3129,74 @@ impl GatewayCmdHandler {
             ))?;
         Ok(save_path.to_string_lossy().to_string())
     }
+
+    fn parse_name_provider_url(provider_url: &str) -> ControlResult<(String, String)> {
+        let url = Url::parse(provider_url)
+            .map_err(|e| cmd_err!(ControlErrorCode::InvalidParams, "invalid url: {}", e))?;
+        let scheme = url.scheme();
+        if !matches!(scheme, "http" | "https") {
+            return Err(cmd_err!(
+                ControlErrorCode::InvalidParams,
+                "name provider url scheme must be http or https"
+            ));
+        }
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+            return Err(cmd_err!(
+                ControlErrorCode::InvalidParams,
+                "name provider url only supports scheme://host[:port]"
+            ));
+        }
+
+        let host = match url.host() {
+            Some(url::Host::Domain(host)) => host.to_string(),
+            Some(url::Host::Ipv4(addr)) => addr.to_string(),
+            Some(url::Host::Ipv6(addr)) => format!("[{}]", addr),
+            None => {
+                return Err(cmd_err!(
+                    ControlErrorCode::InvalidParams,
+                    "name provider url host is required"
+                ));
+            }
+        };
+        let resolver_host = match url.port() {
+            Some(port) => format!("{}:{}", host, port),
+            None => host,
+        };
+
+        Ok((resolver_host, scheme.to_string()))
+    }
+
+    async fn add_name_provider(
+        &self,
+        provider_url: &str,
+        trust_level: Option<i32>,
+    ) -> ControlResult<Value> {
+        let (resolver_host, scheme) = Self::parse_name_provider_url(provider_url)?;
+        let client = GLOBAL_NAME_CLIENT.get().ok_or_else(|| {
+            cmd_err!(
+                ControlErrorCode::Failed,
+                "name client has not been initialized"
+            )
+        })?;
+        let provider = HttpsProvider::new_with_config(json!({
+            "resolver_host": resolver_host,
+            "scheme": scheme,
+        }))
+        .map_err(|e| cmd_err!(ControlErrorCode::InvalidParams, "{}", e))?;
+        let provider_id = provider.get_id();
+        let effective_trust_level = trust_level.unwrap_or(DEFAULT_PROVIDER_TRUST_LEVEL);
+        client
+            .add_provider(Box::new(provider), Some(effective_trust_level))
+            .await;
+
+        Ok(json!({
+            "provider": provider_id,
+            "url": provider_url,
+            "resolver_host": resolver_host,
+            "scheme": scheme,
+            "trust_level": effective_trust_level,
+        }))
+    }
 }
 
 #[derive(Serialize)]
@@ -3162,6 +3230,12 @@ struct QueryTunnelUrlStatusesParams {
     sort: Option<String>,
     include_unsupported: Option<bool>,
     caller_priorities: Option<Vec<u32>>,
+}
+
+#[derive(Deserialize)]
+struct AddNameProviderParams {
+    url: String,
+    trust_level: Option<i32>,
 }
 
 impl QueryTunnelUrlStatusesParams {
@@ -3614,6 +3688,12 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                     "statuses": result.statuses,
                     "sorted_urls": result.sorted_urls,
                 }))
+            }
+            "add_name_provider" | "add-name-provider" => {
+                let params = serde_json::from_value::<AddNameProviderParams>(params)
+                    .map_err(into_cmd_err!(ControlErrorCode::InvalidParams))?;
+                self.add_name_provider(params.url.as_str(), params.trust_level)
+                    .await
             }
             "add_rule" => {
                 let params = serde_json::from_value::<HashMap<String, String>>(params)

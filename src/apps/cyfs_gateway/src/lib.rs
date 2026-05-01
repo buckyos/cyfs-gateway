@@ -1068,6 +1068,22 @@ pub async fn cyfs_gateway_main() {
                 .help("server url")
                 .required(false)
                 .default_value(CONTROL_SERVER)))
+        .subcommand(Command::new("add-name-provider")
+            .about("Add a name-client HTTP/HTTPS resolver provider")
+            .after_help("Examples:\n  cyfs_gateway add-name-provider http://127.0.0.1:8080\n  cyfs_gateway add-name-provider https://resolver.example.com --trust-level 100")
+            .arg(Arg::new("url")
+                .help("provider base url, scheme://host[:port]")
+                .required(true))
+            .arg(Arg::new("trust_level")
+                .long("trust-level")
+                .help("provider trust level, lower number has higher priority")
+                .required(false))
+            .arg(Arg::new("server")
+                .long("server")
+                .short('s')
+                .help("server url")
+                .required(false)
+                .default_value(CONTROL_SERVER)))
         .subcommand(Command::new("add_dispatch")
             .about("Add a local port dispatch to target")
             .after_help("Examples:\n  cyfs_gateway add_dispatch 18080 192.168.0.1:1900\n  cyfs_gateway add_dispatch 0.0.0.0:8080 10.0.0.1:9000 --protocol udp")
@@ -1783,6 +1799,39 @@ pub async fn cyfs_gateway_main() {
             let cyfs_cmd_client =
                 GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
             match cyfs_cmd_client.set_rule(id, rule).await {
+                Ok(_result) => {
+                    println!("success");
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    println!("{}", e.msg());
+                    if let Some(token) = cyfs_cmd_client.get_latest_token().await {
+                        save_login_token(server.as_str(), token.as_str());
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(("add-name-provider", sub_matches)) => {
+            let url = sub_matches
+                .get_one::<String>("url")
+                .expect("url is required");
+            let trust_level = match sub_matches.get_one::<String>("trust_level") {
+                Some(value) => Some(value.parse::<i32>().expect("trust-level must be integer")),
+                None => None,
+            };
+            let server = sub_matches
+                .get_one::<String>("server")
+                .expect("server is required");
+            let cyfs_cmd_client =
+                GatewayControlClient::new(server.as_str(), read_login_token(server.as_str()));
+            match cyfs_cmd_client
+                .add_name_provider(url.as_str(), trust_level)
+                .await
+            {
                 Ok(_result) => {
                     println!("success");
                     if let Some(token) = cyfs_cmd_client.get_latest_token().await {

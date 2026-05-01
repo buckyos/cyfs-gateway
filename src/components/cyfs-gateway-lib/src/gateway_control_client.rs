@@ -296,6 +296,20 @@ impl GatewayControlClient {
         self.call("query_tunnel_url_statuses", params).await
     }
 
+    pub async fn add_name_provider(
+        &self,
+        url: &str,
+        trust_level: Option<i32>,
+    ) -> ControlResult<Value> {
+        let mut params = json!({
+            "url": url,
+        });
+        if let Some(trust_level) = trust_level {
+            params["trust_level"] = json!(trust_level);
+        }
+        self.call("add_name_provider", params).await
+    }
+
     pub async fn collection_list(&self) -> ControlResult<Value> {
         let result = self
             .call("collection_list", Value::Null)

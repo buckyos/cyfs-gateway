@@ -197,6 +197,20 @@ mod tests {
         ret.as_ref().unwrap();
         assert!(ret.is_ok());
 
+        let ret = cmd_client
+            .add_name_provider("http://127.0.0.1:8080", Some(100))
+            .await;
+        ret.as_ref().unwrap();
+        let added_provider = ret.unwrap();
+        assert_eq!(
+            added_provider.get("provider").and_then(Value::as_str),
+            Some("https-resolver:127.0.0.1:8080")
+        );
+        assert_eq!(
+            added_provider.get("scheme").and_then(Value::as_str),
+            Some("http")
+        );
+
         let urls = vec![
             "udp://127.0.0.1:9/".to_string(),
             "unknown://127.0.0.1:9/".to_string(),
