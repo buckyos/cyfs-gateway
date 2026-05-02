@@ -15,6 +15,10 @@ use std::path::PathBuf;
 use log::*;
 
 pub use acme_http_challenge_server::*;
+pub use buckyos_http_server::{
+    HttpServer, ServerError, ServerErrorCode, ServerResult, StreamInfo, hyper_serve_http,
+    hyper_serve_http1, into_server_err, serve_http_by_rpc_handler, server_err,
+};
 pub use dir_server::*;
 pub use dns_server::*;
 pub use http_server::*;
@@ -23,34 +27,6 @@ pub use qa_server::*;
 pub use server::*;
 pub use socks5_server::*;
 pub use welcome_server::*;
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum ServerErrorCode {
-    BindFailed,
-    NotFound,
-    InvalidConfig,
-    InvalidParam,
-    ProcessChainError,
-    StreamError,
-    TunnelError,
-    InvalidTlsKey,
-    InvalidTlsCert,
-    InvalidData,
-    IOError,
-    BadRequest,
-    UnknownServerType,
-    EncodeError,
-    DnsQueryError,
-    InvalidDnsOpType,
-    InvalidDnsMessageType,
-    InvalidDnsRecordType,
-    Rejected,
-    AlreadyExists,
-}
-pub type ServerResult<T> = sfo_result::Result<T, ServerErrorCode>;
-pub type ServerError = sfo_result::Error<ServerErrorCode>;
-pub use sfo_result::err as server_err;
-pub use sfo_result::into_err as into_server_err;
 
 pub fn get_gateway_main_config_dir() -> PathBuf {
     //get env CYFS_GATEWAY_CONFIG_PATH

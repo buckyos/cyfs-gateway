@@ -1,6 +1,7 @@
 use crate::tunnel_mgr::ProtocolCategory;
 use crate::{TunnelError, TunnelResult, get_protocol_category};
 use async_trait::async_trait;
+pub use cyfs_gateway_api::{TunnelProbeOptions, TunnelUrlSortPolicy};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use url::Url;
@@ -10,7 +11,6 @@ const DEFAULT_UNKNOWN_TTL_MS: u64 = 10_000;
 const DEFAULT_UNREACHABLE_TTL_MS: u64 = 5_000;
 const DEFAULT_UNSUPPORTED_TTL_MS: u64 = 60_000;
 const DEFAULT_MAX_MEMORY_HISTORY_ENTRIES: usize = 10_000;
-const DEFAULT_PROBE_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_PROBE_CONCURRENCY: usize = 32;
 const DEFAULT_RECENT_RTT_CAP: usize = 8;
 
@@ -108,21 +108,6 @@ impl TunnelFailureReason {
     }
 }
 
-/// Sort policy applied to batch query results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TunnelUrlSortPolicy {
-    None,
-    ReachableFirst,
-    RttAscending,
-    CallerPriorityThenRtt,
-}
-
-impl Default for TunnelUrlSortPolicy {
-    fn default() -> Self {
-        TunnelUrlSortPolicy::None
-    }
-}
-
 /// One observation of a Tunnel URL status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelUrlStatus {
@@ -193,39 +178,6 @@ impl TunnelUrlHistory {
             TunnelUrlState::Unsupported | TunnelUrlState::Unknown | TunnelUrlState::Probing => {}
         }
         self.current = status;
-    }
-}
-
-/// Caller-supplied control over a probe call.
-#[derive(Debug, Clone)]
-pub struct TunnelProbeOptions {
-    pub force_probe: bool,
-    pub max_age_ms: Option<u64>,
-    pub timeout_ms: Option<u64>,
-    pub sort: TunnelUrlSortPolicy,
-    pub include_unsupported: bool,
-    /// Optional caller priority per URL. Lower number = higher priority.
-    /// Used by `CallerPriorityThenRtt`. Length should match the URL slice
-    /// in batch queries; missing entries are treated as `u32::MAX`.
-    pub caller_priorities: Option<Vec<u32>>,
-}
-
-impl Default for TunnelProbeOptions {
-    fn default() -> Self {
-        Self {
-            force_probe: false,
-            max_age_ms: None,
-            timeout_ms: Some(DEFAULT_PROBE_TIMEOUT_MS),
-            sort: TunnelUrlSortPolicy::None,
-            include_unsupported: true,
-            caller_priorities: None,
-        }
-    }
-}
-
-impl TunnelProbeOptions {
-    pub fn timeout_ms_or_default(&self) -> u64 {
-        self.timeout_ms.unwrap_or(DEFAULT_PROBE_TIMEOUT_MS)
     }
 }
 

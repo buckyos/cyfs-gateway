@@ -1,4 +1,3 @@
-use crate::{TunnelProbeOptions, TunnelUrlSortPolicy};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -9,6 +8,55 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub const CONTROL_SERVER: &str = "http://127.0.0.1:13451";
+pub const DEFAULT_TUNNEL_PROBE_TIMEOUT_MS: u64 = 3_000;
+
+/// Sort policy applied to batch tunnel URL probe results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelUrlSortPolicy {
+    None,
+    ReachableFirst,
+    RttAscending,
+    CallerPriorityThenRtt,
+}
+
+impl Default for TunnelUrlSortPolicy {
+    fn default() -> Self {
+        TunnelUrlSortPolicy::None
+    }
+}
+
+/// Caller-supplied control over a tunnel URL probe call.
+#[derive(Debug, Clone)]
+pub struct TunnelProbeOptions {
+    pub force_probe: bool,
+    pub max_age_ms: Option<u64>,
+    pub timeout_ms: Option<u64>,
+    pub sort: TunnelUrlSortPolicy,
+    pub include_unsupported: bool,
+    /// Optional caller priority per URL. Lower number = higher priority.
+    /// Used by `CallerPriorityThenRtt`. Length should match the URL slice
+    /// in batch queries; missing entries are treated as `u32::MAX`.
+    pub caller_priorities: Option<Vec<u32>>,
+}
+
+impl Default for TunnelProbeOptions {
+    fn default() -> Self {
+        Self {
+            force_probe: false,
+            max_age_ms: None,
+            timeout_ms: Some(DEFAULT_TUNNEL_PROBE_TIMEOUT_MS),
+            sort: TunnelUrlSortPolicy::None,
+            include_unsupported: true,
+            caller_priorities: None,
+        }
+    }
+}
+
+impl TunnelProbeOptions {
+    pub fn timeout_ms_or_default(&self) -> u64 {
+        self.timeout_ms.unwrap_or(DEFAULT_TUNNEL_PROBE_TIMEOUT_MS)
+    }
+}
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ControlErrorCode {

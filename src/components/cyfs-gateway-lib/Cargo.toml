@@ -75,9 +75,11 @@ sfo-ip = "0.1"
 
 buckyos-kit.workspace = true
 kRPC.workspace = true
+buckyos-http-server.workspace = true
 name-client.workspace = true
 name-lib.workspace = true
 
+cyfs-gateway-api.workspace = true
 cyfs-process-chain = { path = "../cyfs-process-chain" }
 cyfs-acme = { path = "../cyfs-acme" }
 cyfs-lookup = { path = "../cyfs-lookup" }
