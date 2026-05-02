@@ -7,6 +7,10 @@ use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+mod sn_client;
+
+pub use sn_client::*;
+
 pub const CONTROL_SERVER: &str = "http://127.0.0.1:13451";
 pub const DEFAULT_TUNNEL_PROBE_TIMEOUT_MS: u64 = 3_000;
 
