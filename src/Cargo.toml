@@ -11,7 +11,6 @@ members = [
     "components/cyfs-sn",
     "components/cyfs-tun",
     "components/cyfs-acme",
-    "components/server-runner",
     "apps/cyfs_gateway",
     "apps/test_server",
 ]

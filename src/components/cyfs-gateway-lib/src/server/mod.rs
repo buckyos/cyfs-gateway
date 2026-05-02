@@ -16,8 +16,9 @@ use log::*;
 
 pub use acme_http_challenge_server::*;
 pub use buckyos_http_server::{
-    HttpServer, ServerError, ServerErrorCode, ServerResult, StreamInfo, hyper_serve_http,
-    hyper_serve_http1, into_server_err, serve_http_by_rpc_handler, server_err,
+    DirServer, DirServerBuilder, HttpServer, ServerError, ServerErrorCode, ServerResult,
+    StreamInfo, hyper_serve_http, hyper_serve_http1, into_server_err, serve_http_by_rpc_handler,
+    server_err,
 };
 pub use dir_server::*;
 pub use dns_server::*;

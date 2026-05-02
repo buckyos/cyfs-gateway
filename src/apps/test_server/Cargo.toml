@@ -10,7 +10,7 @@ http.workspace = true
 http-body-util.workspace = true
 log.workspace = true
 tokio.workspace = true
-server-runner = { path = "../../components/server-runner" }
+buckyos-http-server.workspace = true
 cyfs-gateway-lib = { path = "../../components/cyfs-gateway-lib" }
 buckyos-kit.workspace = true
 kRPC.workspace = true
