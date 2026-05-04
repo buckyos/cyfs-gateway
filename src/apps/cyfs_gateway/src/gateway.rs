@@ -271,6 +271,12 @@ fn build_server_context(
             global_collection_manager,
             SocksTunnelBuilder::new_ref(tunnel_manager),
         ))),
+        "cyfs-dir" => Some(Arc::new(CyfsDirServerContext::new(
+            server_manager,
+            global_process_chains,
+            js_externals,
+            global_collection_manager,
+        ))),
         "acme_response" => Some(Arc::new(AcmeHttpChallengeServerContext::new(acme_mgr))),
         "local_dns" => Some(Arc::new(LocalDnsServerContext::new(None))),
         "control_server" => Some(Arc::new(GatewayControlServerContext::new(

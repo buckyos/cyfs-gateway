@@ -2,9 +2,9 @@ use buckyos_kit::get_buckyos_service_data_dir;
 use cyfs_dns::{DnsServerConfig, LocalDnsConfig};
 use cyfs_gateway_lib::{
     AcmeHttpChallengeServerConfig, BlockConfig, CollectionConfig, ConfigErrorCode, ConfigResult,
-    DirServerConfig, ProcessChainConfig, ProcessChainConfigs, ProcessChainHttpServerConfig,
-    QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig, TcpStackConfig, UdpStackConfig,
-    config_err,
+    CyfsDirServerConfig, DirServerConfig, ProcessChainConfig, ProcessChainConfigs,
+    ProcessChainHttpServerConfig, QuicStackConfig, RtcpStackConfig, ServerConfig, StackConfig,
+    TcpStackConfig, UdpStackConfig, config_err,
 };
 use cyfs_sn::*;
 use cyfs_socks::SocksServerConfig;
@@ -495,6 +495,32 @@ impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for SocksServe
             )
         })?;
 
+        Ok(Arc::new(config))
+    }
+}
+
+pub struct CyfsDirServerConfigParser {}
+
+impl CyfsDirServerConfigParser {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl<D: for<'de> Deserializer<'de> + Clone> ServerConfigParser<D> for CyfsDirServerConfigParser {
+    fn parse(&self, de: D) -> ConfigResult<Arc<dyn ServerConfig>> {
+        // Allow either an array `hook_point: [...]` or the map shorthand
+        // `hook_point: { id: { ... } }` (consistent with the http server).
+        let value = hook_point_value_map_to_vector(de.clone(), "hook_point")?;
+        let config = CyfsDirServerConfig::deserialize(value).map_err(|e| {
+            config_err!(
+                ConfigErrorCode::InvalidConfig,
+                "invalid cyfs-dir server config.{}\n{}",
+                e,
+                serde_json::to_string_pretty(&serde_json::Value::deserialize(de.clone()).unwrap())
+                    .unwrap()
+            )
+        })?;
         Ok(Arc::new(config))
     }
 }

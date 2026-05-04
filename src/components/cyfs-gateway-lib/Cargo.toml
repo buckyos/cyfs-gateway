@@ -78,6 +78,9 @@ kRPC.workspace = true
 buckyos-http-server.workspace = true
 name-client.workspace = true
 name-lib.workspace = true
+ndn-lib.workspace = true
+named_store.workspace = true
+ndn-toolkit.workspace = true
 
 cyfs-gateway-api.workspace = true
 cyfs-process-chain = { path = "../cyfs-process-chain" }

@@ -88,6 +88,10 @@ async fn run_gateway_with_config(
     parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
     parser.register_server_config_parser("dir", Arc::new(DirServerConfigParser::new()));
     parser.register_server_config_parser(
+        "cyfs-dir",
+        Arc::new(CyfsDirServerConfigParser::new()),
+    );
+    parser.register_server_config_parser(
         "control_server",
         Arc::new(GatewayControlServerConfigParser::new()),
     );
@@ -175,6 +179,8 @@ async fn run_gateway_with_config(
     factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new()));
     debug!("Register http server factory");
     factory.register_server_factory("dir", Arc::new(DirServerFactory::new()));
+    factory.register_server_factory("cyfs-dir", Arc::new(CyfsDirServerFactory::new()));
+    debug!("Register cyfs-dir server factory");
     factory.register_server_factory("socks", Arc::new(SocksServerFactory::new()));
     debug!("Register dir server factory");
     factory.register_server_factory("dns", Arc::new(ProcessChainDnsServerFactory::new()));

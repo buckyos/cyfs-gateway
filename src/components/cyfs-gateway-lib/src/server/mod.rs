@@ -1,4 +1,5 @@
 mod acme_http_challenge_server;
+mod cyfs_dir_server;
 mod dir_server;
 mod dns_server;
 mod http_compression;
@@ -20,6 +21,7 @@ pub use buckyos_http_server::{
     StreamInfo, hyper_serve_http, hyper_serve_http1, into_server_err, serve_http_by_rpc_handler,
     server_err,
 };
+pub use cyfs_dir_server::*;
 pub use dir_server::*;
 pub use dns_server::*;
 pub use http_server::*;

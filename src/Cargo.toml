@@ -82,6 +82,7 @@ name-client = { git = "https://github.com/buckyos/buckyos-base.git", branch = "b
 name-lib = { git = "https://github.com/buckyos/buckyos-base.git", branch = "beta2.2", package = "name-lib" }
 ndn-lib = { git = "https://github.com/buckyos/cyfs-ndn.git", branch = "beta2.2", package = "ndn-lib" }
 named_store = { git = "https://github.com/buckyos/cyfs-ndn.git", branch = "beta2.2", package = "named_store" }
+ndn-toolkit = { git = "https://github.com/buckyos/cyfs-ndn.git", branch = "beta2.2", package = "ndn-toolkit" }
 cyfs-gateway-api = { path = "components/cyfs-gateway-api" }
 
 [profile.test]
