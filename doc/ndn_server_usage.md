@@ -1,274 +1,256 @@
-# NdnServer 使用文档
+# CyfsDirServer 使用文档
+
+> 说明:旧版 `NdnServer` / `NdnServerConfig` 已经在 `beta2.2` 中被移除,
+> 当前 cyfs-gateway 中提供 `cyfs://` 语义(R-Link / O-Link)对外服务的
+> 是 `CyfsDirServer`(配置中的 `type: cyfs-dir`)。本文档描述的是它的
+> 实际实现。
+
+实现位置:[src/components/cyfs-gateway-lib/src/server/cyfs_dir_server.rs](../src/components/cyfs-gateway-lib/src/server/cyfs_dir_server.rs)
+
+注册位置:[src/apps/cyfs_gateway/src/lib.rs:91](../src/apps/cyfs_gateway/src/lib.rs#L91) / [:182](../src/apps/cyfs_gateway/src/lib.rs#L182)
 
 ## 概述
 
-`NdnServer` 是一个基于 Named Data Network (NDN) 的 HTTP 服务器实现，用于提供命名数据对象的访问服务。它实现了 `HttpServer` trait，可以集成到 cyfs-gateway-lib 的服务器框架中。
+`CyfsDirServer` 是一个把 HTTP 请求映射到 `NamedDataMgr` 存储里 chunk /
+named object 的服务器。它实现 `HttpServer` trait,可以挂在 cyfs-gateway
+的 server 框架下。
 
-## 核心功能
+它本身**不直接**实现 chunk 读写、inner-path 解析、`cyfs-*` 响应头那一套
+逻辑,而是在请求进入前先跑一段 **process chain**,把"语义路径 → ObjId"
+的解析做完之后,把改写过的请求**转交给内部的 `NdnDirServer`(来自
+`ndn-toolkit`)** 去做实际的内容流式输出。
 
-NdnServer 支持以下功能：
-
-1. **GET 请求** - 获取 NDN 对象（chunk、chunk list、named object）
-2. **PUT/PATCH 请求** - 上传 chunk 数据
-3. **HEAD 请求** - 查询 chunk 状态
-4. **范围请求** - 支持 HTTP Range 请求进行部分内容下载
-5. **路径解析** - 支持多种对象 ID 解析方式（hostname、path、mgr path；其中 mgr path 依赖进程内默认 `NamedDataMgr`）
-
-## 配置说明
-
-### NamedDataMgrRouteConfig
-
-```rust
-pub struct NamedDataMgrRouteConfig {
-    pub named_store_config_path: String, // named_store 布局配置文件路径
-    pub read_only: bool,                // 是否只读模式
-    pub guest_access: bool,             // 是否允许 zone 外访问
-    pub is_object_id_in_path: bool,    // 对象 ID 是否在路径中
-    pub enable_mgr_file_path: bool,    // 是否启用 mgr 文件路径模式
-    pub enable_zone_put_chunk: bool,   // 是否允许上传 chunk
-}
+```
+HTTP Request
+     │
+     ▼
+┌──────────────────────┐
+│  process chain       │  解析 path → ObjId / SidecarRecord
+│  (可选, hook_point)  │  也可以 drop / reject / error / redirect
+└──────────────────────┘
+     │
+     ▼  改写为 O-Link: <url_prefix>/<obj_id>{/@/<inner>?}
+┌──────────────────────┐
+│  NdnDirServer (内)   │  chunk 流、inner-path、cyfs-* headers、
+│                      │  hostname-based O-Link、文件系统回退
+└──────────────────────┘
 ```
 
-### NdnServerConfig
+## 配置
 
-```rust
-pub struct NdnServerConfig {
-    pub id: String,                     // 服务器 ID
-    pub ty: String,                     // 类型（应为 "ndn"）
-    pub version: Option<String>,        // HTTP 版本（可选）
-    pub named_mgr: NamedDataMgrRouteConfig,  // NDN 管理器配置
-}
+### 字段说明(`CyfsDirServerConfig`)
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `id` | string | 服务器 ID |
+| `type` | string | 必须为 `"cyfs-dir"` |
+| `named_store_config_path` | string | `NamedDataMgr` 存储布局配置文件路径 |
+| `http_backend_links` | map<string,string> | 远端存储节点的 HTTP base URL,key 是 store 项的 `device_did`;不在表里的 store 当作本地 store。读写都会走 HTTP backend |
+| `signing_key_path` | string? | 用于签发 `PathObject` JWT 的 ed25519 PEM 私钥路径。不配置时 R-Link 响应里不会带 `cyfs-path-obj` |
+| `signing_kid` | string? | 上述 key 的 kid |
+| `semantic_root` | string? | 文件系统语义根。配置后,未被 chain 解析的 R-Link 会回退到本地文件系统;不配置则纯 chain 驱动,文件系统侧一律 404 |
+| `url_prefix` | string | 转发到内层 `NdnDirServer` 之前要剥掉的 URL 前缀,如 `"/ndn"`。默认空 |
+| `obj_id_in_host` | bool | 是否把 hostname 的首段 label 当作 `ObjId`(O-Link 主机名模式)。默认 false |
+| `mode` | string? | 仅当 `semantic_root` 存在时生效的 scanner 持久化模式。可选 `"local-link"`(默认)、`"in-store"` |
+| `scan_interval_secs` | u64 | 自动 objectify 扫描间隔(秒)。`0` 关闭扫描器,默认 60 |
+| `hook_point` | object? | 可选的 process chain 配置,结构见 `ProcessChainConfigs` |
+
+### YAML 示例
+
+```yaml
+servers:
+  - id: cyfs_dir_1
+    type: cyfs-dir
+    named_store_config_path: /etc/buckyos/named_store.json
+    url_prefix: /ndn
+    obj_id_in_host: true
+
+    # 可选:文件系统回退 + 自动 objectify
+    semantic_root: /var/buckyos/dir
+    mode: local-link
+    scan_interval_secs: 60
+
+    # 可选:R-Link path-obj JWT 签名
+    signing_key_path: /etc/buckyos/keys/path_obj.pem
+    signing_kid: path-obj-2026
+
+    # 可选:远端存储节点 HTTP backend
+    http_backend_links:
+      did:bns:node-a: http://10.0.0.5:8080/ndn
+
+    # 可选:进入内层之前先跑一段 process chain
+    hook_point:
+      chains:
+        - id: resolve
+          blocks:
+            - id: main
+              block: |
+                # 把 /ndn/foo/bar 解析为某个已知 obj_id
+                match REQ_path "^/ndn/foo/bar$" && \
+                  set RESP_cyobj_id "5aSixgLwnWbmcSKvpiaLTqJzg7bxqoPYRCZSPu6Y6p5K";
 ```
 
-## 使用示例
+### 纯 chain 驱动的最小配置
 
-### 1. 使用 Builder 模式创建服务器
-
-```rust
-use cyfs_gateway_lib::{NdnServer, NamedDataMgrRouteConfig};
-
-let config = NamedDataMgrRouteConfig {
-    named_store_config_path: "/etc/buckyos/named_store.json".to_string(),
-    read_only: false,
-    guest_access: true,
-    is_object_id_in_path: true,
-    enable_mgr_file_path: true,
-    enable_zone_put_chunk: true,
-};
-
-let server = NdnServer::builder()
-    .id("ndn_server_1")
-    .version("HTTP/1.1")
-    .config(config)
-    .build()
-    .await?;
+```yaml
+- id: cyfs_dir_chain_only
+  type: cyfs-dir
+  named_store_config_path: /etc/buckyos/named_store.json
+  url_prefix: /ndn
+  hook_point: { ... }
 ```
 
-### 2. 使用 Factory 模式创建服务器
+不配置 `semantic_root` 时,内层只接受 chain 已经解析出来的 O-Link;
+没解析出来的请求会落到 `NdnDirServer` 的文件系统回退路径,因为没有
+`semantic_root` 所以一律 404。
 
-```rust
-use cyfs_gateway_lib::{NdnServerConfig, NdnServerFactory, ServerFactory};
-use std::sync::Arc;
+## Process chain 契约
 
-let config = NdnServerConfig {
-    id: "ndn_server_1".to_string(),
-    ty: "ndn".to_string(),
-    version: Some("HTTP/1.1".to_string()),
-    named_mgr: NamedDataMgrRouteConfig::default(),
-};
+`hook_point` 配置的 chain 在请求被分发到内层之前执行。chain 拿到的是
+标准的 HTTP `REQ_*` 环境(path / method / headers / …),可以通过
+**两种**等价方式告诉服务器"这个语义路径解析到哪个对象":
 
-let factory = NdnServerFactory;
-let server = factory.create(Arc::new(config)).await?;
-```
+### 方式 1:`RESP_cyobj_meta`(完整 sidecar)
 
-### 3. JSON 配置示例
+设置环境变量 `RESP_cyobj_meta` 为一段 JSON 字符串,结构与 `NdnDirServer`
+落地的 `<name>.cyobj` 文件一致:
 
 ```json
 {
-  "id": "ndn_server_1",
-  "type": "ndn",
-  "version": "HTTP/1.1",
-  "named_mgr": {
-    "named_store_config_path": "/etc/buckyos/named_store.json",
-    "read_only": false,
-    "guest_access": true,
-    "is_object_id_in_path": true,
-    "enable_mgr_file_path": true,
-    "enable_zone_put_chunk": true
-  }
+  "obj_type": "...",
+  "obj_id": "5aSixgLwnWbmcSKvpiaLTqJzg7bxqoPYRCZSPu6Y6p5K",
+  "obj_json": { ... },
+  "path_obj_jwt": "eyJhbGciOi..."
 }
 ```
 
-## 请求处理流程
+服务器会:
+1. 解析其中的 `obj_id`;
+2. 把 `obj_json` 通过 `NamedDataMgr::put_object` 旁路写入 store
+   (idempotent,如果已经存在则忽略错误);
+3. 把请求 URI 改写为 O-Link 形式后转交给内层。
 
-### GET 请求
+适合"对象内容由 chain 即时构造、还没在 store 里"的场景。
 
-1. **对象 ID 解析**：
-   - 从 hostname 中解析对象 ID
-   - 从路径中解析对象 ID
-   - 使用 mgr 文件路径模式解析
+### 方式 2:`RESP_cyobj_id`(裸 ObjId)
 
-2. **对象加载**：
-   - Chunk：直接读取 chunk 数据
-   - ChunkList：读取 chunk list 数据
-   - NamedObject：读取命名对象的 JSON 数据
+设置 `RESP_cyobj_id` 为一个 `ObjId` 字符串。要求该对象**已经在 store
+里**(否则内层会 404)。只做 URI 改写,不会触发 `put_object`。
 
-3. **响应构建**：
-   - 设置适当的 Content-Type
-   - 支持范围请求（206 Partial Content）
-   - 添加 cyfs 相关的自定义 headers
+适合"chain 只负责路由、对象本身已经入库"的场景。
 
-### PUT/PATCH 请求
+### 没设置任何变量
 
-上传 chunk 数据到 NamedDataMgr：
+服务器会让请求按原样穿过 chain,继续走内层 `NdnDirServer` 的常规解析:
+- `obj_id_in_host = true` 时识别 hostname 中的 `ObjId`;
+- 路径中的 `ObjId`(O-Link);
+- 配置了 `semantic_root` 时,按文件系统回退解析 R-Link。
 
-```http
-PUT /ndn/{chunk_id}
-Headers:
-  cyfs-chunk-size: 1048576
-Body:
-  <chunk binary data>
-```
+### 控制流
 
-### HEAD 请求
+`drop` / `reject` / `error` 与 `ProcessChainHttpServer` 行为一致:
 
-查询 chunk 状态：
+| 控制 | HTTP 响应 |
+| --- | --- |
+| `drop` | `200 OK`,空 body |
+| `reject` | `403 Forbidden`,空 body |
+| `error <msg>` | `502 Bad Gateway`,body 为 `<msg>` |
+| `return ...` | 当前不用作路由指令,会被忽略 |
 
-```http
-HEAD /ndn/{chunk_id}
+chain 内部抛出的执行错误会被映射成 `500 Internal Server Error`。
 
-Response Headers:
-  Content-Length: 1048576
-  cyfs-chunk-status: completed
-  cyfs-chunk-progress: 100
-```
+## URL 改写规则
 
-## 响应 Headers
-
-NdnServer 返回的响应包含以下自定义 headers：
-
-- `cyfs-obj-id`: 对象 ID（base32 编码）
-- `cyfs-root-obj-id`: 根对象 ID（当使用 inner path 时）
-- `cyfs-proof`: 验证证明（可选）
-- `cyfs-path-obj`: 路径对象 JWT（可选）
-- `cyfs-obj-size`: 对象大小（对于 chunk/chunk list）
-- `cyfs-chunk-status`: Chunk 状态（对于 HEAD 请求）
-- `cyfs-chunk-progress`: Chunk 下载进度（对于 HEAD 请求）
-
-## URL 模式
-
-NdnServer 支持多种 URL 模式来访问 NDN 对象：
-
-### 1. 对象 ID 在路径中
+chain 解析成功后,内部 URI 会被改写为:
 
 ```
-GET /ndn/{obj_id}
-GET /ndn/{obj_id}/{inner_path}
+<url_prefix>/<obj_id>{/@/<inner_path>}{?<query>}
 ```
 
-示例：
-```
-GET /ndn/5aSixgLwnWbmcSKvpiaLTqJzg7bxqoPYRCZSPu6Y6p5K
-GET /ndn/5aSixgLwnWbmcSKvpiaLTqJzg7bxqoPYRCZSPu6Y6p5K/content
+- `url_prefix` 来自 server 配置(去掉首尾 `/`);
+- `/@/` 之前的部分都被替换成 `obj_id`,`/@/` 之后的 inner path 完整保留;
+- query string 原样保留。
+
+例:
+- 配置 `url_prefix: /ndn`,请求 `GET /ndn/foo/bar/@/content?x=1`,
+  chain 设置 `RESP_cyobj_id = OBJ`,改写后内层看到的是
+  `GET /ndn/OBJ/@/content?x=1`。
+
+## 行为委托给内层 `NdnDirServer` 的部分
+
+下面这些都不在 `CyfsDirServer` 自己的代码里,而是 `ndn-toolkit` 的
+`NdnDirServer` 提供:
+
+- chunk / chunk list / named object 的实际读取
+- `inner_path`(`/@/...`)解析与对象内导航
+- HTTP Range / 206 Partial Content
+- `cyfs-obj-id` / `cyfs-root-obj-id` / `cyfs-obj-size` / `cyfs-path-obj`
+  等响应头
+- `obj_id_in_host = true` 时的 hostname O-Link
+- 配置了 `semantic_root` 时的文件系统回退 + 自动 objectify scanner
+  (`spawn_scanner`,按 `scan_interval_secs` 触发)
+- HTTP 版本协商、HTTP/3 端口等
+
+> 这些功能的具体细节请以 `ndn-toolkit` 中 `NdnDirServer` 的实现为准。
+> 当 ACL / 权限字段加到 `.cyobj` sidecar 里时,会在 `ndn-toolkit` 先
+> 落地,本服务器自动继承。
+
+## Server context
+
+`CyfsDirServer` 在带 `hook_point` 时需要一个 `CyfsDirServerContext`:
+
+```rust
+pub struct CyfsDirServerContext {
+    pub server_mgr: ServerManagerWeakRef,
+    pub global_process_chains: GlobalProcessChainsRef,
+    pub js_externals: JsExternalsManagerRef,
+    pub global_collection_manager: GlobalCollectionManagerRef,
+}
 ```
 
-### 2. 对象 ID 在 hostname 中
+cyfs-gateway 在 [gateway.rs:274](../src/apps/cyfs_gateway/src/gateway.rs#L274)
+已经为 `cyfs-dir` 类型注册了 context 构造器,正常通过 yaml/json 加载配置
+时不需要手动构造。
 
-```
-GET https://{obj_id}.ndn.example.com/
+## 注册到 ServerManager
+
+应用初始化时按下面的方式同时注册 parser 和 factory(参考
+[lib.rs:91](../src/apps/cyfs_gateway/src/lib.rs#L91) /
+[lib.rs:182](../src/apps/cyfs_gateway/src/lib.rs#L182)):
+
+```rust
+use cyfs_gateway_lib::CyfsDirServerFactory;
+use crate::config_loader::CyfsDirServerConfigParser;
+
+config_loader.register_parser(
+    "cyfs-dir",
+    Arc::new(CyfsDirServerConfigParser::new()),
+);
+
+server_factory.register_server_factory(
+    "cyfs-dir",
+    Arc::new(CyfsDirServerFactory::new()),
+);
 ```
 
-示例：
-```
-GET https://5aSixgLwnWbmcSKvpiaLTqJzg7bxqoPYRCZSPu6Y6p5K.ndn.example.com/
-```
-
-### 3. Mgr 文件路径模式
-
-```
-GET /ndn/path/to/file
-```
-
-示例：
-```
-GET /ndn/test/my_file.txt
-```
+cyfs-gateway 主程序已经默认注册,自定义嵌入时才需要手动调用。
 
 ## 错误处理
 
-NdnServer 返回标准的 HTTP 状态码：
+| 来源 | 状态码 |
+| --- | --- |
+| chain `drop` | 200 |
+| chain `reject` | 403 |
+| chain `error` | 502 |
+| chain 执行异常 / 解析失败 | 500 |
+| 内层 `NdnDirServer` 的常规结果 | 200 / 206 / 4xx / 5xx |
 
-- `200 OK`: 成功返回完整内容
-- `201 Created`: Chunk 创建成功
-- `206 Partial Content`: 返回部分内容（范围请求）
-- `400 Bad Request`: 请求参数错误
-- `403 Forbidden`: 权限不足或功能被禁用
-- `404 Not Found`: 对象不存在
-- `405 Method Not Allowed`: 不支持的 HTTP 方法
-- `500 Internal Server Error`: 服务器内部错误
-
-## 架构说明
-
-### SyncChunkReader
-
-为了使 `ChunkReader` 能够在多线程环境中安全使用（满足 `Sync` trait），NdnServer 实现了一个 `SyncChunkReader` 包装器：
-
-```rust
-struct SyncChunkReader {
-    reader: Arc<tokio::sync::Mutex<ChunkReader>>,
-}
-```
-
-这个包装器：
-- 使用 `Arc<tokio::sync::Mutex<>>` 来包装 `ChunkReader`
-- 实现了 `tokio::io::AsyncRead` trait
-- 允许 `ChunkReader` 在服务器框架中安全使用
-
-### 与 ndn_router 的区别
-
-`NdnServer` 是基于 `cyfs-warp` 中的 `ndn_router` 实现的，但有以下关键区别：
-
-1. **返回类型**：
-   - `ndn_router`: 返回 `UnsyncBoxBody<Bytes, anyhow::Error>`
-   - `NdnServer`: 返回 `BoxBody<Bytes, ServerError>`
-
-2. **错误处理**：
-   - `ndn_router`: 使用 `RouterError`
-   - `NdnServer`: 使用 `ServerError` 和 `ServerErrorCode`
-
-3. **集成方式**：
-   - `ndn_router`: 直接处理 `hyper::Request<Incoming>`
-   - `NdnServer`: 实现 `HttpServer` trait，集成到服务器框架
-
-## 测试
-
-NdnServer 包含单元测试来验证配置的序列化和反序列化：
-
-```bash
-cargo test --package cyfs-gateway-lib ndn_server
-```
-
-## 注册到服务器工厂
-
-要在应用程序中使用 NdnServer，需要将其注册到 `CyfsServerFactory`：
-
-```rust
-use cyfs_gateway_lib::{CyfsServerFactory, NdnServerFactory};
-
-let factory = CyfsServerFactory::new();
-factory.register("ndn".to_string(), Arc::new(NdnServerFactory));
-```
-
-## 最佳实践
-
-1. **只读模式**：对于公共访问的 NDN 服务，建议启用 `read_only` 模式
-2. **访问控制**：使用 `guest_access` 控制是否允许 zone 外访问
-3. **上传控制**：谨慎启用 `enable_zone_put_chunk`，避免滥用存储空间
-4. **路径模式**：根据应用场景选择合适的对象 ID 解析模式
-5. **缓存控制**：NdnServer 自动为 chunk 数据设置长期缓存（max-age=31536000）
+`RESP_cyobj_meta` 字段无效(JSON 格式错、`obj_id` 不合法等)会被当成
+chain 执行异常,返回 500。
 
 ## 相关文档
 
-- [DIR Server 使用文档](dir_server_usage.md)
-- [NDN Router 实现总结](dir_server_implementation_summary.md)
-- [Process Chain 命令](process_chain_cmd.md)
+- [DIR Server 使用文档](dir_server_usage.md) — 纯文件系统的 HTTP 静态服务器
+- [Process Chain 核心模型](process_chain_core_model.md)
+- [Process Chain Gateway 外部命令](process_chain_gateway_external_commands.md)
+- [编写复杂的 process_chain](编写复杂的 process_chain.md)
