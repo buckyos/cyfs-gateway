@@ -162,6 +162,7 @@ RTCP 在线上有两种首部格式。
 
 ```json
 {
+  "aud": "buckyos-rtcp-v2-hello",
   "to": "<target did hostname>",
   "from": "<source did hostname>",
   "xpub": "<hex encoded 32-byte x25519 public key>",
@@ -172,6 +173,11 @@ RTCP 在线上有两种首部格式。
 
 字段说明：
 
+- `aud`
+  - 必填。固定为 `buckyos-rtcp-v2-hello`。
+  - 接收端的 `Validation` 显式 `set_audience(&[RTCP_HELLO_AUD])` 并将 `aud` 列入 `required_spec_claims`；任何不带或不等于该字符串的 token 一律拒绝。
+  - 与 `HelloAck` 用的 `buckyos-rtcp-v2-ack` 互不兼容，杜绝“confused deputy”——一条捕获到的 Hello token 不能被重放成 ack，反之亦然。
+  - 同时是协议版本号：未来不兼容升级会改 `aud` 后缀，旧实现自然解码失败，无需带外协商版本。
 - `to`
   - 发起端认为的目标设备 host name。
   - 接收端会显式校验 `to == <自身 did hostname>`；不匹配直接拒绝，防止把针对 A 的 token 重放到 B。
@@ -179,28 +185,44 @@ RTCP 在线上有两种首部格式。
   - 发起端设备 host name。
   - 接收端会校验它与已确认的来源设备 ID 一致。
 - `xpub`
-  - 发起端本次 tunnel 的一次性 X25519 公钥，16 进制编码。
-  - 接收端据此与自己的静态 X25519 私钥做 DH，导出 tunnel AES key。
+  - 发起端本次握手的**一次性** X25519 公钥，16 进制编码。
+  - v2 中该公钥与设备长期身份完全无关——每次 `create_tunnel()` 都现场生成新的 `EphemeralSecret`/`PublicKey`，握手结束后即丢弃。
+  - 接收端不再据此推导 AES key；它的作用仅是把发起端的临时公钥送上对端，由对端结合自己的临时私钥完成 ECDH（详见 §5.4）。
 - `exp`
   - JWT 过期时间。
   - 当前生成时为“当前时间 + `TUNNEL_TOKEN_EXP_SECS`（60 秒）”；接收端的 `Validation` 显式设 `leeway = JWT_LEEWAY_SECS`（同为 60 秒），所以实际签名接受窗口是 `[exp - leeway, exp + leeway]`。
 - `nonce`
-  - 16 字节随机数，16 进制编码。
+  - 必填。16 字节随机数，16 进制编码。
   - 接收端维护 `(from_id, nonce)` 的短期 cache（容量上限 16 KiB）；每条记录的保留期固定为 `exp + JWT_LEEWAY_SECS`，与签名接受窗口的上界对齐，杜绝“签名仍合法但 nonce 已被清理”的重放缝隙。
-  - 新实现必须携带该字段；缺失 `nonce` 会被接收端视为旧协议 token 并拒绝。
+  - 不再是可选字段；缺失 `nonce` 的 token 在 JWT 解码阶段就会失败。
 
 ### 4.3 HelloAck / HelloAckConfirm
 
-`HelloAck`（服务端发起，已走 AEAD 记录层）：
+`HelloAck`（接收端发起，**明文**）：
 
 ```json
 {
+  "ack_token": "<eddsa jwt signed by responder>",
   "challenge": "<hex encoded 16-byte random>",
   "responder_id": "<responder did hostname>"
 }
 ```
 
-`HelloAckConfirm`（发起端回送，也走 AEAD 记录层）：
+`HelloAck.ack_token` 的 JWT payload 为：
+
+```json
+{
+  "aud": "buckyos-rtcp-v2-ack",
+  "to": "<initiator did hostname>",
+  "from": "<responder did hostname>",
+  "xpub": "<hex encoded 32-byte responder ephemeral x25519 public key>",
+  "peer_xpub": "<echo of Hello.tunnel_token.xpub>",
+  "exp": 1711111111,
+  "nonce": "<hex encoded 16-byte random>"
+}
+```
+
+`HelloAckConfirm`（发起端回送，走 AEAD 记录层）：
 
 ```json
 {
@@ -210,15 +232,22 @@ RTCP 在线上有两种首部格式。
 
 说明：
 
-- 两者都是 §14.2 key-confirmation handshake 的组成部分，发送时点在 `Hello` 已落地并且双方都把承载流包成 `EncryptedStream` 之后。
+- 三条包共同构成 §14.2 的 v2 3-message handshake：发起端 `Hello`（明文）→ 接收端 `HelloAck`（明文）→ 发起端 `HelloAckConfirm`（AEAD）。
 - `HelloAck`
-  - 接收端收到合法 `Hello`、完成 token 验签和 nonce 校验后，随机生成 16 字节 challenge，写入这条包并作为 tunnel AES 流的第一条 AEAD 记录发出。
-  - `responder_id` 用于发起端确认自己连上的确实是预期的对端；当前实现要求它必须等于发起端 `create_tunnel()` 解析出的目标 DID hostname，否则终止握手。
+  - **明文**发送，发送时点紧接 `Hello` 校验通过、但**早于**任何一侧把承载流包成 `EncryptedStream`。
+  - `ack_token`
+    - 接收端用自己长期 Ed25519 私钥签发的 EdDSA JWT，承担 v2 中“证明该临时公钥确实属于这个 responder”的职责（旧版靠静态 X25519 提供这层身份锚定，v2 把它移到这条 JWT 上）。
+    - `aud` 必须等于 `buckyos-rtcp-v2-ack`；与 Hello 的 `aud` 隔离。
+    - `xpub` 是接收端为本次握手新生成的临时 X25519 公钥；与设备长期 X25519 无关。
+    - `peer_xpub` 必须 echo 发起端 Hello 中的 `xpub`，从而把 ack 绑死到这一次握手——即便攻击者拿到同一台 responder 在另一次会话中签出的合法 ack，也无法拼接到本次握手里冒用。
+    - `exp`、`nonce` 行为与 Hello token 一致，复用同一个 `TUNNEL_TOKEN_EXP_SECS` / `JWT_LEEWAY_SECS`。
+  - `challenge` 是接收端为本次握手随机生成的 16 字节十六进制串，发起端必须在 `HelloAckConfirm` 里原样回写。
+  - `responder_id` 用于发起端确认连到的确实是预期 DID；发起端要求它等于 `create_tunnel()` 解析出的目标 DID hostname，否则终止握手。
 - `HelloAckConfirm`
-  - 发起端能解密 `HelloAck` 就意味着它确实持有与自己 ephemeral X25519 私钥对应的共享密钥；将 challenge 原样回写出去即完成持有证明。
-  - 接收端读到 AEAD 记录解密成功，并且 `challenge_echo` 与自己发出的 challenge 完全一致，才会真正接纳 tunnel。
-- `HelloAck` / `HelloAckConfirm` 的 `seq` 复用 Hello 的 seq（`0`），不影响 AEAD 层的 nonce 独立性（后者由 `write_seq` / `read_seq` 单独计数）。
-- 双侧对这两条包都有 15 秒超时：超时即判定握手失败，释放承载流与 `(aes_key, nonce_base)` 槽位。
+  - 发起端在收到并通过 `ack_token` 校验后，先用 `(initiator_eph, responder_eph)` 完成 ECDH，HKDF 派生出本次会话的 `(aes_key, iv)`（详见 §5.4），然后才把承载流包成 `EncryptedStream`，并以 AEAD 记录形式发出 `HelloAckConfirm`。
+  - 接收端收到此 AEAD 记录后，用自己派生的同一把 `(aes_key, iv)` 解密：解密成功即意味着对端确实持有 `responder_eph` 派生的会话密钥，且 `challenge_echo` 必须与自己发出的 challenge 完全一致，才会真正接纳 tunnel。
+- `HelloAck` / `HelloAckConfirm` 的 `seq` 复用 Hello 的 seq（`0`）。`HelloAck` 因为是明文，不参与 AEAD 计数；`HelloAckConfirm` 是该方向 AEAD 序列上的第一条记录。
+- 双侧对这两条包都有 15 秒超时（`HELLO_HANDSHAKE_TIMEOUT`）：超时即判定握手失败，释放承载流与 `(aes_key, iv)` 槽位。
 
 ### 4.4 Ping / Pong
 
@@ -307,29 +336,28 @@ RTCP 在线上有两种首部格式。
 
 ## 5. 认证、密钥交换与加密
 
-RTCP 当前实现同时使用长期设备密钥和短期会话密钥。
+RTCP v2 的认证锚点是双方设备的长期 Ed25519 身份；会话密钥则完全来自双方现场生成的临时 X25519 密钥对，握手结束后即丢弃。这是与 v1 的关键区别——v1 用设备长期 Ed25519 私钥转换出的**静态** X25519 私钥参与 DH，捕获到该长期密钥就能解密所有历史会话；v2 提供前向安全（forward secrecy）。
 
 ### 5.1 本地长期密钥
 
 本地 RTCP 栈启动时会加载设备私钥：
 
-- Ed25519 私钥：用于签发 `tunnel_token`。
-- 同一把私钥转换出的静态 X25519 私钥：用于和对端 `xpub` 做 DH，导出 tunnel 对称密钥。
+- Ed25519 私钥（`this_device_ed25519_sk`）：唯一用途是签发本端发出的 `tunnel_token`（Hello）和 `ack_token`（HelloAck）。
+- v2 不再加载或派生静态 X25519 私钥；旧版的 `this_device_x25519_sk` 字段已被移除。会话密钥所需的 X25519 私钥每次握手现场生成（`EphemeralSecret::random()`），永不落盘、永不复用。
 
-### 5.2 发起侧如何生成 tunnel_token
+### 5.2 发起侧如何生成 Hello tunnel_token
 
 发起侧 `create_tunnel()` 时执行：
 
 1. 解析目标设备 DID。
-2. 解析目标设备的 Ed25519 exchange key：
+2. 解析目标设备的长期 Ed25519 验签公钥：
    - 默认走 `resolve_ed25519_exchange_key(remote_did)`。
    - 如果是 `did:web` 且 DID doc 路径失败，当前实现会 fallback 到 web host 的 TXT 记录，依次尝试 `DEV=` JWT 和 `PKX=` 字段提取设备公钥。
-3. 把目标 Ed25519 公钥转换成 X25519 公钥。
-4. 生成一次性 X25519 密钥对 `my_secret / my_public`。
-5. 用 `my_secret` 和目标 X25519 公钥做 DH。
-6. 对共享密钥做 `SHA-256`，得到 `32` 字节 AES key。
-7. 将 `my_public` 以十六进制写入 `tunnel_token.xpub`。
-8. 用本地 Ed25519 私钥对 JWT 做 EdDSA 签名。
+   - 该 Ed25519 公钥会随 `InitiatorHandshakeState` 一起持有到收到 `HelloAck` 时再用——v2 会用它直接验证 `ack_token` 的签名，因此不需要二次解析。
+3. 现场生成一次性 X25519 密钥对 `(my_secret, my_public)`（`EphemeralSecret::random()`）；私钥仅在收到 `HelloAck` 后用于一次性的 ECDH，之后被消耗。
+4. 生成 16 字节随机 `nonce`。
+5. 构造 `TunnelTokenPayload { aud: "buckyos-rtcp-v2-hello", to, from, xpub: hex(my_public), exp: now + 60s, nonce }` 并用本地 Ed25519 私钥签名。
+6. 不再在发起阶段计算任何对称密钥——v2 的 AES key / IV 必须等到 `HelloAck` 中拿到 `responder_eph` 才能派生。
 
 ### 5.3 接收侧如何确认来源身份
 
@@ -349,21 +377,53 @@ RTCP 当前实现同时使用长期设备密钥和短期会话密钥。
    - 直接根据 `hello.from_id` 解析设备公钥。
    - 用该设备公钥验证 `tunnel_token`。
 
-### 5.4 tunnel AES key 的导出
+### 5.4 tunnel 会话密钥派生
 
-接收端验签 `tunnel_token` 后：
+v2 的会话密钥派生过程是双方对称的，完全由现场生成的临时 X25519 密钥对提供，且把整个握手上下文绑进 KDF。
 
-1. 读取 `xpub`。
-2. 用自己的静态 X25519 私钥与 `xpub` 做 DH。
-3. 对共享密钥做 `SHA-256`。
-4. 得到 tunnel 的 `AES-256 key`。
+接收侧（responder）在验签 `Hello.tunnel_token` 通过、并通过 §14.2 的 nonce-cache 检查后：
+
+1. 现场生成一次性 X25519 密钥对 `(resp_secret, resp_public)`。
+2. 构造 `TunnelAckTokenPayload { aud: "buckyos-rtcp-v2-ack", to: initiator_host, from: this_host, xpub: hex(resp_public), peer_xpub: <Hello.xpub 原文>, exp, nonce }` 并用本端 Ed25519 私钥签名得到 `ack_token`。
+3. 随机生成 16 字节 `challenge`。
+4. 把 `RTcpHelloAckPackage { ack_token, challenge, responder_id }` 以**明文**写到承载流上。
+5. 用 `resp_secret` 与 `Hello.xpub` 解码出的 32 字节做 ECDH，得到 `shared_secret`。
+6. 走 §5.4.1 的 HKDF 派生 `(aes_key, iv)`，再把承载流包成 `EncryptedStream`（responder 方向），等待 AEAD 形式的 `HelloAckConfirm`。
+
+发起侧（initiator）在收到明文 `HelloAck` 后：
+
+1. 用 `state.responder_ed25519_pk_der`（即 §5.2 步骤 2 解析到的 responder 长期 Ed25519 公钥）验证 `ack_token` 的 EdDSA 签名。
+2. 校验 `ack_token.from / to / aud / nonce / exp`，并显式校验 `peer_xpub == 自己 Hello 中的 xpub_hex`——这一步杜绝把别的会话里 responder 签出的合法 ack 拼接到本次握手。
+3. 用 `state.my_secret` 与 `ack_token.xpub` 解码出的 32 字节做 ECDH，得到与 responder 完全相同的 `shared_secret`。
+4. 走 §5.4.1 的 HKDF 派生 `(aes_key, iv)`，把承载流包成 `EncryptedStream`（initiator 方向）。
+5. 在该加密流上发出 AEAD 形式的 `HelloAckConfirm { challenge_echo }`，作为对持有同一把 `(aes_key, iv)` 的证明。
+
+#### 5.4.1 HKDF 派生
+
+```
+PRK    = HKDF-Extract(salt = None, IKM = shared_secret)             // RFC 5869，HMAC-SHA-256
+ctx    = "|" || init_did || "|" || resp_did
+       || "|" || init_xpub_hex || "|" || resp_xpub_hex
+       || "|" || init_nonce || "|" || resp_nonce
+aes_key (32 bytes) = HKDF-Expand(PRK, "buckyos-rtcp-v2 aes256-key" || ctx)
+iv      (16 bytes) = HKDF-Expand(PRK, "buckyos-rtcp-v2 iv-salt"   || ctx)
+```
+
+要点：
+
+- **协议域分离**：两条 `info` 串都以 `buckyos-rtcp-v2 ...` 开头，确保即使未来出现共享同一对长期 Ed25519 密钥的其它 BuckyOS 协议，也不会派生出与 RTCP 碰撞的密钥。
+- **完整握手上下文**：`ctx` 把双方 DID、双方临时 X25519 公钥、双方 nonce 全部塞进 HKDF 的 `info`。任何一处不一致——例如攻击者把不同 ack 拼到本次 Hello——就算碰巧通过签名校验，也会派生出对端无法复现的密钥，下一条 AEAD 记录直接解密失败。
+- **AES key 与 IV 独立派生**：v1 把 `xpub` 的前 16 字节直接当 IV，与 AES key 共享同一个一次性公钥来源；一旦 RNG 出现碰撞，相同 `(key, IV)` 会被复用。v2 用两条不同 `info` 串各自展开，IV 与 AES key 在密码学上彼此独立。
+- 派生材料消费完毕后，`my_secret`（`EphemeralSecret`）自动 drop——move-only 类型保证它只能被 `diffie_hellman` 消费一次。
+
+业务 stream（`Open` / `ROpen` 后的 `streamid`）仍然复用 tunnel 派生出来的 `aes_key`，但 base IV 换成 `streamid` 解码后的 16 字节；nonce 派生规则与 §5.5 一致。
 
 ### 5.5 加密范围
 
-RTCP 当前实现里有两层加密语义：
+RTCP v2 中明文与加密的分界线是 `HelloAckConfirm`：
 
-- `Hello` 和 `HelloStream` 首包本身不加密。
-- 一旦 tunnel 或 stream 被正式接管，后续字节都走 `EncryptedStream`。
+- `Hello`、`HelloAck`、`HelloStream` 三类首包都是**明文**。
+- `HelloAckConfirm` 是该方向 AEAD 上的第一条记录；之后双方的所有控制包与业务字节都通过 `EncryptedStream` 走 AEAD 记录层。
 
 `EncryptedStream` 使用 `AES-256-GCM` AEAD 记录层，同时提供保密性和完整性。线上记录格式：
 
@@ -380,9 +440,9 @@ RTCP 当前实现里有两层加密语义：
 IV/nonce 选择规则：
 
 - tunnel 控制通道
-  - 使用 `tunnel_token.xpub` 解码后的 32 字节中的前 16 字节作为 base IV。
+  - base IV 是 §5.4.1 HKDF 用 `info = "buckyos-rtcp-v2 iv-salt" || ctx` 展开的 16 字节；与 AES key 在 KDF 层独立，且把双方 DID/xpub/nonce 全部绑入。
 - 业务 stream
-  - 使用 `streamid` 解码后的 16 字节作为 base IV。
+  - 使用 `streamid` 解码后的 16 字节作为 base IV（仍由 `streamid` 直接派生）。
 - 每条记录的 96-bit GCM nonce 由以下步骤派生：
   1. 以 base IV 和方向标签（`"rtcp-aead-nonce/A"` 或 `"rtcp-aead-nonce/B"`）做 `SHA-256`，取前 12 字节作为该方向的 `nonce_base`。
   2. 将当前方向的 64-bit 记录序号以大端序 XOR 到 `nonce_base` 的低 8 字节，得到每条记录的唯一 nonce。
@@ -402,10 +462,10 @@ IV/nonce 选择规则：
    - 先对首个地址发起 attempt；
    - 每 `250ms` 起一条新的 attempt，直到耗尽候选；
    - 单个 TCP connect 超过 `10s` 即视为失败，让位给后续 attempt。
-4. 每条 attempt 各自独立：TCP connect 成功后，该 attempt 单独生成 `tunnel_token`、AES key、一次性 `xpub`；握手材料不跨 attempt 复用。
+4. 每条 attempt 各自独立：TCP connect 成功后，该 attempt 单独生成 `tunnel_token`、一次性 X25519 密钥对（`InitiatorHandshakeState`）、随机 `nonce`；握手材料不跨 attempt 复用。AES key/IV **不在此时派生**，要等到收到对应的 `HelloAck`。
 5. 在该 TCP 连接上发送明文 `Hello`。
-6. 立即把承载连接包装成 `EncryptedStream`（initiator 方向），等待对端返回 `HelloAck`，并回送 `HelloAckConfirm`。
-7. **首个** 完成 `HelloAck` / `HelloAckConfirm` 的 attempt 获胜：注册成 tunnel，标记 `can_direct = true`，加入 `tunnel_map`；其余 in-flight attempt 随 `FuturesUnordered` 被 drop 而取消。
+6. 在仍未加密的承载流上读取明文 `HelloAck`，验证 `ack_token`（含 `peer_xpub` 必须 echo 自己 Hello 的 `xpub`）；通过后用 `(my_secret, ack_token.xpub)` 完成 ECDH，走 §5.4.1 的 HKDF 派生 `(aes_key, iv)`，把承载流包成 `EncryptedStream`（initiator 方向），并以 AEAD 形式发出 `HelloAckConfirm`。
+7. **首个** 走完 `Hello` → `HelloAck` 验证 → `HelloAckConfirm` 写出的 attempt 获胜：注册成 tunnel，标记 `can_direct = true`，加入 `tunnel_map`；其余 in-flight attempt 随 `FuturesUnordered` 被 drop 而取消。
 8. 获胜 attempt 的 Hello RTT 通过 `name_client::record_connection_outcome`（`MeasurementLayer::Application`）回写给 name-client，作为下次排序依据；失败 attempt 则按失败原因记录 `Unreachable` 或 `Timeout`。
 9. 启动 tunnel 读循环。
 
@@ -414,23 +474,24 @@ IV/nonce 选择规则：
 1. `accept()` 新 TCP。
 2. 读取首包。
 3. 若首包是 `Hello`，进入 tunnel 建立流程。
-4. 校验来源身份和 `tunnel_token`，并执行 §14.2 的 anti-replay 检查：
+4. 校验来源身份和 `tunnel_token`（`aud == "buckyos-rtcp-v2-hello"`、签名、`from`），并执行 §14.2 的 anti-replay 检查：
    - token payload 里的 `to` 必须等于本机 did hostname。
    - `(from_id, nonce)` 必须尚未出现过。
 5. 从 `Hello.my_port` 提取对端后续回连所需的 RTCP 监听端口。
-6. 依据 `Hello.tunnel_token.xpub` 与本端静态 X25519 私钥导出 tunnel AES key，并把承载连接包装成 `EncryptedStream`（responder 方向）。
-7. 发送 `HelloAck`，并等待对端回送 `HelloAckConfirm`。
+6. 现场生成一次性 X25519 密钥对 `(resp_secret, resp_public)` 和随机 `challenge`，签发 `ack_token`（`aud == "buckyos-rtcp-v2-ack"`，`peer_xpub == Hello.xpub`），并以**明文**形式把 `HelloAck { ack_token, challenge, responder_id }` 发到承载流上。
+7. 用 `(resp_secret, Hello.xpub)` 做 ECDH，走 §5.4.1 的 HKDF 派生 `(aes_key, iv)`；把承载流包成 `EncryptedStream`（responder 方向），等待 AEAD 形式的 `HelloAckConfirm` 并校验 `challenge_echo`。
 8. 只有 key-confirmation 成功后，才调用 `listener.on_new_tunnel(...)` 做准入控制。
 9. 准入通过后，才把这条连接包装成 tunnel，标记 `can_direct = false`，并注册到 `tunnel_map`。
 10. 启动 tunnel 读循环。
 
 ### 6.3 当前实现上的重要事实
 
-- `Hello` 之后还有一次 `HelloAck` / `HelloAckConfirm` 的往返，必须成功才算 tunnel 建立；详见 §14.2。
+- `Hello` 之后还有一次 `HelloAck`（明文）/ `HelloAckConfirm`（AEAD）的往返，必须成功才算 tunnel 建立；详见 §14.2。
 - **TCP 三次握手成功不等于 tunnel 建立成功**。当前实现的建链完成点是“协议层 key-confirmation 成功”，不是 `TcpStream::connect()` 返回。
 - `can_direct` 的设置时机也在 key-confirmation 之后，而不是刚拿到一条 TCP 连接时。
-- `Hello.to_id` 本身仍只用于日志；真正被接收端严格校验的是 token payload 里的 `to`，它必须等于本机 did hostname，否则接收端直接拒绝 tunnel。
+- `Hello.to_id` 本身仍只用于日志；真正被接收端严格校验的是 token payload 里的 `to` + `aud`，它们必须分别等于本机 did hostname 和 `buckyos-rtcp-v2-hello`，否则接收端直接拒绝 tunnel。
 - 对端后续回连端口来自 `Hello.my_port`，不是当前 TCP 连接的源端口。
+- v2 的 AES key/IV 完全派生自双方临时 X25519 密钥对，与设备长期密钥无关——即便长期 Ed25519 私钥之后被泄露，也无法解密任何已经结束的会话。
 
 ## 7. Open 流程
 
@@ -615,11 +676,13 @@ RTCP stack 的 `device_config_path` 当前支持两类文件内容：
 
 为了避免文档误导，下面这些点要特别说明：
 
-- `HelloAck` 已参与建链流程（§14.2），不再是“定义存在、实现未使用”的字段；同时新增了 `HelloAckConfirm` 作为发起端的 key-confirmation 回包。
-- `Hello.to_id` 本身不作为身份校验依据；token payload 中的 `to` 会被严格校验，必须等于本机 did hostname。
+- `HelloAck` 是 v2 3-message handshake 的核心包：携带 responder 签名的 `ack_token`，明文发送，先于密钥派生；`HelloAckConfirm` 才是首条 AEAD 记录。
+- `Hello.to_id` 本身不作为身份校验依据；token payload 中的 `to` + `aud` 都会被严格校验，必须分别等于本机 did hostname 和 `buckyos-rtcp-v2-hello`。
+- 设备的 X25519 私钥**已被废弃**：v2 中 ECDH 双方都用一次性 `EphemeralSecret`，长期 Ed25519 私钥仅用于签发 Hello/HelloAck JWT。
+- 会话密钥不再是 `SHA256(shared_secret)`，而是 HKDF（详见 §5.4.1），且把双方 DID/xpub/nonce 全部绑进 `info`。
 - `OpenResp.result` / `ROpenResp.result` 已经会被等待者读取并触发快速失败，但错误码集合仍然很小，不是完整错误模型。
 - `Pong.timestamp` 当前固定为 `0`，不是对 `Ping.timestamp` 的镜像。
-- tunnel 和 stream 的首包 `Hello` / `HelloStream` 都是明文；真正加密从 `EncryptedStream` 接管后开始（`HelloAck` / `HelloAckConfirm` 已经走加密）。
+- tunnel 的首包 `Hello`、`HelloAck` 以及业务 stream 的 `HelloStream` 都是明文；真正加密从 `HelloAckConfirm` / 业务流首条 AEAD 记录开始。
 - Datagram 不是 UDP 打洞，而是“在加密 TCP stream 里封装 datagram”。
 - `purpose` 当前只支持 `Stream = 0` 和 `Datagram = 1`，没有 raw/no-encryption 模式。
 
@@ -649,45 +712,60 @@ RTCP stack 的 `device_config_path` 当前支持两类文件内容：
 
 - 和 §14.2 的握手重构一起，把记录序号的初始值、方向标签都纳入正式握手确认，避免中途静默切换。
 
-### 14.2 为 Hello 建立抗重放与密钥确认机制（已落地）
+### 14.2 v2 握手：抗重放、密钥确认与前向安全（已落地）
 
-历史问题：
+历史问题（v0/v1 阶段）：
 
-- `Hello` 依赖签名过的 `tunnel_token` 建立 tunnel；接收端验完签就直接发布 tunnel。
-- 没有 challenge-response，也没有显式的 key confirmation；`HelloAck` 结构形同虚设。
-- `tunnel_token` 有效期长达 2 小时；只要攻击者捕获一次合法 `Hello`，就有 2 小时的重放窗口。
-- 重放即便最终跑不通业务，也可能替换现有 tunnel、干扰在线状态、或者污染 `on_new_tunnel` 观察到的结果。
+- 最早期的 `Hello` 依赖签名过的 `tunnel_token` 建立 tunnel，接收端验完签就直接发布 tunnel：没有 challenge-response，也没有显式 key confirmation。
+- v1 引入了 AEAD 加密的 `HelloAck` / `HelloAckConfirm`，关闭了重放替换 tunnel 的窗口；但 ECDH 仍由发起端 ephemeral X25519 ↔ **responder 长期 X25519** 完成，长期密钥泄露后所有历史会话可被解密（无前向安全）。
+- v1 的会话密钥是 `SHA256(shared_secret)`，IV 直接取 `xpub` 前 16 字节——AES key 与 IV 共享同一个一次性公钥来源，对 RNG 碰撞没有缓冲。
 
-当前实现（3-message handshake）：
+当前实现（v2 3-message handshake）：
 
 1. **Hello（明文，initiator → responder）**
-   - `tunnel_token` payload 新增 `nonce`（16 字节随机）和 `exp = now + 60s`（不再是 2 小时）。
+   - `tunnel_token` payload 形如 §4.2，必填 `aud = "buckyos-rtcp-v2-hello"`、`nonce` 与 `exp = now + 60s`。
+   - `xpub` 是发起端**当场生成**的一次性 X25519 公钥；与设备长期身份解耦。
    - 接收端依次校验：
-     - EdDSA 签名合法。
+     - JWT EdDSA 签名合法。
+     - `aud` 严格等于 `RTCP_HELLO_AUD`（`set_audience` + `required_spec_claims = ["exp", "aud"]`）。
      - `from` 等于 `Hello.from_id` 对应的已验证设备身份。
      - `to` 等于本机 did hostname——防止把针对 A 的 token 重放到 B。
-     - `(from_id, nonce)` 不在短期 cache 中（容量 16 KiB，按 exp 自动过期）；命中即立刻拒绝。
-2. **HelloAck（AEAD 加密，responder → initiator）**
-   - 接收端派生 tunnel AES key、把承载流包成 `EncryptedStream`（responder 方向），然后随机生成 16 字节 challenge，作为 tunnel 上第一条 AEAD 记录发出。
-   - 由于 challenge 完全在 AEAD 之后发送，任何不持有 AES key 的中间人或重放者都无法看到 challenge 明文。
-3. **HelloAckConfirm（AEAD 加密，initiator → responder）**
-   - 发起端收到能解密的 `HelloAck`，即意味着远端确实与自己做了同一组 X25519-DH，得到同一把 AES key；把 `challenge` 原样回写出去即完成持有证明。
-   - 接收端只有在 `challenge_echo` 与自己发出的 challenge 完全一致时，才会把 tunnel 注册进 `tunnel_map` 并触发 `on_new_tunnel` 回调；否则直接丢弃。
+     - `(from_id, nonce)` 不在短期 cache 中（容量 16 KiB，按 `exp + JWT_LEEWAY_SECS` 自动过期）；命中即立刻拒绝。
+2. **HelloAck（明文，responder → initiator）**
+   - 接收端通过 §14.2 的 anti-replay 检查后，现场生成新的临时 X25519 密钥对 `(resp_secret, resp_public)` 和随机 16 字节 `challenge`。
+   - 用本端 Ed25519 私钥签发 `ack_token`（payload 见 §4.3），关键字段：
+     - `aud = "buckyos-rtcp-v2-ack"`，与 Hello 的 audience 严格隔离。
+     - `xpub = hex(resp_public)`，公开本端临时公钥。
+     - `peer_xpub = Hello.xpub`，把这条 ack 绑到本次握手——攻击者即便拿到同一个 responder 在别的会话里签过的合法 ack，也因为 `peer_xpub` 不匹配而无法拼接到当前会话上。
+   - 把 `RTcpHelloAckPackage { ack_token, challenge, responder_id }` 以**明文**形式写到承载流上。
+   - 然后用 `(resp_secret, Hello.xpub)` 完成 ECDH，走 §5.4.1 的 HKDF 派生 `(aes_key, iv)`，把承载流包成 `EncryptedStream`（responder 方向），等待 AEAD 形式的 `HelloAckConfirm`。
+3. **HelloAckConfirm（AEAD，initiator → responder）**
+   - 发起端在仍未加密的承载流上读到明文 `HelloAck`，立即用 §5.2 步骤 2 缓存的 responder 长期 Ed25519 公钥验证 `ack_token`，并校验 `aud` / `from` / `to` / `peer_xpub == 自己 Hello.xpub`。
+   - 任意一项不通过即终止握手，`peer_xpub` 不匹配是 v2 防 ack-splicing 的关键护栏。
+   - 通过后用 `(my_secret, ack_token.xpub)` 完成 ECDH，与 responder 派生出**同一把** `(aes_key, iv)`；把承载流包成 `EncryptedStream`（initiator 方向）。
+   - 在加密流上发出 `HelloAckConfirm { challenge_echo = ack.challenge }`。
+   - 接收端只有在该 AEAD 记录解密成功，且 `challenge_echo` 与本端发出的 `challenge` 完全一致时，才把 tunnel 注册进 `tunnel_map` 并触发 `on_new_tunnel` 回调；否则直接丢弃。
 
 落地后的性质：
 
-- **Challenge-response**：`HelloAck.challenge` 是服务端每次都新生成的随机因子，满足文档此前要求的“服务端 challenge 或等价随机因子”。
-- **Key-confirmation**：发起端必须用 AEAD key 加密一个正确回写的 challenge，才能让接收端接纳 tunnel；这等价于“发起端对 challenge 和会话密钥的持有证明”。
-- **Anti-replay**：双层防护——外层 nonce cache 让同一 token 在 exp 窗口内无法二次被接纳；内层 AEAD 握手让即使攻击者成功重放了 Hello（比如 nonce cache 已过期），也因为拿不到 ephemeral X25519 私钥、无法解密 `HelloAck`、无法产出合法 `HelloAckConfirm`。
-- **超时与清理**：`HelloAck` / `HelloAckConfirm` 各自 15 秒超时；一旦超时或包体不合法，接收端立刻关闭承载流并释放占用的 `(aes_key, nonce_base)` 槽位。
-- **listener 回调时机改变**：`listener.on_new_tunnel(...)` 的触发被推迟到 key-confirmation 通过之后。重放者无法让 `on_new_tunnel` 观察到虚假事件。
-- **兼容性**：这是一次 **不兼容的协议升级**。新实现的 token 必须带 `nonce`，拒绝所有缺失 `nonce` 的 Hello；旧实现也不会发出 `HelloAckConfirm`，因此新旧两侧无法互通。部署时两端必须一起升级，与 §14.1 的 AEAD 切换合并一次完成即可。
+- **前向安全（v2 新增）**：会话密钥派生于双方临时 X25519 密钥对的 ECDH，握手结束后 `EphemeralSecret` 立即被消耗丢弃；事后即便长期 Ed25519 私钥被泄露，攻击者也无法解密任何已经结束的 RTCP 会话。
+- **Challenge-response + Key-confirmation**：`HelloAck.challenge` 是 responder 每次新生成的随机因子；发起端必须先用派生出的 AES key 把它原样加密回写，才能让接收端接纳 tunnel——这等价于“发起端对 challenge 和会话密钥的持有证明”。
+- **Anti-replay**：三层防护——
+  1. nonce cache：同一个 Hello token 在 `exp + JWT_LEEWAY_SECS` 窗口内不会二次被接纳；
+  2. ack 绑定：即便攻击者同时控制本次承载流并重放 Hello，他也产出不了与 `Hello.xpub` 匹配的 `ack_token`（需要 responder 长期 Ed25519 私钥）；
+  3. AEAD key 持有证明：拿到对方临时公钥也无法绕过 ECDH，因此攻击者无法派生 `(aes_key, iv)`，自然无法构造合法的 `HelloAckConfirm`。
+- **Audience / 协议域隔离**：Hello 与 HelloAck 的 `aud` 各自固定（`buckyos-rtcp-v2-hello` / `buckyos-rtcp-v2-ack`），同一把 Ed25519 私钥就算被复用到将来其它 BuckyOS 协议，也不能产生交叉认可的 token——这是 confused-deputy 的常见缓解。HKDF 的 `info` 串以 `buckyos-rtcp-v2 ...` 开头，提供进一步的密钥域分离。
+- **Ack-splicing 防护**：`ack_token.peer_xpub` 必须 echo 发起端 `Hello.xpub`，把 ack 物理地绑到**这一次**握手；与 `aud = "...-ack"` 配合后，已签出的 ack token 不可能被回收复用到任何其它会话。
+- **超时与清理**：`HelloAck` / `HelloAckConfirm` 各自 15 秒超时；一旦超时或包体不合法，接收端立刻关闭承载流并释放占用的 `(aes_key, iv)` 槽位。
+- **listener 回调时机**：`listener.on_new_tunnel(...)` 的触发被推迟到 key-confirmation 通过之后；重放者无法让 `on_new_tunnel` 观察到虚假事件。
+- **兼容性**：v2 是一次 **不兼容的协议升级**。`tunnel_token` 必须带 `aud` 与 `nonce`；`HelloAck` 改为明文且必须带 `ack_token`；HKDF 派生与 v1 的 `SHA256(shared_secret)` + IV-from-xpub 不同。任何只改一端的部署都会握手失败——`aud` 校验在 JWT 解码阶段就会拒绝旧版 token；新 responder 也不会再用静态 X25519 私钥解 v1 token。两端必须同步升级，且与 §14.1 的 AEAD 切换是同一波协议升级的一部分。
 
 注意事项：
 
 - `nonce_cache` 只在本进程内存里维护；如果一台设备水平扩展成多个 RTCP stack 实例（例如多机负载均衡），需要额外的跨实例抗重放手段。当前实现不提供。
 - 60s 的 `TUNNEL_TOKEN_EXP_SECS` + 60s 的显式 `JWT_LEEWAY_SECS`，意味着两端时钟最多允许约 2 分钟偏差；如果部署环境时钟漂移更大，需要在上层配置 NTP 或显式调整 `JWT_LEEWAY_SECS`（同时记得 nonce-cache 的保留期也会随之放大，这是期望的，不要只改签名验证侧）。
-- `HelloAck.responder_id` 虽然用 AEAD 加密，但它只是“提示字段”，对初始化 tunnel 的身份认证并非必需——真正的身份锚点是：AES key 来自对端静态 X25519 私钥，而该私钥由 DID 公钥体系提供。保留 `responder_id` 便于日志排查和多身份部署下的 sanity check。
+- `HelloAck.responder_id` 当前是明文字段，对初始化 tunnel 的身份认证并非必需——真正的身份锚点是 `ack_token` 的 EdDSA 签名（用 §5.2 解析到的 responder 长期 Ed25519 公钥验证），它把 responder 临时 X25519 公钥与设备身份强绑定。保留 `responder_id` 便于日志排查和多身份部署下的 sanity check。
+- `EphemeralSecret`（来自 `x25519-dalek`）是 move-only 类型，DH 后即被消费；这是密码学上保证“一次性”的语言级护栏，不要尝试绕过它做密钥复用。
 
 ### 14.3 stream 建立超时、配额与清理语义（已落地）
 

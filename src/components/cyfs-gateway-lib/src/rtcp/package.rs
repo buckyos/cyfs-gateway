@@ -54,10 +54,31 @@ where
     pub body: T,
 }
 
+// JWT audience tag for the initiator's Hello token. Decode rejects any
+// token whose `aud` is missing or not exactly this string. Bumping the
+// suffix is how RTCP signals an incompatible handshake protocol revision
+// without relying on an out-of-band version negotiation.
+pub(crate) const RTCP_HELLO_AUD: &str = "buckyos-rtcp-v2-hello";
+
+// JWT audience tag for the responder's HelloAck token. Distinct from the
+// Hello tag so that a captured Hello cannot be re-purposed as an ack and
+// vice-versa (this is the "confused deputy" mitigation called out in
+// §14.2 of doc/rtcp.md).
+pub(crate) const RTCP_HELLO_ACK_AUD: &str = "buckyos-rtcp-v2-ack";
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct TunnelTokenPayload {
+    // Audience binding (RFC 7519 §4.1.3). Pinned to RTCP_HELLO_AUD; any
+    // other value is rejected at decode time. Locks this token to the
+    // RTCP Hello flow and a specific protocol version, so it cannot be
+    // replayed against a future BuckyOS protocol that happens to share
+    // the same Ed25519 signing key.
+    pub aud: String,
     pub to: String,
     pub from: String,
+    // Hex-encoded ephemeral X25519 public key. v2 always uses a freshly-
+    // generated ephemeral key here; the key is no longer derived from
+    // the device's long-term Ed25519 identity.
     pub xpub: String,
     pub exp: u64,
     // Hex-encoded random nonce (16 random bytes -> 32 hex chars).
@@ -67,11 +88,31 @@ pub(crate) struct TunnelTokenPayload {
     // closes the replay gap documented in §14.2 of doc/rtcp.md: without the
     // nonce, a captured Hello could be replayed verbatim until the 60s
     // token expiry plus clock leeway elapsed.
-    //
-    // Optional for backwards-compat deserialization only; new tokens
-    // always set it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub nonce: Option<String>,
+    pub nonce: String,
+}
+
+// Responder's signed JWT carried inside HelloAck. Binds the responder's
+// fresh ephemeral X25519 public key to its long-term Ed25519 identity,
+// and to the *specific* Hello it is acking via `peer_xpub`.
+//
+// Without `peer_xpub` an attacker could splice an ack from a different
+// session onto a Hello they captured -- both would type-check as valid
+// JWTs from the responder. Embedding the initiator's ephemeral pin closes
+// that splicing window.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct TunnelAckTokenPayload {
+    pub aud: String,
+    pub to: String,
+    pub from: String,
+    // Hex-encoded ephemeral X25519 public key for this side (responder).
+    pub xpub: String,
+    // Hex-encoded ephemeral X25519 public key from the initiator's Hello
+    // that this ack is responding to. Binds the ack to one specific
+    // handshake: a captured ack cannot be re-served against a different
+    // initiator session, even by the same device.
+    pub peer_xpub: String,
+    pub exp: u64,
+    pub nonce: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -128,29 +169,44 @@ impl RTcpHelloPackage {
     }
 }
 
-// HelloAck is the server's first AEAD-encrypted record in the §14.2
-// 3-message handshake. It carries a fresh 16-byte challenge that the
-// initiator must echo back in HelloAckConfirm. A replayer that does not
-// hold the ephemeral X25519 secret cannot derive the AEAD key, so it
-// cannot even decrypt `challenge`, let alone produce a valid confirm.
+// HelloAck is the responder's plaintext reply in the v2 handshake. It
+// publishes the responder's fresh ephemeral X25519 public key (carried
+// inside `ack_token`, signed by the responder's long-term Ed25519 key)
+// plus a fresh challenge. Both sides then derive the session key from
+// ECDH(initiator_eph, responder_eph) -- a pure ephemeral exchange, so
+// compromise of the long-term Ed25519 keys later does not unlock past
+// sessions (forward secrecy).
+//
+// The challenge is sent in the clear here: HelloAckConfirm flows over
+// the AEAD record layer, and an attacker without the derived AES key
+// cannot produce a valid encrypted echo. The ack_token's signature
+// (verified against the responder's published Ed25519 key) is what
+// authenticates the responder's ephemeral key.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct RTcpHelloAckBody {
-    // Hex-encoded 16 random bytes.
+    // JWT signed by responder's Ed25519 long-term key, payload is
+    // TunnelAckTokenPayload. Carries the responder's ephemeral X25519
+    // public key bound to the initiator's `xpub` from the Hello.
+    pub ack_token: String,
+    // Hex-encoded 16 random bytes. Initiator echoes this back inside an
+    // AEAD record (HelloAckConfirm) to prove it derived the same session
+    // key.
     pub challenge: String,
-    // Responder's DID hostname. Binds the ack to this specific responder
-    // so the initiator can cross-check it against the `to` it asked for.
+    // Responder's DID hostname. Initiator cross-checks against the `to`
+    // it signed into the original Hello.
     pub responder_id: String,
 }
 pub(crate) type RTcpHelloAckPackage = RTcpTunnelPackageImpl<RTcpHelloAckBody>;
 
 impl RTcpHelloAckPackage {
-    pub fn new(seq: u32, challenge: String, responder_id: String) -> Self {
+    pub fn new(seq: u32, ack_token: String, challenge: String, responder_id: String) -> Self {
         RTcpHelloAckPackage {
             len: 0,
             json_pos: 0,
             cmd: CmdType::HelloAck.into(),
             seq: seq,
             body: RTcpHelloAckBody {
+                ack_token,
                 challenge,
                 responder_id,
             },

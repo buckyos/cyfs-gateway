@@ -23,8 +23,9 @@ use log::*;
 use name_client::*;
 use name_lib::*;
 use percent_encoding::percent_decode_str;
+use hkdf::Hkdf;
 use rand::Rng;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::fmt;
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -42,7 +43,7 @@ use tokio::task;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use url::Url;
-use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+use x25519_dalek::{EphemeralSecret, PublicKey};
 
 pub struct RTcp {
     inner: Arc<RTcpInner>,
@@ -221,6 +222,33 @@ impl NonceCache {
     }
 }
 
+// Captures the initiator's per-handshake state from the moment the Hello
+// is signed until HelloAck is verified and the session keys are derived.
+//
+// Held by-value across the network round-trip rather than by reference so
+// `EphemeralSecret` (move-only, single-use) can be consumed exactly once
+// when ECDH runs against the responder's ephemeral public key.
+struct InitiatorHandshakeState {
+    token: String,
+    my_secret: EphemeralSecret,
+    my_xpub_bytes: [u8; 32],
+    my_xpub_hex: String,
+    my_nonce_hex: String,
+    responder_ed25519_pk_der: Vec<u8>,
+    responder_did: String,
+}
+
+// Decode a hex-encoded 32-byte X25519 public key. Used by both Hello and
+// HelloAck JWT verification paths.
+fn decode_x25519_pub_hex(hex_str: &str) -> Result<[u8; 32], TunnelError> {
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        TunnelError::ReasonError(format!("decode x25519 pub hex error:{}", e))
+    })?;
+    bytes.try_into().map_err(|_| {
+        TunnelError::ReasonError("x25519 pub key must be exactly 32 bytes".to_string())
+    })
+}
+
 struct RTcpInner {
     tunnel_map: RTcpTunnelMap,
     stream_helper: RTcpStreamBuildHelper,
@@ -230,7 +258,6 @@ struct RTcpInner {
     reuse_address: bool,
     this_device_did: DID, //name or did
     this_device_ed25519_sk: Option<EncodingKey>,
-    this_device_x25519_sk: Option<StaticSecret>,
     this_device_doc_jwt: Option<String>,
     // Used by create_tunnel to build a bootstrap stream through the tunnel
     // framework when the stack id carries a `params@remote` prefix. None means
@@ -504,7 +531,7 @@ impl RTcpInner {
         let local_addr = tunnel_stream.local_addr().ok();
         let peer_addr = tunnel_stream.peer_addr().ok();
 
-        let (tunnel_token, aes_key, random_pk) = self
+        let state = self
             .generate_tunnel_token(remote_device_id.to_string())
             .await
             .map_err(|e| {
@@ -512,6 +539,7 @@ impl RTcpInner {
                 error!("{}", msg);
                 msg
             })?;
+        let initiator_did = self.this_device_did.to_host_name();
 
         let addr: SocketAddr = self.bind_addr.parse().unwrap();
         let hello_package = RTcpHelloPackage::new(
@@ -519,7 +547,7 @@ impl RTcpInner {
             self.this_device_did.to_string(),
             remote_device_id.to_string(),
             addr.port(),
-            Some(tunnel_token),
+            Some(state.token.clone()),
             self.this_device_doc_jwt.clone(),
         );
         let hello_started_at = Instant::now();
@@ -538,28 +566,27 @@ impl RTcpInner {
             ));
         }
 
-        // §14.2 key confirmation: a direct attempt only wins after the
-        // protocol-level HelloAck / HelloAckConfirm exchange completes.
-        let mut iv = [0u8; 16];
-        iv.copy_from_slice(&random_pk[..16]);
+        // v2 §14.2 key confirmation: read plaintext HelloAck, verify the
+        // responder's signed ack token, derive session keys via HKDF,
+        // wrap the stream, then send the AEAD-protected confirm. A
+        // direct attempt only wins after this completes.
         let bearing: RTcpBearingStream = Box::new(tunnel_stream);
-        let mut encrypted_stream =
-            EncryptedStream::new(bearing, &aes_key, &iv, EncryptionRole::Initiator);
-        let expected_remote_host = remote_stack.did.to_host_name();
-        if let Err(e) =
-            initiator_key_confirmation(&mut encrypted_stream, &expected_remote_host).await
-        {
-            warn!("key confirmation to {} error: {}", remote_addr, e);
-            let outcome = if e.is_timeout() {
-                ConnectionOutcome::Timeout {
-                    elapsed: hello_started_at.elapsed(),
+        let (encrypted_stream, aes_key) =
+            match initiator_complete_handshake(bearing, state, &initiator_did).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("key confirmation to {} error: {}", remote_addr, e);
+                    let outcome = if e.is_timeout() {
+                        ConnectionOutcome::Timeout {
+                            elapsed: hello_started_at.elapsed(),
+                        }
+                    } else {
+                        ConnectionOutcome::Unreachable
+                    };
+                    Self::record_direct_attempt_outcome(local_addr, remote_addr, outcome);
+                    return Err(format!("{} => key confirmation error: {}", remote_addr, e));
                 }
-            } else {
-                ConnectionOutcome::Unreachable
             };
-            Self::record_direct_attempt_outcome(local_addr, remote_addr, outcome);
-            return Err(format!("{} => key confirmation error: {}", remote_addr, e));
-        }
 
         Self::record_direct_attempt_outcome(
             local_addr,
@@ -593,22 +620,15 @@ impl RTcpInner {
         this_device_doc_jwt: Option<String>,
         listener: RTcpListenerRef,
     ) -> RTcpInner {
-        let mut this_device_x25519_sk = None;
-        let mut this_device_ed25519_sk = None;
-        if private_key_pkcs8_bytes.is_some() {
-            let private_key_pkcs8_bytes = private_key_pkcs8_bytes.unwrap();
-            //info!("rtcp stack ed25519 private_key pkcs8 bytes: {:?}",private_key_pkcs8_bytes);
-            let encoding_key = EncodingKey::from_ed_der(&private_key_pkcs8_bytes);
-            this_device_ed25519_sk = Some(encoding_key);
-
-            let private_key_bytes = from_pkcs8(&private_key_pkcs8_bytes).unwrap();
-            //info!("rtcp stack ed25519 private_key  bytes: {:?}",private_key_bytes);
-
-            let x25519_private_key =
-                ed25519_to_curve25519::ed25519_sk_to_curve25519(private_key_bytes);
-            //info!("rtcp stack x25519 private_key_bytes: {:?}",x25519_private_key);
-            this_device_x25519_sk = Some(x25519_dalek::StaticSecret::from(x25519_private_key));
-        }
+        // v2 handshake: the device's long-term Ed25519 key is used only
+        // to sign Hello / HelloAck JWTs. ECDH is run between freshly-
+        // generated ephemeral X25519 keys on each side, so there is no
+        // long-term X25519 secret to keep around any more. (See §14.2 of
+        // doc/rtcp.md: dropping the static X25519 is what gives the
+        // session forward secrecy against future Ed25519 key exposure.)
+        let this_device_ed25519_sk = private_key_pkcs8_bytes
+            .as_ref()
+            .map(|bytes| EncodingKey::from_ed_der(bytes));
 
         let result = RTcpInner {
             tunnel_map: RTcpTunnelMap::new(),
@@ -618,8 +638,7 @@ impl RTcpInner {
             bind_addr,
             reuse_address: false,
             this_device_did,
-            this_device_ed25519_sk: this_device_ed25519_sk, //for sign tunnel token
-            this_device_x25519_sk: this_device_x25519_sk,   //for decode tunnel token from remote
+            this_device_ed25519_sk, //for sign tunnel token
             this_device_doc_jwt,
             tunnel_manager: None,
             nonce_cache: NonceCache::new(),
@@ -627,43 +646,62 @@ impl RTcpInner {
         return result;
     }
 
-    // return (tunnel_token,aes_key,my_public_bytes)
+    fn fresh_ephemeral() -> (EphemeralSecret, [u8; 32], String) {
+        let secret = EphemeralSecret::random();
+        let public = PublicKey::from(&secret);
+        let public_bytes = public.to_bytes();
+        let public_hex: String = public.encode_hex();
+        (secret, public_bytes, public_hex)
+    }
+
+    fn fresh_nonce_hex() -> String {
+        let mut nonce_bytes = [0u8; 16];
+        rand::thread_rng().fill(&mut nonce_bytes);
+        nonce_bytes.encode_hex()
+    }
+
+    fn sign_jwt<T: serde::Serialize>(
+        ed25519_sk: &EncodingKey,
+        payload: &T,
+    ) -> Result<String, TunnelError> {
+        let payload_value = serde_json::to_value(payload)
+            .map_err(|e| TunnelError::ReasonError(format!("encode jwt payload error:{}", e)))?;
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = None;
+        header.typ = None;
+        encode(&header, &payload_value, ed25519_sk)
+            .map_err(|e| TunnelError::ReasonError(format!("sign jwt error:{}", e)))
+    }
+
+    // Generate the initiator's Hello token (signed JWT carrying the
+    // initiator's *ephemeral* X25519 public key). Also resolves the
+    // responder's long-term Ed25519 verifying key here so the same key
+    // can be used to verify HelloAck without a second resolve round-trip.
     async fn generate_tunnel_token(
         &self,
         remote_hostname: String,
-    ) -> Result<(String, [u8; 32], [u8; 32]), TunnelError> {
-        if self.this_device_ed25519_sk.is_none() {
-            return Err(TunnelError::DocumentError(
-                "this device ed25519 sk is none".to_string(),
-            ));
-        }
+    ) -> Result<InitiatorHandshakeState, TunnelError> {
+        let ed25519_sk = self.this_device_ed25519_sk.as_ref().ok_or_else(|| {
+            TunnelError::DocumentError("this device ed25519 sk is none".to_string())
+        })?;
         let remote_did = DID::from_str(remote_hostname.as_str()).map_err(|op| {
             TunnelError::DocumentError(format!("invalid remote device is not did: {}", op))
         })?;
 
-        let exchange_key = Self::resolve_exchange_key(&remote_did)
+        let responder_ed25519_pk_der = Self::resolve_exchange_key(&remote_did)
             .await
             .map_err(|op| {
                 let msg = format!(
-                    "cann't resolve remote device {} ed25519 exchange key: {}",
+                    "cann't resolve remote device {} ed25519 verifying key: {}",
                     remote_hostname.as_str(),
                     op
                 );
                 error!("{}", msg);
                 TunnelError::DocumentError(msg)
-            })?;
+            })?
+            .to_vec();
 
-        //info!("remote ed25519 auth_key: {:?}",auth_key);
-        let remote_x25519_pk = ed25519_to_curve25519::ed25519_pk_to_curve25519(exchange_key);
-        //info!("remote x25519 pk: {:?}",remote_x25519_pk);
-
-        let my_secret = EphemeralSecret::random();
-        let my_public = PublicKey::from(&my_secret);
-        let my_public_bytes = my_public.to_bytes();
-        let my_public_hex = my_public.encode_hex();
-        //info!("my_public_hex: {:?}",my_public_hex);
-        let aes_key = RTcpInner::generate_aes256_key(my_secret, remote_x25519_pk);
-        //info!("aes_key: {:?}",aes_key);
+        let (my_secret, my_public_bytes, my_public_hex) = Self::fresh_ephemeral();
 
         // §14.2: embed a fresh 16-byte random nonce and use a short exp
         // (default 60s). The responder keeps a nonce cache for the exp
@@ -671,135 +709,133 @@ impl RTcpInner {
         // up a second tunnel. An attacker that replays an already-used
         // token will be rejected at the nonce check even before the key-
         // confirmation handshake kicks in.
-        let mut nonce_bytes = [0u8; 16];
-        rand::thread_rng().fill(&mut nonce_bytes);
-        let nonce_hex: String = nonce_bytes.encode_hex();
+        let nonce_hex = Self::fresh_nonce_hex();
 
-        //create jwt by tunnel token payload
         let tunnel_token_payload = TunnelTokenPayload {
+            aud: RTCP_HELLO_AUD.to_string(),
             to: remote_did.to_host_name(),
             from: self.this_device_did.to_host_name(),
-            xpub: my_public_hex,
+            xpub: my_public_hex.clone(),
             exp: buckyos_get_unix_timestamp() + TUNNEL_TOKEN_EXP_SECS,
-            nonce: Some(nonce_hex),
+            nonce: nonce_hex.clone(),
         };
         debug!(
-            "generated tunnel token payload for {} -> {}",
+            "generated v2 hello token for {} -> {}",
             tunnel_token_payload.from, tunnel_token_payload.to
         );
-        let payload = serde_json::to_value(&tunnel_token_payload).map_err(|op| {
-            TunnelError::ReasonError(format!("encode tunnel token payload error:{}", op))
+        let tunnel_token = Self::sign_jwt(ed25519_sk, &tunnel_token_payload)?;
+
+        Ok(InitiatorHandshakeState {
+            token: tunnel_token,
+            my_secret,
+            my_xpub_bytes: my_public_bytes,
+            my_xpub_hex: my_public_hex,
+            my_nonce_hex: nonce_hex,
+            responder_ed25519_pk_der,
+            responder_did: remote_did.to_host_name(),
+        })
+    }
+
+    // Generate the responder's HelloAck JWT, binding the responder's
+    // fresh ephemeral X25519 public key to the initiator's `peer_pub_hex`
+    // from the Hello (so the ack can't be spliced into a different
+    // session).
+    async fn generate_ack_token(
+        &self,
+        initiator_hostname: &str,
+        peer_pub_hex: &str,
+    ) -> Result<(String, EphemeralSecret, [u8; 32], String), TunnelError> {
+        let ed25519_sk = self.this_device_ed25519_sk.as_ref().ok_or_else(|| {
+            TunnelError::DocumentError("this device ed25519 sk is none".to_string())
         })?;
+        let (my_secret, my_public_bytes, my_public_hex) = Self::fresh_ephemeral();
+        let nonce_hex = Self::fresh_nonce_hex();
 
-        let mut header = Header::new(Algorithm::EdDSA);
-        header.kid = None;
-        header.typ = None;
-        let tunnel_token = encode(
-            &header,
-            &payload,
-            &self.this_device_ed25519_sk.as_ref().unwrap(),
-        );
-        if tunnel_token.is_err() {
-            let err_str = tunnel_token.err().unwrap().to_string();
-            return Err(TunnelError::ReasonError(err_str));
-        }
-        let tunnel_token = tunnel_token.unwrap();
-
-        Ok((tunnel_token, aes_key, my_public_bytes))
+        let payload = TunnelAckTokenPayload {
+            aud: RTCP_HELLO_ACK_AUD.to_string(),
+            to: initiator_hostname.to_owned(),
+            from: self.this_device_did.to_host_name(),
+            xpub: my_public_hex,
+            peer_xpub: peer_pub_hex.to_owned(),
+            exp: buckyos_get_unix_timestamp() + TUNNEL_TOKEN_EXP_SECS,
+            nonce: nonce_hex.clone(),
+        };
+        let token = Self::sign_jwt(ed25519_sk, &payload)?;
+        Ok((token, my_secret, my_public_bytes, nonce_hex))
     }
 
-    fn generate_aes256_key(
-        this_private_key: EphemeralSecret,
-        x25519_public_key: [u8; 32],
-    ) -> [u8; 32] {
-        //info!("will create share sec with remote x25519 pk: {:?}",x25519_public_key);
-        let x25519_public_key = x25519_dalek::PublicKey::from(x25519_public_key);
-        let shared_secret = this_private_key.diffie_hellman(&x25519_public_key);
-
-        let mut hasher = Sha256::new();
-        hasher.update(shared_secret.as_bytes());
-        let key_bytes = hasher.finalize();
-        return key_bytes.try_into().unwrap();
-        //return shared_secret.as_bytes().clone();
-    }
-
-    fn decode_tunnel_token_with_key(
-        this_private_key: &StaticSecret,
-        token: String,
-        from_public_key: &DecodingKey,
-        expected_from: Option<&str>,
-    ) -> Result<([u8; 32], [u8; 32], TunnelTokenPayload), TunnelError> {
+    fn jwt_validation_for(aud: &str) -> Validation {
         // Explicit leeway pinned to JWT_LEEWAY_SECS so the nonce-cache
         // retention window stays aligned with the signature acceptance
         // window (see §14.2 anti-replay fix).
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.leeway = JWT_LEEWAY_SECS;
-        let tunnel_token_payload =
-            decode::<TunnelTokenPayload>(token.as_str(), from_public_key, &validation);
-        if tunnel_token_payload.is_err() {
-            return Err(TunnelError::DocumentError(
-                "decode tunnel token error".to_string(),
-            ));
-        }
-        let tunnel_token_payload = tunnel_token_payload.unwrap();
-        let tunnel_token_payload = tunnel_token_payload.claims;
+        validation.set_audience(&[aud]);
+        validation.set_required_spec_claims(&["exp", "aud"]);
+        validation
+    }
+
+    // Verify a Hello token's JWT signature, audience, and `from` binding.
+    // Does NOT touch any X25519 secret; the ephemeral DH is finished by
+    // the caller after it generates its own ephemeral key for HelloAck.
+    fn verify_hello_token(
+        token: &str,
+        from_public_key: &DecodingKey,
+        expected_from: Option<&str>,
+    ) -> Result<([u8; 32], TunnelTokenPayload), TunnelError> {
+        let validation = Self::jwt_validation_for(RTCP_HELLO_AUD);
+        let decoded = decode::<TunnelTokenPayload>(token, from_public_key, &validation)
+            .map_err(|e| TunnelError::DocumentError(format!("decode hello token error:{}", e)))?;
+        let payload = decoded.claims;
         if let Some(expected_from) = expected_from {
-            if tunnel_token_payload.from != expected_from {
+            if payload.from != expected_from {
                 return Err(TunnelError::DocumentError(format!(
-                    "tunnel token from {} not match expected {}",
-                    tunnel_token_payload.from, expected_from
+                    "hello token from {} not match expected {}",
+                    payload.from, expected_from
                 )));
             }
         }
-        //info!("tunnel_token_payload: {:?}",tunnel_token_payload);
-        let remomte_x25519_pk = hex::decode(&tunnel_token_payload.xpub).map_err(|op| {
-            let msg = format!("decode remote x25519 hex error:{}", op);
-            error!("{}", msg);
-            TunnelError::ReasonError(msg)
-        })?;
-
-        let remomte_x25519_pk: [u8; 32] = remomte_x25519_pk.try_into().map_err(|_op| {
-            let msg = format!("decode remote x25519 hex error");
-            error!("{}", msg);
-            TunnelError::ReasonError(msg)
-        })?;
-
-        //info!("remomte_x25519_pk: {:?}",remomte_x25519_pk);
-        let aes_key = RTcpInner::get_aes256_key(this_private_key, remomte_x25519_pk.clone());
-        //info!("aes_key: {:?}",aes_key);
-        Ok((aes_key, remomte_x25519_pk, tunnel_token_payload))
+        let xpub_bytes = decode_x25519_pub_hex(&payload.xpub)?;
+        Ok((xpub_bytes, payload))
     }
 
-    pub async fn decode_tunnel_token(
-        this_private_key: &StaticSecret,
-        token: String,
-        from_hostname: String,
-    ) -> Result<([u8; 32], [u8; 32]), TunnelError> {
-        let from_did = DID::from_str(from_hostname.as_str());
-        if from_did.is_err() {
+    // Verify HelloAck JWT: signature against responder's Ed25519 key,
+    // `aud`, `from`/`to` binding, and -- crucially -- that `peer_xpub`
+    // matches the initiator's ephemeral public key from this same
+    // handshake. Without that last check, an attacker could splice an
+    // ack from any past or parallel session that the same responder
+    // signed.
+    fn verify_ack_token(
+        token: &str,
+        responder_public_key: &DecodingKey,
+        expected_from: &str,
+        expected_to: &str,
+        expected_peer_xpub_hex: &str,
+    ) -> Result<([u8; 32], TunnelAckTokenPayload), TunnelError> {
+        let validation = Self::jwt_validation_for(RTCP_HELLO_ACK_AUD);
+        let decoded = decode::<TunnelAckTokenPayload>(token, responder_public_key, &validation)
+            .map_err(|e| TunnelError::DocumentError(format!("decode ack token error:{}", e)))?;
+        let payload = decoded.claims;
+        if payload.from != expected_from {
+            return Err(TunnelError::DocumentError(format!(
+                "ack token from {} not match expected {}",
+                payload.from, expected_from
+            )));
+        }
+        if payload.to != expected_to {
+            return Err(TunnelError::DocumentError(format!(
+                "ack token to {} not match expected {}",
+                payload.to, expected_to
+            )));
+        }
+        if payload.peer_xpub != expected_peer_xpub_hex {
             return Err(TunnelError::DocumentError(
-                "invalid from device is not did".to_string(),
+                "ack token peer_xpub not match initiator's ephemeral key (replay/splice)"
+                    .to_string(),
             ));
         }
-        let from_did = from_did.unwrap();
-        let ed25519_pk = resolve_ed25519_exchange_key(&from_did)
-            .await
-            .map_err(|op| {
-                TunnelError::DocumentError(format!(
-                    "cann't resolve from device {} auth key:{}",
-                    from_hostname.as_str(),
-                    op
-                ))
-            })?;
-
-        let from_public_key = DecodingKey::from_ed_der(&ed25519_pk);
-        let (aes_key, remote_x25519_pk, _payload) = RTcpInner::decode_tunnel_token_with_key(
-            this_private_key,
-            token,
-            &from_public_key,
-            Some(from_did.to_host_name().as_str()),
-        )?;
-        Ok((aes_key, remote_x25519_pk))
+        let xpub_bytes = decode_x25519_pub_hex(&payload.xpub)?;
+        Ok((xpub_bytes, payload))
     }
 
     async fn resolve_source_device_info(
@@ -874,18 +910,64 @@ impl RTcpInner {
         Ok((hello_body.from_id.clone(), None, from_public_key))
     }
 
-    fn get_aes256_key(
-        this_private_key: &StaticSecret,
-        remote_x25519_auth_key: [u8; 32],
-    ) -> [u8; 32] {
-        //info!("will get share sec with remote x25519 temp pk: {:?}",remote_x25519_auth_key);
-        let x25519_public_key = x25519_dalek::PublicKey::from(remote_x25519_auth_key);
-        let shared_secret = this_private_key.diffie_hellman(&x25519_public_key);
+    // v2 session-key derivation. Replaces the old SHA256(shared_secret)
+    // construction with a real HKDF-Extract+Expand and binds the output
+    // to the full handshake context, including:
+    //   - protocol identifier ("buckyos-rtcp-v2") for domain separation,
+    //     so the same Ed25519/X25519 keys can be safely reused by a future
+    //     non-RTCP protocol without producing a colliding key.
+    //   - both DIDs, both ephemeral public keys, and both nonces, so
+    //     mismatched / replayed ack tokens that somehow pass signature
+    //     checks still produce a key the peer cannot reproduce.
+    //
+    // Two independent keys are expanded from the same PRK -- the AES key
+    // and the IV salt -- so the IV is no longer derived from a public key
+    // prefix (the old construction was vulnerable to nonce-reuse if the
+    // initiator's RNG ever produced a colliding ephemeral, since the same
+    // ephemeral controlled both the key and the IV).
+    fn derive_session_secrets(
+        my_secret: EphemeralSecret,
+        peer_pub_bytes: [u8; 32],
+        initiator_did: &str,
+        responder_did: &str,
+        initiator_xpub_hex: &str,
+        responder_xpub_hex: &str,
+        initiator_nonce: &str,
+        responder_nonce: &str,
+    ) -> ([u8; 32], [u8; 16]) {
+        let peer_pub = x25519_dalek::PublicKey::from(peer_pub_bytes);
+        let shared = my_secret.diffie_hellman(&peer_pub);
+        let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
 
-        let mut hasher = Sha256::new();
-        hasher.update(shared_secret.as_bytes());
-        let key_bytes = hasher.finalize();
-        return key_bytes.try_into().unwrap();
+        let info_tail = [
+            b"|",
+            initiator_did.as_bytes(),
+            b"|",
+            responder_did.as_bytes(),
+            b"|",
+            initiator_xpub_hex.as_bytes(),
+            b"|",
+            responder_xpub_hex.as_bytes(),
+            b"|",
+            initiator_nonce.as_bytes(),
+            b"|",
+            responder_nonce.as_bytes(),
+        ]
+        .concat();
+
+        let mut aes_key = [0u8; 32];
+        let mut aes_info = b"buckyos-rtcp-v2 aes256-key".to_vec();
+        aes_info.extend_from_slice(&info_tail);
+        hk.expand(&aes_info, &mut aes_key)
+            .expect("HKDF expand for aes256-key must succeed for 32-byte output");
+
+        let mut iv = [0u8; 16];
+        let mut iv_info = b"buckyos-rtcp-v2 iv-salt".to_vec();
+        iv_info.extend_from_slice(&info_tail);
+        hk.expand(&iv_info, &mut iv)
+            .expect("HKDF expand for iv-salt must succeed for 16-byte output");
+
+        (aes_key, iv)
     }
 
     pub async fn start(self: &Arc<Self>) -> TunnelResult<JoinHandle<()>> {
@@ -1024,7 +1106,6 @@ impl RTcpInner {
     }
 
     async fn on_new_tunnel(&self, stream: TcpStream, hello_package: RTcpHelloPackage) {
-        // decode hello.body.tunnel_token
         if hello_package.body.tunnel_token.is_none() {
             error!("hello.body.tunnel_token is none");
             return;
@@ -1046,16 +1127,14 @@ impl RTcpInner {
                 return;
             }
         };
-        let decoded = RTcpInner::decode_tunnel_token_with_key(
-            &self.this_device_x25519_sk.as_ref().unwrap(),
-            token,
+        let (initiator_xpub_bytes, hello_payload) = match RTcpInner::verify_hello_token(
+            &token,
             &source_public_key,
             Some(source_did.to_host_name().as_str()),
-        );
-        let (aes_key, random_pk, token_payload) = match decoded {
+        ) {
             Ok(v) => v,
             Err(e) => {
-                error!("decode tunnel token error:{}", e);
+                error!("verify hello token error:{}", e);
                 return;
             }
         };
@@ -1063,49 +1142,32 @@ impl RTcpInner {
         // §14.2 anti-replay: every Hello token must bind this responder
         // and must not be replayed within its exp window.
         let this_host = self.this_device_did.to_host_name();
-        if token_payload.to != this_host {
+        if hello_payload.to != this_host {
             warn!(
                 "reject rtcp tunnel: token.to {} not for this device {}",
-                token_payload.to, this_host
+                hello_payload.to, this_host
             );
             return;
         }
-        match token_payload.nonce.as_ref() {
-            Some(nonce) => {
-                let now_ts = buckyos_get_unix_timestamp();
-                // Retain the nonce for the FULL signature-acceptance
-                // window, not just until `exp`. jsonwebtoken accepts a
-                // token up to `exp + JWT_LEEWAY_SECS`, so if we only
-                // kept the nonce until `exp`, a replay captured within
-                // that leeway would pass signature validation *and*
-                // find a freshly-evicted slot -- defeating the anti-
-                // replay guarantee. See regression test
-                // nonce_cache_retains_entry_past_exp_within_leeway.
-                let retain_until = token_payload.exp.saturating_add(JWT_LEEWAY_SECS);
-                let fresh = self
-                    .nonce_cache
-                    .insert_if_fresh(&source_device_id, nonce, retain_until, now_ts)
-                    .await;
-                if !fresh {
-                    warn!(
-                        "reject rtcp tunnel: replayed Hello nonce {} from {}",
-                        nonce, source_device_id
-                    );
-                    return;
-                }
-            }
-            None => {
-                // A token signed without a nonce is from a pre-§14.2 peer.
-                // Refusing it keeps the replay-resistance guarantee; a
-                // newer peer always includes the nonce, so this rejection
-                // only affects peers that still run the old code -- which
-                // is the whole point of the documented breaking change.
-                warn!(
-                    "reject rtcp tunnel: Hello token from {} missing §14.2 nonce",
-                    source_device_id
-                );
-                return;
-            }
+        let now_ts = buckyos_get_unix_timestamp();
+        // Retain the nonce for the FULL signature-acceptance window, not
+        // just until `exp`. jsonwebtoken accepts a token up to
+        // `exp + JWT_LEEWAY_SECS`, so if we only kept the nonce until
+        // `exp`, a replay captured within that leeway would pass
+        // signature validation *and* find a freshly-evicted slot --
+        // defeating the anti-replay guarantee. See regression test
+        // nonce_cache_retains_entry_past_exp_within_leeway.
+        let retain_until = hello_payload.exp.saturating_add(JWT_LEEWAY_SECS);
+        let fresh = self
+            .nonce_cache
+            .insert_if_fresh(&source_device_id, &hello_payload.nonce, retain_until, now_ts)
+            .await;
+        if !fresh {
+            warn!(
+                "reject rtcp tunnel: replayed Hello nonce {} from {}",
+                hello_payload.nonce, source_device_id
+            );
+            return;
         }
 
         let source_addr = match stream.peer_addr() {
@@ -1123,19 +1185,73 @@ impl RTcpInner {
         }
         let remote_stack = remote_stack.unwrap();
 
-        // §14.2 key confirmation: wrap the bearing stream in the AEAD
-        // record layer and run the HelloAck / HelloAckConfirm exchange
-        // *before* admitting the tunnel to on_new_tunnel or the tunnel
-        // map. Only a peer that actually derived the same AES key can
-        // decrypt our HelloAck and return a matching challenge_echo, so
-        // a replayer without the ephemeral X25519 secret is dropped here.
-        let mut iv = [0u8; 16];
-        iv.copy_from_slice(&random_pk[..16]);
-        let bearing: RTcpBearingStream = Box::new(stream);
+        // v2 §14.2: generate a fresh ephemeral X25519 keypair, sign an
+        // ack JWT binding it to the initiator's xpub, ship HelloAck in
+        // the clear, then derive (aes_key, iv) from ECDH(my_eph,
+        // peer_eph) via HKDF and wrap the stream. Only after the AEAD-
+        // protected HelloAckConfirm is verified do we admit the tunnel.
+        //
+        // hello_payload.from is the JWT-verified host-name form; using
+        // it (rather than the raw `did:dev:...` form returned by
+        // resolve_source_device_info) keeps the ack token's `to` field
+        // aligned with what the initiator will check against its own
+        // host_name.
+        let initiator_hostname = hello_payload.from.clone();
+        let ack_state = match self
+            .generate_ack_token(initiator_hostname.as_str(), &hello_payload.xpub)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                error!("generate ack token error:{}", e);
+                return;
+            }
+        };
+        let (ack_token, my_secret, my_xpub_bytes, my_nonce_hex) = ack_state;
+        let my_xpub_hex: String = my_xpub_bytes.encode_hex();
+
+        let mut challenge_bytes = [0u8; 16];
+        rand::thread_rng().fill(&mut challenge_bytes);
+        let challenge_hex: String = challenge_bytes.encode_hex();
+
+        let mut bearing: RTcpBearingStream = Box::new(stream);
+        let ack_pkg = RTcpHelloAckPackage::new(
+            0,
+            ack_token,
+            challenge_hex.clone(),
+            this_host.clone(),
+        );
+        if let Err(e) = timeout(
+            HELLO_HANDSHAKE_TIMEOUT,
+            RTcpTunnelPackage::send_package(Pin::new(&mut bearing), ack_pkg),
+        )
+        .await
+        .map_err(|_| TunnelError::ReasonError("HelloAck send timed out".to_string()))
+        .and_then(|r| r.map_err(|e| TunnelError::ReasonError(format!("HelloAck send error: {}", e))))
+        {
+            warn!(
+                "reject rtcp tunnel from {} {}: {}",
+                source_device_id, source_addr, e
+            );
+            return;
+        }
+
+        let (aes_key, iv) = RTcpInner::derive_session_secrets(
+            my_secret,
+            initiator_xpub_bytes,
+            &initiator_hostname,
+            &this_host,
+            &hello_payload.xpub,
+            &my_xpub_hex,
+            &hello_payload.nonce,
+            &my_nonce_hex,
+        );
         let mut encrypted_stream =
             EncryptedStream::new(bearing, &aes_key, &iv, EncryptionRole::Responder);
 
-        if let Err(e) = responder_key_confirmation(&mut encrypted_stream, &this_host).await {
+        if let Err(e) =
+            responder_key_confirmation(&mut encrypted_stream, &challenge_hex).await
+        {
             warn!(
                 "reject rtcp tunnel from {} {}: key confirmation failed: {}",
                 source_device_id, source_addr, e
@@ -1290,7 +1406,7 @@ impl RTcpInner {
                     TunnelError::ConnectError(msg)
                 })?;
 
-            let (tunnel_token, aes_key, random_pk) = self
+            let state = self
                 .generate_tunnel_token(remote_device_id.clone())
                 .await
                 .map_err(|e| {
@@ -1298,6 +1414,7 @@ impl RTcpInner {
                     error!("{}", msg);
                     e
                 })?;
+            let initiator_did = self.this_device_did.to_host_name();
 
             let addr: SocketAddr = self.bind_addr.parse().unwrap();
             let hello_package = RTcpHelloPackage::new(
@@ -1305,7 +1422,7 @@ impl RTcpInner {
                 self.this_device_did.to_string(),
                 remote_device_id.clone(),
                 addr.port(),
-                Some(tunnel_token),
+                Some(state.token.clone()),
                 self.this_device_doc_jwt.clone(),
             );
 
@@ -1321,26 +1438,23 @@ impl RTcpInner {
                     TunnelError::ConnectError(msg)
                 })?;
 
-            // §14.2 key confirmation: wrap in EncryptedStream and run the
-            // HelloAck / HelloAckConfirm exchange before the tunnel is
-            // registered. A responder that didn't actually derive the
-            // same AES key (or a MitM stream) can't decrypt our HelloAck
-            // and will be dropped here before any user traffic flows.
-            let mut iv = [0u8; 16];
-            iv.copy_from_slice(&random_pk[..16]);
-            let mut encrypted_stream =
-                EncryptedStream::new(bearing, &aes_key, &iv, EncryptionRole::Initiator);
-            let expected_remote_host = remote_stack.did.to_host_name();
-            initiator_key_confirmation(&mut encrypted_stream, &expected_remote_host)
-                .await
-                .map_err(|e| {
-                    let msg = format!(
-                        "key confirmation over bootstrap stream '{}' for {} failed: {}",
-                        bootstrap_url, remote_device_id, e
-                    );
-                    error!("{}", msg);
-                    TunnelError::ConnectError(msg)
-                })?;
+            // v2 §14.2 key confirmation: read plaintext HelloAck off the
+            // bearing, verify the responder's signed ack_token, derive
+            // session keys, wrap, and ship the AEAD-protected confirm
+            // before the tunnel is registered. A responder that didn't
+            // actually derive the same AES key (or a MitM splicing in a
+            // stale ack) is dropped here before any user traffic flows.
+            let (encrypted_stream, aes_key) =
+                initiator_complete_handshake(bearing, state, &initiator_did)
+                    .await
+                    .map_err(|e| {
+                        let msg = format!(
+                            "key confirmation over bootstrap stream '{}' for {} failed: {}",
+                            bootstrap_url, remote_device_id, e
+                        );
+                        error!("{}", msg);
+                        TunnelError::ConnectError(msg)
+                    })?;
 
             // peer_addr is None for bootstrap-backed tunnels. Instead, we hand
             // the tunnel a bootstrap context so that subsequent Open/ROpen
@@ -1674,27 +1788,31 @@ impl fmt::Display for InitiatorKeyConfirmationError {
     }
 }
 
-// §14.2 initiator side of the key-confirmation handshake.
+// v2 §14.2 initiator-side handshake completion.
 //
-// Runs after the initiator has sent the plaintext Hello and wrapped the
-// bearing stream in an EncryptedStream (initiator role). Expects a single
-// HelloAck (AEAD-decrypted, so already authenticated by the record layer),
-// echoes the challenge back as HelloAckConfirm, then returns so the caller
-// can hand the stream to RTcpTunnel. Any timeout or protocol violation
-// returns an error so the caller drops the stream before publishing the
-// tunnel.
-async fn initiator_key_confirmation(
-    stream: &mut EncryptedStream<RTcpBearingStream>,
-    expected_responder_host: &str,
-) -> Result<(), InitiatorKeyConfirmationError> {
+// Runs after the initiator has sent the plaintext Hello. Reads HelloAck
+// in the clear off the still-unwrapped bearing stream, verifies the
+// responder's signed ack_token (audience tag, identity, and the
+// `peer_xpub` binding to *this* initiator's ephemeral key), derives the
+// session keys via HKDF, wraps the stream, and then sends an AEAD-
+// protected HelloAckConfirm echoing the challenge.
+//
+// On success returns the wrapped EncryptedStream and the AES key.
+async fn initiator_complete_handshake(
+    bearing: RTcpBearingStream,
+    state: InitiatorHandshakeState,
+    initiator_did: &str,
+) -> Result<(EncryptedStream<RTcpBearingStream>, [u8; 32]), InitiatorKeyConfirmationError> {
+    let mut bearing = bearing;
+
     let pkg = timeout(
         HELLO_HANDSHAKE_TIMEOUT,
-        RTcpTunnelPackage::read_package(Pin::new(stream), false, "hello_ack"),
+        RTcpTunnelPackage::read_package(Pin::new(&mut bearing), false, "hello_ack"),
     )
     .await
     .map_err(|_| {
         InitiatorKeyConfirmationError::Timeout(TunnelError::ReasonError(
-            "HelloAck read timed out; peer may be a replayer without the AEAD key".to_string(),
+            "HelloAck read timed out; peer did not complete v2 handshake".to_string(),
         ))
     })?
     .map_err(|e| {
@@ -1714,22 +1832,51 @@ async fn initiator_key_confirmation(
     };
 
     // Cross-check: the responder's self-reported id must match the
-    // `to` we signed into the tunnel token. A mismatch means either a
-    // misconfigured peer or a MitM attempting to stand up a tunnel under
-    // a different identity than the initiator requested.
-    if ack.body.responder_id != expected_responder_host {
+    // `to` we signed into the tunnel token. A mismatch here would
+    // indicate either a misconfigured peer or a MitM trying to stand
+    // up a tunnel under a different identity than we asked for.
+    if ack.body.responder_id != state.responder_did {
         return Err(InitiatorKeyConfirmationError::Failed(
             TunnelError::ReasonError(format!(
                 "HelloAck responder_id {} not equal to expected {}",
-                ack.body.responder_id, expected_responder_host
+                ack.body.responder_id, state.responder_did
             )),
         ));
     }
 
+    // Verify the responder's signed ack_token. This is what binds the
+    // responder's ephemeral X25519 public key to its long-term Ed25519
+    // identity (the only key the initiator could have looked up before
+    // the handshake started).
+    let responder_pk = DecodingKey::from_ed_der(&state.responder_ed25519_pk_der);
+    let (responder_xpub_bytes, ack_payload) = RTcpInner::verify_ack_token(
+        &ack.body.ack_token,
+        &responder_pk,
+        &state.responder_did,
+        initiator_did,
+        &state.my_xpub_hex,
+    )
+    .map_err(|e| InitiatorKeyConfirmationError::Failed(e))?;
+
+    let responder_xpub_hex: String = responder_xpub_bytes.encode_hex();
+
+    let (aes_key, iv) = RTcpInner::derive_session_secrets(
+        state.my_secret,
+        responder_xpub_bytes,
+        initiator_did,
+        &state.responder_did,
+        &state.my_xpub_hex,
+        &responder_xpub_hex,
+        &state.my_nonce_hex,
+        &ack_payload.nonce,
+    );
+    let mut encrypted_stream =
+        EncryptedStream::new(bearing, &aes_key, &iv, EncryptionRole::Initiator);
+
     let confirm = RTcpHelloAckConfirmPackage::new(ack.seq, ack.body.challenge.clone());
     timeout(
         HELLO_HANDSHAKE_TIMEOUT,
-        RTcpTunnelPackage::send_package(Pin::new(stream), confirm),
+        RTcpTunnelPackage::send_package(Pin::new(&mut encrypted_stream), confirm),
     )
     .await
     .map_err(|_| {
@@ -1744,39 +1891,21 @@ async fn initiator_key_confirmation(
         )))
     })?;
 
-    Ok(())
+    Ok((encrypted_stream, aes_key))
 }
 
-// §14.2 responder side of the key-confirmation handshake.
+// v2 §14.2 responder-side key confirmation, post-key-derivation.
 //
-// Runs after the responder has read the plaintext Hello, verified the
-// signed tunnel_token, and wrapped the bearing stream in an
-// EncryptedStream (responder role). Generates a fresh 16-byte challenge,
-// sends it as HelloAck over the AEAD record layer, then waits for the
-// initiator to echo it back inside a HelloAckConfirm.
-//
-// A replayer that does not hold the ephemeral X25519 secret cannot derive
-// the AEAD key, so it cannot decrypt HelloAck to learn `challenge`, and
-// therefore cannot produce a valid HelloAckConfirm. The timeout here is
-// what makes the rejection prompt: without it, the replayer could pin
-// the (aes_key, nonce_base) slot indefinitely by never responding.
+// Runs after the responder has shipped HelloAck plaintext, derived the
+// session keys, and wrapped the bearing stream. Reads HelloAckConfirm
+// (an AEAD record) and rejects any echo that doesn't match the
+// `expected_challenge` the responder sent in HelloAck. A peer without
+// the right session key cannot decrypt the confirm record at all, let
+// alone produce one with a matching echo.
 async fn responder_key_confirmation(
     stream: &mut EncryptedStream<RTcpBearingStream>,
-    this_host: &str,
+    expected_challenge: &str,
 ) -> Result<(), TunnelError> {
-    let mut challenge_bytes = [0u8; 16];
-    rand::thread_rng().fill(&mut challenge_bytes);
-    let challenge_hex: String = challenge_bytes.encode_hex();
-
-    let ack = RTcpHelloAckPackage::new(0, challenge_hex.clone(), this_host.to_owned());
-    timeout(
-        HELLO_HANDSHAKE_TIMEOUT,
-        RTcpTunnelPackage::send_package(Pin::new(stream), ack),
-    )
-    .await
-    .map_err(|_| TunnelError::ReasonError("HelloAck send timed out".to_string()))?
-    .map_err(|e| TunnelError::ReasonError(format!("HelloAck send error: {}", e)))?;
-
     let pkg = timeout(
         HELLO_HANDSHAKE_TIMEOUT,
         RTcpTunnelPackage::read_package(Pin::new(stream), false, "hello_ack_confirm"),
@@ -1799,7 +1928,7 @@ async fn responder_key_confirmation(
             )));
         }
     };
-    if confirm.body.challenge_echo != challenge_hex {
+    if confirm.body.challenge_echo != expected_challenge {
         return Err(TunnelError::ReasonError(
             "HelloAckConfirm challenge_echo mismatch; key confirmation failed".to_string(),
         ));
@@ -3571,7 +3700,7 @@ mod tests {
             Arc::new(MockRTcpListener::new()),
         );
 
-        let (tunnel_token, _, _) = client_inner
+        let state = client_inner
             .generate_tunnel_token(server_device_config.id.to_string())
             .await
             .unwrap();
@@ -3579,7 +3708,7 @@ mod tests {
             from_id: client_id.to_string(),
             to_id: server_device_config.id.to_string(),
             my_port: 19063,
-            tunnel_token: Some(tunnel_token.clone()),
+            tunnel_token: Some(state.token.clone()),
             device_doc_jwt: Some(client_device_doc_jwt),
         };
         let (source_device_id, source_device_info, source_public_key) =
@@ -3591,10 +3720,12 @@ mod tests {
             source_device_info.unwrap().owner,
             Some(owner_did.to_string())
         );
+        // server_inner is exercised here just to make sure the test
+        // device boots without the long-term X25519 key (v2 dropped it).
+        assert!(server_inner.this_device_ed25519_sk.is_some());
 
-        RTcpInner::decode_tunnel_token_with_key(
-            server_inner.this_device_x25519_sk.as_ref().unwrap(),
-            tunnel_token,
+        RTcpInner::verify_hello_token(
+            &state.token,
             &source_public_key,
             Some(client_id.to_host_name().as_str()),
         )
