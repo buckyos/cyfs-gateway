@@ -1526,7 +1526,7 @@ mod tests {
         let connection_manager = ConnectionManager::new();
         let result = TlsStack::builder()
             .id("test")
-            .bind("127.0.0.1:9096")
+            .bind("127.0.0.1:9097")
             .hook_point(chains)
             .connection_manager(connection_manager.clone())
             .add_certs(vec![TlsDomainConfig {
@@ -1577,7 +1577,7 @@ mod tests {
                 .with_no_client_auth();
 
         {
-            let stream = TcpStream::connect("127.0.0.1:9096").await.unwrap();
+            let stream = TcpStream::connect("127.0.0.1:9097").await.unwrap();
             let connector = TlsConnector::from(Arc::new(config));
             let mut stream = connector
                 .connect(ServerName::try_from("www.buckyos.com").unwrap(), stream)
