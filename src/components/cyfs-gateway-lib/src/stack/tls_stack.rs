@@ -6,7 +6,7 @@ use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
 use crate::stack::{
     TlsCertResolver, get_limit_info, get_source_addr_from_req_env, probe_proxy_protocol_stream,
-    stream_forward,
+    stream_forward, stream_idle_timeout_from_secs,
 };
 use crate::{
     ConnectionInfo, ConnectionManagerRef, DumpStream, GlobalCollectionManagerRef,
@@ -147,6 +147,7 @@ struct TlsConnectionHandler {
     certs: Arc<dyn ResolvesServerCert>,
     alpn_protocols: Vec<Vec<u8>>,
     io_dump: Option<IoDumpStackConfig>,
+    stream_idle_timeout: std::time::Duration,
 }
 
 impl TlsConnectionHandler {
@@ -157,6 +158,7 @@ impl TlsConnectionHandler {
         env: Arc<TlsStackContext>,
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
+        stream_idle_timeout: std::time::Duration,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -175,6 +177,7 @@ impl TlsConnectionHandler {
             certs,
             alpn_protocols,
             io_dump,
+            stream_idle_timeout,
         })
     }
 
@@ -195,6 +198,7 @@ impl TlsConnectionHandler {
             certs: self.certs.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
             io_dump: self.io_dump.clone(),
+            stream_idle_timeout: self.stream_idle_timeout,
         })
     }
 
@@ -435,6 +439,7 @@ impl TlsConnectionHandler {
                                 target,
                                 &self.env.tunnel_manager,
                                 Some(&stream_info),
+                                self.stream_idle_timeout,
                             )
                             .await?;
                         }
@@ -554,6 +559,7 @@ impl TlsStack {
             env,
             config.connection_manager.clone(),
             config.io_dump,
+            config.stream_idle_timeout,
         )
         .await?;
 
@@ -761,6 +767,7 @@ impl Stack for TlsStack {
             )
             .await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
+            stream_idle_timeout_from_secs(config.stream_idle_timeout),
         )
         .await?;
 
@@ -827,6 +834,8 @@ pub struct TlsStackConfig {
     pub io_dump_max_upload_bytes_per_conn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_max_download_bytes_per_conn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout: Option<u64>,
     pub reuse_address: Option<bool>,
 }
 
@@ -910,6 +919,7 @@ impl crate::StackFactory for TlsStackFactory {
             .reuse_address(config.reuse_address.unwrap_or(false))
             .stack_context(stack_context)
             .io_dump(io_dump)
+            .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -927,6 +937,7 @@ pub struct TlsStackBuilder {
     stack_context: Option<Arc<TlsStackContext>>,
     io_dump: Option<IoDumpStackConfig>,
     reuse_address: bool,
+    stream_idle_timeout: std::time::Duration,
 }
 
 impl TlsStackBuilder {
@@ -942,6 +953,7 @@ impl TlsStackBuilder {
             stack_context: None,
             io_dump: None,
             reuse_address: false,
+            stream_idle_timeout: stream_idle_timeout_from_secs(None),
         }
     }
 
@@ -996,6 +1008,11 @@ impl TlsStackBuilder {
 
     pub fn reuse_address(mut self, reuse_address: bool) -> Self {
         self.reuse_address = reuse_address;
+        self
+    }
+
+    pub fn stream_idle_timeout(mut self, stream_idle_timeout: std::time::Duration) -> Self {
+        self.stream_idle_timeout = stream_idle_timeout;
         self
     }
 
@@ -2404,6 +2421,7 @@ mod tests {
             io_dump_rotate_max_files: None,
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
+            stream_idle_timeout: None,
             reuse_address: None,
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(TlsStackContext::new(

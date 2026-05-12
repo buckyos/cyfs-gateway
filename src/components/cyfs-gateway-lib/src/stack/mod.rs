@@ -47,7 +47,14 @@ pub type StackError = sfo_result::Error<StackErrorCode>;
 use crate::{DatagramClientBox, TunnelManager};
 pub use sfo_result::err as stack_err;
 pub use sfo_result::into_err as into_stack_err;
+use std::time::Duration;
 use url::Url;
+
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
+
+pub fn stream_idle_timeout_from_secs(timeout_secs: Option<u64>) -> Duration {
+    Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SECS))
+}
 
 pub async fn get_source_addr_from_req_env(
     global_env: &cyfs_process_chain::EnvRef,
@@ -82,6 +89,7 @@ pub async fn stream_forward(
     target: &str,
     tunnel_manager: &TunnelManager,
     info: Option<&crate::StreamInfo>,
+    idle_timeout: Duration,
 ) -> StackResult<()> {
     let url = Url::parse(target).map_err(into_stack_err!(
         StackErrorCode::InvalidConfig,
@@ -103,16 +111,13 @@ pub async fn stream_forward(
         if let Some(info) = info {
             let src_addr = info.src_addr.as_deref();
             let dst_addr = info.dst_addr.as_deref();
-            let _ = proxy_protocol::write_proxy_v2_preamble(
-                &mut forward_stream,
-                src_addr,
-                dst_addr,
-            )
-            .await?;
+            let _ =
+                proxy_protocol::write_proxy_v2_preamble(&mut forward_stream, src_addr, dst_addr)
+                    .await?;
         }
     }
 
-    tokio::io::copy_bidirectional(&mut stream, forward_stream.as_mut())
+    sfo_io::copy_bidirectional_with_timeout(&mut stream, forward_stream.as_mut(), idle_timeout)
         .await
         .map_err(into_stack_err!(
             StackErrorCode::StreamError,

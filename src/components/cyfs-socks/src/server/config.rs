@@ -22,6 +22,9 @@ pub struct SocksServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_config: Option<String>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout: Option<u64>,
+
     pub hook_point: Vec<ProcessChainConfig>,
 }
 

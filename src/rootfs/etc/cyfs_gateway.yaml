@@ -111,6 +111,7 @@ stacks:
     # io_dump_rotate_max_files: 8 # optional, keep at most N rotated files
     # io_dump_max_upload_bytes_per_conn: 1MB   # optional, default 1MB
     # io_dump_max_download_bytes_per_conn: 1MB # optional, default 1MB
+    # stream_idle_timeout: 60     # stream forwarding idle timeout (seconds), default 60, same as nginx proxy timeout
     hook_point: # process chains (map form, converted to array)
       main:
         priority: 1000
@@ -137,6 +138,7 @@ stacks:
     #   alpn_protocols: ["http/1.1"] # default http/1.1, supports h2/h3
     #   reuse_address: false
     #   io_dump_file: tls.dump
+    #   stream_idle_timeout: 60    # stream forwarding idle timeout (seconds), default 60
     #   certs:
     #     - domain: example.com # local certificate
     #       cert_path: ./cert.pem
@@ -153,6 +155,7 @@ stacks:
     #   alpn_protocols: ["h3"] # supports h2/h3
     #   reuse_address: false
     #   io_dump_file: quic.dump
+    #   stream_idle_timeout: 60    # stream forwarding idle timeout (seconds), default 60
     #   certs:
     #     - domain: example.com # local certificate
     #       cert_path: ./cert.pem
@@ -170,6 +173,7 @@ stacks:
     #   name: optional_name
     #   reuse_address: false
     #   io_dump_file: rtcp.dump
+    #   stream_idle_timeout: 60    # stream forwarding idle timeout (seconds), default 60
     #   hook_point: { }
 
     # tun_example:
@@ -179,6 +183,7 @@ stacks:
     #   mtu: 1500                   # default 1500
     #   tcp_timeout: 60             # default 60
     #   udp_timeout: 60             # default 60
+    #   stream_idle_timeout: 60     # stream forwarding idle timeout (seconds), default 60
     #   io_dump_file: tun.dump
     #   hook_point: { }
 
@@ -262,6 +267,7 @@ stacks:
   #   password: ""
   #   enable_tunnel: []               # optional allowed tunnel schemes list
   #   rule_config: ./socks_rules.yaml # optional rule file path
+  #   stream_idle_timeout: 60         # socks data copy idle timeout (seconds), default 60
   #   hook_point:
   #     main:
   #       priority: 1

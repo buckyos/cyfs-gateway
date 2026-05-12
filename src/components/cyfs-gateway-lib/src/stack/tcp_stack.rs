@@ -1,6 +1,6 @@
 use super::{
     Stack, get_limit_info, get_source_addr_from_req_env, probe_proxy_protocol_stream,
-    stream_forward,
+    stream_forward, stream_idle_timeout_from_secs,
 };
 
 #[cfg(target_os = "linux")]
@@ -75,6 +75,7 @@ struct TcpConnectionHandler {
     executor: ProcessChainLibExecutor,
     connection_manager: Option<ConnectionManagerRef>,
     io_dump: Option<IoDumpStackConfig>,
+    stream_idle_timeout: std::time::Duration,
 }
 
 impl TcpConnectionHandler {
@@ -83,6 +84,7 @@ impl TcpConnectionHandler {
         env: Arc<TcpStackContext>,
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
+        stream_idle_timeout: std::time::Duration,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -98,6 +100,7 @@ impl TcpConnectionHandler {
             executor,
             connection_manager,
             io_dump,
+            stream_idle_timeout,
         })
     }
 
@@ -120,6 +123,7 @@ impl TcpConnectionHandler {
             executor,
             connection_manager: self.connection_manager.clone(),
             io_dump,
+            stream_idle_timeout: self.stream_idle_timeout,
         })
     }
 
@@ -261,6 +265,7 @@ impl TcpConnectionHandler {
                                 target,
                                 &self.env.tunnel_manager,
                                 Some(&stream_info),
+                                self.stream_idle_timeout,
                             )
                             .await?;
                         }
@@ -376,6 +381,7 @@ impl TcpStack {
             transparent: false,
             io_dump: None,
             reuse_address: false,
+            stream_idle_timeout: stream_idle_timeout_from_secs(None),
         }
     }
 
@@ -410,6 +416,7 @@ impl TcpStack {
             env,
             config.connection_manager.clone(),
             config.io_dump,
+            config.stream_idle_timeout,
         )
         .await?;
 
@@ -652,6 +659,7 @@ impl Stack for TcpStack {
             env,
             self.connection_manager.clone(),
             io_dump,
+            stream_idle_timeout_from_secs(config.stream_idle_timeout),
         )
         .await?;
 
@@ -679,6 +687,7 @@ pub struct TcpStackBuilder {
     transparent: bool,
     io_dump: Option<IoDumpStackConfig>,
     reuse_address: bool,
+    stream_idle_timeout: std::time::Duration,
 }
 
 impl TcpStackBuilder {
@@ -722,6 +731,11 @@ impl TcpStackBuilder {
         self
     }
 
+    pub fn stream_idle_timeout(mut self, stream_idle_timeout: std::time::Duration) -> Self {
+        self.stream_idle_timeout = stream_idle_timeout;
+        self
+    }
+
     pub async fn build(self) -> StackResult<TcpStack> {
         let stack = TcpStack::create(self).await?;
         Ok(stack)
@@ -745,6 +759,8 @@ pub struct TcpStackConfig {
     pub io_dump_max_upload_bytes_per_conn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_max_download_bytes_per_conn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout: Option<u64>,
     pub reuse_address: Option<bool>,
     pub hook_point: Vec<ProcessChainConfig>,
 }
@@ -816,6 +832,7 @@ impl StackFactory for TcpStackFactory {
             .hook_point(config.hook_point.clone())
             .stack_context(handler_env)
             .io_dump(io_dump)
+            .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -1777,6 +1794,7 @@ mod tests {
             io_dump_rotate_max_files: None,
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
+            stream_idle_timeout: None,
             reuse_address: None,
             hook_point: vec![],
         };

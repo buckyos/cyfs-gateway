@@ -10,7 +10,10 @@ use crate::global_process_chains::{
 };
 use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
-use crate::stack::{TlsCertResolver, get_limit_info, probe_proxy_protocol_stream, stream_forward};
+use crate::stack::{
+    TlsCertResolver, get_limit_info, probe_proxy_protocol_stream, stream_forward,
+    stream_idle_timeout_from_secs,
+};
 use crate::{
     ComposedSpeedStat, ConnectionController, ConnectionInfo, ConnectionManagerRef, DumpStream,
     GlobalCollectionManagerRef, HandleConnectionController, IoDumpStackConfig,
@@ -109,6 +112,7 @@ struct QuicConnectionHandler {
     executor: ProcessChainLibExecutor,
     connection_manager: Option<ConnectionManagerRef>,
     io_dump: Option<IoDumpStackConfig>,
+    stream_idle_timeout: std::time::Duration,
 }
 
 impl QuicConnectionHandler {
@@ -117,6 +121,7 @@ impl QuicConnectionHandler {
         env: Arc<QuicStackContext>,
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
+        stream_idle_timeout: std::time::Duration,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -132,6 +137,7 @@ impl QuicConnectionHandler {
             executor,
             connection_manager,
             io_dump,
+            stream_idle_timeout,
         })
     }
 
@@ -362,20 +368,19 @@ impl QuicConnectionHandler {
                                     };
                                 let (stream, proxy_source_addr) =
                                     probe_proxy_protocol_stream(stream).await?;
-                                let request_source_addr =
-                                    proxy_source_addr.unwrap_or(remote_addr);
+                                let request_source_addr = proxy_source_addr.unwrap_or(remote_addr);
                                 let stream_info = StreamInfo::with_addrs(
                                     Some(remote_addr.to_string()),
                                     proxy_source_addr.map(|a| a.to_string()),
                                 )
                                 .with_dst_addr(Some(local_addr.to_string()))
                                 .with_device_info(
-                                    device_info.as_ref().and_then(|v| {
-                                        v.mac().map(|m| m.to_string())
-                                    }),
-                                    device_info.as_ref().and_then(|v| {
-                                        v.hostname().map(|h| h.to_string())
-                                    }),
+                                    device_info
+                                        .as_ref()
+                                        .and_then(|v| v.mac().map(|m| m.to_string())),
+                                    device_info
+                                        .as_ref()
+                                        .and_then(|v| v.hostname().map(|h| h.to_string())),
                                     device_info
                                         .as_ref()
                                         .map(|v| v.today_online_seconds().to_string()),
@@ -396,12 +401,14 @@ impl QuicConnectionHandler {
                                 };
                                 let tunnel_manager = self.env.tunnel_manager.clone();
                                 let forward_info = stream_info.clone();
+                                let stream_idle_timeout = self.stream_idle_timeout;
                                 let handle = tokio::spawn(async move {
                                     if let Err(e) = stream_forward(
                                         stream,
                                         target.as_str(),
                                         &tunnel_manager,
                                         Some(&forward_info),
+                                        stream_idle_timeout,
                                     )
                                     .await
                                     {
@@ -619,19 +626,18 @@ impl QuicConnectionHandler {
                                             )
                                             .with_dst_addr(Some(local_addr.to_string()))
                                             .with_device_info(
-                                                device_info.as_ref().and_then(|v| {
-                                                    v.mac().map(|m| m.to_string())
-                                                }),
+                                                device_info
+                                                    .as_ref()
+                                                    .and_then(|v| v.mac().map(|m| m.to_string())),
                                                 device_info.as_ref().and_then(|v| {
                                                     v.hostname().map(|h| h.to_string())
                                                 }),
-                                                device_info.as_ref().map(|v| {
-                                                    v.today_online_seconds().to_string()
-                                                }),
+                                                device_info
+                                                    .as_ref()
+                                                    .map(|v| v.today_online_seconds().to_string()),
                                             );
-                                            if let Err(e) = server
-                                                .serve_connection(stream, info)
-                                                .await
+                                            if let Err(e) =
+                                                server.serve_connection(stream, info).await
                                             {
                                                 log::error!("server error: {}", e);
                                             }
@@ -1540,6 +1546,7 @@ impl QuicStack {
             stack_context.clone(),
             builder.connection_manager.clone(),
             builder.io_dump,
+            builder.stream_idle_timeout,
         )
         .await?;
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
@@ -1646,6 +1653,7 @@ impl Stack for QuicStack {
             )
             .await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
+            stream_idle_timeout_from_secs(config.stream_idle_timeout),
         )
         .await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
@@ -1674,6 +1682,7 @@ pub struct QuicStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     stack_context: Option<Arc<QuicStackContext>>,
     io_dump: Option<IoDumpStackConfig>,
+    stream_idle_timeout: std::time::Duration,
 }
 
 impl QuicStackBuilder {
@@ -1689,6 +1698,7 @@ impl QuicStackBuilder {
             connection_manager: None,
             stack_context: None,
             io_dump: None,
+            stream_idle_timeout: stream_idle_timeout_from_secs(None),
         }
     }
 
@@ -1745,6 +1755,11 @@ impl QuicStackBuilder {
         self
     }
 
+    pub fn stream_idle_timeout(mut self, stream_idle_timeout: std::time::Duration) -> Self {
+        self.stream_idle_timeout = stream_idle_timeout;
+        self
+    }
+
     pub async fn build(self) -> StackResult<QuicStack> {
         QuicStack::create(self).await
     }
@@ -1770,6 +1785,8 @@ pub struct QuicStackConfig {
     pub io_dump_max_upload_bytes_per_conn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_max_download_bytes_per_conn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout: Option<u64>,
     pub reuse_address: Option<bool>,
 }
 
@@ -1849,6 +1866,7 @@ impl StackFactory for QuicStackFactory {
             .concurrency(config.concurrency.unwrap_or(1024))
             .stack_context(stack_context.clone())
             .io_dump(io_dump)
+            .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
             .reuse_address(config.reuse_address.unwrap_or(false))
             .build()
             .await?;
@@ -3591,6 +3609,7 @@ mod tests {
             io_dump_rotate_max_files: None,
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
+            stream_idle_timeout: None,
             reuse_address: None,
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(QuicStackContext::new(
