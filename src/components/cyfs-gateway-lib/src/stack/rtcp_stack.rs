@@ -630,8 +630,13 @@ impl RtcpConnectionHandler {
                                 datagram
                             };
                             let datagram_stream = Box::new(RTcpTunnelDatagramClient::new(stream));
-                            datagram_forward(datagram_stream, target, &self.env.tunnel_manager)
-                                .await?;
+                            datagram_forward(
+                                datagram_stream,
+                                target,
+                                &self.env.tunnel_manager,
+                                self.stream_idle_timeout,
+                            )
+                            .await?;
                         }
                         "server" => {
                             if list.len() < 2 {

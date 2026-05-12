@@ -47,7 +47,10 @@ pub type StackError = sfo_result::Error<StackErrorCode>;
 use crate::{DatagramClientBox, TunnelManager};
 pub use sfo_result::err as stack_err;
 pub use sfo_result::into_err as into_stack_err;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
+use tokio::time::{Instant, sleep_until};
 use url::Url;
 
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
@@ -130,6 +133,7 @@ pub async fn datagram_forward(
     datagram: Box<dyn DatagramClientBox>,
     target: &str,
     tunnel_manager: &TunnelManager,
+    idle_timeout: Duration,
 ) -> StackResult<()> {
     let url = Url::parse(&target).map_err(into_stack_err!(
         StackErrorCode::InvalidConfig,
@@ -141,42 +145,101 @@ pub async fn datagram_forward(
         .await
         .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
 
-    copy_datagram_bidirectional(datagram, forward_datagram)
+    copy_datagram_bidirectional(datagram, forward_datagram, idle_timeout)
         .await
         .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
     Ok(())
 }
 
-#[allow(unreachable_code)]
 pub async fn copy_datagram_bidirectional(
     a: Box<dyn DatagramClientBox>,
     b: Box<dyn DatagramClientBox>,
+    idle_timeout: Duration,
 ) -> Result<(), std::io::Error> {
-    let recv = {
-        let a = a.clone();
-        let b = b.clone();
-        async move {
-            loop {
-                let mut buf = [0u8; 4096];
-                let n = a.recv_datagram(&mut buf).await?;
-                b.send_datagram(&buf[..n]).await?;
-            }
-            Ok::<(), std::io::Error>(())
-        }
-    };
-
-    let send = async move {
-        let mut buf = [0u8; 4096];
+    async fn copy_datagram_one_way(
+        recv: Box<dyn DatagramClientBox>,
+        send: Box<dyn DatagramClientBox>,
+        last_active: Arc<Mutex<Instant>>,
+        active_notify: Arc<Notify>,
+    ) -> Result<(), std::io::Error> {
         loop {
-            let n = b.recv_datagram(&mut buf).await?;
-            a.send_datagram(&buf[..n]).await?;
-        }
-        Ok::<(), std::io::Error>(())
-    };
+            let mut buf = [0u8; 4096];
+            let n = recv.recv_datagram(&mut buf).await?;
+            send.send_datagram(&buf[..n]).await?;
 
-    let ret = tokio::try_join!(recv, send);
+            *last_active.lock().unwrap() = Instant::now();
+            active_notify.notify_waiters();
+        }
+    }
+
+    async fn idle_timeout_guard(
+        idle_timeout: Duration,
+        last_active: Arc<Mutex<Instant>>,
+        active_notify: Arc<Notify>,
+    ) -> Result<(), std::io::Error> {
+        loop {
+            let deadline = *last_active.lock().unwrap() + idle_timeout;
+            tokio::select! {
+                _ = sleep_until(deadline) => {
+                    if last_active.lock().unwrap().elapsed() >= idle_timeout {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "datagram copy idle timeout",
+                        ));
+                    }
+                }
+                _ = active_notify.notified() => {}
+            }
+        }
+    }
+
+    let last_active = Arc::new(Mutex::new(Instant::now()));
+    let active_notify = Arc::new(Notify::new());
+
+    let recv = copy_datagram_one_way(
+        a.clone(),
+        b.clone(),
+        last_active.clone(),
+        active_notify.clone(),
+    );
+    let send = copy_datagram_one_way(b, a, last_active.clone(), active_notify.clone());
+    let timeout = idle_timeout_guard(idle_timeout, last_active, active_notify);
+
+    let ret = tokio::try_join!(recv, send, timeout);
     ret?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct PendingDatagram;
+
+    #[async_trait::async_trait]
+    impl crate::DatagramClient for PendingDatagram {
+        async fn recv_datagram(&self, _buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+            std::future::pending::<Result<usize, std::io::Error>>().await
+        }
+
+        async fn send_datagram(&self, buffer: &[u8]) -> Result<usize, std::io::Error> {
+            Ok(buffer.len())
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_datagram_bidirectional_times_out_when_idle() {
+        let err = copy_datagram_bidirectional(
+            Box::new(PendingDatagram),
+            Box::new(PendingDatagram),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -397,8 +397,13 @@ impl TunConnectionHandler {
                                 ));
                             }
                             let target = list[1].as_str();
-                            datagram_forward(datagram_stream, target, &self.env.tunnel_manager)
-                                .await?;
+                            datagram_forward(
+                                datagram_stream,
+                                target,
+                                &self.env.tunnel_manager,
+                                self.stream_idle_timeout,
+                            )
+                            .await?;
                         }
                         "server" => {
                             if list.len() < 2 {
