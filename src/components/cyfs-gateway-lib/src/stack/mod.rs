@@ -50,13 +50,18 @@ pub use sfo_result::into_err as into_stack_err;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, sleep_until, timeout};
 use url::Url;
 
-pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 600;
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 60;
 
 pub fn stream_idle_timeout_from_secs(timeout_secs: Option<u64>) -> Duration {
     Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SECS))
+}
+
+pub fn connect_timeout_from_secs(timeout_secs: Option<u64>) -> Duration {
+    Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS))
 }
 
 pub async fn get_source_addr_from_req_env(
@@ -93,6 +98,7 @@ pub async fn stream_forward(
     tunnel_manager: &TunnelManager,
     info: Option<&crate::StreamInfo>,
     idle_timeout: Duration,
+    connect_timeout: Duration,
 ) -> StackResult<()> {
     let url = Url::parse(target).map_err(into_stack_err!(
         StackErrorCode::InvalidConfig,
@@ -105,10 +111,18 @@ pub async fn stream_forward(
         .query_pairs()
         .any(|(k, v)| k == "proxy_protocol" && v.eq_ignore_ascii_case("v2"));
 
-    let mut forward_stream = tunnel_manager
-        .open_stream_by_url(&url)
-        .await
-        .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
+    let mut forward_stream =
+        match timeout(connect_timeout, tunnel_manager.open_stream_by_url(&url)).await {
+            Ok(result) => result.map_err(into_stack_err!(StackErrorCode::TunnelError))?,
+            Err(_) => {
+                return Err(stack_err!(
+                    StackErrorCode::TunnelError,
+                    "connect target {} timeout after {:?}",
+                    target,
+                    connect_timeout
+                ));
+            }
+        };
 
     if emit_proxy_v2 {
         if let Some(info) = info {
@@ -134,16 +148,29 @@ pub async fn datagram_forward(
     target: &str,
     tunnel_manager: &TunnelManager,
     idle_timeout: Duration,
+    connect_timeout: Duration,
 ) -> StackResult<()> {
     let url = Url::parse(&target).map_err(into_stack_err!(
         StackErrorCode::InvalidConfig,
         "invalid forward url {}",
         target
     ))?;
-    let forward_datagram = tunnel_manager
-        .create_datagram_client_by_url(&url)
-        .await
-        .map_err(into_stack_err!(StackErrorCode::TunnelError))?;
+    let forward_datagram = match timeout(
+        connect_timeout,
+        tunnel_manager.create_datagram_client_by_url(&url),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(into_stack_err!(StackErrorCode::TunnelError))?,
+        Err(_) => {
+            return Err(stack_err!(
+                StackErrorCode::TunnelError,
+                "connect target {} timeout after {:?}",
+                target,
+                connect_timeout
+            ));
+        }
+    };
 
     copy_datagram_bidirectional(datagram, forward_datagram, idle_timeout)
         .await

@@ -11,8 +11,8 @@ use crate::global_process_chains::{
 use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
 use crate::stack::{
-    TlsCertResolver, get_limit_info, probe_proxy_protocol_stream, stream_forward,
-    stream_idle_timeout_from_secs,
+    TlsCertResolver, connect_timeout_from_secs, get_limit_info, probe_proxy_protocol_stream,
+    stream_forward, stream_idle_timeout_from_secs,
 };
 use crate::{
     ComposedSpeedStat, ConnectionController, ConnectionInfo, ConnectionManagerRef, DumpStream,
@@ -113,6 +113,7 @@ struct QuicConnectionHandler {
     connection_manager: Option<ConnectionManagerRef>,
     io_dump: Option<IoDumpStackConfig>,
     stream_idle_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
 }
 
 impl QuicConnectionHandler {
@@ -122,6 +123,7 @@ impl QuicConnectionHandler {
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
         stream_idle_timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -138,6 +140,7 @@ impl QuicConnectionHandler {
             connection_manager,
             io_dump,
             stream_idle_timeout,
+            connect_timeout,
         })
     }
 
@@ -402,6 +405,7 @@ impl QuicConnectionHandler {
                                 let tunnel_manager = self.env.tunnel_manager.clone();
                                 let forward_info = stream_info.clone();
                                 let stream_idle_timeout = self.stream_idle_timeout;
+                                let connect_timeout = self.connect_timeout;
                                 let handle = tokio::spawn(async move {
                                     if let Err(e) = stream_forward(
                                         stream,
@@ -409,6 +413,7 @@ impl QuicConnectionHandler {
                                         &tunnel_manager,
                                         Some(&forward_info),
                                         stream_idle_timeout,
+                                        connect_timeout,
                                     )
                                     .await
                                     {
@@ -1547,6 +1552,7 @@ impl QuicStack {
             builder.connection_manager.clone(),
             builder.io_dump,
             builder.stream_idle_timeout,
+            builder.connect_timeout,
         )
         .await?;
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
@@ -1654,6 +1660,7 @@ impl Stack for QuicStack {
             .await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
             stream_idle_timeout_from_secs(config.stream_idle_timeout),
+            connect_timeout_from_secs(config.connect_timeout),
         )
         .await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
@@ -1683,6 +1690,7 @@ pub struct QuicStackBuilder {
     stack_context: Option<Arc<QuicStackContext>>,
     io_dump: Option<IoDumpStackConfig>,
     stream_idle_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
 }
 
 impl QuicStackBuilder {
@@ -1699,6 +1707,7 @@ impl QuicStackBuilder {
             stack_context: None,
             io_dump: None,
             stream_idle_timeout: stream_idle_timeout_from_secs(None),
+            connect_timeout: connect_timeout_from_secs(None),
         }
     }
 
@@ -1760,6 +1769,11 @@ impl QuicStackBuilder {
         self
     }
 
+    pub fn connect_timeout(mut self, connect_timeout: std::time::Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
     pub async fn build(self) -> StackResult<QuicStack> {
         QuicStack::create(self).await
     }
@@ -1787,6 +1801,8 @@ pub struct QuicStackConfig {
     pub io_dump_max_download_bytes_per_conn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_idle_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<u64>,
     pub reuse_address: Option<bool>,
 }
 
@@ -1867,6 +1883,7 @@ impl StackFactory for QuicStackFactory {
             .stack_context(stack_context.clone())
             .io_dump(io_dump)
             .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
+            .connect_timeout(connect_timeout_from_secs(config.connect_timeout))
             .reuse_address(config.reuse_address.unwrap_or(false))
             .build()
             .await?;
@@ -3610,6 +3627,7 @@ mod tests {
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
             stream_idle_timeout: None,
+            connect_timeout: None,
             reuse_address: None,
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(QuicStackContext::new(

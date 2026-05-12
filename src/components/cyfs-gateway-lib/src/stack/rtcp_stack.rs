@@ -21,8 +21,8 @@ use crate::global_process_chains::{
 use crate::rtcp::{AsyncStreamWithDatagram, RTcpTunnelDatagramClient};
 use crate::stack::limiter::Limiter;
 use crate::stack::{
-    datagram_forward, get_limit_info, get_source_addr_from_req_env, probe_proxy_protocol_stream,
-    stream_forward, stream_idle_timeout_from_secs,
+    connect_timeout_from_secs, datagram_forward, get_limit_info, get_source_addr_from_req_env,
+    probe_proxy_protocol_stream, stream_forward, stream_idle_timeout_from_secs,
 };
 use crate::{
     ConnectionInfo, ConnectionManagerRef, DatagramInfo, DumpStream, GlobalCollectionManagerRef,
@@ -80,6 +80,7 @@ struct RtcpConnectionHandler {
     connection_manager: Option<ConnectionManagerRef>,
     io_dump: Option<IoDumpStackConfig>,
     stream_idle_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
 }
 
 impl RtcpConnectionHandler {
@@ -90,6 +91,7 @@ impl RtcpConnectionHandler {
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
         stream_idle_timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -122,6 +124,7 @@ impl RtcpConnectionHandler {
             connection_manager,
             io_dump,
             stream_idle_timeout,
+            connect_timeout,
         })
     }
 
@@ -163,6 +166,7 @@ impl RtcpConnectionHandler {
             connection_manager: self.connection_manager.clone(),
             io_dump,
             stream_idle_timeout: self.stream_idle_timeout,
+            connect_timeout: self.connect_timeout,
         })
     }
 
@@ -417,6 +421,7 @@ impl RtcpConnectionHandler {
                                 &self.env.tunnel_manager,
                                 Some(&stream_info),
                                 self.stream_idle_timeout,
+                                self.connect_timeout,
                             )
                             .await?;
                         }
@@ -635,6 +640,7 @@ impl RtcpConnectionHandler {
                                 target,
                                 &self.env.tunnel_manager,
                                 self.stream_idle_timeout,
+                                self.connect_timeout,
                             )
                             .await?;
                         }
@@ -1150,6 +1156,7 @@ impl RtcpStack {
             connection_manager.clone(),
             builder.io_dump,
             builder.stream_idle_timeout,
+            builder.connect_timeout,
         )
         .await?;
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
@@ -1271,6 +1278,7 @@ impl Stack for RtcpStack {
             self.connection_manager.clone(),
             io_dump,
             stream_idle_timeout_from_secs(config.stream_idle_timeout),
+            connect_timeout_from_secs(config.connect_timeout),
         )
         .await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(handler));
@@ -1302,6 +1310,7 @@ pub struct RtcpStackBuilder {
     io_dump: Option<IoDumpStackConfig>,
     reuse_address: bool,
     stream_idle_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
 }
 
 impl RtcpStackBuilder {
@@ -1320,6 +1329,7 @@ impl RtcpStackBuilder {
             io_dump: None,
             reuse_address: false,
             stream_idle_timeout: stream_idle_timeout_from_secs(None),
+            connect_timeout: connect_timeout_from_secs(None),
         }
     }
 
@@ -1391,6 +1401,11 @@ impl RtcpStackBuilder {
         self
     }
 
+    pub fn connect_timeout(mut self, connect_timeout: std::time::Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
     pub async fn build(self) -> StackResult<RtcpStack> {
         RtcpStack::create(self).await
     }
@@ -1421,6 +1436,8 @@ pub struct RtcpStackConfig {
     pub io_dump_max_download_bytes_per_conn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_idle_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<u64>,
     pub reuse_address: Option<bool>,
 }
 
@@ -1534,6 +1551,7 @@ impl StackFactory for RtcpStackFactory {
             .stack_context(stack_context.clone())
             .io_dump(io_dump)
             .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
+            .connect_timeout(connect_timeout_from_secs(config.connect_timeout))
             .reuse_address(config.reuse_address.unwrap_or(false))
             .build()
             .await?;
@@ -1734,6 +1752,7 @@ mod tests {
             None,
             None,
             Duration::from_secs(60),
+            Duration::from_secs(10),
         )
         .await
         .unwrap();
@@ -5010,6 +5029,7 @@ mod tests {
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
             stream_idle_timeout: None,
+            connect_timeout: None,
             reuse_address: None,
         };
 
@@ -5043,6 +5063,7 @@ mod tests {
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
             stream_idle_timeout: None,
+            connect_timeout: None,
             reuse_address: None,
         };
 
@@ -5082,6 +5103,7 @@ mod tests {
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
             stream_idle_timeout: None,
+            connect_timeout: None,
             reuse_address: None,
         };
 
