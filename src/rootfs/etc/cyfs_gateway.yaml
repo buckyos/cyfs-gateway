@@ -206,6 +206,15 @@ stacks:
     #             priority: 1
     #             block: |
     #               map-add RESP x-from-gateway true;
+    #     forward:                    # optional upstream forward timeout settings
+    #       connect_timeout: 60        # upstream connection timeout (seconds), default 60
+    #       tls_handshake_timeout: 60  # upstream TLS handshake timeout (seconds), default 60
+    #       http_handshake_timeout: 60 # upstream HTTP handshake timeout (seconds), default 60
+    #       request_timeout: 60        # upstream request timeout (seconds), default 60
+    #       response_header_timeout: 60 # upstream response header timeout (seconds), default 60
+    #       response_body_idle_timeout: 60 # upstream response body idle timeout (seconds), default 60
+    #       post_chain_timeout: 60     # post_hook_point execution timeout (seconds), default 60
+    #       abort_upstream_on_client_close: true # abort upstream when downstream closes, default true
     #     gzip: false                 # default false
     #     gzip_types: []              # optional content-types white list
     #     gzip_min_length: 20         # default 20 bytes
