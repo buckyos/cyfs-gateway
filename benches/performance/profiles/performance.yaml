@@ -1,0 +1,172 @@
+# Profile schema version used by the performance-test module.
+version: v0.6
+
+# Human-readable benchmark profile name shown in reports.
+name: local-docker-smoke
+
+# Target machine where the benchmark containers run.
+target:
+  # Target execution mode. Allowed values: local, ssh.
+  mode: local
+  # Target host or SSH host alias. Local mode defaults to loopback.
+  host: 127.0.0.1
+  # Keep Ubuntu/Debian as an explicit preflight requirement for reproducible DV runs.
+  ubuntu_required: true
+
+# Registry used to publish test images and later pull them on the target.
+registry:
+  # Whether build outputs are expected to be pushed before running.
+  push: true
+  # Pull policy used by the target-side Docker deployment.
+  pull_policy: always
+  # Allows local DV to record an approved environment deferral when no registry is available.
+  allow_deferral: true
+
+# Candidate service images compared by the benchmark.
+images:
+  # nginx baseline image metadata.
+  nginx:
+    # Full image reference used by build, push, pull, deployment, and report metadata.
+    image_ref: registry.example.com/cyfs-gateway/performance/nginx-perf:v0.6-local
+
+  # cyfs_gateway candidate image metadata.
+  cyfs_gateway:
+    # Full image reference used by build, push, pull, deployment, and report metadata.
+    image_ref: registry.example.com/cyfs-gateway/performance/cyfs-gateway-perf:v0.6-local
+    # Source tree used when building the cyfs_gateway test image.
+    source:
+      # Repository root relative to this profile file.
+      repo_root: ../../../
+      # Cargo workspace manifest used for source build metadata.
+      cargo_manifest: ../../../src/Cargo.toml
+      # Cargo package expected to produce the cyfs_gateway binary.
+      package: cyfs_gateway
+      # Build optimized cyfs_gateway binary for benchmark images.
+      build_profile: release
+      # Build a musl target so the benchmark image uses a self-contained binary.
+      target: x86_64-unknown-linux-musl
+
+# Generated test assets embedded into image build contexts.
+generated_config:
+  # Docker network settings for candidate containers.
+  docker:
+    # Network name created for the local benchmark run.
+    network: cyfs-perf-local
+
+  # Static files served by the static-file scenario.
+  static_files:
+    # Directory where generated static fixtures are placed.
+    root: fixtures/static
+    # Static fixture files and deterministic sizes.
+    files:
+      - # Small smoke-test HTML path requested by the benchmark.
+        path: index.html
+        # File size in bytes.
+        size_bytes: 4096
+      - # Larger binary payload path requested by the benchmark.
+        path: payload.bin
+        # File size in bytes.
+        size_bytes: 1048576
+
+  # Test TLS material generation policy.
+  tls:
+    # Test certificate material policy.
+    mode: generated
+    # Common name used by generated test certificates and HTTPS reports.
+    common_name: perf.local
+
+# Fixture services used as in-image upstream targets for reverse-proxy scenarios.
+upstream:
+  # HTTP fixture is compiled from generated Rust source and packaged into each candidate test image.
+  http_fixture:
+    # Container-side HTTP fixture port.
+    port: 8080
+    # Request path used to verify reverse-proxy payload behavior.
+    response_path: /proxy/payload
+
+  # Stream fixture is compiled from generated Rust source and packaged into each candidate test image.
+  stream_fixture:
+    # Container-side plain TCP fixture port.
+    port: 9000
+    # Container-side TLS-wrapped TCP fixture port.
+    tls_port: 9443
+    # Deterministic stream payload size in bytes.
+    payload_bytes: 1024
+
+# Scenario matrix enabled for both candidate services.
+scenarios:
+  # Static file serving through each candidate service.
+  static_http_file:
+    # Whether this scenario participates in matrix expansion.
+    enabled: true
+    # Static paths requested by HTTP/HTTPS load generation.
+    paths:
+      - /index.html
+      - /payload.bin
+
+  # HTTP reverse proxy through each candidate service to the HTTP fixture.
+  http_reverse_proxy:
+    # Whether this scenario participates in matrix expansion.
+    enabled: true
+    # Candidate-facing path mapped to the HTTP fixture response.
+    path: /proxy/payload
+
+  # TCP stream reverse proxy through each candidate service.
+  stream_reverse_proxy:
+    # Whether this scenario participates in matrix expansion.
+    enabled: true
+    # Stream modes covered by the first benchmark version.
+    modes:
+      - tcp
+      - tcp_tls
+
+# Application protocols used for HTTP-style scenarios.
+protocols:
+  # Enable cleartext HTTP requests.
+  http: true
+  # Enable HTTPS requests with benchmark test certificates.
+  https: true
+
+# Fixed-rate workload settings shared by both candidates.
+load:
+  # Measured duration for each candidate/scenario/protocol/rate tier.
+  duration_seconds: 60
+  # Warmup period excluded from the main comparison window.
+  warmup_seconds: 10
+  # Client-side concurrency target for generated load.
+  concurrency: 64
+  # Explicit fixed request/connection rates.
+  rates:
+    - 100
+    - 500
+    - 1000
+  # Per-request or per-connection timeout in seconds.
+  timeout_seconds: 5
+
+# Service-side resource metrics collected during benchmark windows.
+metrics:
+  # Docker stats sampling interval in seconds.
+  resource_sample_interval_seconds: 1
+  # Whether to collect Docker CPU and memory samples for candidate containers.
+  collect_docker_stats: true
+  # Latency percentile cutoffs included in JSON, Markdown, and optional CSV output.
+  latency_percentiles:
+    - 50
+    - 90
+    - 95
+    - 99
+
+# Report and evidence output settings.
+output:
+  # Default output directory for generated reports and logs, relative to this profile file.
+  directory: ../results/latest
+  # Report formats produced by the run command.
+  formats:
+    # Machine-readable benchmark result.
+    json: true
+    # Human-readable benchmark summary.
+    markdown: true
+    # Optional tabular output for trend collection.
+    csv: true
+  # Keep container/log metadata in the output directory when available.
+  keep_logs: true
