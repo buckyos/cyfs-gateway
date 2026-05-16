@@ -23,6 +23,9 @@ configuration, define production SLOs, or provide a CI performance gate.
 
 - Python 3.10 or newer.
 - Python dependencies declared in `pyproject.toml`.
+- `vegeta` for HTTP/HTTPS fixed-rate load. The runner first uses
+  `CYFS_VEGETA_PATH` or `PATH`, then downloads the latest matching release from
+  `https://github.com/tsenart/vegeta` into a local cache when missing.
 - Ubuntu or Debian target host for benchmark runs.
 - Docker CLI and Docker daemon on the benchmark target.
 - Rust/cargo build environment for `cyfs_gateway` image builds.
@@ -49,7 +52,8 @@ workload planning, metrics collection, and report metadata. Important fields:
 - `generated_config`: generated test assets and Docker network settings.
 - `scenarios`: enabled static file, HTTP proxy, and stream proxy cases.
 - `protocols`: HTTP and HTTPS switches for HTTP-style scenarios.
-- `load`: fixed-rate workload duration, warmup, concurrency, and rates.
+- `load`: fixed-rate workload duration, warmup, concurrency, rates, and
+  connection reuse modes.
 - `metrics`: resource sampling and latency percentiles.
 - `output`: result directory and report formats. Relative directories are
   resolved from the profile file's directory.
@@ -118,8 +122,9 @@ The output directory contains command evidence and benchmark artifacts such as:
 - `logs/`: stdout/stderr logs for executed commands.
 
 The report records profile path, target metadata, image refs, source build
-metadata, request metrics, latency statistics, CPU samples, memory samples, and
-deferral reasons when the environment cannot complete a real run.
+metadata, request metrics, latency statistics, actual attempted request count,
+actual request rate, CPU samples, memory samples, and deferral reasons when the
+environment cannot complete a real run.
 
 ## Validation
 
@@ -143,8 +148,13 @@ permissions, registry access, and target machine load are environment-specific.
 
 - The benchmark uses fixed configured rate tiers; it does not search for max
   throughput automatically.
+- HTTP/HTTPS load uses `vegeta attack` and records response latency from
+  `vegeta encode -to=json`; stream TCP/TLS load uses the built-in socket runner.
+- Set `CYFS_VEGETA_CACHE` to choose the auto-download cache directory, or
+  `CYFS_VEGETA_PATH` to force a specific binary.
 - nginx and `cyfs_gateway` must use the same profile, payloads, durations,
-  warmup, concurrency, target host, and image refs for a valid comparison.
+  warmup, concurrency, connection reuse mode, target host, and image refs for a
+  valid comparison.
 - Generated images are test images only, not production release artifacts.
 - Successful or failed runs attempt to clean up containers and the benchmark
   Docker network created by this module.

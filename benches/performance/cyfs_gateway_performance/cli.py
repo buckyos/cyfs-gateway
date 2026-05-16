@@ -395,13 +395,14 @@ def _run(args: argparse.Namespace) -> int:
         rows = []
         for index, scenario in enumerate(scenarios, start=1):
             _log(
-                "scenario {}/{} start: candidate={} scenario={} protocol={} stream_mode={} rate={} payload={}".format(
+                "scenario {}/{} start: candidate={} scenario={} protocol={} stream_mode={} connection_reuse={} rate={} payload={}".format(
                     index,
                     len(scenarios),
                     scenario.candidate,
                     scenario.scenario,
                     scenario.protocol,
                     scenario.stream_mode or "",
+                    scenario.connection_reuse,
                     scenario.rate,
                     scenario.payload,
                 )
@@ -435,6 +436,7 @@ def _run(args: argparse.Namespace) -> int:
                     "scenario": scenario.scenario,
                     "protocol": scenario.protocol,
                     "stream_mode": scenario.stream_mode,
+                    "connection_reuse": scenario.connection_reuse,
                     "rate": scenario.rate,
                     "payload": scenario.payload,
                     "requests": request_metrics,

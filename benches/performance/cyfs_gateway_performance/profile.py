@@ -7,6 +7,9 @@ from typing import Any
 from .model import BenchmarkPlan, ConfigError, ImageConfig, LoadConfig, TargetConfig
 
 
+CONNECTION_REUSE_MODES = {"new_connection", "reuse_connection"}
+
+
 try:
     import yaml  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - exercised when PyYAML is absent.
@@ -76,6 +79,13 @@ def load_profile(path: str | Path) -> BenchmarkPlan:
     rates = load.get("rates")
     if not isinstance(rates, list) or not rates or not all(isinstance(rate, int) and rate > 0 for rate in rates):
         raise ConfigError("load.rates must be a non-empty list of positive fixed rates")
+    reuse_modes = load.get("connection_reuse_modes", ["new_connection"])
+    if (
+        not isinstance(reuse_modes, list)
+        or not reuse_modes
+        or not all(isinstance(mode, str) and mode in CONNECTION_REUSE_MODES for mode in reuse_modes)
+    ):
+        raise ConfigError("load.connection_reuse_modes must contain new_connection or reuse_connection")
     duration = _required_int(load, "duration_seconds", 1)
     warmup = _required_int(load, "warmup_seconds", 0)
     if warmup >= duration:
@@ -107,6 +117,7 @@ def load_profile(path: str | Path) -> BenchmarkPlan:
             warmup_seconds=warmup,
             concurrency=_required_int(load, "concurrency", 1),
             rates=tuple(rates),
+            connection_reuse_modes=tuple(reuse_modes),
             timeout_seconds=_required_int(load, "timeout_seconds", 1),
         ),
         metrics=dict(data.get("metrics") or {}),

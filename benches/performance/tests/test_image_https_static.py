@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cyfs_gateway_performance.image import image_build_plan, push_plan, write_image_context
 from cyfs_gateway_performance.profile import load_profile
 from cyfs_gateway_performance.target import run_container_commands
-from cyfs_gateway_performance.workload import _http_request, endpoint_for
+from cyfs_gateway_performance.workload import _http_request, _stream_request, endpoint_for, stream_tls_server_name
 from cyfs_gateway_performance.model import ScenarioPlan
 
 
@@ -95,6 +95,45 @@ class ImageHttpsStaticTests(unittest.TestCase):
         self.assertIsInstance(context, ssl.SSLContext)
         self.assertFalse(context.check_hostname)
         self.assertEqual(context.verify_mode, ssl.CERT_NONE)
+
+    def test_stream_tls_workload_uses_profile_common_name_for_sni(self) -> None:
+        plan = load_profile(PROFILE)
+        self.assertEqual(stream_tls_server_name(plan), "perf.local")
+
+        class FakeSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def settimeout(self, _timeout):
+                pass
+
+            def sendall(self, _payload):
+                pass
+
+            def recv(self, _size):
+                return b"cyfs-performance-stream-payload"
+
+            def close(self):
+                pass
+
+        class FakeContext:
+            def wrap_socket(self, raw, server_hostname=None):
+                self.raw = raw
+                self.server_hostname = server_hostname
+                return raw
+
+        context = FakeContext()
+        raw = FakeSocket()
+        with mock.patch("socket.create_connection", return_value=raw), mock.patch(
+            "ssl._create_unverified_context",
+            return_value=context,
+        ):
+            _stream_request("127.0.0.1", 29443, 1, True, stream_tls_server_name(plan))
+
+        self.assertEqual(context.server_hostname, "perf.local")
 
 
 if __name__ == "__main__":

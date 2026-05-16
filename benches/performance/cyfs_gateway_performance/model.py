@@ -29,6 +29,7 @@ class LoadConfig:
     warmup_seconds: int
     concurrency: int
     rates: tuple[int, ...]
+    connection_reuse_modes: tuple[str, ...]
     timeout_seconds: int
 
 
@@ -58,6 +59,7 @@ class ScenarioPlan:
     rate: int
     payload: str
     stream_mode: str | None = None
+    connection_reuse: str = "new_connection"
 
 
 @dataclass(frozen=True)

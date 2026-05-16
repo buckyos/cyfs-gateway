@@ -140,6 +140,10 @@ load:
     - 100
     - 500
     - 1000
+  # Connection lifecycle modes included in the scenario matrix.
+  connection_reuse_modes:
+    - new_connection
+    - reuse_connection
   # Per-request or per-connection timeout in seconds.
   timeout_seconds: 5
 

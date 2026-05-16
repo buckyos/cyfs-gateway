@@ -16,9 +16,10 @@ from cyfs_gateway_performance import cli
 from cyfs_gateway_performance.executor import CommandResult
 from cyfs_gateway_performance.image import source_build_commands, write_image_context
 from cyfs_gateway_performance.metrics import run_with_resource_metrics
-from cyfs_gateway_performance.model import ScenarioPlan
+from cyfs_gateway_performance.model import ConfigError, ScenarioPlan
 from cyfs_gateway_performance.profile import load_profile
 from cyfs_gateway_performance.report import write_reports
+from cyfs_gateway_performance.scenario import expand_scenarios
 from cyfs_gateway_performance.target import container_readiness_commands, preflight, run_container_commands
 from cyfs_gateway_performance.workload import endpoint_for, run_fixed_rate_workload
 
@@ -74,19 +75,94 @@ class RuntimeBehaviorTests(unittest.TestCase):
         plan = replace(plan, load=replace(plan.load, duration_seconds=1, warmup_seconds=1, concurrency=2, rates=(2,)))
         scenario = ScenarioPlan("nginx", "static_http_file", "http", 2, "/index.html")
 
-        with mock.patch(
-            "cyfs_gateway_performance.workload._run_one",
-            return_value=(True, 3.0, None),
-        ) as run_one:
+        def fake_run(command, **kwargs):
+            if command[1] == "attack":
+                return mock.Mock(returncode=0, stdout=b"vegeta-binary-results", stderr=b"")
+            return mock.Mock(
+                returncode=0,
+                stdout=b'{"code":200,"latency":3000000}\n{"code":200,"latency":3000000}\n',
+                stderr=b"",
+            )
+
+        with mock.patch("cyfs_gateway_performance.workload.ensure_vegeta", return_value=(Path("/tmp/vegeta"), {})), mock.patch(
+            "cyfs_gateway_performance.workload.subprocess.run",
+            side_effect=fake_run,
+        ) as run_command:
             result = run_fixed_rate_workload(plan, scenario)
 
-        self.assertEqual(run_one.call_count, 4)
+        attack_commands = [call.args[0] for call in run_command.call_args_list if call.args[0][1] == "attack"]
+        self.assertEqual(len(attack_commands), 2)
+        self.assertIn("-rate", attack_commands[0])
+        self.assertIn("2/s", attack_commands[0])
+        self.assertIn("-workers", attack_commands[0])
+        self.assertIn("2", attack_commands[0])
+        self.assertIn("-keepalive=false", attack_commands[0])
         self.assertEqual(result["warmup_attempted"], 2)
+        self.assertEqual(result["warmup_actual_attempted"], 2)
         self.assertEqual(result["attempted"], 2)
+        self.assertEqual(result["actual_attempted"], 2)
         self.assertEqual(result["warmup_success"], 2)
         self.assertEqual(result["success"], 2)
         self.assertEqual(result["latency_ms"]["avg"], 3.0)
         self.assertEqual(result["concurrency"], 2)
+        self.assertEqual(result["connection_reuse"], "new_connection")
+        self.assertEqual(result["engine"], "vegeta")
+
+    def test_profile_expands_connection_reuse_modes_in_scenario_matrix(self) -> None:
+        plan = load_profile(PROFILE)
+        scenarios = expand_scenarios(plan)
+        reuse_modes = {scenario.connection_reuse for scenario in scenarios}
+        equivalent = [
+            scenario
+            for scenario in scenarios
+            if scenario.candidate == "nginx"
+            and scenario.scenario == "static_http_file"
+            and scenario.protocol == "http"
+            and scenario.payload == "/index.html"
+            and scenario.rate == 100
+        ]
+
+        self.assertEqual(plan.load.connection_reuse_modes, ("new_connection", "reuse_connection"))
+        self.assertEqual(reuse_modes, {"new_connection", "reuse_connection"})
+        self.assertEqual({scenario.connection_reuse for scenario in equivalent}, {"new_connection", "reuse_connection"})
+
+    def test_profile_rejects_unknown_connection_reuse_mode(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("- reuse_connection", "- multiplex_everything")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "connection_reuse_modes"):
+                load_profile(profile)
+
+    def test_reuse_connection_workload_reuses_worker_sessions(self) -> None:
+        plan = load_profile(PROFILE)
+        plan = replace(plan, load=replace(plan.load, duration_seconds=1, warmup_seconds=0, concurrency=2, rates=(4,)))
+        scenario = ScenarioPlan("nginx", "stream_reverse_proxy", "tcp", 4, "stream", "tcp", "reuse_connection")
+        sessions = []
+
+        class FakeReusableConnection:
+            def __init__(self, *_args):
+                self.requests = 0
+                self.closed = False
+                sessions.append(self)
+
+            def request(self):
+                self.requests += 1
+
+            def close(self):
+                self.closed = True
+
+        with mock.patch("cyfs_gateway_performance.workload._ReusableConnection", FakeReusableConnection), mock.patch(
+            "cyfs_gateway_performance.workload.time.sleep"
+        ):
+            result = run_fixed_rate_workload(plan, scenario)
+
+        self.assertEqual(result["attempted"], 4)
+        self.assertEqual(result["success"], 4)
+        self.assertEqual(result["connection_reuse"], "reuse_connection")
+        self.assertLessEqual(len(sessions), 2)
+        self.assertGreaterEqual(max(session.requests for session in sessions), 2)
+        self.assertTrue(all(session.closed for session in sessions))
 
     def test_resource_metrics_samples_during_measured_window(self) -> None:
         plan = load_profile(PROFILE)
@@ -447,6 +523,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
                     "protocol": "http",
                     "stream_mode": None,
                     "payload": "/index.html",
+                    "connection_reuse": "new_connection",
                     "rate": 100,
                     "requests": {"success": 10, "latency_ms": {"avg": 1.1}},
                     "resources": {"cpu_percent_avg": 2.0, "memory_bytes_avg": 100},
@@ -457,6 +534,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
                     "protocol": "http",
                     "stream_mode": None,
                     "payload": "/proxy/payload",
+                    "connection_reuse": "new_connection",
                     "rate": 100,
                     "requests": {"success": 20, "latency_ms": {"avg": 2.2}},
                     "resources": {"cpu_percent_avg": 3.0, "memory_bytes_avg": 200},
@@ -467,6 +545,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
                     "protocol": "http",
                     "stream_mode": None,
                     "payload": "/index.html",
+                    "connection_reuse": "new_connection",
                     "rate": 100,
                     "requests": {"success": 11, "latency_ms": {"avg": 1.2}},
                     "resources": {"cpu_percent_avg": 2.1, "memory_bytes_avg": 101},
@@ -477,6 +556,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
                     "protocol": "http",
                     "stream_mode": None,
                     "payload": "/proxy/payload",
+                    "connection_reuse": "new_connection",
                     "rate": 100,
                     "requests": {"success": 21, "latency_ms": {"avg": 2.3}},
                     "resources": {"cpu_percent_avg": 3.1, "memory_bytes_avg": 201},
@@ -488,10 +568,10 @@ class RuntimeBehaviorTests(unittest.TestCase):
             outputs = write_reports(result, Path(temp))
             summary = Path(outputs["markdown"]).read_text(encoding="utf-8")
 
-        static_nginx = summary.index("| static_http_file | http |  | /index.html | 100 | nginx |")
-        static_cyfs = summary.index("| static_http_file | http |  | /index.html | 100 | cyfs_gateway |")
-        proxy_nginx = summary.index("| http_reverse_proxy | http |  | /proxy/payload | 100 | nginx |")
-        proxy_cyfs = summary.index("| http_reverse_proxy | http |  | /proxy/payload | 100 | cyfs_gateway |")
+        static_nginx = summary.index("| static_http_file | http |  | /index.html | new_connection | 100 | nginx |")
+        static_cyfs = summary.index("| static_http_file | http |  | /index.html | new_connection | 100 | cyfs_gateway |")
+        proxy_nginx = summary.index("| http_reverse_proxy | http |  | /proxy/payload | new_connection | 100 | nginx |")
+        proxy_cyfs = summary.index("| http_reverse_proxy | http |  | /proxy/payload | new_connection | 100 | cyfs_gateway |")
         self.assertLess(proxy_nginx, proxy_cyfs)
         self.assertLess(proxy_cyfs, static_nginx)
         self.assertLess(static_nginx, static_cyfs)

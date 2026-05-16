@@ -34,5 +34,6 @@ def expand_scenarios(plan: BenchmarkPlan) -> list[ScenarioPlan]:
                 for payload in payloads:
                     for mode in stream_modes:
                         for rate in plan.load.rates:
-                            result.append(ScenarioPlan(candidate, scenario, protocol, rate, payload, mode))
+                            for reuse_mode in plan.load.connection_reuse_modes:
+                                result.append(ScenarioPlan(candidate, scenario, protocol, rate, payload, mode, reuse_mode))
     return result
