@@ -245,6 +245,10 @@ stacks:
     #    autoindex: false             # default false, list dir when no index_file
     #    etag: true                   # default true
     #    if_modified_since: "exact"   # optional; exact | before | off
+    #    open_file_cache: "max=10000 inactive=60s"  # optional, nginx-like static file stat/error cache; "off" disables
+    #    open_file_cache_valid: "60s"               # revalidate cached stat/error after this duration
+    #    open_file_cache_min_uses: 2                # cache only after this many accesses
+    #    open_file_cache_errors: true               # cache stat errors such as missing files
 
   # dns_example:
   #   type: dns

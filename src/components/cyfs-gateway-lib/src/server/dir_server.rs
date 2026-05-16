@@ -10,8 +10,12 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
 use hyper::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE};
+use mini_moka::sync::Cache;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -41,6 +45,7 @@ pub struct DirServerBuilder {
     autoindex: bool,
     etag: Option<bool>,
     if_modified_since: Option<String>,
+    open_file_cache: Option<OpenFileCacheSettings>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +53,318 @@ enum IfModifiedSinceMode {
     Off,
     Exact,
     Before,
+}
+
+#[derive(Clone, Debug)]
+struct OpenFileCacheSettings {
+    max: u64,
+    inactive: Duration,
+    valid: Duration,
+    min_uses: u64,
+    errors: bool,
+}
+
+impl Default for OpenFileCacheSettings {
+    fn default() -> Self {
+        Self {
+            max: 10_000,
+            inactive: Duration::from_secs(60),
+            valid: Duration::from_secs(60),
+            min_uses: 2,
+            errors: true,
+        }
+    }
+}
+
+impl OpenFileCacheSettings {
+    fn from_config(
+        config: DirServerOpenFileCacheConfig,
+        valid: Option<DirServerCacheDuration>,
+        min_uses: Option<u64>,
+        errors: Option<bool>,
+    ) -> ServerResult<Option<Self>> {
+        if config.off {
+            return Ok(None);
+        }
+
+        let defaults = Self::default();
+        let settings = Self {
+            max: config.max.unwrap_or(defaults.max),
+            inactive: config
+                .inactive
+                .map(|v| v.into_duration())
+                .unwrap_or(defaults.inactive),
+            valid: valid.map(|v| v.into_duration()).unwrap_or(defaults.valid),
+            min_uses: min_uses.unwrap_or(defaults.min_uses),
+            errors: errors.unwrap_or(defaults.errors),
+        };
+
+        if settings.max == 0 {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "open_file_cache max must be greater than 0"
+            ));
+        }
+
+        if settings.min_uses == 0 {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "open_file_cache_min_uses must be greater than 0"
+            ));
+        }
+
+        Ok(Some(settings))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OpenFileCache {
+    settings: OpenFileCacheSettings,
+    stat_cache: Cache<PathBuf, CachedPathStat>,
+    admission_counts: Cache<PathBuf, u64>,
+}
+
+impl OpenFileCache {
+    fn new(settings: OpenFileCacheSettings) -> Self {
+        let admission_capacity = settings.max.saturating_mul(2).max(1);
+        Self {
+            stat_cache: Cache::builder()
+                .max_capacity(settings.max)
+                .time_to_live(settings.valid)
+                .time_to_idle(settings.inactive)
+                .build(),
+            admission_counts: Cache::builder()
+                .max_capacity(admission_capacity)
+                .time_to_idle(settings.inactive)
+                .build(),
+            settings,
+        }
+    }
+
+    fn stat_path(&self, path: &Path) -> DirPathStat {
+        let key = path.to_path_buf();
+        if let Some(cached) = self.stat_cache.get(&key) {
+            return cached.into_stat();
+        }
+
+        let stat = DirPathStat::from_path(path, false);
+        let uses = self.admission_counts.get(&key).unwrap_or(0) + 1;
+        self.admission_counts.insert(key.clone(), uses);
+
+        if uses >= self.settings.min_uses && (stat.exists() || self.settings.errors) {
+            let cached_stat = stat.with_cached_file(path);
+            self.stat_cache
+                .insert(key, CachedPathStat::from(&cached_stat));
+            return cached_stat;
+        }
+
+        stat
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedPathStat {
+    result: Result<CachedPathMetadata, CachedPathError>,
+}
+
+impl CachedPathStat {
+    fn into_stat(self) -> DirPathStat {
+        match self.result {
+            Ok(metadata) => DirPathStat::Found(metadata),
+            Err(e) => DirPathStat::Error(e.into_io_error()),
+        }
+    }
+}
+
+impl From<&DirPathStat> for CachedPathStat {
+    fn from(stat: &DirPathStat) -> Self {
+        let result = match stat {
+            DirPathStat::Found(metadata) => Ok(metadata.clone()),
+            DirPathStat::Error(e) => Err(CachedPathError {
+                kind: e.kind(),
+                message: e.to_string(),
+            }),
+        };
+        Self { result }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedPathMetadata {
+    metadata: std::fs::Metadata,
+    file: Option<Arc<std::fs::File>>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedPathError {
+    kind: ErrorKind,
+    message: String,
+}
+
+impl CachedPathError {
+    fn into_io_error(self) -> std::io::Error {
+        std::io::Error::new(self.kind, self.message)
+    }
+}
+
+#[derive(Debug)]
+enum DirPathStat {
+    Found(CachedPathMetadata),
+    Error(std::io::Error),
+}
+
+struct OpenedDirFile {
+    file: tokio::fs::File,
+    metadata: std::fs::Metadata,
+}
+
+impl DirPathStat {
+    fn from_path(path: &Path, cache_file: bool) -> Self {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Self::Found(CachedPathMetadata {
+                file: if cache_file && metadata.is_file() {
+                    std::fs::File::open(path).ok().map(Arc::new)
+                } else {
+                    None
+                },
+                metadata,
+            }),
+            Err(e) => Self::Error(e),
+        }
+    }
+
+    fn with_cached_file(self, path: &Path) -> Self {
+        match self {
+            Self::Found(mut metadata) => {
+                if metadata.metadata.is_file() && metadata.file.is_none() {
+                    metadata.file = std::fs::File::open(path).ok().map(Arc::new);
+                }
+                Self::Found(metadata)
+            }
+            Self::Error(e) => Self::Error(e),
+        }
+    }
+
+    fn exists(&self) -> bool {
+        matches!(self, Self::Found(_))
+    }
+
+    fn is_dir(&self) -> bool {
+        matches!(self, Self::Found(metadata) if metadata.metadata.is_dir())
+    }
+
+    fn is_file(&self) -> bool {
+        matches!(self, Self::Found(metadata) if metadata.metadata.is_file())
+    }
+
+    fn metadata(&self) -> Option<std::fs::Metadata> {
+        match self {
+            Self::Found(metadata) => Some(metadata.metadata.clone()),
+            Self::Error(_) => None,
+        }
+    }
+
+    fn try_clone_file(&self) -> Option<std::io::Result<std::fs::File>> {
+        match self {
+            Self::Found(metadata) => metadata.file.as_ref().map(|file| file.try_clone()),
+            Self::Error(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_not_found(&self) -> bool {
+        matches!(self, Self::Error(e) if e.kind() == ErrorKind::NotFound)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum DirServerCacheDuration {
+    Seconds(u64),
+}
+
+impl DirServerCacheDuration {
+    fn into_duration(self) -> Duration {
+        match self {
+            Self::Seconds(seconds) => Duration::from_secs(seconds),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DirServerCacheDuration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DurationVisitor;
+
+        impl<'de> Visitor<'de> for DurationVisitor {
+            type Value = DirServerCacheDuration;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a duration in seconds or a string ending with s/m/h")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(DirServerCacheDuration::Seconds(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value < 0 {
+                    return Err(E::custom("duration must be non-negative"));
+                }
+                Ok(DirServerCacheDuration::Seconds(value as u64))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                parse_cache_duration(value)
+                    .map(DirServerCacheDuration::Seconds)
+                    .map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(DurationVisitor)
+    }
+}
+
+fn parse_cache_duration(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("duration must not be empty".to_string());
+    }
+
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+        let millis = number
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("invalid duration: {}", value))?;
+        return Ok(millis.div_ceil(1000));
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 60 * 60)
+    } else {
+        (value, 1)
+    };
+
+    let number = number
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| format!("invalid duration: {}", value))?;
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("duration is too large: {}", value))
 }
 
 impl IfModifiedSinceMode {
@@ -107,6 +424,17 @@ impl DirServerBuilder {
         self
     }
 
+    pub fn open_file_cache(
+        mut self,
+        config: DirServerOpenFileCacheConfig,
+        valid: Option<DirServerCacheDuration>,
+        min_uses: Option<u64>,
+        errors: Option<bool>,
+    ) -> ServerResult<Self> {
+        self.open_file_cache = OpenFileCacheSettings::from_config(config, valid, min_uses, errors)?;
+        Ok(self)
+    }
+
     pub async fn build(self) -> ServerResult<DirServer> {
         DirServer::create_server(self).await
     }
@@ -123,6 +451,7 @@ pub struct DirServer {
     autoindex: bool,
     etag: bool,
     if_modified_since: IfModifiedSinceMode,
+    open_file_cache: Option<OpenFileCache>,
 }
 
 impl DirServer {
@@ -137,6 +466,7 @@ impl DirServer {
             autoindex: false,
             etag: None,
             if_modified_since: None,
+            open_file_cache: None,
         }
     }
 
@@ -242,6 +572,7 @@ impl DirServer {
             autoindex: builder.autoindex,
             etag,
             if_modified_since,
+            open_file_cache: builder.open_file_cache.map(OpenFileCache::new),
         })
     }
 
@@ -335,6 +666,30 @@ impl DirServer {
         ))
     }
 
+    fn stat_path(&self, path: &Path) -> DirPathStat {
+        match &self.open_file_cache {
+            Some(cache) => cache.stat_path(path),
+            None => DirPathStat::from_path(path, false),
+        }
+    }
+
+    async fn open_file_for_read(&self, file_path: &Path) -> std::io::Result<OpenedDirFile> {
+        if self.open_file_cache.is_some() {
+            let stat = self.stat_path(file_path);
+            if let Some(metadata) = stat.metadata() {
+                let file = match stat.try_clone_file() {
+                    Some(cloned_file) => tokio::fs::File::from_std(cloned_file?),
+                    None => tokio::fs::File::open(file_path).await?,
+                };
+                return Ok(OpenedDirFile { file, metadata });
+            }
+        }
+
+        let file = tokio::fs::File::open(file_path).await?;
+        let metadata = file.metadata().await?;
+        Ok(OpenedDirFile { file, metadata })
+    }
+
     /// Parse Range header (e.g., "bytes=start-end")
     fn parse_range(&self, range: &str, file_size: u64) -> ServerResult<(u64, u64)> {
         let range = range.trim_start_matches("bytes=");
@@ -364,19 +719,12 @@ impl DirServer {
         file_path: &Path,
         req: &http::Request<BoxBody<Bytes, ServerError>>,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        let file = tokio::fs::File::open(&file_path).await.map_err(|e| {
+        let opened_file = self.open_file_for_read(file_path).await.map_err(|e| {
             warn!("Failed to open file: {:?}, error: {}", file_path, e);
             server_err!(ServerErrorCode::IOError, "Failed to open file: {}", e)
         })?;
-
-        let file_meta = file.metadata().await.map_err(|e| {
-            warn!("Failed to get file metadata: {:?}, error: {}", file_path, e);
-            server_err!(
-                ServerErrorCode::IOError,
-                "Failed to get file metadata: {}",
-                e
-            )
-        })?;
+        let file = opened_file.file;
+        let file_meta = opened_file.metadata;
 
         let file_size = file_meta.len();
         let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
@@ -708,7 +1056,8 @@ impl HttpServer for DirServer {
             }
         };
 
-        if file_path.exists() {
+        let mut file_stat = self.stat_path(&file_path);
+        if file_stat.exists() {
             file_path = match self.ensure_path_in_root(&file_path) {
                 Ok(path) => path,
                 Err(_) => {
@@ -716,11 +1065,13 @@ impl HttpServer for DirServer {
                     return Ok(self.build_text_response(StatusCode::FORBIDDEN, "Forbidden"));
                 }
             };
+            file_stat = self.stat_path(&file_path);
         }
 
-        if file_path.is_dir() {
+        if file_stat.is_dir() {
             let index_path = file_path.join(&self.index_file);
-            if index_path.exists() && index_path.is_file() {
+            let index_stat = self.stat_path(&index_path);
+            if index_stat.is_file() {
                 let index_path = match self.ensure_path_in_root(&index_path) {
                     Ok(path) => path,
                     Err(_) => {
@@ -739,13 +1090,13 @@ impl HttpServer for DirServer {
         }
 
         // Check if file exists
-        if !file_path.exists() || !file_path.is_file() {
+        if !file_stat.is_file() {
             warn!("File not found: {:?}", file_path);
             if let Some(fallback_file) = &self.fallback_file {
                 let fallback_path = self.root_dir.join(fallback_file);
                 match self.ensure_path_in_root(&fallback_path) {
                     Ok(fallback_path) => {
-                        if fallback_path.exists() && fallback_path.is_file() {
+                        if self.stat_path(&fallback_path).is_file() {
                             info!("Fallback to file: {:?}", fallback_path);
                             return self.serve_file(&fallback_path, &req).await;
                         }
@@ -800,6 +1151,131 @@ pub struct DirServerConfig {
     pub etag: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub if_modified_since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_file_cache: Option<DirServerOpenFileCacheConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_file_cache_valid: Option<DirServerCacheDuration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_file_cache_min_uses: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_file_cache_errors: Option<bool>,
+}
+
+/// Nginx-like `open_file_cache` directive for DirServer path metadata lookup.
+#[derive(Clone, Debug, Default)]
+pub struct DirServerOpenFileCacheConfig {
+    pub max: Option<u64>,
+    pub inactive: Option<DirServerCacheDuration>,
+    off: bool,
+}
+
+impl Serialize for DirServerOpenFileCacheConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.off {
+            return serializer.serialize_str("off");
+        }
+
+        let mut parts = Vec::new();
+        if let Some(max) = self.max {
+            parts.push(format!("max={}", max));
+        }
+        if let Some(inactive) = self.inactive {
+            parts.push(format!(
+                "inactive={}s",
+                inactive.into_duration().as_secs()
+            ));
+        }
+
+        if parts.is_empty() {
+            parts.push("max=10000".to_string());
+            parts.push("inactive=60s".to_string());
+        }
+
+        serializer.serialize_str(parts.join(" ").as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DirServerOpenFileCacheConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct OpenFileCacheVisitor;
+
+        impl<'de> Visitor<'de> for OpenFileCacheVisitor {
+            type Value = DirServerOpenFileCacheConfig;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("an nginx-like open_file_cache string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                parse_open_file_cache_directive(value).map_err(E::custom)
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if !value {
+                    return Ok(DirServerOpenFileCacheConfig {
+                        max: None,
+                        inactive: None,
+                        off: true,
+                    });
+                }
+
+                Err(E::custom("open_file_cache true is invalid; use max=..."))
+            }
+        }
+
+        deserializer.deserialize_any(OpenFileCacheVisitor)
+    }
+}
+
+fn parse_open_file_cache_directive(value: &str) -> Result<DirServerOpenFileCacheConfig, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(DirServerOpenFileCacheConfig {
+            max: None,
+            inactive: None,
+            off: true,
+        });
+    }
+
+    if value.is_empty() {
+        return Err("open_file_cache must not be empty".to_string());
+    }
+
+    let mut config = DirServerOpenFileCacheConfig::default();
+    for part in value.split_whitespace() {
+        let (key, raw_value) = part
+            .split_once('=')
+            .ok_or_else(|| format!("invalid open_file_cache parameter: {}", part))?;
+        match key {
+            "max" => {
+                config.max = Some(
+                    raw_value
+                        .parse::<u64>()
+                        .map_err(|_| format!("invalid open_file_cache max: {}", raw_value))?,
+                );
+            }
+            "inactive" => {
+                config.inactive = Some(DirServerCacheDuration::Seconds(parse_cache_duration(
+                    raw_value,
+                )?));
+            }
+            _ => return Err(format!("unknown open_file_cache parameter: {}", key)),
+        }
+    }
+
+    Ok(config)
 }
 
 fn dir_server_default_etag() -> bool {
@@ -865,6 +1341,15 @@ impl ServerFactory for DirServerFactory {
 
         if let Some(if_modified_since) = &config.if_modified_since {
             builder = builder.if_modified_since(if_modified_since.clone());
+        }
+
+        if let Some(open_file_cache) = &config.open_file_cache {
+            builder = builder.open_file_cache(
+                open_file_cache.clone(),
+                config.open_file_cache_valid,
+                config.open_file_cache_min_uses,
+                config.open_file_cache_errors,
+            )?;
         }
 
         let server = builder.build().await?;
@@ -1038,11 +1523,198 @@ mod tests {
             autoindex: false,
             etag: true,
             if_modified_since: None,
+            open_file_cache: None,
+            open_file_cache_valid: None,
+            open_file_cache_min_uses: None,
+            open_file_cache_errors: None,
         };
 
         let factory = DirServerFactory::new();
         let result = factory.create(Arc::new(config), None).await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_open_file_cache_config_deserializes_nginx_like_fields() {
+        let config: DirServerConfig = serde_json::from_value(serde_json::json!({
+            "id": "test",
+            "type": "dir",
+            "root_path": "/tmp",
+            "open_file_cache": "max=10000 inactive=60s",
+            "open_file_cache_valid": "1m",
+            "open_file_cache_min_uses": 2,
+            "open_file_cache_errors": true
+        }))
+        .unwrap();
+
+        let cache_config = config.open_file_cache.unwrap();
+        assert_eq!(cache_config.max, Some(10_000));
+        assert_eq!(
+            cache_config.inactive.unwrap().into_duration(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            config.open_file_cache_valid.unwrap().into_duration(),
+            Duration::from_secs(60)
+        );
+        assert_eq!(config.open_file_cache_min_uses, Some(2));
+        assert_eq!(config.open_file_cache_errors, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_open_file_cache_defaults_when_directive_has_only_max() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = parse_open_file_cache_directive("max=10000").unwrap();
+        let server = DirServer::builder()
+            .id("test")
+            .root_path(temp_dir.path().to_path_buf())
+            .open_file_cache(config, None, None, None)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let cache = server.open_file_cache.as_ref().unwrap();
+        assert_eq!(cache.settings.max, 10_000);
+        assert_eq!(cache.settings.inactive, Duration::from_secs(60));
+        assert_eq!(cache.settings.valid, Duration::from_secs(60));
+        assert_eq!(cache.settings.min_uses, 2);
+        assert!(cache.settings.errors);
+    }
+
+    #[tokio::test]
+    async fn test_open_file_cache_off_disables_cache() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = parse_open_file_cache_directive("off").unwrap();
+        let server = DirServer::builder()
+            .id("test")
+            .root_path(temp_dir.path().to_path_buf())
+            .open_file_cache(
+                config,
+                Some(DirServerCacheDuration::Seconds(60)),
+                Some(2),
+                Some(true),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        assert!(server.open_file_cache.is_none());
+    }
+
+    #[test]
+    fn test_open_file_cache_min_uses_and_error_cache() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let missing_path = temp_dir.path().join("missing.txt");
+        let cache = OpenFileCache::new(OpenFileCacheSettings {
+            max: 16,
+            inactive: Duration::from_secs(60),
+            valid: Duration::from_secs(60),
+            min_uses: 2,
+            errors: true,
+        });
+
+        assert!(cache.stat_path(&missing_path).is_not_found());
+        assert!(cache.stat_cache.get(&missing_path).is_none());
+
+        assert!(cache.stat_path(&missing_path).is_not_found());
+        assert!(cache.stat_cache.get(&missing_path).is_some());
+    }
+
+    #[test]
+    fn test_open_file_cache_keeps_cloneable_file_handle_after_min_uses() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("cached.txt");
+        std::fs::write(&file_path, b"cached").unwrap();
+        let cache = OpenFileCache::new(OpenFileCacheSettings {
+            max: 16,
+            inactive: Duration::from_secs(60),
+            valid: Duration::from_secs(60),
+            min_uses: 2,
+            errors: true,
+        });
+
+        assert!(cache.stat_path(&file_path).try_clone_file().is_none());
+        let cached = cache.stat_path(&file_path);
+        assert!(cached.try_clone_file().unwrap().is_ok());
+        assert!(cache.stat_cache.get(&file_path).is_some());
+    }
+
+    #[test]
+    fn test_open_file_cache_promotes_file_without_second_stat() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("cached.txt");
+        std::fs::write(&file_path, b"old").unwrap();
+
+        let stat = DirPathStat::from_path(&file_path, false);
+        std::fs::write(&file_path, b"new-content").unwrap();
+
+        let cached = stat.with_cached_file(&file_path);
+        assert_eq!(cached.metadata().unwrap().len(), 3);
+        assert!(cached.try_clone_file().unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_open_file_cache_reuses_metadata_for_serve_file_headers() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("cached.txt");
+        tokio::fs::write(&file_path, b"old").await.unwrap();
+        let cached_metadata = std::fs::metadata(&file_path).unwrap();
+        tokio::fs::write(&file_path, b"new-content").await.unwrap();
+
+        let server = DirServer::builder()
+            .id("test")
+            .root_path(temp_dir.path().to_path_buf())
+            .open_file_cache(
+                DirServerOpenFileCacheConfig {
+                    max: Some(16),
+                    inactive: None,
+                    off: false,
+                },
+                Some(DirServerCacheDuration::Seconds(60)),
+                Some(1),
+                Some(true),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let cache = server.open_file_cache.as_ref().unwrap();
+        cache.stat_cache.insert(
+            file_path.clone(),
+            CachedPathStat {
+                result: Ok(CachedPathMetadata {
+                    metadata: cached_metadata,
+                    file: None,
+                }),
+            },
+        );
+
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/cached.txt")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+        let resp = server.serve_file(&file_path, &req).await.unwrap();
+
+        assert_eq!(resp.headers().get("Content-Length").unwrap(), "3");
+    }
+
+    #[test]
+    fn test_open_file_cache_errors_off_does_not_cache_missing_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let missing_path = temp_dir.path().join("missing.txt");
+        let cache = OpenFileCache::new(OpenFileCacheSettings {
+            max: 16,
+            inactive: Duration::from_secs(60),
+            valid: Duration::from_secs(60),
+            min_uses: 1,
+            errors: false,
+        });
+
+        assert!(cache.stat_path(&missing_path).is_not_found());
+        assert!(cache.stat_cache.get(&missing_path).is_none());
     }
 
     #[tokio::test]
