@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import csv
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -13,14 +15,14 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cyfs_gateway_performance import cli
-from cyfs_gateway_performance.executor import CommandResult
-from cyfs_gateway_performance.image import source_build_commands, write_image_context
-from cyfs_gateway_performance.metrics import run_with_resource_metrics
-from cyfs_gateway_performance.model import ConfigError, ScenarioPlan
+from cyfs_gateway_performance.executor import CommandResult, write_command_log
+from cyfs_gateway_performance.image import cyfs_gateway_source, source_build_commands, write_image_context
+from cyfs_gateway_performance.metrics import container_name_for_candidate, run_with_resource_metrics
+from cyfs_gateway_performance.model import CommandPlan, ConfigError, ScenarioPlan
 from cyfs_gateway_performance.profile import load_profile
-from cyfs_gateway_performance.report import write_reports
+from cyfs_gateway_performance.report import build_result, write_reports
 from cyfs_gateway_performance.scenario import expand_scenarios
-from cyfs_gateway_performance.target import container_readiness_commands, preflight, run_container_commands
+from cyfs_gateway_performance.target import container_readiness_commands, preflight, pull_commands, run_container_commands
 from cyfs_gateway_performance.workload import endpoint_for, run_fixed_rate_workload
 
 
@@ -39,6 +41,22 @@ class RuntimeBehaviorTests(unittest.TestCase):
             started_at=1.0,
             ended_at=1.1,
         )
+
+    def test_command_result_and_log_include_readable_times(self) -> None:
+        command = CommandPlan("test command", ("echo", "ok"))
+        result = self._command_result(command, 0)
+        result_dict = result.as_dict()
+
+        self.assertIn("started_at_text", result_dict)
+        self.assertIn("ended_at_text", result_dict)
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch("cyfs_gateway_performance.executor.current_time_text", return_value="2026-05-19T12:00:00+08:00"):
+                log_path = write_command_log(Path(temp), "command.log", result)
+            log = Path(log_path).read_text(encoding="utf-8")
+
+        self.assertIn("log_written_at: 2026-05-19T12:00:00+08:00", log)
+        self.assertIn("started_at:", log)
+        self.assertIn("ended_at:", log)
 
     def test_stream_context_ports_and_candidate_endpoints_are_wired(self) -> None:
         plan = load_profile(PROFILE)
@@ -61,6 +79,13 @@ class RuntimeBehaviorTests(unittest.TestCase):
         rendered = [" ".join(command.command) for command in run_container_commands(plan)]
         self.assertTrue(any("-p 19080:9080 -p 19443:9443" in command for command in rendered))
         self.assertTrue(any("-p 29080:9080 -p 29443:9443" in command for command in rendered))
+        self.assertTrue(any("-p 18180:10080" in command for command in rendered))
+        self.assertTrue(any("-p 28180:10080" in command for command in rendered))
+        self.assertTrue(any("-p 18181:10081" in command for command in rendered))
+        self.assertTrue(any("-p 28181:10081" in command for command in rendered))
+        self.assertTrue(any("-e REUSEPORT_STATIC_RUNTIME=tokio" in command for command in rendered))
+        self.assertTrue(any("-e REUSEPORT_STATIC_ENABLED=1" in command for command in rendered))
+        self.assertFalse(any("--security-opt seccomp=unconfined" in command for command in rendered))
         self.assertEqual(
             endpoint_for(ScenarioPlan("nginx", "stream_reverse_proxy", "tcp", 1, "stream", "tcp")),
             ("127.0.0.1", 19080, False),
@@ -69,6 +94,47 @@ class RuntimeBehaviorTests(unittest.TestCase):
             endpoint_for(ScenarioPlan("cyfs_gateway", "stream_reverse_proxy", "tcp", 1, "stream", "tcp_tls")),
             ("127.0.0.1", 29443, True),
         )
+        self.assertEqual(
+            endpoint_for(ScenarioPlan("nginx_hyper", "static_http_file", "http", 1, "/payload.bin")),
+            ("127.0.0.1", 18180, False),
+        )
+        self.assertEqual(
+            endpoint_for(ScenarioPlan("cyfs_gateway_hyper", "static_http_file", "http", 1, "/payload.bin")),
+            ("127.0.0.1", 28180, False),
+        )
+        self.assertEqual(
+            endpoint_for(ScenarioPlan("nginx_reuseport_static", "static_http_file", "http", 1, "/payload.bin")),
+            ("127.0.0.1", 18181, False),
+        )
+        self.assertEqual(
+            endpoint_for(ScenarioPlan("cyfs_gateway_reuseport_static", "static_http_file", "http", 1, "/payload.bin")),
+            ("127.0.0.1", 28181, False),
+        )
+        self.assertEqual(container_name_for_candidate("nginx_hyper"), "cyfs-perf-nginx")
+        self.assertEqual(container_name_for_candidate("cyfs_gateway_hyper"), "cyfs-perf-cyfs_gateway")
+        self.assertEqual(container_name_for_candidate("nginx_reuseport_static"), "cyfs-perf-nginx")
+        self.assertEqual(container_name_for_candidate("cyfs_gateway_reuseport_static"), "cyfs-perf-cyfs_gateway")
+
+    def test_tokio_uring_reuseport_static_adds_docker_seccomp_unconfined(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("runtime: tokio", "runtime: tokio_uring")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            plan = load_profile(profile)
+            rendered = [" ".join(command.command) for command in run_container_commands(plan)]
+
+        self.assertTrue(any("--security-opt seccomp=unconfined" in command for command in rendered))
+
+    def test_disabled_tokio_uring_reuseport_static_keeps_default_docker_seccomp(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("enabled: true", "enabled: false", 1)
+        text = text.replace("runtime: tokio", "runtime: tokio_uring")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            plan = load_profile(profile)
+            rendered = [" ".join(command.command) for command in run_container_commands(plan)]
+
+        self.assertFalse(any("--security-opt seccomp=unconfined" in command for command in rendered))
 
     def test_fixed_rate_workload_uses_warmup_and_measured_windows(self) -> None:
         plan = load_profile(PROFILE)
@@ -97,6 +163,8 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertIn("-workers", attack_commands[0])
         self.assertIn("2", attack_commands[0])
         self.assertIn("-keepalive=false", attack_commands[0])
+        self.assertIn("-max-body", attack_commands[0])
+        self.assertIn("0", attack_commands[0])
         self.assertEqual(result["warmup_attempted"], 2)
         self.assertEqual(result["warmup_actual_attempted"], 2)
         self.assertEqual(result["attempted"], 2)
@@ -122,9 +190,94 @@ class RuntimeBehaviorTests(unittest.TestCase):
             and scenario.rate == 100
         ]
 
+        self.assertEqual(
+            set(plan.candidates),
+            {
+                "nginx",
+                "cyfs_gateway",
+                "nginx_hyper",
+                "cyfs_gateway_hyper",
+                "nginx_reuseport_static",
+                "cyfs_gateway_reuseport_static",
+            },
+        )
         self.assertEqual(plan.load.connection_reuse_modes, ("new_connection", "reuse_connection"))
         self.assertEqual(reuse_modes, {"new_connection", "reuse_connection"})
         self.assertEqual({scenario.connection_reuse for scenario in equivalent}, {"new_connection", "reuse_connection"})
+
+        hyper_static = [
+            scenario
+            for scenario in scenarios
+            if scenario.candidate in {
+                "nginx_hyper",
+                "cyfs_gateway_hyper",
+                "nginx_reuseport_static",
+                "cyfs_gateway_reuseport_static",
+            }
+        ]
+        self.assertTrue(hyper_static)
+        self.assertEqual({scenario.scenario for scenario in hyper_static}, {"static_http_file"})
+        self.assertEqual({scenario.protocol for scenario in hyper_static}, {"http"})
+
+    def test_profile_candidates_filter_scenario_matrix_and_deployment(self) -> None:
+        plan = replace(load_profile(PROFILE), candidates=("nginx_hyper",))
+        scenarios = expand_scenarios(plan)
+
+        self.assertTrue(scenarios)
+        self.assertEqual({scenario.candidate for scenario in scenarios}, {"nginx_hyper"})
+        self.assertEqual({scenario.scenario for scenario in scenarios}, {"static_http_file"})
+        self.assertEqual({scenario.protocol for scenario in scenarios}, {"http"})
+
+        pull_rendered = [" ".join(command.command) for command in pull_commands(plan)]
+        run_rendered = [" ".join(command.command) for command in run_container_commands(plan)]
+        readiness_rendered = [" ".join(command.command) for command in container_readiness_commands(plan)]
+
+        self.assertTrue(any(plan.images["nginx"].image_ref in command for command in pull_rendered))
+        self.assertFalse(any(plan.images["cyfs_gateway"].image_ref in command for command in pull_rendered))
+        self.assertTrue(any("--name cyfs-perf-nginx" in command for command in run_rendered))
+        self.assertFalse(any("--name cyfs-perf-cyfs_gateway" in command for command in run_rendered))
+        self.assertEqual(readiness_rendered, ["docker inspect --format {{.State.Running}} cyfs-perf-nginx"])
+
+    def test_reuseport_static_fixture_can_be_disabled(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("enabled: true", "enabled: false", 1)
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            plan = load_profile(profile)
+            scenarios = expand_scenarios(plan)
+            metadata = write_image_context(plan, "nginx", Path(temp))
+            dockerfile_text = Path(metadata["dockerfile"]).read_text(encoding="utf-8")
+
+        self.assertFalse(plan.upstream["reuseport_static_fixture"]["enabled"])
+        self.assertFalse(metadata["packaged_reuseport_static_fixture"]["enabled"])
+        self.assertIn("ENV REUSEPORT_STATIC_ENABLED=0", dockerfile_text)
+        self.assertFalse(
+            any(
+                scenario.candidate in {"nginx_reuseport_static", "cyfs_gateway_reuseport_static"}
+                for scenario in scenarios
+            )
+        )
+
+    def test_pull_policy_never_skips_target_pull_commands(self) -> None:
+        plan = replace(load_profile(PROFILE), registry_pull_policy="never")
+
+        self.assertEqual(pull_commands(plan), [])
+
+    def test_profile_rejects_unknown_pull_policy(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("pull_policy: always", "pull_policy: sometimes")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "registry.pull_policy"):
+                load_profile(profile)
+
+    def test_profile_rejects_unknown_candidate(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("- cyfs_gateway_hyper", "- cyfs_gateay_hyper")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "unknown candidate"):
+                load_profile(profile)
 
     def test_profile_rejects_unknown_connection_reuse_mode(self) -> None:
         text = PROFILE.read_text(encoding="utf-8").replace("- reuse_connection", "- multiplex_everything")
@@ -132,6 +285,50 @@ class RuntimeBehaviorTests(unittest.TestCase):
             profile = Path(temp) / "profile.yaml"
             profile.write_text(text, encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "connection_reuse_modes"):
+                load_profile(profile)
+
+    def test_profile_accepts_configured_reuseport_static_threads(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("# threads: 8", "threads: 6")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            plan = load_profile(profile)
+            metadata = write_image_context(plan, "nginx", Path(temp))
+            dockerfile_text = Path(metadata["dockerfile"]).read_text(encoding="utf-8")
+
+        self.assertEqual(plan.upstream["reuseport_static_fixture"]["threads"], 6)
+        self.assertEqual(metadata["packaged_reuseport_static_fixture"]["threads"], 6)
+        self.assertIn("ENV REUSEPORT_STATIC_THREADS=6", dockerfile_text)
+        rendered = [" ".join(command.command) for command in run_container_commands(plan)]
+        self.assertTrue(any("-e REUSEPORT_STATIC_THREADS=6" in command for command in rendered))
+
+    def test_profile_accepts_configured_reuseport_static_tokio_uring_runtime(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("runtime: tokio", "runtime: tokio_uring")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            plan = load_profile(profile)
+            metadata = write_image_context(plan, "nginx", Path(temp))
+            dockerfile_text = Path(metadata["dockerfile"]).read_text(encoding="utf-8")
+
+        self.assertEqual(plan.upstream["reuseport_static_fixture"]["runtime"], "tokio_uring")
+        self.assertEqual(metadata["packaged_reuseport_static_fixture"]["runtime"], "tokio_uring")
+        self.assertIn("ENV REUSEPORT_STATIC_RUNTIME=tokio_uring", dockerfile_text)
+
+    def test_profile_rejects_invalid_reuseport_static_runtime(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("runtime: tokio", "runtime: async_everything")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "reuseport_static_fixture.runtime"):
+                load_profile(profile)
+
+    def test_profile_rejects_invalid_reuseport_static_threads(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("# threads: 8", "threads: 0")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "reuseport_static_fixture.threads"):
                 load_profile(profile)
 
     def test_reuse_connection_workload_reuses_worker_sessions(self) -> None:
@@ -194,6 +391,9 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertEqual(resource_metrics["cpu_percent_avg"], 12.5)
         self.assertEqual(resource_metrics["memory_bytes_avg"], 64 * 1024 * 1024)
         self.assertEqual(len(resource_metrics["samples"]), 1)
+        self.assertNotIn("process_sample", resource_metrics["samples"][0])
+        self.assertNotIn("process_cpu_percent_avg", resource_metrics)
+        self.assertNotIn("process_rss_kib_avg", resource_metrics)
 
     def test_ssh_preflight_uses_remote_commands(self) -> None:
         plan = load_profile(PROFILE)
@@ -342,12 +542,55 @@ class RuntimeBehaviorTests(unittest.TestCase):
         command = commands[0].command
         self.assertIn("--release", command)
         self.assertIn("--target", command)
-        self.assertEqual(command[command.index("--target") + 1], "x86_64-unknown-linux-musl")
+        self.assertEqual(command[command.index("--target") + 1], cyfs_gateway_source(plan)["target"])
         self.assertIn("--target-dir", command)
         target_dir = command[command.index("--target-dir") + 1]
         self.assertTrue(target_dir.endswith("cargo-target/cyfs_gateway"))
         self.assertNotIn("/src/target", target_dir)
         self.assertNotIn("docker/cyfs_gateway/cargo-target", target_dir)
+
+    def test_cyfs_gateway_source_build_logs_command_line(self) -> None:
+        plan = load_profile(PROFILE)
+        inspect_result = {
+            "command": ["docker", "image", "inspect", plan.images["cyfs_gateway"].image_ref],
+            "description": "inspect existing cyfs_gateway image",
+            "returncode": 1,
+        }
+        source_result = {
+            "command": ["cargo", "build"],
+            "description": "build cyfs_gateway from current source",
+            "returncode": 0,
+        }
+        build_result = {
+            "command": ["docker", "build"],
+            "description": "build cyfs_gateway image",
+            "returncode": 0,
+        }
+        push_result = {
+            "command": ["docker", "push", plan.images["cyfs_gateway"].image_ref],
+            "description": "push cyfs_gateway image",
+            "returncode": 0,
+        }
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "cyfs_gateway_performance.cli._remove_existing_image",
+            return_value=[inspect_result],
+        ), mock.patch(
+            "cyfs_gateway_performance.cli._run_commands",
+            side_effect=[[source_result], [build_result], [push_result]],
+        ):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                metadata = cli._build_image_from_plan(plan, Path(temp), "cyfs_gateway")
+
+        self.assertEqual(metadata["status"], "pushed")
+        log = stderr.getvalue()
+        self.assertIn("cyfs_gateway source build command: cargo build", log)
+        self.assertIn("--manifest-path", log)
+        self.assertIn("--package cyfs_gateway", log)
+        self.assertIn("--target-dir", log)
+        self.assertIn("cyfs_gateway compiled binary path:", log)
+        self.assertIn("cyfs_gateway packaged binary path:", log)
 
     def test_profile_output_path_is_absolute_for_source_build_and_package_steps(self) -> None:
         plan = load_profile(PROFILE)
@@ -443,6 +686,57 @@ class RuntimeBehaviorTests(unittest.TestCase):
         push_commands = run_commands.call_args_list[1].args[0]
         self.assertEqual(push_commands[-1].command, ("docker", "push", plan.images["nginx"].image_ref))
         self.assertEqual(metadata["push_results"][0]["description"], "push nginx image")
+
+    def test_build_image_from_plan_skips_push_when_disabled(self) -> None:
+        plan = replace(load_profile(PROFILE), registry_push=False)
+        inspect_result = {
+            "command": ["docker", "image", "inspect", plan.images["nginx"].image_ref],
+            "description": "inspect existing nginx image",
+            "returncode": 1,
+        }
+        build_result_data = {
+            "command": ["docker", "build"],
+            "description": "build nginx image",
+            "returncode": 0,
+        }
+
+        with tempfile.TemporaryDirectory() as temp, mock.patch(
+            "cyfs_gateway_performance.cli._remove_existing_image",
+            return_value=[inspect_result],
+        ), mock.patch(
+            "cyfs_gateway_performance.cli._run_commands",
+            return_value=[build_result_data],
+        ) as run_commands:
+            metadata = cli._build_image_from_plan(plan, Path(temp), "nginx")
+
+        self.assertEqual(metadata["status"], "built")
+        self.assertEqual(run_commands.call_count, 1)
+        self.assertEqual(metadata["push_skipped"], "registry.push is false")
+
+    def test_push_image_command_skips_when_push_disabled(self) -> None:
+        plan = replace(load_profile(PROFILE), registry_push=False)
+        with tempfile.TemporaryDirectory() as temp:
+            plan = replace(plan, output={**plan.output, "directory": temp})
+            with mock.patch("cyfs_gateway_performance.cli.load_profile", return_value=plan), mock.patch(
+                "cyfs_gateway_performance.cli._run_commands"
+            ) as run_commands:
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    rc = cli.main(["push-image", "--profile", str(PROFILE), "--image", "nginx"])
+            metadata = json.loads((Path(temp) / "nginx-push-plan.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(rc, 0)
+        run_commands.assert_not_called()
+        self.assertEqual(metadata["status"], "skipped")
+        self.assertEqual(metadata["push_skipped"], "registry.push is false")
+        self.assertIn("image push skipped", stderr.getvalue())
+
+    def test_result_records_registry_push_and_pull_policy(self) -> None:
+        plan = replace(load_profile(PROFILE), registry_push=False, registry_pull_policy="never")
+        result = build_result(plan, [], "completed", evidence={})
+
+        self.assertEqual(result["registry"]["push"], False)
+        self.assertEqual(result["registry"]["pull_policy"], "never")
 
     def test_build_image_removes_existing_target_image_before_build(self) -> None:
         plan = load_profile(PROFILE)
@@ -575,6 +869,84 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertLess(proxy_nginx, proxy_cyfs)
         self.assertLess(proxy_cyfs, static_nginx)
         self.assertLess(static_nginx, static_cyfs)
+
+    def test_reports_include_generated_time_in_json_markdown_and_csv(self) -> None:
+        result = {
+            "status": "completed",
+            "profile": str(PROFILE),
+            "results": [
+                {
+                    "candidate": "nginx",
+                    "scenario": "static_http_file",
+                    "protocol": "http",
+                    "stream_mode": None,
+                    "payload": "/index.html",
+                    "connection_reuse": "new_connection",
+                    "rate": 100,
+                    "requests": {"success": 10, "latency_ms": {"avg": 1.1}},
+                    "resources": {"cpu_percent_avg": 2.0, "memory_bytes_avg": 100},
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch("cyfs_gateway_performance.report.current_time_text", return_value="2026-05-19T12:00:00+08:00"):
+                outputs = write_reports(result, Path(temp), csv_enabled=True)
+            result_json = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
+            summary = Path(outputs["markdown"]).read_text(encoding="utf-8")
+            with Path(outputs["csv"]).open(encoding="utf-8", newline="") as handle:
+                csv_rows = list(csv.DictReader(handle))
+
+        self.assertEqual(result_json["generated_at"], "2026-05-19T12:00:00+08:00")
+        self.assertIn("- generated_at: 2026-05-19T12:00:00+08:00", summary)
+        self.assertEqual(csv_rows[0]["generated_at"], "2026-05-19T12:00:00+08:00")
+
+    def test_markdown_report_appends_when_summary_already_exists(self) -> None:
+        first = {
+            "status": "completed",
+            "profile": str(PROFILE),
+            "results": [
+                {
+                    "candidate": "nginx",
+                    "scenario": "static_http_file",
+                    "protocol": "http",
+                    "stream_mode": None,
+                    "payload": "/index.html",
+                    "connection_reuse": "new_connection",
+                    "rate": 100,
+                    "requests": {"success": 10, "latency_ms": {"avg": 1.1}},
+                    "resources": {"cpu_percent_avg": 2.0, "memory_bytes_avg": 100},
+                },
+            ],
+        }
+        second = {
+            "status": "environment-deferred",
+            "profile": str(PROFILE),
+            "results": [
+                {
+                    "candidate": "cyfs_gateway",
+                    "scenario": "static_http_file",
+                    "protocol": "http",
+                    "stream_mode": None,
+                    "payload": "/index.html",
+                    "connection_reuse": "new_connection",
+                    "rate": 200,
+                    "requests": {"success": 11, "latency_ms": {"avg": 1.2}},
+                    "resources": {"cpu_percent_avg": 2.1, "memory_bytes_avg": 101},
+                },
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as temp:
+            outputs = write_reports(first, Path(temp))
+            write_reports(second, Path(temp))
+            summary = Path(outputs["markdown"]).read_text(encoding="utf-8")
+
+        self.assertEqual(summary.count("# Performance Benchmark Summary"), 2)
+        self.assertIn("- status: completed", summary)
+        self.assertIn("- status: environment-deferred", summary)
+        self.assertLess(summary.index("- status: completed"), summary.index("- status: environment-deferred"))
+        self.assertIn("\n---\n\n# Performance Benchmark Summary", summary)
 
 
 if __name__ == "__main__":

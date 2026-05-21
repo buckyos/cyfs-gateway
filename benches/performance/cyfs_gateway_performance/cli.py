@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from pathlib import Path
 
-from .executor import run_command, write_command_log
+from .executor import current_time_text, run_command, write_command_log
 from .image import (
     cyfs_gateway_binary_metadata,
     fixture_binary_metadata,
     image_build_plan,
     push_plan,
+    reuseport_static_binary_metadata,
     source_build_commands,
     write_image_context,
 )
@@ -23,6 +25,7 @@ from .target import (
     cleanup_commands,
     container_logs_commands,
     container_readiness_commands,
+    image_keys_for_candidates,
     preflight,
     pull_commands,
     run_container_commands,
@@ -36,7 +39,11 @@ EXIT_EXECUTION = 3
 
 
 def _log(message: str) -> None:
-    print(f"[performance] {message}", file=sys.stderr, flush=True)
+    print(f"[performance {current_time_text()}] {message}", file=sys.stderr, flush=True)
+
+
+def _command_line(command: CommandPlan) -> str:
+    return shlex.join(command.command)
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -61,6 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    data = dict(data)
+    data.setdefault("generated_at", current_time_text())
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -202,8 +211,11 @@ def _build_image_from_plan(plan, output: Path, image_key: str) -> dict:
         _log("writing cyfs_gateway Docker context")
         metadata = write_image_context(plan, image_key, output)
         context = Path(metadata["dockerfile"]).parent
+        source_commands = source_build_commands(plan, context)
+        for command in source_commands:
+            _log(f"cyfs_gateway source build command: {_command_line(command)}")
         _log("building cyfs_gateway from current source")
-        evidence.extend(_run_commands(source_build_commands(plan, context), output, timeout=3600))
+        evidence.extend(_run_commands(source_commands, output, timeout=3600))
         if evidence and evidence[-1]["returncode"] != 0:
             _log("cyfs_gateway source build failed")
             metadata["status"] = _command_failed_status(plan, evidence)
@@ -213,13 +225,18 @@ def _build_image_from_plan(plan, output: Path, image_key: str) -> dict:
             _write_json(artifact, metadata)
             _log_summary(metadata["status"], artifact=artifact)
             return metadata
+        source_metadata = cyfs_gateway_binary_metadata(plan, context)
+        _log(f"cyfs_gateway compiled binary path: {source_metadata['expected_binary']}")
+        _log(f"cyfs_gateway packaged binary path: {source_metadata['packaged_binary']}")
     else:
         _log(f"writing {image_key} Docker context")
         metadata = write_image_context(plan, image_key, output)
     _, commands = image_build_plan(plan, image_key, output)
     _log(f"running {len(commands)} image build command(s)")
     evidence.extend(_run_commands(commands, output, timeout=3600))
-    metadata["packaged_reverse_proxy_fixture"].update(fixture_binary_metadata(Path(metadata["dockerfile"]).parent))
+    context = Path(metadata["dockerfile"]).parent
+    metadata["packaged_reverse_proxy_fixture"].update(fixture_binary_metadata(context))
+    metadata["packaged_reuseport_static_fixture"].update(reuseport_static_binary_metadata(context))
     if image_key == "cyfs_gateway":
         metadata["source_build"] = cyfs_gateway_binary_metadata(plan, Path(metadata["dockerfile"]).parent)
     metadata["commands"] = [item["command"] for item in evidence]
@@ -282,20 +299,30 @@ def _push_image(args: argparse.Namespace) -> int:
     output = _profile_output(plan, args.output)
     _log(f"push {args.image} image output: {output}")
     commands = push_plan(plan, args.image)
-    _log(f"running {len(commands)} image push command(s)")
-    evidence = _run_commands(commands, output, timeout=120)
-    status = "pushed" if evidence and evidence[-1]["returncode"] == 0 else _command_failed_status(plan, evidence)
+    if commands:
+        _log(f"running {len(commands)} image push command(s)")
+        evidence = _run_commands(commands, output, timeout=120)
+        status = "pushed" if evidence and evidence[-1]["returncode"] == 0 else _command_failed_status(plan, evidence)
+        push_skipped = None
+    else:
+        _log("image push skipped because registry.push is false")
+        evidence = []
+        status = "skipped"
+        push_skipped = "registry.push is false"
     metadata = {
         "image": args.image,
+        "image_ref": plan.images[args.image].image_ref,
         "status": status,
         "commands": [list(item.command) for item in commands],
         "command_results": evidence,
     }
+    if push_skipped:
+        metadata["push_skipped"] = push_skipped
     artifact = output / f"{args.image}-push-plan.json"
     _write_json(artifact, metadata)
     _log(f"push {args.image} image finished with status={status}")
     _log_summary(status, artifact=artifact)
-    return 0 if status in {"pushed", "environment-deferred"} else EXIT_EXECUTION
+    return 0 if status in {"pushed", "skipped", "environment-deferred"} else EXIT_EXECUTION
 
 
 def _run(args: argparse.Namespace) -> int:
@@ -327,6 +354,11 @@ def _run(args: argparse.Namespace) -> int:
         "container_logs": [],
         "cleanup": [],
         "deferrals": [],
+        "registry": {
+            "push": plan.registry_push,
+            "pull_policy": plan.registry_pull_policy,
+            "allow_deferral": plan.registry_allow_deferral,
+        },
     }
     if target["unsupported_os"]:
         message = target["unsupported_os_error"]
@@ -352,8 +384,16 @@ def _run(args: argparse.Namespace) -> int:
     try:
         _log("cleanup before deployment")
         evidence["cleanup"].extend(_run_all_commands(cleanup_commands(plan), output, timeout=60))
-        _log("pulling benchmark images")
-        evidence["pull"].extend(_run_commands(pull_commands(plan), output, timeout=120))
+        pull_plan = pull_commands(plan)
+        if pull_plan:
+            _log("pulling benchmark images")
+            evidence["pull"].extend(_run_commands(pull_plan, output, timeout=120))
+        else:
+            _log("image pull skipped because registry.pull_policy is never")
+            evidence["pull_skipped"] = {
+                "reason": "registry.pull_policy is never",
+                "image_refs": [plan.images[image_key].image_ref for image_key in image_keys_for_candidates(plan)],
+            }
         if evidence["pull"] and evidence["pull"][-1]["returncode"] != 0:
             _log("image pull failed; writing deferred or failed report")
             evidence["deferrals"].append("configured registry image pull failed")

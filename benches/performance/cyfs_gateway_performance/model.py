@@ -40,8 +40,10 @@ class BenchmarkPlan:
     profile_path: Path
     target: TargetConfig
     registry_push: bool
+    registry_pull_policy: str
     registry_allow_deferral: bool
     images: dict[str, ImageConfig]
+    candidates: tuple[str, ...]
     scenarios: dict
     protocols: dict
     generated_config: dict

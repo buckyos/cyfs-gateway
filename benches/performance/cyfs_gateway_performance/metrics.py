@@ -9,6 +9,14 @@ from .model import BenchmarkPlan, ScenarioPlan
 from .target import target_command
 
 
+def container_name_for_candidate(candidate: str) -> str:
+    if candidate in {"nginx_hyper", "nginx_reuseport_static"}:
+        return "cyfs-perf-nginx"
+    if candidate in {"cyfs_gateway_hyper", "cyfs_gateway_reuseport_static"}:
+        return "cyfs-perf-cyfs_gateway"
+    return f"cyfs-perf-{candidate}"
+
+
 def _parse_size(value: str) -> int:
     units = {
         "KiB": 1024,
@@ -29,7 +37,7 @@ def _parse_size(value: str) -> int:
 def _sample_resource_metrics(plan: BenchmarkPlan, scenario: ScenarioPlan) -> dict:
     if not plan.metrics.get("collect_docker_stats", True):
         return {"samples": [], "sampling": "disabled", "cpu_percent_avg": 0.0, "memory_bytes_avg": 0}
-    container = f"cyfs-perf-{scenario.candidate}"
+    container = container_name_for_candidate(scenario.candidate)
     command = target_command(
         plan,
         f"docker stats {container}",

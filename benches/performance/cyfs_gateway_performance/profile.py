@@ -8,6 +8,16 @@ from .model import BenchmarkPlan, ConfigError, ImageConfig, LoadConfig, TargetCo
 
 
 CONNECTION_REUSE_MODES = {"new_connection", "reuse_connection"}
+VALID_CANDIDATES = (
+    "nginx",
+    "cyfs_gateway",
+    "nginx_hyper",
+    "cyfs_gateway_hyper",
+    "nginx_reuseport_static",
+    "cyfs_gateway_reuseport_static",
+)
+VALID_PULL_POLICIES = {"always", "never"}
+VALID_REUSEPORT_STATIC_RUNTIMES = {"tokio", "tokio_uring"}
 
 
 try:
@@ -52,6 +62,36 @@ def _image(key: str, data: dict[str, Any]) -> ImageConfig:
     return ImageConfig(key=key, image_ref=image_ref)
 
 
+def _candidate_list(data: dict[str, Any]) -> tuple[str, ...]:
+    candidates = data.get("candidates", list(VALID_CANDIDATES))
+    if not isinstance(candidates, list) or not candidates or not all(isinstance(item, str) for item in candidates):
+        raise ConfigError("candidates must be a non-empty list of candidate names")
+    unknown = [item for item in candidates if item not in VALID_CANDIDATES]
+    if unknown:
+        valid = ", ".join(VALID_CANDIDATES)
+        raise ConfigError(f"unknown candidate(s): {', '.join(unknown)}; valid candidates: {valid}")
+    return tuple(dict.fromkeys(candidates))
+
+
+def _validate_upstream(data: dict[str, Any]) -> dict:
+    upstream = dict(data.get("upstream") or {})
+    reuseport_static = upstream.get("reuseport_static_fixture")
+    if isinstance(reuseport_static, dict) and "threads" in reuseport_static:
+        threads = reuseport_static["threads"]
+        if not isinstance(threads, int) or threads <= 0:
+            raise ConfigError("upstream.reuseport_static_fixture.threads must be a positive integer when provided")
+    if isinstance(reuseport_static, dict) and "enabled" in reuseport_static:
+        enabled = reuseport_static["enabled"]
+        if not isinstance(enabled, bool):
+            raise ConfigError("upstream.reuseport_static_fixture.enabled must be a boolean when provided")
+    if isinstance(reuseport_static, dict) and "runtime" in reuseport_static:
+        runtime = reuseport_static["runtime"]
+        if runtime not in VALID_REUSEPORT_STATIC_RUNTIMES:
+            valid = ", ".join(sorted(VALID_REUSEPORT_STATIC_RUNTIMES))
+            raise ConfigError(f"upstream.reuseport_static_fixture.runtime must be one of: {valid}")
+    return upstream
+
+
 def load_profile(path: str | Path) -> BenchmarkPlan:
     profile_path = Path(path).resolve()
     data = _load_yaml(profile_path.read_text(encoding="utf-8"))
@@ -68,6 +108,9 @@ def load_profile(path: str | Path) -> BenchmarkPlan:
         raise ConfigError("target.port must be a positive integer when provided")
 
     registry = _required_map(data, "registry")
+    pull_policy = registry.get("pull_policy", "always")
+    if pull_policy not in VALID_PULL_POLICIES:
+        raise ConfigError("registry.pull_policy must be always or never")
 
     images_data = _required_map(data, "images")
     images = {
@@ -106,12 +149,14 @@ def load_profile(path: str | Path) -> BenchmarkPlan:
             port=port,
         ),
         registry_push=bool(registry.get("push", True)),
+        registry_pull_policy=str(pull_policy),
         registry_allow_deferral=bool(registry.get("allow_deferral", False)),
         images=images,
+        candidates=_candidate_list(data),
         scenarios=_required_map(data, "scenarios"),
         protocols=_required_map(data, "protocols"),
         generated_config=generated_config,
-        upstream=dict(data.get("upstream") or {}),
+        upstream=_validate_upstream(data),
         load=LoadConfig(
             duration_seconds=duration,
             warmup_seconds=warmup,

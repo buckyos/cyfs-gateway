@@ -14,12 +14,16 @@ use mini_moka::sync::Cache;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 use std::fmt;
 use std::io::ErrorKind;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -33,6 +37,9 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'}')
     .add(b'/');
+const SMALL_FILE_INLINE_LIMIT: u64 = 64 * 1024;
+const MIN_FILE_STREAM_BUFFER_SIZE: usize = 16 * 1024;
+const MAX_FILE_STREAM_BUFFER_SIZE: usize = 512 * 1024;
 
 /// DirServer Builder for fluent configuration
 pub struct DirServerBuilder {
@@ -147,15 +154,12 @@ impl OpenFileCache {
             return cached.into_stat();
         }
 
-        let stat = DirPathStat::from_path(path, false);
+        let stat = DirPathStat::from_path(path);
         let uses = self.admission_counts.get(&key).unwrap_or(0) + 1;
         self.admission_counts.insert(key.clone(), uses);
 
         if uses >= self.settings.min_uses && (stat.exists() || self.settings.errors) {
-            let cached_stat = stat.with_cached_file(path);
-            self.stat_cache
-                .insert(key, CachedPathStat::from(&cached_stat));
-            return cached_stat;
+            self.stat_cache.insert(key, CachedPathStat::from(&stat));
         }
 
         stat
@@ -192,7 +196,6 @@ impl From<&DirPathStat> for CachedPathStat {
 #[derive(Clone, Debug)]
 struct CachedPathMetadata {
     metadata: std::fs::Metadata,
-    file: Option<Arc<std::fs::File>>,
 }
 
 #[derive(Clone, Debug)]
@@ -216,32 +219,14 @@ enum DirPathStat {
 struct OpenedDirFile {
     file: tokio::fs::File,
     metadata: std::fs::Metadata,
+    canonical_path: Option<PathBuf>,
 }
 
 impl DirPathStat {
-    fn from_path(path: &Path, cache_file: bool) -> Self {
+    fn from_path(path: &Path) -> Self {
         match std::fs::metadata(path) {
-            Ok(metadata) => Self::Found(CachedPathMetadata {
-                file: if cache_file && metadata.is_file() {
-                    std::fs::File::open(path).ok().map(Arc::new)
-                } else {
-                    None
-                },
-                metadata,
-            }),
+            Ok(metadata) => Self::Found(CachedPathMetadata { metadata }),
             Err(e) => Self::Error(e),
-        }
-    }
-
-    fn with_cached_file(self, path: &Path) -> Self {
-        match self {
-            Self::Found(mut metadata) => {
-                if metadata.metadata.is_file() && metadata.file.is_none() {
-                    metadata.file = std::fs::File::open(path).ok().map(Arc::new);
-                }
-                Self::Found(metadata)
-            }
-            Self::Error(e) => Self::Error(e),
         }
     }
 
@@ -260,13 +245,6 @@ impl DirPathStat {
     fn metadata(&self) -> Option<std::fs::Metadata> {
         match self {
             Self::Found(metadata) => Some(metadata.metadata.clone()),
-            Self::Error(_) => None,
-        }
-    }
-
-    fn try_clone_file(&self) -> Option<std::io::Result<std::fs::File>> {
-        match self {
-            Self::Found(metadata) => metadata.file.as_ref().map(|file| file.try_clone()),
             Self::Error(_) => None,
         }
     }
@@ -445,6 +423,8 @@ pub struct DirServer {
     id: String,
     version: http::Version,
     root_dir: PathBuf,
+    #[cfg(target_os = "linux")]
+    root_dir_file: Arc<std::fs::File>,
     index_file: String,
     fallback_file: Option<String>,
     base_url: String,
@@ -561,11 +541,21 @@ impl DirServer {
                 e
             )
         })?;
+        #[cfg(target_os = "linux")]
+        let root_dir_file = Arc::new(std::fs::File::open(&new_root_dir).map_err(|e| {
+            server_err!(
+                ServerErrorCode::IOError,
+                "Failed to open root directory: {}",
+                e
+            )
+        })?);
         debug!("after normalize,root_dir is : {:?}", new_root_dir);
         Ok(DirServer {
             id: builder.id.unwrap(),
             version,
             root_dir: new_root_dir,
+            #[cfg(target_os = "linux")]
+            root_dir_file,
             index_file,
             fallback_file,
             base_url: builder.base_url.unwrap_or_else(|| "/".to_string()),
@@ -669,25 +659,150 @@ impl DirServer {
     fn stat_path(&self, path: &Path) -> DirPathStat {
         match &self.open_file_cache {
             Some(cache) => cache.stat_path(path),
-            None => DirPathStat::from_path(path, false),
+            None => DirPathStat::from_path(path),
         }
     }
 
     async fn open_file_for_read(&self, file_path: &Path) -> std::io::Result<OpenedDirFile> {
-        if self.open_file_cache.is_some() {
-            let stat = self.stat_path(file_path);
-            if let Some(metadata) = stat.metadata() {
-                let file = match stat.try_clone_file() {
-                    Some(cloned_file) => tokio::fs::File::from_std(cloned_file?),
-                    None => tokio::fs::File::open(file_path).await?,
-                };
-                return Ok(OpenedDirFile { file, metadata });
-            }
+        self.open_path_in_root(file_path).await
+    }
+
+    async fn open_path_in_root(&self, file_path: &Path) -> std::io::Result<OpenedDirFile> {
+        #[cfg(target_os = "linux")]
+        if let Ok(opened) = self.open_path_in_root_openat2(file_path) {
+            return Ok(opened);
         }
 
-        let file = tokio::fs::File::open(file_path).await?;
+        let canonical_path = file_path.canonicalize()?;
+        if !canonical_path.starts_with(&self.root_dir) {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "path out of root directory",
+            ));
+        }
+
+        let file = tokio::fs::File::open(&canonical_path).await?;
         let metadata = file.metadata().await?;
-        Ok(OpenedDirFile { file, metadata })
+        Ok(OpenedDirFile {
+            file,
+            metadata,
+            canonical_path: Some(canonical_path),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_path_in_root_openat2(&self, file_path: &Path) -> std::io::Result<OpenedDirFile> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let relative_path = file_path.strip_prefix(&self.root_dir).map_err(|_| {
+            std::io::Error::new(ErrorKind::PermissionDenied, "path out of root directory")
+        })?;
+
+        if relative_path.as_os_str().is_empty() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "root directory cannot be opened as a file",
+            ));
+        }
+
+        let path = CString::new(relative_path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(ErrorKind::InvalidInput, "path contains interior nul byte")
+        })?;
+        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+        how.flags = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
+        how.resolve = (libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS) as u64;
+
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                self.root_dir_file.as_raw_fd(),
+                path.as_ptr(),
+                &how,
+                std::mem::size_of::<libc::open_how>(),
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
+        let metadata = file.metadata()?;
+        let canonical_path = if metadata.is_file() {
+            None
+        } else {
+            std::fs::read_link(format!("/proc/self/fd/{}", fd))
+                .ok()
+                .filter(|path| path.starts_with(&self.root_dir))
+        };
+        Ok(OpenedDirFile {
+            file: tokio::fs::File::from_std(file),
+            metadata,
+            canonical_path,
+        })
+    }
+
+    fn file_stream_buffer_size(content_length: u64) -> usize {
+        content_length.clamp(
+            MIN_FILE_STREAM_BUFFER_SIZE as u64,
+            MAX_FILE_STREAM_BUFFER_SIZE as u64,
+        ) as usize
+    }
+
+    fn empty_body() -> BoxBody<Bytes, ServerError> {
+        Full::new(Bytes::new()).map_err(|e| match e {}).boxed()
+    }
+
+    async fn full_or_stream_body(
+        mut file: tokio::fs::File,
+        content_length: u64,
+    ) -> ServerResult<BoxBody<Bytes, ServerError>> {
+        if content_length <= SMALL_FILE_INLINE_LIMIT {
+            let mut body = Vec::with_capacity(content_length as usize);
+            file.read_to_end(&mut body)
+                .await
+                .map_err(|e| server_err!(ServerErrorCode::IOError, "Failed to read file: {}", e))?;
+            return Ok(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed());
+        }
+
+        let stream = tokio_util::io::ReaderStream::with_capacity(
+            file,
+            Self::file_stream_buffer_size(content_length),
+        );
+        let stream_body = StreamBody::new(stream.map_ok(Frame::data));
+        Ok(BodyExt::map_err(stream_body, |e| {
+            ServerError::new(ServerErrorCode::StreamError, format!("Stream error: {}", e))
+        })
+        .boxed())
+    }
+
+    async fn range_body(
+        mut file: tokio::fs::File,
+        start: u64,
+        content_length: u64,
+    ) -> ServerResult<BoxBody<Bytes, ServerError>> {
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| server_err!(ServerErrorCode::IOError, "Failed to seek file: {}", e))?;
+
+        if content_length <= SMALL_FILE_INLINE_LIMIT {
+            let mut limited_reader = file.take(content_length);
+            let mut body = Vec::with_capacity(content_length as usize);
+            limited_reader.read_to_end(&mut body).await.map_err(|e| {
+                server_err!(ServerErrorCode::IOError, "Failed to read file range: {}", e)
+            })?;
+            return Ok(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed());
+        }
+
+        let limited_reader = file.take(content_length);
+        let stream = tokio_util::io::ReaderStream::with_capacity(
+            limited_reader,
+            Self::file_stream_buffer_size(content_length),
+        );
+        let stream_body = StreamBody::new(stream.map_ok(Frame::data));
+        Ok(BodyExt::map_err(stream_body, |e| {
+            ServerError::new(ServerErrorCode::StreamError, format!("Stream error: {}", e))
+        })
+        .boxed())
     }
 
     /// Parse Range header (e.g., "bytes=start-end")
@@ -723,9 +838,17 @@ impl DirServer {
             warn!("Failed to open file: {:?}, error: {}", file_path, e);
             server_err!(ServerErrorCode::IOError, "Failed to open file: {}", e)
         })?;
+        self.serve_opened_file(file_path, opened_file, req).await
+    }
+
+    async fn serve_opened_file(
+        &self,
+        file_path: &Path,
+        opened_file: OpenedDirFile,
+        req: &http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         let file = opened_file.file;
         let file_meta = opened_file.metadata;
-
         let file_size = file_meta.len();
         let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
         let last_modified = file_meta.modified().ok();
@@ -745,35 +868,16 @@ impl DirServer {
                 response_builder = response_builder.header(LAST_MODIFIED, formatted);
             }
 
-            return response_builder
-                .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
-                .map_err(|e| {
-                    server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e)
-                });
+            return response_builder.body(Self::empty_body()).map_err(|e| {
+                server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e)
+            });
         }
 
         // Handle Range requests
         if let Some(range_header) = req.headers().get(RANGE) {
             if let Ok(range_str) = range_header.to_str() {
                 if let Ok((start, end)) = self.parse_range(range_str, file_size) {
-                    let mut file = tokio::io::BufReader::new(file);
-                    // Seek to the start position
-                    use tokio::io::AsyncSeekExt;
-                    file.seek(std::io::SeekFrom::Start(start))
-                        .await
-                        .map_err(|e| {
-                            server_err!(ServerErrorCode::IOError, "Failed to seek file: {}", e)
-                        })?;
-
                     let content_length = end - start + 1;
-                    // Take only the content_length bytes
-                    let limited_reader = file.take(content_length);
-                    let stream = tokio_util::io::ReaderStream::with_capacity(
-                        limited_reader,
-                        content_length as usize,
-                    );
-                    let stream_body = StreamBody::new(stream.map_ok(Frame::data));
-
                     let mut response_builder = http::Response::builder()
                         .status(StatusCode::PARTIAL_CONTENT)
                         .header("Content-Type", mime_type.as_ref())
@@ -792,26 +896,17 @@ impl DirServer {
                         response_builder = response_builder.header(LAST_MODIFIED, formatted);
                     }
 
-                    return Ok(response_builder
-                        .body(
-                            BodyExt::map_err(stream_body, |e| {
-                                ServerError::new(
-                                    ServerErrorCode::StreamError,
-                                    format!("Stream error: {}", e),
-                                )
-                            })
-                            .boxed(),
-                        )
-                        .map_err(|e| {
-                            server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e)
-                        })?);
+                    let body = if req.method() == hyper::Method::HEAD {
+                        Self::empty_body()
+                    } else {
+                        Self::range_body(file, start, content_length).await?
+                    };
+                    return response_builder.body(body).map_err(|e| {
+                        server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e)
+                    });
                 }
             }
         }
-
-        // Non-Range request: return full file
-        let stream = tokio_util::io::ReaderStream::with_capacity(file, file_size as usize);
-        let stream_body = StreamBody::new(stream.map_ok(Frame::data));
 
         let mut response_builder = http::Response::builder()
             .status(StatusCode::OK)
@@ -827,16 +922,15 @@ impl DirServer {
             response_builder = response_builder.header(LAST_MODIFIED, formatted);
         }
 
-        Ok(response_builder
-            .body(
-                BodyExt::map_err(stream_body, |e| {
-                    ServerError::new(ServerErrorCode::StreamError, format!("Stream error: {}", e))
-                })
-                .boxed(),
-            )
-            .map_err(|e| {
-                server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e)
-            })?)
+        let body = if req.method() == hyper::Method::HEAD {
+            Self::empty_body()
+        } else {
+            Self::full_or_stream_body(file, file_size).await?
+        };
+
+        response_builder
+            .body(body)
+            .map_err(|e| server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e))
     }
 
     fn resolve_path(&self, req_path: &str) -> ServerResult<PathBuf> {
@@ -1056,31 +1150,51 @@ impl HttpServer for DirServer {
             }
         };
 
-        let mut file_stat = self.stat_path(&file_path);
+        let mut opened_canonical_path = None;
+        let mut file_stat = match self.open_path_in_root(&file_path).await {
+            Ok(opened_file) if opened_file.metadata.is_file() => {
+                info!("Serving file: {:?}", file_path);
+                return self.serve_opened_file(&file_path, opened_file, &req).await;
+            }
+            Ok(opened_file) => {
+                opened_canonical_path = opened_file.canonical_path;
+                DirPathStat::Found(CachedPathMetadata {
+                    metadata: opened_file.metadata,
+                })
+            }
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                warn!("Path traversal attempt: {:?}", file_path);
+                return Ok(self.build_text_response(StatusCode::FORBIDDEN, "Forbidden"));
+            }
+            Err(_) => self.stat_path(&file_path),
+        };
         if file_stat.exists() {
-            file_path = match self.ensure_path_in_root(&file_path) {
-                Ok(path) => path,
-                Err(_) => {
-                    warn!("Path traversal attempt: {:?}", file_path);
-                    return Ok(self.build_text_response(StatusCode::FORBIDDEN, "Forbidden"));
-                }
+            file_path = match opened_canonical_path.take() {
+                Some(path) => path,
+                None => match self.ensure_path_in_root(&file_path) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        warn!("Path traversal attempt: {:?}", file_path);
+                        return Ok(self.build_text_response(StatusCode::FORBIDDEN, "Forbidden"));
+                    }
+                },
             };
             file_stat = self.stat_path(&file_path);
         }
 
         if file_stat.is_dir() {
             let index_path = file_path.join(&self.index_file);
-            let index_stat = self.stat_path(&index_path);
-            if index_stat.is_file() {
-                let index_path = match self.ensure_path_in_root(&index_path) {
-                    Ok(path) => path,
-                    Err(_) => {
-                        warn!("Path traversal attempt: {:?}", index_path);
-                        return Ok(self.build_text_response(StatusCode::FORBIDDEN, "Forbidden"));
-                    }
-                };
-                info!("Serving index file: {:?}", index_path);
-                return self.serve_file(&index_path, &req).await;
+            match self.open_path_in_root(&index_path).await {
+                Ok(opened_file) if opened_file.metadata.is_file() => {
+                    info!("Serving index file: {:?}", index_path);
+                    return self.serve_opened_file(&index_path, opened_file, &req).await;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    warn!("Path traversal attempt: {:?}", index_path);
+                    return Ok(self.build_text_response(StatusCode::FORBIDDEN, "Forbidden"));
+                }
+                Err(_) => {}
             }
 
             if self.autoindex {
@@ -1094,11 +1208,13 @@ impl HttpServer for DirServer {
             warn!("File not found: {:?}", file_path);
             if let Some(fallback_file) = &self.fallback_file {
                 let fallback_path = self.root_dir.join(fallback_file);
-                match self.ensure_path_in_root(&fallback_path) {
-                    Ok(fallback_path) => {
-                        if self.stat_path(&fallback_path).is_file() {
+                match self.open_path_in_root(&fallback_path).await {
+                    Ok(opened_file) => {
+                        if opened_file.metadata.is_file() {
                             info!("Fallback to file: {:?}", fallback_path);
-                            return self.serve_file(&fallback_path, &req).await;
+                            return self
+                                .serve_opened_file(&fallback_path, opened_file, &req)
+                                .await;
                         }
                         warn!("Fallback file not found: {:?}", fallback_path);
                     }
@@ -1183,10 +1299,7 @@ impl Serialize for DirServerOpenFileCacheConfig {
             parts.push(format!("max={}", max));
         }
         if let Some(inactive) = self.inactive {
-            parts.push(format!(
-                "inactive={}s",
-                inactive.into_duration().as_secs()
-            ));
+            parts.push(format!("inactive={}s", inactive.into_duration().as_secs()));
         }
 
         if parts.is_empty() {
@@ -1561,6 +1674,21 @@ mod tests {
         assert_eq!(config.open_file_cache_errors, Some(true));
     }
 
+    #[test]
+    fn test_open_file_cache_defaults_to_off_when_omitted() {
+        let config: DirServerConfig = serde_json::from_value(serde_json::json!({
+            "id": "test",
+            "type": "dir",
+            "root_path": "/tmp"
+        }))
+        .unwrap();
+
+        assert!(config.open_file_cache.is_none());
+        assert!(config.open_file_cache_valid.is_none());
+        assert!(config.open_file_cache_min_uses.is_none());
+        assert!(config.open_file_cache_errors.is_none());
+    }
+
     #[tokio::test]
     async fn test_open_file_cache_defaults_when_directive_has_only_max() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1623,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn test_open_file_cache_keeps_cloneable_file_handle_after_min_uses() {
+    fn test_open_file_cache_keeps_only_path_metadata_after_min_uses() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("cached.txt");
         std::fs::write(&file_path, b"cached").unwrap();
@@ -1635,28 +1763,29 @@ mod tests {
             errors: true,
         });
 
-        assert!(cache.stat_path(&file_path).try_clone_file().is_none());
+        assert!(cache.stat_cache.get(&file_path).is_none());
+        assert_eq!(cache.stat_path(&file_path).metadata().unwrap().len(), 6);
+        assert!(cache.stat_cache.get(&file_path).is_none());
         let cached = cache.stat_path(&file_path);
-        assert!(cached.try_clone_file().unwrap().is_ok());
+        assert_eq!(cached.metadata().unwrap().len(), 6);
         assert!(cache.stat_cache.get(&file_path).is_some());
     }
 
     #[test]
-    fn test_open_file_cache_promotes_file_without_second_stat() {
+    fn test_open_file_cache_promotes_cached_stat_without_file_handle() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("cached.txt");
         std::fs::write(&file_path, b"old").unwrap();
 
-        let stat = DirPathStat::from_path(&file_path, false);
+        let stat = DirPathStat::from_path(&file_path);
         std::fs::write(&file_path, b"new-content").unwrap();
 
-        let cached = stat.with_cached_file(&file_path);
+        let cached = CachedPathStat::from(&stat).into_stat();
         assert_eq!(cached.metadata().unwrap().len(), 3);
-        assert!(cached.try_clone_file().unwrap().is_ok());
     }
 
     #[tokio::test]
-    async fn test_open_file_cache_reuses_metadata_for_serve_file_headers() {
+    async fn test_open_file_cache_does_not_reuse_stale_metadata_for_serve_file_headers() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("cached.txt");
         tokio::fs::write(&file_path, b"old").await.unwrap();
@@ -1686,7 +1815,6 @@ mod tests {
             CachedPathStat {
                 result: Ok(CachedPathMetadata {
                     metadata: cached_metadata,
-                    file: None,
                 }),
             },
         );
@@ -1698,7 +1826,110 @@ mod tests {
             .unwrap();
         let resp = server.serve_file(&file_path, &req).await.unwrap();
 
-        assert_eq!(resp.headers().get("Content-Length").unwrap(), "3");
+        assert_eq!(resp.headers().get("Content-Length").unwrap(), "11");
+    }
+
+    #[tokio::test]
+    async fn test_open_file_cache_does_not_cache_full_file_body() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("cached-body.txt");
+        tokio::fs::write(&file_path, b"old-body").await.unwrap();
+
+        let server = DirServer::builder()
+            .id("test")
+            .root_path(temp_dir.path().to_path_buf())
+            .open_file_cache(
+                DirServerOpenFileCacheConfig {
+                    max: Some(16),
+                    inactive: None,
+                    off: false,
+                },
+                Some(DirServerCacheDuration::Seconds(60)),
+                Some(1),
+                Some(true),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/cached-body.txt")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+        let resp = server.serve_file(&file_path, &req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"old-body");
+
+        tokio::fs::write(&file_path, b"new-body").await.unwrap();
+
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/cached-body.txt")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+        let resp = server.serve_file(&file_path, &req).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"new-body");
+    }
+
+    #[tokio::test]
+    async fn test_head_request_returns_headers_without_body() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(temp_dir.path().join("head.txt"), b"head-body")
+            .await
+            .unwrap();
+
+        let server = DirServer::builder()
+            .id("test")
+            .root_path(temp_dir.path().to_path_buf())
+            .build()
+            .await
+            .unwrap();
+
+        let req = http::Request::builder()
+            .method("HEAD")
+            .uri("http://localhost/head.txt")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+        let resp = server
+            .serve_request(req, StreamInfo::default())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("Content-Length").unwrap(), "9");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_symlink_escape_is_forbidden() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("secret.txt");
+        tokio::fs::write(&outside_file, b"secret").await.unwrap();
+        std::os::unix::fs::symlink(&outside_file, root_dir.path().join("leak.txt")).unwrap();
+
+        let server = DirServer::builder()
+            .id("test")
+            .root_path(root_dir.path().to_path_buf())
+            .build()
+            .await
+            .unwrap();
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/leak.txt")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+        let resp = server
+            .serve_request(req, StreamInfo::default())
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

@@ -15,6 +15,14 @@ from .vegeta import VegetaUnavailable, ensure_vegeta
 
 
 def endpoint_for(scenario: ScenarioPlan, host: str = "127.0.0.1") -> tuple[str, int, bool]:
+    if scenario.candidate == "nginx_hyper":
+        return host, 18180, False
+    if scenario.candidate == "cyfs_gateway_hyper":
+        return host, 28180, False
+    if scenario.candidate == "nginx_reuseport_static":
+        return host, 18181, False
+    if scenario.candidate == "cyfs_gateway_reuseport_static":
+        return host, 28181, False
     if scenario.scenario == "stream_reverse_proxy":
         if scenario.candidate == "nginx":
             return host, 19443 if scenario.stream_mode == "tcp_tls" else 19080, scenario.stream_mode == "tcp_tls"
@@ -171,6 +179,8 @@ def _run_vegeta_attack(
         "-workers",
         str(max(1, plan.load.concurrency)),
         f"-keepalive={'true' if scenario.connection_reuse == 'reuse_connection' else 'false'}",
+        "-max-body",
+        "0",
     ]
     if scenario.protocol == "https":
         attack_command.append("-insecure")

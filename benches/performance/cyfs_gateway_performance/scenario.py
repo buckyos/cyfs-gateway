@@ -3,7 +3,15 @@ from __future__ import annotations
 from .model import BenchmarkPlan, ConfigError, ScenarioPlan
 
 
-CANDIDATES = ("nginx", "cyfs_gateway")
+HYPER_STATIC_CANDIDATES = ("nginx_hyper", "cyfs_gateway_hyper")
+REUSEPORT_STATIC_CANDIDATES = ("nginx_reuseport_static", "cyfs_gateway_reuseport_static")
+
+
+def reuseport_static_enabled(plan: BenchmarkPlan) -> bool:
+    fixture = plan.upstream.get("reuseport_static_fixture") if isinstance(plan.upstream, dict) else None
+    if not isinstance(fixture, dict):
+        return False
+    return bool(fixture.get("enabled", False))
 
 
 def expand_scenarios(plan: BenchmarkPlan) -> list[ScenarioPlan]:
@@ -27,13 +35,22 @@ def expand_scenarios(plan: BenchmarkPlan) -> list[ScenarioPlan]:
         raise ConfigError("at least one required scenario must be enabled")
 
     result: list[ScenarioPlan] = []
-    for candidate in CANDIDATES:
+    reuseport_enabled = reuseport_static_enabled(plan)
+    for candidate in plan.candidates:
+        if candidate in REUSEPORT_STATIC_CANDIDATES and not reuseport_enabled:
+            continue
         for scenario, payloads, stream_modes in scenarios:
             scenario_protocols = protocols if scenario != "stream_reverse_proxy" else ["tcp"]
+            if candidate in HYPER_STATIC_CANDIDATES or candidate in REUSEPORT_STATIC_CANDIDATES:
+                if scenario != "static_http_file":
+                    continue
+                scenario_protocols = [protocol for protocol in scenario_protocols if protocol == "http"]
             for protocol in scenario_protocols:
                 for payload in payloads:
                     for mode in stream_modes:
                         for rate in plan.load.rates:
                             for reuse_mode in plan.load.connection_reuse_modes:
                                 result.append(ScenarioPlan(candidate, scenario, protocol, rate, payload, mode, reuse_mode))
+    if not result:
+        raise ConfigError("configured candidates, protocols, and scenarios produced no benchmark cases")
     return result

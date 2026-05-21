@@ -13,13 +13,24 @@ target:
   # Keep Ubuntu/Debian as an explicit preflight requirement for reproducible DV runs.
   ubuntu_required: true
 
-# Registry used to publish test images and later pull them on the target.
+# Image distribution policy for benchmark test images.
 registry:
-  # Whether build outputs are expected to be pushed before running.
+  # Whether build commands publish the generated nginx/cyfs_gateway images to
+  # the registry encoded in each images.*.image_ref.
+  # true: after a successful local image build, run docker push for each image.
+  # false: keep the image only in the local Docker daemon and record that push
+  #        was intentionally skipped.
   push: true
-  # Pull policy used by the target-side Docker deployment.
+  # Pull policy used by the target-side Docker deployment before docker run.
+  # Supported values:
+  # - always: run docker pull for each candidate image_ref before deployment.
+  #           Use this when the target should consume images from a registry.
+  # - never: do not pull; docker run uses the image already present in the
+  #          target Docker daemon. Use this for local-only tests or when images
+  #          were preloaded on the target host.
   pull_policy: always
-  # Allows local DV to record an approved environment deferral when no registry is available.
+  # Allows local DV to record an approved environment deferral when push/pull is
+  # enabled but no registry is available.
   allow_deferral: true
 
 # Candidate service images compared by the benchmark.
@@ -44,7 +55,18 @@ images:
       # Build optimized cyfs_gateway binary for benchmark images.
       build_profile: release
       # Build a musl target so the benchmark image uses a self-contained binary.
-      target: x86_64-unknown-linux-musl
+      target: x86_64-unknown-linux-gnu
+
+# Candidate endpoints included in benchmark execution.
+# nginx_hyper/cyfs_gateway_hyper use the legacy in-image Hyper static fixture.
+# nginx_reuseport_static/cyfs_gateway_reuseport_static use the optional SO_REUSEPORT fixture.
+candidates:
+  - nginx
+  - cyfs_gateway
+  - nginx_hyper
+  - cyfs_gateway_hyper
+  - nginx_reuseport_static
+  - cyfs_gateway_reuseport_static
 
 # Generated test assets embedded into image build contexts.
 generated_config:
@@ -92,6 +114,29 @@ upstream:
     tls_port: 9443
     # Deterministic stream payload size in bytes.
     payload_bytes: 1024
+
+  # Hyper HTTP/1 static-file fixture embedded in every candidate image.
+  hyper_static_fixture:
+    # Container-side hyper static fixture port.
+    port: 10080
+
+  # Optional SO_REUSEPORT Hyper HTTP/1 static-file fixture embedded in every candidate image.
+  reuseport_static_fixture:
+    # Whether the generated reuseport static fixture starts and participates in the matrix.
+    enabled: true
+    # Runtime and file-read mode used inside the generated fixture.
+    # Supported values:
+    # - tokio: existing Tokio runtime with tokio::fs reads and streaming for large files.
+    # - tokio_uring: tokio-uring runtime performs file data reads; networking stays on the
+    #                existing Hyper/Tokio accept path. Docker run automatically adds
+    #                seccomp=unconfined for this mode because default Docker seccomp
+    #                commonly blocks io_uring_setup.
+    runtime: tokio
+    # Container-side reuseport static fixture port. Kept separate from the legacy Hyper fixture.
+    port: 10081
+    # Optional SO_REUSEPORT acceptor thread count. When omitted, the generated Rust fixture
+    # uses the container-visible CPU count.
+    # threads: 8
 
 # Scenario matrix enabled for both candidate services.
 scenarios:

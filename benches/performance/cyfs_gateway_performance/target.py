@@ -85,7 +85,16 @@ def deployment_plan(plan: BenchmarkPlan) -> list[CommandPlan]:
         commands.append(
             CommandPlan(
                 f"run {image.key} container",
-                ("docker", "run", "--rm", "--network", network, "--name", f"cyfs-perf-{image.key}", image.image_ref),
+                (
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--network",
+                    network,
+                    "--name",
+                    f"cyfs-perf-{image.key}",
+                    image.image_ref,
+                ),
             )
         )
     commands.append(CommandPlan("remove benchmark network", ("docker", "network", "rm", network)))
@@ -127,14 +136,82 @@ def docker_network_name(plan: BenchmarkPlan) -> str:
     return str(((plan.generated_config.get("docker") or {}) or {}).get("network") or "cyfs-perf-local")
 
 
+def docker_env_args(plan: BenchmarkPlan, image_key: str) -> tuple[str, ...]:
+    docker_cfg = (plan.generated_config.get("docker") or {}) if isinstance(plan.generated_config, dict) else {}
+    env_cfg = docker_cfg.get(f"{image_key}_env") or {}
+    if not isinstance(env_cfg, dict):
+        return ()
+
+    args: list[str] = []
+    for key in sorted(env_cfg):
+        value = env_cfg[key]
+        if value is None:
+            continue
+        args.extend(["-e", f"{key}={value}"])
+    return tuple(args)
+
+
+def reuseport_static_config(plan: BenchmarkPlan) -> dict:
+    fixture = plan.upstream.get("reuseport_static_fixture") if isinstance(plan.upstream, dict) else None
+    return fixture if isinstance(fixture, dict) else {}
+
+
+def reuseport_static_env_args(plan: BenchmarkPlan) -> tuple[str, ...]:
+    fixture = reuseport_static_config(plan)
+    enabled = 1 if fixture.get("enabled", False) else 0
+    runtime = fixture.get("runtime") if fixture.get("runtime") in {"tokio", "tokio_uring"} else "tokio"
+    port = int(fixture.get("port") or 10081)
+    args = [
+        "-e",
+        f"REUSEPORT_STATIC_ENABLED={enabled}",
+        "-e",
+        f"REUSEPORT_STATIC_RUNTIME={runtime}",
+        "-e",
+        f"REUSEPORT_STATIC_PORT={port}",
+    ]
+    threads = fixture.get("threads")
+    if isinstance(threads, int) and threads > 0:
+        args.extend(["-e", f"REUSEPORT_STATIC_THREADS={threads}"])
+    return tuple(args)
+
+
+def reuseport_static_needs_io_uring(plan: BenchmarkPlan) -> bool:
+    fixture = reuseport_static_config(plan)
+    return bool(fixture.get("enabled", False)) and fixture.get("runtime") == "tokio_uring"
+
+
+def docker_security_args(plan: BenchmarkPlan) -> tuple[str, ...]:
+    if reuseport_static_needs_io_uring(plan):
+        return ("--security-opt", "seccomp=unconfined")
+    return ()
+
+
+def image_keys_for_candidates(plan: BenchmarkPlan) -> tuple[str, ...]:
+    wanted = {
+        "nginx"
+        if candidate in {"nginx_hyper", "nginx_reuseport_static"}
+        else "cyfs_gateway"
+        if candidate in {"cyfs_gateway_hyper", "cyfs_gateway_reuseport_static"}
+        else candidate
+        for candidate in plan.candidates
+    }
+    return tuple(image_key for image_key in plan.images if image_key in wanted)
+
+
 def pull_commands(plan: BenchmarkPlan) -> list[CommandPlan]:
-    return [target_command(plan, f"pull {image.key} image", ("docker", "pull", image.image_ref)) for image in plan.images.values()]
+    if plan.registry_pull_policy == "never":
+        return []
+    return [
+        target_command(plan, f"pull {plan.images[image_key].key} image", ("docker", "pull", plan.images[image_key].image_ref))
+        for image_key in image_keys_for_candidates(plan)
+    ]
 
 
 def cleanup_commands(plan: BenchmarkPlan) -> list[CommandPlan]:
     network = docker_network_name(plan)
     commands = []
-    for image in plan.images.values():
+    for image_key in image_keys_for_candidates(plan):
+        image = plan.images[image_key]
         commands.append(target_command(plan, f"remove {image.key} container", ("docker", "rm", "-f", f"cyfs-perf-{image.key}")))
     commands.append(target_command(plan, "remove benchmark network", ("docker", "network", "rm", network)))
     return commands
@@ -142,59 +219,79 @@ def cleanup_commands(plan: BenchmarkPlan) -> list[CommandPlan]:
 
 def run_container_commands(plan: BenchmarkPlan) -> list[CommandPlan]:
     network = docker_network_name(plan)
-    return [
-        target_command(plan, "create benchmark network", ("docker", "network", "create", network)),
-        target_command(
-            plan,
-            "run nginx container",
-            (
-                "docker",
-                "run",
-                "-d",
-                "--network",
-                network,
-                "--name",
-                "cyfs-perf-nginx",
-                "-p",
-                "18080:80",
-                "-p",
-                "18443:443",
-                "-p",
-                "19080:9080",
-                "-p",
-                "19443:9443",
-                plan.images["nginx"].image_ref,
-            ),
-        ),
-        target_command(
-            plan,
-            "run cyfs_gateway container",
-            (
-                "docker",
-                "run",
-                "-d",
-                "--network",
-                network,
-                "--name",
-                "cyfs-perf-cyfs_gateway",
-                "-p",
-                "28080:80",
-                "-p",
-                "28443:443",
-                "-p",
-                "29080:9080",
-                "-p",
-                "29443:9443",
-                plan.images["cyfs_gateway"].image_ref,
-            ),
-        ),
-    ]
+    commands = [target_command(plan, "create benchmark network", ("docker", "network", "create", network))]
+    image_keys = image_keys_for_candidates(plan)
+    if "nginx" in image_keys:
+        commands.append(
+            target_command(
+                plan,
+                "run nginx container",
+                (
+                    "docker",
+                    "run",
+                    "-d",
+                    "--network",
+                    network,
+                    "--name",
+                    "cyfs-perf-nginx",
+                    "-p",
+                    "18080:80",
+                    "-p",
+                    "18443:443",
+                    "-p",
+                    "19080:9080",
+                    "-p",
+                    "19443:9443",
+                    "-p",
+                    "18180:10080",
+                    "-p",
+                    "18181:10081",
+                    *docker_security_args(plan),
+                    *reuseport_static_env_args(plan),
+                    *docker_env_args(plan, "nginx"),
+                    plan.images["nginx"].image_ref,
+                ),
+            )
+        )
+    if "cyfs_gateway" in image_keys:
+        commands.append(
+            target_command(
+                plan,
+                "run cyfs_gateway container",
+                (
+                    "docker",
+                    "run",
+                    "-d",
+                    "--network",
+                    network,
+                    "--name",
+                    "cyfs-perf-cyfs_gateway",
+                    "-p",
+                    "28080:80",
+                    "-p",
+                    "28443:443",
+                    "-p",
+                    "29080:9080",
+                    "-p",
+                    "29443:9443",
+                    "-p",
+                    "28180:10080",
+                    "-p",
+                    "28181:10081",
+                    *docker_security_args(plan),
+                    *reuseport_static_env_args(plan),
+                    *docker_env_args(plan, "cyfs_gateway"),
+                    plan.images["cyfs_gateway"].image_ref,
+                ),
+            )
+        )
+    return commands
 
 
 def container_logs_commands(plan: BenchmarkPlan) -> list[CommandPlan]:
     return [
-        target_command(plan, f"logs {image.key} container", ("docker", "logs", f"cyfs-perf-{image.key}"))
-        for image in plan.images.values()
+        target_command(plan, f"logs {plan.images[image_key].key} container", ("docker", "logs", f"cyfs-perf-{plan.images[image_key].key}"))
+        for image_key in image_keys_for_candidates(plan)
     ]
 
 
@@ -202,8 +299,8 @@ def container_readiness_commands(plan: BenchmarkPlan) -> list[CommandPlan]:
     return [
         target_command(
             plan,
-            f"inspect {image.key} container running",
-            ("docker", "inspect", "--format", "{{.State.Running}}", f"cyfs-perf-{image.key}"),
+            f"inspect {plan.images[image_key].key} container running",
+            ("docker", "inspect", "--format", "{{.State.Running}}", f"cyfs-perf-{plan.images[image_key].key}"),
         )
-        for image in plan.images.values()
+        for image_key in image_keys_for_candidates(plan)
     ]
