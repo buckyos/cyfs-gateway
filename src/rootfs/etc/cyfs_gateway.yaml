@@ -104,6 +104,7 @@ stacks:
     # id comes from map key (here: http_tcp)
     protocol: tcp                 # tcp | udp | tls | quic | rtcp | tun
     bind: 0.0.0.0:80            # bind address
+    # concurrency: 0              # active connection limit, default 0 (unlimited)
     # transparent: false          # transparent proxy mode (tcp/udp optional, default false)
     # reuse_address: false        # SO_REUSEADDR (optional, default false)
     # io_dump_file: tcp.dump      # enable io dump; relative path resolves to service data dir/dumps/
@@ -125,8 +126,9 @@ stacks:
     # udp_example:
     #   protocol: udp
     #   bind: 0.0.0.0:53
-    #   concurrency: 200            # default 200
-    #   session_idle_time: 120      # session timeout (seconds), default 120
+    #   concurrency: 0              # default 0 (unlimited)
+    #   max_sessions: 0             # max tracked udp sessions, default 0 (unlimited)
+    #   session_idle_time: 5        # session timeout (seconds), default 5
     #   transparent: false
     #   reuse_address: false
     #   io_dump_file: udp.dump
@@ -153,7 +155,7 @@ stacks:
     # quic_example:
     #   protocol: quic
     #   bind: 0.0.0.0:4433
-    #   concurrency: 1024           # default 1024
+    #   concurrency: 0              # default 0 (unlimited)
     #   alpn_protocols: ["h3"] # supports h2/h3
     #   reuse_address: false
     #   io_dump_file: quic.dump
