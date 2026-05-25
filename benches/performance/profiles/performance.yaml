@@ -84,11 +84,11 @@ generated_config:
       - # Small smoke-test HTML path requested by the benchmark.
         path: index.html
         # File size in bytes.
-        size_bytes: 4096
+        size_bytes: 1024
       - # Larger binary payload path requested by the benchmark.
         path: payload.bin
         # File size in bytes.
-        size_bytes: 1048576
+        size_bytes: 4096
 
   # Test TLS material generation policy.
   tls:
@@ -97,9 +97,9 @@ generated_config:
     # Common name used by generated test certificates and HTTPS reports.
     common_name: perf.local
 
-# Fixture services used as in-image upstream targets for reverse-proxy scenarios.
+# Fixture services used as in-image upstream targets for reverse-proxy and stream scenarios.
 upstream:
-  # HTTP fixture is compiled from generated Rust source and packaged into each candidate test image.
+  # HTTP echo fixture used by the HTTP reverse-proxy scenario.
   http_fixture:
     # Container-side HTTP fixture port.
     port: 8080
@@ -127,10 +127,10 @@ upstream:
     # Runtime and file-read mode used inside the generated fixture.
     # Supported values:
     # - tokio: existing Tokio runtime with tokio::fs reads and streaming for large files.
-    # - tokio_uring: tokio-uring runtime performs file data reads; networking stays on the
-    #                existing Hyper/Tokio accept path. Docker run automatically adds
-    #                seccomp=unconfined for this mode because default Docker seccomp
-    #                commonly blocks io_uring_setup.
+    # - tokio_custom: Tokio runtime with a custom HTTP/1 server implementation and tokio::fs reads.
+    # - tokio_uring: tokio-uring runtime with the custom HTTP/1 server implementation.
+    #                Docker run automatically adds seccomp=unconfined for this mode
+    #                because default Docker seccomp commonly blocks io_uring_setup.
     runtime: tokio
     # Container-side reuseport static fixture port. Kept separate from the legacy Hyper fixture.
     port: 10081
@@ -156,14 +156,14 @@ scenarios:
     # Candidate-facing path mapped to the HTTP fixture response.
     path: /proxy/payload
 
-  # TCP stream reverse proxy through each candidate service.
+  # TCP/TLS stream reverse proxy through each candidate service to the reverse_proxy_fixture static server.
   stream_reverse_proxy:
     # Whether this scenario participates in matrix expansion.
     enabled: true
-    # Stream modes covered by the first benchmark version.
-    modes:
-      - tcp
-      - tcp_tls
+    # HTTP paths requested through the TCP/TLS stream proxy with vegeta.
+    paths:
+      - /index.html
+      - /payload.bin
 
 # Application protocols used for HTTP-style scenarios.
 protocols:

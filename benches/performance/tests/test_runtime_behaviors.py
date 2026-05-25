@@ -71,10 +71,10 @@ class RuntimeBehaviorTests(unittest.TestCase):
 
         self.assertIn("listen 9080;", nginx_conf)
         self.assertIn("listen 9443 ssl;", nginx_conf)
-        self.assertIn("proxy_pass 127.0.0.1:9000;", nginx_conf)
+        self.assertIn("proxy_pass 127.0.0.1:10080;", nginx_conf)
         self.assertIn("bind: 0.0.0.0:9080", gateway_yaml)
         self.assertIn("bind: 0.0.0.0:9443", gateway_yaml)
-        self.assertIn('return "forward tcp:///127.0.0.1:9000";', gateway_yaml)
+        self.assertIn('return "forward tcp:///127.0.0.1:10080";', gateway_yaml)
 
         rendered = [" ".join(command.command) for command in run_container_commands(plan)]
         self.assertTrue(any("-p 19080:9080 -p 19443:9443" in command for command in rendered))
@@ -87,11 +87,11 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertTrue(any("-e REUSEPORT_STATIC_ENABLED=1" in command for command in rendered))
         self.assertFalse(any("--security-opt seccomp=unconfined" in command for command in rendered))
         self.assertEqual(
-            endpoint_for(ScenarioPlan("nginx", "stream_reverse_proxy", "tcp", 1, "stream", "tcp")),
+            endpoint_for(ScenarioPlan("nginx", "stream_reverse_proxy", "http", 1, "/index.html")),
             ("127.0.0.1", 19080, False),
         )
         self.assertEqual(
-            endpoint_for(ScenarioPlan("cyfs_gateway", "stream_reverse_proxy", "tcp", 1, "stream", "tcp_tls")),
+            endpoint_for(ScenarioPlan("cyfs_gateway", "stream_reverse_proxy", "https", 1, "/payload.bin")),
             ("127.0.0.1", 29443, True),
         )
         self.assertEqual(
@@ -124,6 +124,17 @@ class RuntimeBehaviorTests(unittest.TestCase):
             rendered = [" ".join(command.command) for command in run_container_commands(plan)]
 
         self.assertTrue(any("--security-opt seccomp=unconfined" in command for command in rendered))
+
+    def test_tokio_custom_reuseport_static_keeps_default_docker_seccomp(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("runtime: tokio", "runtime: tokio_custom")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            plan = load_profile(profile)
+            rendered = [" ".join(command.command) for command in run_container_commands(plan)]
+
+        self.assertTrue(any("-e REUSEPORT_STATIC_RUNTIME=tokio_custom" in command for command in rendered))
+        self.assertFalse(any("--security-opt seccomp=unconfined" in command for command in rendered))
 
     def test_disabled_tokio_uring_reuseport_static_keeps_default_docker_seccomp(self) -> None:
         text = PROFILE.read_text(encoding="utf-8").replace("enabled: true", "enabled: false", 1)
@@ -176,6 +187,31 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertEqual(result["connection_reuse"], "new_connection")
         self.assertEqual(result["engine"], "vegeta")
 
+    def test_https_fixed_rate_workload_uses_vegeta_with_sni_connect_mapping(self) -> None:
+        plan = load_profile(PROFILE)
+        plan = replace(plan, load=replace(plan.load, duration_seconds=1, warmup_seconds=0, concurrency=1, rates=(1,)))
+        scenario = ScenarioPlan("cyfs_gateway", "stream_reverse_proxy", "https", 1, "/payload.bin")
+
+        def fake_run(command, **kwargs):
+            if command[1] == "attack":
+                return mock.Mock(returncode=0, stdout=b"vegeta-binary-results", stderr=b"")
+            return mock.Mock(returncode=0, stdout=b'{"code":200,"latency":4000000}\n', stderr=b"")
+
+        with mock.patch("cyfs_gateway_performance.workload.ensure_vegeta", return_value=(Path("/tmp/vegeta"), {})), mock.patch(
+            "cyfs_gateway_performance.workload.subprocess.run",
+            side_effect=fake_run,
+        ) as run_command:
+            result = run_fixed_rate_workload(plan, scenario)
+
+        attack_commands = [call.args[0] for call in run_command.call_args_list if call.args[0][1] == "attack"]
+        self.assertEqual(len(attack_commands), 1)
+        self.assertIn("-insecure", attack_commands[0])
+        self.assertIn("-connect-to", attack_commands[0])
+        self.assertIn("perf.local:29443:127.0.0.1:29443", attack_commands[0])
+        self.assertIn(b"GET https://perf.local:29443/payload.bin\n", run_command.call_args_list[0].kwargs["input"])
+        self.assertEqual(result["engine"], "vegeta")
+        self.assertEqual(result["success"], 1)
+
     def test_profile_expands_connection_reuse_modes_in_scenario_matrix(self) -> None:
         plan = load_profile(PROFILE)
         scenarios = expand_scenarios(plan)
@@ -204,6 +240,34 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertEqual(plan.load.connection_reuse_modes, ("new_connection", "reuse_connection"))
         self.assertEqual(reuse_modes, {"new_connection", "reuse_connection"})
         self.assertEqual({scenario.connection_reuse for scenario in equivalent}, {"new_connection", "reuse_connection"})
+        self.assertEqual(
+            {
+                scenario.payload
+                for scenario in scenarios
+                if scenario.candidate == "nginx"
+                and scenario.scenario == "http_reverse_proxy"
+                and scenario.protocol == "http"
+                and scenario.rate == 100
+                and scenario.connection_reuse == "new_connection"
+            },
+            {"/proxy/payload"},
+        )
+        self.assertEqual(
+            {
+                (scenario.protocol, scenario.payload)
+                for scenario in scenarios
+                if scenario.candidate == "nginx"
+                and scenario.scenario == "stream_reverse_proxy"
+                and scenario.rate == 100
+                and scenario.connection_reuse == "new_connection"
+            },
+            {
+                ("http", "/index.html"),
+                ("http", "/payload.bin"),
+                ("https", "/index.html"),
+                ("https", "/payload.bin"),
+            },
+        )
 
         hyper_static = [
             scenario
@@ -315,6 +379,19 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertEqual(metadata["packaged_reuseport_static_fixture"]["runtime"], "tokio_uring")
         self.assertIn("ENV REUSEPORT_STATIC_RUNTIME=tokio_uring", dockerfile_text)
 
+    def test_profile_accepts_configured_reuseport_static_tokio_custom_runtime(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("runtime: tokio", "runtime: tokio_custom")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            plan = load_profile(profile)
+            metadata = write_image_context(plan, "nginx", Path(temp))
+            dockerfile_text = Path(metadata["dockerfile"]).read_text(encoding="utf-8")
+
+        self.assertEqual(plan.upstream["reuseport_static_fixture"]["runtime"], "tokio_custom")
+        self.assertEqual(metadata["packaged_reuseport_static_fixture"]["runtime"], "tokio_custom")
+        self.assertIn("ENV REUSEPORT_STATIC_RUNTIME=tokio_custom", dockerfile_text)
+
     def test_profile_rejects_invalid_reuseport_static_runtime(self) -> None:
         text = PROFILE.read_text(encoding="utf-8").replace("runtime: tokio", "runtime: async_everything")
         with tempfile.TemporaryDirectory() as temp:
@@ -331,35 +408,33 @@ class RuntimeBehaviorTests(unittest.TestCase):
             with self.assertRaisesRegex(ConfigError, "reuseport_static_fixture.threads"):
                 load_profile(profile)
 
-    def test_reuse_connection_workload_reuses_worker_sessions(self) -> None:
+    def test_reuse_connection_workload_sets_vegeta_keepalive(self) -> None:
         plan = load_profile(PROFILE)
         plan = replace(plan, load=replace(plan.load, duration_seconds=1, warmup_seconds=0, concurrency=2, rates=(4,)))
-        scenario = ScenarioPlan("nginx", "stream_reverse_proxy", "tcp", 4, "stream", "tcp", "reuse_connection")
-        sessions = []
+        scenario = ScenarioPlan("nginx", "stream_reverse_proxy", "https", 4, "/payload.bin", None, "reuse_connection")
 
-        class FakeReusableConnection:
-            def __init__(self, *_args):
-                self.requests = 0
-                self.closed = False
-                sessions.append(self)
+        def fake_run(command, **kwargs):
+            if command[1] == "attack":
+                return mock.Mock(returncode=0, stdout=b"vegeta-binary-results", stderr=b"")
+            return mock.Mock(
+                returncode=0,
+                stdout=b'{"code":200,"latency":3000000}\n{"code":200,"latency":3000000}\n',
+                stderr=b"",
+            )
 
-            def request(self):
-                self.requests += 1
-
-            def close(self):
-                self.closed = True
-
-        with mock.patch("cyfs_gateway_performance.workload._ReusableConnection", FakeReusableConnection), mock.patch(
-            "cyfs_gateway_performance.workload.time.sleep"
-        ):
+        with mock.patch("cyfs_gateway_performance.workload.ensure_vegeta", return_value=(Path("/tmp/vegeta"), {})), mock.patch(
+            "cyfs_gateway_performance.workload.subprocess.run",
+            side_effect=fake_run,
+        ) as run_command:
             result = run_fixed_rate_workload(plan, scenario)
 
-        self.assertEqual(result["attempted"], 4)
-        self.assertEqual(result["success"], 4)
+        attack_commands = [call.args[0] for call in run_command.call_args_list if call.args[0][1] == "attack"]
+        self.assertEqual(len(attack_commands), 1)
+        self.assertIn("-keepalive=true", attack_commands[0])
+        self.assertIn("-insecure", attack_commands[0])
+        self.assertIn("perf.local:19443:127.0.0.1:19443", attack_commands[0])
+        self.assertEqual(result["engine"], "vegeta")
         self.assertEqual(result["connection_reuse"], "reuse_connection")
-        self.assertLessEqual(len(sessions), 2)
-        self.assertGreaterEqual(max(session.requests for session in sessions), 2)
-        self.assertTrue(all(session.closed for session in sessions))
 
     def test_resource_metrics_samples_during_measured_window(self) -> None:
         plan = load_profile(PROFILE)

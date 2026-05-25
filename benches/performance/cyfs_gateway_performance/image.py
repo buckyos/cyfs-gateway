@@ -49,7 +49,7 @@ use tokio_util::io::ReaderStream;
 
 const HYPER_STATIC_SMALL_FILE_INLINE_LIMIT: u64 = 64 * 1024;
 const HYPER_STATIC_MIN_STREAM_BUFFER_SIZE: usize = 16 * 1024;
-const HYPER_STATIC_MAX_STREAM_BUFFER_SIZE: usize = 512 * 1024;
+const HYPER_STATIC_MAX_STREAM_BUFFER_SIZE: usize = 64 * 1024;
 type HyperStaticBody = BoxBody<Bytes, std::io::Error>;
 
 struct HyperStaticRoot {
@@ -216,6 +216,7 @@ fn serve_hyper_static(
         let listener = TokioTcpListener::bind(addr).await?;
         loop {
             let (stream, _) = listener.accept().await?;
+            stream.set_nodelay(true)?;
             let static_root = static_root.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |request| {
@@ -416,6 +417,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::env;
 use std::ffi::CString;
@@ -424,24 +426,29 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener as TokioTcpListener;
-use tokio_uring::buf::BoundedBuf;
 use tokio_uring::net::{TcpListener as UringTcpListener, TcpStream as UringTcpStream};
 use tokio_util::io::ReaderStream;
 
 const HYPER_STATIC_SMALL_FILE_INLINE_LIMIT: u64 = 64 * 1024;
 const HYPER_STATIC_MIN_STREAM_BUFFER_SIZE: usize = 16 * 1024;
-const HYPER_STATIC_MAX_STREAM_BUFFER_SIZE: usize = 512 * 1024;
+const HYPER_STATIC_MAX_STREAM_BUFFER_SIZE: usize = 64 * 1024;
+const URING_STATIC_BODY_WRITE_CHUNK_SIZE: usize = 64 * 1024;
 type HyperStaticBody = BoxBody<Bytes, std::io::Error>;
 
 struct HyperStaticRoot {
     root_dir_file: std::fs::File,
 }
 
+struct UringStaticRoot {
+    files: HashMap<PathBuf, Bytes>,
+}
+
 #[derive(Clone, Copy)]
 enum StaticRuntimeMode {
     Tokio,
+    TokioCustom,
     TokioUring,
 }
 
@@ -500,6 +507,7 @@ fn configured_runtime_mode() -> Result<StaticRuntimeMode, Box<dyn std::error::Er
         .as_str()
     {
         "tokio" => Ok(StaticRuntimeMode::Tokio),
+        "tokio_custom" => Ok(StaticRuntimeMode::TokioCustom),
         "tokio_uring" => Ok(StaticRuntimeMode::TokioUring),
         other => Err(format!("unsupported REUSEPORT_STATIC_RUNTIME: {other}").into()),
     }
@@ -519,6 +527,7 @@ fn serve_reuseport_worker(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match runtime_mode {
         StaticRuntimeMode::Tokio => serve_tokio_reuseport_worker(thread_index, addr, static_root),
+        StaticRuntimeMode::TokioCustom => serve_tokio_custom_reuseport_worker(thread_index, addr, static_root),
         StaticRuntimeMode::TokioUring => serve_tokio_uring_reuseport_worker(thread_index, addr, static_root),
     }
 }
@@ -538,6 +547,7 @@ fn serve_tokio_reuseport_worker(
         eprintln!("reuseport static worker {thread_index} listening on {addr}");
         loop {
             let (stream, _) = listener.accept().await?;
+            stream.set_nodelay(true)?;
             let static_root = static_root.clone();
             tokio::spawn(async move {
                 let service = service_fn(move |request| {
@@ -555,7 +565,7 @@ fn serve_tokio_reuseport_worker(
     })
 }
 
-fn serve_tokio_uring_reuseport_worker(
+fn serve_tokio_custom_reuseport_worker(
     thread_index: usize,
     addr: SocketAddr,
     static_root: PathBuf,
@@ -563,12 +573,38 @@ fn serve_tokio_uring_reuseport_worker(
     let root_dir_file = std::fs::File::open(&static_root)?;
     let static_root = Arc::new(HyperStaticRoot { root_dir_file });
     let std_listener = bind_reuseport_listener(addr)?;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+
+    runtime.block_on(async move {
+        let listener = TokioTcpListener::from_std(std_listener)?;
+        eprintln!("reuseport static tokio_custom worker {thread_index} listening on {addr}");
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            stream.set_nodelay(true)?;
+            let static_root = static_root.clone();
+            tokio::spawn(async move {
+                if let Err(err) = serve_tokio_custom_static_connection(&mut stream, static_root).await {
+                    eprintln!("reuseport static tokio_custom connection failed: {err}");
+                }
+            });
+        }
+    })
+}
+
+fn serve_tokio_uring_reuseport_worker(
+    thread_index: usize,
+    addr: SocketAddr,
+    static_root: PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let static_root = Arc::new(load_uring_static_cache(&static_root)?);
+    let std_listener = bind_reuseport_listener(addr)?;
 
     tokio_uring::start(async move {
         let listener = UringTcpListener::from_std(std_listener);
         eprintln!("reuseport static tokio_uring worker {thread_index} listening on {addr}");
         loop {
             let (stream, _) = listener.accept().await?;
+            stream.set_nodelay(true)?;
             let static_root = static_root.clone();
             tokio_uring::spawn(async move {
                 if let Err(err) = serve_uring_static_connection(stream, static_root).await {
@@ -705,9 +741,104 @@ async fn hyper_static_body(
     Ok(BodyExt::map_err(StreamBody::new(stream), |err| err).boxed())
 }
 
+async fn serve_tokio_custom_static_connection(
+    stream: &mut tokio::net::TcpStream,
+    static_root: Arc<HyperStaticRoot>,
+) -> std::io::Result<()> {
+    let request = read_tokio_http_request(stream).await?;
+    match custom_request_line(&request) {
+        Some((method, path)) if method == "GET" || method == "HEAD" => {
+            match write_tokio_custom_static_response(stream, &static_root, method, path).await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    eprintln!("reuseport static tokio_custom request failed for {path}: {err}");
+                    write_tokio_response(stream, custom_text_response(StatusCode::INTERNAL_SERVER_ERROR, "read error")).await
+                }
+            }
+        }
+        Some(_) => write_tokio_response(stream, custom_text_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")).await,
+        None => write_tokio_response(stream, custom_text_response(StatusCode::BAD_REQUEST, "bad request")).await,
+    }
+}
+
+async fn read_tokio_http_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut request = Vec::with_capacity(1024);
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") || request.len() >= 8192 {
+            break;
+        }
+    }
+    Ok(request)
+}
+
+fn custom_request_line(request: &[u8]) -> Option<(&str, &str)> {
+    let text = std::str::from_utf8(request).ok()?;
+    let line = text.split("\r\n").next()?;
+    let mut parts = line.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    Some((method, path))
+}
+
+async fn write_tokio_custom_static_response(
+    stream: &mut tokio::net::TcpStream,
+    static_root: &HyperStaticRoot,
+    method: &str,
+    request_path: &str,
+) -> std::io::Result<()> {
+    let Some(path) = normalized_request_path(request_path) else {
+        return write_tokio_response(stream, custom_text_response(StatusCode::FORBIDDEN, "forbidden")).await;
+    };
+    let file_path = PathBuf::from(path.trim_start_matches('/'));
+    let opened = match open_hyper_static_file(static_root, &file_path) {
+        Ok(opened) if opened.metadata.is_file() => opened,
+        Ok(_) => return write_tokio_response(stream, custom_text_response(StatusCode::NOT_FOUND, "not found")).await,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return write_tokio_response(stream, custom_text_response(StatusCode::NOT_FOUND, "not found")).await;
+        }
+        Err(err) => return Err(err),
+    };
+
+    let content_length = opened.metadata.len();
+    let headers = status_line_and_headers(
+        StatusCode::OK,
+        "application/octet-stream",
+        content_length,
+        false,
+    );
+    if method == "HEAD" {
+        return write_tokio_response(stream, headers).await;
+    }
+    write_tokio_file_body(stream, headers, opened.file, content_length).await
+}
+
+async fn write_tokio_file_body(
+    stream: &mut tokio::net::TcpStream,
+    headers: Vec<u8>,
+    mut file: tokio::fs::File,
+    content_length: u64,
+) -> std::io::Result<()> {
+    stream.write_all(&headers).await?;
+    let mut buffer = vec![0_u8; hyper_static_stream_buffer_size(content_length)];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        stream.write_all(&buffer[..read]).await?;
+    }
+    Ok(())
+}
+
 async fn serve_uring_static_connection(
     stream: UringTcpStream,
-    static_root: Arc<HyperStaticRoot>,
+    static_root: Arc<UringStaticRoot>,
 ) -> std::io::Result<()> {
     let request = read_uring_http_request(&stream).await?;
     match uring_request_line(&request) {
@@ -754,7 +885,7 @@ fn uring_request_line(request: &[u8]) -> Option<(&str, &str)> {
 
 async fn write_uring_static_response(
     stream: &UringTcpStream,
-    static_root: &HyperStaticRoot,
+    static_root: &UringStaticRoot,
     method: &str,
     request_path: &str,
 ) -> std::io::Result<()> {
@@ -762,45 +893,92 @@ async fn write_uring_static_response(
         return write_uring_response(stream, uring_text_response(StatusCode::FORBIDDEN, "forbidden")).await;
     };
     let file_path = PathBuf::from(path.trim_start_matches('/'));
-    let opened = match open_std_hyper_static_file(static_root, &file_path) {
-        Ok(opened) if opened.metadata.is_file() => opened,
-        Ok(_) => return write_uring_response(stream, uring_text_response(StatusCode::NOT_FOUND, "not found")).await,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return write_uring_response(stream, uring_text_response(StatusCode::NOT_FOUND, "not found")).await;
-        }
-        Err(err) => return Err(err),
+    let Some(body) = static_root.files.get(&file_path) else {
+        return write_uring_response(stream, uring_text_response(StatusCode::NOT_FOUND, "not found")).await;
     };
 
-    let content_length = opened.metadata.len();
-    write_uring_response(
-        stream,
-        status_line_and_headers(StatusCode::OK, "application/octet-stream", content_length),
-    )
-    .await?;
+    let content_length = body.len() as u64;
+    let headers = status_line_and_headers(
+        StatusCode::OK,
+        "application/octet-stream",
+        content_length,
+        false,
+    );
     if method == "HEAD" {
-        return Ok(());
+        return write_uring_response(stream, headers).await;
     }
-    stream_file_with_tokio_uring(stream, opened.file, content_length).await
+    write_cached_uring_body(stream, headers, body.clone()).await
 }
 
-async fn stream_file_with_tokio_uring(
+async fn write_cached_uring_body(
     stream: &UringTcpStream,
-    file: std::fs::File,
-    content_length: u64,
+    headers: Vec<u8>,
+    body: Bytes,
 ) -> std::io::Result<()> {
-    let file = tokio_uring::fs::File::from_std(file);
-    let mut offset = 0u64;
-    while offset < content_length {
-        let len = (content_length - offset).min(HYPER_STATIC_MAX_STREAM_BUFFER_SIZE as u64) as usize;
-        let buffer = vec![0; len];
-        let (result, buffer) = file.read_at(buffer, offset).await;
-        let bytes_read = result?;
-        if bytes_read == 0 {
-            break;
-        }
-        let (result, _) = stream.write_all(buffer.slice(..bytes_read)).await;
+    let (result, _) = stream.write_all(headers).await;
+    result?;
+
+    for chunk in body.chunks(URING_STATIC_BODY_WRITE_CHUNK_SIZE) {
+        let (result, _) = stream.write_all(chunk.to_vec()).await;
         result?;
-        offset += bytes_read as u64;
+    }
+
+    Ok(())
+}
+
+fn uring_text_response(status: StatusCode, text: &'static str) -> Vec<u8> {
+    let mut response = status_line_and_headers(status, "text/plain", text.len() as u64, true);
+    response.extend_from_slice(text.as_bytes());
+    response
+}
+
+fn custom_text_response(status: StatusCode, text: &'static str) -> Vec<u8> {
+    let mut response = status_line_and_headers(status, "text/plain", text.len() as u64, true);
+    response.extend_from_slice(text.as_bytes());
+    response
+}
+
+fn status_line_and_headers(
+    status: StatusCode,
+    content_type: &str,
+    content_length: u64,
+    close: bool,
+) -> Vec<u8> {
+    let connection = if close { "Connection: close\r\n" } else { "" };
+    format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("unknown"),
+        content_type,
+        content_length,
+        connection,
+    )
+    .into_bytes()
+}
+
+fn load_uring_static_cache(static_root: &Path) -> std::io::Result<UringStaticRoot> {
+    let mut files = HashMap::new();
+    load_uring_static_cache_dir(static_root, static_root, &mut files)?;
+    Ok(UringStaticRoot { files })
+}
+
+fn load_uring_static_cache_dir(
+    static_root: &Path,
+    dir: &Path,
+    files: &mut HashMap<PathBuf, Bytes>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            load_uring_static_cache_dir(static_root, &path, files)?;
+        } else if file_type.is_file() {
+            let rel_path = path.strip_prefix(static_root).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "static file escaped root")
+            })?;
+            files.insert(rel_path.to_path_buf(), Bytes::from(std::fs::read(path)?));
+        }
     }
     Ok(())
 }
@@ -810,21 +988,8 @@ async fn write_uring_response(stream: &UringTcpStream, response: Vec<u8>) -> std
     result
 }
 
-fn uring_text_response(status: StatusCode, text: &'static str) -> Vec<u8> {
-    let mut response = status_line_and_headers(status, "text/plain", text.len() as u64);
-    response.extend_from_slice(text.as_bytes());
-    response
-}
-
-fn status_line_and_headers(status: StatusCode, content_type: &str, content_length: u64) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        status.as_u16(),
-        status.canonical_reason().unwrap_or("unknown"),
-        content_type,
-        content_length,
-    )
-    .into_bytes()
+async fn write_tokio_response(stream: &mut tokio::net::TcpStream, response: Vec<u8>) -> std::io::Result<()> {
+    stream.write_all(&response).await
 }
 
 fn ok_response(content_length: u64, body: HyperStaticBody) -> Response<HyperStaticBody> {
@@ -874,8 +1039,8 @@ fn text_response(status: StatusCode, text: &'static str) -> Response<HyperStatic
 def _write_candidate_configs(plan: BenchmarkPlan, image_key: str, config_dir: Path) -> None:
     http_port = int((plan.upstream.get("http_fixture") or {}).get("port") or 8080)
     stream_port = int((plan.upstream.get("stream_fixture") or {}).get("port") or 9000)
-    proxy_path = str((plan.scenarios.get("http_reverse_proxy") or {}).get("path") or "/proxy/payload")
-    proxy_prefix = proxy_path.rsplit("/", 1)[0] or "/"
+    hyper_static_port = int((plan.upstream.get("hyper_static_fixture") or {}).get("port") or 10080)
+    proxy_prefix = _reverse_proxy_prefix(plan)
     common_name = _tls_common_name(plan)
     if image_key == "nginx":
         (config_dir / "default.conf").write_text(
@@ -925,14 +1090,14 @@ http {{
 stream {{
     server {{
         listen 9080;
-        proxy_pass 127.0.0.1:{stream_port};
+        proxy_pass 127.0.0.1:{hyper_static_port};
     }}
 
     server {{
         listen 9443 ssl;
         ssl_certificate /etc/cyfs-perf/tls.crt;
         ssl_certificate_key /etc/cyfs-perf/tls.key;
-        proxy_pass 127.0.0.1:{stream_port};
+        proxy_pass 127.0.0.1:{hyper_static_port};
     }}
 }}
 """,
@@ -957,7 +1122,7 @@ stream {{
     bind: 0.0.0.0:443
     protocol: tls
     certs:
-      - domain: "*"
+      - domain: "{common_name}"
         cert_path: /etc/cyfs-perf/tls.crt
         key_path: /etc/cyfs-perf/tls.key
     hook_point:
@@ -978,12 +1143,12 @@ stream {{
           default:
             priority: 1
             block: |
-              return "forward tcp:///127.0.0.1:{stream_port}";
+              return "forward tcp:///127.0.0.1:{hyper_static_port}";
   perf_stream_tls:
     bind: 0.0.0.0:9443
     protocol: tls
     certs:
-      - domain: "*"
+      - domain: "{common_name}"
         cert_path: /etc/cyfs-perf/tls.crt
         key_path: /etc/cyfs-perf/tls.key
     hook_point:
@@ -993,7 +1158,7 @@ stream {{
           default:
             priority: 1
             block: |
-              return "forward tcp:///127.0.0.1:{stream_port}";
+              return "forward tcp:///127.0.0.1:{hyper_static_port}";
 
 servers:
   perf_http_server:
@@ -1021,6 +1186,17 @@ servers:
 def _tls_common_name(plan: BenchmarkPlan) -> str:
     tls = (plan.generated_config.get("tls") or {}) if isinstance(plan.generated_config, dict) else {}
     return str(tls.get("common_name") or "perf.local")
+
+
+def _reverse_proxy_prefix(plan: BenchmarkPlan) -> str:
+    proxy = plan.scenarios.get("http_reverse_proxy") or {}
+    paths = proxy.get("paths")
+    if isinstance(paths, list) and paths:
+        first_path = str(paths[0])
+    else:
+        first_path = str(proxy.get("path") or "/proxy/payload")
+    prefix = first_path.rsplit("/", 1)[0] or "/proxy"
+    return prefix.rstrip("/") or "/proxy"
 
 
 def _static_file_specs(plan: BenchmarkPlan) -> list[dict]:
@@ -1311,7 +1487,7 @@ def reuseport_static_threads(plan: BenchmarkPlan) -> int | None:
 
 def reuseport_static_runtime(plan: BenchmarkPlan) -> str:
     runtime = reuseport_static_config(plan).get("runtime")
-    return runtime if runtime in {"tokio", "tokio_uring"} else "tokio"
+    return runtime if runtime in {"tokio", "tokio_custom", "tokio_uring"} else "tokio"
 
 
 def dockerfile_env_lines(plan: BenchmarkPlan, image_key: str) -> str:

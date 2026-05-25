@@ -39,7 +39,7 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'/');
 const SMALL_FILE_INLINE_LIMIT: u64 = 64 * 1024;
 const MIN_FILE_STREAM_BUFFER_SIZE: usize = 16 * 1024;
-const MAX_FILE_STREAM_BUFFER_SIZE: usize = 512 * 1024;
+const MAX_FILE_STREAM_BUFFER_SIZE: usize = 64 * 1024;
 
 /// DirServer Builder for fluent configuration
 pub struct DirServerBuilder {
@@ -1482,6 +1482,15 @@ mod tests {
     async fn test_dir_server_builder_creation() {
         let builder = DirServer::builder();
         assert!(std::mem::size_of_val(&builder) > 0);
+    }
+
+    #[test]
+    fn test_large_file_stream_buffer_is_capped_at_64k() {
+        assert_eq!(
+            DirServer::file_stream_buffer_size(SMALL_FILE_INLINE_LIMIT + 1),
+            MAX_FILE_STREAM_BUFFER_SIZE
+        );
+        assert_eq!(MAX_FILE_STREAM_BUFFER_SIZE, 64 * 1024);
     }
 
     #[tokio::test]

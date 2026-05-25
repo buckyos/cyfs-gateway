@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import ssl
 import sys
 import tempfile
@@ -23,7 +24,13 @@ from cyfs_gateway_performance.image import (
 )
 from cyfs_gateway_performance.profile import load_profile
 from cyfs_gateway_performance.target import run_container_commands
-from cyfs_gateway_performance.workload import _http_request, _stream_request, endpoint_for, stream_tls_server_name
+from cyfs_gateway_performance.workload import (
+    _http_endpoint_request,
+    _http_request,
+    _stream_request,
+    endpoint_for,
+    stream_tls_server_name,
+)
 from cyfs_gateway_performance.model import ScenarioPlan
 
 
@@ -49,6 +56,7 @@ class ImageHttpsStaticTests(unittest.TestCase):
             self.assertIn("listen 443 ssl;", nginx_conf)
             self.assertIn("root /etc/cyfs-perf/static;", nginx_conf)
             self.assertIn("location /proxy/", nginx_conf)
+            self.assertNotIn("rewrite ^/proxy/(.*)$ /$1 break;", nginx_conf)
             self.assertIn("proxy_pass http://127.0.0.1:8080;", nginx_conf)
             self.assertIn("ssl_certificate /etc/cyfs-perf/tls.crt;", nginx_conf)
             self.assertTrue((config_dir / "static" / "index.html").exists())
@@ -91,17 +99,37 @@ class ImageHttpsStaticTests(unittest.TestCase):
         self.assertIn("socket.set_reuse_port(true)?", REUSEPORT_STATIC_MAIN_RS)
         self.assertIn("tokio::runtime::Builder::new_current_thread()", REUSEPORT_STATIC_MAIN_RS)
         self.assertIn('env::var("REUSEPORT_STATIC_RUNTIME")', REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn('"tokio_custom" => Ok(StaticRuntimeMode::TokioCustom)', REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("serve_tokio_custom_reuseport_worker(thread_index, addr, static_root)", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("serve_tokio_custom_static_connection(&mut stream, static_root).await", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("open_hyper_static_file(static_root, &file_path)", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("write_tokio_file_body(stream, headers, opened.file, content_length).await", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("file.read(&mut buffer).await?", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("stream.write_all(&buffer[..read]).await?", REUSEPORT_STATIC_MAIN_RS)
         self.assertIn("tokio_uring::start(async move", REUSEPORT_STATIC_MAIN_RS)
-        self.assertIn("tokio_uring::fs::File::from_std(file)", REUSEPORT_STATIC_MAIN_RS)
-        self.assertIn("file.read_at(buffer, offset).await", REUSEPORT_STATIC_MAIN_RS)
-        self.assertIn("stream.write_all(buffer.slice(..bytes_read)).await", REUSEPORT_STATIC_MAIN_RS)
-        self.assertIn("stream_file_with_tokio_uring(stream, opened.file, content_length).await", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("struct UringStaticRoot", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("files: HashMap<PathBuf, Bytes>", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("let static_root = Arc::new(load_uring_static_cache(&static_root)?);", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("Bytes::from(std::fs::read(path)?)", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("static_root.files.get(&file_path)", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("write_cached_uring_body(stream, headers, body.clone()).await", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("const URING_STATIC_BODY_WRITE_CHUNK_SIZE: usize = 64 * 1024;", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("for chunk in body.chunks(URING_STATIC_BODY_WRITE_CHUNK_SIZE)", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("stream.write_all(chunk.to_vec()).await", REUSEPORT_STATIC_MAIN_RS)
+        self.assertNotIn("stream.write_all(body.to_vec()).await", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("stream.set_nodelay(true)?", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("let connection = if close", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn('"Connection: close\\r\\n"', REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("content_length,\n        false,", REUSEPORT_STATIC_MAIN_RS)
         self.assertNotIn("read_file_with_tokio_uring", REUSEPORT_STATIC_MAIN_RS)
         self.assertNotIn("uring_binary_response", REUSEPORT_STATIC_MAIN_RS)
+        self.assertNotIn("stream_file_with_tokio_uring", REUSEPORT_STATIC_MAIN_RS)
+        self.assertNotIn("file.read_at(buffer, offset).await", REUSEPORT_STATIC_MAIN_RS)
         self.assertIn("thread::available_parallelism()", REUSEPORT_STATIC_MAIN_RS)
         self.assertIn('env::var("REUSEPORT_STATIC_THREADS")', REUSEPORT_STATIC_MAIN_RS)
         self.assertIn("tokio::spawn(async move", REUSEPORT_STATIC_MAIN_RS)
         self.assertIn("TokioTcpListener::from_std(std_listener)?", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("stream.set_nodelay(true)?", FIXTURE_MAIN_RS)
         self.assertNotIn("load_static_files", FIXTURE_MAIN_RS)
         self.assertNotIn("tokio::fs::read(&file_path).await", FIXTURE_MAIN_RS)
         self.assertNotIn("tokio::fs::File::open(&file_path).await", FIXTURE_MAIN_RS)
@@ -117,11 +145,12 @@ class ImageHttpsStaticTests(unittest.TestCase):
         self.assertIn("tokio::fs::File::from_std(file)", FIXTURE_MAIN_RS)
         self.assertIn("HYPER_STATIC_SMALL_FILE_INLINE_LIMIT", FIXTURE_MAIN_RS)
         self.assertIn("HYPER_STATIC_MIN_STREAM_BUFFER_SIZE", FIXTURE_MAIN_RS)
-        self.assertIn("HYPER_STATIC_MAX_STREAM_BUFFER_SIZE", FIXTURE_MAIN_RS)
+        self.assertIn("const HYPER_STATIC_MAX_STREAM_BUFFER_SIZE: usize = 64 * 1024;", FIXTURE_MAIN_RS)
         self.assertIn("file.read_to_end(&mut body).await?", FIXTURE_MAIN_RS)
         self.assertIn("ReaderStream::with_capacity(file, hyper_static_stream_buffer_size(content_length))", FIXTURE_MAIN_RS)
         self.assertIn("libc::SYS_openat2", REUSEPORT_STATIC_MAIN_RS)
         self.assertIn("root_dir_file.as_raw_fd()", REUSEPORT_STATIC_MAIN_RS)
+        self.assertIn("const HYPER_STATIC_MAX_STREAM_BUFFER_SIZE: usize = 64 * 1024;", REUSEPORT_STATIC_MAIN_RS)
         self.assertIn("tokio::fs::File::from_std(opened.file)", REUSEPORT_STATIC_MAIN_RS)
 
     def test_cyfs_gateway_context_routes_static_reverse_proxy_and_https(self) -> None:
@@ -135,9 +164,13 @@ class ImageHttpsStaticTests(unittest.TestCase):
             self.assertIn("bind: 0.0.0.0:80", gateway_yaml)
             self.assertIn("bind: 0.0.0.0:443", gateway_yaml)
             self.assertIn("protocol: tls", gateway_yaml)
+            self.assertIn('domain: "perf.local"', gateway_yaml)
+            self.assertNotIn('domain: "*"', gateway_yaml)
             self.assertIn("cert_path: /etc/cyfs-perf/tls.crt", gateway_yaml)
             self.assertIn('starts-with ${REQ.path} "/proxy/"', gateway_yaml)
+            self.assertNotIn('rewrite ${REQ.path} "/proxy/*" "/*"', gateway_yaml)
             self.assertIn("forward http://127.0.0.1:8080;", gateway_yaml)
+            self.assertIn('return "forward tcp:///127.0.0.1:10080";', gateway_yaml)
             self.assertIn("call-server perf_static_files;", gateway_yaml)
             self.assertIn("root_path: /etc/cyfs-perf/static", gateway_yaml)
             self.assertIn("etag: true", gateway_yaml)
@@ -191,6 +224,47 @@ class ImageHttpsStaticTests(unittest.TestCase):
         self.assertIsInstance(context, ssl.SSLContext)
         self.assertFalse(context.check_hostname)
         self.assertEqual(context.verify_mode, ssl.CERT_NONE)
+
+    def test_https_endpoint_workload_connects_to_ip_with_profile_sni(self) -> None:
+        class FakeSocket:
+            def __init__(self):
+                self.sent = b""
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def makefile(self, _mode):
+                return io.BytesIO(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+
+            def settimeout(self, _timeout):
+                pass
+
+            def sendall(self, data):
+                self.sent += data
+
+            def close(self):
+                self.closed = True
+
+        class FakeContext:
+            def wrap_socket(self, raw, server_hostname=None):
+                self.server_hostname = server_hostname
+                return raw
+
+        raw = FakeSocket()
+        context = FakeContext()
+        with mock.patch("socket.create_connection", return_value=raw) as connect, mock.patch(
+            "ssl._create_unverified_context",
+            return_value=context,
+        ):
+            _http_endpoint_request("127.0.0.1", 28443, "/index.html", 1, True, "perf.local")
+
+        self.assertEqual(connect.call_args.args[0], ("127.0.0.1", 28443))
+        self.assertEqual(context.server_hostname, "perf.local")
+        self.assertIn(b"Host: perf.local\r\n", raw.sent)
 
     def test_stream_tls_workload_uses_profile_common_name_for_sni(self) -> None:
         plan = load_profile(PROFILE)

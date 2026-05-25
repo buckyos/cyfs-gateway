@@ -17,7 +17,7 @@ VALID_CANDIDATES = (
     "cyfs_gateway_reuseport_static",
 )
 VALID_PULL_POLICIES = {"always", "never"}
-VALID_REUSEPORT_STATIC_RUNTIMES = {"tokio", "tokio_uring"}
+VALID_REUSEPORT_STATIC_RUNTIMES = {"tokio", "tokio_custom", "tokio_uring"}
 
 
 try:

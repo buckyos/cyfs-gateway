@@ -14,6 +14,13 @@ def reuseport_static_enabled(plan: BenchmarkPlan) -> bool:
     return bool(fixture.get("enabled", False))
 
 
+def _scenario_paths(config: dict, default: str) -> list[str]:
+    paths = config.get("paths")
+    if isinstance(paths, list) and paths:
+        return [str(path) for path in paths]
+    return [str(config.get("path") or default)]
+
+
 def expand_scenarios(plan: BenchmarkPlan) -> list[ScenarioPlan]:
     protocols = [name for name, enabled in plan.protocols.items() if enabled and name in {"http", "https"}]
     if not protocols:
@@ -22,15 +29,13 @@ def expand_scenarios(plan: BenchmarkPlan) -> list[ScenarioPlan]:
     scenarios: list[tuple[str, list[str], list[str | None]]] = []
     static = plan.scenarios.get("static_http_file") or {}
     if static.get("enabled", False):
-        paths = static.get("paths") or ["/"]
-        scenarios.append(("static_http_file", [str(path) for path in paths], [None]))
+        scenarios.append(("static_http_file", _scenario_paths(static, "/"), [None]))
     proxy = plan.scenarios.get("http_reverse_proxy") or {}
     if proxy.get("enabled", False):
-        scenarios.append(("http_reverse_proxy", [str(proxy.get("path") or "/")], [None]))
+        scenarios.append(("http_reverse_proxy", _scenario_paths(proxy, "/proxy/payload"), [None]))
     stream = plan.scenarios.get("stream_reverse_proxy") or {}
     if stream.get("enabled", False):
-        modes = [str(mode) for mode in stream.get("modes", ["tcp", "tcp_tls"])]
-        scenarios.append(("stream_reverse_proxy", ["stream"], modes))
+        scenarios.append(("stream_reverse_proxy", _scenario_paths(stream, "/index.html"), [None]))
     if not scenarios:
         raise ConfigError("at least one required scenario must be enabled")
 
@@ -40,7 +45,7 @@ def expand_scenarios(plan: BenchmarkPlan) -> list[ScenarioPlan]:
         if candidate in REUSEPORT_STATIC_CANDIDATES and not reuseport_enabled:
             continue
         for scenario, payloads, stream_modes in scenarios:
-            scenario_protocols = protocols if scenario != "stream_reverse_proxy" else ["tcp"]
+            scenario_protocols = protocols
             if candidate in HYPER_STATIC_CANDIDATES or candidate in REUSEPORT_STATIC_CANDIDATES:
                 if scenario != "static_http_file":
                     continue

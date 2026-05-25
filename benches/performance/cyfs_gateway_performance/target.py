@@ -159,7 +159,7 @@ def reuseport_static_config(plan: BenchmarkPlan) -> dict:
 def reuseport_static_env_args(plan: BenchmarkPlan) -> tuple[str, ...]:
     fixture = reuseport_static_config(plan)
     enabled = 1 if fixture.get("enabled", False) else 0
-    runtime = fixture.get("runtime") if fixture.get("runtime") in {"tokio", "tokio_uring"} else "tokio"
+    runtime = fixture.get("runtime") if fixture.get("runtime") in {"tokio", "tokio_custom", "tokio_uring"} else "tokio"
     port = int(fixture.get("port") or 10081)
     args = [
         "-e",

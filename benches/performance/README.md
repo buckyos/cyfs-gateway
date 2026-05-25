@@ -148,8 +148,9 @@ permissions, registry access, and target machine load are environment-specific.
 
 - The benchmark uses fixed configured rate tiers; it does not search for max
   throughput automatically.
-- HTTP/HTTPS load uses `vegeta attack` and records response latency from
-  `vegeta encode -to=json`; stream TCP/TLS load uses the built-in socket runner.
+- HTTP/HTTPS load, including stream TCP/TLS ports carrying HTTP static-file
+  requests, uses `vegeta attack` and records response latency from
+  `vegeta encode -to=json`.
 - Set `CYFS_VEGETA_CACHE` to choose the auto-download cache directory, or
   `CYFS_VEGETA_PATH` to force a specific binary.
 - nginx and `cyfs_gateway` must use the same profile, payloads, durations,
