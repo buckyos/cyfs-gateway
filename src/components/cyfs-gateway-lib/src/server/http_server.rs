@@ -13,6 +13,7 @@ use crate::{
 };
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
 use http::Version;
+use http::header::HeaderName;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Frame};
@@ -587,6 +588,46 @@ impl ProcessChainHttpServer {
         }
     }
 
+    fn strip_hop_by_hop_headers(header: &mut http::HeaderMap) {
+        let mut connection_tokens = Vec::new();
+        for value in header.get_all(http::header::CONNECTION).iter() {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            for token in value.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
+                }
+                if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+                    connection_tokens.push(name);
+                }
+            }
+        }
+
+        for name in connection_tokens {
+            header.remove(name);
+        }
+
+        for name in [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            header.remove(name);
+        }
+    }
+
+    fn strip_forward_response_headers<B>(mut resp: http::Response<B>) -> http::Response<B> {
+        Self::strip_hop_by_hop_headers(resp.headers_mut());
+        resp
+    }
+
     async fn handle_forward_upstream(
         &self,
         req: http::Request<BoxBody<Bytes, ServerError>>,
@@ -620,6 +661,7 @@ impl ProcessChainHttpServer {
                     Client::builder(TokioExecutor::new()).build_http();
                 let mut header = req.headers().clone();
                 Self::inject_forward_headers(&mut header, info);
+                Self::strip_hop_by_hop_headers(&mut header);
                 let method = req.method().clone();
                 let body = req
                     .into_body()
@@ -655,6 +697,7 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
+                let resp = Self::strip_forward_response_headers(resp);
                 let resp = resp.map(|body| {
                     Self::wrap_upstream_body(body, timeouts.response_body_idle_timeout, None)
                 });
@@ -663,6 +706,7 @@ impl ProcessChainHttpServer {
             "https" => {
                 let mut header = req.headers().clone();
                 Self::inject_forward_headers(&mut header, info);
+                Self::strip_hop_by_hop_headers(&mut header);
                 let method = req.method().clone();
                 let upstream_http_version = match req.version() {
                     http::Version::HTTP_10 => http::Version::HTTP_10,
@@ -795,6 +839,7 @@ impl ProcessChainHttpServer {
                     }
                     Ok(Ok(resp)) => resp,
                 };
+                let resp = Self::strip_forward_response_headers(resp);
                 let abort_on_drop = if timeouts.abort_upstream_on_client_close {
                     connection_task.take()
                 } else {
@@ -822,6 +867,7 @@ impl ProcessChainHttpServer {
 
                 let mut header = req.headers().clone();
                 Self::inject_forward_headers(&mut header, info);
+                Self::strip_hop_by_hop_headers(&mut header);
                 let mut host_name = "localhost".to_string();
                 let hname = req.headers().get("host");
                 if hname.is_some() {
@@ -861,6 +907,7 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
+                let resp = Self::strip_forward_response_headers(resp);
                 let resp = resp.map(|body| {
                     Self::wrap_upstream_body(body, timeouts.response_body_idle_timeout, None)
                 });
@@ -2656,6 +2703,30 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn test_strip_hop_by_hop_headers() {
+        let mut resp = http::Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONNECTION, "close, X-Upstream-Hop")
+            .header("X-Upstream-Hop", "remove")
+            .header("Keep-Alive", "timeout=5")
+            .header(http::header::UPGRADE, "websocket")
+            .header(http::header::CONTENT_TYPE, "text/plain")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        ProcessChainHttpServer::strip_hop_by_hop_headers(resp.headers_mut());
+
+        assert!(resp.headers().get(http::header::CONNECTION).is_none());
+        assert!(resp.headers().get("X-Upstream-Hop").is_none());
+        assert!(resp.headers().get("Keep-Alive").is_none());
+        assert!(resp.headers().get(http::header::UPGRADE).is_none());
+        assert_eq!(
+            resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "text/plain"
+        );
+    }
+
     #[tokio::test]
     async fn test_handle_http1_request_http1_server() {
         let mock_server_mgr = Arc::new(ServerManager::new());
@@ -2941,6 +3012,16 @@ mod tests {
                 let service = hyper::service::service_fn(
                     |req: http::Request<hyper::body::Incoming>| async move {
                         println!("{:?}", req.headers());
+                        assert!(req.headers().get(http::header::CONNECTION).is_none());
+                        assert!(req.headers().get("X-Client-Hop").is_none());
+                        assert!(req.headers().get("Keep-Alive").is_none());
+                        assert!(req.headers().get(http::header::UPGRADE).is_none());
+                        assert_eq!(
+                            req.headers()
+                                .get("X-End-To-End")
+                                .map(|v| v.to_str().unwrap()),
+                            Some("keep")
+                        );
                         assert!(req.headers().get("X-Real-IP").is_some());
                         assert_eq!(
                             req.headers().get("X-Real-IP").map(|v| v.to_str().unwrap()),
@@ -2957,6 +3038,7 @@ mod tests {
                         Ok::<_, ServerError>(
                             http::Response::builder()
                                 .status(StatusCode::OK)
+                                .header(http::header::CONNECTION, "close")
                                 .body(
                                     Full::new(Bytes::from("forward success"))
                                         .map_err(|e| match e {})
@@ -3025,6 +3107,11 @@ mod tests {
         let request = http::Request::builder()
             .method("GET")
             .uri("/test")
+            .header(http::header::CONNECTION, "X-Client-Hop")
+            .header("X-Client-Hop", "remove")
+            .header("Keep-Alive", "timeout=5")
+            .header(http::header::UPGRADE, "websocket")
+            .header("X-End-To-End", "keep")
             .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
             .unwrap();
 
@@ -3039,6 +3126,7 @@ mod tests {
 
         let resp = sender.send_request(request).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(http::header::CONNECTION).is_none());
 
         let body = resp.collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from("forward success"));

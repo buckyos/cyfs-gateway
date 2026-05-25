@@ -532,6 +532,13 @@ async fn handle_reuseport_stream(
             return;
         }
     };
+    if let Err(e) = stream.set_nodelay(true) {
+        log::warn!(
+            "set TCP_NODELAY failed for tcp stream from {}: {}",
+            remote_addr,
+            e
+        );
+    }
     let dest_addr = match get_dest_addr(&stream) {
         Ok(addr) => addr,
         Err(e) => {
