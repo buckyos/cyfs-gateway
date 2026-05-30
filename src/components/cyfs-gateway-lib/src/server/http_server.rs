@@ -334,6 +334,26 @@ impl ProcessChainHttpServer {
         Url::parse(target_url).ok()
     }
 
+    fn origin_form_uri(raw_uri: &str) -> String {
+        if raw_uri.starts_with('/') {
+            return raw_uri.to_string();
+        }
+
+        if let Ok(url) = Url::parse(raw_uri) {
+            let mut origin = url.path().to_string();
+            if origin.is_empty() {
+                origin.push('/');
+            }
+            if let Some(query) = url.query() {
+                origin.push('?');
+                origin.push_str(query);
+            }
+            return origin;
+        }
+
+        raw_uri.to_string()
+    }
+
     pub fn builder() -> ProcessChainHttpServerBuilder {
         ProcessChainHttpServerBuilder {
             id: None,
@@ -511,14 +531,15 @@ impl ProcessChainHttpServer {
                 host,
             )
         };
+        let origin_uri = Self::origin_form_uri(org_url.as_str());
         // Trim URL boundary slashes so we don't end up with "//" when target_url ends with '/'
-        // and org_url starts with '/'.
-        let raw_url = if target_url.ends_with('/') || org_url.starts_with('/') {
+        // and the request path starts with '/'.
+        let raw_url = if target_url.ends_with('/') || origin_uri.starts_with('/') {
             let base = target_url.trim_end_matches('/');
-            let path = org_url.trim_start_matches('/');
+            let path = origin_uri.trim_start_matches('/');
             format!("{}/{}", base, path)
         } else {
-            format!("{}{}", target_url, org_url)
+            format!("{}{}", target_url, origin_uri)
         };
         let request_url = Url::parse(&raw_url).map_err(|e| {
             server_err!(
@@ -624,7 +645,7 @@ impl ProcessChainHttpServer {
                     .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
-                    .uri(request_url.as_str())
+                    .uri(origin_uri.as_str())
                     .body(body)
                     .map_err(|e| {
                         server_err!(
@@ -792,7 +813,7 @@ impl ProcessChainHttpServer {
                     .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
-                    .uri(org_url)
+                    .uri(origin_uri.as_str())
                     .version(upstream_http_version)
                     .body(body)
                     .map_err(|e| {
@@ -871,15 +892,13 @@ impl ProcessChainHttpServer {
                 let req = req_slot
                     .take()
                     .expect("forward_to_candidate: req_slot drained mid-flight");
-                let host_name = host_header.unwrap_or_else(|| "localhost".to_string());
-                let fake_url = format!("http://{}{}", host_name, org_url);
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
                     .boxed();
                 let mut upstream_req = Request::builder()
                     .method(method)
-                    .uri(fake_url)
+                    .uri(origin_uri.as_str())
                     .body(body)
                     .map_err(|e| {
                         server_err!(
@@ -2256,6 +2275,20 @@ mod tests {
         assert!(builder.post_hook_point.is_none());
         assert!(builder.global_process_chains.is_none());
         assert!(builder.server_mgr.is_none());
+    }
+
+    #[test]
+    fn test_origin_form_uri_normalizes_absolute_uri() {
+        assert_eq!(
+            ProcessChainHttpServer::origin_form_uri(
+                "http://127.0.0.1:3180/.cluster/klog/ood2/raft/append-entries?x=1",
+            ),
+            "/.cluster/klog/ood2/raft/append-entries?x=1"
+        );
+        assert_eq!(
+            ProcessChainHttpServer::origin_form_uri("/kapi/klog-service"),
+            "/kapi/klog-service"
+        );
     }
 
     #[tokio::test]
