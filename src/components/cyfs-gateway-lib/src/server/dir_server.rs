@@ -217,7 +217,7 @@ enum DirPathStat {
 }
 
 struct OpenedDirFile {
-    file: tokio::fs::File,
+    file: Option<tokio::fs::File>,
     metadata: std::fs::Metadata,
     canonical_path: Option<PathBuf>,
 }
@@ -681,10 +681,19 @@ impl DirServer {
             ));
         }
 
+        let path_metadata = std::fs::metadata(&canonical_path)?;
+        if path_metadata.is_dir() {
+            return Ok(OpenedDirFile {
+                file: None,
+                metadata: path_metadata,
+                canonical_path: Some(canonical_path),
+            });
+        }
+
         let file = tokio::fs::File::open(&canonical_path).await?;
         let metadata = file.metadata().await?;
         Ok(OpenedDirFile {
-            file,
+            file: Some(file),
             metadata,
             canonical_path: Some(canonical_path),
         })
@@ -735,7 +744,11 @@ impl DirServer {
                 .filter(|path| path.starts_with(&self.root_dir))
         };
         Ok(OpenedDirFile {
-            file: tokio::fs::File::from_std(file),
+            file: if metadata.is_file() {
+                Some(tokio::fs::File::from_std(file))
+            } else {
+                None
+            },
             metadata,
             canonical_path,
         })
@@ -847,7 +860,12 @@ impl DirServer {
         opened_file: OpenedDirFile,
         req: &http::Request<BoxBody<Bytes, ServerError>>,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        let file = opened_file.file;
+        let file = opened_file.file.ok_or_else(|| {
+            server_err!(
+                ServerErrorCode::InvalidParam,
+                "opened path is not a regular file"
+            )
+        })?;
         let file_meta = opened_file.metadata;
         let file_size = file_meta.len();
         let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
