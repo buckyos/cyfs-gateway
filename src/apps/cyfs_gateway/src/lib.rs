@@ -182,7 +182,10 @@ async fn run_gateway_with_config(
     );
     factory.register_stack_factory(
         StackProtocol::Rtcp,
-        Arc::new(RtcpStackFactory::new(connect_manager.clone())),
+        Arc::new(RtcpStackFactory::new(
+            connect_manager.clone(),
+            tcp_server_runtime.clone(),
+        )),
     );
     debug!("Register rtcp stack factory");
     factory.register_stack_factory(

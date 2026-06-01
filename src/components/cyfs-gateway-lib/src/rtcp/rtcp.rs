@@ -113,6 +113,10 @@ impl RTcp {
         Ok(())
     }
 
+    pub async fn serve_connection(&self, stream: TcpStream, addr: SocketAddr) {
+        self.inner.serve_connection(stream, addr).await;
+    }
+
     pub async fn create_tunnel(
         &self,
         tunnel_stack_id: Option<&str>,

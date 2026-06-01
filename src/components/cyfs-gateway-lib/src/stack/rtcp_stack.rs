@@ -13,6 +13,7 @@ use name_lib::{
 };
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
+use sfo_reuseport::{ServerRuntime, ServiceConfig, SocketOptions, TcpServer, TransparentMode};
 use url::Url;
 
 use crate::forward::ForwardPlan;
@@ -1075,6 +1076,8 @@ pub struct RtcpStack {
     bind_addr: String,
     keep_tunnel: Vec<String>,
     reuse_address: bool,
+    server_runtime: ServerRuntime,
+    server: Mutex<Option<TcpServer>>,
     rtcp: Mutex<Option<RTcp>>,
     rtcp_ref: Mutex<Option<Arc<RTcp>>>,
     connection_manager: Option<ConnectionManagerRef>,
@@ -1085,6 +1088,11 @@ pub struct RtcpStack {
 
 impl Drop for RtcpStack {
     fn drop(&mut self) {
+        if let Some(server) = self.server.lock().unwrap().take() {
+            if let Err(e) = server.close() {
+                log::error!("close rtcp server failed: {}", e);
+            }
+        }
         self.tunnel_manager.remove_tunnel_builder("rtcp");
         self.tunnel_manager.remove_tunnel_builder("rudp");
     }
@@ -1255,6 +1263,12 @@ impl RtcpStack {
                 "hook_point is required"
             ));
         }
+        if builder.server_runtime.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "server_runtime is required"
+            ));
+        }
 
         let id = builder.id.take().unwrap();
         let bind_addr = builder.bind_addr.clone().unwrap();
@@ -1263,6 +1277,7 @@ impl RtcpStack {
         let device_doc_jwt = builder.device_doc_jwt.take();
         let private_key = builder.private_key.take();
         let connection_manager = builder.connection_manager.clone();
+        let server_runtime = builder.server_runtime.take().unwrap();
         let stack_context = if let Some(stack_context) = builder.stack_context.take() {
             stack_context
         } else {
@@ -1300,6 +1315,8 @@ impl RtcpStack {
             bind_addr,
             keep_tunnel,
             reuse_address: builder.reuse_address,
+            server_runtime,
+            server: Mutex::new(None),
             rtcp: Mutex::new(Some(rtcp)),
             rtcp_ref: Mutex::new(None),
             connection_manager,
@@ -1307,6 +1324,34 @@ impl RtcpStack {
             handler,
             prepare_handler: Arc::new(Default::default()),
         })
+    }
+
+    async fn start_listener(&self, rtcp: Arc<RTcp>) -> StackResult<TcpServer> {
+        let addr: SocketAddr = self.bind_addr.parse().map_err(into_stack_err!(
+            StackErrorCode::InvalidConfig,
+            "invalid bind address {}",
+            self.bind_addr
+        ))?;
+        let socket_options = SocketOptions {
+            reuse_address: self.reuse_address,
+            ipv4_transparent: TransparentMode::Disabled,
+            ipv6_transparent: TransparentMode::Disabled,
+        };
+        let service_config = ServiceConfig::new(addr).with_socket_options(socket_options);
+        let server = TcpServer::serve(&self.server_runtime, service_config, move |stream| {
+            let rtcp = rtcp.clone();
+            async move {
+                let peer_addr = stream.peer_addr().map_err(|e| {
+                    log::error!("read rtcp peer addr failed: {}", e);
+                    e
+                })?;
+                log::debug!("RTcp stack accept new tcp stream from {}", peer_addr);
+                rtcp.serve_connection(stream, peer_addr).await;
+                Ok(())
+            }
+        })
+        .map_err(|e| stack_err!(StackErrorCode::BindFailed, "start rtcp server error: {e}"))?;
+        Ok(server)
     }
 }
 
@@ -1325,19 +1370,31 @@ impl Stack for RtcpStack {
     }
 
     async fn start(&self) -> StackResult<()> {
+        {
+            if self.server.lock().unwrap().is_some() {
+                return Ok(());
+            }
+        }
         let mut rtcp = { self.rtcp.lock().unwrap().take().unwrap() };
         // Provide the tunnel framework entry point so create_tunnel can build
         // bootstrap streams when the stack id carries a `params@remote` prefix.
         rtcp.set_tunnel_manager(self.tunnel_manager.clone());
-        rtcp.start()
-            .await
-            .map_err(|e| stack_err!(StackErrorCode::IoError, "start rtcp failed: {:?}", e))?;
         let rtcp = Arc::new(rtcp);
+        let server = match self.start_listener(rtcp.clone()).await {
+            Ok(server) => server,
+            Err(e) => {
+                if let Ok(rtcp) = Arc::try_unwrap(rtcp) {
+                    *self.rtcp.lock().unwrap() = Some(rtcp);
+                }
+                return Err(e);
+            }
+        };
         let tunnel_builder = Arc::new(RtcpTunnelBuilder::new(rtcp.clone()));
         self.tunnel_manager
             .register_tunnel_builder("rtcp", tunnel_builder.clone());
         self.tunnel_manager
             .register_tunnel_builder("rudp", tunnel_builder);
+        *self.server.lock().unwrap() = Some(server);
         *self.rtcp_ref.lock().unwrap() = Some(rtcp);
         self.start_keep_tunnels();
         Ok(())
@@ -1430,6 +1487,7 @@ pub struct RtcpStackBuilder {
     private_key: Option<[u8; 48]>,
     hook_point: Option<ProcessChainConfigs>,
     on_new_tunnel_hook_point: Option<ProcessChainConfigs>,
+    server_runtime: Option<ServerRuntime>,
     connection_manager: Option<ConnectionManagerRef>,
     stack_context: Option<Arc<RtcpStackContext>>,
     io_dump: Option<IoDumpStackConfig>,
@@ -1449,6 +1507,7 @@ impl RtcpStackBuilder {
             private_key: None,
             hook_point: None,
             on_new_tunnel_hook_point: None,
+            server_runtime: None,
             connection_manager: None,
             stack_context: None,
             io_dump: None,
@@ -1498,6 +1557,11 @@ impl RtcpStackBuilder {
         on_new_tunnel_hook_point: ProcessChainConfigs,
     ) -> Self {
         self.on_new_tunnel_hook_point = Some(on_new_tunnel_hook_point);
+        self
+    }
+
+    pub fn server_runtime(mut self, server_runtime: ServerRuntime) -> Self {
+        self.server_runtime = Some(server_runtime);
         self
     }
 
@@ -1582,11 +1646,15 @@ impl crate::StackConfig for RtcpStackConfig {
 
 pub struct RtcpStackFactory {
     connection_manager: ConnectionManagerRef,
+    server_runtime: ServerRuntime,
 }
 
 impl RtcpStackFactory {
-    pub fn new(connection_manager: ConnectionManagerRef) -> Self {
-        Self { connection_manager }
+    pub fn new(connection_manager: ConnectionManagerRef, server_runtime: ServerRuntime) -> Self {
+        Self {
+            connection_manager,
+            server_runtime,
+        }
     }
 }
 
@@ -1657,6 +1725,7 @@ impl StackFactory for RtcpStackFactory {
             .id(config.id.clone())
             .bind(config.bind.clone())
             .keep_tunnel(config.keep_tunnel.clone())
+            .server_runtime(self.server_runtime.clone())
             .connection_manager(self.connection_manager.clone())
             .device_config(device_config)
             .private_key(private_key)
@@ -1706,9 +1775,9 @@ mod tests {
     use crate::global_process_chains::GlobalProcessChains;
     use crate::{
         ConnectionManager, DatagramInfo, DefaultLimiterManager, GlobalCollectionManager,
-        LimiterManagerRef, ProcessChainConfigs, RtcpStack, RtcpStackConfig, RtcpStackContext,
-        RtcpStackFactory, Server, ServerManager, ServerManagerRef, ServerResult, Stack,
-        StackContext, StackFactory, StackProtocol, StatManager, StatManagerRef, StreamInfo,
+        LimiterManagerRef, ProcessChainConfigs, RtcpStack, RtcpStackBuilder, RtcpStackConfig,
+        RtcpStackContext, RtcpStackFactory, Server, ServerManager, ServerManagerRef, ServerResult,
+        Stack, StackContext, StackFactory, StackProtocol, StatManager, StatManagerRef, StreamInfo,
         StreamServer, TunnelEndpoint, TunnelManager, create_io_dump_stack_config,
         decode_io_dump_frames,
     };
@@ -1725,6 +1794,17 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
     use url::Url;
+
+    fn test_server_runtime() -> sfo_reuseport::ServerRuntime {
+        sfo_reuseport::ServerRuntime::start(
+            sfo_reuseport::ServerRuntimeConfig::new().with_workers(1),
+        )
+        .unwrap()
+    }
+
+    fn rtcp_stack_builder() -> RtcpStackBuilder {
+        RtcpStack::builder().server_runtime(test_server_runtime())
+    }
 
     async fn wait_dump_frames(
         file: &std::path::Path,
@@ -1767,21 +1847,21 @@ mod tests {
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
 
-        let result = RtcpStack::builder().build().await;
+        let result = rtcp_stack_builder().build().await;
         assert!(result.is_err());
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .bind("127.0.0.1:2980".to_string())
             .build()
             .await;
         assert!(result.is_err());
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
             .build()
             .await;
         assert!(result.is_err());
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
@@ -1789,7 +1869,7 @@ mod tests {
             .build()
             .await;
         assert!(result.is_err());
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
@@ -1815,8 +1895,24 @@ mod tests {
             ))
             .build()
             .await;
+        assert!(result.is_err());
+        let result = rtcp_stack_builder()
+            .id("test")
+            .bind("127.0.0.1:2980".to_string())
+            .device_config(device_config.clone())
+            .private_key(pkcs8_bytes)
+            .hook_point(vec![])
+            .stack_context(build_stack_context(
+                Arc::new(ServerManager::new()),
+                tunnel_manager.clone(),
+                Arc::new(DefaultLimiterManager::new()),
+                StatManager::new(),
+                None,
+            ))
+            .build()
+            .await;
         assert!(result.is_ok());
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
@@ -1832,7 +1928,7 @@ mod tests {
             .build()
             .await;
         assert!(result.is_ok());
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2980".to_string())
             .device_config(device_config.clone())
@@ -1952,7 +2048,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2981".to_string())
             .device_config(device_config.clone())
@@ -2009,7 +2105,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2982".to_string())
             .device_config(device_config.clone())
@@ -2088,7 +2184,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2983".to_string())
             .device_config(device_config.clone())
@@ -2142,7 +2238,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2984".to_string())
             .device_config(device_config.clone())
@@ -2221,7 +2317,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2985".to_string())
             .device_config(device_config.clone())
@@ -2275,7 +2371,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2986".to_string())
             .device_config(device_config.clone())
@@ -2367,7 +2463,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2988".to_string())
             .device_config(device_config.clone())
@@ -2421,7 +2517,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2989".to_string())
             .device_config(device_config.clone())
@@ -2533,7 +2629,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2990".to_string())
             .device_config(device_config.clone())
@@ -2593,7 +2689,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2991".to_string())
             .device_config(device_config.clone())
@@ -2679,7 +2775,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let stack1 = RtcpStack::builder()
+        let stack1 = rtcp_stack_builder()
             .id("rtcp-dump-1")
             .bind("127.0.0.1:3010".to_string())
             .device_config(d1.clone())
@@ -2720,7 +2816,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let stack2 = RtcpStack::builder()
+        let stack2 = rtcp_stack_builder()
             .id("rtcp-dump-2")
             .bind("127.0.0.1:3011".to_string())
             .device_config(d2)
@@ -2804,7 +2900,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let stack1 = RtcpStack::builder()
+        let stack1 = rtcp_stack_builder()
             .id("rtcp-limit-1")
             .bind("127.0.0.1:3014".to_string())
             .device_config(d1.clone())
@@ -2845,7 +2941,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let stack2 = RtcpStack::builder()
+        let stack2 = rtcp_stack_builder()
             .id("rtcp-limit-2")
             .bind("127.0.0.1:3015".to_string())
             .device_config(d2)
@@ -2968,7 +3064,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let stack1 = RtcpStack::builder()
+        let stack1 = rtcp_stack_builder()
             .id("rtcp-http-1")
             .bind("127.0.0.1:3012".to_string())
             .device_config(d1.clone())
@@ -3009,7 +3105,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let stack2 = RtcpStack::builder()
+        let stack2 = rtcp_stack_builder()
             .id("rtcp-http-2")
             .bind("127.0.0.1:3013".to_string())
             .device_config(d2)
@@ -3105,7 +3201,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let stack1 = RtcpStack::builder()
+        let stack1 = rtcp_stack_builder()
             .id("rtcp-http-limit-1")
             .bind("127.0.0.1:3016".to_string())
             .device_config(d1.clone())
@@ -3146,7 +3242,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let stack2 = RtcpStack::builder()
+        let stack2 = rtcp_stack_builder()
             .id("rtcp-http-limit-2")
             .bind("127.0.0.1:3017".to_string())
             .device_config(d2)
@@ -3221,7 +3317,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2995".to_string())
             .device_config(device_config.clone())
@@ -3276,7 +3372,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2996".to_string())
             .device_config(device_config.clone())
@@ -3353,7 +3449,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2997".to_string())
             .device_config(device_config.clone())
@@ -3408,7 +3504,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2313".to_string())
             .device_config(device_config.clone())
@@ -3485,7 +3581,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2998".to_string())
             .device_config(device_config.clone())
@@ -3540,7 +3636,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2999".to_string())
             .device_config(device_config.clone())
@@ -3631,7 +3727,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2301".to_string())
             .device_config(device_config.clone())
@@ -3686,7 +3782,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2302".to_string())
             .device_config(device_config.clone())
@@ -3772,7 +3868,7 @@ mod tests {
             stat1.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2322".to_string())
             .device_config(device_config.clone())
@@ -3832,7 +3928,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2323".to_string())
             .device_config(device_config.clone())
@@ -3921,7 +4017,7 @@ mod tests {
             stat1.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2324".to_string())
             .device_config(device_config.clone())
@@ -3981,7 +4077,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2325".to_string())
             .device_config(device_config.clone())
@@ -4080,7 +4176,7 @@ mod tests {
             stat1.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2326".to_string())
             .device_config(device_config.clone())
@@ -4140,7 +4236,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2327".to_string())
             .device_config(device_config.clone())
@@ -4239,7 +4335,7 @@ mod tests {
             stat1.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2328".to_string())
             .device_config(device_config.clone())
@@ -4299,7 +4395,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2329".to_string())
             .device_config(device_config.clone())
@@ -4407,7 +4503,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2310".to_string())
             .device_config(device_config.clone())
@@ -4465,7 +4561,7 @@ mod tests {
             StatManager::new(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2311".to_string())
             .device_config(device_config.clone())
@@ -4545,7 +4641,7 @@ mod tests {
             stat1.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2332".to_string())
             .device_config(device_config.clone())
@@ -4605,7 +4701,7 @@ mod tests {
             stat2.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2333".to_string())
             .device_config(device_config.clone())
@@ -4706,7 +4802,7 @@ mod tests {
             stat1.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2314".to_string())
             .device_config(device_config.clone())
@@ -4766,7 +4862,7 @@ mod tests {
             stat2.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2315".to_string())
             .device_config(device_config.clone())
@@ -4864,7 +4960,7 @@ mod tests {
             stat1.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2316".to_string())
             .device_config(device_config.clone())
@@ -4924,7 +5020,7 @@ mod tests {
             stat2.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2317".to_string())
             .device_config(device_config.clone())
@@ -5022,7 +5118,7 @@ mod tests {
             stat1.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test")
             .bind("127.0.0.1:2318".to_string())
             .device_config(device_config.clone())
@@ -5082,7 +5178,7 @@ mod tests {
             stat2.clone(),
             Some(Arc::new(GlobalProcessChains::new())),
         );
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("test2")
             .bind("127.0.0.1:2319".to_string())
             .device_config(device_config.clone())
@@ -5131,7 +5227,7 @@ mod tests {
         let limiter_manager = Arc::new(DefaultLimiterManager::new());
         let stat_manager = StatManager::new();
         let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
-        let factory = RtcpStackFactory::new(ConnectionManager::new());
+        let factory = RtcpStackFactory::new(ConnectionManager::new(), test_server_runtime());
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key_pair();
 
