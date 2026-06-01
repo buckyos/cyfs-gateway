@@ -58,6 +58,10 @@ impl SqliteSnDB {
             .map_err(into_sn_err!(SnErrorCode::DBError, "create user_auth_v2 table failed"))?;
         conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS devices (owner TEXT, device_name TEXT, did TEXT PRIMARY KEY, ip TEXT, description TEXT, mini_config_jwt TEXT, created_at INTEGER, updated_at INTEGER)")).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create devices table failed"))?;
+        conn.execute_sql(sql_query("DELETE FROM devices WHERE rowid NOT IN (SELECT rowid FROM devices d1 WHERE rowid = (SELECT rowid FROM devices d2 WHERE d2.owner = d1.owner AND d2.device_name = d1.device_name ORDER BY d2.updated_at DESC, d2.created_at DESC, d2.rowid DESC LIMIT 1))")).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "deduplicate devices by owner and device_name failed"))?;
+        conn.execute_sql(sql_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_owner_device_name ON devices (owner, device_name)")).await
+            .map_err(into_sn_err!(SnErrorCode::DBError, "create unique index on devices owner and device_name failed"))?;
         conn.execute_sql(sql_query("CREATE TABLE IF NOT EXISTS user_dns_records (id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT, domain TEXT, record_type TEXT, record TEXT, ttl INTEGER, created_at INTEGER, updated_at INTEGER)")).await
             .map_err(into_sn_err!(SnErrorCode::DBError, "create user_dns_records table failed"))?;
         conn.execute_sql(sql_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_user_domain_record_type ON user_dns_records (owner, domain, record_type)")).await
@@ -1007,7 +1011,7 @@ impl SnDB for SqliteSnDB {
             .get_conn()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        conn.execute_sql(sql_query("INSERT INTO devices (owner, device_name, did, ip, description, mini_config_jwt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)")
+        conn.execute_sql(sql_query("INSERT INTO devices (owner, device_name, did, ip, description, mini_config_jwt, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(owner, device_name) DO UPDATE SET did = excluded.did, ip = excluded.ip, description = excluded.description, mini_config_jwt = excluded.mini_config_jwt, updated_at = excluded.updated_at")
             .bind(username)
             .bind(device_name)
             .bind(did)
@@ -1113,7 +1117,7 @@ impl SnDB for SqliteSnDB {
             .get_conn()
             .await
             .map_err(into_sn_err!(SnErrorCode::DBError, "get conn"))?;
-        match conn.query_one(sql_query("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE device_name = ?1 AND owner = ?2")
+        match conn.query_one(sql_query("SELECT owner, device_name, mini_config_jwt, did, ip, description, created_at, updated_at FROM devices WHERE device_name = ?1 AND owner = ?2 ORDER BY updated_at DESC, created_at DESC LIMIT 1")
             .bind(device_name)
             .bind(username)).await {
             Ok(row) => {
@@ -1800,6 +1804,43 @@ mod tests {
 
         db.update_user_domain("user_b", Some("bob.abc.com".to_string()))
             .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_register_device_upserts_by_owner_and_device_name() -> SnResult<()> {
+        let db_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let db = SqliteSnDB::new_by_path(db_file.path().to_str().unwrap()).await?;
+        db.initialize_database().await?;
+
+        db.register_device(
+            "wugren004",
+            "ood1",
+            "did:dev:old",
+            "old-mini-config-jwt",
+            "127.0.0.1",
+            r#"{"id":"did:dev:old","name":"ood1"}"#,
+        )
+        .await?;
+        db.register_device(
+            "wugren004",
+            "ood1",
+            "did:dev:new",
+            "new-mini-config-jwt",
+            "192.168.122.100",
+            r#"{"id":"did:dev:new","name":"ood1"}"#,
+        )
+        .await?;
+
+        let devices = db.list_user_devices("wugren004").await?;
+        assert_eq!(devices.len(), 1);
+
+        let device = db.query_device_by_name("wugren004", "ood1").await?.unwrap();
+        assert_eq!(device.did, "did:dev:new");
+        assert_eq!(device.ip, "192.168.122.100");
+        assert_eq!(device.mini_config_jwt, "new-mini-config-jwt");
+        assert!(db.query_device("did:dev:old").await?.is_none());
 
         Ok(())
     }

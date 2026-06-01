@@ -285,13 +285,17 @@ impl Socks5Proxy {
         // Reply success after connected
         Socks5Util::reply_error(&mut socket, fast_socks5::ReplyError::Succeeded).await?;
 
-        let (read, write) = tokio::io::copy_bidirectional(&mut stream, &mut socket)
-            .await
-            .map_err(|e| {
-                let msg = format!("Error copying data on socks connection: {}, {}", target, e);
-                error!("{}", msg);
-                SocksError::IoError(msg)
-            })?;
+        let (read, write) = sfo_io::copy_bidirectional_with_timeout(
+            &mut stream,
+            &mut socket,
+            self.config.stream_idle_timeout,
+        )
+        .await
+        .map_err(|e| {
+            let msg = format!("Error copying data on socks connection: {}, {}", target, e);
+            error!("{}", msg);
+            SocksError::IoError(msg)
+        })?;
 
         info!(
             "socks5 connection to {} closed, {} bytes read, {} bytes written",
@@ -323,13 +327,17 @@ impl Socks5Proxy {
             }
         };
 
-        let (read, write) = tokio::io::copy_bidirectional(&mut tunnel, &mut socket)
-            .await
-            .map_err(|e| {
-                let msg = format!("Error copying data on socks connection: {}, {}", target, e);
-                error!("{}", msg);
-                SocksError::IoError(msg)
-            })?;
+        let (read, write) = sfo_io::copy_bidirectional_with_timeout(
+            &mut tunnel,
+            &mut socket,
+            self.config.stream_idle_timeout,
+        )
+        .await
+        .map_err(|e| {
+            let msg = format!("Error copying data on socks connection: {}, {}", target, e);
+            error!("{}", msg);
+            SocksError::IoError(msg)
+        })?;
 
         info!(
             "socks5 connection to {} closed, {} bytes read, {} bytes written",

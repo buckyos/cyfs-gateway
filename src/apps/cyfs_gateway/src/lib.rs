@@ -29,8 +29,8 @@ use cyfs_gateway_lib::*;
 use process_chain_doc::GatewayProcessChainDoc;
 use std::collections::HashSet;
 
-use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::Result;
 use buckyos_kit::init_logging;
 use buckyos_kit::{get_buckyos_service_data_dir, get_buckyos_system_etc_dir};
 use cyfs_sn::{SnServerFactory, SqliteDBFactory};
@@ -146,10 +146,15 @@ async fn run_gateway_with_config(
         info!("device_manager disabled");
     }
 
+    let tcp_server_runtime = ReuseportServerRuntime::start(ReuseportServerRuntimeConfig::new())
+        .map_err(|e| anyhow!("start tcp server runtime failed: {}", e))?;
     let factory = GatewayFactory::new(connect_manager.clone(), parser.clone());
     factory.register_stack_factory(
         StackProtocol::Tcp,
-        Arc::new(TcpStackFactory::new(connect_manager.clone())),
+        Arc::new(TcpStackFactory::new(
+            connect_manager.clone(),
+            tcp_server_runtime.clone(),
+        )),
     );
     debug!("Register tcp stack factory");
     factory.register_stack_factory(
@@ -159,7 +164,10 @@ async fn run_gateway_with_config(
     debug!("Register udp stack factory");
     factory.register_stack_factory(
         StackProtocol::Tls,
-        Arc::new(TlsStackFactory::new(connect_manager.clone())),
+        Arc::new(TlsStackFactory::new(
+            connect_manager.clone(),
+            tcp_server_runtime.clone(),
+        )),
     );
     debug!("Register tls stack factory");
     factory.register_stack_factory(

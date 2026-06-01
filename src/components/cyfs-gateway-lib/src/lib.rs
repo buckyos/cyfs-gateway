@@ -51,6 +51,9 @@ pub use global_process_chains::*;
 pub use io_dump::*;
 pub use js_externals::*;
 pub use self_cert_mgr::*;
+pub use sfo_reuseport::{
+    ServerRuntime as ReuseportServerRuntime, ServerRuntimeConfig as ReuseportServerRuntimeConfig,
+};
 pub use stack::*;
 pub use timer_manager::*;
 

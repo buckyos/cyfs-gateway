@@ -126,10 +126,15 @@ mod tests {
                 .unwrap();
         let inner_dns_record_manager = cyfs_dns::InnerDnsRecordManager::new();
         let stack_manager = StackManager::new();
+        let tcp_server_runtime =
+            ReuseportServerRuntime::start(ReuseportServerRuntimeConfig::new()).unwrap();
         let factory = GatewayFactory::new(connect_manager.clone(), parser.clone());
         factory.register_stack_factory(
             StackProtocol::Tcp,
-            Arc::new(TcpStackFactory::new(connect_manager.clone())),
+            Arc::new(TcpStackFactory::new(
+                connect_manager.clone(),
+                tcp_server_runtime.clone(),
+            )),
         );
         factory.register_stack_factory(
             StackProtocol::Udp,
@@ -137,7 +142,10 @@ mod tests {
         );
         factory.register_stack_factory(
             StackProtocol::Tls,
-            Arc::new(TlsStackFactory::new(connect_manager.clone())),
+            Arc::new(TlsStackFactory::new(
+                connect_manager.clone(),
+                tcp_server_runtime.clone(),
+            )),
         );
         factory.register_stack_factory(
             StackProtocol::Quic,

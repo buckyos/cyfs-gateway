@@ -85,6 +85,7 @@ pub(crate) async fn handle_auth(server: &SNServer, req: RPCRequest) -> RpcCallRe
                     "register failed, invalid activation code",
                 ));
             }
+            server.invalidate_query_cache_for_username(username.as_str()).await;
             build_auth_success_response(server, &req, username.as_str(), true)
         }
         "login" => {

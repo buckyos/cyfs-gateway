@@ -625,7 +625,7 @@ impl ProcessChainDnsServer {
             .inner_record_manager
             .get_record(&name, &record_type_str)
         {
-            info!(
+            debug!(
                 "dns query resolved by provider=inner_record_manager: name={} type={}",
                 name, record_type_str
             );
@@ -745,7 +745,7 @@ impl ProcessChainDnsServer {
                                     map_collection_to_nameinfo(&resp).await.map_err(|e| {
                                         server_err!(ServerErrorCode::ProcessChainError, "{e}")
                                     })?;
-                                info!(
+                                debug!(
                                     "dns query resolved by provider={}: name={} type={}",
                                     provider_name, name, record_type_str
                                 );

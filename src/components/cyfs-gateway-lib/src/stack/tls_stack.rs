@@ -6,12 +6,13 @@ use crate::self_cert_mgr::SelfCertMgrRef;
 use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
 use crate::stack::{
-    TlsCertResolver, get_limit_info, get_source_addr_from_req_env, probe_proxy_protocol_stream,
-    stream_forward, stream_forward_group,
+    TlsCertResolver, connect_timeout_from_secs, get_limit_info, get_source_addr_from_req_env,
+    probe_proxy_protocol_stream, stream_forward, stream_forward_group,
+    stream_idle_timeout_from_secs,
 };
 use crate::{
-    ConnectionInfo, ConnectionManagerRef, DumpStream, GlobalCollectionManagerRef,
-    HandleConnectionController, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
+    ConnectionController, ConnectionInfo, ConnectionManagerRef, DumpStream,
+    GlobalCollectionManagerRef, IoDumpStackConfig, JsExternalsManagerRef, LimiterManagerRef,
     MutComposedSpeedStat, MutComposedSpeedStatRef, ProcessChainConfigs, Server, ServerManagerRef,
     Stack, StackCertConfig, StackConfig, StackContext, StackErrorCode, StackProtocol, StackResult,
     StatManagerRef, StreamInfo, TunnelManager, create_io_dump_stack_config, get_external_commands,
@@ -19,6 +20,7 @@ use crate::{
 };
 use cyfs_acme::{ACME_TLS_ALPN_NAME, AcmeCertManagerRef, AcmeItem, ChallengeType};
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor, StreamRequest};
+use futures_util::future::{AbortHandle, Abortable};
 use rustls::ServerConfig;
 use rustls::pki_types::pem::PemObject;
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -26,15 +28,15 @@ use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
+use sfo_reuseport::{ServerRuntime, ServiceConfig, SocketOptions, TcpServer, TransparentMode};
 use std::net::SocketAddr;
-#[cfg(unix)]
-use std::os::fd::{FromRawFd, IntoRawFd};
-#[cfg(windows)]
-use std::os::windows::io::{FromRawSocket, IntoRawSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
+use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
+
+const DEFAULT_TLS_CONCURRENCY: u32 = 0;
 
 pub async fn load_certs(path: &str) -> StackResult<Vec<CertificateDer<'static>>> {
     let certs = CertificateDer::pem_file_iter(path)
@@ -148,6 +150,8 @@ struct TlsConnectionHandler {
     certs: Arc<dyn ResolvesServerCert>,
     alpn_protocols: Vec<Vec<u8>>,
     io_dump: Option<IoDumpStackConfig>,
+    stream_idle_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
 }
 
 impl TlsConnectionHandler {
@@ -158,6 +162,8 @@ impl TlsConnectionHandler {
         env: Arc<TlsStackContext>,
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
+        stream_idle_timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -176,6 +182,8 @@ impl TlsConnectionHandler {
             certs,
             alpn_protocols,
             io_dump,
+            stream_idle_timeout,
+            connect_timeout,
         })
     }
 
@@ -196,6 +204,8 @@ impl TlsConnectionHandler {
             certs: self.certs.clone(),
             alpn_protocols: self.alpn_protocols.clone(),
             io_dump: self.io_dump.clone(),
+            stream_idle_timeout: self.stream_idle_timeout,
+            connect_timeout: self.connect_timeout,
         })
     }
 
@@ -436,6 +446,8 @@ impl TlsConnectionHandler {
                                 target,
                                 &self.env.tunnel_manager,
                                 Some(&stream_info),
+                                self.stream_idle_timeout,
+                                self.connect_timeout,
                             )
                             .await?;
                         }
@@ -533,17 +545,21 @@ impl TlsConnectionHandler {
 pub struct TlsStack {
     id: String,
     bind_addr: String,
+    concurrency: u32,
+    server_runtime: ServerRuntime,
     connection_manager: Option<ConnectionManagerRef>,
     handler: Arc<RwLock<Arc<TlsConnectionHandler>>>,
     prepare_handler: Arc<RwLock<Option<Arc<TlsConnectionHandler>>>>,
     reuse_address: bool,
-    handle: Mutex<Option<JoinHandle<()>>>,
+    server: Mutex<Option<TcpServer>>,
 }
 
 impl Drop for TlsStack {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.lock().unwrap().take() {
-            handle.abort();
+        if let Some(server) = self.server.lock().unwrap().take() {
+            if let Err(e) = server.close() {
+                log::error!("close tls server failed: {}", e);
+            }
         }
     }
 }
@@ -575,9 +591,16 @@ impl TlsStack {
                 "stack_context is required"
             ));
         }
+        if config.server_runtime.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "server_runtime is required"
+            ));
+        }
 
         let id = config.id.unwrap();
         let bind_addr = config.bind.unwrap();
+        let server_runtime = config.server_runtime.unwrap();
         let env = config.stack_context.unwrap();
         let handler = TlsConnectionHandler::create(
             config.hook_point.unwrap(),
@@ -586,118 +609,161 @@ impl TlsStack {
             env,
             config.connection_manager.clone(),
             config.io_dump,
+            config.stream_idle_timeout,
+            config.connect_timeout,
         )
         .await?;
 
         Ok(Self {
             id,
             bind_addr,
+            concurrency: config.concurrency,
+            server_runtime,
             connection_manager: config.connection_manager,
             handler: Arc::new(RwLock::new(Arc::new(handler))),
             prepare_handler: Arc::new(Default::default()),
             reuse_address: config.reuse_address,
-            handle: Mutex::new(None),
+            server: Mutex::new(None),
         })
     }
 
-    async fn start_listener(&self) -> StackResult<JoinHandle<()>> {
+    async fn start_listener(&self) -> StackResult<TcpServer> {
         let addr: SocketAddr = self.bind_addr.parse().map_err(into_stack_err!(
             StackErrorCode::InvalidConfig,
             "invalid bind address {}",
             self.bind_addr
         ))?;
-        let sockaddr: socket2::SockAddr = addr.into();
-        let domain = match addr {
-            std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
-            std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
+        let socket_options = SocketOptions {
+            reuse_address: self.reuse_address,
+            ipv4_transparent: TransparentMode::Disabled,
+            ipv6_transparent: TransparentMode::Disabled,
         };
-        let socket =
-            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-                .map_err(into_stack_err!(
-                    StackErrorCode::IoError,
-                    "create socket error"
-                ))?;
-
-        socket.set_nonblocking(true).map_err(into_stack_err!(
-            StackErrorCode::IoError,
-            "set nonblocking error"
-        ))?;
-        #[cfg(target_os = "linux")]
-        {
-            if self.reuse_address {
-                socket.set_reuse_address(true).map_err(into_stack_err!(
-                    StackErrorCode::IoError,
-                    "set reuse address error"
-                ))?;
-            }
+        let mut service_config = ServiceConfig::new(addr).with_socket_options(socket_options);
+        if self.concurrency != u32::MAX {
+            service_config =
+                service_config.with_max_concurrency_per_worker(self.concurrency as usize);
         }
-        socket.bind(&sockaddr).map_err(into_stack_err!(
-            StackErrorCode::BindFailed,
-            "bind {} error",
-            self.bind_addr
-        ))?;
-        socket.listen(1024).map_err(into_stack_err!(
-            StackErrorCode::ListenFailed,
-            "listen error"
-        ))?;
-        #[cfg(unix)]
-        let std_listener = unsafe { std::net::TcpListener::from_raw_fd(socket.into_raw_fd()) };
-        #[cfg(windows)]
-        let std_listener =
-            unsafe { std::net::TcpListener::from_raw_socket(socket.into_raw_socket()) };
 
-        let listener = tokio::net::TcpListener::from_std(std_listener)
-            .map_err(into_stack_err!(StackErrorCode::BindFailed))?;
         let handler = self.handler.clone();
         let connection_manager = self.connection_manager.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                let (stream, remote_addr) = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::error!("accept tcp stream failed: {}", e);
-                        continue;
-                    }
-                };
-
-                let local_addr = match stream.local_addr() {
-                    Ok(addr) => addr,
-                    Err(e) => {
-                        log::error!("get remote addr failed: {}", e);
-                        continue;
-                    }
-                };
-
-                log::debug!("accept tcp stream from {} to {}", remote_addr, local_addr);
-                let compose_stat = MutComposedSpeedStat::new();
-                let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
-                let speed = stat_stream.get_speed_stat();
-                let handler_snapshot = {
-                    let handler = handler.read().unwrap();
-                    handler.clone()
-                };
-                let handle = tokio::spawn(async move {
-                    if let Err(e) = handler_snapshot
-                        .handle_connect(stat_stream, local_addr, compose_stat)
-                        .await
-                    {
-                        log::error!("handle tcp stream failed: {}", e);
-                    }
-                });
-
-                if let Some(connection_manager) = &connection_manager {
-                    let controller = HandleConnectionController::new(handle);
-                    connection_manager.add_connection(ConnectionInfo::new(
-                        remote_addr.to_string(),
-                        local_addr.to_string(),
-                        StackProtocol::Tls,
-                        speed,
-                        controller,
-                    ));
-                }
+        let server = TcpServer::serve(&self.server_runtime, service_config, move |stream| {
+            let handler = handler.clone();
+            let connection_manager = connection_manager.clone();
+            async move {
+                handle_reuseport_tls_stream(stream, handler, connection_manager).await;
+                Ok(())
             }
-        });
-        Ok(handle)
+        })
+        .map_err(|e| stack_err!(StackErrorCode::BindFailed, "start tls server error: {e}"))?;
+        Ok(server)
+    }
+}
+
+async fn handle_reuseport_tls_stream(
+    stream: TcpStream,
+    handler: Arc<RwLock<Arc<TlsConnectionHandler>>>,
+    connection_manager: Option<ConnectionManagerRef>,
+) {
+    let remote_addr = match stream.peer_addr() {
+        Ok(addr) => addr,
+        Err(e) => {
+            log::error!("read tls peer addr failed: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = stream.set_nodelay(true) {
+        log::warn!(
+            "set TCP_NODELAY failed for tcp stream from {}: {}",
+            remote_addr,
+            e
+        );
+    }
+    let local_addr = match stream.local_addr() {
+        Ok(addr) => addr,
+        Err(e) => {
+            log::error!("get local addr failed: {}", e);
+            return;
+        }
+    };
+
+    log::debug!("accept tls stream from {} to {}", remote_addr, local_addr);
+    let compose_stat = MutComposedSpeedStat::new();
+    let stat_stream = StatStream::new_with_tracker(stream, compose_stat.clone());
+    let speed = stat_stream.get_speed_stat();
+    let handler_snapshot = {
+        let handler = handler.read().unwrap();
+        handler.clone()
+    };
+
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    let (controller, done_sender) = AbortableTlsConnectionController::new(abort_handle);
+    if let Some(manager) = &connection_manager {
+        manager.add_connection(ConnectionInfo::new(
+            remote_addr.to_string(),
+            local_addr.to_string(),
+            StackProtocol::Tls,
+            speed,
+            controller.clone(),
+        ));
+    }
+
+    let result = Abortable::new(
+        handler_snapshot.handle_connect(stat_stream, local_addr, compose_stat),
+        abort_registration,
+    )
+    .await;
+    controller.mark_stopped();
+    let _ = done_sender.send(());
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::error!("handle tls stream failed: {}", e),
+        Err(_) => log::debug!("tls stream handler aborted"),
+    }
+}
+
+struct AbortableTlsConnectionController {
+    abort_handle: AbortHandle,
+    stopped: AtomicBool,
+    done_receiver: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl AbortableTlsConnectionController {
+    fn new(abort_handle: AbortHandle) -> (Arc<Self>, oneshot::Sender<()>) {
+        let (done_sender, done_receiver) = oneshot::channel();
+        (
+            Arc::new(Self {
+                abort_handle,
+                stopped: AtomicBool::new(false),
+                done_receiver: Mutex::new(Some(done_receiver)),
+            }),
+            done_sender,
+        )
+    }
+
+    fn mark_stopped(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+}
+
+#[async_trait::async_trait]
+impl ConnectionController for AbortableTlsConnectionController {
+    fn stop_connection(&self) {
+        self.abort_handle.abort();
+    }
+
+    async fn wait_stop(&self) {
+        let receiver = {
+            let mut receiver = self.done_receiver.lock().unwrap();
+            receiver.take()
+        };
+        if let Some(receiver) = receiver {
+            let _ = receiver.await;
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire) || self.abort_handle.is_aborted()
     }
 }
 
@@ -717,12 +783,12 @@ impl Stack for TlsStack {
 
     async fn start(&self) -> StackResult<()> {
         {
-            if self.handle.lock().unwrap().is_some() {
+            if self.server.lock().unwrap().is_some() {
                 return Ok(());
             }
         }
-        let handle = self.start_listener().await?;
-        *self.handle.lock().unwrap() = Some(handle);
+        let server = self.start_listener().await?;
+        *self.server.lock().unwrap() = Some(server);
         Ok(())
     }
 
@@ -750,6 +816,15 @@ impl Stack for TlsStack {
             return Err(stack_err!(
                 StackErrorCode::InvalidConfig,
                 "reuse_address unmatch"
+            ));
+        }
+
+        if normalize_concurrency(config.concurrency.unwrap_or(DEFAULT_TLS_CONCURRENCY))
+            != self.concurrency
+        {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "concurrency unmatch"
             ));
         }
 
@@ -793,6 +868,8 @@ impl Stack for TlsStack {
             )
             .await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
+            stream_idle_timeout_from_secs(config.stream_idle_timeout),
+            connect_timeout_from_secs(config.connect_timeout),
         )
         .await?;
 
@@ -859,6 +936,10 @@ pub struct TlsStackConfig {
     pub io_dump_max_upload_bytes_per_conn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_max_download_bytes_per_conn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<u64>,
     pub reuse_address: Option<bool>,
 }
 
@@ -876,13 +957,25 @@ impl crate::StackConfig for TlsStackConfig {
     }
 }
 
+fn normalize_concurrency(concurrency: u32) -> u32 {
+    if concurrency == 0 {
+        u32::MAX
+    } else {
+        concurrency
+    }
+}
+
 pub struct TlsStackFactory {
     connection_manager: ConnectionManagerRef,
+    server_runtime: ServerRuntime,
 }
 
 impl TlsStackFactory {
-    pub fn new(connection_manager: ConnectionManagerRef) -> Self {
-        Self { connection_manager }
+    pub fn new(connection_manager: ConnectionManagerRef, server_runtime: ServerRuntime) -> Self {
+        Self {
+            connection_manager,
+            server_runtime,
+        }
     }
 }
 
@@ -926,10 +1019,11 @@ impl crate::StackFactory for TlsStackFactory {
         let stack = TlsStack::builder()
             .id(config.id.clone())
             .bind(config.bind.to_string())
+            .server_runtime(self.server_runtime.clone())
             .connection_manager(self.connection_manager.clone())
             .hook_point(config.hook_point.clone())
             .add_certs(cert_list)
-            .concurrency(config.concurrency.unwrap_or(0))
+            .concurrency(config.concurrency.unwrap_or(DEFAULT_TLS_CONCURRENCY))
             .alpn_protocols(
                 config
                     .alpn_protocols
@@ -942,6 +1036,8 @@ impl crate::StackFactory for TlsStackFactory {
             .reuse_address(config.reuse_address.unwrap_or(false))
             .stack_context(stack_context)
             .io_dump(io_dump)
+            .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
+            .connect_timeout(connect_timeout_from_secs(config.connect_timeout))
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -954,11 +1050,14 @@ pub struct TlsStackBuilder {
     hook_point: Option<ProcessChainConfigs>,
     certs: Vec<TlsDomainConfig>,
     concurrency: u32,
+    server_runtime: Option<ServerRuntime>,
     connection_manager: Option<ConnectionManagerRef>,
     alpn_protocols: Vec<Vec<u8>>,
     stack_context: Option<Arc<TlsStackContext>>,
     io_dump: Option<IoDumpStackConfig>,
     reuse_address: bool,
+    stream_idle_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
 }
 
 impl TlsStackBuilder {
@@ -968,12 +1067,15 @@ impl TlsStackBuilder {
             bind: None,
             hook_point: None,
             certs: vec![],
-            concurrency: 0,
+            concurrency: normalize_concurrency(DEFAULT_TLS_CONCURRENCY),
+            server_runtime: None,
             connection_manager: None,
             alpn_protocols: vec![],
             stack_context: None,
             io_dump: None,
             reuse_address: false,
+            stream_idle_timeout: stream_idle_timeout_from_secs(None),
+            connect_timeout: connect_timeout_from_secs(None),
         }
     }
 
@@ -1002,17 +1104,18 @@ impl TlsStackBuilder {
         self
     }
 
+    pub fn server_runtime(mut self, server_runtime: ServerRuntime) -> Self {
+        self.server_runtime = Some(server_runtime);
+        self
+    }
+
     pub fn stack_context(mut self, stack_context: Arc<TlsStackContext>) -> Self {
         self.stack_context = Some(stack_context);
         self
     }
 
     pub fn concurrency(mut self, concurrency: u32) -> Self {
-        if concurrency == 0 {
-            self.concurrency = u32::MAX;
-        } else {
-            self.concurrency = concurrency;
-        }
+        self.concurrency = normalize_concurrency(concurrency);
         self
     }
 
@@ -1028,6 +1131,16 @@ impl TlsStackBuilder {
 
     pub fn reuse_address(mut self, reuse_address: bool) -> Self {
         self.reuse_address = reuse_address;
+        self
+    }
+
+    pub fn stream_idle_timeout(mut self, stream_idle_timeout: std::time::Duration) -> Self {
+        self.stream_idle_timeout = stream_idle_timeout;
+        self
+    }
+
+    pub fn connect_timeout(mut self, connect_timeout: std::time::Duration) -> Self {
+        self.connect_timeout = connect_timeout;
         self
     }
 
@@ -1051,7 +1164,7 @@ mod tests {
     };
     use crate::{
         LimiterManagerRef, ServerManagerRef, StackContext, StatManagerRef, TlsDomainConfig,
-        TlsStack, TlsStackContext,
+        TlsStack, TlsStackBuilder, TlsStackContext,
     };
     use buckyos_kit::{AsyncStream, init_logging};
     use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, CertManagerConfig};
@@ -1076,6 +1189,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    fn test_server_runtime() -> sfo_reuseport::ServerRuntime {
+        sfo_reuseport::ServerRuntime::start(
+            sfo_reuseport::ServerRuntimeConfig::new().with_workers(1),
+        )
+        .unwrap()
+    }
 
     async fn wait_dump_frames(
         file: &std::path::Path,
@@ -1116,15 +1236,19 @@ mod tests {
         ))
     }
 
+    fn tls_stack_builder() -> TlsStackBuilder {
+        TlsStack::builder().server_runtime(test_server_runtime())
+    }
+
     #[tokio::test]
     async fn test_tls_stack_creation() {
         let subject_alt_names = vec!["www.buckyos.com".to_string(), "127.0.0.1".to_string()];
         let cert_key = generate_simple_self_signed(subject_alt_names).unwrap();
-        let result = TlsStack::builder().build().await;
+        let result = tls_stack_builder().build().await;
         assert!(result.is_err());
-        let result = TlsStack::builder().bind("127.0.0.1:9080").build().await;
+        let result = tls_stack_builder().bind("127.0.0.1:9080").build().await;
         assert!(result.is_err());
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9080")
             .stack_context(build_stack_context(
@@ -1143,7 +1267,7 @@ mod tests {
             .build()
             .await;
         assert!(result.is_err());
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9080")
             .hook_point(vec![])
@@ -1163,7 +1287,7 @@ mod tests {
             .build()
             .await;
         assert!(result.is_ok());
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9080")
             .hook_point(vec![])
@@ -1209,7 +1333,7 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9080")
             .hook_point(chains)
@@ -1280,7 +1404,7 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9081")
             .hook_point(chains)
@@ -1352,7 +1476,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let connection_manager = ConnectionManager::new();
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9091")
             .hook_point(chains)
@@ -1444,7 +1568,7 @@ mod tests {
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
         let connection_manager = ConnectionManager::new();
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9093")
             .hook_point(chains)
@@ -1524,7 +1648,7 @@ mod tests {
         let mut self_cert_config = SelfCertConfig::default();
         self_cert_config.store_path = tls_self_certs_path.clone();
         let connection_manager = ConnectionManager::new();
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9097")
             .hook_point(chains)
@@ -1700,7 +1824,7 @@ mod tests {
         let _ = server_manager.add_server(Server::Stream(Arc::new(MockServer::new(
             "www.buckyos.com".to_string(),
         ))));
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9085")
             .hook_point(chains)
@@ -1800,7 +1924,7 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9087")
             .hook_point(chains)
@@ -1917,7 +2041,7 @@ mod tests {
 
         let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
 
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9086")
             .hook_point(chains)
@@ -2019,7 +2143,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stack = TlsStack::builder()
+        let stack = tls_stack_builder()
             .id("tls-raw")
             .bind("127.0.0.1:9093")
             .hook_point(chains)
@@ -2105,7 +2229,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stack = TlsStack::builder()
+        let stack = tls_stack_builder()
             .id("tls-raw-limit")
             .bind("127.0.0.1:9095")
             .hook_point(chains)
@@ -2210,7 +2334,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let stack = TlsStack::builder()
+        let stack = tls_stack_builder()
             .id("tls-http")
             .bind("127.0.0.1:9094")
             .hook_point(chains)
@@ -2335,7 +2459,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let stack = TlsStack::builder()
+        let stack = tls_stack_builder()
             .id("tls-http-limit")
             .bind("127.0.0.1:9096")
             .hook_point(chains)
@@ -2421,7 +2545,7 @@ mod tests {
         let limiter_manager = Arc::new(DefaultLimiterManager::new());
         let stat_manager = StatManager::new();
         let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
-        let factory = TlsStackFactory::new(ConnectionManager::new());
+        let factory = TlsStackFactory::new(ConnectionManager::new(), test_server_runtime());
 
         let config = TlsStackConfig {
             id: "test".to_string(),
@@ -2436,6 +2560,8 @@ mod tests {
             io_dump_rotate_max_files: None,
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
+            stream_idle_timeout: None,
+            connect_timeout: None,
             reuse_address: None,
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(TlsStackContext::new(
@@ -2476,7 +2602,7 @@ mod tests {
                 "www.buckyos.com".to_string(),
             ))))
             .unwrap();
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9185")
             .hook_point(chains)
@@ -2564,7 +2690,7 @@ mod tests {
                 "www.buckyos.com".to_string(),
             ))))
             .unwrap();
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9186")
             .hook_point(chains)
@@ -2664,7 +2790,7 @@ mod tests {
                 "www.buckyos.com".to_string(),
             ))))
             .unwrap();
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9187")
             .hook_point(chains)
@@ -2764,7 +2890,7 @@ mod tests {
                 "www.buckyos.com".to_string(),
             ))))
             .unwrap();
-        let result = TlsStack::builder()
+        let result = tls_stack_builder()
             .id("test")
             .bind("127.0.0.1:9188")
             .hook_point(chains)

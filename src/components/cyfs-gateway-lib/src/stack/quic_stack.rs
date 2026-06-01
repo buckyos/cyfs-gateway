@@ -12,8 +12,8 @@ use crate::global_process_chains::{
 use crate::stack::limiter::Limiter;
 use crate::stack::tls_cert_resolver::ResolvesServerCertUsingSni;
 use crate::stack::{
-    TlsCertResolver, get_limit_info, probe_proxy_protocol_stream, stream_forward,
-    stream_forward_group,
+    TlsCertResolver, connect_timeout_from_secs, get_limit_info, probe_proxy_protocol_stream,
+    stream_forward, stream_forward_group, stream_idle_timeout_from_secs,
 };
 use crate::{
     ComposedSpeedStat, ConnectionController, ConnectionInfo, ConnectionManagerRef, DumpStream,
@@ -59,9 +59,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf, Take};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
+
+const DEFAULT_QUIC_CONCURRENCY: u32 = 0;
 
 #[derive(Clone)]
 pub struct QuicStackContext {
@@ -113,6 +115,9 @@ struct QuicConnectionHandler {
     executor: ProcessChainLibExecutor,
     connection_manager: Option<ConnectionManagerRef>,
     io_dump: Option<IoDumpStackConfig>,
+    stream_idle_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
+    stream_semaphore: Arc<Semaphore>,
 }
 
 impl QuicConnectionHandler {
@@ -121,6 +126,9 @@ impl QuicConnectionHandler {
         env: Arc<QuicStackContext>,
         connection_manager: Option<ConnectionManagerRef>,
         io_dump: Option<IoDumpStackConfig>,
+        stream_idle_timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
+        stream_concurrency: u32,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -136,6 +144,9 @@ impl QuicConnectionHandler {
             executor,
             connection_manager,
             io_dump,
+            stream_idle_timeout,
+            connect_timeout,
+            stream_semaphore: Arc::new(Semaphore::new(stream_concurrency as usize)),
         })
     }
 
@@ -360,6 +371,11 @@ impl QuicConnectionHandler {
                             };
                             let speed_stat = speed_stat.clone();
                             loop {
+                                let permit =
+                                    match self.stream_semaphore.clone().acquire_owned().await {
+                                        Ok(permit) => permit,
+                                        Err(_) => break,
+                                    };
                                 let (send, recv) = connection
                                     .accept_bi()
                                     .await
@@ -415,7 +431,10 @@ impl QuicConnectionHandler {
                                 };
                                 let tunnel_manager = self.env.tunnel_manager.clone();
                                 let forward_info = stream_info.clone();
+                                let stream_idle_timeout = self.stream_idle_timeout;
+                                let connect_timeout = self.connect_timeout;
                                 let handle = tokio::spawn(async move {
+                                    let _permit = permit;
                                     let result = match target_or_plan {
                                         Ok(target) => {
                                             stream_forward(
@@ -423,6 +442,8 @@ impl QuicConnectionHandler {
                                                 target.as_str(),
                                                 &tunnel_manager,
                                                 Some(&forward_info),
+                                                stream_idle_timeout,
+                                                connect_timeout,
                                             )
                                             .await
                                         }
@@ -509,7 +530,17 @@ impl QuicConnectionHandler {
                                             let server = server.clone();
                                             let speed_stat = speed_stat.clone();
                                             let device_info = device_info.clone();
+                                            let permit = match self
+                                                .stream_semaphore
+                                                .clone()
+                                                .acquire_owned()
+                                                .await
+                                            {
+                                                Ok(permit) => permit,
+                                                Err(_) => break,
+                                            };
                                             let handle = tokio::spawn(async move {
+                                                let _permit = permit;
                                                 let ret: StackResult<()> = async move {
                                                     let (req, stream) = resolver.unwrap().resolve_request().await
                                                         .map_err(into_stack_err!(StackErrorCode::QuicError, "h3 resolve request error"))?;
@@ -602,6 +633,15 @@ impl QuicConnectionHandler {
                                         }
                                     }
                                     Server::Stream(server) => loop {
+                                        let permit = match self
+                                            .stream_semaphore
+                                            .clone()
+                                            .acquire_owned()
+                                            .await
+                                        {
+                                            Ok(permit) => permit,
+                                            Err(_) => break,
+                                        };
                                         let (send, recv) = connection
                                             .accept_bi()
                                             .await
@@ -645,6 +685,7 @@ impl QuicConnectionHandler {
                                         };
                                         let device_info = device_info.clone();
                                         let handle = tokio::spawn(async move {
+                                            let _permit = permit;
                                             let info = StreamInfo::with_addrs(
                                                 Some(remote_addr.to_string()),
                                                 proxy_source_addr.map(|a| a.to_string()),
@@ -1571,6 +1612,9 @@ impl QuicStack {
             stack_context.clone(),
             builder.connection_manager.clone(),
             builder.io_dump,
+            builder.stream_idle_timeout,
+            builder.connect_timeout,
+            builder.concurrency,
         )
         .await?;
         let handler = Arc::new(RwLock::new(Arc::new(handler)));
@@ -1648,6 +1692,15 @@ impl Stack for QuicStack {
             ));
         }
 
+        if normalize_concurrency(config.concurrency.unwrap_or(DEFAULT_QUIC_CONCURRENCY))
+            != self.inner.concurrency
+        {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "concurrency unmatch"
+            ));
+        }
+
         let env = match context {
             Some(context) => {
                 let quic_context = context
@@ -1677,6 +1730,9 @@ impl Stack for QuicStack {
             )
             .await
             .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?,
+            stream_idle_timeout_from_secs(config.stream_idle_timeout),
+            connect_timeout_from_secs(config.connect_timeout),
+            self.inner.concurrency,
         )
         .await?;
         *self.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
@@ -1705,6 +1761,8 @@ pub struct QuicStackBuilder {
     connection_manager: Option<ConnectionManagerRef>,
     stack_context: Option<Arc<QuicStackContext>>,
     io_dump: Option<IoDumpStackConfig>,
+    stream_idle_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
 }
 
 impl QuicStackBuilder {
@@ -1714,12 +1772,14 @@ impl QuicStackBuilder {
             bind: None,
             hook_point: None,
             certs: vec![],
-            concurrency: 1024,
+            concurrency: normalize_concurrency(DEFAULT_QUIC_CONCURRENCY),
             alpn_protocols: vec![],
             reuse_address: false,
             connection_manager: None,
             stack_context: None,
             io_dump: None,
+            stream_idle_timeout: stream_idle_timeout_from_secs(None),
+            connect_timeout: connect_timeout_from_secs(None),
         }
     }
 
@@ -1743,11 +1803,7 @@ impl QuicStackBuilder {
     }
 
     pub fn concurrency(mut self, concurrency: u32) -> Self {
-        if concurrency == 0 {
-            self.concurrency = u32::MAX;
-        } else {
-            self.concurrency = concurrency;
-        }
+        self.concurrency = normalize_concurrency(concurrency);
         self
     }
 
@@ -1776,6 +1832,16 @@ impl QuicStackBuilder {
         self
     }
 
+    pub fn stream_idle_timeout(mut self, stream_idle_timeout: std::time::Duration) -> Self {
+        self.stream_idle_timeout = stream_idle_timeout;
+        self
+    }
+
+    pub fn connect_timeout(mut self, connect_timeout: std::time::Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
     pub async fn build(self) -> StackResult<QuicStack> {
         QuicStack::create(self).await
     }
@@ -1801,6 +1867,10 @@ pub struct QuicStackConfig {
     pub io_dump_max_upload_bytes_per_conn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_max_download_bytes_per_conn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<u64>,
     pub reuse_address: Option<bool>,
 }
 
@@ -1815,6 +1885,14 @@ impl StackConfig for QuicStackConfig {
 
     fn get_config_json(&self) -> String {
         serde_json::to_string(self).unwrap()
+    }
+}
+
+fn normalize_concurrency(concurrency: u32) -> u32 {
+    if concurrency == 0 {
+        u32::MAX
+    } else {
+        concurrency
     }
 }
 
@@ -1877,9 +1955,11 @@ impl StackFactory for QuicStackFactory {
                     .map(|s| s.as_bytes().to_vec())
                     .collect(),
             )
-            .concurrency(config.concurrency.unwrap_or(1024))
+            .concurrency(config.concurrency.unwrap_or(DEFAULT_QUIC_CONCURRENCY))
             .stack_context(stack_context.clone())
             .io_dump(io_dump)
+            .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
+            .connect_timeout(connect_timeout_from_secs(config.connect_timeout))
             .reuse_address(config.reuse_address.unwrap_or(false))
             .build()
             .await?;
@@ -3622,6 +3702,8 @@ mod tests {
             io_dump_rotate_max_files: None,
             io_dump_max_upload_bytes_per_conn: None,
             io_dump_max_download_bytes_per_conn: None,
+            stream_idle_timeout: None,
+            connect_timeout: None,
             reuse_address: None,
         };
         let stack_context: Arc<dyn StackContext> = Arc::new(QuicStackContext::new(

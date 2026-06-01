@@ -30,7 +30,8 @@ src/web3-gateway/web3_gateway
 src/apps/cyfs_gateway/web/node_modules/
 src/apps/cyfs_gateway/web/pnpm-lock.yaml
 *.log
-local_rootfs
+src/local_rootfs
 .sisyphus
 .tmp_oss
 uv.lock
+*.egg-info

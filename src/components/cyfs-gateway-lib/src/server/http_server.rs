@@ -17,9 +17,10 @@ use crate::{
 };
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
 use http::Version;
+use http::header::HeaderName;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use hyper::body::{Body, Bytes, Frame};
 use hyper::{Request, StatusCode, http};
 use hyper_util::rt::TokioIo;
 use regex::Regex;
@@ -27,10 +28,14 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use serde::{Deserialize, Serialize};
+use std::fmt::Debug as FmtDebug;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use tokio::net::{TcpStream, lookup_host};
-use tokio::time::{Duration, timeout};
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, Sleep, timeout};
 use tokio_rustls::TlsConnector;
 use url::Url;
 
@@ -46,6 +51,7 @@ pub struct ProcessChainHttpServerBuilder {
     tunnel_manager: Option<TunnelManager>,
     global_collection_manager: Option<GlobalCollectionManagerRef>,
     compression: HttpCompressionSettings,
+    forward_timeouts: ForwardUpstreamTimeouts,
 }
 
 // Add setter methods for HttpServerBuilder
@@ -108,6 +114,11 @@ impl ProcessChainHttpServerBuilder {
         self
     }
 
+    fn forward_timeouts(mut self, forward_timeouts: ForwardUpstreamTimeouts) -> Self {
+        self.forward_timeouts = forward_timeouts;
+        self
+    }
+
     pub async fn build(self) -> ServerResult<ProcessChainHttpServer> {
         ProcessChainHttpServer::create_server(self).await
     }
@@ -153,6 +164,134 @@ pub struct ProcessChainHttpServer {
     post_executor: Option<Arc<Mutex<ProcessChainLibExecutor>>>,
     tunnel_manager: TunnelManager,
     compression: HttpCompressionSettings,
+    forward_timeouts: ForwardUpstreamTimeouts,
+}
+
+#[derive(Clone)]
+struct ForwardUpstreamTimeouts {
+    connect_timeout: Duration,
+    tls_handshake_timeout: Duration,
+    http_handshake_timeout: Duration,
+    request_timeout: Duration,
+    response_header_timeout: Duration,
+    response_body_idle_timeout: Duration,
+    post_chain_timeout: Duration,
+    abort_upstream_on_client_close: bool,
+}
+
+impl Default for ForwardUpstreamTimeouts {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(60),
+            tls_handshake_timeout: Duration::from_secs(60),
+            http_handshake_timeout: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(60),
+            response_header_timeout: Duration::from_secs(60),
+            response_body_idle_timeout: Duration::from_secs(60),
+            post_chain_timeout: Duration::from_secs(60),
+            abort_upstream_on_client_close: true,
+        }
+    }
+}
+
+impl ForwardUpstreamTimeouts {
+    fn from_config(config: Option<&ForwardUpstreamTimeoutConfig>) -> Self {
+        let mut timeouts = Self::default();
+        if let Some(config) = config {
+            if let Some(value) = config.connect_timeout {
+                timeouts.connect_timeout = Duration::from_secs(value);
+            }
+            if let Some(value) = config.tls_handshake_timeout {
+                timeouts.tls_handshake_timeout = Duration::from_secs(value);
+            }
+            if let Some(value) = config.http_handshake_timeout {
+                timeouts.http_handshake_timeout = Duration::from_secs(value);
+            }
+            if let Some(value) = config.request_timeout {
+                timeouts.request_timeout = Duration::from_secs(value);
+            }
+            if let Some(value) = config.response_header_timeout {
+                timeouts.response_header_timeout = Duration::from_secs(value);
+            }
+            if let Some(value) = config.response_body_idle_timeout {
+                timeouts.response_body_idle_timeout = Duration::from_secs(value);
+            }
+            if let Some(value) = config.post_chain_timeout {
+                timeouts.post_chain_timeout = Duration::from_secs(value);
+            }
+            if let Some(value) = config.abort_upstream_on_client_close {
+                timeouts.abort_upstream_on_client_close = value;
+            }
+        }
+        timeouts
+    }
+}
+
+struct UpstreamBody<B> {
+    inner: Pin<Box<B>>,
+    idle_timeout: Duration,
+    sleep: Option<Pin<Box<Sleep>>>,
+    abort_on_drop: Option<JoinHandle<()>>,
+}
+
+impl<B> UpstreamBody<B> {
+    fn new(body: B, idle_timeout: Duration, abort_on_drop: Option<JoinHandle<()>>) -> Self {
+        Self {
+            inner: Box::pin(body),
+            idle_timeout,
+            sleep: None,
+            abort_on_drop,
+        }
+    }
+}
+
+impl<B> Body for UpstreamBody<B>
+where
+    B: Body<Data = Bytes, Error = ServerError>,
+{
+    type Data = Bytes;
+    type Error = ServerError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Ready(frame) => {
+                this.sleep = None;
+                if frame.is_none() {
+                    this.abort_on_drop = None;
+                }
+                Poll::Ready(frame)
+            }
+            Poll::Pending => {
+                if this.sleep.is_none() {
+                    this.sleep = Some(Box::pin(tokio::time::sleep(this.idle_timeout)));
+                }
+
+                if let Some(sleep) = this.sleep.as_mut() {
+                    if sleep.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(Some(Err(ServerError::new(
+                            ServerErrorCode::StreamError,
+                            "upstream response body idle timeout".to_string(),
+                        ))));
+                    }
+                }
+
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl<B> Drop for UpstreamBody<B> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.abort_on_drop.take() {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -214,8 +353,6 @@ impl Drop for ProcessChainHttpServer {
 }
 
 impl ProcessChainHttpServer {
-    const HTTPS_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
-
     fn request_header_value<'a>(
         req: &'a http::Request<BoxBody<Bytes, ServerError>>,
         name: &str,
@@ -279,6 +416,7 @@ impl ProcessChainHttpServer {
 
     async fn connect_upstream_candidates(
         candidates: Vec<SocketAddr>,
+        connect_timeout: Duration,
     ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String)> {
         if candidates.is_empty() {
             return Err((
@@ -289,12 +427,7 @@ impl ProcessChainHttpServer {
 
         let mut errors: Vec<(String, String, bool)> = Vec::new();
         for addr in candidates {
-            match timeout(
-                Self::HTTPS_UPSTREAM_CONNECT_TIMEOUT,
-                TcpStream::connect(addr),
-            )
-            .await
-            {
+            match timeout(connect_timeout, TcpStream::connect(addr)).await {
                 Ok(Ok(stream)) => return Ok((stream, addr)),
                 Ok(Err(err)) => errors.push((addr.to_string(), err.to_string(), false)),
                 Err(_) => errors.push((addr.to_string(), "connect timeout".to_string(), true)),
@@ -313,6 +446,7 @@ impl ProcessChainHttpServer {
     async fn connect_upstream_with_fallback(
         connect_host: &str,
         connect_port: u16,
+        connect_timeout: Duration,
     ) -> Result<(TcpStream, SocketAddr), (TunnelFailureReason, String)> {
         let candidates: Vec<SocketAddr> = match lookup_host((connect_host, connect_port)).await {
             Ok(it) => it.collect(),
@@ -323,7 +457,31 @@ impl ProcessChainHttpServer {
                 ));
             }
         };
-        Self::connect_upstream_candidates(candidates).await
+        Self::connect_upstream_candidates(candidates, connect_timeout).await
+    }
+
+    fn upstream_timeout(stage: &str, target: impl std::fmt::Display) -> ServerError {
+        ServerError::new(
+            ServerErrorCode::StreamError,
+            format!("upstream {} timeout: {}", stage, target),
+        )
+    }
+
+    fn wrap_upstream_body<B, E>(
+        body: B,
+        idle_timeout: Duration,
+        abort_on_drop: Option<JoinHandle<()>>,
+    ) -> BoxBody<Bytes, ServerError>
+    where
+        B: Body<Data = Bytes, Error = E> + Send + Sync + 'static,
+        E: FmtDebug + 'static,
+    {
+        UpstreamBody::new(
+            body.map_err(|e| ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))),
+            idle_timeout,
+            abort_on_drop,
+        )
+        .boxed()
     }
 
     /// Best-effort: parse a candidate URL string into a `Url` suitable
@@ -347,6 +505,7 @@ impl ProcessChainHttpServer {
             tunnel_manager: None,
             global_collection_manager: None,
             compression: HttpCompressionSettings::default(),
+            forward_timeouts: ForwardUpstreamTimeouts::default(),
         }
     }
 
@@ -432,6 +591,7 @@ impl ProcessChainHttpServer {
             post_executor,
             tunnel_manager: builder.tunnel_manager.unwrap(),
             compression: builder.compression,
+            forward_timeouts: builder.forward_timeouts,
         })
     }
 
@@ -462,6 +622,46 @@ impl ProcessChainHttpServer {
         if let Ok(v) = http::HeaderValue::from_str(&xff) {
             header.insert("X-Forwarded-For", v);
         }
+    }
+
+    fn strip_hop_by_hop_headers(header: &mut http::HeaderMap) {
+        let mut connection_tokens = Vec::new();
+        for value in header.get_all(http::header::CONNECTION).iter() {
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            for token in value.split(',') {
+                let token = token.trim();
+                if token.is_empty() {
+                    continue;
+                }
+                if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+                    connection_tokens.push(name);
+                }
+            }
+        }
+
+        for name in connection_tokens {
+            header.remove(name);
+        }
+
+        for name in [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            header.remove(name);
+        }
+    }
+
+    fn strip_forward_response_headers<B>(mut resp: http::Response<B>) -> http::Response<B> {
+        Self::strip_hop_by_hop_headers(resp.headers_mut());
+        resp
     }
 
     async fn handle_forward_upstream(
@@ -511,6 +711,8 @@ impl ProcessChainHttpServer {
                 host,
             )
         };
+        let timeouts = self.forward_timeouts.clone();
+        Self::strip_hop_by_hop_headers(&mut header);
         // Trim URL boundary slashes so we don't end up with "//" when target_url ends with '/'
         // and org_url starts with '/'.
         let raw_url = if target_url.ends_with('/') || org_url.starts_with('/') {
@@ -560,7 +762,13 @@ impl ProcessChainHttpServer {
                 // per §6.3.
                 let started = std::time::Instant::now();
                 let (tcp_stream, connected_addr) =
-                    match Self::connect_upstream_with_fallback(connect_host, connect_port).await {
+                    match Self::connect_upstream_with_fallback(
+                        connect_host,
+                        connect_port,
+                        timeouts.connect_timeout,
+                    )
+                    .await
+                    {
                         Ok(v) => v,
                         Err((reason, msg)) => {
                             if let Some(key) = history_key.as_ref() {
@@ -577,9 +785,26 @@ impl ProcessChainHttpServer {
                     };
 
                 let (mut sender, conn) =
-                    match hyper::client::conn::http1::handshake(TokioIo::new(tcp_stream)).await {
-                        Ok(v) => v,
-                        Err(e) => {
+                    match timeout(
+                        timeouts.http_handshake_timeout,
+                        hyper::client::conn::http1::handshake(TokioIo::new(tcp_stream)),
+                    )
+                    .await
+                    {
+                        Err(_) => {
+                            if let Some(key) = history_key.as_ref() {
+                                self.tunnel_manager
+                                    .record_business_failure(
+                                        key,
+                                        TunnelFailureReason::TunnelOpen,
+                                        Some("http handshake timeout"),
+                                    )
+                                    .await;
+                            }
+                            return Err(Self::upstream_timeout("http handshake", connected_addr));
+                        }
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
                             if let Some(key) = history_key.as_ref() {
                                 let detail = e.to_string();
                                 self.tunnel_manager
@@ -632,10 +857,18 @@ impl ProcessChainHttpServer {
                             "Failed to build request: {}",
                             e
                         )
-                    })?;
+                })?;
                 *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                let resp = sender.send_request(upstream_req).await.map_err(|e| {
+                let resp = timeout(
+                    timeouts
+                        .response_header_timeout
+                        .min(timeouts.request_timeout),
+                    sender.send_request(upstream_req),
+                )
+                .await
+                .map_err(|_| Self::upstream_timeout("response header", &request_url))?
+                .map_err(|e| {
                     server_err!(
                         ServerErrorCode::InvalidConfig,
                         "Failed to request upstream {}: {}",
@@ -643,11 +876,9 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
+                let resp = Self::strip_forward_response_headers(resp);
                 let resp = resp.map(|body| {
-                    body.map_err(|e| {
-                        ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
-                    })
-                    .boxed()
+                    Self::wrap_upstream_body(body, timeouts.response_body_idle_timeout, None)
                 });
                 Ok(resp)
             }
@@ -683,7 +914,13 @@ impl ProcessChainHttpServer {
                 let started = std::time::Instant::now();
 
                 let (tcp_stream, connected_addr) =
-                    match Self::connect_upstream_with_fallback(connect_host, connect_port).await {
+                    match Self::connect_upstream_with_fallback(
+                        connect_host,
+                        connect_port,
+                        timeouts.connect_timeout,
+                    )
+                    .await
+                    {
                         Ok(v) => v,
                         Err((reason, msg)) => {
                             if let Some(key) = history_key.as_ref() {
@@ -718,12 +955,26 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
-                let tls_stream = match tls_connector
-                    .connect(server_name, tcp_stream)
-                    .await
+                let tls_stream = match timeout(
+                    timeouts.tls_handshake_timeout,
+                    tls_connector.connect(server_name, tcp_stream),
+                )
+                .await
                 {
-                    Ok(s) => s,
-                    Err(e) => {
+                    Err(_) => {
+                        if let Some(key) = history_key.as_ref() {
+                            self.tunnel_manager
+                                .record_business_failure(
+                                    key,
+                                    TunnelFailureReason::TlsHandshake,
+                                    Some("tls handshake timeout"),
+                                )
+                                .await;
+                        }
+                        return Err(Self::upstream_timeout("tls handshake", &sni_host));
+                    }
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
                         if let Some(key) = history_key.as_ref() {
                             let detail = e.to_string();
                             self.tunnel_manager
@@ -745,9 +996,26 @@ impl ProcessChainHttpServer {
                 };
 
                 let (mut sender, conn) =
-                    match hyper::client::conn::http1::handshake(TokioIo::new(tls_stream)).await {
-                        Ok(v) => v,
-                        Err(e) => {
+                    match timeout(
+                        timeouts.http_handshake_timeout,
+                        hyper::client::conn::http1::handshake(TokioIo::new(tls_stream)),
+                    )
+                    .await
+                    {
+                        Err(_) => {
+                            if let Some(key) = history_key.as_ref() {
+                                self.tunnel_manager
+                                    .record_business_failure(
+                                        key,
+                                        TunnelFailureReason::TunnelOpen,
+                                        Some("http handshake timeout"),
+                                    )
+                                    .await;
+                            }
+                            return Err(Self::upstream_timeout("http handshake", &sni_host));
+                        }
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
                             if let Some(key) = history_key.as_ref() {
                                 let detail = e.to_string();
                                 self.tunnel_manager
@@ -776,11 +1044,11 @@ impl ProcessChainHttpServer {
                         .record_business_success(key, Some(started.elapsed()))
                         .await;
                 }
-                tokio::spawn(async move {
+                let mut connection_task = Some(tokio::spawn(async move {
                     if let Err(e) = conn.await {
                         debug!("https upstream connection closed with error: {}", e);
                     }
-                });
+                }));
 
                 let _ = host_header;
                 let req = req_slot
@@ -801,23 +1069,49 @@ impl ProcessChainHttpServer {
                             "Failed to build https upstream request: {}",
                             e
                         )
-                    })?;
+                })?;
                 *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                let resp = sender.send_request(upstream_req).await.map_err(|e| {
-                    server_err!(
-                        ServerErrorCode::InvalidConfig,
-                        "Failed to request https upstream {} via {}: {}",
-                        sni_host,
-                        connected_addr,
-                        e
-                    )
-                })?;
+                let resp = match timeout(
+                    timeouts
+                        .response_header_timeout
+                        .min(timeouts.request_timeout),
+                    sender.send_request(upstream_req),
+                )
+                .await
+                {
+                    Err(_) => {
+                        if let Some(connection_task) = connection_task.take() {
+                            connection_task.abort();
+                        }
+                        return Err(Self::upstream_timeout("response header", &sni_host));
+                    }
+                    Ok(Err(e)) => {
+                        if let Some(connection_task) = connection_task.take() {
+                            connection_task.abort();
+                        }
+                        return Err(server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "Failed to request https upstream {} via {}: {}",
+                            sni_host,
+                            connected_addr,
+                            e
+                        ));
+                    }
+                    Ok(Ok(resp)) => resp,
+                };
+                let resp = Self::strip_forward_response_headers(resp);
+                let abort_on_drop = if timeouts.abort_upstream_on_client_close {
+                    connection_task.take()
+                } else {
+                    None
+                };
                 let resp = resp.map(|body| {
-                    body.map_err(|e| {
-                        ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
-                    })
-                    .boxed()
+                    Self::wrap_upstream_body(
+                        body,
+                        timeouts.response_body_idle_timeout,
+                        abort_on_drop,
+                    )
                 });
                 Ok(resp)
             }
@@ -846,13 +1140,19 @@ impl ProcessChainHttpServer {
                     }
                 };
 
-                let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(
-                    crate::tunnel_connector::TunnelStreamConnection::new(stream),
-                ))
+                let (mut sender, conn) = match timeout(
+                    timeouts.http_handshake_timeout,
+                    hyper::client::conn::http1::handshake(TokioIo::new(
+                        crate::tunnel_connector::TunnelStreamConnection::new(stream),
+                    )),
+                )
                 .await
                 {
-                    Ok(v) => v,
-                    Err(e) => {
+                    Err(_) => {
+                        return Err(Self::upstream_timeout("http handshake", target_url));
+                    }
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
                         return Err(server_err!(
                             ServerErrorCode::StreamError,
                             "Failed to build tunnel client connection to {}: {}",
@@ -861,7 +1161,7 @@ impl ProcessChainHttpServer {
                         ));
                     }
                 };
-                tokio::spawn(async move {
+                let connection_task = tokio::spawn(async move {
                     if let Err(e) = conn.await {
                         debug!("tunnel upstream connection closed with error: {}", e);
                     }
@@ -887,10 +1187,18 @@ impl ProcessChainHttpServer {
                             "Failed to build upstream_req: {}",
                             e
                         )
-                    })?;
+                })?;
                 *upstream_req.headers_mut() = std::mem::take(&mut header);
 
-                let resp = sender.send_request(upstream_req).await.map_err(|e| {
+                let resp = timeout(
+                    timeouts
+                        .response_header_timeout
+                        .min(timeouts.request_timeout),
+                    sender.send_request(upstream_req),
+                )
+                .await
+                .map_err(|_| Self::upstream_timeout("response header", target_url))?
+                .map_err(|e| {
                     server_err!(
                         ServerErrorCode::TunnelError,
                         "Failed to request upstream {}: {}",
@@ -898,11 +1206,14 @@ impl ProcessChainHttpServer {
                         e
                     )
                 })?;
+                let resp = Self::strip_forward_response_headers(resp);
                 let resp = resp.map(|body| {
-                    body.map_err(|e| {
-                        ServerError::new(ServerErrorCode::StreamError, format!("{:?}", e))
-                    })
-                    .boxed()
+                    let abort_on_drop = if timeouts.abort_upstream_on_client_close {
+                        Some(connection_task)
+                    } else {
+                        None
+                    };
+                    Self::wrap_upstream_body(body, timeouts.response_body_idle_timeout, abort_on_drop)
                 });
                 Ok(resp)
             }
@@ -1533,7 +1844,17 @@ impl ProcessChainHttpServer {
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
         match resp {
             Ok(resp) => {
-                let resp = self.apply_post_chain(resp, info).await?;
+                let resp = timeout(
+                    self.forward_timeouts.post_chain_timeout,
+                    self.apply_post_chain(resp, info),
+                )
+                .await
+                .map_err(|_| {
+                    ServerError::new(
+                        ServerErrorCode::StreamError,
+                        "post hook timeout".to_string(),
+                    )
+                })??;
                 apply_response_compression(resp, req_info, &self.compression)
             }
             Err(err) => Err(err),
@@ -1969,6 +2290,26 @@ fn parse_gzip_http_version(value: &str) -> ServerResult<Version> {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct ForwardUpstreamTimeoutConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_handshake_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_handshake_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_header_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body_idle_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_chain_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abort_upstream_on_client_close: Option<bool>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ProcessChainHttpServerConfig {
     pub id: String,
@@ -1981,6 +2322,8 @@ pub struct ProcessChainHttpServerConfig {
     pub hook_point: ProcessChainConfigs,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post_hook_point: Option<ProcessChainConfigs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward: Option<ForwardUpstreamTimeoutConfig>,
     #[serde(default)]
     pub gzip: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2105,6 +2448,9 @@ impl ServerFactory for ProcessChainHttpServerFactory {
         if config.version.is_some() {
             builder = builder.version(config.version.clone().unwrap());
         }
+        builder = builder.forward_timeouts(ForwardUpstreamTimeouts::from_config(
+            config.forward.as_ref(),
+        ));
         if let Some(post_hook_point) = config.post_hook_point.as_ref() {
             builder = builder.post_hook_point(post_hook_point.clone());
         }
@@ -2123,9 +2469,68 @@ mod tests {
     use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, GzipEncoder};
     use buckyos_kit::init_logging;
     use hyper_util::rt::{TokioExecutor, TokioIo};
+    use std::collections::VecDeque;
     use std::io::Cursor;
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
+
+    struct PendingBody;
+
+    impl Body for PendingBody {
+        type Data = Bytes;
+        type Error = ServerError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
+
+    struct DelayedFramesBody {
+        frames: VecDeque<Bytes>,
+        delay: Duration,
+        sleep: Option<Pin<Box<Sleep>>>,
+    }
+
+    impl DelayedFramesBody {
+        fn new(frames: Vec<Bytes>, delay: Duration) -> Self {
+            Self {
+                frames: frames.into(),
+                delay,
+                sleep: None,
+            }
+        }
+    }
+
+    impl Body for DelayedFramesBody {
+        type Data = Bytes;
+        type Error = ServerError;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let this = self.get_mut();
+            if this.frames.is_empty() {
+                return Poll::Ready(None);
+            }
+
+            if this.sleep.is_none() {
+                this.sleep = Some(Box::pin(tokio::time::sleep(this.delay)));
+            }
+
+            if let Some(sleep) = this.sleep.as_mut()
+                && sleep.as_mut().poll(cx).is_pending()
+            {
+                return Poll::Pending;
+            }
+
+            this.sleep = None;
+            Poll::Ready(this.frames.pop_front().map(|frame| Ok(Frame::data(frame))))
+        }
+    }
 
     struct FixedResponseServer {
         id: String,
@@ -2246,6 +2651,38 @@ mod tests {
         let mut output = Vec::new();
         decoder.read_to_end(&mut output).await.unwrap();
         Bytes::from(output)
+    }
+
+    async fn build_timeout_test_server(
+        post_hook_point: Option<ProcessChainConfigs>,
+        js_externals: Option<JsExternalsManagerRef>,
+    ) -> ProcessChainHttpServer {
+        let mock_server_mgr = Arc::new(ServerManager::new());
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        reject;
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let mut builder = ProcessChainHttpServer::builder()
+            .id("timeout_test")
+            .version("HTTP/1.1".to_string())
+            .hook_point(chains)
+            .tunnel_manager(TunnelManager::new())
+            .server_mgr(Arc::downgrade(&mock_server_mgr));
+
+        if let Some(post_hook_point) = post_hook_point {
+            builder = builder.post_hook_point(post_hook_point);
+        }
+        if let Some(js_externals) = js_externals {
+            builder = builder.js_externals(js_externals);
+        }
+
+        builder.build().await.unwrap()
     }
 
     #[tokio::test]
@@ -2964,6 +3401,30 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn test_strip_hop_by_hop_headers() {
+        let mut resp = http::Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONNECTION, "close, X-Upstream-Hop")
+            .header("X-Upstream-Hop", "remove")
+            .header("Keep-Alive", "timeout=5")
+            .header(http::header::UPGRADE, "websocket")
+            .header(http::header::CONTENT_TYPE, "text/plain")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        ProcessChainHttpServer::strip_hop_by_hop_headers(resp.headers_mut());
+
+        assert!(resp.headers().get(http::header::CONNECTION).is_none());
+        assert!(resp.headers().get("X-Upstream-Hop").is_none());
+        assert!(resp.headers().get("Keep-Alive").is_none());
+        assert!(resp.headers().get(http::header::UPGRADE).is_none());
+        assert_eq!(
+            resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "text/plain"
+        );
+    }
+
     #[tokio::test]
     async fn test_handle_http1_request_http1_server() {
         let mock_server_mgr = Arc::new(ServerManager::new());
@@ -3249,6 +3710,16 @@ mod tests {
                 let service = hyper::service::service_fn(
                     |req: http::Request<hyper::body::Incoming>| async move {
                         println!("{:?}", req.headers());
+                        assert!(req.headers().get(http::header::CONNECTION).is_none());
+                        assert!(req.headers().get("X-Client-Hop").is_none());
+                        assert!(req.headers().get("Keep-Alive").is_none());
+                        assert!(req.headers().get(http::header::UPGRADE).is_none());
+                        assert_eq!(
+                            req.headers()
+                                .get("X-End-To-End")
+                                .map(|v| v.to_str().unwrap()),
+                            Some("keep")
+                        );
                         assert!(req.headers().get("X-Real-IP").is_some());
                         assert_eq!(
                             req.headers().get("X-Real-IP").map(|v| v.to_str().unwrap()),
@@ -3265,6 +3736,7 @@ mod tests {
                         Ok::<_, ServerError>(
                             http::Response::builder()
                                 .status(StatusCode::OK)
+                                .header(http::header::CONNECTION, "close")
                                 .body(
                                     Full::new(Bytes::from("forward success"))
                                         .map_err(|e| match e {})
@@ -3333,6 +3805,11 @@ mod tests {
         let request = http::Request::builder()
             .method("GET")
             .uri("/test")
+            .header(http::header::CONNECTION, "X-Client-Hop")
+            .header("X-Client-Hop", "remove")
+            .header("Keep-Alive", "timeout=5")
+            .header(http::header::UPGRADE, "websocket")
+            .header("X-End-To-End", "keep")
             .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
             .unwrap();
 
@@ -3347,6 +3824,7 @@ mod tests {
 
         let resp = sender.send_request(request).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(http::header::CONNECTION).is_none());
 
         let body = resp.collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from("forward success"));
@@ -3602,6 +4080,339 @@ mod tests {
     }
 
     #[test]
+    fn test_forward_upstream_timeouts_default() {
+        let timeouts = ForwardUpstreamTimeouts::default();
+
+        assert_eq!(timeouts.connect_timeout, Duration::from_secs(60));
+        assert_eq!(timeouts.tls_handshake_timeout, Duration::from_secs(60));
+        assert_eq!(timeouts.http_handshake_timeout, Duration::from_secs(60));
+        assert_eq!(timeouts.request_timeout, Duration::from_secs(60));
+        assert_eq!(timeouts.response_header_timeout, Duration::from_secs(60));
+        assert_eq!(timeouts.response_body_idle_timeout, Duration::from_secs(60));
+        assert_eq!(timeouts.post_chain_timeout, Duration::from_secs(60));
+        assert!(timeouts.abort_upstream_on_client_close);
+    }
+
+    #[test]
+    fn test_forward_upstream_config_defaults_when_omitted() {
+        let config: ProcessChainHttpServerConfig = serde_yaml_ng::from_str(
+            r#"
+id: test
+type: http
+hook_point: []
+"#,
+        )
+        .unwrap();
+
+        assert!(config.forward.is_none());
+        let timeouts = ForwardUpstreamTimeouts::from_config(config.forward.as_ref());
+        let defaults = ForwardUpstreamTimeouts::default();
+        assert_eq!(timeouts.connect_timeout, defaults.connect_timeout);
+        assert_eq!(
+            timeouts.response_body_idle_timeout,
+            defaults.response_body_idle_timeout
+        );
+        assert_eq!(
+            timeouts.abort_upstream_on_client_close,
+            defaults.abort_upstream_on_client_close
+        );
+    }
+
+    #[test]
+    fn test_forward_upstream_config_overrides_timeouts() {
+        let config: ProcessChainHttpServerConfig = serde_yaml_ng::from_str(
+            r#"
+id: test
+type: http
+hook_point: []
+forward:
+  connect_timeout: 11
+  tls_handshake_timeout: 12
+  http_handshake_timeout: 13
+  request_timeout: 14
+  response_header_timeout: 15
+  response_body_idle_timeout: 16
+  post_chain_timeout: 17
+  abort_upstream_on_client_close: false
+"#,
+        )
+        .unwrap();
+
+        let timeouts = ForwardUpstreamTimeouts::from_config(config.forward.as_ref());
+        assert_eq!(timeouts.connect_timeout, Duration::from_secs(11));
+        assert_eq!(timeouts.tls_handshake_timeout, Duration::from_secs(12));
+        assert_eq!(timeouts.http_handshake_timeout, Duration::from_secs(13));
+        assert_eq!(timeouts.request_timeout, Duration::from_secs(14));
+        assert_eq!(timeouts.response_header_timeout, Duration::from_secs(15));
+        assert_eq!(timeouts.response_body_idle_timeout, Duration::from_secs(16));
+        assert_eq!(timeouts.post_chain_timeout, Duration::from_secs(17));
+        assert!(!timeouts.abort_upstream_on_client_close);
+    }
+
+    #[test]
+    fn test_forward_upstream_config_partial_preserves_defaults() {
+        let config: ProcessChainHttpServerConfig = serde_yaml_ng::from_str(
+            r#"
+id: test
+type: http
+hook_point: []
+forward:
+  response_header_timeout: 7
+"#,
+        )
+        .unwrap();
+
+        let timeouts = ForwardUpstreamTimeouts::from_config(config.forward.as_ref());
+        let defaults = ForwardUpstreamTimeouts::default();
+        assert_eq!(timeouts.connect_timeout, defaults.connect_timeout);
+        assert_eq!(timeouts.response_header_timeout, Duration::from_secs(7));
+        assert_eq!(
+            timeouts.response_body_idle_timeout,
+            defaults.response_body_idle_timeout
+        );
+        assert_eq!(
+            timeouts.abort_upstream_on_client_close,
+            defaults.abort_upstream_on_client_close
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_body_idle_timeout_errors() {
+        let mut body = UpstreamBody::new(PendingBody, Duration::from_millis(10), None);
+        let err = body.frame().await.unwrap().unwrap_err();
+
+        assert_eq!(err.code(), ServerErrorCode::StreamError, "{}", err.msg());
+        assert!(err.msg().contains("upstream response body idle timeout"));
+    }
+
+    #[tokio::test]
+    async fn test_upstream_body_allows_frames_before_idle_and_resets_timer() {
+        let inner = DelayedFramesBody::new(
+            vec![Bytes::from_static(b"first"), Bytes::from_static(b"second")],
+            Duration::from_millis(10),
+        );
+        let mut body = UpstreamBody::new(inner, Duration::from_millis(100), None);
+
+        let first = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .map_err(|_| ())
+            .unwrap();
+        let second = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .map_err(|_| ())
+            .unwrap();
+
+        assert_eq!(first, Bytes::from_static(b"first"));
+        assert_eq!(second, Bytes::from_static(b"second"));
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_upstream_body_abort_handle_fires_on_drop() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        struct AbortGuard(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for AbortGuard {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let connection_task = tokio::spawn(async move {
+            let _guard = AbortGuard(Some(tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+
+        let body = UpstreamBody::new(
+            Full::new(Bytes::new()).map_err(|e| match e {}),
+            Duration::from_secs(60),
+            Some(connection_task),
+        );
+        drop(body);
+
+        timeout(Duration::from_secs(1), rx).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_upstream_body_does_not_abort_handle_after_eof() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        struct AbortGuard(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for AbortGuard {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let connection_task = tokio::spawn(async move {
+            let _guard = AbortGuard(Some(tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+
+        let mut body = UpstreamBody::new(
+            Full::new(Bytes::from_static(b"done")).map_err(|e| match e {}),
+            Duration::from_secs(60),
+            Some(connection_task),
+        );
+        let data = body
+            .frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .map_err(|_| ())
+            .unwrap();
+        assert_eq!(data, Bytes::from_static(b"done"));
+        assert!(body.frame().await.is_none());
+        drop(body);
+
+        assert!(timeout(Duration::from_millis(20), rx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_http_forward_response_header_timeout_errors() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            std::future::pending::<()>().await;
+        });
+
+        let mut http_server = build_timeout_test_server(None, None).await;
+        http_server.forward_timeouts.response_header_timeout = Duration::from_millis(10);
+        http_server.forward_timeouts.request_timeout = Duration::from_secs(1);
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/slow")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+        let target_url = format!("http://{}", listen_addr);
+
+        let err = http_server
+            .handle_forward_upstream(request, &target_url, &StreamInfo::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ServerErrorCode::StreamError, "{}", err.msg());
+        assert!(err.msg().contains("upstream response header timeout"));
+        assert!(err.msg().contains(target_url.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_https_forward_tls_handshake_timeout_errors() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let mut http_server = build_timeout_test_server(None, None).await;
+        http_server.forward_timeouts.connect_timeout = Duration::from_secs(1);
+        http_server.forward_timeouts.tls_handshake_timeout = Duration::from_millis(10);
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/slow")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+        let target_url = format!("https://{}", listen_addr);
+
+        let err = http_server
+            .handle_forward_upstream(request, &target_url, &StreamInfo::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ServerErrorCode::StreamError, "{}", err.msg());
+        assert!(err.msg().contains("upstream tls handshake timeout"));
+        assert!(err.msg().contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn test_post_chain_timeout_errors() {
+        let js_externals = Arc::new(JsExternalsManager::new());
+        js_externals
+            .add_js_external(
+                "slow_post",
+                r#"
+function slow_post(context) {
+    let sum = 0;
+    for (let i = 0; i < 10000000; i++) {
+        sum += i;
+    }
+    return sum > 0;
+}
+"#
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let post_chains = r#"
+- id: post
+  priority: 1
+  blocks:
+    - id: post
+      block: |
+        call slow_post;
+        "#;
+        let post_chains: ProcessChainConfigs = serde_yaml_ng::from_str(post_chains).unwrap();
+
+        let mut http_server =
+            build_timeout_test_server(Some(post_chains), Some(js_externals.clone())).await;
+        http_server.forward_timeouts.post_chain_timeout = Duration::from_millis(5);
+
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/")
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+        let req_info = CompressionRequestInfo::from_request(&request);
+        let response = http::Response::builder()
+            .status(StatusCode::OK)
+            .body(
+                Full::new(Bytes::from_static(b"ok"))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            )
+            .unwrap();
+
+        let err = http_server
+            .apply_post_chain_result(Ok(response), &req_info, Some(&StreamInfo::default()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ServerErrorCode::StreamError, "{}", err.msg());
+        assert!(err.msg().contains("post hook timeout"));
+    }
+
+    #[test]
     fn test_upstream_sni_host_uses_upstream_host() {
         let request_url = Url::parse("https://inuy7.tbudr.top/api/v1/ai/chat/completions").unwrap();
         let sni_host = ProcessChainHttpServer::upstream_sni_host(&request_url).unwrap();
@@ -3627,10 +4438,12 @@ mod tests {
         });
 
         let unreachable_v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
-        let (stream, connected_addr) =
-            ProcessChainHttpServer::connect_upstream_candidates(vec![unreachable_v6, listen_addr])
-                .await
-                .unwrap();
+        let (stream, connected_addr) = ProcessChainHttpServer::connect_upstream_candidates(
+            vec![unreachable_v6, listen_addr],
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(connected_addr, listen_addr);
         assert_eq!(stream.peer_addr().unwrap(), listen_addr);
@@ -3641,10 +4454,12 @@ mod tests {
         let unreachable_v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
         let closed_v4: SocketAddr = "127.0.0.1:9".parse().unwrap();
 
-        let (_reason, msg) =
-            ProcessChainHttpServer::connect_upstream_candidates(vec![unreachable_v6, closed_v4])
-                .await
-                .unwrap_err();
+        let (_reason, msg) = ProcessChainHttpServer::connect_upstream_candidates(
+            vec![unreachable_v6, closed_v4],
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
 
         assert!(msg.contains("2001:db8::1"));
         assert!(msg.contains("127.0.0.1:9"));
@@ -3991,6 +4806,7 @@ mod tests {
             h3_port: None,
             hook_point: ProcessChainConfigs::default(),
             post_hook_point: None,
+            forward: None,
             gzip: false,
             gzip_types: Vec::new(),
             gzip_min_length: default_gzip_min_length(),

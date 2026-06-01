@@ -3,16 +3,16 @@ use crate::sn_db::{self, *};
 use crate::sqlite_db::SqliteSnDB;
 use crate::v2::{
     handle_auth, handle_device, handle_did, handle_dns, handle_query, handle_user, handle_zone,
-    SnV2AuthManager,
+    parse_params, require_account_username, DeviceUpdateReq, SnV2AuthManager,
 };
 use ::kRPC::*;
 use async_trait::async_trait;
 use buckyos_kit::{get_buckyos_service_data_dir, is_valid_name, NameType};
 use cyfs_gateway_lib::{into_server_err, server_err};
 use cyfs_gateway_lib::{
-    qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer, NameServer, QAServer,
-    Server, ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory,
-    ServerResult, StreamInfo,
+    qa_json_to_rpc_request, HttpRequestProcessChainVars, HttpServer, NameServer, QAServer, Server,
+    ServerConfig, ServerContextRef, ServerError, ServerErrorCode, ServerFactory, ServerResult,
+    StreamInfo,
 };
 use http::{Method, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -36,11 +36,14 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     result::Result,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{Duration, Instant};
 
 const CLEAR_STATE_ACTIVE_CODE: &str = "zX6cV7bN8mK9lJ0hG1fD";
 const RESERVED_USER_NAMES_FILE_ENV: &str = "BUCKYOS_SN_RESERVED_NAMES_FILE";
 const RESERVED_USER_NAMES_FILE: &str = "reserved_user_names.txt";
+const SN_QUERY_POSITIVE_TTL_SECS: u64 = 60;
+const SN_QUERY_NEGATIVE_TTL_SECS: u64 = 15;
 
 fn is_filtered_zonegate_ip(ip: IpAddr) -> bool {
     match ip {
@@ -155,6 +158,19 @@ pub struct SNServer {
     device_jwt: Vec<String>,
     db: SnDBRef,
     v2_auth: Arc<SnV2AuthManager>,
+    query_cache: Arc<RwLock<HashMap<String, SnQueryCacheEntry>>>,
+}
+
+#[derive(Clone, Debug)]
+enum SnQueryCacheValue {
+    Hit(NameInfo),
+    Miss,
+}
+
+#[derive(Clone, Debug)]
+struct SnQueryCacheEntry {
+    expires_at: Instant,
+    value: SnQueryCacheValue,
 }
 
 impl SNServer {
@@ -206,6 +222,113 @@ impl SNServer {
 
     fn normalize_registration_username(username: &str) -> String {
         username.trim().to_lowercase()
+    }
+
+    fn normalize_query_name(name: &str) -> String {
+        name.trim().trim_end_matches('.').to_ascii_lowercase()
+    }
+
+    fn build_query_cache_key(name: &str, record_type: RecordType) -> String {
+        format!(
+            "{}|{}",
+            Self::normalize_query_name(name),
+            record_type.to_string()
+        )
+    }
+
+    async fn get_cached_query_result(
+        &self,
+        name: &str,
+        record_type: RecordType,
+    ) -> Option<ServerResult<NameInfo>> {
+        let key = Self::build_query_cache_key(name, record_type);
+        let mut cache = self.query_cache.write().await;
+        let Some(entry) = cache.get(key.as_str()).cloned() else {
+            return None;
+        };
+
+        if Instant::now() >= entry.expires_at {
+            cache.remove(key.as_str());
+            return None;
+        }
+
+        match entry.value {
+            SnQueryCacheValue::Hit(name_info) => Some(Ok(name_info)),
+            SnQueryCacheValue::Miss => Some(Err(server_err!(
+                ServerErrorCode::NotFound,
+                "cached miss for {}",
+                Self::normalize_query_name(name)
+            ))),
+        }
+    }
+
+    async fn cache_query_hit(&self, name: &str, record_type: RecordType, name_info: &NameInfo) {
+        let key = Self::build_query_cache_key(name, record_type);
+        let entry = SnQueryCacheEntry {
+            expires_at: Instant::now() + Duration::from_secs(SN_QUERY_POSITIVE_TTL_SECS),
+            value: SnQueryCacheValue::Hit(name_info.clone()),
+        };
+        self.query_cache.write().await.insert(key, entry);
+    }
+
+    async fn cache_query_miss(&self, name: &str, record_type: RecordType) {
+        let key = Self::build_query_cache_key(name, record_type);
+        let entry = SnQueryCacheEntry {
+            expires_at: Instant::now() + Duration::from_secs(SN_QUERY_NEGATIVE_TTL_SECS),
+            value: SnQueryCacheValue::Miss,
+        };
+        self.query_cache.write().await.insert(key, entry);
+    }
+
+    fn build_user_query_cache_domains(
+        &self,
+        username: &str,
+        user_domain: Option<&str>,
+    ) -> Vec<String> {
+        let mut domains = vec![format!("{}.web3.{}", username, self.server_host)];
+        if let Some(user_domain) = user_domain {
+            let normalized = Self::normalize_query_name(user_domain);
+            if !normalized.is_empty() {
+                domains.push(normalized);
+            }
+        }
+        domains
+    }
+
+    async fn invalidate_query_cache_domains(&self, domains: &[String]) {
+        if domains.is_empty() {
+            return;
+        }
+
+        let mut cache = self.query_cache.write().await;
+        cache.retain(|key, _| {
+            let Some((cached_domain, _)) = key.split_once('|') else {
+                return true;
+            };
+            !domains.iter().any(|domain| {
+                cached_domain == domain || cached_domain.ends_with(format!(".{}", domain).as_str())
+            })
+        });
+    }
+
+    pub(crate) async fn invalidate_query_cache_for_username(&self, username: &str) {
+        let user_domain = self
+            .db
+            .get_user_info(username)
+            .await
+            .ok()
+            .and_then(|user| user.and_then(|u| u.user_domain));
+        let domains = self.build_user_query_cache_domains(username, user_domain.as_deref());
+        self.invalidate_query_cache_domains(&domains).await;
+    }
+
+    pub(crate) async fn invalidate_query_cache_for_username_and_domain(
+        &self,
+        username: &str,
+        user_domain: Option<&str>,
+    ) {
+        let domains = self.build_user_query_cache_domains(username, user_domain);
+        self.invalidate_query_cache_domains(&domains).await;
     }
 
     fn reserved_user_names_file() -> PathBuf {
@@ -387,6 +510,7 @@ impl SNServer {
             device_jwt: server_config.device_jwt,
             db,
             v2_auth,
+            query_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -402,11 +526,7 @@ impl SNServer {
         let username = Self::normalize_registration_username(username);
         let (valid, reason, message) =
             if let Err(message) = Self::validate_registration_username(username.as_str()) {
-                (
-                    false,
-                    "invalid_username".to_string(),
-                    message.to_string(),
-                )
+                (false, "invalid_username".to_string(), message.to_string())
             } else {
                 let exists = self
                     .db
@@ -550,7 +670,7 @@ impl SNServer {
                 user_name.as_str(),
                 public_key,
                 zone_config_jwt,
-                real_user_domain,
+                real_user_domain.clone(),
             )
             .await;
         if ret.is_err() {
@@ -570,6 +690,11 @@ impl SNServer {
             "user {} registered success, public_key: {}, active_code: {}",
             user_name, public_key, active_code
         );
+        self.invalidate_query_cache_for_username_and_domain(
+            user_name.as_str(),
+            real_user_domain.as_deref(),
+        )
+        .await;
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -685,6 +810,7 @@ impl SNServer {
         }
 
         info!("device {}_{} registered success", user_name, device_name);
+        self.invalidate_query_cache_for_username(user_name).await;
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -775,6 +901,8 @@ impl SNServer {
             "user {} zone_config and user_domain updated successfully",
             user_name
         );
+        self.invalidate_query_cache_for_username_and_domain(user_name, real_user_domain.as_deref())
+            .await;
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -841,6 +969,7 @@ impl SNServer {
             })?;
 
         info!("user {} zone_config cleared successfully", user_name);
+        self.invalidate_query_cache_for_username(user_name).await;
 
         Ok(RPCResponse::create_by_req(
             RPCResult::Success(json!({ "code": 0 })),
@@ -885,6 +1014,11 @@ impl SNServer {
             return Err(RPCErrors::ParseRequestError("device not found".to_string()));
         }
         let (old_device_info, _) = old_device_info.unwrap();
+        if old_device_info.id != device_info.id {
+            return Err(RPCErrors::ParseRequestError(
+                "device did mismatch".to_string(),
+            ));
+        }
 
         let session_token = req.token.clone();
         if session_token.is_none() {
@@ -901,7 +1035,15 @@ impl SNServer {
                 error!("Failed to decode device public key: {:?}", e);
                 RPCErrors::ParseRequestError(e.to_string())
             })?;
-        rpc_session_token.verify_by_key(&verify_public_key)?;
+        if let Err(verify_err) = rpc_session_token.verify_by_key(&verify_public_key) {
+            Self::verify_legacy_device_update_trusted_token(&rpc_session_token)?;
+            warn!(
+                "accept legacy device update with trusted verify-hub token for {}_{} after device signature verify failed: {}",
+                owner_id,
+                device_info.name,
+                verify_err
+            );
+        }
 
         info!(
             "start update {}_{} ==> {:?}",
@@ -909,29 +1051,217 @@ impl SNServer {
             device_info.name.clone(),
             device_info_json
         );
-        let ip_str = ip_from.to_string();
+        let device_ip = ip_from.to_string();
+        let device_info_json = device_info_json.to_string();
+        self.update_device_by_owner(
+            owner_id,
+            device_info.name.as_str(),
+            None,
+            None,
+            device_ip.as_str(),
+            device_info_json.as_str(),
+        )
+        .await?;
 
-        self.db
-            .update_device_info_by_name(
-                owner_id,
-                &device_info.name.clone(),
-                ip_str.as_str(),
-                device_info_json.to_string().as_str(),
-            )
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("{}", e)));
-
-        let resp = RPCResponse::create_by_req(
+        Ok(RPCResponse::create_by_req(
             RPCResult::Success(json!({
                 "code":0
             })),
             &req,
-        );
+        ))
+    }
 
-        let key = format!("{}_{}", owner_id, device_info.name.clone());
+    fn verify_legacy_device_update_trusted_token(
+        rpc_session_token: &RPCSessionToken,
+    ) -> Result<(), RPCErrors> {
+        if !rpc_session_token.is_self_verify() {
+            return Err(RPCErrors::InvalidToken(
+                "legacy device.update token is not self verified jwt".to_string(),
+            ));
+        }
 
+        match rpc_session_token.iss.as_deref() {
+            Some("verify-hub") => {}
+            Some(other) => {
+                return Err(RPCErrors::InvalidToken(format!(
+                    "legacy device.update token issuer mismatch: {}",
+                    other
+                )))
+            }
+            None => {
+                return Err(RPCErrors::InvalidToken(
+                    "legacy device.update token issuer missing".to_string(),
+                ))
+            }
+        }
+
+        match rpc_session_token.appid.as_deref() {
+            Some("node-daemon") => {}
+            Some(other) => {
+                return Err(RPCErrors::InvalidToken(format!(
+                    "legacy device.update token appid mismatch: {}",
+                    other
+                )))
+            }
+            None => {
+                return Err(RPCErrors::InvalidToken(
+                    "legacy device.update token appid missing".to_string(),
+                ))
+            }
+        }
+
+        match rpc_session_token.aud.as_deref() {
+            Some("node-daemon") => {}
+            Some(other) => {
+                return Err(RPCErrors::InvalidToken(format!(
+                    "legacy device.update token aud mismatch: {}",
+                    other
+                )))
+            }
+            None => {
+                return Err(RPCErrors::InvalidToken(
+                    "legacy device.update token aud missing".to_string(),
+                ))
+            }
+        }
+
+        match rpc_session_token.sub.as_deref() {
+            Some("kernel") => {}
+            Some(other) => {
+                return Err(RPCErrors::InvalidToken(format!(
+                    "legacy device.update token sub mismatch: {}",
+                    other
+                )))
+            }
+            None => {
+                return Err(RPCErrors::InvalidToken(
+                    "legacy device.update token sub missing".to_string(),
+                ))
+            }
+        }
+
+        let now = buckyos_kit::buckyos_get_unix_timestamp();
+        match rpc_session_token.exp {
+            Some(exp) if exp > now => Ok(()),
+            Some(_) => Err(RPCErrors::InvalidToken(
+                "legacy device.update token expired".to_string(),
+            )),
+            None => Err(RPCErrors::InvalidToken(
+                "legacy device.update token exp missing".to_string(),
+            )),
+        }
+    }
+
+    pub async fn update_device_v2(&self, req: RPCRequest) -> Result<RPCResponse, RPCErrors> {
+        let username = require_account_username(self, &req)?;
+        let params: DeviceUpdateReq = parse_params(&req)?;
+
+        self.update_device_by_owner(
+            username.as_str(),
+            params.device_name.as_str(),
+            params.device_did.as_deref(),
+            params.mini_config_jwt.as_deref(),
+            params.device_ip.as_str(),
+            params.device_info.as_str(),
+        )
+        .await?;
+
+        Ok(RPCResponse::create_by_req(
+            RPCResult::Success(json!({ "code": 0 })),
+            &req,
+        ))
+    }
+
+    fn is_legacy_device_update_params(params: &Value) -> bool {
+        params.get("device_id").is_some()
+            || params.get("owner_id").is_some()
+            || params
+                .get("device_info")
+                .map(|device_info| device_info.is_object())
+                .unwrap_or(false)
+    }
+
+    fn normalize_legacy_device_update_req(mut req: RPCRequest) -> Result<RPCRequest, RPCErrors> {
+        if req.params.get("owner_id").is_some() {
+            return Ok(req);
+        }
+
+        let owner_id = req
+            .params
+            .get("device_info")
+            .and_then(|device_info| {
+                device_info
+                    .get("owner_id")
+                    .or_else(|| device_info.get("owner"))
+            })
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RPCErrors::ParseRequestError("Invalid params, owner_id is none".to_string())
+            })?
+            .to_string();
+
+        req.params
+            .as_object_mut()
+            .ok_or_else(|| {
+                RPCErrors::ParseRequestError(
+                    "Invalid params, request params is not object".to_string(),
+                )
+            })?
+            .insert("owner_id".to_string(), Value::String(owner_id));
+
+        Ok(req)
+    }
+
+    pub async fn update_device_namespaced(
+        &self,
+        req: RPCRequest,
+        ip_from: IpAddr,
+    ) -> Result<RPCResponse, RPCErrors> {
+        if Self::is_legacy_device_update_params(&req.params) {
+            let req = Self::normalize_legacy_device_update_req(req)?;
+            self.update_device(Self::rewrite_rpc_method(req, "update"), ip_from)
+                .await
+        } else {
+            self.update_device_v2(Self::rewrite_rpc_method(req, "update"))
+                .await
+        }
+    }
+
+    async fn update_device_by_owner(
+        &self,
+        username: &str,
+        device_name: &str,
+        device_did: Option<&str>,
+        mini_config_jwt: Option<&str>,
+        device_ip: &str,
+        device_info: &str,
+    ) -> Result<(), RPCErrors> {
+        match (device_did, mini_config_jwt) {
+            (Some(device_did), Some(mini_config_jwt)) => {
+                self.db
+                    .update_device_by_name(
+                        username,
+                        device_name,
+                        device_did,
+                        mini_config_jwt,
+                        device_ip,
+                        device_info,
+                    )
+                    .await
+                    .map_err(|e| RPCErrors::ReasonError(format!("{}", e)))?;
+            }
+            _ => {
+                self.db
+                    .update_device_info_by_name(username, device_name, device_ip, device_info)
+                    .await
+                    .map_err(|e| RPCErrors::ReasonError(format!("{}", e)))?;
+            }
+        }
+
+        let key = format!("{}_{}", username, device_name);
         info!("update device info done: for {}", key);
-        return Ok(resp);
+        self.invalidate_query_cache_for_username(username).await;
+        Ok(())
     }
 
     pub async fn get_device_by_public_key(
@@ -1313,6 +1643,53 @@ impl SNServer {
         return None;
     }
 
+    async fn user_exists_for_host_resolution(&self, username: &str) -> bool {
+        match self.db.get_user_info(username).await {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(e) => {
+                warn!(
+                    "get user info error for host resolution {}: {}",
+                    username, e
+                );
+                false
+            }
+        }
+    }
+
+    // Resolve web3 hosts using DB state only for dash-separated names. This avoids
+    // treating usernames like "wqs-vps-us" as legacy "subhost-username" hosts.
+    async fn resolve_user_subhost_from_host(&self, host: &str) -> Option<(String, String)> {
+        let end_string = format!(".web3.{}", self.server_host);
+        if !host.ends_with(&end_string) {
+            return None;
+        }
+
+        let sub_name = host[0..host.len() - end_string.len()].to_string();
+        if sub_name.contains(".") {
+            let username = sub_name.split(".").last()?.to_string();
+            return Some((sub_name, username));
+        }
+
+        if !sub_name.contains("-") {
+            return Some((sub_name.clone(), sub_name));
+        }
+
+        if self.user_exists_for_host_resolution(&sub_name).await {
+            return Some((sub_name.clone(), sub_name));
+        }
+
+        let parts: Vec<&str> = sub_name.split("-").collect();
+        for start in 1..parts.len() {
+            let username = parts[start..].join("-");
+            if self.user_exists_for_host_resolution(&username).await {
+                return Some((sub_name.clone(), username));
+            }
+        }
+
+        SNServer::get_user_subhost_from_host(host, &self.server_host)
+    }
+
     async fn get_user_zonegate_address_by_domain(
         &self,
         domain: &str,
@@ -1513,6 +1890,7 @@ impl SNServer {
         }
 
         info!("add dns record {} {} success", user_name, domain);
+        self.invalidate_query_cache_for_username(user_name).await;
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -1644,6 +2022,7 @@ impl SNServer {
         }
 
         info!("remove dns record {} {} success", user_name, domain);
+        self.invalidate_query_cache_for_username(user_name).await;
 
         let resp = RPCResponse::create_by_req(
             RPCResult::Success(json!({
@@ -1925,7 +2304,7 @@ impl SNServer {
                     handle_device(self, Self::rewrite_rpc_method(req, "register")).await
                 }
             }
-            "device.update" => handle_device(self, Self::rewrite_rpc_method(req, "update")).await,
+            "device.update" => self.update_device_namespaced(req, ip_from).await,
             "update" => {
                 self.update_device(Self::rewrite_rpc_method(req, "update"), ip_from)
                     .await
@@ -2070,7 +2449,7 @@ impl SNServer {
     }
 
     pub(crate) async fn query_device_by_hostname_v2(&self, req_host: &str) -> Option<OODInfo> {
-        let get_result = SNServer::get_user_subhost_from_host(req_host, &self.server_host);
+        let get_result = self.resolve_user_subhost_from_host(req_host).await;
         if get_result.is_some() {
             let (sub_host, username) = get_result.unwrap();
             let user_info = self.db.get_user_info(username.as_str()).await;
@@ -2874,11 +3253,45 @@ impl NameServer for SNServer {
         record_type: Option<RecordType>,
         from_ip: Option<IpAddr>,
     ) -> ServerResult<NameInfo> {
-        info!(
-            "sn server process name query: {} record_type: {:?}",
-            name, record_type
-        );
         let record_type = record_type.unwrap_or_default();
+        if let Some(cached) = self.get_cached_query_result(name, record_type).await {
+            return cached;
+        }
+
+        let result = self.query_uncached(name, record_type, from_ip).await;
+        match &result {
+            Ok(name_info) => self.cache_query_hit(name, record_type, name_info).await,
+            Err(err) if err.code() == ServerErrorCode::NotFound => {
+                self.cache_query_miss(name, record_type).await
+            }
+            Err(_) => {}
+        }
+
+        result
+    }
+
+    async fn query_did(
+        &self,
+        did: &DID,
+        doc_type: Option<&str>,
+        from_ip: Option<IpAddr>,
+    ) -> ServerResult<EncodedDocument> {
+        self.query_did_v2(did, doc_type, from_ip).await
+    }
+}
+
+impl SNServer {
+    async fn query_uncached(
+        &self,
+        name: &str,
+        record_type: RecordType,
+        from_ip: Option<IpAddr>,
+    ) -> ServerResult<NameInfo> {
+        debug!(
+            "sn server process name query: {} record_type: {:?}",
+            name,
+            Some(record_type)
+        );
         let from_ip = from_ip.unwrap_or(self.server_ip);
         let mut is_support = false;
         if record_type == RecordType::A
@@ -2940,7 +3353,7 @@ impl NameServer for SNServer {
             }
         }
 
-        let get_result = SNServer::get_user_subhost_from_host(&req_real_name, &self.server_host);
+        let get_result = self.resolve_user_subhost_from_host(&req_real_name).await;
         if get_result.is_some() {
             let (sub_host, username) = get_result.unwrap();
 
@@ -2956,7 +3369,7 @@ impl NameServer for SNServer {
             //             name.to_string()
             //         ));
             //     }
-            info!(
+            debug!(
                 "host {} owner by user {}, sub_host: {}, record_type: {:?}",
                 req_real_name, username, sub_host, record_type
             );
@@ -3012,7 +3425,7 @@ impl NameServer for SNServer {
 
                         let mut result_name_info = NameInfo::from_address_vec(name, address_vec);
                         result_name_info.ttl = Some(ttl);
-                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        debug!("=>{} result_name_info: {:?}", name, result_name_info);
                         return Ok(result_name_info);
                     }
                     let address_vec = self
@@ -3021,7 +3434,7 @@ impl NameServer for SNServer {
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        debug!("=>{} result_name_info: {:?}", name, result_name_info);
                         Ok(result_name_info)
                     } else {
                         Err(server_err!(
@@ -3040,7 +3453,7 @@ impl NameServer for SNServer {
                 }
             }
         } else {
-            info!("get user subhost from host: {} failed", req_real_name);
+            debug!("get user subhost from host: {} failed", req_real_name);
             let real_domain_name = name[0..name.len() - 1].to_string();
             match record_type {
                 RecordType::TXT => {
@@ -3069,7 +3482,7 @@ impl NameServer for SNServer {
                     if address_vec.is_some() {
                         let address_vec = address_vec.unwrap();
                         let result_name_info = NameInfo::from_address_vec(name, address_vec);
-                        info!("=>{} result_name_info: {:?}", name, result_name_info);
+                        debug!("=>{} result_name_info: {:?}", name, result_name_info);
                         return Ok(result_name_info);
                     }
                 }
@@ -3088,15 +3501,6 @@ impl NameServer for SNServer {
                 name.to_string()
             ));
         }
-    }
-
-    async fn query_did(
-        &self,
-        did: &DID,
-        doc_type: Option<&str>,
-        from_ip: Option<IpAddr>,
-    ) -> ServerResult<EncodedDocument> {
-        self.query_did_v2(did, doc_type, from_ip).await
     }
 }
 
@@ -3468,6 +3872,35 @@ mod tests {
     const TEST_ROOT_USER: &str = "testroot";
     const TEST_LEGACY_USER: &str = "testlegacy";
 
+    async fn create_test_sn_server() -> SNServer {
+        let db = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+        let sqlite_db = Arc::new(
+            SqliteSnDB::new_by_path(db.path().to_str().unwrap())
+                .await
+                .unwrap(),
+        );
+        sqlite_db.initialize_database().await.unwrap();
+        sqlite_db
+            .insert_activation_code(CLEAR_STATE_ACTIVE_CODE)
+            .await
+            .unwrap();
+        let db = sqlite_db as SnDBRef;
+
+        let config = SNServerConfig {
+            id: "test-cache".to_string(),
+            host: "buckyos.ai".to_string(),
+            ip: "127.0.0.1".to_string(),
+            boot_jwt: String::new(),
+            owner_pkx: String::new(),
+            device_jwt: vec![],
+            aliases: vec![],
+            v2_auth_data_dir: None,
+            db_type: Some("sqlite".to_string()),
+            db_params: None,
+        };
+        SNServer::new(config, db).await
+    }
+
     #[test]
     fn test_split_host_name() {
         let req_host = "home.lzc.web3.buckyos.io".to_string();
@@ -3517,6 +3950,58 @@ mod tests {
         assert_eq!(username, "alice".to_string());
     }
 
+    async fn register_test_user(server: &SNServer, username: &str) {
+        server
+            .db
+            .register_user_directly(username, "pk", "{}", None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_subhost_prefers_full_dash_username() {
+        let server = create_test_sn_server().await;
+        register_test_user(&server, "wqs-vps-us").await;
+        register_test_user(&server, "us").await;
+
+        let (sub_host, username) = server
+            .resolve_user_subhost_from_host("wqs-vps-us.web3.buckyos.ai")
+            .await
+            .unwrap();
+
+        assert_eq!(sub_host, "wqs-vps-us");
+        assert_eq!(username, "wqs-vps-us");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_subhost_keeps_legacy_dash_subhost() {
+        let server = create_test_sn_server().await;
+        register_test_user(&server, "lzc").await;
+
+        let (sub_host, username) = server
+            .resolve_user_subhost_from_host("buckyos-filebrowser-lzc.web3.buckyos.ai")
+            .await
+            .unwrap();
+
+        assert_eq!(sub_host, "buckyos-filebrowser-lzc");
+        assert_eq!(username, "lzc");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_user_subhost_uses_longest_existing_dash_suffix() {
+        let server = create_test_sn_server().await;
+        register_test_user(&server, "wqs-vps-us").await;
+        register_test_user(&server, "us").await;
+
+        let (sub_host, username) = server
+            .resolve_user_subhost_from_host("home-wqs-vps-us.web3.buckyos.ai")
+            .await
+            .unwrap();
+
+        assert_eq!(sub_host, "home-wqs-vps-us");
+        assert_eq!(username, "wqs-vps-us");
+    }
+
     #[test]
     fn test_validate_registration_username() {
         for username in ["validuser", "my-device"] {
@@ -3557,24 +4042,67 @@ mod tests {
     }
 
     #[test]
+    fn test_query_cache_key_normalizes_domain_and_record_type() {
+        let key =
+            SNServer::build_query_cache_key(" Meteormeta.Web3.Buckyos.Ai. ", RecordType::AAAA);
+        assert_eq!(key, "meteormeta.web3.buckyos.ai|AAAA");
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_query_cache_domains_removes_matching_domain_and_subdomains() {
+        let server = create_test_sn_server().await;
+        let mut cache = server.query_cache.write().await;
+        let expires_at = Instant::now() + Duration::from_secs(60);
+        cache.insert(
+            "meteormeta.web3.buckyos.ai|A".to_string(),
+            SnQueryCacheEntry {
+                expires_at,
+                value: SnQueryCacheValue::Miss,
+            },
+        );
+        cache.insert(
+            "home.meteormeta.web3.buckyos.ai|TXT".to_string(),
+            SnQueryCacheEntry {
+                expires_at,
+                value: SnQueryCacheValue::Miss,
+            },
+        );
+        cache.insert(
+            "other.web3.buckyos.ai|A".to_string(),
+            SnQueryCacheEntry {
+                expires_at,
+                value: SnQueryCacheValue::Miss,
+            },
+        );
+        drop(cache);
+
+        server
+            .invalidate_query_cache_domains(&vec!["meteormeta.web3.buckyos.ai".to_string()])
+            .await;
+
+        let cache = server.query_cache.read().await;
+        assert!(!cache.contains_key("meteormeta.web3.buckyos.ai|A"));
+        assert!(!cache.contains_key("home.meteormeta.web3.buckyos.ai|TXT"));
+        assert!(cache.contains_key("other.web3.buckyos.ai|A"));
+    }
+
+    #[test]
     fn test_zonegate_ip_filter_only_blocks_172_private_range() {
         assert!(is_filtered_zonegate_ip("172.17.0.1".parse().unwrap()));
         assert!(is_filtered_zonegate_ip("172.31.255.254".parse().unwrap()));
 
         assert!(!is_filtered_zonegate_ip("192.168.100.191".parse().unwrap()));
         assert!(!is_filtered_zonegate_ip("207.246.96.13".parse().unwrap()));
-        assert!(!is_filtered_zonegate_ip("240e:3b3:30c0:930::47f".parse().unwrap()));
+        assert!(!is_filtered_zonegate_ip(
+            "240e:3b3:30c0:930::47f".parse().unwrap()
+        ));
     }
 
     #[test]
     fn test_push_zonegate_address_for_a_record_keeps_192_filters_172_and_dedups() {
         let mut addresses = Vec::new();
 
-        push_zonegate_address(
-            &mut addresses,
-            "172.17.0.1".parse().unwrap(),
-            RecordType::A,
-        );
+        push_zonegate_address(&mut addresses, "172.17.0.1".parse().unwrap(), RecordType::A);
         push_zonegate_address(
             &mut addresses,
             "192.168.100.191".parse().unwrap(),
@@ -3690,7 +4218,10 @@ mod tests {
 
         let exported = SNServer::build_device_info_json(&device);
         assert!(exported.get("ip").is_none());
-        assert_eq!(exported.get("ips").and_then(|v| v.as_array()).cloned(), Some(vec![]));
+        assert_eq!(
+            exported.get("ips").and_then(|v| v.as_array()).cloned(),
+            Some(vec![])
+        );
         assert_eq!(
             exported.get("all_ip").and_then(|v| v.as_array()).cloned(),
             Some(vec![])
@@ -4085,7 +4616,7 @@ mod tests {
         //println!("v: {:?}", v);
         assert_eq!(v.get("device_name").unwrap().as_str().unwrap(), "ood1");
         assert_eq!(v.get("owner").unwrap().as_str().unwrap(), TEST_USER);
-        //assert!(v.get("ip").is_some());
+        assert!(v.get("ip").is_none());
 
         // did:dev:public_key type=doc/info
         let did_dev = device_config.id.to_string();
@@ -4112,7 +4643,7 @@ mod tests {
         assert!(resp.status().is_success());
         let v: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(v.get("device_name").unwrap().as_str().unwrap(), "ood1");
-        //assert!(v.get("ip").is_some());
+        assert!(v.get("ip").is_none());
 
         let krpc = kRPC::new("http://127.0.0.1:19091", Some(token.clone()));
         let result = krpc
@@ -4299,7 +4830,98 @@ mod tests {
         let device_info = ret.unwrap();
         assert_eq!(device_info.cpu_info.unwrap(), "AMD");
 
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
+                device_config.id.to_string()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["cpu_info"].as_str().unwrap(), "AMD");
+
+        let mut legacy_namespaced_device_info = DeviceInfo::from_device_doc(&device_config);
+        legacy_namespaced_device_info.cpu_info = Some("Zen5".to_string());
+        let mut legacy_namespaced_device_info_json =
+            serde_json::to_value(&legacy_namespaced_device_info).unwrap();
+        legacy_namespaced_device_info_json
+            .as_object_mut()
+            .unwrap()
+            .insert("owner_id".to_string(), Value::String(TEST_USER.to_string()));
         let result = krpc
+            .call(
+                "device.update",
+                json!({
+                    "device_id": device_config.name,
+                    "device_info": legacy_namespaced_device_info_json
+                }),
+            )
+            .await;
+        assert!(result.is_ok());
+
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
+                device_config.id.to_string()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["cpu_info"].as_str().unwrap(), "Zen5");
+
+        let verify_hub_legacy_token = RPCSessionToken {
+            token_type: RPCSessionTokenType::JWT,
+            token: None,
+            aud: Some("node-daemon".to_string()),
+            exp: Some(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 600,
+            ),
+            iss: Some("verify-hub".to_string()),
+            jti: Some("legacy-update-test".to_string()),
+            session: Some(1),
+            sub: Some("kernel".to_string()),
+            appid: Some("node-daemon".to_string()),
+            extra: HashMap::new(),
+        }
+        .generate_jwt(Some("verify-hub".to_string()), &user_encoding_key)
+        .unwrap();
+        let verify_hub_krpc = kRPC::new("http://127.0.0.1:19091", Some(verify_hub_legacy_token));
+        let mut verify_hub_device_info = DeviceInfo::from_device_doc(&device_config);
+        verify_hub_device_info.cpu_info = Some("Zen6".to_string());
+        let result = verify_hub_krpc
+            .call(
+                "device.update",
+                json!({
+                    "device_id": device_config.name,
+                    "owner_id": TEST_USER,
+                    "device_info": verify_hub_device_info
+                }),
+            )
+            .await;
+        assert!(result.is_ok());
+
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:19091/1.0/identifiers/{}?type=info",
+                device_config.id.to_string()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["cpu_info"].as_str().unwrap(), "Zen6");
+
+        let result = verify_hub_krpc
             .call(
                 "query_by_did",
                 json!({
@@ -4309,7 +4931,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let result = krpc
+        let result = verify_hub_krpc
             .call(
                 "query_by_hostname",
                 json!({
@@ -4818,6 +5440,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["code"].as_i64().unwrap(), 0);
+
+        let mut updated_device_info = DeviceInfo::from_device_doc(&device_config);
+        updated_device_info.cpu_info = Some("Intel".to_string());
+        let result = device_krpc
+            .call(
+                "device.update",
+                json!({
+                    "device_name": "ood1",
+                    "device_ip": "192.168.100.10",
+                    "device_info": serde_json::to_string(&updated_device_info).unwrap(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["code"].as_i64().unwrap(), 0);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:19092/1.0/identifiers/{}?type=info",
+                device_config.id.to_string()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["cpu_info"].as_str().unwrap(), "Intel");
+        assert_eq!(v["ip"].as_str().unwrap(), "192.168.100.10");
 
         let result = device_krpc.call("device.list", json!({})).await.unwrap();
         assert_eq!(result["items"].as_array().unwrap().len(), 1);

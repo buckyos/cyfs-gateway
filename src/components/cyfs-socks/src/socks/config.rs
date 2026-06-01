@@ -1,6 +1,7 @@
 use crate::{rule::RuleEngine, RuleResult};
 use buckyos_kit::get_buckyos_system_etc_dir;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,6 +23,8 @@ pub struct SocksProxyConfig {
     // The rule config, if not set, use the default r ule config in the /{buckyos}/etc/rules/ dir
     pub rule_config: Option<String>,
     pub rule_engine: Option<RuleEngine>,
+
+    pub stream_idle_timeout: Duration,
 }
 
 impl SocksProxyConfig {

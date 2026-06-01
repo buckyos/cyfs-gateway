@@ -46,7 +46,7 @@ tokio-socks = "*"
 libsocks_client = "*"
 sfo-result = "0.2"
 sfo-split = { version = "0.1.6", features = ["io"] }
-sfo-io = "0.1.14"
+sfo-io = "0.1.17"
 sfo-sql = { version = "0.4", default-features = false, features = ["sqlite"] }
 serde_yaml_ng.workspace = true
 shlex.workspace = true
@@ -73,6 +73,7 @@ mini-moka = "0.10"
 callback-trait = "0.1"
 reqwest.workspace = true
 sfo-ip = "0.1"
+sfo-reuseport = {version = "0.1.5", features = ["quinn"]}
 
 buckyos-kit.workspace = true
 kRPC.workspace = true

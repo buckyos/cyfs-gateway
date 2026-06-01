@@ -1,8 +1,9 @@
 // 命令行参数如下：
-// --bind 0.0.0.0:8080 --target rtcp://127.0.0.1:8080 --username *** --password ***
+// --bind 0.0.0.0:8080 --target rtcp://127.0.0.1:8080 --username *** --password *** --stream-idle-timeout 60
 // bind参数可以缺省，缺省时候使用默认值0.0.0.0:1080，还可以只输入端口，只有端口时默认使用0.0.0.0作为绑定地址
 // target参数必须输入
 // username和password参数可以缺省, 缺省时配置中不添加username和password字段
+// stream-idle-timeout参数可以缺省, 缺省时使用默认值60秒
 // 还要支持--help参数，使用console.log输出命令行帮助信息
 /*
     生成配置格式：
@@ -48,13 +49,14 @@
 export function main(argv) {
     const helpText = [
         "Usage:",
-        "  socks_server --target <url> [--bind <ip:port|port>] [--username <name>] [--password <pass>]",
+        "  socks_server --target <url> [--bind <ip:port|port>] [--username <name>] [--password <pass>] [--stream-idle-timeout <seconds>]",
         "",
         "Options:",
         "  --bind      Bind address, default 0.0.0.0:1080",
         "  --target    Target proxy address (required)",
         "  --username  Username for auth",
         "  --password  Password for auth",
+        "  --stream-idle-timeout  Data copy idle timeout in seconds, default 60",
         "  --help      Show this help",
     ].join("\n");
 
@@ -62,6 +64,7 @@ export function main(argv) {
     let targetArg = "";
     let usernameArg = "";
     let passwordArg = "";
+    let streamIdleTimeoutArg = "";
     let showHelp = false;
 
     for (let i = 0; i < argv.length; i += 1) {
@@ -110,6 +113,17 @@ export function main(argv) {
         if (arg === "--password") {
             if (i + 1 < argv.length) {
                 passwordArg = String(argv[i + 1]);
+                i += 1;
+            }
+            continue;
+        }
+        if (arg.startsWith("--stream-idle-timeout=")) {
+            streamIdleTimeoutArg = arg.slice("--stream-idle-timeout=".length);
+            continue;
+        }
+        if (arg === "--stream-idle-timeout") {
+            if (i + 1 < argv.length) {
+                streamIdleTimeoutArg = String(argv[i + 1]);
                 i += 1;
             }
         }
@@ -172,6 +186,15 @@ export function main(argv) {
     }
     if (password.length > 0) {
         serverConfig.password = password;
+    }
+    const streamIdleTimeout = streamIdleTimeoutArg.trim();
+    if (streamIdleTimeout.length > 0) {
+        const timeout = Number(streamIdleTimeout);
+        if (!Number.isInteger(timeout) || timeout <= 0) {
+            console.log(helpText);
+            return "";
+        }
+        serverConfig.stream_idle_timeout = timeout;
     }
 
     const config = {

@@ -104,6 +104,7 @@ stacks:
     # id comes from map key (here: http_tcp)
     protocol: tcp                 # tcp | udp | tls | quic | rtcp | tun
     bind: 0.0.0.0:80            # bind address
+    # concurrency: 0              # active connection limit, default 0 (unlimited)
     # transparent: false          # transparent proxy mode (tcp/udp optional, default false)
     # reuse_address: false        # SO_REUSEADDR (optional, default false)
     # io_dump_file: tcp.dump      # enable io dump; relative path resolves to service data dir/dumps/
@@ -111,6 +112,8 @@ stacks:
     # io_dump_rotate_max_files: 8 # optional, keep at most N rotated files
     # io_dump_max_upload_bytes_per_conn: 1MB   # optional, default 1MB
     # io_dump_max_download_bytes_per_conn: 1MB # optional, default 1MB
+    # stream_idle_timeout: 600     # stream forwarding idle timeout (seconds), default 600, same as nginx proxy timeout
+    # connect_timeout: 60         # forward target connection timeout (seconds), default 60
     hook_point: # process chains (map form, converted to array)
       main:
         priority: 1000
@@ -123,8 +126,9 @@ stacks:
     # udp_example:
     #   protocol: udp
     #   bind: 0.0.0.0:53
-    #   concurrency: 200            # default 200
-    #   session_idle_time: 120      # session timeout (seconds), default 120
+    #   concurrency: 0              # default 0 (unlimited)
+    #   max_sessions: 0             # max tracked udp sessions, default 0 (unlimited)
+    #   session_idle_time: 5        # session timeout (seconds), default 5
     #   transparent: false
     #   reuse_address: false
     #   io_dump_file: udp.dump
@@ -137,6 +141,8 @@ stacks:
     #   alpn_protocols: ["http/1.1"] # default http/1.1, supports h2/h3
     #   reuse_address: false
     #   io_dump_file: tls.dump
+    #   stream_idle_timeout: 600    # stream forwarding idle timeout (seconds), default 600
+    #   connect_timeout: 60        # forward target connection timeout (seconds), default 60
     #   certs:
     #     - domain: example.com # local certificate
     #       cert_path: ./cert.pem
@@ -149,10 +155,12 @@ stacks:
     # quic_example:
     #   protocol: quic
     #   bind: 0.0.0.0:4433
-    #   concurrency: 1024           # default 1024
+    #   concurrency: 0              # default 0 (unlimited)
     #   alpn_protocols: ["h3"] # supports h2/h3
     #   reuse_address: false
     #   io_dump_file: quic.dump
+    #   stream_idle_timeout: 600    # stream forwarding idle timeout (seconds), default 600
+    #   connect_timeout: 60        # forward target connection timeout (seconds), default 60
     #   certs:
     #     - domain: example.com # local certificate
     #       cert_path: ./cert.pem
@@ -170,6 +178,8 @@ stacks:
     #   name: optional_name
     #   reuse_address: false
     #   io_dump_file: rtcp.dump
+    #   stream_idle_timeout: 600    # stream forwarding idle timeout (seconds), default 600
+    #   connect_timeout: 60        # forward target connection timeout (seconds), default 60
     #   hook_point: { }
 
     # tun_example:
@@ -179,6 +189,8 @@ stacks:
     #   mtu: 1500                   # default 1500
     #   tcp_timeout: 60             # default 60
     #   udp_timeout: 60             # default 60
+    #   stream_idle_timeout: 600     # stream forwarding idle timeout (seconds), default 600
+    #   connect_timeout: 60         # forward target connection timeout (seconds), default 60
     #   io_dump_file: tun.dump
     #   hook_point: { }
 
@@ -196,6 +208,15 @@ stacks:
     #             priority: 1
     #             block: |
     #               map-add RESP x-from-gateway true;
+    #     forward:                    # optional upstream forward timeout settings
+    #       connect_timeout: 60        # upstream connection timeout (seconds), default 60
+    #       tls_handshake_timeout: 60  # upstream TLS handshake timeout (seconds), default 60
+    #       http_handshake_timeout: 60 # upstream HTTP handshake timeout (seconds), default 60
+    #       request_timeout: 60        # upstream request timeout (seconds), default 60
+    #       response_header_timeout: 60 # upstream response header timeout (seconds), default 60
+    #       response_body_idle_timeout: 60 # upstream response body idle timeout (seconds), default 60
+    #       post_chain_timeout: 60     # post_hook_point execution timeout (seconds), default 60
+    #       abort_upstream_on_client_close: true # abort upstream when downstream closes, default true
     #     gzip: false                 # default false
     #     gzip_types: []              # optional content-types white list
     #     gzip_min_length: 20         # default 20 bytes
@@ -226,6 +247,10 @@ stacks:
     #    autoindex: false             # default false, list dir when no index_file
     #    etag: true                   # default true
     #    if_modified_since: "exact"   # optional; exact | before | off
+    #    open_file_cache: "max=10000 inactive=60s"  # optional, nginx-like static file stat/error cache; "off" disables
+    #    open_file_cache_valid: "60s"               # revalidate cached stat/error after this duration
+    #    open_file_cache_min_uses: 2                # cache only after this many accesses
+    #    open_file_cache_errors: true               # cache stat errors such as missing files
 
   # dns_example:
   #   type: dns
@@ -262,6 +287,7 @@ stacks:
   #   password: ""
   #   enable_tunnel: []               # optional allowed tunnel schemes list
   #   rule_config: ./socks_rules.yaml # optional rule file path
+  #   stream_idle_timeout: 60         # socks data copy idle timeout (seconds), default 60
   #   hook_point:
   #     main:
   #       priority: 1

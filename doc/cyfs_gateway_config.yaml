@@ -85,6 +85,7 @@ stacks:
     protocol: tcp                 # tcp | udp | tls | quic | rtcp | tun
     bind: 0.0.0.0:8080            # 监听地址
     # transparent: false          # 透明代理模式（tcp/udp 可选，默认 false）
+    # stream_idle_timeout: 60     # stream 转发空闲超时（秒），默认 60，与 nginx proxy 超时默认值一致
     hook_point:                   # 处理链（map 形式，会被转换为数组）
       main:
         priority: 1
@@ -107,6 +108,7 @@ stacks:
   #   bind: 0.0.0.0:443
   #   concurrency: 0              # 默认 0（不限制）
   #   alpn_protocols: ["http/1.1"] # 默认为http/1.1,支持 h2、h3
+  #   stream_idle_timeout: 60     # stream 转发空闲超时（秒），默认 60
   #   certs:
   #     - domain: example.com #配置本地证书
   #       cert_path: ./cert.pem
@@ -121,6 +123,7 @@ stacks:
   #   bind: 0.0.0.0:4433
   #   concurrency: 1024           # 默认 1024
   #   alpn_protocols: ["h3"] # 支持h2、h3
+  #   stream_idle_timeout: 60     # stream 转发空闲超时（秒），默认 60
   #   certs:
   #     - domain: example.com #配置本地证书
   #       cert_path: ./cert.pem
@@ -136,6 +139,7 @@ stacks:
   #   key_path: ./sn_private_key.pem
   #   device_config_path: ./device.doc.jwt  # 也支持 JSON；只有配置 JWT 时，Hello 才会自动携带 device_doc_jwt
   #   name: optional_name
+  #   stream_idle_timeout: 60     # stream 转发空闲超时（秒），默认 60
   #   hook_point: { }
 
   # tun_example:
@@ -145,6 +149,7 @@ stacks:
   #   mtu: 1500                   # 默认 1500
   #   tcp_timeout: 60             # 默认 60
   #   udp_timeout: 60             # 默认 60
+  #   stream_idle_timeout: 60     # stream 转发空闲超时（秒），默认 60
   #   hook_point: { }
 
 servers:
@@ -210,6 +215,7 @@ servers:
   #   target: "http://127.0.0.1:1080"
   #   username: ""  # 没有username和password字段则表示不设置密码
   #   password: ""
+  #   stream_idle_timeout: 60     # socks 数据转发空闲超时（秒），默认 60
   #   hook_point:
   #     main:
   #       priority: 1

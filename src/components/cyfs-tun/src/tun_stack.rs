@@ -57,6 +57,8 @@ struct TunConnectionHandler {
     env: Arc<TunStackContext>,
     executor: ProcessChainLibExecutor,
     io_dump: Option<IoDumpStackConfig>,
+    stream_idle_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
 }
 
 impl TunConnectionHandler {
@@ -64,6 +66,8 @@ impl TunConnectionHandler {
         hook_point: ProcessChainConfigs,
         env: Arc<TunStackContext>,
         io_dump: Option<IoDumpStackConfig>,
+        stream_idle_timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
     ) -> StackResult<Self> {
         let (executor, _) = create_process_chain_executor(
             &hook_point,
@@ -78,6 +82,8 @@ impl TunConnectionHandler {
             env,
             executor,
             io_dump,
+            stream_idle_timeout,
+            connect_timeout,
         })
     }
 
@@ -177,6 +183,8 @@ impl TunConnectionHandler {
                                 target,
                                 &self.env.tunnel_manager,
                                 Some(&stream_info),
+                                self.stream_idle_timeout,
+                                self.connect_timeout,
                             )
                             .await?;
                         }
@@ -393,8 +401,14 @@ impl TunConnectionHandler {
                                 ));
                             }
                             let target = list[1].as_str();
-                            datagram_forward(datagram_stream, target, &self.env.tunnel_manager)
-                                .await?;
+                            datagram_forward(
+                                datagram_stream,
+                                target,
+                                &self.env.tunnel_manager,
+                                self.stream_idle_timeout,
+                                self.connect_timeout,
+                            )
+                            .await?;
                         }
                         "server" => {
                             if list.len() < 2 {
@@ -635,8 +649,14 @@ impl Stack for TunStack {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "{e}"))?;
-        let new_handler =
-            TunConnectionHandler::create(config.hook_point.clone(), env, io_dump).await?;
+        let new_handler = TunConnectionHandler::create(
+            config.hook_point.clone(),
+            env,
+            io_dump,
+            stream_idle_timeout_from_secs(config.stream_idle_timeout),
+            connect_timeout_from_secs(config.connect_timeout),
+        )
+        .await?;
         *self.inner.prepare_handler.write().unwrap() = Some(Arc::new(new_handler));
         Ok(())
     }
@@ -696,6 +716,8 @@ impl TunStackInner {
             builder.hook_point.as_ref().unwrap().clone(),
             env,
             builder.io_dump,
+            builder.stream_idle_timeout,
+            builder.connect_timeout,
         )
         .await?;
 
@@ -860,6 +882,8 @@ pub struct TunStackBuilder {
     mtu: Option<u16>,
     tcp_timeout: u64,
     udp_timeout: u64,
+    stream_idle_timeout: std::time::Duration,
+    connect_timeout: std::time::Duration,
     hook_point: Option<ProcessChainConfigs>,
     connection_manager: Option<ConnectionManagerRef>,
     stack_context: Option<Arc<TunStackContext>>,
@@ -875,6 +899,8 @@ impl TunStackBuilder {
             mtu: None,
             tcp_timeout: 60,
             udp_timeout: 60,
+            stream_idle_timeout: stream_idle_timeout_from_secs(None),
+            connect_timeout: connect_timeout_from_secs(None),
             hook_point: None,
             connection_manager: None,
             stack_context: None,
@@ -909,6 +935,16 @@ impl TunStackBuilder {
 
     pub fn udp_timeout(mut self, udp_timeout: u64) -> Self {
         self.udp_timeout = udp_timeout;
+        self
+    }
+
+    pub fn stream_idle_timeout(mut self, stream_idle_timeout: std::time::Duration) -> Self {
+        self.stream_idle_timeout = stream_idle_timeout;
+        self
+    }
+
+    pub fn connect_timeout(mut self, connect_timeout: std::time::Duration) -> Self {
+        self.connect_timeout = connect_timeout;
         self
     }
 
@@ -949,6 +985,10 @@ pub struct TunStackConfig {
     pub tcp_timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub udp_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub io_dump_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1028,6 +1068,8 @@ impl StackFactory for TunStackFactory {
             .mtu(config.mtu.unwrap_or(1500))
             .tcp_timeout(config.tcp_timeout.unwrap_or(60))
             .udp_timeout(config.udp_timeout.unwrap_or(60))
+            .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
+            .connect_timeout(connect_timeout_from_secs(config.connect_timeout))
             .hook_point(config.hook_point.clone())
             .connection_manager(self.connection_manager.clone())
             .stack_context(stack_context.clone())
