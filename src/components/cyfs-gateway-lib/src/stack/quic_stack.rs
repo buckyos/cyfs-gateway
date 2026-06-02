@@ -1,9 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-#[cfg(unix)]
-use std::os::fd::{FromRawFd, IntoRawFd};
-#[cfg(windows)]
-use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 
 use crate::forward::ForwardPlan;
 use crate::global_process_chains::{
@@ -50,20 +46,239 @@ use sfo_io::{
     LimitRead, LimitStream, LimitWrite, SfoSpeedStat, SimpleAsyncWrite, SimpleAsyncWriteHolder,
     SpeedTracker, StatRead, StatStream, StatWrite,
 };
+use sfo_reuseport::{
+    Error as SfoReuseportError, QuicCidGenerator, QuicServer, ServerRuntime, SocketOptions,
+    UdpServiceConfig, UdpSocket as ReuseportUdpSocket,
+};
 use std::future::poll_fn;
 use std::io;
+use std::io::IoSliceMut;
 use std::io::Read;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf, Take};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore};
-use tokio::task::JoinHandle;
 use tokio_util::io::ReaderStream;
 
 const DEFAULT_QUIC_CONCURRENCY: u32 = 0;
+
+struct SfoQuicUdpSocket {
+    socket: ReuseportUdpSocket,
+    worker_id: usize,
+    worker_count: Arc<AtomicUsize>,
+}
+
+impl SfoQuicUdpSocket {
+    fn new(socket: ReuseportUdpSocket, worker_id: usize, worker_count: Arc<AtomicUsize>) -> Self {
+        Self {
+            socket,
+            worker_id,
+            worker_count,
+        }
+    }
+}
+
+impl std::fmt::Debug for SfoQuicUdpSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SfoQuicUdpSocket").finish_non_exhaustive()
+    }
+}
+
+impl quinn::AsyncUdpSocket for SfoQuicUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+        Box::pin(SfoQuicUdpPoller { socket: self })
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
+        match transmit.segment_size {
+            Some(segment_size) if segment_size > 0 => {
+                for chunk in transmit.contents.chunks(segment_size) {
+                    let sent = self.socket.try_send_to(chunk, transmit.destination)?;
+                    if sent != chunk.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "short quic udp send",
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            _ => {
+                let sent = self
+                    .socket
+                    .try_send_to(transmit.contents, transmit.destination)?;
+                if sent == transmit.contents.len() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "short quic udp send",
+                    ))
+                }
+            }
+        }
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        if bufs.is_empty() || meta.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        match self.socket.poll_recv_from_vectored(cx, bufs) {
+            Poll::Ready(Ok((len, peer_addr))) => {
+                if cfg!(debug_assertions) {
+                    let mut packet = Vec::new();
+                    let packet = quic_packet_prefix(bufs, len, &mut packet);
+                    let worker_count = self.worker_count.load(Ordering::Acquire);
+                    if let Some(worker_index) = quic_packet_worker_index(packet, worker_count) {
+                        debug_assert_eq!(
+                            worker_index, self.worker_id,
+                            "quic packet dcid worker index does not match sfo worker socket"
+                        );
+                    }
+                }
+                meta[0] = quinn::udp::RecvMeta {
+                    addr: peer_addr,
+                    len,
+                    stride: len,
+                    ecn: None,
+                    dst_ip: None,
+                };
+                Poll::Ready(Ok(1))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket
+            .local_addr()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+    }
+}
+
+struct SfoQuicUdpPoller {
+    socket: Arc<SfoQuicUdpSocket>,
+}
+
+impl std::fmt::Debug for SfoQuicUdpPoller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SfoQuicUdpPoller").finish()
+    }
+}
+
+impl quinn::UdpPoller for SfoQuicUdpPoller {
+    fn poll_writable(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.socket.socket.poll_send_ready(cx)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WorkerQuicCidGenerator {
+    inner: QuicCidGenerator,
+}
+
+impl WorkerQuicCidGenerator {
+    fn for_worker(worker_id: usize) -> StackResult<Self> {
+        let inner = QuicCidGenerator::for_worker(worker_id).map_err(|err| {
+            stack_err!(
+                StackErrorCode::InvalidConfig,
+                "create quic cid generator failed: {}",
+                err
+            )
+        })?;
+        Ok(Self { inner })
+    }
+}
+
+impl quinn::ConnectionIdGenerator for WorkerQuicCidGenerator {
+    fn generate_cid(&mut self) -> quinn::ConnectionId {
+        let cid = self
+            .inner
+            .generate()
+            .expect("sfo quic cid generation should not fail after validation");
+        quinn::ConnectionId::new(cid.as_slice())
+    }
+
+    fn cid_len(&self) -> usize {
+        self.inner.cid_len()
+    }
+
+    fn cid_lifetime(&self) -> Option<std::time::Duration> {
+        None
+    }
+}
+
+fn new_quic_endpoint_config(worker_id: usize) -> StackResult<quinn::EndpointConfig> {
+    let generator = WorkerQuicCidGenerator::for_worker(worker_id)?;
+    let mut endpoint_config = quinn::EndpointConfig::default();
+    endpoint_config.cid_generator(move || Box::new(generator.clone()));
+    Ok(endpoint_config)
+}
+
+fn quic_packet_worker_index_prefix(packet: &[u8]) -> Option<usize> {
+    if packet.is_empty() {
+        return None;
+    }
+
+    let dcid = if packet[0] & 0x80 != 0 {
+        if matches!(packet[0] & 0x30, 0x00 | 0x10) {
+            return None;
+        }
+        let dcid_len = usize::from(*packet.get(5)?);
+        if dcid_len == 0 {
+            return None;
+        }
+        packet.get(6..6 + dcid_len)?
+    } else {
+        packet.get(1..)?
+    };
+
+    let high = *dcid.first()?;
+    let low = *dcid.get(1)?;
+    Some((usize::from(high) << 8) | usize::from(low))
+}
+
+fn quic_packet_worker_index(packet: &[u8], worker_count: usize) -> Option<usize> {
+    if worker_count == 0 {
+        return None;
+    }
+    quic_packet_worker_index_prefix(packet).map(|worker_index| worker_index % worker_count)
+}
+
+fn quic_packet_prefix<'a>(
+    bufs: &'a [IoSliceMut<'_>],
+    len: usize,
+    out: &'a mut Vec<u8>,
+) -> &'a [u8] {
+    if let Some(first) = bufs.first()
+        && first.len() >= len
+    {
+        return &first[..len];
+    }
+
+    out.clear();
+    out.reserve(len);
+    let mut remaining = len;
+    for buf in bufs {
+        if remaining == 0 {
+            break;
+        }
+        let copy_len = remaining.min(buf.len());
+        out.extend_from_slice(&buf[..copy_len]);
+        remaining -= copy_len;
+    }
+    out.as_slice()
+}
 
 #[derive(Clone)]
 pub struct QuicStackContext {
@@ -1459,10 +1674,13 @@ struct QuicStackInner {
     reuse_address: bool,
     connection_manager: Option<ConnectionManagerRef>,
     handler: Arc<RwLock<Arc<QuicConnectionHandler>>>,
+    server_runtime: ServerRuntime,
+    endpoints: Mutex<Vec<quinn::Endpoint>>,
+    worker_count: Arc<AtomicUsize>,
 }
 
 impl QuicStackInner {
-    async fn start(self: &Arc<Self>) -> StackResult<JoinHandle<()>> {
+    async fn start(self: &Arc<Self>) -> StackResult<QuicServer> {
         let mut server_config =
             ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_protocol_versions(rustls::DEFAULT_VERSIONS)
@@ -1479,75 +1697,71 @@ impl QuicStackInner {
             .bind_addr
             .parse()
             .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
-        let sockaddr: socket2::SockAddr = addr.into();
-        let domain = match addr {
-            std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
-            std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
-        };
-        let socket =
-            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
-                .map_err(into_stack_err!(
-                    StackErrorCode::IoError,
-                    "create socket error"
-                ))?;
-        socket.set_nonblocking(true).map_err(into_stack_err!(
-            StackErrorCode::IoError,
-            "set nonblocking error"
-        ))?;
-        #[cfg(target_os = "linux")]
-        {
-            if self.reuse_address {
-                socket.set_reuse_address(true).map_err(into_stack_err!(
-                    StackErrorCode::IoError,
-                    "set reuse address error"
-                ))?;
-            }
-        }
-        socket.bind(&sockaddr).map_err(into_stack_err!(
-            StackErrorCode::BindFailed,
-            "bind {} error",
-            self.bind_addr
-        ))?;
-        #[cfg(unix)]
-        let socket = unsafe { std::net::UdpSocket::from_raw_fd(socket.into_raw_fd()) };
-        #[cfg(windows)]
-        let socket = unsafe { std::net::UdpSocket::from_raw_socket(socket.into_raw_socket()) };
-        let runtime = quinn::default_runtime().ok_or(stack_err!(
-            StackErrorCode::InvalidConfig,
-            "no async runtime found"
-        ))?;
-        let endpoint = quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
-            Some(server_config),
-            socket,
-            runtime,
-        )
-        .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
 
         let this = self.clone();
-        let handle = tokio::spawn(async move {
-            loop {
-                match endpoint.accept().await {
-                    None => {
-                        log::error!("quic endpoint accept error");
-                        break;
+        let config = UdpServiceConfig::new(addr).with_socket_options(SocketOptions {
+            reuse_address: self.reuse_address,
+            ..SocketOptions::default()
+        });
+        QuicServer::serve_socket(&self.server_runtime, config, move |socket, worker_id| {
+            let this = this.clone();
+            let server_config = server_config.clone();
+            async move {
+                this.run_worker_endpoint(socket, worker_id, server_config)
+                    .await
+            }
+        })
+        .map_err(|err| {
+            stack_err!(
+                StackErrorCode::BindFailed,
+                "bind {} error: {}",
+                self.bind_addr,
+                err
+            )
+        })
+    }
+
+    async fn run_worker_endpoint(
+        self: Arc<Self>,
+        socket: ReuseportUdpSocket,
+        worker_id: usize,
+        server_config: quinn::ServerConfig,
+    ) -> Result<(), SfoReuseportError> {
+        self.worker_count
+            .fetch_max(worker_id.saturating_add(1), Ordering::AcqRel);
+        let endpoint_config = new_quic_endpoint_config(worker_id)
+            .map_err(|err| SfoReuseportError::Runtime(err.to_string()))?;
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
+            endpoint_config,
+            Some(server_config),
+            Arc::new(SfoQuicUdpSocket::new(
+                socket,
+                worker_id,
+                self.worker_count.clone(),
+            )),
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|err| SfoReuseportError::Runtime(err.to_string()))?;
+        self.endpoints.lock().unwrap().push(endpoint.clone());
+
+        loop {
+            match endpoint.accept().await {
+                None => break,
+                Some(conn) => {
+                    if endpoint.open_connections() > self.concurrency as usize {
+                        conn.refuse();
+                        continue;
                     }
-                    Some(conn) => {
-                        if endpoint.open_connections() > this.concurrency as usize {
-                            conn.refuse();
-                            continue;
+                    let this = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = this.accept(conn).await {
+                            log::error!("quic accept error: {}", e);
                         }
-                        let this = this.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = this.accept(conn).await {
-                                log::error!("quic accept error: {}", e);
-                            }
-                        });
-                    }
+                    });
                 }
             }
-        });
-        Ok(handle)
+        }
+        Ok(())
     }
 
     async fn accept(self: &Arc<Self>, conn: Incoming) -> StackResult<()> {
@@ -1561,19 +1775,29 @@ impl QuicStackInner {
         };
         handler_snapshot.accept(conn, local_addr).await
     }
+
+    fn close_endpoints(&self) {
+        let endpoints = std::mem::take(&mut *self.endpoints.lock().unwrap());
+        for endpoint in endpoints {
+            endpoint.close(0_u32.into(), b"close quic listener");
+        }
+    }
 }
 
 pub struct QuicStack {
     inner: Arc<QuicStackInner>,
     prepare_handler: Arc<RwLock<Option<Arc<QuicConnectionHandler>>>>,
-    handle: Mutex<Option<JoinHandle<()>>>,
+    server: Mutex<Option<QuicServer>>,
 }
 
 impl Drop for QuicStack {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.lock().unwrap().take() {
-            handle.abort();
+        if let Some(server) = self.server.lock().unwrap().take() {
+            if let Err(e) = server.close() {
+                log::warn!("close quic server failed: {}", e);
+            }
         }
+        self.inner.close_endpoints();
     }
 }
 
@@ -1604,6 +1828,12 @@ impl QuicStack {
                 "stack_context is required"
             ));
         }
+        if builder.server_runtime.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "server_runtime is required"
+            ));
+        }
 
         let stack_context = builder.stack_context.unwrap();
 
@@ -1631,9 +1861,12 @@ impl QuicStack {
                 reuse_address: builder.reuse_address,
                 connection_manager: builder.connection_manager.clone(),
                 handler,
+                server_runtime: builder.server_runtime.take().unwrap(),
+                endpoints: Mutex::new(Vec::new()),
+                worker_count: Arc::new(AtomicUsize::new(0)),
             }),
             prepare_handler: Arc::new(Default::default()),
-            handle: Mutex::new(None),
+            server: Mutex::new(None),
         })
     }
 }
@@ -1654,12 +1887,12 @@ impl Stack for QuicStack {
 
     async fn start(&self) -> StackResult<()> {
         {
-            if self.handle.lock().unwrap().is_some() {
+            if self.server.lock().unwrap().is_some() {
                 return Ok(());
             }
         }
-        let handle = self.inner.start().await?;
-        *self.handle.lock().unwrap() = Some(handle);
+        let server = self.inner.start().await?;
+        *self.server.lock().unwrap() = Some(server);
         Ok(())
     }
 
@@ -1763,6 +1996,7 @@ pub struct QuicStackBuilder {
     io_dump: Option<IoDumpStackConfig>,
     stream_idle_timeout: std::time::Duration,
     connect_timeout: std::time::Duration,
+    server_runtime: Option<ServerRuntime>,
 }
 
 impl QuicStackBuilder {
@@ -1780,6 +2014,7 @@ impl QuicStackBuilder {
             io_dump: None,
             stream_idle_timeout: stream_idle_timeout_from_secs(None),
             connect_timeout: connect_timeout_from_secs(None),
+            server_runtime: None,
         }
     }
 
@@ -1842,6 +2077,11 @@ impl QuicStackBuilder {
         self
     }
 
+    pub fn server_runtime(mut self, server_runtime: ServerRuntime) -> Self {
+        self.server_runtime = Some(server_runtime);
+        self
+    }
+
     pub async fn build(self) -> StackResult<QuicStack> {
         QuicStack::create(self).await
     }
@@ -1898,11 +2138,15 @@ fn normalize_concurrency(concurrency: u32) -> u32 {
 
 pub struct QuicStackFactory {
     connection_manager: ConnectionManagerRef,
+    server_runtime: ServerRuntime,
 }
 
 impl QuicStackFactory {
-    pub fn new(connection_manager: ConnectionManagerRef) -> Self {
-        Self { connection_manager }
+    pub fn new(connection_manager: ConnectionManagerRef, server_runtime: ServerRuntime) -> Self {
+        Self {
+            connection_manager,
+            server_runtime,
+        }
     }
 }
 
@@ -1961,6 +2205,7 @@ impl StackFactory for QuicStackFactory {
             .stream_idle_timeout(stream_idle_timeout_from_secs(config.stream_idle_timeout))
             .connect_timeout(connect_timeout_from_secs(config.connect_timeout))
             .reuse_address(config.reuse_address.unwrap_or(false))
+            .server_runtime(self.server_runtime.clone())
             .build()
             .await?;
         Ok(Arc::new(stack))
@@ -2015,6 +2260,13 @@ mod tests {
             global_collection_manager,
             None,
         ))
+    }
+
+    fn test_server_runtime() -> sfo_reuseport::ServerRuntime {
+        sfo_reuseport::ServerRuntime::start(
+            sfo_reuseport::ServerRuntimeConfig::new().with_workers(1),
+        )
+        .unwrap()
     }
 
     async fn wait_dump_frames(
@@ -2080,6 +2332,7 @@ mod tests {
             .bind("127.0.0.1:9080")
             .hook_point(vec![])
             .stack_context(stack_context)
+            .server_runtime(test_server_runtime())
             .build()
             .await;
         assert!(result.is_ok());
@@ -2107,6 +2360,7 @@ mod tests {
                 data: None,
             }])
             .stack_context(stack_context)
+            .server_runtime(test_server_runtime())
             .build()
             .await;
         assert!(result.is_ok());
@@ -2155,6 +2409,7 @@ mod tests {
                 data: None,
             }])
             .stack_context(stack_context)
+            .server_runtime(test_server_runtime())
             .build()
             .await;
         assert!(result.is_ok());
@@ -2231,6 +2486,7 @@ mod tests {
                 data: None,
             }])
             .stack_context(stack_context)
+            .server_runtime(test_server_runtime())
             .build()
             .await;
         assert!(result.is_ok());
@@ -2309,6 +2565,7 @@ mod tests {
                 data: None,
             }])
             .stack_context(stack_context)
+            .server_runtime(test_server_runtime())
             .build()
             .await;
         assert!(result.is_ok());
@@ -2477,6 +2734,7 @@ mod tests {
                 data: None,
             }])
             .stack_context(stack_context)
+            .server_runtime(test_server_runtime())
             .build()
             .await;
         assert!(result.is_ok());
@@ -2598,6 +2856,7 @@ mod tests {
             }])
             .alpn_protocols(vec![b"h2".to_vec(), b"h3".to_vec()])
             .stack_context(stack_context)
+            .server_runtime(test_server_runtime())
             .build()
             .await;
         assert!(result.is_ok());
@@ -2739,6 +2998,7 @@ mod tests {
             }])
             .stack_context(ctx)
             .io_dump(io_dump)
+            .server_runtime(test_server_runtime())
             .build()
             .await
             .unwrap();
@@ -2834,6 +3094,7 @@ mod tests {
             }])
             .stack_context(ctx)
             .io_dump(io_dump)
+            .server_runtime(test_server_runtime())
             .build()
             .await
             .unwrap();
@@ -2965,6 +3226,7 @@ mod tests {
             }])
             .stack_context(ctx)
             .io_dump(io_dump)
+            .server_runtime(test_server_runtime())
             .build()
             .await
             .unwrap();
@@ -3069,6 +3331,7 @@ mod tests {
             }])
             .stack_context(ctx)
             .io_dump(io_dump)
+            .server_runtime(test_server_runtime())
             .build()
             .await
             .unwrap();
@@ -3152,6 +3415,7 @@ mod tests {
                 data: None,
             }])
             .stack_context(stack_context)
+            .server_runtime(test_server_runtime())
             .build()
             .await;
         assert!(result.is_ok());
@@ -3249,6 +3513,7 @@ mod tests {
                 data: None,
             }])
             .stack_context(stack_context)
+            .server_runtime(test_server_runtime())
             .build()
             .await;
         assert!(result.is_ok());
@@ -3359,6 +3624,7 @@ mod tests {
                 data: None,
             }])
             .stack_context(stack_context)
+            .server_runtime(test_server_runtime())
             .build()
             .await;
         assert!(result.is_ok());
@@ -3484,6 +3750,7 @@ mod tests {
                 data: None,
             }])
             .stack_context(stack_context)
+            .server_runtime(test_server_runtime())
             .build()
             .await;
         assert!(result.is_ok());
@@ -3609,6 +3876,7 @@ mod tests {
                 data: None,
             }])
             .stack_context(stack_context)
+            .server_runtime(test_server_runtime())
             .build()
             .await;
         assert!(result.is_ok());
@@ -3687,7 +3955,7 @@ mod tests {
         let stat_manager = StatManager::new();
         let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
 
-        let factory = QuicStackFactory::new(ConnectionManager::new());
+        let factory = QuicStackFactory::new(ConnectionManager::new(), test_server_runtime());
 
         let config = QuicStackConfig {
             id: "test".to_string(),

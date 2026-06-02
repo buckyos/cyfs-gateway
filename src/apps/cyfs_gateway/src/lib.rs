@@ -175,7 +175,10 @@ async fn run_gateway_with_config(
     debug!("Register tls stack factory");
     factory.register_stack_factory(
         StackProtocol::Quic,
-        Arc::new(QuicStackFactory::new(connect_manager.clone())),
+        Arc::new(QuicStackFactory::new(
+            connect_manager.clone(),
+            tcp_server_runtime.clone(),
+        )),
     );
     factory.register_stack_factory(
         StackProtocol::Rtcp,

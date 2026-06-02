@@ -138,7 +138,10 @@ mod tests {
         );
         factory.register_stack_factory(
             StackProtocol::Udp,
-            Arc::new(UdpStackFactory::new(connect_manager.clone())),
+            Arc::new(UdpStackFactory::new(
+                connect_manager.clone(),
+                tcp_server_runtime.clone(),
+            )),
         );
         factory.register_stack_factory(
             StackProtocol::Tls,
@@ -149,7 +152,10 @@ mod tests {
         );
         factory.register_stack_factory(
             StackProtocol::Quic,
-            Arc::new(QuicStackFactory::new(connect_manager.clone())),
+            Arc::new(QuicStackFactory::new(
+                connect_manager.clone(),
+                tcp_server_runtime.clone(),
+            )),
         );
         factory.register_stack_factory(
             StackProtocol::Rtcp,
