@@ -28,7 +28,7 @@ use rustls::server::ResolvesServerCert;
 use rustls::sign::CertifiedKey;
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
-use sfo_reuseport::{ServerRuntime, ServiceConfig, SocketOptions, TcpServer, TransparentMode};
+use sfo_reuseport::{ServerRuntime, SocketOptions, TcpServer, TcpServiceConfig, TransparentMode};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -638,7 +638,7 @@ impl TlsStack {
             ipv4_transparent: TransparentMode::Disabled,
             ipv6_transparent: TransparentMode::Disabled,
         };
-        let mut service_config = ServiceConfig::new(addr).with_socket_options(socket_options);
+        let mut service_config = TcpServiceConfig::new(addr).with_socket_options(socket_options);
         if self.concurrency != u32::MAX {
             service_config =
                 service_config.with_max_concurrency_per_worker(self.concurrency as usize);
