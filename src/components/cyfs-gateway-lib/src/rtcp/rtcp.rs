@@ -3478,9 +3478,19 @@ mod tests {
             let datagram_stream = AsyncStreamWithDatagram::new(stream);
             let mut buf = [0u8; 1024];
             loop {
-                let len = datagram_stream.recv_datagram(&mut buf).await.unwrap();
-                datagram_stream.send_datagram(&buf[..len]).await.unwrap();
+                let len = match datagram_stream.recv_datagram(&mut buf).await {
+                    Ok(len) => len,
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(TunnelError::IoError(e.to_string())),
+                };
+                if let Err(e) = datagram_stream.send_datagram(&buf[..len]).await {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        break;
+                    }
+                    return Err(TunnelError::IoError(e.to_string()));
+                }
             }
+            Ok(())
         }
     }
 
@@ -3968,6 +3978,9 @@ mod tests {
     #[tokio::test]
     async fn test_rtcp_nested_remote_rebinds_transport_via_rtcp_relay() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let port_a = 19173;
+        let port_b = 19174;
+        let port_c = 19175;
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
@@ -3991,11 +4004,12 @@ mod tests {
 
         let mut rtcp_a = RTcp::new(
             device_config.id,
-            "127.0.0.1:19073".to_string(),
+            format!("127.0.0.1:{}", port_a),
             Some(pkcs8_bytes),
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        rtcp_a.set_reuse_address(true);
         let tunnel_manager = TunnelManager::new();
         rtcp_a.set_tunnel_manager(tunnel_manager.clone());
         tunnel_manager.register_tunnel_builder(
@@ -4028,11 +4042,12 @@ mod tests {
 
         let mut rtcp_b = RTcp::new(
             device_config.id,
-            "127.0.0.1:19074".to_string(),
+            format!("127.0.0.1:{}", port_b),
             Some(pkcs8_bytes),
             None,
             Arc::new(MockRTcpListener::new()),
         );
+        rtcp_b.set_reuse_address(true);
         rtcp_b.start().await.unwrap();
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -4055,30 +4070,46 @@ mod tests {
         .await
         .unwrap();
 
-        let relay_routes =
-            HashMap::from([(id_b.to_host_name(), "127.0.0.1:19074".parse().unwrap())]);
+        let relay_routes = HashMap::from([(
+            id_b.to_host_name(),
+            format!("127.0.0.1:{}", port_b).parse().unwrap(),
+        )]);
         let mut rtcp_c = RTcp::new(
             device_config.id,
-            "127.0.0.1:19075".to_string(),
+            format!("127.0.0.1:{}", port_c),
             Some(pkcs8_bytes),
             None,
             Arc::new(RelayRTcpListener::new(relay_routes)),
         );
+        rtcp_c.set_reuse_address(true);
         rtcp_c.start().await.unwrap();
 
         tokio::time::sleep(Duration::from_secs(1)).await;
+        let bootstrap_tunnel = tokio::time::timeout(
+            Duration::from_secs(30),
+            rtcp_a.create_tunnel(Some(format!("{}:{}", id_c.to_host_name(), port_c).as_str())),
+        )
+        .await
+        .expect("bootstrap tunnel creation timed out")
+        .expect("A should build the bootstrap tunnel to C");
+        tokio::time::timeout(Duration::from_secs(10), bootstrap_tunnel.ping())
+            .await
+            .expect("bootstrap tunnel ping timed out")
+            .expect("bootstrap tunnel ping failed");
 
         let bootstrap_url = Url::parse(
             format!(
-                "rtcp://{}:19075/{}:19074",
+                "rtcp://{}:{}/{}:{}",
                 id_c.to_host_name(),
-                id_b.to_host_name()
+                port_c,
+                id_b.to_host_name(),
+                port_b
             )
             .as_str(),
         )
         .unwrap();
         let nested_remote_stack_id =
-            build_rtcp_nested_remote_stack_id(&bootstrap_url, &id_b.to_host_name(), Some(19074));
+            build_rtcp_nested_remote_stack_id(&bootstrap_url, &id_b.to_host_name(), Some(port_b));
 
         let tunnel = tokio::time::timeout(
             Duration::from_secs(10),

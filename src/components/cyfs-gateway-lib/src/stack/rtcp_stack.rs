@@ -13,7 +13,7 @@ use name_lib::{
 };
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitStream, StatStream};
-use sfo_reuseport::{ServerRuntime, ServiceConfig, SocketOptions, TcpServer, TransparentMode};
+use sfo_reuseport::{ServerRuntime, SocketOptions, TcpServer, TcpServiceConfig, TransparentMode};
 use url::Url;
 
 use crate::forward::ForwardPlan;
@@ -1337,7 +1337,7 @@ impl RtcpStack {
             ipv4_transparent: TransparentMode::Disabled,
             ipv6_transparent: TransparentMode::Disabled,
         };
-        let service_config = ServiceConfig::new(addr).with_socket_options(socket_options);
+        let service_config = TcpServiceConfig::new(addr).with_socket_options(socket_options);
         let server = TcpServer::serve(&self.server_runtime, service_config, move |stream| {
             let rtcp = rtcp.clone();
             async move {
