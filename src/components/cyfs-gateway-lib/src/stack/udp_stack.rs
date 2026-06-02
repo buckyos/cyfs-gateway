@@ -1,9 +1,9 @@
 use crate::forward::{ForwardFailureRegistry, ForwardPlan, NextUpstreamCondition};
 use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
 use crate::stack::get_limit_info;
-use crate::stack::limiter::Limiter;
 #[cfg(target_os = "linux")]
-use crate::stack::{has_root_privileges, recv_from, set_socket_opt};
+use crate::stack::has_root_privileges;
+use crate::stack::limiter::Limiter;
 use crate::{
     ComposedSpeedStat, ConnectionController, ConnectionInfo, ConnectionManagerRef,
     DatagramClientBox, DatagramInfo, GlobalCollectionManagerRef, IoDumpStackConfig,
@@ -19,6 +19,10 @@ use cyfs_process_chain::{
 use local_ip_address::list_afinet_netifas;
 use serde::{Deserialize, Serialize};
 use sfo_io::{Datagram, LimitDatagram, SpeedTracker};
+use sfo_reuseport::{
+    PacketMeta, ServerRuntime, SocketOptions, TransparentMode, UdpServer, UdpServiceConfig,
+    UdpSocket as ReuseportUdpSocket,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Div;
@@ -29,7 +33,7 @@ use std::os::windows::io::{FromRawSocket, IntoRawSocket};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use url::Url;
 
@@ -72,6 +76,38 @@ impl StackContext for UdpStackContext {
     }
 }
 
+#[derive(Clone)]
+enum UdpSocketRef {
+    Tokio(Arc<UdpSocket>),
+    Reuseport(ReuseportUdpSocket),
+}
+
+impl UdpSocketRef {
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> StackResult<usize> {
+        match self {
+            Self::Tokio(socket) => socket
+                .send_to(buf, addr)
+                .await
+                .map_err(into_stack_err!(StackErrorCode::IoError)),
+            Self::Reuseport(socket) => socket
+                .send_to(buf, addr)
+                .await
+                .map_err(|e| stack_err!(StackErrorCode::IoError, "send udp datagram error: {}", e)),
+        }
+    }
+
+    fn local_addr(&self) -> StackResult<SocketAddr> {
+        match self {
+            Self::Tokio(socket) => socket
+                .local_addr()
+                .map_err(into_stack_err!(StackErrorCode::IoError)),
+            Self::Reuseport(socket) => socket.local_addr().map_err(|e| {
+                stack_err!(StackErrorCode::IoError, "get udp local addr error: {}", e)
+            }),
+        }
+    }
+}
+
 struct UdpDatagramHandler {
     env: Arc<UdpStackContext>,
     executor: ProcessChainLibExecutor,
@@ -109,7 +145,7 @@ impl UdpDatagramHandler {
     async fn handle_datagram(
         &self,
         state: &UdpStackInner,
-        udp_socket: Arc<UdpSocket>,
+        udp_socket: UdpSocketRef,
         src_addr: SocketAddr,
         dest_addr: SocketAddr,
         data: Vec<u8>,
@@ -753,12 +789,12 @@ impl UdpDatagramHandler {
 }
 
 pub struct UdpSendDatagram {
-    socket: Arc<UdpSocket>,
+    socket: UdpSocketRef,
     addr: SocketAddr,
 }
 
 impl UdpSendDatagram {
-    pub fn new(socket: Arc<UdpSocket>, addr: SocketAddr) -> Self {
+    fn new(socket: UdpSocketRef, addr: SocketAddr) -> Self {
         Self { socket, addr }
     }
 }
@@ -768,10 +804,7 @@ impl Datagram for UdpSendDatagram {
     type Error = StackError;
 
     async fn send_to(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.socket
-            .send_to(buf, self.addr)
-            .await
-            .map_err(into_stack_err!(StackErrorCode::IoError))
+        self.socket.send_to(buf, self.addr).await
     }
 
     async fn recv_from(&mut self, _buf: &mut [u8]) -> Result<usize, Self::Error> {
@@ -780,14 +813,14 @@ impl Datagram for UdpSendDatagram {
 }
 
 pub struct UdpDatagram {
-    socket: Arc<UdpSocket>,
+    socket: UdpSocketRef,
     dest: SocketAddr,
     recv_channel: tokio::sync::mpsc::Receiver<Vec<u8>>,
 }
 
 impl UdpDatagram {
     fn new(
-        socket: Arc<UdpSocket>,
+        socket: UdpSocketRef,
         dest: SocketAddr,
         recv_channel: tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) -> Self {
@@ -804,10 +837,7 @@ impl Datagram for UdpDatagram {
     type Error = StackError;
 
     async fn send_to(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.socket
-            .send_to(buf, self.dest)
-            .await
-            .map_err(into_stack_err!(StackErrorCode::IoError))
+        self.socket.send_to(buf, self.dest).await
     }
 
     async fn recv_from(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
@@ -1038,10 +1068,10 @@ impl SocketCache {
         }
     }
 
-    pub async fn get_socket(&self, addr: SocketAddr) -> StackResult<Arc<UdpSocket>> {
+    pub async fn get_socket(&self, addr: SocketAddr) -> StackResult<UdpSocketRef> {
         let mut cache = self.socket_cache.lock().await;
         if let Some(socket) = cache.get(&addr) {
-            Ok(socket.clone())
+            Ok(UdpSocketRef::Tokio(socket.clone()))
         } else {
             let std_addr = addr;
             let domain = match addr {
@@ -1072,46 +1102,44 @@ impl SocketCache {
                     "set ip transparent error"
                 ))?;
 
-                unsafe {
-                    if domain == socket2::Domain::IPV4 {
-                        crate::stack::set_socket_opt(
-                            &socket,
-                            libc::SOL_IP,
-                            libc::IP_TRANSPARENT,
-                            libc::c_int::from(1),
-                        )?;
-                        crate::stack::set_socket_opt(
-                            &socket,
-                            libc::SOL_IP,
-                            libc::IP_ORIGDSTADDR,
-                            libc::c_int::from(1),
-                        )?;
-                        crate::stack::set_socket_opt(
-                            &socket,
-                            libc::SOL_IP,
-                            libc::IP_FREEBIND,
-                            libc::c_int::from(1),
-                        )?;
-                    } else if domain == socket2::Domain::IPV6 {
-                        crate::stack::set_socket_opt(
-                            &socket,
-                            libc::SOL_IPV6,
-                            libc::IP_TRANSPARENT,
-                            libc::c_int::from(1),
-                        )?;
-                        crate::stack::set_socket_opt(
-                            &socket,
-                            libc::SOL_IPV6,
-                            libc::IPV6_RECVORIGDSTADDR,
-                            libc::c_int::from(1),
-                        )?;
-                        crate::stack::set_socket_opt(
-                            &socket,
-                            libc::SOL_IPV6,
-                            libc::IP_FREEBIND,
-                            libc::c_int::from(1),
-                        )?;
-                    }
+                if domain == socket2::Domain::IPV4 {
+                    crate::stack::set_socket_opt(
+                        &socket,
+                        libc::SOL_IP,
+                        libc::IP_TRANSPARENT,
+                        libc::c_int::from(1),
+                    )?;
+                    crate::stack::set_socket_opt(
+                        &socket,
+                        libc::SOL_IP,
+                        libc::IP_ORIGDSTADDR,
+                        libc::c_int::from(1),
+                    )?;
+                    crate::stack::set_socket_opt(
+                        &socket,
+                        libc::SOL_IP,
+                        libc::IP_FREEBIND,
+                        libc::c_int::from(1),
+                    )?;
+                } else if domain == socket2::Domain::IPV6 {
+                    crate::stack::set_socket_opt(
+                        &socket,
+                        libc::SOL_IPV6,
+                        libc::IP_TRANSPARENT,
+                        libc::c_int::from(1),
+                    )?;
+                    crate::stack::set_socket_opt(
+                        &socket,
+                        libc::SOL_IPV6,
+                        libc::IPV6_RECVORIGDSTADDR,
+                        libc::c_int::from(1),
+                    )?;
+                    crate::stack::set_socket_opt(
+                        &socket,
+                        libc::SOL_IPV6,
+                        libc::IP_FREEBIND,
+                        libc::c_int::from(1),
+                    )?;
                 }
             }
             let addr_str = std_addr.to_string();
@@ -1129,7 +1157,7 @@ impl SocketCache {
             let udp_socket = Arc::new(udp_socket);
 
             cache.insert(std_addr, udp_socket.clone());
-            Ok(udp_socket)
+            Ok(UdpSocketRef::Tokio(udp_socket))
         }
     }
 
@@ -1152,6 +1180,7 @@ struct UdpStackInner {
     id: String,
     bind_addr: String,
     concurrency: u32,
+    server_runtime: ServerRuntime,
     max_sessions: usize,
     session_idle_time: Duration,
     all_client_session: DatagramClientSessionMap,
@@ -1185,6 +1214,10 @@ impl UdpStackInner {
             id: builder.id.unwrap(),
             bind_addr: builder.bind.unwrap(),
             concurrency: builder.concurrency,
+            server_runtime: builder.server_runtime.ok_or(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "server_runtime is required"
+            ))?,
             max_sessions: normalize_max_sessions(builder.max_sessions),
             session_idle_time: builder.session_idle_time,
             all_client_session: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1218,7 +1251,7 @@ impl UdpStackInner {
 
     async fn handle_datagram(
         &self,
-        udp_socket: Arc<UdpSocket>,
+        udp_socket: UdpSocketRef,
         src_addr: SocketAddr,
         dest_addr: SocketAddr,
         data: Vec<u8>,
@@ -1305,7 +1338,7 @@ impl UdpStackInner {
                                 {
                                     Ok(resp) => {
                                         if let Err(e) =
-                                            udp_socket.send_to(resp.as_slice(), &src_addr).await
+                                            udp_socket.send_to(resp.as_slice(), src_addr).await
                                         {
                                             log::error!("send datagram error: {}", e);
                                             *session_guard = None;
@@ -1383,39 +1416,13 @@ impl UdpStackInner {
         Ok(())
     }
 
-    pub async fn start(self: &Arc<Self>) -> StackResult<JoinHandle<()>> {
+    pub async fn start_listener(self: &Arc<Self>) -> StackResult<UdpServer> {
         let addr: SocketAddr = self.bind_addr.parse().map_err(into_stack_err!(
             StackErrorCode::InvalidConfig,
             "invalid bind address"
         ))?;
-        let sockaddr: socket2::SockAddr = addr.into();
-
-        // 2. 创建原始套接字
-        // 根据目标地址的IP版本选择域 (Domain::IPV4 或 Domain::IPV6)
-        let domain = match addr {
-            std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
-            std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
-        };
-        // 创建数据报 (DGRAM) 套接字，对应 UDP
-        let socket =
-            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
-                .map_err(into_stack_err!(
-                    StackErrorCode::IoError,
-                    "create socket error"
-                ))?;
-
-        socket.set_nonblocking(true).map_err(into_stack_err!(
-            StackErrorCode::IoError,
-            "set nonblocking error"
-        ))?;
         #[cfg(target_os = "linux")]
         {
-            if self.reuse_address || self.transparent {
-                socket.set_reuse_address(true).map_err(into_stack_err!(
-                    StackErrorCode::IoError,
-                    "set reuse address error"
-                ))?;
-            }
             if self.transparent {
                 if !has_root_privileges() {
                     return Err(stack_err!(
@@ -1423,144 +1430,34 @@ impl UdpStackInner {
                         "transparent mode requires root privileges"
                     ));
                 }
-                socket.set_ip_transparent_v4(true).map_err(into_stack_err!(
-                    StackErrorCode::IoError,
-                    "set ip transparent error"
-                ))?;
-
-                unsafe {
-                    if domain == socket2::Domain::IPV4 {
-                        set_socket_opt(
-                            &socket,
-                            libc::SOL_IP,
-                            libc::IP_TRANSPARENT,
-                            libc::c_int::from(1),
-                        )?;
-                        set_socket_opt(
-                            &socket,
-                            libc::SOL_IP,
-                            libc::IP_ORIGDSTADDR,
-                            libc::c_int::from(1),
-                        )?;
-                        set_socket_opt(
-                            &socket,
-                            libc::SOL_IP,
-                            libc::IP_FREEBIND,
-                            libc::c_int::from(1),
-                        )?;
-                    } else if domain == socket2::Domain::IPV6 {
-                        set_socket_opt(
-                            &socket,
-                            libc::SOL_IPV6,
-                            libc::IP_TRANSPARENT,
-                            libc::c_int::from(1),
-                        )?;
-                        set_socket_opt(
-                            &socket,
-                            libc::SOL_IPV6,
-                            libc::IPV6_RECVORIGDSTADDR,
-                            libc::c_int::from(1),
-                        )?;
-                        set_socket_opt(
-                            &socket,
-                            libc::SOL_IPV6,
-                            libc::IP_FREEBIND,
-                            libc::c_int::from(1),
-                        )?;
-                    }
-                }
             }
         }
-        // 4. 绑定套接字到指定地址
-        let sockaddr_str = addr.to_string();
-        socket.bind(&sockaddr).map_err(into_stack_err!(
-            StackErrorCode::BindFailed,
-            "bind error, address:{}",
-            sockaddr_str
-        ))?;
-        #[cfg(unix)]
-        let socket = unsafe { std::net::UdpSocket::from_raw_fd(socket.into_raw_fd()) };
-        #[cfg(windows)]
-        let socket = unsafe { std::net::UdpSocket::from_raw_socket(socket.into_raw_socket()) };
-        let udp_socket = tokio::net::UdpSocket::from_std(socket)
-            .map_err(into_stack_err!(StackErrorCode::IoError))?;
-        let udp_socket = Arc::new(udp_socket);
 
         let this = self.clone();
-        let concurrency = self.concurrency;
-        let handle = tokio::spawn(async move {
-            let semaphore = Arc::new(Semaphore::new(concurrency as usize));
-            loop {
-                let permit = semaphore.clone().acquire_owned().await.unwrap();
-                let mut buffer = vec![0u8; 1024 * 2];
-                #[cfg(target_os = "linux")]
-                let (len, src_addr, dest_addr) = if this.transparent {
-                    match udp_socket
-                        .async_io(tokio::io::Interest::READABLE, || {
-                            recv_from(&udp_socket, &mut buffer)
-                        })
-                        .await
-                    {
-                        Ok(ret) => ret,
-                        Err(e) => {
-                            log::error!("accept error: {}", e);
-                            break;
-                        }
-                    }
-                } else {
-                    let (len, addr) = match udp_socket.recv_from(&mut buffer).await {
-                        Ok(pair) => pair,
-                        Err(err) => {
-                            log::error!("accept error: {}", err);
-                            break;
-                        }
-                    };
-                    let dest_addr = match udp_socket.local_addr() {
-                        Ok(addr) => addr,
-                        Err(err) => {
-                            log::error!("get local addr error: {}", err);
-                            break;
-                        }
-                    };
-                    (len, addr, dest_addr)
-                };
-                #[cfg(not(target_os = "linux"))]
-                let (len, src_addr, dest_addr) = {
-                    let (len, addr) = match udp_socket.recv_from(&mut buffer).await {
-                        Ok(pair) => pair,
-                        Err(err) => {
-                            if let Some(err) = err.raw_os_error() {
-                                if err == 10054 {
-                                    continue;
-                                }
-                            }
-                            log::error!("accept error: {}", err);
-                            break;
-                        }
-                    };
-                    let dest_addr = match udp_socket.local_addr() {
-                        Ok(addr) => addr,
-                        Err(err) => {
-                            log::error!("get local addr error: {}", err);
-                            break;
-                        }
-                    };
-                    (len, addr, dest_addr)
-                };
+        let socket_options = SocketOptions {
+            reuse_address: self.reuse_address || self.transparent,
+            ipv4_transparent: transparent_mode(self.transparent, addr.is_ipv4()),
+            ipv6_transparent: transparent_mode(self.transparent, addr.is_ipv6()),
+        };
+        let mut service_config = UdpServiceConfig::new(addr).with_socket_options(socket_options);
+        if self.concurrency != u32::MAX {
+            service_config =
+                service_config.with_max_concurrency_per_worker(self.concurrency as usize);
+        }
+
+        let server = UdpServer::serve(
+            &self.server_runtime,
+            service_config,
+            move |socket, meta, payload| {
                 let this = this.clone();
-                let socket = udp_socket.clone();
-                tokio::spawn(async move {
-                    let result = this
-                        .handle_datagram(socket, src_addr, dest_addr, buffer, len)
-                        .await;
-                    if let Err(e) = result {
-                        log::error!("handle datagram error: {}", e);
-                    }
-                    drop(permit);
-                });
-            }
-        });
-        Ok(handle)
+                async move {
+                    handle_reuseport_udp_datagram(this, socket, meta, payload).await;
+                    Ok(())
+                }
+            },
+        )
+        .map_err(|e| stack_err!(StackErrorCode::BindFailed, "start udp server error: {e}"))?;
+        Ok(server)
     }
 
     async fn clear_idle_sessions(&self, latest_key: Option<SessionKey>) -> Option<SessionKey> {
@@ -1631,17 +1528,69 @@ impl UdpStackInner {
     }
 }
 
+fn transparent_mode(transparent: bool, matches_bind_family: bool) -> TransparentMode {
+    if transparent && matches_bind_family {
+        #[cfg(target_os = "linux")]
+        {
+            TransparentMode::Required
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            TransparentMode::Disabled
+        }
+    } else {
+        TransparentMode::Disabled
+    }
+}
+
+async fn handle_reuseport_udp_datagram(
+    inner: Arc<UdpStackInner>,
+    socket: ReuseportUdpSocket,
+    meta: PacketMeta,
+    payload: Vec<u8>,
+) {
+    let Some(src_addr) = meta.peer_addr else {
+        log::error!("udp datagram missing peer addr");
+        return;
+    };
+    let dest_addr = match meta.local_addr {
+        Some(addr) => addr,
+        None => match socket.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                log::error!("get udp local addr failed: {}", e);
+                return;
+            }
+        },
+    };
+    let len = payload.len();
+    if let Err(e) = inner
+        .handle_datagram(
+            UdpSocketRef::Reuseport(socket),
+            src_addr,
+            dest_addr,
+            payload,
+            len,
+        )
+        .await
+    {
+        log::error!("handle datagram error: {}", e);
+    }
+}
+
 pub struct UdpStack {
     inner: Arc<UdpStackInner>,
     prepare_handler: Arc<RwLock<Option<Arc<UdpDatagramHandler>>>>,
-    handle: Mutex<Option<JoinHandle<()>>>,
+    server: Mutex<Option<UdpServer>>,
     clear_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for UdpStack {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.lock().unwrap().take() {
-            handle.abort();
+        if let Some(server) = self.server.lock().unwrap().take() {
+            if let Err(e) = server.close() {
+                log::error!("close udp server failed: {}", e);
+            }
         }
         if let Some(handle) = self.clear_handle.lock().unwrap().take() {
             handle.abort();
@@ -1680,7 +1629,7 @@ impl UdpStack {
         Ok(Self {
             inner: Arc::new(inner),
             prepare_handler: Arc::new(Default::default()),
-            handle: Mutex::new(None),
+            server: Mutex::new(None),
             clear_handle: Mutex::new(None),
         })
     }
@@ -1706,11 +1655,11 @@ impl Stack for UdpStack {
 
     async fn start(&self) -> StackResult<()> {
         {
-            if self.handle.lock().unwrap().is_some() {
+            if self.server.lock().unwrap().is_some() {
                 return Ok(());
             }
         }
-        let handle = self.inner.start().await?;
+        let server = self.inner.start_listener().await?;
         let inner = self.inner.clone();
         *self.clear_handle.lock().unwrap() = Some(tokio::spawn(async move {
             let mut latest_key = None;
@@ -1721,7 +1670,7 @@ impl Stack for UdpStack {
                 tokio::time::sleep(clear_interval.div(2)).await;
             }
         }));
-        *self.handle.lock().unwrap() = Some(handle);
+        *self.server.lock().unwrap() = Some(server);
         Ok(())
     }
 
@@ -1745,6 +1694,15 @@ impl Stack for UdpStack {
 
         if config.bind.to_string() != self.inner.bind_addr {
             return Err(stack_err!(StackErrorCode::BindUnmatched, "bind unmatch"));
+        }
+
+        if normalize_concurrency(config.concurrency.unwrap_or(DEFAULT_UDP_CONCURRENCY))
+            != self.inner.concurrency
+        {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "concurrency unmatch"
+            ));
         }
 
         if config.transparent.unwrap_or(false) != self.inner.transparent {
@@ -1811,6 +1769,7 @@ pub struct UdpStackBuilder {
     id: Option<String>,
     bind: Option<String>,
     concurrency: u32,
+    server_runtime: Option<ServerRuntime>,
     max_sessions: u32,
     session_idle_time: Duration,
     hook_point: Option<ProcessChainConfigs>,
@@ -1827,6 +1786,7 @@ impl UdpStackBuilder {
             id: None,
             bind: None,
             concurrency: normalize_concurrency(DEFAULT_UDP_CONCURRENCY),
+            server_runtime: None,
             max_sessions: DEFAULT_UDP_MAX_SESSIONS,
             session_idle_time: Duration::from_secs(5),
             hook_point: None,
@@ -1854,6 +1814,11 @@ impl UdpStackBuilder {
 
     pub fn concurrency(mut self, concurrency: u32) -> Self {
         self.concurrency = normalize_concurrency(concurrency);
+        self
+    }
+
+    pub fn server_runtime(mut self, server_runtime: ServerRuntime) -> Self {
+        self.server_runtime = Some(server_runtime);
         self
     }
 
@@ -1940,11 +1905,15 @@ impl StackConfig for UdpStackConfig {
 
 pub struct UdpStackFactory {
     connection_manager: ConnectionManagerRef,
+    server_runtime: ServerRuntime,
 }
 
 impl UdpStackFactory {
-    pub fn new(connection_manager: ConnectionManagerRef) -> Self {
-        Self { connection_manager }
+    pub fn new(connection_manager: ConnectionManagerRef, server_runtime: ServerRuntime) -> Self {
+        Self {
+            connection_manager,
+            server_runtime,
+        }
     }
 }
 
@@ -1985,6 +1954,7 @@ impl StackFactory for UdpStackFactory {
             .id(config.id.clone())
             .bind(config.bind.to_string())
             .connection_manager(self.connection_manager.clone())
+            .server_runtime(self.server_runtime.clone())
             .hook_point(config.hook_point.clone())
             .concurrency(config.concurrency.unwrap_or(DEFAULT_UDP_CONCURRENCY))
             .max_sessions(config.max_sessions.unwrap_or(DEFAULT_UDP_MAX_SESSIONS))
@@ -2016,6 +1986,13 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::net::UdpSocket;
+
+    fn test_server_runtime() -> sfo_reuseport::ServerRuntime {
+        sfo_reuseport::ServerRuntime::start(
+            sfo_reuseport::ServerRuntimeConfig::new().with_workers(1),
+        )
+        .unwrap()
+    }
 
     fn build_udp_context(
         servers: ServerManagerRef,
@@ -2078,6 +2055,7 @@ mod tests {
             .id("test")
             .bind("0.0.0.0:8930")
             .hook_point(vec![])
+            .server_runtime(test_server_runtime())
             .stack_context(stack_context)
             .build()
             .await;
@@ -2094,6 +2072,7 @@ mod tests {
             .id("test")
             .bind("0.0.0.0:8930")
             .hook_point(vec![])
+            .server_runtime(test_server_runtime())
             .stack_context(stack_context)
             .build()
             .await;
@@ -2126,6 +2105,7 @@ mod tests {
             .id("test")
             .bind("0.0.0.0:8932")
             .hook_point(chains)
+            .server_runtime(test_server_runtime())
             .session_idle_time(Duration::from_secs(5))
             .transparent(false)
             .stack_context(stack_context)
@@ -2199,6 +2179,7 @@ mod tests {
             .id("udp-dump-forward")
             .bind("0.0.0.0:8941")
             .hook_point(chains)
+            .server_runtime(test_server_runtime())
             .session_idle_time(Duration::from_secs(5))
             .stack_context(stack_context)
             .io_dump(io_dump)
@@ -2262,6 +2243,7 @@ mod tests {
             .id("test")
             .bind("0.0.0.0:8931")
             .hook_point(chains)
+            .server_runtime(test_server_runtime())
             .session_idle_time(Duration::from_secs(5))
             .stack_context(stack_context)
             .build()
@@ -2340,6 +2322,7 @@ mod tests {
             .id("test")
             .bind("0.0.0.0:8938")
             .hook_point(chains)
+            .server_runtime(test_server_runtime())
             .session_idle_time(Duration::from_secs(5))
             .stack_context(stack_context)
             .build()
@@ -2410,6 +2393,7 @@ mod tests {
             .id("udp-dump-server")
             .bind("0.0.0.0:8943")
             .hook_point(chains)
+            .server_runtime(test_server_runtime())
             .session_idle_time(Duration::from_secs(5))
             .stack_context(stack_context)
             .io_dump(io_dump)
@@ -2477,6 +2461,7 @@ mod tests {
             .id("test")
             .bind("0.0.0.0:8939")
             .hook_point(chains)
+            .server_runtime(test_server_runtime())
             .session_idle_time(Duration::from_secs(5))
             .stack_context(stack_context)
             .build()
@@ -2543,6 +2528,7 @@ mod tests {
             .id("test")
             .bind("0.0.0.0:8940")
             .hook_point(chains)
+            .server_runtime(test_server_runtime())
             .session_idle_time(Duration::from_secs(5))
             .stack_context(stack_context)
             .build()
@@ -2596,7 +2582,7 @@ mod tests {
         let limiter_manager = Arc::new(DefaultLimiterManager::new());
         let stat_manager = StatManager::new();
         let collection_manager = GlobalCollectionManager::create(vec![]).await.unwrap();
-        let udp_factory = UdpStackFactory::new(ConnectionManager::new());
+        let udp_factory = UdpStackFactory::new(ConnectionManager::new(), test_server_runtime());
 
         let config = UdpStackConfig {
             id: "test".to_string(),

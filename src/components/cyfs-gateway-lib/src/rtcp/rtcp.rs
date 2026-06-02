@@ -27,7 +27,7 @@ use hkdf::Hkdf;
 use rand::Rng;
 use sha2::Sha256;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
@@ -154,6 +154,40 @@ const HELLO_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 // next one until it fully fails.
 const DIRECT_CONNECT_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 const DIRECT_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DIRECT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+const RECONNECT_RESOLVE_TIMEOUT: Duration = Duration::from_millis(250);
+
+async fn resolve_rtcp_candidate_ips(
+    resolve_name: &str,
+    timeout_dur: Duration,
+) -> Result<Vec<IpAddr>, String> {
+    match timeout(timeout_dur, resolve_ips(resolve_name)).await {
+        Ok(Ok(ips)) => Ok(ips),
+        Ok(Err(err)) => resolve_rtcp_nameinfo_ips(resolve_name, timeout_dur)
+            .await
+            .map_err(|fallback_err| format!("{}; fallback resolve failed: {}", err, fallback_err)),
+        Err(_) => resolve_rtcp_nameinfo_ips(resolve_name, timeout_dur)
+            .await
+            .map_err(|fallback_err| {
+                format!(
+                    "timed out after {:?}; fallback resolve failed: {}",
+                    timeout_dur, fallback_err
+                )
+            }),
+    }
+}
+
+async fn resolve_rtcp_nameinfo_ips(
+    resolve_name: &str,
+    timeout_dur: Duration,
+) -> Result<Vec<IpAddr>, String> {
+    match timeout(timeout_dur, resolve(resolve_name, None)).await {
+        Ok(Ok(info)) if !info.address.is_empty() => Ok(info.address),
+        Ok(Ok(_)) => Err("empty address list".to_string()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!("timed out after {:?}", timeout_dur)),
+    }
+}
 
 // Upper bound on NonceCache size. Each entry is ~100 bytes, so 16k entries
 // caps memory at roughly 1.6 MiB. A healthy peer hits nowhere near this;
@@ -1526,25 +1560,26 @@ impl RTcpInner {
             remote_device_id, resolve_name
         );
 
-        let candidate_ips = match resolve_ips(resolve_name.as_str()).await {
-            Ok(ips) if !ips.is_empty() => ips,
-            Ok(_) => {
-                let msg = format!(
-                    "cann't resolve remote device {} ip by {}: empty address list",
-                    remote_device_id, resolve_name
-                );
-                error!("{}", msg);
-                return Err(TunnelError::DocumentError(msg));
-            }
-            Err(err) => {
-                let msg = format!(
-                    "cann't resolve remote device {} ip by {}: {}",
-                    remote_device_id, resolve_name, err
-                );
-                error!("{}", msg);
-                return Err(TunnelError::DocumentError(msg));
-            }
-        };
+        let candidate_ips =
+            match resolve_rtcp_candidate_ips(resolve_name.as_str(), DIRECT_RESOLVE_TIMEOUT).await {
+                Ok(ips) if !ips.is_empty() => ips,
+                Ok(_) => {
+                    let msg = format!(
+                        "cann't resolve remote device {} ip by {}: empty address list",
+                        remote_device_id, resolve_name
+                    );
+                    error!("{}", msg);
+                    return Err(TunnelError::DocumentError(msg));
+                }
+                Err(err) => {
+                    let msg = format!(
+                        "cann't resolve remote device {} ip by {}: {}",
+                        remote_device_id, resolve_name, err
+                    );
+                    error!("{}", msg);
+                    return Err(TunnelError::DocumentError(msg));
+                }
+            };
 
         let port = remote_stack.stack_port;
         let candidate_addrs: Vec<SocketAddr> = candidate_ips
@@ -2222,7 +2257,12 @@ impl RTcpTunnel {
     async fn collect_reconnect_candidates(&self, last_addr: SocketAddr) -> Vec<SocketAddr> {
         let port = self.remote_stack.stack_port;
         let resolve_name = self.remote_stack.did.to_string();
-        let resolved = match resolve_ips(resolve_name.as_str()).await {
+        let resolved = match resolve_rtcp_candidate_ips(
+            resolve_name.as_str(),
+            RECONNECT_RESOLVE_TIMEOUT,
+        )
+        .await
+        {
             Ok(ips) => ips,
             Err(e) => {
                 debug!(

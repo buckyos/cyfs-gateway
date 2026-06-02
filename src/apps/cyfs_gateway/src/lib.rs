@@ -159,7 +159,10 @@ async fn run_gateway_with_config(
     debug!("Register tcp stack factory");
     factory.register_stack_factory(
         StackProtocol::Udp,
-        Arc::new(UdpStackFactory::new(connect_manager.clone())),
+        Arc::new(UdpStackFactory::new(
+            connect_manager.clone(),
+            tcp_server_runtime.clone(),
+        )),
     );
     debug!("Register udp stack factory");
     factory.register_stack_factory(
