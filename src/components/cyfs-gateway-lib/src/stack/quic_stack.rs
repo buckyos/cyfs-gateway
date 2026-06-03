@@ -771,10 +771,10 @@ impl QuicConnectionHandler {
 
                                                     let body = if read_limit.is_some() {
                                                         AsyncReadBody::with_capacity(LimitRead::new(recv_stream, read_limit.unwrap()), 4096)
-                                                            .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed()
+                                                            .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed_unsync()
                                                     } else {
                                                         AsyncReadBody::with_capacity(recv_stream, 4096)
-                                                            .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed()
+                                                            .map_err(|e| server_err!(ServerErrorCode::IOError, "async read body error: {e}")).boxed_unsync()
                                                     };
                                                     let req = http::Request::from_parts(parts, body);
                                                     log::debug!("recv http request:remote {} method {} host {} path {}",
@@ -782,17 +782,17 @@ impl QuicConnectionHandler {
                                                         req.method().to_string(),
                                                         req.headers().get("host").map(|h| h.to_str().unwrap_or("none")).unwrap_or("none"),
                                                         req.uri().to_string());
-                                                    let resp = server
-                                                        .serve_request(
-                                                            req,
-                                                            StreamInfo::new(remote_addr.to_string()).with_dst_addr(Some(local_addr.to_string())).with_device_info(
-                                                                device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
-                                                                device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
-                                                                device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
-                                                            ),
-                                                        )
-                                                        .await
-                                                        .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
+                                                    let resp = crate::serve_http_server_request(
+                                                        server,
+                                                        req,
+                                                        StreamInfo::new(remote_addr.to_string()).with_dst_addr(Some(local_addr.to_string())).with_device_info(
+                                                            device_info.as_ref().and_then(|v| v.mac().map(|m| m.to_string())),
+                                                            device_info.as_ref().and_then(|v| v.hostname().map(|h| h.to_string())),
+                                                            device_info.as_ref().map(|v| v.today_online_seconds().to_string()),
+                                                        ),
+                                                    )
+                                                    .await
+                                                    .map_err(into_stack_err!(StackErrorCode::InvalidConfig))?;
                                                     let (parts, mut body) = resp.into_parts();
 
                                                     send.send_response(http::Response::from_parts(parts, ())).await

@@ -3,7 +3,7 @@ use crate::{
     ServerError, ServerErrorCode, ServerFactory, ServerResult, StreamInfo, server_err,
 };
 use http::{Request, Response, StatusCode, Version};
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use serde::{Deserialize, Serialize};
@@ -35,9 +35,9 @@ impl AcmeHttpChallengeServer {
 impl HttpServer for AcmeHttpChallengeServer {
     async fn serve_request(
         &self,
-        req: Request<BoxBody<Bytes, ServerError>>,
+        req: Request<UnsyncBoxBody<Bytes, ServerError>>,
         _info: StreamInfo,
-    ) -> ServerResult<Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let path = req.uri().path();
 
         // 提取ACME挑战token
@@ -49,7 +49,7 @@ impl HttpServer for AcmeHttpChallengeServer {
                     .body(
                         Full::new(Bytes::from(key_auth.clone()))
                             .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{e}"))
-                            .boxed(),
+                            .boxed_unsync(),
                     )
                     .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{e}"))?;
                 return Ok(response);
@@ -63,7 +63,7 @@ impl HttpServer for AcmeHttpChallengeServer {
             .body(
                 Full::new(Bytes::from("Not Found"))
                     .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{e}"))
-                    .boxed(),
+                    .boxed_unsync(),
             )
             .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "{e}"))?;
         Ok(response)

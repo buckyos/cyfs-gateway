@@ -1,7 +1,6 @@
 use crate::server::dns_server::NameServer;
-use crate::{
-    HttpServer, QAServer, ServerError, ServerErrorCode, ServerResult, StreamInfo, server_err,
-};
+use crate::QAServer;
+use ::kRPC::{RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use as_any::AsAny;
 use buckyos_kit::AsyncStream;
 use cyfs_process_chain::{
@@ -10,14 +9,599 @@ use cyfs_process_chain::{
     VariableVisitorWrapperForMapCollection,
 };
 use http::uri::{Parts, PathAndQuery};
-use http::{HeaderName, Method, Uri};
-use http_body_util::combinators::BoxBody;
+use http::{HeaderName, Method, Response, StatusCode, Uri};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, Mutex, Weak};
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock as StdRwLock, Weak};
+use tokio::net::{TcpListener, TcpStream};
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ServerErrorCode {
+    BindFailed,
+    NotFound,
+    InvalidConfig,
+    InvalidParam,
+    ProcessChainError,
+    StreamError,
+    TunnelError,
+    InvalidTlsKey,
+    InvalidTlsCert,
+    InvalidData,
+    IOError,
+    BadRequest,
+    UnknownServerType,
+    EncodeError,
+    DnsQueryError,
+    InvalidDnsOpType,
+    InvalidDnsMessageType,
+    InvalidDnsRecordType,
+    Rejected,
+    AlreadyExists,
+}
+
+pub type ServerResult<T> = sfo_result::Result<T, ServerErrorCode>;
+pub type ServerError = sfo_result::Error<ServerErrorCode>;
+pub use sfo_result::err as server_err;
+pub use sfo_result::into_err as into_server_err;
+
+#[derive(Default, Debug, Clone)]
+pub struct StreamInfo {
+    pub src_addr: Option<String>,
+    pub dst_addr: Option<String>,
+    pub conn_src_addr: Option<String>,
+    pub real_src_addr: Option<String>,
+    pub source_mac: Option<String>,
+    pub source_hostname: Option<String>,
+    pub source_online_secs: Option<String>,
+}
+
+impl StreamInfo {
+    pub fn new(src_addr: String) -> Self {
+        Self {
+            src_addr: Some(src_addr.clone()),
+            dst_addr: None,
+            conn_src_addr: Some(src_addr),
+            real_src_addr: None,
+            source_mac: None,
+            source_hostname: None,
+            source_online_secs: None,
+        }
+    }
+
+    pub fn with_addrs(conn_src_addr: Option<String>, real_src_addr: Option<String>) -> Self {
+        let src_addr = real_src_addr.clone().or_else(|| conn_src_addr.clone());
+        Self {
+            src_addr,
+            dst_addr: None,
+            conn_src_addr,
+            real_src_addr,
+            source_mac: None,
+            source_hostname: None,
+            source_online_secs: None,
+        }
+    }
+
+    pub fn with_device_info(
+        mut self,
+        source_mac: Option<String>,
+        source_hostname: Option<String>,
+        source_online_secs: Option<String>,
+    ) -> Self {
+        self.source_mac = source_mac;
+        self.source_hostname = source_hostname;
+        self.source_online_secs = source_online_secs;
+        self
+    }
+
+    pub fn with_dst_addr(mut self, dst_addr: Option<String>) -> Self {
+        self.dst_addr = dst_addr;
+        self
+    }
+}
+
+#[async_trait::async_trait]
+pub trait HttpServer: Send + Sync + 'static {
+    async fn serve_request(
+        &self,
+        req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
+        info: StreamInfo,
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>>;
+
+    fn id(&self) -> String;
+    fn http_version(&self) -> http::Version;
+    fn http3_port(&self) -> Option<u16>;
+}
+
+pub async fn serve_http_server_request(
+    server: Arc<dyn HttpServer>,
+    req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
+    info: StreamInfo,
+) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
+    server.serve_request(req, info).await
+}
+
+pub async fn serve_http_by_rpc_handler<T: RPCHandler + Send + Sync + 'static>(
+    req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
+    info: StreamInfo,
+    rpc_handler: &T,
+) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
+    if req.method() != hyper::Method::POST {
+        return Ok(text_response(
+            hyper::StatusCode::METHOD_NOT_ALLOWED,
+            "Method Not Allowed",
+        )?);
+    }
+
+    let client_ip = match client_ip(&info) {
+        Ok(client_ip) => client_ip,
+        Err(resp) => return Ok(resp),
+    };
+
+    let body_bytes = match req.collect().await {
+        Ok(data) => data.to_bytes(),
+        Err(e) => {
+            return Ok(text_response(
+                hyper::StatusCode::BAD_REQUEST,
+                format!("Failed to read body: {:?}", e),
+            )?);
+        }
+    };
+
+    let body_str = match String::from_utf8(body_bytes.to_vec()) {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(text_response(
+                hyper::StatusCode::BAD_REQUEST,
+                format!("Failed to convert body to string: {}", e),
+            )?);
+        }
+    };
+
+    log::debug!("|==>recv kRPC req: {}", body_str);
+
+    let rpc_request: RPCRequest = match serde_json::from_str(body_str.as_str()) {
+        Ok(rpc_request) => rpc_request,
+        Err(e) => {
+            return Ok(text_response(
+                hyper::StatusCode::BAD_REQUEST,
+                format!("Failed to parse request body to RPCRequest: {}", e),
+            )?);
+        }
+    };
+
+    let rpc_seq = rpc_request.seq;
+    let rpc_trace_id = rpc_request.trace_id.clone();
+    let resp: RPCResponse = match rpc_handler.handle_rpc_call(rpc_request, client_ip).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            log::warn!("Failed to handle rpc call: {}", e);
+            RPCResponse {
+                result: RPCResult::Failed(e.to_string()),
+                seq: rpc_seq,
+                trace_id: rpc_trace_id,
+            }
+        }
+    };
+
+    let body_json = serde_json::to_string(&resp).map_err(|e| {
+        server_err!(
+            ServerErrorCode::EncodeError,
+            "Failed to convert response to string: {}",
+            e
+        )
+    })?;
+
+    Response::builder()
+        .body(full_body(body_json))
+        .map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidData,
+                "Failed to build response: {}",
+                e
+            )
+        })
+}
+
+pub async fn hyper_serve_http(
+    stream: Box<dyn AsyncStream>,
+    server: Arc<dyn HttpServer>,
+    info: StreamInfo,
+) -> ServerResult<()> {
+    if server.http_version() <= http::Version::HTTP_11 {
+        hyper_serve_http1(stream, server, info).await
+    } else if server.http_version() == http::Version::HTTP_3 && server.http3_port().is_some() {
+        serve_auto_http(stream, server, info, true).await
+    } else {
+        serve_auto_http(stream, server, info, false).await
+    }
+}
+
+pub async fn hyper_serve_http1(
+    stream: Box<dyn AsyncStream>,
+    server: Arc<dyn HttpServer>,
+    info: StreamInfo,
+) -> ServerResult<()> {
+    hyper::server::conn::http1::Builder::new()
+        .serve_connection(
+            TokioIo::new(stream),
+            hyper::service::service_fn(|req| {
+                let server = server.clone();
+                let info = info.clone();
+                async move { handle_request(req, server, info, false).await }
+            }),
+        )
+        .await
+        .map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
+
+    Ok(())
+}
+
+async fn serve_auto_http(
+    stream: Box<dyn AsyncStream>,
+    server: Arc<dyn HttpServer>,
+    info: StreamInfo,
+    add_http3_alt_svc: bool,
+) -> ServerResult<()> {
+    hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+        .serve_connection(
+            TokioIo::new(stream),
+            hyper::service::service_fn(|req| {
+                let server = server.clone();
+                let info = info.clone();
+                async move { handle_request(req, server, info, add_http3_alt_svc).await }
+            }),
+        )
+        .await
+        .map_err(|e| server_err!(ServerErrorCode::StreamError, "{e}"))?;
+
+    Ok(())
+}
+
+async fn handle_request(
+    req: hyper::Request<hyper::body::Incoming>,
+    server: Arc<dyn HttpServer>,
+    info: StreamInfo,
+    add_http3_alt_svc: bool,
+) -> ServerResult<Response<UnsyncBoxBody<Bytes, ServerError>>> {
+    let (parts, body) = req.into_parts();
+    let req = http::Request::new(UnsyncBoxBody::new(body))
+        .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{}", e))
+        .boxed_unsync();
+    let req = http::Request::from_parts(parts, req);
+
+    let remote = info
+        .src_addr
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let method_is_options = req.method() == Method::OPTIONS;
+    let method = req.method().to_string();
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("none")
+        .to_string();
+    let uri = req.uri().to_string();
+
+    log::debug!(
+        "recv http request:remote {} method {} host {} path {}",
+        remote,
+        method,
+        host,
+        uri,
+    );
+
+    match serve_http_server_request(server.clone(), req, info).await {
+        Ok(mut resp) => {
+            if add_http3_alt_svc {
+                if let Some(http3_port) = server.http3_port() {
+                    let value = format!("h3=\":{http3_port}\"; ma=86400");
+                    resp.headers_mut().insert(
+                        http::header::ALT_SVC,
+                        http::HeaderValue::from_str(value.as_str())
+                            .map_err(|e| server_err!(ServerErrorCode::InvalidData, "{:?}", e))?,
+                    );
+                }
+            }
+
+            log_forbidden(
+                &server,
+                resp.status(),
+                method_is_options,
+                remote,
+                method,
+                host,
+                uri,
+            );
+            Ok(resp)
+        }
+        Err(e) => {
+            log::error!("http error {}", e);
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(
+                    Full::new(Bytes::from(e.msg().to_string()))
+                        .map_err(|e| server_err!(ServerErrorCode::BadRequest, "{:?}", e))
+                        .boxed_unsync(),
+                )
+                .map_err(|e| server_err!(ServerErrorCode::StreamError, "{:?}", e))
+        }
+    }
+}
+
+fn log_forbidden(
+    server: &Arc<dyn HttpServer>,
+    status: StatusCode,
+    method_is_options: bool,
+    remote: String,
+    method: String,
+    host: String,
+    uri: String,
+) {
+    if status != StatusCode::FORBIDDEN {
+        return;
+    }
+
+    if method_is_options {
+        log::warn!(
+            "http_forbidden server={} remote={} method={} host={} uri={}",
+            server.id(),
+            remote,
+            method,
+            host,
+            uri,
+        );
+    } else {
+        log::debug!(
+            "http_forbidden server={} remote={} method={} host={} uri={}",
+            server.id(),
+            remote,
+            method,
+            host,
+            uri,
+        );
+    }
+}
+
+fn client_ip(info: &StreamInfo) -> Result<IpAddr, http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
+    match info.src_addr.as_ref() {
+        Some(addr) => match addr.parse::<std::net::SocketAddr>() {
+            Ok(sa) => Ok(sa.ip()),
+            Err(e) => {
+                log::error!("parse client ip {} err {}", addr, e);
+                Err(text_response(hyper::StatusCode::BAD_REQUEST, "Bad Request")
+                    .expect("static bad request response should build"))
+            }
+        },
+        None => {
+            log::error!("Failed to get client ip");
+            Err(text_response(hyper::StatusCode::BAD_REQUEST, "Bad Request")
+                .expect("static bad request response should build"))
+        }
+    }
+}
+
+fn text_response(
+    status: StatusCode,
+    body: impl Into<Bytes>,
+) -> ServerResult<Response<UnsyncBoxBody<Bytes, ServerError>>> {
+    Response::builder()
+        .status(status)
+        .body(full_body(body))
+        .map_err(|e| {
+            server_err!(
+                ServerErrorCode::BadRequest,
+                "Failed to build response: {}",
+                e
+            )
+        })
+}
+
+fn full_body(body: impl Into<Bytes>) -> UnsyncBoxBody<Bytes, ServerError> {
+    Full::new(body.into())
+        .map_err(|never| match never {})
+        .boxed_unsync()
+}
+
+#[derive(Clone)]
+struct Router {
+    routes: Arc<StdRwLock<Vec<(String, Arc<dyn HttpServer>)>>>,
+}
+
+impl Router {
+    fn new() -> Self {
+        Self {
+            routes: Arc::new(StdRwLock::new(Vec::new())),
+        }
+    }
+
+    fn add_route(&self, path: String, server: Arc<dyn HttpServer>) {
+        let mut routes = self.routes.write().unwrap();
+        routes.push((normalize_route(path), server));
+        routes.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()));
+    }
+}
+
+#[async_trait::async_trait]
+impl HttpServer for Router {
+    async fn serve_request(
+        &self,
+        req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
+        info: StreamInfo,
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
+        let path = req.uri().path().to_string();
+        let routes = self.routes.read().unwrap().clone();
+        let src_addr = info.src_addr.as_deref().unwrap_or("unknown");
+        info!("{}=>{} {}", src_addr, req.method(), path);
+
+        for (prefix, server) in routes {
+            debug!("try match router: {}", prefix);
+            if route_matches(&path, &prefix) {
+                debug!(" {} match router: {}", path, prefix);
+                return server.serve_request(req, info).await;
+            }
+        }
+
+        http::Response::builder()
+            .status(http::StatusCode::NOT_FOUND)
+            .body(
+                http_body_util::Full::new(Bytes::from("No Router Found"))
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
+            .map_err(|e| server_err!(ServerErrorCode::InvalidData, "{}", e))
+    }
+
+    fn id(&self) -> String {
+        "router".to_string()
+    }
+
+    fn http_version(&self) -> http::Version {
+        http::Version::HTTP_11
+    }
+
+    fn http3_port(&self) -> Option<u16> {
+        None
+    }
+}
+
+#[derive(Clone)]
+pub struct Runner {
+    bind_addr: SocketAddr,
+    router: Router,
+}
+
+#[derive(Clone, Default)]
+pub struct DirHandlerOptions {
+    pub index_file: Option<String>,
+    pub fallback_file: Option<String>,
+}
+
+impl Runner {
+    pub fn new(port: u16) -> Self {
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
+        Self::with_addr(addr)
+    }
+
+    pub fn with_addr(addr: SocketAddr) -> Self {
+        Self {
+            bind_addr: addr,
+            router: Router::new(),
+        }
+    }
+
+    pub fn bind_addr(&self) -> SocketAddr {
+        self.bind_addr
+    }
+
+    pub fn add_http_server(
+        &self,
+        router_url: String,
+        server: Arc<dyn HttpServer>,
+    ) -> ServerResult<()> {
+        self.router.add_route(router_url, server);
+        Ok(())
+    }
+
+    pub async fn add_dir_handler(&self, router_url: String, dir: PathBuf) -> ServerResult<()> {
+        self.add_dir_handler_with_options(router_url, dir, DirHandlerOptions::default())
+            .await
+    }
+
+    pub async fn add_dir_handler_with_options(
+        &self,
+        router_url: String,
+        dir: PathBuf,
+        options: DirHandlerOptions,
+    ) -> ServerResult<()> {
+        let mut builder = crate::DirServer::builder()
+            .id(router_url.clone())
+            .root_path(dir)
+            .base_url(router_url.clone());
+
+        if let Some(index_file) = options.index_file {
+            builder = builder.index_file(index_file);
+        }
+
+        if let Some(fallback_file) = options.fallback_file {
+            builder = builder.fallback_file(fallback_file);
+        }
+
+        let dir_server = builder.build().await?;
+        self.router.add_route(router_url, Arc::new(dir_server));
+        Ok(())
+    }
+
+    pub fn start(self) -> ServerResult<()> {
+        tokio::spawn(async move {
+            let _ = self.run().await;
+        });
+        Ok(())
+    }
+
+    pub async fn run(&self) -> ServerResult<()> {
+        let listener = TcpListener::bind(self.bind_addr)
+            .await
+            .map_err(|e| server_err!(ServerErrorCode::BindFailed, "{}", e))?;
+
+        let local_addr = listener.local_addr().unwrap_or(self.bind_addr);
+        info!("cyfs-gateway-lib runner listening on {}", local_addr);
+
+        loop {
+            let (stream, peer_addr) = match listener.accept().await {
+                Ok(ret) => ret,
+                Err(e) => {
+                    error!("failed to accept tcp connection: {}", e);
+                    continue;
+                }
+            };
+
+            let server = Arc::new(self.router.clone());
+            tokio::spawn(async move {
+                if let Err(err) = serve_tcp_stream(stream, server, peer_addr).await {
+                    error!("failed to serve {}: {:?}", peer_addr, err);
+                }
+            });
+        }
+    }
+}
+
+async fn serve_tcp_stream(
+    stream: TcpStream,
+    server: Arc<dyn HttpServer>,
+    peer_addr: SocketAddr,
+) -> ServerResult<()> {
+    let info = StreamInfo::new(peer_addr.to_string());
+    let stream: Box<dyn AsyncStream> = Box::new(stream);
+    hyper_serve_http(stream, server, info).await
+}
+
+fn normalize_route(route: String) -> String {
+    if route.is_empty() {
+        return "/".to_string();
+    }
+
+    if route.starts_with('/') {
+        route
+    } else {
+        format!("/{route}")
+    }
+}
+
+fn route_matches(path: &str, route: &str) -> bool {
+    if route == "/" {
+        return path.starts_with('/');
+    }
+
+    path == route.trim_end_matches('/') || path.starts_with(route)
+}
 
 pub trait ServerConfig: AsAny + Send + Sync {
     fn id(&self) -> String;
@@ -169,14 +753,14 @@ pub fn str_to_http_version(version: &str) -> Option<http::Version> {
 
 #[derive(Clone)]
 pub struct HttpRequestHeaderMap {
-    request: Arc<RwLock<http::Request<BoxBody<Bytes, ServerError>>>>,
+    request: Arc<Mutex<http::Request<UnsyncBoxBody<Bytes, ServerError>>>>,
     transverse_counter: Arc<AtomicU32>, // Indicates if a traversal is currently happening
 }
 
 impl HttpRequestHeaderMap {
-    pub fn new(request: http::Request<BoxBody<Bytes, ServerError>>) -> Self {
+    pub fn new(request: http::Request<UnsyncBoxBody<Bytes, ServerError>>) -> Self {
         Self {
-            request: Arc::new(RwLock::new(request)),
+            request: Arc::new(Mutex::new(request)),
             transverse_counter: Arc::new(AtomicU32::new(0)), // Initialize counter to 0
         }
     }
@@ -187,14 +771,19 @@ impl HttpRequestHeaderMap {
             > 0
     }
 
-    pub fn into_request(self) -> Result<http::Request<BoxBody<Bytes, ServerError>>, String> {
+    pub fn into_request(self) -> Result<http::Request<UnsyncBoxBody<Bytes, ServerError>>, String> {
         let req = Arc::try_unwrap(self.request)
             .map_err(|_| {
                 let msg = "Failed to unwrap HyperHttpRequestHeaderMap".to_string();
                 error!("{}", msg);
                 msg
             })?
-            .into_inner();
+            .into_inner()
+            .map_err(|_| {
+                let msg = "Failed to unwrap poisoned HyperHttpRequestHeaderMap".to_string();
+                error!("{}", msg);
+                msg
+            })?;
 
         Ok(req)
     }
@@ -228,7 +817,7 @@ impl HttpRequestHeaderMap {
 #[async_trait::async_trait]
 impl MapCollection for HttpRequestHeaderMap {
     async fn len(&self) -> Result<usize, String> {
-        let request = self.request.read().await;
+        let request = self.request.lock().unwrap();
         Ok(request.headers().len())
     }
 
@@ -245,7 +834,7 @@ impl MapCollection for HttpRequestHeaderMap {
             return Err(msg);
         }
 
-        let mut request = self.request.write().await;
+        let mut request = self.request.lock().unwrap();
         let header = value.try_as_str()?.parse().map_err(|e| {
             let msg = format!("Invalid header value '{}': {}", value, e);
             warn!("{}", msg);
@@ -279,7 +868,7 @@ impl MapCollection for HttpRequestHeaderMap {
             return Err(msg);
         }
 
-        let mut request = self.request.write().await;
+        let mut request = self.request.lock().unwrap();
         if key == "uri" {
             let old_value = CollectionValue::String(request.uri().to_string());
             *request.uri_mut() = Uri::try_from(value.try_as_str()?).map_err(|e| {
@@ -371,7 +960,7 @@ impl MapCollection for HttpRequestHeaderMap {
     }
 
     async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
-        let request = self.request.read().await;
+        let request = self.request.lock().unwrap();
         if key == "path" {
             Ok(Some(CollectionValue::String(
                 request.uri().path().to_string(),
@@ -402,7 +991,7 @@ impl MapCollection for HttpRequestHeaderMap {
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
-        let request = self.request.read().await;
+        let request = self.request.lock().unwrap();
         if key == "path" || key == "method" || key == "uri" || key == "version" {
             return Ok(true);
         }
@@ -416,7 +1005,7 @@ impl MapCollection for HttpRequestHeaderMap {
             return Err(msg);
         }
 
-        let mut request = self.request.write().await;
+        let mut request = self.request.lock().unwrap();
         let prev = request.headers_mut().remove(key);
         if let Some(prev_value) = prev {
             let prev = match prev_value.to_str() {
@@ -436,57 +1025,49 @@ impl MapCollection for HttpRequestHeaderMap {
     async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String> {
         let _guard = TraverseGuard::new(&self.transverse_counter);
 
-        let request = self.request.read().await;
-        if !callback
-            .call(
-                "path",
-                &CollectionValue::String(request.uri().path().to_string()),
-            )
-            .await?
-        {
-            return Ok(());
-        }
-        if !callback
-            .call(
-                "method",
-                &CollectionValue::String(request.method().to_string()),
-            )
-            .await?
-        {
-            return Ok(());
-        }
-        if !callback
-            .call("uri", &CollectionValue::String(request.uri().to_string()))
-            .await?
-        {
-            return Ok(());
-        }
-        if !callback
-            .call(
-                "version",
-                &CollectionValue::String(format!("{:?}", request.version())),
-            )
-            .await?
-        {
-            return Ok(());
-        }
-        for (key, value) in request.headers().iter() {
-            if let Ok(value_str) = value.to_str() {
-                if !callback
-                    .call(key.as_str(), &CollectionValue::String(value_str.to_owned()))
-                    .await?
-                {
-                    break; // Stop traversal if callback returns false
+        let entries = {
+            let request = self.request.lock().unwrap();
+            let mut entries = vec![
+                (
+                    "path".to_string(),
+                    CollectionValue::String(request.uri().path().to_string()),
+                ),
+                (
+                    "method".to_string(),
+                    CollectionValue::String(request.method().to_string()),
+                ),
+                (
+                    "uri".to_string(),
+                    CollectionValue::String(request.uri().to_string()),
+                ),
+                (
+                    "version".to_string(),
+                    CollectionValue::String(format!("{:?}", request.version())),
+                ),
+            ];
+            for (key, value) in request.headers().iter() {
+                if let Ok(value_str) = value.to_str() {
+                    entries.push((
+                        key.as_str().to_string(),
+                        CollectionValue::String(value_str.to_owned()),
+                    ));
+                } else {
+                    warn!("Header value for '{}' is not valid UTF-8", key);
                 }
-            } else {
-                warn!("Header value for '{}' is not valid UTF-8", key);
+            }
+            entries
+        };
+
+        for (key, value) in entries {
+            if !callback.call(&key, &value).await? {
+                break;
             }
         }
         Ok(())
     }
 
     async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
-        let request = self.request.read().await;
+        let request = self.request.lock().unwrap();
         let mut result = Vec::new();
         result.push((
             "path".to_string(),
@@ -520,14 +1101,14 @@ impl MapCollection for HttpRequestHeaderMap {
 
 #[derive(Clone)]
 pub struct HttpResponseHeaderMap {
-    response: Arc<RwLock<http::Response<BoxBody<Bytes, ServerError>>>>,
+    response: Arc<Mutex<http::Response<UnsyncBoxBody<Bytes, ServerError>>>>,
     transverse_counter: Arc<AtomicU32>,
 }
 
 impl HttpResponseHeaderMap {
-    pub fn new(response: http::Response<BoxBody<Bytes, ServerError>>) -> Self {
+    pub fn new(response: http::Response<UnsyncBoxBody<Bytes, ServerError>>) -> Self {
         Self {
-            response: Arc::new(RwLock::new(response)),
+            response: Arc::new(Mutex::new(response)),
             transverse_counter: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -538,14 +1119,19 @@ impl HttpResponseHeaderMap {
             > 0
     }
 
-    pub fn into_response(self) -> Result<http::Response<BoxBody<Bytes, ServerError>>, String> {
+    pub fn into_response(self) -> Result<http::Response<UnsyncBoxBody<Bytes, ServerError>>, String> {
         let resp = Arc::try_unwrap(self.response)
             .map_err(|_| {
                 let msg = "Failed to unwrap HttpResponseHeaderMap".to_string();
                 error!("{}", msg);
                 msg
             })?
-            .into_inner();
+            .into_inner()
+            .map_err(|_| {
+                let msg = "Failed to unwrap poisoned HttpResponseHeaderMap".to_string();
+                error!("{}", msg);
+                msg
+            })?;
 
         Ok(resp)
     }
@@ -560,7 +1146,7 @@ impl HttpResponseHeaderMap {
 #[async_trait::async_trait]
 impl MapCollection for HttpResponseHeaderMap {
     async fn len(&self) -> Result<usize, String> {
-        let response = self.response.read().await;
+        let response = self.response.lock().unwrap();
         Ok(response.headers().len())
     }
 
@@ -571,7 +1157,7 @@ impl MapCollection for HttpResponseHeaderMap {
             return Err(msg);
         }
 
-        let mut response = self.response.write().await;
+        let mut response = self.response.lock().unwrap();
         let header = value.try_as_str()?.parse().map_err(|e| {
             let msg = format!("Invalid header value '{}': {}", value, e);
             warn!("{}", msg);
@@ -605,7 +1191,7 @@ impl MapCollection for HttpResponseHeaderMap {
             return Err(msg);
         }
 
-        let mut response = self.response.write().await;
+        let mut response = self.response.lock().unwrap();
         let header = value.try_as_str()?.parse().map_err(|e| {
             let msg = format!("Invalid header value '{}': {}", value, e);
             warn!("{}", msg);
@@ -635,7 +1221,7 @@ impl MapCollection for HttpResponseHeaderMap {
     }
 
     async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
-        let response = self.response.read().await;
+        let response = self.response.lock().unwrap();
         let ret = response.headers().get(key);
         if let Some(value) = ret {
             if let Ok(value_str) = value.to_str() {
@@ -651,7 +1237,7 @@ impl MapCollection for HttpResponseHeaderMap {
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
-        let response = self.response.read().await;
+        let response = self.response.lock().unwrap();
         Ok(response.headers().get(key).is_some())
     }
 
@@ -662,7 +1248,7 @@ impl MapCollection for HttpResponseHeaderMap {
             return Err(msg);
         }
 
-        let mut response = self.response.write().await;
+        let mut response = self.response.lock().unwrap();
         let prev = response.headers_mut().remove(key);
         if let Some(prev_value) = prev {
             let prev = match prev_value.to_str() {
@@ -682,24 +1268,32 @@ impl MapCollection for HttpResponseHeaderMap {
     async fn traverse(&self, callback: MapCollectionTraverseCallBackRef) -> Result<(), String> {
         let _guard = TraverseGuard::new(&self.transverse_counter);
 
-        let response = self.response.read().await;
-        for (key, value) in response.headers().iter() {
-            if let Ok(value_str) = value.to_str() {
-                if !callback
-                    .call(key.as_str(), &CollectionValue::String(value_str.to_owned()))
-                    .await?
-                {
-                    break;
+        let entries = {
+            let response = self.response.lock().unwrap();
+            let mut entries = Vec::new();
+            for (key, value) in response.headers().iter() {
+                if let Ok(value_str) = value.to_str() {
+                    entries.push((
+                        key.as_str().to_string(),
+                        CollectionValue::String(value_str.to_owned()),
+                    ));
+                } else {
+                    warn!("Header value for '{}' is not valid UTF-8", key);
                 }
-            } else {
-                warn!("Header value for '{}' is not valid UTF-8", key);
+            }
+            entries
+        };
+
+        for (key, value) in entries {
+            if !callback.call(&key, &value).await? {
+                break;
             }
         }
         Ok(())
     }
 
     async fn dump(&self) -> Result<Vec<(String, CollectionValue)>, String> {
-        let response = self.response.read().await;
+        let response = self.response.lock().unwrap();
         let mut result = Vec::new();
         for (key, value) in response.headers().iter() {
             if let Ok(value_str) = value.to_str() {
@@ -718,13 +1312,13 @@ impl MapCollection for HttpResponseHeaderMap {
 // Url visitor for HTTP requests
 #[derive(Clone)]
 pub struct HttpRequestUrlVisitor {
-    request: Arc<RwLock<http::Request<BoxBody<Bytes, ServerError>>>>,
+    request: Arc<Mutex<http::Request<UnsyncBoxBody<Bytes, ServerError>>>>,
     read_only: bool,
 }
 
 impl HttpRequestUrlVisitor {
     pub fn new(
-        request: Arc<RwLock<http::Request<BoxBody<Bytes, ServerError>>>>,
+        request: Arc<Mutex<http::Request<UnsyncBoxBody<Bytes, ServerError>>>>,
         read_only: bool,
     ) -> Self {
         Self { request, read_only }
@@ -734,7 +1328,7 @@ impl HttpRequestUrlVisitor {
 #[async_trait::async_trait]
 impl VariableVisitor for HttpRequestUrlVisitor {
     async fn get(&self, _id: &str) -> Result<CollectionValue, String> {
-        let request = self.request.read().await;
+        let request = self.request.lock().unwrap();
         let ret = request.uri().to_string();
 
         Ok(CollectionValue::String(ret))
@@ -757,7 +1351,7 @@ impl VariableVisitor for HttpRequestUrlVisitor {
             msg
         })?;
 
-        let mut request = self.request.write().await;
+        let mut request = self.request.lock().unwrap();
         let old_value = request.uri().to_string();
         *request.uri_mut() = new_url;
 

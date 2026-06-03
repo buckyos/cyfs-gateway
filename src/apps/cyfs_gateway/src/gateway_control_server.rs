@@ -7,7 +7,7 @@ use cyfs_gateway_lib::{
 };
 use cyfs_gateway_lib::{HttpServer, ServerContext, ServerContextRef, ServerFactory};
 use cyfs_gateway_lib::{ServerErrorCode, ServerResult, server_err};
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use log::*;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -191,9 +191,9 @@ impl HttpServer for GatewayControlServer {
 
     async fn serve_request(
         &self,
-        request: http::Request<BoxBody<Bytes, ServerError>>,
+        request: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
         info: StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         if request.method() != http::Method::POST {
             return Ok(http::Response::builder()
                 .status(http::StatusCode::FORBIDDEN)
@@ -202,12 +202,12 @@ impl HttpServer for GatewayControlServer {
                         .map_err(|e| {
                             ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))
                         })
-                        .boxed(),
+                        .boxed_unsync(),
                 )
                 .unwrap());
         }
         let body = request.into_body();
-        let ret: ControlResult<http::Response<BoxBody<Bytes, ServerError>>> = async move {
+        let ret: ControlResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> = async move {
             let data = body
                 .collect()
                 .await
@@ -229,7 +229,7 @@ impl HttpServer for GatewayControlServer {
                                         format!("{:?}", e),
                                     )
                                 })
-                                .boxed(),
+                                .boxed_unsync(),
                         )
                         .unwrap();
                     return Ok(resp);
@@ -249,7 +249,7 @@ impl HttpServer for GatewayControlServer {
                                             format!("{:?}", e),
                                         )
                                     })
-                                    .boxed(),
+                                    .boxed_unsync(),
                             )
                             .unwrap();
                         return Ok(resp);
@@ -290,7 +290,7 @@ impl HttpServer for GatewayControlServer {
                         .map_err(|e| {
                             ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))
                         })
-                        .boxed(),
+                        .boxed_unsync(),
                 ));
             }
 
@@ -306,7 +306,7 @@ impl HttpServer for GatewayControlServer {
                                         format!("{:?}", e),
                                     )
                                 })
-                                .boxed(),
+                                .boxed_unsync(),
                         )
                         .unwrap();
                     return Ok(resp);
@@ -331,7 +331,7 @@ impl HttpServer for GatewayControlServer {
                                             format!("{:?}", e),
                                         )
                                     })
-                                    .boxed(),
+                                    .boxed_unsync(),
                             )
                             .unwrap();
                         return Ok(resp);
@@ -350,7 +350,7 @@ impl HttpServer for GatewayControlServer {
                         .map_err(|e| {
                             ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))
                         })
-                        .boxed(),
+                        .boxed_unsync(),
                 ));
             }
 
@@ -366,7 +366,7 @@ impl HttpServer for GatewayControlServer {
                                         format!("{:?}", e),
                                     )
                                 })
-                                .boxed(),
+                                .boxed_unsync(),
                         )
                         .unwrap();
                     return Ok(resp);
@@ -404,7 +404,7 @@ impl HttpServer for GatewayControlServer {
                             .map_err(|e| {
                                 ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))
                             })
-                            .boxed(),
+                            .boxed_unsync(),
                     ));
                 } else {
                     return Err(cmd_err!(
@@ -423,7 +423,7 @@ impl HttpServer for GatewayControlServer {
                             .map_err(|e| {
                                 ServerError::new(ServerErrorCode::BadRequest, format!("{:?}", e))
                             })
-                            .boxed(),
+                            .boxed_unsync(),
                     )
                     .unwrap();
                 return Ok(resp);
@@ -447,7 +447,7 @@ impl HttpServer for GatewayControlServer {
                                         format!("{:?}", e),
                                     )
                                 })
-                                .boxed(),
+                                .boxed_unsync(),
                         )
                         .unwrap();
                     return Ok(resp);
@@ -480,7 +480,7 @@ impl HttpServer for GatewayControlServer {
                         .map_err(|e| {
                             ServerError::new(ServerErrorCode::EncodeError, format!("{:?}", e))
                         })
-                        .boxed(),
+                        .boxed_unsync(),
                 ))
             } else {
                 Err(cmd_err!(
@@ -500,7 +500,7 @@ impl HttpServer for GatewayControlServer {
                 .body(
                     Full::new(Bytes::from(msg.as_bytes().to_vec()))
                         .map_err(|e| ServerError::new(ServerErrorCode::IOError, format!("{:?}", e)))
-                        .boxed(),
+                        .boxed_unsync(),
                 )
                 .unwrap()
         }))

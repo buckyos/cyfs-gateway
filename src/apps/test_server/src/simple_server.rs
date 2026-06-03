@@ -4,7 +4,7 @@ use cyfs_gateway_lib::{
     HttpServer, ServerError, ServerResult, StreamInfo, serve_http_by_rpc_handler,
 };
 use http::{Method, Response, StatusCode, Version};
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use log::info;
 use std::net::IpAddr;
@@ -36,13 +36,13 @@ impl RPCHandler for SimpleHttpServer {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl HttpServer for SimpleHttpServer {
     async fn serve_request(
         &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
+        req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
         info: StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         if *req.method() == Method::POST {
             return serve_http_by_rpc_handler(req, info, self).await;
         }
@@ -63,7 +63,7 @@ impl HttpServer for SimpleHttpServer {
             .body(
                 Full::new(Bytes::from(body))
                     .map_err(|never| match never {})
-                    .boxed(),
+                    .boxed_unsync(),
             )
             .map_err(|e| {
                 cyfs_gateway_lib::server_err!(

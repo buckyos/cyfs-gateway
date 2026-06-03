@@ -1,6 +1,6 @@
 use crate::{HttpServer, ServerError, ServerResult, StreamInfo};
 use http::{StatusCode, Version};
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 
@@ -85,9 +85,9 @@ impl WelcomeServer {
 impl HttpServer for WelcomeServer {
     async fn serve_request(
         &self,
-        _req: http::Request<BoxBody<Bytes, ServerError>>,
+        _req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
         _info: StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         Ok(http::Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/html; charset=utf-8")
@@ -95,7 +95,7 @@ impl HttpServer for WelcomeServer {
             .body(
                 Full::new(Bytes::from_static(WELCOME_HTML))
                     .map_err(|e| match e {})
-                    .boxed(),
+                    .boxed_unsync(),
             )
             .unwrap())
     }

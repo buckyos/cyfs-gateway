@@ -2,8 +2,7 @@ mod simple_server;
 
 use std::sync::Arc;
 
-use buckyos_http_server::Runner;
-use cyfs_gateway_lib::ServerResult;
+use cyfs_gateway_lib::{Runner, ServerResult};
 use log::info;
 use simple_server::SimpleHttpServer;
 

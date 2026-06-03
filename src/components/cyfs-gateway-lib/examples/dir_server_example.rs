@@ -22,6 +22,7 @@ use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::task::LocalSet;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -109,55 +110,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n按 Ctrl+C 停止服务器");
 
     // 接受连接
-    loop {
-        let (stream, remote_addr) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let server = server.clone();
-
-        tokio::spawn(async move {
-            let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+    let local = LocalSet::new();
+    local
+        .run_until(async move {
+            loop {
+                let (stream, remote_addr) = listener.accept().await?;
+                let io = TokioIo::new(stream);
                 let server = server.clone();
-                async move {
-                    let stream_info = StreamInfo::default();
 
-                    // 将 Incoming body 转换为 BoxBody
-                    let req = req.map(|body| {
-                        body.map_err(|e| {
-                            cyfs_gateway_lib::ServerError::new(
-                                cyfs_gateway_lib::ServerErrorCode::StreamError,
-                                format!("{:?}", e),
-                            )
-                        })
-                        .boxed()
+                tokio::task::spawn_local(async move {
+                    let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let server = server.clone();
+                        async move {
+                            let stream_info = StreamInfo::default();
+
+                            // 将 Incoming body 转换为 HttpServer 使用的 UnsyncBoxBody
+                            let req = req.map(|body| {
+                                body.map_err(|e| {
+                                    cyfs_gateway_lib::ServerError::new(
+                                        cyfs_gateway_lib::ServerErrorCode::StreamError,
+                                        format!("{:?}", e),
+                                    )
+                                })
+                                .boxed_unsync()
+                            });
+
+                            // 调用服务器处理请求
+                            let result = server.serve_request(req, stream_info).await;
+
+                            match result {
+                                Ok(resp) => {
+                                    println!("✓ {} - {}", remote_addr, resp.status());
+                                    Ok::<_, hyper::Error>(resp)
+                                }
+                                Err(e) => {
+                                    eprintln!("✗ {} - Error: {:?}", remote_addr, e);
+                                    // 返回 500 错误
+                                    Ok(hyper::Response::builder()
+                                        .status(500)
+                                        .body(
+                                            Full::new(Bytes::from("Internal Server Error"))
+                                                .map_err(
+                                                    |e: std::convert::Infallible| match e {},
+                                                )
+                                                .boxed_unsync(),
+                                        )
+                                        .unwrap())
+                                }
+                            }
+                        }
                     });
 
-                    // 调用服务器处理请求
-                    let result = server.serve_request(req, stream_info).await;
-
-                    match result {
-                        Ok(resp) => {
-                            println!("✓ {} - {}", remote_addr, resp.status());
-                            Ok::<_, hyper::Error>(resp)
-                        }
-                        Err(e) => {
-                            eprintln!("✗ {} - Error: {:?}", remote_addr, e);
-                            // 返回 500 错误
-                            Ok(hyper::Response::builder()
-                                .status(500)
-                                .body(
-                                    Full::new(Bytes::from("Internal Server Error"))
-                                        .map_err(|e: std::convert::Infallible| match e {})
-                                        .boxed(),
-                                )
-                                .unwrap())
-                        }
+                    if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+                        eprintln!("连接错误: {:?}", err);
                     }
-                }
-            });
-
-            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                eprintln!("连接错误: {:?}", err);
+                });
             }
-        });
-    }
+        })
+        .await
 }

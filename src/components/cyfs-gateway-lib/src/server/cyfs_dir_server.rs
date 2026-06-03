@@ -40,10 +40,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use buckyos_http_server::{HttpServer, ServerError, StreamInfo};
+use buckyos_http_server as bucky_http;
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
 use http::{Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use http_body_util::{
+    BodyExt, Full,
+    combinators::{BoxBody, UnsyncBoxBody},
+};
 use hyper::body::Bytes;
 use jsonwebtoken::EncodingKey;
 use log::{debug, warn};
@@ -56,8 +59,9 @@ use std::collections::HashMap;
 use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
 use crate::{
     GlobalCollectionManagerRef, HttpRequestHeaderMap, JsExternalsManagerRef, ProcessChainConfigs,
-    Server, ServerConfig, ServerContext, ServerContextRef, ServerErrorCode, ServerFactory,
-    ServerManagerWeakRef, ServerResult, get_external_commands, into_server_err, server_err,
+    HttpServer, Server, ServerConfig, ServerContext, ServerContextRef, ServerError,
+    ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo,
+    get_external_commands, into_server_err, server_err,
 };
 
 const ENV_KEY_CYOBJ_META: &str = "RESP_cyobj_meta";
@@ -217,7 +221,7 @@ impl CyfsDirServer {
     /// filesystem-backed pipeline.
     async fn run_chain(
         &self,
-        req: Request<BoxBody<Bytes, ServerError>>,
+        req: Request<UnsyncBoxBody<Bytes, ServerError>>,
     ) -> ServerResult<ChainOutcome> {
         let executor = match self.executor.as_ref() {
             Some(e) => e,
@@ -332,9 +336,9 @@ impl CyfsDirServer {
 impl HttpServer for CyfsDirServer {
     async fn serve_request(
         &self,
-        req: Request<BoxBody<Bytes, ServerError>>,
+        req: Request<UnsyncBoxBody<Bytes, ServerError>>,
         info: StreamInfo,
-    ) -> Result<Response<BoxBody<Bytes, ServerError>>, ServerError> {
+    ) -> Result<Response<UnsyncBoxBody<Bytes, ServerError>>, ServerError> {
         let req = match self.run_chain(req).await {
             Ok(ChainOutcome::Response(resp)) => return Ok(resp),
             Ok(ChainOutcome::Resolved(req)) | Ok(ChainOutcome::PassThrough(req)) => req,
@@ -346,10 +350,26 @@ impl HttpServer for CyfsDirServer {
             }
         };
 
-        // Delegate everything else (inner-path walking, chunk streaming,
-        // cyfs-* headers, hostname O-Link, filesystem fallback) to the
-        // inner NdnDirServer.
-        self.inner.serve_request(req, info).await
+        // NdnDirServer is provided by ndn-toolkit and still implements the
+        // upstream buckyos_http_server::HttpServer trait. Keep the gateway
+        // public surface on the local trait and adapt only at this boundary.
+        let (parts, body) = req.into_parts();
+        let body = body.collect().await?.to_bytes();
+        let req: Request<BoxBody<Bytes, bucky_http::ServerError>> = Request::from_parts(
+            parts,
+            Full::new(body)
+                .map_err(|never| match never {})
+                .boxed(),
+        );
+        let resp = bucky_http::HttpServer::serve_request(
+            self.inner.as_ref(),
+            req,
+            to_bucky_stream_info(info),
+        )
+        .await
+        .map_err(from_bucky_server_error)?;
+
+        Ok(resp.map(|body| body.map_err(from_bucky_server_error).boxed_unsync()))
     }
 
     fn id(&self) -> String {
@@ -357,23 +377,93 @@ impl HttpServer for CyfsDirServer {
     }
 
     fn http_version(&self) -> http::Version {
-        self.inner.http_version()
+        bucky_http::HttpServer::http_version(self.inner.as_ref())
     }
 
     fn http3_port(&self) -> Option<u16> {
-        self.inner.http3_port()
+        bucky_http::HttpServer::http3_port(self.inner.as_ref())
+    }
+}
+
+fn to_bucky_stream_info(info: StreamInfo) -> bucky_http::StreamInfo {
+    bucky_http::StreamInfo {
+        src_addr: info.src_addr,
+        dst_addr: info.dst_addr,
+        conn_src_addr: info.conn_src_addr,
+        real_src_addr: info.real_src_addr,
+        source_mac: info.source_mac,
+        source_hostname: info.source_hostname,
+        source_online_secs: info.source_online_secs,
+    }
+}
+
+fn to_bucky_server_error(err: ServerError) -> bucky_http::ServerError {
+    bucky_http::ServerError::new(to_bucky_error_code(err.code()), err.msg().to_string())
+}
+
+fn from_bucky_server_error(err: bucky_http::ServerError) -> ServerError {
+    ServerError::new(from_bucky_error_code(err.code()), err.msg().to_string())
+}
+
+fn to_bucky_error_code(code: ServerErrorCode) -> bucky_http::ServerErrorCode {
+    match code {
+        ServerErrorCode::BindFailed => bucky_http::ServerErrorCode::BindFailed,
+        ServerErrorCode::NotFound => bucky_http::ServerErrorCode::NotFound,
+        ServerErrorCode::InvalidConfig => bucky_http::ServerErrorCode::InvalidConfig,
+        ServerErrorCode::InvalidParam => bucky_http::ServerErrorCode::InvalidParam,
+        ServerErrorCode::ProcessChainError => bucky_http::ServerErrorCode::ProcessChainError,
+        ServerErrorCode::StreamError => bucky_http::ServerErrorCode::StreamError,
+        ServerErrorCode::TunnelError => bucky_http::ServerErrorCode::TunnelError,
+        ServerErrorCode::InvalidTlsKey => bucky_http::ServerErrorCode::InvalidTlsKey,
+        ServerErrorCode::InvalidTlsCert => bucky_http::ServerErrorCode::InvalidTlsCert,
+        ServerErrorCode::InvalidData => bucky_http::ServerErrorCode::InvalidData,
+        ServerErrorCode::IOError => bucky_http::ServerErrorCode::IOError,
+        ServerErrorCode::BadRequest => bucky_http::ServerErrorCode::BadRequest,
+        ServerErrorCode::UnknownServerType => bucky_http::ServerErrorCode::UnknownServerType,
+        ServerErrorCode::EncodeError => bucky_http::ServerErrorCode::EncodeError,
+        ServerErrorCode::DnsQueryError => bucky_http::ServerErrorCode::DnsQueryError,
+        ServerErrorCode::InvalidDnsOpType => bucky_http::ServerErrorCode::InvalidDnsOpType,
+        ServerErrorCode::InvalidDnsMessageType => bucky_http::ServerErrorCode::InvalidDnsMessageType,
+        ServerErrorCode::InvalidDnsRecordType => bucky_http::ServerErrorCode::InvalidDnsRecordType,
+        ServerErrorCode::Rejected => bucky_http::ServerErrorCode::Rejected,
+        ServerErrorCode::AlreadyExists => bucky_http::ServerErrorCode::AlreadyExists,
+    }
+}
+
+fn from_bucky_error_code(code: bucky_http::ServerErrorCode) -> ServerErrorCode {
+    match code {
+        bucky_http::ServerErrorCode::BindFailed => ServerErrorCode::BindFailed,
+        bucky_http::ServerErrorCode::NotFound => ServerErrorCode::NotFound,
+        bucky_http::ServerErrorCode::InvalidConfig => ServerErrorCode::InvalidConfig,
+        bucky_http::ServerErrorCode::InvalidParam => ServerErrorCode::InvalidParam,
+        bucky_http::ServerErrorCode::ProcessChainError => ServerErrorCode::ProcessChainError,
+        bucky_http::ServerErrorCode::StreamError => ServerErrorCode::StreamError,
+        bucky_http::ServerErrorCode::TunnelError => ServerErrorCode::TunnelError,
+        bucky_http::ServerErrorCode::InvalidTlsKey => ServerErrorCode::InvalidTlsKey,
+        bucky_http::ServerErrorCode::InvalidTlsCert => ServerErrorCode::InvalidTlsCert,
+        bucky_http::ServerErrorCode::InvalidData => ServerErrorCode::InvalidData,
+        bucky_http::ServerErrorCode::IOError => ServerErrorCode::IOError,
+        bucky_http::ServerErrorCode::BadRequest => ServerErrorCode::BadRequest,
+        bucky_http::ServerErrorCode::UnknownServerType => ServerErrorCode::UnknownServerType,
+        bucky_http::ServerErrorCode::EncodeError => ServerErrorCode::EncodeError,
+        bucky_http::ServerErrorCode::DnsQueryError => ServerErrorCode::DnsQueryError,
+        bucky_http::ServerErrorCode::InvalidDnsOpType => ServerErrorCode::InvalidDnsOpType,
+        bucky_http::ServerErrorCode::InvalidDnsMessageType => ServerErrorCode::InvalidDnsMessageType,
+        bucky_http::ServerErrorCode::InvalidDnsRecordType => ServerErrorCode::InvalidDnsRecordType,
+        bucky_http::ServerErrorCode::Rejected => ServerErrorCode::Rejected,
+        bucky_http::ServerErrorCode::AlreadyExists => ServerErrorCode::AlreadyExists,
     }
 }
 
 enum ChainOutcome {
     /// Chain produced no resolution; pass the (possibly mutated) request
     /// through to the inner server.
-    PassThrough(Request<BoxBody<Bytes, ServerError>>),
+    PassThrough(Request<UnsyncBoxBody<Bytes, ServerError>>),
     /// Chain resolved the path to an obj_id; the request URI has been
     /// rewritten into O-Link form.
-    Resolved(Request<BoxBody<Bytes, ServerError>>),
+    Resolved(Request<UnsyncBoxBody<Bytes, ServerError>>),
     /// Chain produced a terminal HTTP response (drop/reject/error).
-    Response(Response<BoxBody<Bytes, ServerError>>),
+    Response(Response<UnsyncBoxBody<Bytes, ServerError>>),
 }
 
 // =====================================================================
@@ -531,24 +621,24 @@ impl ServerFactory for CyfsDirServerFactory {
 // Helpers
 // =====================================================================
 
-fn empty_response(status: StatusCode) -> Response<BoxBody<Bytes, ServerError>> {
+fn empty_response(status: StatusCode) -> Response<UnsyncBoxBody<Bytes, ServerError>> {
     let mut resp = Response::new(full_body(Bytes::new()));
     *resp.status_mut() = status;
     resp
 }
 
-fn full_body(data: Bytes) -> BoxBody<Bytes, ServerError> {
-    Full::new(data).map_err(|never| match never {}).boxed()
+fn full_body(data: Bytes) -> UnsyncBoxBody<Bytes, ServerError> {
+    Full::new(data).map_err(|never| match never {}).boxed_unsync()
 }
 
 /// Rewrite the request URI so the inner [`NdnDirServer`] sees an O-Link:
 /// `<url_prefix>/<obj_id>{inner_path?}{?query}`. The URL prefix and any
 /// `/@/` inner-path tail are preserved.
 fn rewrite_to_o_link(
-    mut req: Request<BoxBody<Bytes, ServerError>>,
+    mut req: Request<UnsyncBoxBody<Bytes, ServerError>>,
     obj_id: &str,
     url_prefix: &str,
-) -> Request<BoxBody<Bytes, ServerError>> {
+) -> Request<UnsyncBoxBody<Bytes, ServerError>> {
     let uri = req.uri().clone();
     let original_path = uri.path();
     let inner_tail = match original_path.find(INNER_PATH_DELIMITER) {
@@ -575,4 +665,3 @@ fn rewrite_to_o_link(
     }
     req
 }
-

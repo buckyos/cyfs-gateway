@@ -7,7 +7,7 @@ use async_compression::tokio::bufread::{
 };
 use futures_util::TryStreamExt;
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Version, header};
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Bytes, Frame};
 use regex::Regex;
@@ -44,7 +44,7 @@ pub struct CompressionRequestInfo {
 }
 
 impl CompressionRequestInfo {
-    pub fn from_request(req: &http::Request<BoxBody<Bytes, ServerError>>) -> Self {
+    pub fn from_request(req: &http::Request<UnsyncBoxBody<Bytes, ServerError>>) -> Self {
         let accept_encoding = req
             .headers()
             .get(header::ACCEPT_ENCODING)
@@ -131,9 +131,9 @@ impl Default for HttpCompressionSettings {
 }
 
 pub fn apply_request_decompression(
-    req: http::Request<BoxBody<Bytes, ServerError>>,
+    req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
     settings: &HttpCompressionSettings,
-) -> Result<http::Request<BoxBody<Bytes, ServerError>>, ServerError> {
+) -> Result<http::Request<UnsyncBoxBody<Bytes, ServerError>>, ServerError> {
     if !settings.gzip_request {
         return Ok(req);
     }
@@ -184,10 +184,10 @@ pub fn apply_request_decompression(
 }
 
 pub fn apply_response_compression(
-    resp: http::Response<BoxBody<Bytes, ServerError>>,
+    resp: http::Response<UnsyncBoxBody<Bytes, ServerError>>,
     req_info: &CompressionRequestInfo,
     settings: &HttpCompressionSettings,
-) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
     let (mut parts, body) = resp.into_parts();
 
     if settings.gzip_vary {
@@ -276,9 +276,9 @@ fn parse_content_encoding(value: &str) -> Vec<String> {
 }
 
 fn decode_body(
-    body: BoxBody<Bytes, ServerError>,
+    body: UnsyncBoxBody<Bytes, ServerError>,
     encodings: &[Encoding],
-) -> BoxBody<Bytes, ServerError> {
+) -> UnsyncBoxBody<Bytes, ServerError> {
     let stream = body.into_data_stream().map_err(map_body_err);
     let reader = StreamReader::new(stream);
     let mut reader: Box<dyn AsyncRead + Send + Unpin> = Box::new(reader);
@@ -292,14 +292,14 @@ fn decode_body(
     BodyExt::map_err(stream_body, |e| {
         server_err!(ServerErrorCode::StreamError, "Stream error: {}", e)
     })
-    .boxed()
+    .boxed_unsync()
 }
 
 fn encode_body(
-    body: BoxBody<Bytes, ServerError>,
+    body: UnsyncBoxBody<Bytes, ServerError>,
     encoding: &Encoding,
     comp_level: u32,
-) -> BoxBody<Bytes, ServerError> {
+) -> UnsyncBoxBody<Bytes, ServerError> {
     let stream = body.into_data_stream().map_err(map_body_err);
     let reader = StreamReader::new(stream);
     let mut reader: Box<dyn AsyncRead + Send + Unpin> = Box::new(reader);
@@ -316,7 +316,7 @@ fn encode_body(
     BodyExt::map_err(stream_body, |e| {
         server_err!(ServerErrorCode::StreamError, "Stream error: {}", e)
     })
-    .boxed()
+    .boxed_unsync()
 }
 
 fn wrap_decoder(

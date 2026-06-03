@@ -18,7 +18,7 @@ use crate::{
 use cyfs_process_chain::{CollectionValue, CommandControl, ProcessChainLibExecutor};
 use http::Version;
 use http::header::HeaderName;
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Frame};
 use hyper::{Request, StatusCode, http};
@@ -354,7 +354,7 @@ impl Drop for ProcessChainHttpServer {
 
 impl ProcessChainHttpServer {
     fn request_header_value<'a>(
-        req: &'a http::Request<BoxBody<Bytes, ServerError>>,
+        req: &'a http::Request<UnsyncBoxBody<Bytes, ServerError>>,
         name: &str,
     ) -> &'a str {
         req.headers()
@@ -471,7 +471,7 @@ impl ProcessChainHttpServer {
         body: B,
         idle_timeout: Duration,
         abort_on_drop: Option<JoinHandle<()>>,
-    ) -> BoxBody<Bytes, ServerError>
+    ) -> UnsyncBoxBody<Bytes, ServerError>
     where
         B: Body<Data = Bytes, Error = E> + Send + Sync + 'static,
         E: FmtDebug + 'static,
@@ -481,7 +481,7 @@ impl ProcessChainHttpServer {
             idle_timeout,
             abort_on_drop,
         )
-        .boxed()
+        .boxed_unsync()
     }
 
     /// Best-effort: parse a candidate URL string into a `Url` suitable
@@ -666,10 +666,10 @@ impl ProcessChainHttpServer {
 
     async fn handle_forward_upstream(
         &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
+        req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
         target_url: &str,
         info: &StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let mut slot = Some(req);
         self.forward_to_candidate(&mut slot, target_url, info).await
     }
@@ -688,10 +688,10 @@ impl ProcessChainHttpServer {
     ///   body started transmitting. Not retryable.
     async fn forward_to_candidate(
         &self,
-        req_slot: &mut Option<http::Request<BoxBody<Bytes, ServerError>>>,
+        req_slot: &mut Option<http::Request<UnsyncBoxBody<Bytes, ServerError>>>,
         target_url: &str,
         info: &StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let (org_url, mut header, method, version, host_header) = {
             let req_ref = req_slot
                 .as_ref()
@@ -846,7 +846,7 @@ impl ProcessChainHttpServer {
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-                    .boxed();
+                    .boxed_unsync();
                 let mut upstream_req = Request::builder()
                     .method(method)
                     .uri(request_url.as_str())
@@ -1057,7 +1057,7 @@ impl ProcessChainHttpServer {
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-                    .boxed();
+                    .boxed_unsync();
                 let mut upstream_req = Request::builder()
                     .method(method)
                     .uri(org_url)
@@ -1176,7 +1176,7 @@ impl ProcessChainHttpServer {
                 let body = req
                     .into_body()
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-                    .boxed();
+                    .boxed_unsync();
                 let mut upstream_req = Request::builder()
                     .method(method)
                     .uri(fake_url)
@@ -1238,10 +1238,10 @@ impl ProcessChainHttpServer {
     /// tunnel_mgr for an RTT-sorted candidate order before iterating.
     async fn handle_forward_group_upstream(
         &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
+        req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
         plan: &ForwardPlan,
         info: &StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         // Stage 4: RTT-aware reordering before iteration.
         let mut plan_local;
         let plan: &ForwardPlan = if matches!(plan.balance, BalanceMethod::LeastTime) {
@@ -1287,10 +1287,10 @@ impl ProcessChainHttpServer {
     /// surface its result without further retry.
     async fn handle_forward_group_connect_only(
         &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
+        req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
         plan: &ForwardPlan,
         info: &StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let registry = ForwardFailureRegistry::global();
         let group_key = plan.failure_state_key();
         let policy = &plan.next_upstream;
@@ -1404,10 +1404,10 @@ impl ProcessChainHttpServer {
     /// matching upstream HTTP statuses both consume an attempt.
     async fn handle_forward_group_with_status_retry(
         &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
+        req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
         plan: &ForwardPlan,
         info: &StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let registry = ForwardFailureRegistry::global();
         let group_key = plan.failure_state_key();
         let policy = &plan.next_upstream;
@@ -1445,7 +1445,7 @@ impl ProcessChainHttpServer {
         };
 
         let mut last_err: Option<ServerError> = None;
-        let mut last_status_resp: Option<http::Response<BoxBody<Bytes, ServerError>>> = None;
+        let mut last_status_resp: Option<http::Response<UnsyncBoxBody<Bytes, ServerError>>> = None;
         let deadline = policy.timeout.map(|d| std::time::Instant::now() + d);
 
         for (idx, candidate) in plan.candidates.iter().enumerate() {
@@ -1553,7 +1553,7 @@ impl ProcessChainHttpServer {
     /// if it exceeded the cap (in which case retry is no longer safe
     /// for this request).
     async fn buffer_body(
-        body: BoxBody<Bytes, ServerError>,
+        body: UnsyncBoxBody<Bytes, ServerError>,
         cap: u64,
     ) -> ServerResult<Option<Bytes>> {
         let cap = cap as usize;
@@ -1571,11 +1571,11 @@ impl ProcessChainHttpServer {
         Ok(Some(bytes))
     }
 
-    fn full_body(bytes: Bytes) -> BoxBody<Bytes, ServerError> {
-        Full::new(bytes).map_err(|e| match e {}).boxed()
+    fn full_body(bytes: Bytes) -> UnsyncBoxBody<Bytes, ServerError> {
+        Full::new(bytes).map_err(|e| match e {}).boxed_unsync()
     }
 
-    fn set_content_length(req: &mut http::Request<BoxBody<Bytes, ServerError>>) {
+    fn set_content_length(req: &mut http::Request<UnsyncBoxBody<Bytes, ServerError>>) {
         use hyper::body::Body;
         let len = req
             .body()
@@ -1631,11 +1631,11 @@ impl ProcessChainHttpServer {
         &self,
         location: &str,
         status: StatusCode,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let response = http::Response::builder()
             .status(status)
             .header(http::header::LOCATION, location)
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .map_err(|e| {
                 server_err!(
                     ServerErrorCode::BadRequest,
@@ -1676,7 +1676,7 @@ impl ProcessChainHttpServer {
         &self,
         status: StatusCode,
         message: Option<&str>,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let body = message.unwrap_or("");
         let response = http::Response::builder()
             .status(status)
@@ -1684,7 +1684,7 @@ impl ProcessChainHttpServer {
             .body(
                 Full::new(Bytes::from(body.to_string()))
                     .map_err(|e| match e {})
-                    .boxed(),
+                    .boxed_unsync(),
             )
             .map_err(|e| {
                 server_err!(
@@ -1702,9 +1702,9 @@ impl ProcessChainHttpServer {
     // - Post chain control results are ignored; only header mutations are applied.
     async fn apply_post_chain(
         &self,
-        resp: http::Response<BoxBody<Bytes, ServerError>>,
+        resp: http::Response<UnsyncBoxBody<Bytes, ServerError>>,
         info: Option<&StreamInfo>,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let post_executor = match &self.post_executor {
             Some(executor) => executor.lock().unwrap().fork(),
             None => return Ok(resp),
@@ -1838,10 +1838,10 @@ impl ProcessChainHttpServer {
 
     async fn apply_post_chain_result(
         &self,
-        resp: ServerResult<http::Response<BoxBody<Bytes, ServerError>>>,
+        resp: ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>>,
         req_info: &CompressionRequestInfo,
         info: Option<&StreamInfo>,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         match resp {
             Ok(resp) => {
                 let resp = timeout(
@@ -1866,9 +1866,9 @@ impl ProcessChainHttpServer {
 impl HttpServer for ProcessChainHttpServer {
     async fn serve_request(
         &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
+        req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
         info: StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let req_info = CompressionRequestInfo::from_request(&req);
         let mut req = match apply_request_decompression(req, &self.compression) {
             Ok(req) => req,
@@ -1876,7 +1876,7 @@ impl HttpServer for ProcessChainHttpServer {
                 let mut response = http::Response::new(
                     Full::new(Bytes::from(err.msg().to_string()))
                         .map_err(|e| match e {})
-                        .boxed(),
+                        .boxed_unsync(),
                 );
                 *response.status_mut() = StatusCode::BAD_REQUEST;
                 return self
@@ -2041,7 +2041,7 @@ impl HttpServer for ProcessChainHttpServer {
                 let response = http::Response::new(
                     Full::new(Bytes::from("Request dropped"))
                         .map_err(|e| match e {})
-                        .boxed(),
+                        .boxed_unsync(),
                 );
                 return self
                     .apply_post_chain_result(Ok(response), &req_info, Some(&info))
@@ -2052,7 +2052,7 @@ impl HttpServer for ProcessChainHttpServer {
                     self.id, req_remote, req_method, req_host, req_uri,
                 );
                 let mut response =
-                    http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
+                    http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync());
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 return self
                     .apply_post_chain_result(Ok(response), &req_info, Some(&info))
@@ -2066,7 +2066,7 @@ impl HttpServer for ProcessChainHttpServer {
                 let mut response = http::Response::new(
                     Full::new(Bytes::from(ret.value.to_string()))
                         .map_err(|e| match e {})
-                        .boxed(),
+                        .boxed_unsync(),
                 );
                 *response.status_mut() = StatusCode::BAD_GATEWAY;
                 return self
@@ -2082,7 +2082,7 @@ impl HttpServer for ProcessChainHttpServer {
                         ret.value.get_type()
                     );
                     let mut response = http::Response::new(
-                        Full::new(Bytes::new()).map_err(|e| match e {}).boxed(),
+                        Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync(),
                     );
                     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                     return self
@@ -2093,7 +2093,7 @@ impl HttpServer for ProcessChainHttpServer {
                     if list.is_empty() {
                         log::error!("process chain return is empty");
                         let mut response = http::Response::new(
-                            Full::new(Bytes::new()).map_err(|e| match e {}).boxed(),
+                            Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync(),
                         );
                         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                         return self
@@ -2221,7 +2221,7 @@ impl HttpServer for ProcessChainHttpServer {
             );
         }
         let mut response =
-            http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed());
+            http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
         self.apply_post_chain_result(Ok(response), &req_info, Some(&info))
             .await
@@ -2544,9 +2544,9 @@ mod tests {
     impl HttpServer for FixedResponseServer {
         async fn serve_request(
             &self,
-            _req: http::Request<BoxBody<Bytes, ServerError>>,
+            _req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
             _info: StreamInfo,
-        ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
             let body = self.body.clone();
             let len = body.len();
             let mut builder = http::Response::builder()
@@ -2557,7 +2557,7 @@ mod tests {
                 builder = builder.header("Content-Encoding", encoding);
             }
             let response = builder
-                .body(Full::new(body).map_err(|e| match e {}).boxed())
+                .body(Full::new(body).map_err(|e| match e {}).boxed_unsync())
                 .map_err(|e| {
                     server_err!(
                         ServerErrorCode::BadRequest,
@@ -2589,9 +2589,9 @@ mod tests {
     impl HttpServer for EchoBodyServer {
         async fn serve_request(
             &self,
-            req: http::Request<BoxBody<Bytes, ServerError>>,
+            req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
             _info: StreamInfo,
-        ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
             let body_bytes = req
                 .collect()
                 .await
@@ -2602,7 +2602,7 @@ mod tests {
                 .status(StatusCode::OK)
                 .header("Content-Type", "application/octet-stream")
                 .header("Content-Length", len)
-                .body(Full::new(body_bytes).map_err(|e| match e {}).boxed())
+                .body(Full::new(body_bytes).map_err(|e| match e {}).boxed_unsync())
                 .map_err(|e| {
                     server_err!(
                         ServerErrorCode::BadRequest,
@@ -2742,7 +2742,7 @@ mod tests {
             .method("GET")
             .uri("http://localhost/")
             .header("Accept-Encoding", "gzip")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let resp = http_server
@@ -2808,7 +2808,7 @@ mod tests {
             .method("GET")
             .uri("http://localhost/")
             .header("Accept-Encoding", "gzip")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let resp = http_server
@@ -2876,7 +2876,7 @@ mod tests {
             .method("POST")
             .uri("http://localhost/")
             .header("Content-Encoding", "gzip")
-            .body(Full::new(compressed).map_err(|e| match e {}).boxed())
+            .body(Full::new(compressed).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let resp = http_server
@@ -2934,7 +2934,7 @@ mod tests {
             .method("GET")
             .uri("http://localhost/")
             .header("Accept-Encoding", "gzip")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let resp = http_server
@@ -2998,7 +2998,7 @@ mod tests {
             .method("HEAD")
             .uri("http://localhost/")
             .header("Accept-Encoding", "gzip")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let resp = http_server
@@ -3056,7 +3056,7 @@ mod tests {
             .method("GET")
             .uri("http://localhost/")
             .header("Accept-Encoding", "gzip")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let resp = http_server
@@ -3112,7 +3112,7 @@ mod tests {
             .method("GET")
             .uri("http://localhost/")
             .header("Accept-Encoding", "gzip")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let resp = http_server
@@ -3169,7 +3169,7 @@ mod tests {
             .method("GET")
             .uri("http://localhost/")
             .header("Accept-Encoding", "br")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let resp = http_server
@@ -3244,7 +3244,7 @@ mod tests {
             .method("GET")
             .uri("http://localhost/")
             .header("Accept-Encoding", "gzip")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let resp = http_server
@@ -3311,7 +3311,7 @@ mod tests {
             .uri("http://localhost/")
             .header("Accept-Encoding", "gzip")
             .header("User-Agent", "TestAgent/1.0")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let resp = http_server
@@ -3740,7 +3740,7 @@ mod tests {
                                 .body(
                                     Full::new(Bytes::from("forward success"))
                                         .map_err(|e| match e {})
-                                        .boxed(),
+                                        .boxed_unsync(),
                                 )
                                 .unwrap(),
                         )
@@ -3810,7 +3810,7 @@ mod tests {
             .header("Keep-Alive", "timeout=5")
             .header(http::header::UPGRADE, "websocket")
             .header("X-End-To-End", "keep")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -3850,7 +3850,7 @@ mod tests {
                                 .body(
                                     Full::new(Bytes::from("forward success"))
                                         .map_err(|e| match e {})
-                                        .boxed(),
+                                        .boxed_unsync(),
                                 )
                                 .unwrap(),
                         )
@@ -3903,7 +3903,7 @@ mod tests {
         let request = http::Request::builder()
             .method("GET")
             .uri("/test")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -3950,7 +3950,7 @@ mod tests {
                                 .body(
                                     Full::new(Bytes::from("forward plan success"))
                                         .map_err(|e| match e {})
-                                        .boxed(),
+                                        .boxed_unsync(),
                                 )
                                 .unwrap(),
                         )
@@ -4004,7 +4004,7 @@ mod tests {
         let request = http::Request::builder()
             .method("GET")
             .uri("/plan")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -4062,7 +4062,7 @@ mod tests {
         let request = http::Request::builder()
             .method("GET")
             .uri("/test")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -4309,7 +4309,7 @@ forward:
         let request = http::Request::builder()
             .method("GET")
             .uri("/slow")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
         let target_url = format!("http://{}", listen_addr);
 
@@ -4341,7 +4341,7 @@ forward:
         let request = http::Request::builder()
             .method("GET")
             .uri("/slow")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
         let target_url = format!("https://{}", listen_addr);
 
@@ -4391,7 +4391,7 @@ function slow_post(context) {
         let request = http::Request::builder()
             .method("GET")
             .uri("http://localhost/")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
         let req_info = CompressionRequestInfo::from_request(&request);
         let response = http::Response::builder()
@@ -4399,7 +4399,7 @@ function slow_post(context) {
             .body(
                 Full::new(Bytes::from_static(b"ok"))
                     .map_err(|e| match e {})
-                    .boxed(),
+                    .boxed_unsync(),
             )
             .unwrap();
 
@@ -4502,7 +4502,7 @@ function slow_post(context) {
         let request = http::Request::builder()
             .method("GET")
             .uri("/test")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -4561,7 +4561,7 @@ function slow_post(context) {
         let request = http::Request::builder()
             .method("GET")
             .uri("/test")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -4620,7 +4620,7 @@ function slow_post(context) {
         let request = http::Request::builder()
             .method("GET")
             .uri("/test")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -4673,7 +4673,7 @@ function slow_post(context) {
         let request = http::Request::builder()
             .method("GET")
             .uri("/test")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -4726,7 +4726,7 @@ function slow_post(context) {
         let request = http::Request::builder()
             .method("GET")
             .uri("/test")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -4781,7 +4781,7 @@ function slow_post(context) {
         let request = http::Request::builder()
             .method("GET")
             .uri("/test")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
 
         let (mut sender, conn) = hyper::client::conn::http1::Builder::new()

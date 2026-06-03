@@ -15,7 +15,7 @@ use cyfs_gateway_lib::{
     StreamInfo,
 };
 use http::{Method, Response, StatusCode};
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Collected, Full};
 use hyper::body::Bytes;
 use jsonwebtoken::DecodingKey;
@@ -101,7 +101,7 @@ fn parse_ip_or_socket_addr(value: &str) -> Option<IpAddr> {
 }
 
 fn get_request_client_ip(
-    req: &http::Request<BoxBody<Bytes, ServerError>>,
+    req: &http::Request<UnsyncBoxBody<Bytes, ServerError>>,
     info: &StreamInfo,
 ) -> Option<IpAddr> {
     req.extensions()
@@ -2567,14 +2567,14 @@ impl SNServer {
     fn builder_error_http_response(
         status: StatusCode,
         msg: String,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         Ok(Response::builder()
             .status(status)
             .header("Access-Control-Allow-Origin", "*")
-            .body(BoxBody::new(
+            .body(UnsyncBoxBody::new(
                 Full::new(Bytes::from(msg))
                     .map_err(|never| match never {})
-                    .boxed(),
+                    .boxed_unsync(),
             ))
             .unwrap())
     }
@@ -2582,15 +2582,15 @@ impl SNServer {
     fn builder_json_http_response(
         status: StatusCode,
         value: &serde_json::Value,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         Ok(Response::builder()
             .status(status)
             .header("Access-Control-Allow-Origin", "*")
             .header("Content-Type", "application/json")
-            .body(BoxBody::new(
+            .body(UnsyncBoxBody::new(
                 Full::new(Bytes::from(serde_json::to_string(value).unwrap()))
                     .map_err(|never| match never {})
-                    .boxed(),
+                    .boxed_unsync(),
             ))
             .unwrap())
     }
@@ -2772,7 +2772,7 @@ impl SNServer {
         &self,
         username: &str,
         resolve_type: Option<&str>,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let user = self.resolve_user_by_username(username).await?;
         match resolve_type.unwrap_or("zone") {
             "boot" => {
@@ -2801,7 +2801,7 @@ impl SNServer {
         username: &str,
         device_name: &str,
         resolve_type: Option<&str>,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let device = self.resolve_device_by_name(username, device_name).await?;
         match resolve_type.unwrap_or("doc") {
             "info" => {
@@ -2832,7 +2832,7 @@ impl SNServer {
         &self,
         did_str: &str,
         resolve_type: Option<&str>,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let device = self.resolve_device_by_did(did_str).await?;
         match resolve_type.unwrap_or("doc") {
             "info" => {
@@ -2899,7 +2899,7 @@ impl SNServer {
         &self,
         query_str: &str,
         info: StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         //query_str is like "did:bns:xxxx[?type=boot]"
         let (did_part, query_part) = match query_str.split_once('?') {
             Some((did, query)) => (did, Some(query)),
@@ -2959,10 +2959,10 @@ impl SNServer {
                     .status(StatusCode::OK)
                     .header("Access-Control-Allow-Origin", "*")
                     .header("Content-Type", content_type)
-                    .body(BoxBody::new(
+                    .body(UnsyncBoxBody::new(
                         Full::new(Bytes::from(body))
                             .map_err(|never| match never {})
-                            .boxed(),
+                            .boxed_unsync(),
                     ))
                     .unwrap())
             }
@@ -3520,9 +3520,9 @@ impl HttpServer for SNServer {
 
     async fn serve_request(
         &self,
-        request: http::Request<BoxBody<Bytes, ServerError>>,
+        request: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
         info: StreamInfo,
-    ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         // Handle OPTIONS preflight request for CORS
         if request.method() == Method::OPTIONS {
             return Ok(Response::builder()
@@ -3534,8 +3534,8 @@ impl HttpServer for SNServer {
                     "Content-Type, Authorization",
                 )
                 .header("Access-Control-Max-Age", "86400")
-                .body(BoxBody::new(
-                    Full::new(Bytes::new()).map_err(|e| match e {}).boxed(),
+                .body(UnsyncBoxBody::new(
+                    Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync(),
                 ))
                 .unwrap());
         }
@@ -3591,10 +3591,10 @@ impl HttpServer for SNServer {
                         .status(StatusCode::OK)
                         .header("Access-Control-Allow-Origin", "*")
                         .header("Content-Type", content_type)
-                        .body(BoxBody::new(
+                        .body(UnsyncBoxBody::new(
                             Full::new(Bytes::from(body))
                                 .map_err(|never| match never {})
-                                .boxed(),
+                                .boxed_unsync(),
                         ))
                         .unwrap());
                 }
@@ -3615,10 +3615,10 @@ impl HttpServer for SNServer {
             return Ok(Response::builder()
                 .status(StatusCode::METHOD_NOT_ALLOWED)
                 .header("Access-Control-Allow-Origin", "*")
-                .body(BoxBody::new(
+                .body(UnsyncBoxBody::new(
                     Full::new(Bytes::from_static(b"Method Not Allowed"))
                         .map_err(|e| match e {})
-                        .boxed(),
+                        .boxed_unsync(),
                 ))
                 .unwrap());
         }
@@ -3629,10 +3629,10 @@ impl HttpServer for SNServer {
                 return Ok(Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .header("Access-Control-Allow-Origin", "*")
-                    .body(BoxBody::new(
+                    .body(UnsyncBoxBody::new(
                         Full::new(Bytes::from_static(b"Not Found"))
                             .map_err(|e| match e {})
-                            .boxed(),
+                            .boxed_unsync(),
                     ))
                     .unwrap());
             }
@@ -3646,9 +3646,9 @@ impl HttpServer for SNServer {
                     .status(StatusCode::BAD_REQUEST)
                     .header("Access-Control-Allow-Origin", "*")
                     .body(
-                        BoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
+                        UnsyncBoxBody::new(Full::new(Bytes::from_static(b"Bad Request")))
                             .map_err(|e| match e {})
-                            .boxed(),
+                            .boxed_unsync(),
                     )
                     .unwrap());
             }
@@ -3661,12 +3661,12 @@ impl HttpServer for SNServer {
                     .status(StatusCode::BAD_REQUEST)
                     .header("Access-Control-Allow-Origin", "*")
                     .body(
-                        BoxBody::new(Full::new(Bytes::from(format!(
+                        UnsyncBoxBody::new(Full::new(Bytes::from(format!(
                             "Failed to read body: {:?}",
                             e
                         ))))
                         .map_err(|e| match e {})
-                        .boxed(),
+                        .boxed_unsync(),
                     )
                     .unwrap());
             }
@@ -3679,12 +3679,12 @@ impl HttpServer for SNServer {
                     .status(StatusCode::BAD_REQUEST)
                     .header("Access-Control-Allow-Origin", "*")
                     .body(
-                        BoxBody::new(Full::new(Bytes::from(format!(
+                        UnsyncBoxBody::new(Full::new(Bytes::from(format!(
                             "Failed to convert body to string: {}",
                             e
                         ))))
                         .map_err(|e| match e {})
-                        .boxed(),
+                        .boxed_unsync(),
                     )
                     .unwrap());
             }
@@ -3699,12 +3699,12 @@ impl HttpServer for SNServer {
                     .status(StatusCode::BAD_REQUEST)
                     .header("Access-Control-Allow-Origin", "*")
                     .body(
-                        BoxBody::new(Full::new(Bytes::from(format!(
+                        UnsyncBoxBody::new(Full::new(Bytes::from(format!(
                             "Failed to parse request body to RPCRequest: {}",
                             e
                         ))))
                         .map_err(|e| match e {})
-                        .boxed(),
+                        .boxed_unsync(),
                     )
                     .unwrap());
             }
@@ -3734,9 +3734,9 @@ impl HttpServer for SNServer {
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .header("Access-Control-Allow-Origin", "*")
                         .body(
-                            BoxBody::new(Full::new(Bytes::from(msg)))
+                            UnsyncBoxBody::new(Full::new(Bytes::from(msg)))
                                 .map_err(|e| match e {})
-                                .boxed(),
+                                .boxed_unsync(),
                         )
                         .unwrap());
                 }
@@ -3754,10 +3754,10 @@ impl HttpServer for SNServer {
             .header("Access-Control-Max-Age", "86400");
 
         Ok(response_builder
-            .body(BoxBody::new(
+            .body(UnsyncBoxBody::new(
                 Full::new(Bytes::from(serde_json::to_string(&resp).unwrap()))
                     .map_err(|never| match never {})
-                    .boxed(),
+                    .boxed_unsync(),
             ))
             .unwrap())
     }
