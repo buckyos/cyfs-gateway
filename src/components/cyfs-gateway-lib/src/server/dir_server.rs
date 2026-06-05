@@ -4,10 +4,11 @@ use crate::{
     ServerFactory, ServerResult, StreamInfo,
 };
 use chrono::{DateTime, Local};
+use futures_util::TryStreamExt;
 use http::{StatusCode, Version};
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Bytes, Frame};
 use hyper::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE};
 use mini_moka::sync::Cache;
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -22,7 +23,8 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio_util::io::ReaderStream;
 
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -52,6 +54,7 @@ pub struct DirServerBuilder {
     etag: Option<bool>,
     if_modified_since: Option<String>,
     open_file_cache: Option<OpenFileCacheSettings>,
+    file_io_mode: DirServerFileIoMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,13 +150,13 @@ impl OpenFileCache {
         }
     }
 
-    async fn stat_path(&self, path: &Path) -> DirPathStat {
+    async fn stat_path(&self, path: &Path, file_io_mode: DirServerFileIoMode) -> DirPathStat {
         let key = path.to_path_buf();
         if let Some(cached) = self.stat_cache.get(&key) {
             return cached.into_stat();
         }
 
-        let stat = DirPathStat::from_path(path).await;
+        let stat = DirPathStat::from_path(path, file_io_mode).await;
         let uses = self.admission_counts.get(&key).unwrap_or(0) + 1;
         self.admission_counts.insert(key.clone(), uses);
 
@@ -162,6 +165,39 @@ impl OpenFileCache {
         }
 
         stat
+    }
+
+    fn record_opened_file_metadata(&self, path: &Path, metadata: &std::fs::Metadata) {
+        if !metadata.is_file() {
+            return;
+        }
+
+        let key = path.to_path_buf();
+        if self.stat_cache.get(&key).is_some() {
+            self.stat_cache.insert(
+                key,
+                CachedPathStat {
+                    result: Ok(CachedPathMetadata {
+                        metadata: metadata.clone(),
+                    }),
+                },
+            );
+            return;
+        }
+
+        let uses = self.admission_counts.get(&key).unwrap_or(0) + 1;
+        self.admission_counts.insert(key.clone(), uses);
+
+        if uses >= self.settings.min_uses {
+            self.stat_cache.insert(
+                key,
+                CachedPathStat {
+                    result: Ok(CachedPathMetadata {
+                        metadata: metadata.clone(),
+                    }),
+                },
+            );
+        }
     }
 }
 
@@ -246,58 +282,24 @@ impl CachedPathError {
 #[derive(Debug)]
 enum DirPathStat {
     Found(CachedPathMetadata),
-    Opened(OpenedPathMetadata),
+    Opened(std::fs::Metadata),
     Error(std::io::Error),
 }
 
 struct OpenedDirFile {
     file: Option<DirReadFile>,
-    metadata: OpenedPathMetadata,
+    metadata: std::fs::Metadata,
     canonical_path: Option<PathBuf>,
 }
 
 enum DirReadFile {
-    Std(std::fs::File),
-}
-
-#[derive(Clone, Debug)]
-struct OpenedPathMetadata {
-    len: u64,
-    is_file: bool,
-    is_dir: bool,
-    modified: Option<SystemTime>,
-}
-
-impl OpenedPathMetadata {
-    fn from_std(metadata: std::fs::Metadata) -> Self {
-        Self {
-            len: metadata.len(),
-            is_file: metadata.is_file(),
-            is_dir: metadata.is_dir(),
-            modified: metadata.modified().ok(),
-        }
-    }
-
-    fn len(&self) -> u64 {
-        self.len
-    }
-
-    fn is_file(&self) -> bool {
-        self.is_file
-    }
-
-    fn is_dir(&self) -> bool {
-        self.is_dir
-    }
-
-    fn modified(&self) -> Option<SystemTime> {
-        self.modified
-    }
+    Tokio(tokio::fs::File),
+    Sync(std::fs::File),
 }
 
 impl DirPathStat {
-    async fn from_path(path: &Path) -> Self {
-        match tokio::fs::metadata(path).await {
+    async fn from_path(path: &Path, file_io_mode: DirServerFileIoMode) -> Self {
+        match DirServer::fs_metadata(file_io_mode, path).await {
             Ok(metadata) => Self::Found(CachedPathMetadata { metadata }),
             Err(e) => Self::Error(e),
         }
@@ -438,6 +440,19 @@ impl IfModifiedSinceMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DirServerFileIoMode {
+    Async,
+    Sync,
+}
+
+impl Default for DirServerFileIoMode {
+    fn default() -> Self {
+        Self::Async
+    }
+}
+
 impl DirServerBuilder {
     pub fn id(mut self, id: impl Into<String>) -> Self {
         self.id = Some(id.into());
@@ -495,6 +510,11 @@ impl DirServerBuilder {
         Ok(self)
     }
 
+    pub fn file_io_mode(mut self, mode: DirServerFileIoMode) -> Self {
+        self.file_io_mode = mode;
+        self
+    }
+
     pub async fn build(self) -> ServerResult<DirServer> {
         DirServer::create_server(self).await
     }
@@ -514,6 +534,7 @@ pub struct DirServer {
     etag: bool,
     if_modified_since: IfModifiedSinceMode,
     open_file_cache: Option<OpenFileCache>,
+    file_io_mode: DirServerFileIoMode,
 }
 
 impl DirServer {
@@ -529,6 +550,7 @@ impl DirServer {
             etag: None,
             if_modified_since: None,
             open_file_cache: None,
+            file_io_mode: DirServerFileIoMode::default(),
         }
     }
 
@@ -548,7 +570,8 @@ impl DirServer {
         }
 
         let root_path = builder.root_path.unwrap();
-        let root_metadata = match tokio::fs::metadata(&root_path).await {
+        let file_io_mode = builder.file_io_mode;
+        let root_metadata = match Self::fs_metadata(file_io_mode, &root_path).await {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 return Err(server_err!(
@@ -626,7 +649,7 @@ impl DirServer {
         } else {
             None
         };
-        let new_root_dir = tokio::fs::canonicalize(&root_path).await.map_err(|e| {
+        let new_root_dir = Self::fs_canonicalize(file_io_mode, &root_path).await.map_err(|e| {
             server_err!(
                 ServerErrorCode::IOError,
                 "Failed to canonicalize path: {}",
@@ -634,13 +657,13 @@ impl DirServer {
             )
         })?;
         #[cfg(target_os = "linux")]
-        let root_dir_file = Arc::new(tokio::fs::File::open(&new_root_dir).await.map_err(|e| {
+        let root_dir_file = Arc::new(Self::open_std_file(file_io_mode, &new_root_dir).await.map_err(|e| {
             server_err!(
                 ServerErrorCode::IOError,
                 "Failed to open root directory: {}",
                 e
             )
-        })?.into_std().await);
+        })?);
         debug!("after normalize,root_dir is : {:?}", new_root_dir);
         Ok(DirServer {
             id: builder.id.unwrap(),
@@ -655,6 +678,7 @@ impl DirServer {
             etag,
             if_modified_since,
             open_file_cache: builder.open_file_cache.map(OpenFileCache::new),
+            file_io_mode,
         })
     }
 
@@ -729,8 +753,8 @@ impl DirServer {
         false
     }
 
-    fn build_etag(file_meta: &OpenedPathMetadata) -> Option<String> {
-        let modified = file_meta.modified()?;
+    fn build_etag(file_meta: &std::fs::Metadata) -> Option<String> {
+        let modified = file_meta.modified().ok()?;
         let dur = modified.duration_since(UNIX_EPOCH).ok()?;
         Some(format!(
             "\"{:x}-{:x}-{:x}\"",
@@ -742,13 +766,54 @@ impl DirServer {
 
     async fn stat_path(&self, path: &Path) -> DirPathStat {
         match &self.open_file_cache {
-            Some(cache) => cache.stat_path(path).await,
-            None => DirPathStat::from_path(path).await,
+            Some(cache) => cache.stat_path(path, self.file_io_mode).await,
+            None => DirPathStat::from_path(path, self.file_io_mode).await,
+        }
+    }
+
+    async fn fs_metadata(
+        file_io_mode: DirServerFileIoMode,
+        path: &Path,
+    ) -> std::io::Result<std::fs::Metadata> {
+        match file_io_mode {
+            DirServerFileIoMode::Async => tokio::fs::metadata(path).await,
+            DirServerFileIoMode::Sync => std::fs::metadata(path),
+        }
+    }
+
+    async fn fs_canonicalize(
+        file_io_mode: DirServerFileIoMode,
+        path: &Path,
+    ) -> std::io::Result<PathBuf> {
+        match file_io_mode {
+            DirServerFileIoMode::Async => tokio::fs::canonicalize(path).await,
+            DirServerFileIoMode::Sync => std::fs::canonicalize(path),
+        }
+    }
+
+    async fn open_std_file(
+        file_io_mode: DirServerFileIoMode,
+        path: &Path,
+    ) -> std::io::Result<std::fs::File> {
+        match file_io_mode {
+            DirServerFileIoMode::Async => Ok(tokio::fs::File::open(path).await?.into_std().await),
+            DirServerFileIoMode::Sync => std::fs::File::open(path),
         }
     }
 
     async fn open_file_for_read(&self, file_path: &Path) -> std::io::Result<OpenedDirFile> {
-        self.open_path_in_root(file_path).await
+        self.open_path_in_root_cached(file_path).await
+    }
+
+    async fn open_path_in_root_cached(
+        &self,
+        file_path: &Path,
+    ) -> std::io::Result<OpenedDirFile> {
+        let opened = self.open_path_in_root(file_path).await?;
+        if let Some(cache) = &self.open_file_cache {
+            cache.record_opened_file_metadata(file_path, &opened.metadata);
+        }
+        Ok(opened)
     }
 
     async fn open_path_in_root(&self, file_path: &Path) -> std::io::Result<OpenedDirFile> {
@@ -757,7 +822,7 @@ impl DirServer {
             return Ok(opened);
         }
 
-        let canonical_path = tokio::fs::canonicalize(file_path).await?;
+        let canonical_path = Self::fs_canonicalize(self.file_io_mode, file_path).await?;
         if !canonical_path.starts_with(&self.root_dir) {
             return Err(std::io::Error::new(
                 ErrorKind::PermissionDenied,
@@ -765,21 +830,27 @@ impl DirServer {
             ));
         }
 
-        let path_metadata = tokio::fs::metadata(&canonical_path).await?;
-        if path_metadata.is_dir() {
+        let metadata = Self::fs_metadata(self.file_io_mode, &canonical_path).await?;
+        if metadata.is_dir() {
             return Ok(OpenedDirFile {
                 file: None,
-                metadata: OpenedPathMetadata::from_std(path_metadata),
+                metadata,
                 canonical_path: Some(canonical_path),
             });
         }
 
-        let file = tokio::fs::File::open(&canonical_path).await?;
-        let metadata = file.metadata().await?;
-        let file = file.into_std().await;
+        let file = match self.file_io_mode {
+            DirServerFileIoMode::Async => {
+                DirReadFile::Tokio(tokio::fs::File::open(&canonical_path).await?)
+            }
+            DirServerFileIoMode::Sync => {
+                DirReadFile::Sync(Self::open_std_file(self.file_io_mode, &canonical_path).await?)
+            }
+        };
+
         Ok(OpenedDirFile {
-            file: Some(DirReadFile::Std(file)),
-            metadata: OpenedPathMetadata::from_std(metadata),
+            file: Some(file),
+            metadata,
             canonical_path: Some(canonical_path),
         })
     }
@@ -788,22 +859,26 @@ impl DirServer {
     async fn open_path_in_root_openat2(&self, file_path: &Path) -> std::io::Result<OpenedDirFile> {
         use std::os::unix::ffi::OsStrExt;
 
-        let relative_path = file_path.strip_prefix(&self.root_dir).map_err(|_| {
-            std::io::Error::new(ErrorKind::PermissionDenied, "path out of root directory")
-        })?;
-
-        if relative_path.as_os_str().is_empty() {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "root directory cannot be opened as a file",
-            ));
-        }
-
-        let path = CString::new(relative_path.as_os_str().as_bytes()).map_err(|_| {
-            std::io::Error::new(ErrorKind::InvalidInput, "path contains interior nul byte")
-        })?;
+        let root_dir = self.root_dir.clone();
         let root_dir_file = self.root_dir_file.clone();
-        let file = tokio::task::spawn_blocking(move || {
+        let file_path = file_path.to_path_buf();
+        let file_io_mode = self.file_io_mode;
+
+        let open_with_openat2 = move || {
+            let relative_path = file_path.strip_prefix(&root_dir).map_err(|_| {
+                std::io::Error::new(ErrorKind::PermissionDenied, "path out of root directory")
+            })?;
+
+            if relative_path.as_os_str().is_empty() {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "root directory cannot be opened as a file",
+                ));
+            }
+
+            let path = CString::new(relative_path.as_os_str().as_bytes()).map_err(|_| {
+                std::io::Error::new(ErrorKind::InvalidInput, "path contains interior nul byte")
+            })?;
             let mut how: libc::open_how = unsafe { std::mem::zeroed() };
             how.flags = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
             how.resolve = (libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS) as u64;
@@ -821,31 +896,39 @@ impl DirServer {
                 return Err(std::io::Error::last_os_error());
             }
 
-            Ok(unsafe { std::fs::File::from_raw_fd(fd as i32) })
-        })
-        .await
-        .map_err(|e| std::io::Error::other(format!("openat2 task failed: {e}")))??;
+            let file = unsafe { std::fs::File::from_raw_fd(fd as i32) };
 
-        let metadata = OpenedPathMetadata::from_std(file.metadata()?);
-        let canonical_path = if metadata.is_file() {
-            None
+            let metadata = file.metadata()?;
+            let canonical_path = if metadata.is_file() {
+                None
+            } else {
+                std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                    .ok()
+                    .filter(|path| path.starts_with(&root_dir))
+            };
+            let file = if metadata.is_file() {
+                Some(match file_io_mode {
+                    DirServerFileIoMode::Async => DirReadFile::Tokio(tokio::fs::File::from_std(file)),
+                    DirServerFileIoMode::Sync => DirReadFile::Sync(file),
+                })
+            } else {
+                None
+            };
+
+            Ok(OpenedDirFile {
+                file,
+                metadata,
+                canonical_path,
+            })
+        };
+
+        if self.file_io_mode == DirServerFileIoMode::Sync {
+            open_with_openat2()
         } else {
-            tokio::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            tokio::task::spawn_blocking(open_with_openat2)
                 .await
-                .ok()
-                .filter(|path| path.starts_with(&self.root_dir))
-        };
-        let file = if metadata.is_file() {
-            Some(DirReadFile::Std(file))
-        } else {
-            None
-        };
-
-        Ok(OpenedDirFile {
-            file,
-            metadata,
-            canonical_path,
-        })
+                .map_err(|e| std::io::Error::new(ErrorKind::Other, e))?
+        }
     }
 
     fn file_stream_buffer_size(content_length: u64) -> usize {
@@ -856,15 +939,77 @@ impl DirServer {
     }
 
     fn empty_body() -> UnsyncBoxBody<Bytes, ServerError> {
-        Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync()
+        Full::new(Bytes::new())
+            .map_err(|e| match e {})
+            .boxed_unsync()
     }
 
     async fn full_or_stream_body(
         file: DirReadFile,
         content_length: u64,
     ) -> ServerResult<UnsyncBoxBody<Bytes, ServerError>> {
-        let body = Self::read_file_range(file, 0, content_length).await?;
-        Ok(Full::new(body).map_err(|e| match e {}).boxed_unsync())
+        if content_length == 0 {
+            return Ok(Self::empty_body());
+        }
+
+        let mut file = match file {
+            DirReadFile::Tokio(file) => file,
+            file @ DirReadFile::Sync(_) => return Self::sync_full_body(file, content_length).await,
+        };
+
+        if content_length <= SMALL_FILE_INLINE_LIMIT {
+            let mut buf = Vec::with_capacity(content_length as usize);
+            file.read_to_end(&mut buf).await.map_err(|e| {
+                server_err!(
+                    ServerErrorCode::IOError,
+                    "Failed to read file content: {}",
+                    e
+                )
+            })?;
+            return Ok(Full::new(Bytes::from(buf))
+                .map_err(|e| match e {})
+                .boxed_unsync());
+        }
+
+        let stream =
+            ReaderStream::with_capacity(file, Self::file_stream_buffer_size(content_length))
+                .map_ok(Frame::data);
+
+        Ok(BodyExt::map_err(StreamBody::new(stream), |e| {
+            server_err!(
+                ServerErrorCode::IOError,
+                "Failed to read file stream: {}",
+                e
+            )
+        })
+        .boxed_unsync())
+    }
+
+    async fn sync_full_body(
+        file: DirReadFile,
+        content_length: u64,
+    ) -> ServerResult<UnsyncBoxBody<Bytes, ServerError>> {
+        let DirReadFile::Sync(mut file) = file else {
+            unreachable!("sync_full_body only accepts sync files");
+        };
+        let capacity = usize::try_from(content_length).map_err(|_| {
+            server_err!(
+                ServerErrorCode::IOError,
+                "file content is too large to read synchronously"
+            )
+        })?;
+        let mut buf = Vec::with_capacity(capacity);
+        std::io::Read::read_to_end(&mut file, &mut buf).map_err(|e| {
+            server_err!(
+                ServerErrorCode::IOError,
+                "Failed to read sync file content: {}",
+                e
+            )
+        })?;
+
+        Ok(Full::new(Bytes::from(buf))
+            .map_err(|e| match e {})
+            .boxed_unsync())
     }
 
     async fn range_body(
@@ -872,49 +1017,62 @@ impl DirServer {
         start: u64,
         content_length: u64,
     ) -> ServerResult<UnsyncBoxBody<Bytes, ServerError>> {
-        let body = Self::read_file_range(file, start, content_length).await?;
-        Ok(Full::new(body).map_err(|e| match e {}).boxed_unsync())
+        if content_length == 0 {
+            return Ok(Self::empty_body());
+        }
+
+        let mut file = match file {
+            DirReadFile::Tokio(file) => file,
+            file @ DirReadFile::Sync(_) => {
+                return Self::sync_range_body(file, start, content_length).await;
+            }
+        };
+
+        file.seek(SeekFrom::Start(start)).await.map_err(|e| {
+            server_err!(ServerErrorCode::IOError, "Failed to seek file range: {}", e)
+        })?;
+
+        let stream = ReaderStream::with_capacity(
+            file.take(content_length),
+            Self::file_stream_buffer_size(content_length),
+        )
+        .map_ok(Frame::data);
+
+        Ok(BodyExt::map_err(StreamBody::new(stream), |e| {
+            server_err!(ServerErrorCode::IOError, "Failed to read file range: {}", e)
+        })
+        .boxed_unsync())
     }
 
-    async fn read_file_range(
+    async fn sync_range_body(
         file: DirReadFile,
         start: u64,
         content_length: u64,
-    ) -> ServerResult<Bytes> {
-        let DirReadFile::Std(file) = file;
-        let mut file = tokio::fs::File::from_std(file);
-        file.seek(std::io::SeekFrom::Start(start)).await.map_err(|e| {
+    ) -> ServerResult<UnsyncBoxBody<Bytes, ServerError>> {
+        let DirReadFile::Sync(mut file) = file else {
+            unreachable!("sync_range_body only accepts sync files");
+        };
+        let len = usize::try_from(content_length).map_err(|_| {
             server_err!(
                 ServerErrorCode::IOError,
-                "Failed to seek file range: {}",
+                "file range is too large to read synchronously"
+            )
+        })?;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start)).map_err(|e| {
+            server_err!(ServerErrorCode::IOError, "Failed to seek sync file range: {}", e)
+        })?;
+        let mut buf = vec![0u8; len];
+        std::io::Read::read_exact(&mut file, &mut buf).map_err(|e| {
+            server_err!(
+                ServerErrorCode::IOError,
+                "Failed to read sync file range: {}",
                 e
             )
         })?;
 
-        let mut remaining = content_length;
-        let mut body = Vec::new();
-        let chunk_size = Self::file_stream_buffer_size(content_length);
-
-        while remaining > 0 {
-            let read_len = remaining.min(chunk_size as u64) as usize;
-            let mut buf = vec![0; read_len];
-            let read = file.read(&mut buf).await.map_err(|e| {
-                server_err!(
-                    ServerErrorCode::IOError,
-                    "Failed to read file range: {}",
-                    e
-                )
-            })?;
-
-            if read == 0 {
-                break;
-            }
-
-            body.extend_from_slice(&buf[..read]);
-            remaining -= read as u64;
-        }
-
-        Ok(Bytes::from(body))
+        Ok(Full::new(Bytes::from(buf))
+            .map_err(|e| match e {})
+            .boxed_unsync())
     }
 
     /// Parse Range header (e.g., "bytes=start-end")
@@ -954,6 +1112,31 @@ impl DirServer {
             .await
     }
 
+    async fn serve_opened_file_if_regular(
+        &self,
+        file_path: &Path,
+        opened_file: OpenedDirFile,
+        req_info: &DirFileRequestInfo,
+        log_message: &str,
+    ) -> ServerResult<Result<http::Response<UnsyncBoxBody<Bytes, ServerError>>, OpenedDirFile>> {
+        if !opened_file.metadata.is_file() {
+            return Ok(Err(opened_file));
+        }
+
+        info!("{}: {:?}", log_message, file_path);
+        self.serve_opened_file(file_path, opened_file, req_info)
+            .await
+            .map(Ok)
+    }
+
+    fn path_forbidden_response(
+        &self,
+        file_path: &Path,
+    ) -> http::Response<UnsyncBoxBody<Bytes, ServerError>> {
+        warn!("Path traversal attempt: {:?}", file_path);
+        self.build_text_response(StatusCode::FORBIDDEN, "Forbidden")
+    }
+
     async fn serve_opened_file(
         &self,
         file_path: &Path,
@@ -969,7 +1152,7 @@ impl DirServer {
         let file_meta = opened_file.metadata;
         let file_size = file_meta.len();
         let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
-        let last_modified = file_meta.modified();
+        let last_modified = file_meta.modified().ok();
         let etag = if self.etag {
             Self::build_etag(&file_meta)
         } else {
@@ -994,33 +1177,33 @@ impl DirServer {
         // Handle Range requests
         if let Some(range_str) = req_info.range_header.as_deref() {
             if let Ok((start, end)) = self.parse_range(range_str, file_size) {
-                    let content_length = end - start + 1;
-                    let mut response_builder = http::Response::builder()
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .header("Content-Type", mime_type.as_ref())
-                        .header("Content-Length", content_length)
-                        .header(
-                            "Content-Range",
-                            format!("bytes {}-{}/{}", start, end, file_size),
-                        )
-                        .header("Accept-Ranges", "bytes");
+                let content_length = end - start + 1;
+                let mut response_builder = http::Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header("Content-Type", mime_type.as_ref())
+                    .header("Content-Length", content_length)
+                    .header(
+                        "Content-Range",
+                        format!("bytes {}-{}/{}", start, end, file_size),
+                    )
+                    .header("Accept-Ranges", "bytes");
 
-                    if let Some(etag) = etag.as_ref() {
-                        response_builder = response_builder.header(ETAG, etag.as_str());
-                    }
-                    if let Some(last_modified) = last_modified {
-                        let formatted = Self::format_http_date(last_modified);
-                        response_builder = response_builder.header(LAST_MODIFIED, formatted);
-                    }
+                if let Some(etag) = etag.as_ref() {
+                    response_builder = response_builder.header(ETAG, etag.as_str());
+                }
+                if let Some(last_modified) = last_modified {
+                    let formatted = Self::format_http_date(last_modified);
+                    response_builder = response_builder.header(LAST_MODIFIED, formatted);
+                }
 
-                    let body = if req_info.is_head {
-                        Self::empty_body()
-                    } else {
-                        Self::range_body(file, start, content_length).await?
-                    };
-                    return response_builder.body(body).map_err(|e| {
-                        server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e)
-                    });
+                let body = if req_info.is_head {
+                    Self::empty_body()
+                } else {
+                    Self::range_body(file, start, content_length).await?
+                };
+                return response_builder.body(body).map_err(|e| {
+                    server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e)
+                });
             }
         }
 
@@ -1078,7 +1261,11 @@ impl DirServer {
     ) -> http::Response<UnsyncBoxBody<Bytes, ServerError>> {
         http::Response::builder()
             .status(status)
-            .body(Full::new(body.into()).map_err(|e| match e {}).boxed_unsync())
+            .body(
+                Full::new(body.into())
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
             .unwrap()
     }
 
@@ -1090,12 +1277,16 @@ impl DirServer {
         http::Response::builder()
             .status(status)
             .header("Content-Type", "text/html; charset=utf-8")
-            .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed_unsync())
+            .body(
+                Full::new(Bytes::from(body))
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
             .unwrap()
     }
 
     async fn ensure_path_in_root(&self, path: &Path) -> ServerResult<PathBuf> {
-        let canonical_path = tokio::fs::canonicalize(path).await.map_err(|e| {
+        let canonical_path = Self::fs_canonicalize(self.file_io_mode, path).await.map_err(|e| {
             server_err!(
                 ServerErrorCode::IOError,
                 "Failed to canonicalize path: {}",
@@ -1136,68 +1327,13 @@ impl DirServer {
         req_path: &str,
         dir_path: &Path,
     ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
-        struct Entry {
-            name: String,
-            href: String,
-            is_dir: bool,
-            modified: String,
-            size: String,
-        }
-
-        let mut entries = Vec::new();
-        let mut read_dir = tokio::fs::read_dir(dir_path).await.map_err(|e| {
-            server_err!(ServerErrorCode::IOError, "Failed to read directory: {}", e)
-        })?;
-
         let req_base = if req_path.ends_with('/') {
             req_path.to_string()
         } else {
             format!("{}/", req_path)
         };
 
-        while let Some(entry) = read_dir.next_entry().await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::IOError,
-                "Failed to read directory entry: {}",
-                e
-            )
-        })? {
-            let file_name = entry.file_name();
-            let name = file_name.to_string_lossy().to_string();
-            if name.starts_with('.') {
-                continue;
-            }
-
-            let metadata = entry.metadata().await.map_err(|e| {
-                server_err!(ServerErrorCode::IOError, "Failed to read metadata: {}", e)
-            })?;
-            let is_dir = metadata.is_dir();
-            let encoded_name = utf8_percent_encode(&name, PATH_SEGMENT_ENCODE_SET).to_string();
-            let mut href = format!("{}{}", req_base, encoded_name);
-            if is_dir {
-                href.push('/');
-            }
-
-            let modified = metadata
-                .modified()
-                .ok()
-                .map(Self::format_modified_time)
-                .unwrap_or_else(|| "-".to_string());
-            let size = if is_dir {
-                "-".to_string()
-            } else {
-                metadata.len().to_string()
-            };
-
-            entries.push(Entry {
-                name,
-                href,
-                is_dir,
-                modified,
-                size,
-            });
-        }
-
+        let mut entries = self.collect_directory_entries(dir_path, req_base).await?;
         entries.sort_by(|a, b| {
             b.is_dir
                 .cmp(&a.is_dir)
@@ -1236,6 +1372,107 @@ impl DirServer {
         html.push_str("</pre><hr></section></main></body>\r\n</html>\r\n");
         Ok(self.build_html_response(StatusCode::OK, html))
     }
+
+    async fn collect_directory_entries(
+        &self,
+        dir_path: &Path,
+        req_base: String,
+    ) -> ServerResult<Vec<DirectoryListingEntry>> {
+        if self.file_io_mode == DirServerFileIoMode::Sync {
+            let mut entries = Vec::new();
+            for entry in std::fs::read_dir(dir_path).map_err(|e| {
+                server_err!(
+                    ServerErrorCode::IOError,
+                    "Failed to read directory: {}",
+                    e
+                )
+            })? {
+                let entry = entry.map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::IOError,
+                        "Failed to read directory entry: {}",
+                        e
+                    )
+                })?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                let metadata = entry.metadata().map_err(|e| {
+                    server_err!(ServerErrorCode::IOError, "Failed to read metadata: {}", e)
+                })?;
+                if let Some(entry) = DirServer::directory_listing_entry(name, metadata, &req_base) {
+                    entries.push(entry);
+                }
+            }
+            return Ok(entries);
+        }
+
+        let mut entries = Vec::new();
+        let mut read_dir = tokio::fs::read_dir(dir_path).await.map_err(|e| {
+            server_err!(ServerErrorCode::IOError, "Failed to read directory: {}", e)
+        })?;
+
+        while let Some(entry) = read_dir.next_entry().await.map_err(|e| {
+            server_err!(
+                ServerErrorCode::IOError,
+                "Failed to read directory entry: {}",
+                e
+            )
+        })? {
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy().to_string();
+            let metadata = entry.metadata().await.map_err(|e| {
+                server_err!(ServerErrorCode::IOError, "Failed to read metadata: {}", e)
+            })?;
+            if let Some(entry) = Self::directory_listing_entry(name, metadata, &req_base) {
+                entries.push(entry);
+            }
+        }
+
+        Ok(entries)
+    }
+
+    fn directory_listing_entry(
+        name: String,
+        metadata: std::fs::Metadata,
+        req_base: &str,
+    ) -> Option<DirectoryListingEntry> {
+        if name.starts_with('.') {
+            return None;
+        }
+
+        let is_dir = metadata.is_dir();
+        let encoded_name = utf8_percent_encode(&name, PATH_SEGMENT_ENCODE_SET).to_string();
+        let mut href = format!("{}{}", req_base, encoded_name);
+        if is_dir {
+            href.push('/');
+        }
+
+        let modified = metadata
+            .modified()
+            .ok()
+            .map(Self::format_modified_time)
+            .unwrap_or_else(|| "-".to_string());
+        let size = if is_dir {
+            "-".to_string()
+        } else {
+            metadata.len().to_string()
+        };
+
+        Some(DirectoryListingEntry {
+            name,
+            href,
+            is_dir,
+            modified,
+            size,
+        })
+    }
+}
+
+struct DirectoryListingEntry {
+    name: String,
+    href: String,
+    is_dir: bool,
+    modified: String,
+    size: String,
 }
 
 #[async_trait::async_trait]
@@ -1269,24 +1506,30 @@ impl HttpServer for DirServer {
 
         let mut opened_canonical_path = None;
         let mut file_stat_from_open = false;
-        let mut file_stat = match self.open_path_in_root(&file_path).await {
-            Ok(opened_file) if opened_file.metadata.is_file() => {
-                info!("Serving file: {:?}", file_path);
-                return self
-                    .serve_opened_file(&file_path, opened_file, &req_info)
-                    .await;
-            }
-            Ok(opened_file) => {
-                opened_canonical_path = opened_file.canonical_path;
-                file_stat_from_open = true;
-                DirPathStat::Opened(opened_file.metadata)
-            }
+        let mut file_stat = match self.open_path_in_root_cached(&file_path).await {
+            Ok(opened_file) => match self
+                .serve_opened_file_if_regular(&file_path, opened_file, &req_info, "Serving file")
+                .await?
+            {
+                Ok(response) => return Ok(response),
+                Err(opened_file) => {
+                    opened_canonical_path = opened_file.canonical_path;
+                    file_stat_from_open = true;
+                    DirPathStat::Opened(opened_file.metadata)
+                }
+            },
             Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                warn!("Path traversal attempt: {:?}", file_path);
-                return Ok(self.build_text_response(StatusCode::FORBIDDEN, "Forbidden"));
+                return Ok(self.path_forbidden_response(&file_path));
             }
             Err(e) if e.kind() == ErrorKind::NotFound => DirPathStat::Error(e),
-            Err(_) => self.stat_path(&file_path).await,
+            Err(_) => {
+                let file_stat = self.stat_path(&file_path).await;
+                if file_stat.is_file() {
+                    info!("Serving file: {:?}", file_path);
+                    return self.serve_file(&file_path, &req_info).await;
+                }
+                file_stat
+            }
         };
         if file_stat.exists() {
             file_path = match opened_canonical_path.take() {
@@ -1294,8 +1537,7 @@ impl HttpServer for DirServer {
                 None => match self.ensure_path_in_root(&file_path).await {
                     Ok(path) => path,
                     Err(_) => {
-                        warn!("Path traversal attempt: {:?}", file_path);
-                        return Ok(self.build_text_response(StatusCode::FORBIDDEN, "Forbidden"));
+                        return Ok(self.path_forbidden_response(&file_path));
                     }
                 },
             };
@@ -1309,17 +1551,22 @@ impl HttpServer for DirServer {
 
         if file_stat.is_dir() {
             let index_path = file_path.join(&self.index_file);
-            match self.open_path_in_root(&index_path).await {
-                Ok(opened_file) if opened_file.metadata.is_file() => {
-                    info!("Serving index file: {:?}", index_path);
-                    return self
-                        .serve_opened_file(&index_path, opened_file, &req_info)
-                        .await;
+            match self.open_path_in_root_cached(&index_path).await {
+                Ok(opened_file) => {
+                    if let Ok(response) = self
+                        .serve_opened_file_if_regular(
+                            &index_path,
+                            opened_file,
+                            &req_info,
+                            "Serving index file",
+                        )
+                        .await?
+                    {
+                        return Ok(response);
+                    }
                 }
-                Ok(_) => {}
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                    warn!("Path traversal attempt: {:?}", index_path);
-                    return Ok(self.build_text_response(StatusCode::FORBIDDEN, "Forbidden"));
+                    return Ok(self.path_forbidden_response(&index_path));
                 }
                 Err(_) => {}
             }
@@ -1330,36 +1577,33 @@ impl HttpServer for DirServer {
             }
         }
 
-        // Check if file exists
-        if !file_stat.is_file() {
-            warn!("File not found: {:?}", file_path);
-            if let Some(fallback_file) = &self.fallback_file {
-                let fallback_path = self.root_dir.join(fallback_file);
-                match self.open_path_in_root(&fallback_path).await {
-                    Ok(opened_file) => {
-                        if opened_file.metadata.is_file() {
-                            info!("Fallback to file: {:?}", fallback_path);
-                            return self
-                                .serve_opened_file(&fallback_path, opened_file, &req_info)
-                                .await;
-                        }
-                        warn!("Fallback file not found: {:?}", fallback_path);
+        warn!("File not found: {:?}", file_path);
+        if let Some(fallback_file) = &self.fallback_file {
+            let fallback_path = self.root_dir.join(fallback_file);
+            match self.open_path_in_root_cached(&fallback_path).await {
+                Ok(opened_file) => {
+                    if let Ok(response) = self
+                        .serve_opened_file_if_regular(
+                            &fallback_path,
+                            opened_file,
+                            &req_info,
+                            "Fallback to file",
+                        )
+                        .await?
+                    {
+                        return Ok(response);
                     }
-                    Err(e) => {
-                        warn!(
-                            "Failed to resolve fallback file: {:?}, error: {}",
-                            fallback_path, e
-                        );
-                    }
+                    warn!("Fallback file not found: {:?}", fallback_path);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to resolve fallback file: {:?}, error: {}",
+                        fallback_path, e
+                    );
                 }
             }
-            return Ok(self.build_text_response(StatusCode::NOT_FOUND, "Not found"));
         }
-
-        info!("Serving file: {:?}", file_path);
-
-        // Serve the file
-        self.serve_file(&file_path, &req_info).await
+        Ok(self.build_text_response(StatusCode::NOT_FOUND, "Not found"))
     }
 
     fn id(&self) -> String {
@@ -1402,6 +1646,8 @@ pub struct DirServerConfig {
     pub open_file_cache_min_uses: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_file_cache_errors: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_io_mode: Option<DirServerFileIoMode>,
 }
 
 /// Nginx-like `open_file_cache` directive for DirServer path metadata lookup.
@@ -1591,6 +1837,9 @@ impl ServerFactory for DirServerFactory {
                 config.open_file_cache_errors,
             )?;
         }
+        if let Some(file_io_mode) = config.file_io_mode {
+            builder = builder.file_io_mode(file_io_mode);
+        }
 
         let server = builder.build().await?;
         Ok(vec![Server::Http(Arc::new(server))])
@@ -1776,6 +2025,7 @@ mod tests {
             open_file_cache_valid: None,
             open_file_cache_min_uses: None,
             open_file_cache_errors: None,
+            file_io_mode: None,
         };
 
         let factory = DirServerFactory::new();
@@ -1823,6 +2073,173 @@ mod tests {
         assert!(config.open_file_cache_valid.is_none());
         assert!(config.open_file_cache_min_uses.is_none());
         assert!(config.open_file_cache_errors.is_none());
+    }
+
+    #[test]
+    fn test_dir_server_file_io_mode_config_deserializes_values() {
+        let config: DirServerConfig = serde_json::from_value(serde_json::json!({
+            "id": "test",
+            "type": "dir",
+            "root_path": "/tmp",
+            "file_io_mode": "sync"
+        }))
+        .unwrap();
+        assert_eq!(config.file_io_mode, Some(DirServerFileIoMode::Sync));
+
+        let config: DirServerConfig = serde_json::from_value(serde_json::json!({
+            "id": "test",
+            "type": "dir",
+            "root_path": "/tmp",
+            "file_io_mode": "async"
+        }))
+        .unwrap();
+        assert_eq!(config.file_io_mode, Some(DirServerFileIoMode::Async));
+    }
+
+    #[test]
+    fn test_dir_server_file_io_mode_rejects_invalid_value() {
+        let result = serde_json::from_value::<DirServerConfig>(serde_json::json!({
+            "id": "test",
+            "type": "dir",
+            "root_path": "/tmp",
+            "file_io_mode": "blocking"
+        }));
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dir_server_file_io_mode_defaults_to_async() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let server = DirServer::builder()
+            .id("test")
+            .root_path(temp_dir.path().to_path_buf())
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(server.file_io_mode, DirServerFileIoMode::Async);
+    }
+
+    #[tokio::test]
+    async fn test_dir_server_file_io_mode_config_selects_sync() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config: DirServerConfig = serde_json::from_value(serde_json::json!({
+            "id": "test",
+            "type": "dir",
+            "root_path": temp_dir.path().to_string_lossy(),
+            "file_io_mode": "sync"
+        }))
+        .unwrap();
+
+        let server = DirServer::builder()
+            .id(config.id)
+            .root_path(PathBuf::from(config.root_path))
+            .file_io_mode(config.file_io_mode.unwrap())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(server.file_io_mode, DirServerFileIoMode::Sync);
+    }
+
+    #[tokio::test]
+    async fn test_dir_server_sync_file_io_serves_full_range_and_head() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("sync.txt");
+        tokio::fs::write(&file_path, b"0123456789abcdef")
+            .await
+            .unwrap();
+
+        let server = DirServer::builder()
+            .id("test")
+            .root_path(temp_dir.path().to_path_buf())
+            .file_io_mode(DirServerFileIoMode::Sync)
+            .build()
+            .await
+            .unwrap();
+
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/sync.txt")
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        let req_info = DirFileRequestInfo::from_request(&req);
+        let resp = server.serve_file(&file_path, &req_info).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("Content-Length").unwrap(), "16");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"0123456789abcdef");
+
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://localhost/sync.txt")
+            .header(RANGE, "bytes=4-9")
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        let req_info = DirFileRequestInfo::from_request(&req);
+        let resp = server.serve_file(&file_path, &req_info).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.headers().get("Content-Length").unwrap(), "6");
+        assert_eq!(
+            resp.headers().get("Content-Range").unwrap(),
+            "bytes 4-9/16"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), b"456789");
+
+        let req = http::Request::builder()
+            .method("HEAD")
+            .uri("http://localhost/sync.txt")
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
+            .unwrap();
+        let req_info = DirFileRequestInfo::from_request(&req);
+        let resp = server.serve_file(&file_path, &req_info).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("Content-Length").unwrap(), "16");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dir_server_sync_file_io_uses_sync_stat_open_and_listing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("sync-listing.txt");
+        std::fs::write(&file_path, b"sync-listing").unwrap();
+        std::fs::write(temp_dir.path().join(".hidden.txt"), b"hidden").unwrap();
+
+        let server = DirServer::builder()
+            .id("test")
+            .root_path(temp_dir.path().to_path_buf())
+            .file_io_mode(DirServerFileIoMode::Sync)
+            .build()
+            .await
+            .unwrap();
+
+        let stat = server.stat_path(&file_path).await;
+        assert!(stat.is_file());
+        assert_eq!(stat.metadata().unwrap().len(), 12);
+
+        let opened = server.open_file_for_read(&file_path).await.unwrap();
+        assert!(opened.metadata.is_file());
+        assert!(matches!(opened.file, Some(DirReadFile::Sync(_))));
+
+        let entries = server
+            .collect_directory_entries(temp_dir.path(), "/".to_string())
+            .await
+            .unwrap();
+        assert!(entries.iter().any(|entry| entry.name == "sync-listing.txt"));
+        assert!(!entries.iter().any(|entry| entry.name == ".hidden.txt"));
     }
 
     #[tokio::test]
@@ -1879,10 +2296,16 @@ mod tests {
             errors: true,
         });
 
-        assert!(cache.stat_path(&missing_path).await.is_not_found());
+        assert!(cache
+            .stat_path(&missing_path, DirServerFileIoMode::Async)
+            .await
+            .is_not_found());
         assert!(cache.stat_cache.get(&missing_path).is_none());
 
-        assert!(cache.stat_path(&missing_path).await.is_not_found());
+        assert!(cache
+            .stat_path(&missing_path, DirServerFileIoMode::Async)
+            .await
+            .is_not_found());
         assert!(cache.stat_cache.get(&missing_path).is_some());
     }
 
@@ -1901,11 +2324,16 @@ mod tests {
 
         assert!(cache.stat_cache.get(&file_path).is_none());
         assert_eq!(
-            cache.stat_path(&file_path).await.metadata().unwrap().len(),
+            cache
+                .stat_path(&file_path, DirServerFileIoMode::Async)
+                .await
+                .metadata()
+                .unwrap()
+                .len(),
             6
         );
         assert!(cache.stat_cache.get(&file_path).is_none());
-        let cached = cache.stat_path(&file_path).await;
+        let cached = cache.stat_path(&file_path, DirServerFileIoMode::Async).await;
         assert_eq!(cached.metadata().unwrap().len(), 6);
         assert!(cache.stat_cache.get(&file_path).is_some());
     }
@@ -1916,11 +2344,46 @@ mod tests {
         let file_path = temp_dir.path().join("cached.txt");
         std::fs::write(&file_path, b"old").unwrap();
 
-        let stat = DirPathStat::from_path(&file_path).await;
+        let stat = DirPathStat::from_path(&file_path, DirServerFileIoMode::Async).await;
         std::fs::write(&file_path, b"new-content").unwrap();
 
         let cached = CachedPathStat::from(&stat).into_stat();
         assert_eq!(cached.metadata().unwrap().len(), 3);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_open_file_cache_records_linux_opened_file_metadata() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("opened.txt");
+        tokio::fs::write(&file_path, b"opened-meta").await.unwrap();
+
+        let server = DirServer::builder()
+            .id("test")
+            .root_path(temp_dir.path().to_path_buf())
+            .open_file_cache(
+                DirServerOpenFileCacheConfig {
+                    max: Some(16),
+                    inactive: None,
+                    off: false,
+                },
+                Some(DirServerCacheDuration::Seconds(60)),
+                Some(1),
+                Some(true),
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let cache = server.open_file_cache.as_ref().unwrap();
+        assert!(cache.stat_cache.get(&file_path).is_none());
+
+        let opened = server.open_file_for_read(&file_path).await.unwrap();
+        assert!(opened.metadata.is_file());
+
+        let cached = cache.stat_cache.get(&file_path).unwrap().into_stat();
+        assert_eq!(cached.metadata().unwrap().len(), 11);
     }
 
     #[tokio::test]
@@ -1961,7 +2424,11 @@ mod tests {
         let req = http::Request::builder()
             .method("GET")
             .uri("http://localhost/cached.txt")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
             .unwrap();
         let req_info = DirFileRequestInfo::from_request(&req);
         let resp = server.serve_file(&file_path, &req_info).await.unwrap();
@@ -1996,7 +2463,11 @@ mod tests {
         let req = http::Request::builder()
             .method("GET")
             .uri("http://localhost/cached-body.txt")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
             .unwrap();
         let req_info = DirFileRequestInfo::from_request(&req);
         let resp = server.serve_file(&file_path, &req_info).await.unwrap();
@@ -2008,7 +2479,11 @@ mod tests {
         let req = http::Request::builder()
             .method("GET")
             .uri("http://localhost/cached-body.txt")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
             .unwrap();
         let req_info = DirFileRequestInfo::from_request(&req);
         let resp = server.serve_file(&file_path, &req_info).await.unwrap();
@@ -2033,7 +2508,11 @@ mod tests {
         let req = http::Request::builder()
             .method("HEAD")
             .uri("http://localhost/head.txt")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
             .unwrap();
         let resp = server
             .serve_request(req, StreamInfo::default())
@@ -2064,7 +2543,11 @@ mod tests {
         let req = http::Request::builder()
             .method("GET")
             .uri("http://localhost/leak.txt")
-            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(|e| match e {})
+                    .boxed_unsync(),
+            )
             .unwrap();
         let resp = server
             .serve_request(req, StreamInfo::default())
@@ -2086,7 +2569,10 @@ mod tests {
             errors: false,
         });
 
-        assert!(cache.stat_path(&missing_path).await.is_not_found());
+        assert!(cache
+            .stat_path(&missing_path, DirServerFileIoMode::Async)
+            .await
+            .is_not_found());
         assert!(cache.stat_cache.get(&missing_path).is_none());
     }
 
@@ -2242,6 +2728,7 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .unwrap()
             .to_string();
+        let _ = first_resp.collect().await.unwrap().to_bytes();
 
         let second_req = http::Request::builder()
             .method("GET")

@@ -10,9 +10,9 @@ from .target import target_command
 
 
 def container_name_for_candidate(candidate: str) -> str:
-    if candidate in {"nginx_hyper", "nginx_reuseport_static"}:
+    if candidate in {"nginx_hyper", "nginx_reuseport_static", "nginx_reuseport_dirserver"}:
         return "cyfs-perf-nginx"
-    if candidate in {"cyfs_gateway_hyper", "cyfs_gateway_reuseport_static"}:
+    if candidate in {"cyfs_gateway_hyper", "cyfs_gateway_reuseport_static", "cyfs_gateway_reuseport_dirserver"}:
         return "cyfs-perf-cyfs_gateway"
     return f"cyfs-perf-{candidate}"
 

@@ -22,7 +22,13 @@ from cyfs_gateway_performance.model import CommandPlan, ConfigError, ScenarioPla
 from cyfs_gateway_performance.profile import load_profile
 from cyfs_gateway_performance.report import build_result, write_reports
 from cyfs_gateway_performance.scenario import expand_scenarios
-from cyfs_gateway_performance.target import container_readiness_commands, preflight, pull_commands, run_container_commands
+from cyfs_gateway_performance.target import (
+    container_readiness_commands,
+    local_image_check_commands,
+    preflight,
+    pull_commands,
+    run_container_commands,
+)
 from cyfs_gateway_performance.workload import endpoint_for, run_fixed_rate_workload
 
 
@@ -77,15 +83,24 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertIn('return "forward tcp:///127.0.0.1:10080";', gateway_yaml)
 
         rendered = [" ".join(command.command) for command in run_container_commands(plan)]
+        self.assertTrue(
+            all(command.startswith("docker run --pull never ") for command in rendered if command.startswith("docker run "))
+        )
         self.assertTrue(any("-p 19080:9080 -p 19443:9443" in command for command in rendered))
         self.assertTrue(any("-p 29080:9080 -p 29443:9443" in command for command in rendered))
         self.assertTrue(any("-p 18180:10080" in command for command in rendered))
         self.assertTrue(any("-p 28180:10080" in command for command in rendered))
         self.assertTrue(any("-p 18181:10081" in command for command in rendered))
         self.assertTrue(any("-p 28181:10081" in command for command in rendered))
+        self.assertTrue(any("-p 18182:10082" in command for command in rendered))
+        self.assertTrue(any("-p 28182:10082" in command for command in rendered))
         self.assertTrue(any("-e REUSEPORT_STATIC_RUNTIME=tokio" in command for command in rendered))
         self.assertTrue(any("-e REUSEPORT_STATIC_ENABLED=1" in command for command in rendered))
-        self.assertFalse(any("--security-opt seccomp=unconfined" in command for command in rendered))
+        self.assertTrue(any("-e REUSEPORT_DIRSERVER_ENABLED=1" in command for command in rendered))
+        self.assertTrue(any("-e REUSEPORT_DIRSERVER_FILE_IO_MODE=async" in command for command in rendered))
+        self.assertTrue(any("--name cyfs-perf-nginx" in command and "--security-opt seccomp=unconfined" in command for command in rendered))
+        self.assertTrue(any("--name cyfs-perf-cyfs_gateway" in command and "--security-opt seccomp=unconfined" in command for command in rendered))
+        self.assertFalse(any("--name cyfs-perf-cyfs_gateway" in command and " wait" in command for command in rendered))
         self.assertEqual(
             endpoint_for(ScenarioPlan("nginx", "stream_reverse_proxy", "http", 1, "/index.html")),
             ("127.0.0.1", 19080, False),
@@ -110,10 +125,20 @@ class RuntimeBehaviorTests(unittest.TestCase):
             endpoint_for(ScenarioPlan("cyfs_gateway_reuseport_static", "static_http_file", "http", 1, "/payload.bin")),
             ("127.0.0.1", 28181, False),
         )
+        self.assertEqual(
+            endpoint_for(ScenarioPlan("nginx_reuseport_dirserver", "static_http_file", "http", 1, "/payload.bin")),
+            ("127.0.0.1", 18182, False),
+        )
+        self.assertEqual(
+            endpoint_for(ScenarioPlan("cyfs_gateway_reuseport_dirserver", "static_http_file", "http", 1, "/payload.bin")),
+            ("127.0.0.1", 28182, False),
+        )
         self.assertEqual(container_name_for_candidate("nginx_hyper"), "cyfs-perf-nginx")
         self.assertEqual(container_name_for_candidate("cyfs_gateway_hyper"), "cyfs-perf-cyfs_gateway")
         self.assertEqual(container_name_for_candidate("nginx_reuseport_static"), "cyfs-perf-nginx")
         self.assertEqual(container_name_for_candidate("cyfs_gateway_reuseport_static"), "cyfs-perf-cyfs_gateway")
+        self.assertEqual(container_name_for_candidate("nginx_reuseport_dirserver"), "cyfs-perf-nginx")
+        self.assertEqual(container_name_for_candidate("cyfs_gateway_reuseport_dirserver"), "cyfs-perf-cyfs_gateway")
 
     def test_tokio_uring_reuseport_static_adds_docker_seccomp_unconfined(self) -> None:
         text = PROFILE.read_text(encoding="utf-8").replace("runtime: tokio", "runtime: tokio_uring")
@@ -127,6 +152,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
 
     def test_tokio_custom_reuseport_static_keeps_default_docker_seccomp(self) -> None:
         text = PROFILE.read_text(encoding="utf-8").replace("runtime: tokio", "runtime: tokio_custom")
+        text = text.replace("reuseport_dirserver_fixture:\n    # Whether the generated reuseport DirServer fixture starts and participates in the matrix.\n    enabled: true", "reuseport_dirserver_fixture:\n    # Whether the generated reuseport DirServer fixture starts and participates in the matrix.\n    enabled: false")
         with tempfile.TemporaryDirectory() as temp:
             profile = Path(temp) / "profile.yaml"
             profile.write_text(text, encoding="utf-8")
@@ -134,18 +160,39 @@ class RuntimeBehaviorTests(unittest.TestCase):
             rendered = [" ".join(command.command) for command in run_container_commands(plan)]
 
         self.assertTrue(any("-e REUSEPORT_STATIC_RUNTIME=tokio_custom" in command for command in rendered))
-        self.assertFalse(any("--security-opt seccomp=unconfined" in command for command in rendered))
+        self.assertFalse(any("--name cyfs-perf-nginx" in command and "--security-opt seccomp=unconfined" in command for command in rendered))
+        self.assertFalse(any("--name cyfs-perf-cyfs_gateway" in command and "--security-opt seccomp=unconfined" in command for command in rendered))
 
     def test_disabled_tokio_uring_reuseport_static_keeps_default_docker_seccomp(self) -> None:
         text = PROFILE.read_text(encoding="utf-8").replace("enabled: true", "enabled: false", 1)
         text = text.replace("runtime: tokio", "runtime: tokio_uring")
+        text = text.replace("reuseport_dirserver_fixture:\n    # Whether the generated reuseport DirServer fixture starts and participates in the matrix.\n    enabled: true", "reuseport_dirserver_fixture:\n    # Whether the generated reuseport DirServer fixture starts and participates in the matrix.\n    enabled: false")
         with tempfile.TemporaryDirectory() as temp:
             profile = Path(temp) / "profile.yaml"
             profile.write_text(text, encoding="utf-8")
             plan = load_profile(profile)
             rendered = [" ".join(command.command) for command in run_container_commands(plan)]
 
-        self.assertFalse(any("--security-opt seccomp=unconfined" in command for command in rendered))
+        self.assertFalse(any("--name cyfs-perf-nginx" in command and "--security-opt seccomp=unconfined" in command for command in rendered))
+        self.assertFalse(any("--name cyfs-perf-cyfs_gateway" in command and "--security-opt seccomp=unconfined" in command for command in rendered))
+
+    def test_cyfs_gateway_fixture_only_candidates_override_gateway_cmd(self) -> None:
+        plan = replace(load_profile(PROFILE), candidates=("cyfs_gateway_reuseport_static", "cyfs_gateway_reuseport_dirserver"))
+        rendered = [" ".join(command.command) for command in run_container_commands(plan)]
+
+        self.assertEqual(len([command for command in rendered if "--name cyfs-perf-cyfs_gateway" in command]), 1)
+        self.assertTrue(any("cyfs-perf-reverse-proxy-fixture &" in command for command in rendered))
+        self.assertTrue(any("cyfs-perf-reuseport-static-fixture &" in command for command in rendered))
+        self.assertTrue(any("cyfs-perf-reuseport-dirserver-fixture &" in command for command in rendered))
+        self.assertTrue(any(command.endswith("/bin/sh -c cyfs-perf-reverse-proxy-fixture & if [ x$REUSEPORT_STATIC_ENABLED = x1 ]; then cyfs-perf-reuseport-static-fixture & fi; if [ x$REUSEPORT_DIRSERVER_ENABLED = x1 ]; then cyfs-perf-reuseport-dirserver-fixture & fi; wait") for command in rendered))
+        self.assertTrue(any("--security-opt seccomp=unconfined" in command for command in rendered))
+
+    def test_cyfs_gateway_direct_fixture_candidates_keep_gateway_cmd_when_gateway_fixture_is_needed(self) -> None:
+        plan = replace(load_profile(PROFILE), candidates=("cyfs_gateway_hyper", "cyfs_gateway_reuseport_static"))
+        rendered = [" ".join(command.command) for command in run_container_commands(plan)]
+
+        self.assertEqual(len([command for command in rendered if "--name cyfs-perf-cyfs_gateway" in command]), 1)
+        self.assertFalse(any(command.endswith(" wait") for command in rendered))
 
     def test_fixed_rate_workload_uses_warmup_and_measured_windows(self) -> None:
         plan = load_profile(PROFILE)
@@ -235,6 +282,8 @@ class RuntimeBehaviorTests(unittest.TestCase):
                 "cyfs_gateway_hyper",
                 "nginx_reuseport_static",
                 "cyfs_gateway_reuseport_static",
+                "nginx_reuseport_dirserver",
+                "cyfs_gateway_reuseport_dirserver",
             },
         )
         self.assertEqual(plan.load.connection_reuse_modes, ("new_connection", "reuse_connection"))
@@ -277,6 +326,8 @@ class RuntimeBehaviorTests(unittest.TestCase):
                 "cyfs_gateway_hyper",
                 "nginx_reuseport_static",
                 "cyfs_gateway_reuseport_static",
+                "nginx_reuseport_dirserver",
+                "cyfs_gateway_reuseport_dirserver",
             }
         ]
         self.assertTrue(hyper_static)
@@ -322,10 +373,33 @@ class RuntimeBehaviorTests(unittest.TestCase):
             )
         )
 
+    def test_reuseport_dirserver_fixture_can_be_disabled(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("reuseport_dirserver_fixture:\n    # Whether the generated reuseport DirServer fixture starts and participates in the matrix.\n    enabled: true", "reuseport_dirserver_fixture:\n    # Whether the generated reuseport DirServer fixture starts and participates in the matrix.\n    enabled: false")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            plan = load_profile(profile)
+            scenarios = expand_scenarios(plan)
+            metadata = write_image_context(plan, "nginx", Path(temp))
+            dockerfile_text = Path(metadata["dockerfile"]).read_text(encoding="utf-8")
+
+        self.assertFalse(plan.upstream["reuseport_dirserver_fixture"]["enabled"])
+        self.assertFalse(metadata["packaged_reuseport_dirserver_fixture"]["enabled"])
+        self.assertIn("ENV REUSEPORT_DIRSERVER_ENABLED=0", dockerfile_text)
+        self.assertFalse(
+            any(
+                scenario.candidate in {"nginx_reuseport_dirserver", "cyfs_gateway_reuseport_dirserver"}
+                for scenario in scenarios
+            )
+        )
+
     def test_pull_policy_never_skips_target_pull_commands(self) -> None:
         plan = replace(load_profile(PROFILE), registry_pull_policy="never")
 
         self.assertEqual(pull_commands(plan), [])
+        local_checks = [" ".join(command.command) for command in local_image_check_commands(plan)]
+        self.assertIn(f"docker image inspect {plan.images['nginx'].image_ref}", local_checks)
+        self.assertIn(f"docker image inspect {plan.images['cyfs_gateway'].image_ref}", local_checks)
 
     def test_profile_rejects_unknown_pull_policy(self) -> None:
         text = PROFILE.read_text(encoding="utf-8").replace("pull_policy: always", "pull_policy: sometimes")
@@ -365,6 +439,50 @@ class RuntimeBehaviorTests(unittest.TestCase):
         self.assertIn("ENV REUSEPORT_STATIC_THREADS=6", dockerfile_text)
         rendered = [" ".join(command.command) for command in run_container_commands(plan)]
         self.assertTrue(any("-e REUSEPORT_STATIC_THREADS=6" in command for command in rendered))
+
+    def test_profile_accepts_configured_reuseport_dirserver_threads(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace(
+            "# Optional SO_REUSEPORT acceptor thread count. When omitted, the generated Rust fixture\n"
+            "    # uses the container-visible CPU count.\n"
+            "    # threads: 8\n\n"
+            "# Scenario matrix",
+            "# Optional SO_REUSEPORT acceptor thread count. When omitted, the generated Rust fixture\n"
+            "    # uses the container-visible CPU count.\n"
+            "    threads: 5\n\n"
+            "# Scenario matrix",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            plan = load_profile(profile)
+            metadata = write_image_context(plan, "nginx", Path(temp))
+            dockerfile_text = Path(metadata["dockerfile"]).read_text(encoding="utf-8")
+
+        self.assertEqual(plan.upstream["reuseport_dirserver_fixture"]["threads"], 5)
+        self.assertEqual(metadata["packaged_reuseport_dirserver_fixture"]["threads"], 5)
+        self.assertIn("ENV REUSEPORT_DIRSERVER_THREADS=5", dockerfile_text)
+        rendered = [" ".join(command.command) for command in run_container_commands(plan)]
+        self.assertTrue(any("-e REUSEPORT_DIRSERVER_THREADS=5" in command for command in rendered))
+
+    def test_profile_accepts_configured_reuseport_dirserver_sync_file_io_mode(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("file_io_mode: async", "file_io_mode: sync")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            plan = load_profile(profile)
+            metadata = write_image_context(plan, "nginx", Path(temp))
+            dockerfile_text = Path(metadata["dockerfile"]).read_text(encoding="utf-8")
+            main_rs = (Path(metadata["dockerfile"]).parent / "reuseport_dirserver_fixture" / "src" / "main.rs").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(plan.upstream["reuseport_dirserver_fixture"]["file_io_mode"], "sync")
+        self.assertEqual(metadata["packaged_reuseport_dirserver_fixture"]["file_io_mode"], "sync")
+        self.assertIn("ENV REUSEPORT_DIRSERVER_FILE_IO_MODE=sync", dockerfile_text)
+        self.assertIn("REUSEPORT_DIRSERVER_FILE_IO_MODE", main_rs)
+        self.assertIn(".file_io_mode(file_io_mode)", main_rs)
+        rendered = [" ".join(command.command) for command in run_container_commands(plan)]
+        self.assertTrue(any("-e REUSEPORT_DIRSERVER_FILE_IO_MODE=sync" in command for command in rendered))
 
     def test_profile_accepts_configured_reuseport_static_tokio_uring_runtime(self) -> None:
         text = PROFILE.read_text(encoding="utf-8").replace("runtime: tokio", "runtime: tokio_uring")
@@ -406,6 +524,31 @@ class RuntimeBehaviorTests(unittest.TestCase):
             profile = Path(temp) / "profile.yaml"
             profile.write_text(text, encoding="utf-8")
             with self.assertRaisesRegex(ConfigError, "reuseport_static_fixture.threads"):
+                load_profile(profile)
+
+    def test_profile_rejects_invalid_reuseport_dirserver_threads(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace(
+            "# Optional SO_REUSEPORT acceptor thread count. When omitted, the generated Rust fixture\n"
+            "    # uses the container-visible CPU count.\n"
+            "    # threads: 8\n\n"
+            "# Scenario matrix",
+            "# Optional SO_REUSEPORT acceptor thread count. When omitted, the generated Rust fixture\n"
+            "    # uses the container-visible CPU count.\n"
+            "    threads: 0\n\n"
+            "# Scenario matrix",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "reuseport_dirserver_fixture.threads"):
+                load_profile(profile)
+
+    def test_profile_rejects_invalid_reuseport_dirserver_file_io_mode(self) -> None:
+        text = PROFILE.read_text(encoding="utf-8").replace("file_io_mode: async", "file_io_mode: direct")
+        with tempfile.TemporaryDirectory() as temp:
+            profile = Path(temp) / "profile.yaml"
+            profile.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigError, "reuseport_dirserver_fixture.file_io_mode"):
                 load_profile(profile)
 
     def test_reuse_connection_workload_sets_vegeta_keepalive(self) -> None:

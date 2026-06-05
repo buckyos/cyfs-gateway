@@ -15,9 +15,12 @@ VALID_CANDIDATES = (
     "cyfs_gateway_hyper",
     "nginx_reuseport_static",
     "cyfs_gateway_reuseport_static",
+    "nginx_reuseport_dirserver",
+    "cyfs_gateway_reuseport_dirserver",
 )
 VALID_PULL_POLICIES = {"always", "never"}
 VALID_REUSEPORT_STATIC_RUNTIMES = {"tokio", "tokio_custom", "tokio_uring"}
+VALID_DIRSERVER_FILE_IO_MODES = {"async", "sync"}
 
 
 try:
@@ -89,6 +92,20 @@ def _validate_upstream(data: dict[str, Any]) -> dict:
         if runtime not in VALID_REUSEPORT_STATIC_RUNTIMES:
             valid = ", ".join(sorted(VALID_REUSEPORT_STATIC_RUNTIMES))
             raise ConfigError(f"upstream.reuseport_static_fixture.runtime must be one of: {valid}")
+    reuseport_dirserver = upstream.get("reuseport_dirserver_fixture")
+    if isinstance(reuseport_dirserver, dict) and "threads" in reuseport_dirserver:
+        threads = reuseport_dirserver["threads"]
+        if not isinstance(threads, int) or threads <= 0:
+            raise ConfigError("upstream.reuseport_dirserver_fixture.threads must be a positive integer when provided")
+    if isinstance(reuseport_dirserver, dict) and "enabled" in reuseport_dirserver:
+        enabled = reuseport_dirserver["enabled"]
+        if not isinstance(enabled, bool):
+            raise ConfigError("upstream.reuseport_dirserver_fixture.enabled must be a boolean when provided")
+    if isinstance(reuseport_dirserver, dict) and "file_io_mode" in reuseport_dirserver:
+        file_io_mode = reuseport_dirserver["file_io_mode"]
+        if file_io_mode not in VALID_DIRSERVER_FILE_IO_MODES:
+            valid = ", ".join(sorted(VALID_DIRSERVER_FILE_IO_MODES))
+            raise ConfigError(f"upstream.reuseport_dirserver_fixture.file_io_mode must be one of: {valid}")
     return upstream
 
 

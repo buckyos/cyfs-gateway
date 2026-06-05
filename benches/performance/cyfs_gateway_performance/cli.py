@@ -26,6 +26,7 @@ from .target import (
     container_logs_commands,
     container_readiness_commands,
     image_keys_for_candidates,
+    local_image_check_commands,
     preflight,
     pull_commands,
     run_container_commands,
@@ -394,6 +395,21 @@ def _run(args: argparse.Namespace) -> int:
                 "reason": "registry.pull_policy is never",
                 "image_refs": [plan.images[image_key].image_ref for image_key in image_keys_for_candidates(plan)],
             }
+            _log("checking required local benchmark images")
+            evidence["local_images"] = _run_all_commands(local_image_check_commands(plan), output, timeout=30)
+            missing_local_images = [item for item in evidence["local_images"] if item["returncode"] != 0]
+            if missing_local_images:
+                _log("one or more local benchmark images are missing; writing failed report")
+                status = "failed"
+                result = build_result(plan, scenarios, status, evidence, rows=[])
+                outputs = write_reports(
+                    result,
+                    output,
+                    csv_enabled=bool((plan.output.get("formats") or {}).get("csv", False)),
+                )
+                _log(f"reports written: {outputs}")
+                _log_summary(status, outputs=outputs)
+                return EXIT_EXECUTION
         if evidence["pull"] and evidence["pull"][-1]["returncode"] != 0:
             _log("image pull failed; writing deferred or failed report")
             evidence["deferrals"].append("configured registry image pull failed")

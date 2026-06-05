@@ -175,23 +175,70 @@ def reuseport_static_env_args(plan: BenchmarkPlan) -> tuple[str, ...]:
     return tuple(args)
 
 
+def reuseport_dirserver_config(plan: BenchmarkPlan) -> dict:
+    fixture = plan.upstream.get("reuseport_dirserver_fixture") if isinstance(plan.upstream, dict) else None
+    return fixture if isinstance(fixture, dict) else {}
+
+
+def reuseport_dirserver_env_args(plan: BenchmarkPlan) -> tuple[str, ...]:
+    fixture = reuseport_dirserver_config(plan)
+    enabled = 1 if fixture.get("enabled", False) else 0
+    port = int(fixture.get("port") or 10082)
+    file_io_mode = fixture.get("file_io_mode") if fixture.get("file_io_mode") in {"async", "sync"} else "async"
+    args = [
+        "-e",
+        f"REUSEPORT_DIRSERVER_ENABLED={enabled}",
+        "-e",
+        f"REUSEPORT_DIRSERVER_PORT={port}",
+        "-e",
+        f"REUSEPORT_DIRSERVER_FILE_IO_MODE={file_io_mode}",
+    ]
+    threads = fixture.get("threads")
+    if isinstance(threads, int) and threads > 0:
+        args.extend(["-e", f"REUSEPORT_DIRSERVER_THREADS={threads}"])
+    return tuple(args)
+
+
 def reuseport_static_needs_io_uring(plan: BenchmarkPlan) -> bool:
     fixture = reuseport_static_config(plan)
     return bool(fixture.get("enabled", False)) and fixture.get("runtime") == "tokio_uring"
 
 
+def reuseport_dirserver_needs_io_uring(plan: BenchmarkPlan) -> bool:
+    fixture = reuseport_dirserver_config(plan)
+    return bool(fixture.get("enabled", False))
+
+
 def docker_security_args(plan: BenchmarkPlan) -> tuple[str, ...]:
-    if reuseport_static_needs_io_uring(plan):
+    if reuseport_static_needs_io_uring(plan) or reuseport_dirserver_needs_io_uring(plan):
         return ("--security-opt", "seccomp=unconfined")
     return ()
+
+
+def cyfs_gateway_container_needs_gateway(plan: BenchmarkPlan) -> bool:
+    gateway_candidates = {"cyfs_gateway", "cyfs_gateway_hyper"}
+    return any(candidate in gateway_candidates for candidate in plan.candidates)
+
+
+def cyfs_gateway_command_args(plan: BenchmarkPlan) -> tuple[str, ...]:
+    if cyfs_gateway_container_needs_gateway(plan):
+        return ()
+    return (
+        "/bin/sh",
+        "-c",
+        "cyfs-perf-reverse-proxy-fixture & "
+        "if [ x$REUSEPORT_STATIC_ENABLED = x1 ]; then cyfs-perf-reuseport-static-fixture & fi; "
+        "if [ x$REUSEPORT_DIRSERVER_ENABLED = x1 ]; then cyfs-perf-reuseport-dirserver-fixture & fi; "
+        "wait",
+    )
 
 
 def image_keys_for_candidates(plan: BenchmarkPlan) -> tuple[str, ...]:
     wanted = {
         "nginx"
-        if candidate in {"nginx_hyper", "nginx_reuseport_static"}
+        if candidate in {"nginx_hyper", "nginx_reuseport_static", "nginx_reuseport_dirserver"}
         else "cyfs_gateway"
-        if candidate in {"cyfs_gateway_hyper", "cyfs_gateway_reuseport_static"}
+        if candidate in {"cyfs_gateway_hyper", "cyfs_gateway_reuseport_static", "cyfs_gateway_reuseport_dirserver"}
         else candidate
         for candidate in plan.candidates
     }
@@ -203,6 +250,19 @@ def pull_commands(plan: BenchmarkPlan) -> list[CommandPlan]:
         return []
     return [
         target_command(plan, f"pull {plan.images[image_key].key} image", ("docker", "pull", plan.images[image_key].image_ref))
+        for image_key in image_keys_for_candidates(plan)
+    ]
+
+
+def local_image_check_commands(plan: BenchmarkPlan) -> list[CommandPlan]:
+    if plan.registry_pull_policy != "never":
+        return []
+    return [
+        target_command(
+            plan,
+            f"inspect local {plan.images[image_key].key} image",
+            ("docker", "image", "inspect", plan.images[image_key].image_ref),
+        )
         for image_key in image_keys_for_candidates(plan)
     ]
 
@@ -229,6 +289,8 @@ def run_container_commands(plan: BenchmarkPlan) -> list[CommandPlan]:
                 (
                     "docker",
                     "run",
+                    "--pull",
+                    "never",
                     "-d",
                     "--network",
                     network,
@@ -246,8 +308,11 @@ def run_container_commands(plan: BenchmarkPlan) -> list[CommandPlan]:
                     "18180:10080",
                     "-p",
                     "18181:10081",
+                    "-p",
+                    "18182:10082",
                     *docker_security_args(plan),
                     *reuseport_static_env_args(plan),
+                    *reuseport_dirserver_env_args(plan),
                     *docker_env_args(plan, "nginx"),
                     plan.images["nginx"].image_ref,
                 ),
@@ -261,6 +326,8 @@ def run_container_commands(plan: BenchmarkPlan) -> list[CommandPlan]:
                 (
                     "docker",
                     "run",
+                    "--pull",
+                    "never",
                     "-d",
                     "--network",
                     network,
@@ -278,10 +345,14 @@ def run_container_commands(plan: BenchmarkPlan) -> list[CommandPlan]:
                     "28180:10080",
                     "-p",
                     "28181:10081",
+                    "-p",
+                    "28182:10082",
                     *docker_security_args(plan),
                     *reuseport_static_env_args(plan),
+                    *reuseport_dirserver_env_args(plan),
                     *docker_env_args(plan, "cyfs_gateway"),
                     plan.images["cyfs_gateway"].image_ref,
+                    *cyfs_gateway_command_args(plan),
                 ),
             )
         )

@@ -60,6 +60,7 @@ images:
 # Candidate endpoints included in benchmark execution.
 # nginx_hyper/cyfs_gateway_hyper use the legacy in-image Hyper static fixture.
 # nginx_reuseport_static/cyfs_gateway_reuseport_static use the optional SO_REUSEPORT fixture.
+# nginx_reuseport_dirserver/cyfs_gateway_reuseport_dirserver use SO_REUSEPORT plus cyfs-gateway-lib DirServer.
 candidates:
   - nginx
   - cyfs_gateway
@@ -67,6 +68,8 @@ candidates:
   - cyfs_gateway_hyper
   - nginx_reuseport_static
   - cyfs_gateway_reuseport_static
+  - nginx_reuseport_dirserver
+  - cyfs_gateway_reuseport_dirserver
 
 # Generated test assets embedded into image build contexts.
 generated_config:
@@ -134,6 +137,21 @@ upstream:
     runtime: tokio
     # Container-side reuseport static fixture port. Kept separate from the legacy Hyper fixture.
     port: 10081
+    # Optional SO_REUSEPORT acceptor thread count. When omitted, the generated Rust fixture
+    # uses the container-visible CPU count.
+    # threads: 8
+
+  # Optional SO_REUSEPORT static-file fixture backed by cyfs-gateway-lib DirServer.
+  reuseport_dirserver_fixture:
+    # Whether the generated reuseport DirServer fixture starts and participates in the matrix.
+    enabled: true
+    # DirServer filesystem IO mode used by the generated fixture.
+    # Supported values:
+    # - async: use DirServer's default async/tokio-uring filesystem IO path.
+    # - sync: use DirServer's direct synchronous filesystem IO path.
+    file_io_mode: async
+    # Container-side reuseport DirServer fixture port.
+    port: 10082
     # Optional SO_REUSEPORT acceptor thread count. When omitted, the generated Rust fixture
     # uses the container-visible CPU count.
     # threads: 8

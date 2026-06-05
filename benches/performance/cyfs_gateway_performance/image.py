@@ -27,11 +27,12 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 FIXTURE_MAIN_RS = r'''use bytes::Bytes;
 use futures_util::TryStreamExt;
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::{BoxBody, UnsyncBoxBody};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
+use hyper::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
@@ -43,7 +44,8 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use tokio::io::AsyncReadExt;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio_util::io::ReaderStream;
 
@@ -400,6 +402,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+sfo-reuseport = "0.2.4"
 socket2 = "0.6"
 tokio = { version = "1", features = ["fs", "io-util", "net", "rt"] }
 tokio-uring = "0.5"
@@ -409,15 +412,19 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 REUSEPORT_STATIC_MAIN_RS = r'''use bytes::Bytes;
 use futures_util::TryStreamExt;
-use http_body_util::combinators::BoxBody;
+use http_body_util::combinators::{BoxBody, UnsyncBoxBody};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
+use hyper::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, RANGE};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use sfo_reuseport::{
+    Error as ReuseportError, ServerRuntime, ServerRuntimeConfig, SocketOptions, TcpServer,
+    TcpServiceConfig, TransparentMode,
+};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::env;
 use std::ffi::CString;
@@ -427,7 +434,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener as TokioTcpListener;
 use tokio_uring::net::{TcpListener as UringTcpListener, TcpStream as UringTcpStream};
 use tokio_util::io::ReaderStream;
 
@@ -442,7 +448,7 @@ struct HyperStaticRoot {
 }
 
 struct UringStaticRoot {
-    files: HashMap<PathBuf, Bytes>,
+    root_dir_file: std::fs::File,
 }
 
 #[derive(Clone, Copy)]
@@ -470,15 +476,21 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let threads = configured_threads()?;
     let runtime_mode = configured_runtime_mode()?;
 
-    let mut handles = Vec::with_capacity(threads);
-    for thread_index in 0..threads {
-        let static_root = static_root.clone();
-        let runtime_mode = runtime_mode.clone();
-        handles.push(thread::spawn(move || serve_reuseport_worker(thread_index, addr, static_root, runtime_mode)));
-    }
+    match runtime_mode {
+        StaticRuntimeMode::Tokio | StaticRuntimeMode::TokioCustom => {
+            serve_sfo_reuseport_static(addr, static_root, threads, runtime_mode)?;
+        }
+        StaticRuntimeMode::TokioUring => {
+            let mut handles = Vec::with_capacity(threads);
+            for thread_index in 0..threads {
+                let static_root = static_root.clone();
+                handles.push(thread::spawn(move || serve_tokio_uring_reuseport_worker(thread_index, addr, static_root)));
+            }
 
-    for handle in handles {
-        handle.join().expect("reuseport static worker panicked")?;
+            for handle in handles {
+                handle.join().expect("reuseport static tokio_uring worker panicked")?;
+            }
+        }
     }
     Ok(())
 }
@@ -519,76 +531,67 @@ fn resolve_addr(addr: &str) -> std::io::Result<SocketAddr> {
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty listen address"))
 }
 
-fn serve_reuseport_worker(
-    thread_index: usize,
+fn serve_sfo_reuseport_static(
     addr: SocketAddr,
     static_root: PathBuf,
+    threads: usize,
     runtime_mode: StaticRuntimeMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    match runtime_mode {
-        StaticRuntimeMode::Tokio => serve_tokio_reuseport_worker(thread_index, addr, static_root),
-        StaticRuntimeMode::TokioCustom => serve_tokio_custom_reuseport_worker(thread_index, addr, static_root),
-        StaticRuntimeMode::TokioUring => serve_tokio_uring_reuseport_worker(thread_index, addr, static_root),
+    let runtime = ServerRuntime::start(ServerRuntimeConfig::new().with_workers(threads))?;
+    let service_config = TcpServiceConfig::new(addr).with_socket_options(SocketOptions {
+        reuse_address: true,
+        ipv4_transparent: TransparentMode::Disabled,
+        ipv6_transparent: TransparentMode::Disabled,
+    });
+
+    let _server = match runtime_mode {
+        StaticRuntimeMode::Tokio => {
+            let root_dir_file = std::fs::File::open(&static_root)?;
+            let static_root = Arc::new(HyperStaticRoot { root_dir_file });
+            TcpServer::serve(&runtime, service_config, move |stream| {
+                let static_root = static_root.clone();
+                async move {
+                    stream.set_nodelay(true)?;
+                    let service = service_fn(move |request| {
+                        let static_root = static_root.clone();
+                        async move { serve_hyper_static_request(request, static_root).await }
+                    });
+                    http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .map_err(|err| ReuseportError::Handler(format!("reuseport static connection failed: {err}")))
+                }
+            })?
+        }
+        StaticRuntimeMode::TokioCustom => {
+            let root_dir_file = std::fs::File::open(&static_root)?;
+            let static_root = Arc::new(HyperStaticRoot { root_dir_file });
+            TcpServer::serve(&runtime, service_config, move |mut stream| {
+                let static_root = static_root.clone();
+                async move {
+                    stream.set_nodelay(true)?;
+                    serve_tokio_custom_static_connection(&mut stream, static_root)
+                        .await
+                        .map_err(|err| ReuseportError::Handler(format!("reuseport static tokio_custom connection failed: {err}")))
+                }
+            })?
+        }
+        StaticRuntimeMode::TokioUring => unreachable!("tokio_uring keeps its dedicated listener path"),
+    };
+    eprintln!("reuseport static {runtime_mode_name} server listening on {addr} with {threads} sfo-reuseport workers", runtime_mode_name = runtime_mode.name());
+    loop {
+        thread::park();
     }
 }
 
-fn serve_tokio_reuseport_worker(
-    thread_index: usize,
-    addr: SocketAddr,
-    static_root: PathBuf,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root_dir_file = std::fs::File::open(&static_root)?;
-    let static_root = Arc::new(HyperStaticRoot { root_dir_file });
-    let std_listener = bind_reuseport_listener(addr)?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-
-    runtime.block_on(async move {
-        let listener = TokioTcpListener::from_std(std_listener)?;
-        eprintln!("reuseport static worker {thread_index} listening on {addr}");
-        loop {
-            let (stream, _) = listener.accept().await?;
-            stream.set_nodelay(true)?;
-            let static_root = static_root.clone();
-            tokio::spawn(async move {
-                let service = service_fn(move |request| {
-                    let static_root = static_root.clone();
-                    async move { serve_hyper_static_request(request, static_root).await }
-                });
-                if let Err(err) = http1::Builder::new()
-                    .serve_connection(TokioIo::new(stream), service)
-                    .await
-                {
-                    eprintln!("reuseport static connection failed: {err}");
-                }
-            });
+impl StaticRuntimeMode {
+    fn name(self) -> &'static str {
+        match self {
+            StaticRuntimeMode::Tokio => "tokio",
+            StaticRuntimeMode::TokioCustom => "tokio_custom",
+            StaticRuntimeMode::TokioUring => "tokio_uring",
         }
-    })
-}
-
-fn serve_tokio_custom_reuseport_worker(
-    thread_index: usize,
-    addr: SocketAddr,
-    static_root: PathBuf,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let root_dir_file = std::fs::File::open(&static_root)?;
-    let static_root = Arc::new(HyperStaticRoot { root_dir_file });
-    let std_listener = bind_reuseport_listener(addr)?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-
-    runtime.block_on(async move {
-        let listener = TokioTcpListener::from_std(std_listener)?;
-        eprintln!("reuseport static tokio_custom worker {thread_index} listening on {addr}");
-        loop {
-            let (mut stream, _) = listener.accept().await?;
-            stream.set_nodelay(true)?;
-            let static_root = static_root.clone();
-            tokio::spawn(async move {
-                if let Err(err) = serve_tokio_custom_static_connection(&mut stream, static_root).await {
-                    eprintln!("reuseport static tokio_custom connection failed: {err}");
-                }
-            });
-        }
-    })
+    }
 }
 
 fn serve_tokio_uring_reuseport_worker(
@@ -596,7 +599,8 @@ fn serve_tokio_uring_reuseport_worker(
     addr: SocketAddr,
     static_root: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let static_root = Arc::new(load_uring_static_cache(&static_root)?);
+    let root_dir_file = std::fs::File::open(&static_root)?;
+    let static_root = Arc::new(UringStaticRoot { root_dir_file });
     let std_listener = bind_reuseport_listener(addr)?;
 
     tokio_uring::start(async move {
@@ -893,11 +897,16 @@ async fn write_uring_static_response(
         return write_uring_response(stream, uring_text_response(StatusCode::FORBIDDEN, "forbidden")).await;
     };
     let file_path = PathBuf::from(path.trim_start_matches('/'));
-    let Some(body) = static_root.files.get(&file_path) else {
-        return write_uring_response(stream, uring_text_response(StatusCode::NOT_FOUND, "not found")).await;
+    let mut opened = match open_uring_static_file(static_root, &file_path) {
+        Ok(opened) if opened.metadata.is_file() => opened,
+        Ok(_) => return write_uring_response(stream, uring_text_response(StatusCode::NOT_FOUND, "not found")).await,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return write_uring_response(stream, uring_text_response(StatusCode::NOT_FOUND, "not found")).await;
+        }
+        Err(err) => return Err(err),
     };
 
-    let content_length = body.len() as u64;
+    let content_length = opened.metadata.len();
     let headers = status_line_and_headers(
         StatusCode::OK,
         "application/octet-stream",
@@ -907,17 +916,30 @@ async fn write_uring_static_response(
     if method == "HEAD" {
         return write_uring_response(stream, headers).await;
     }
-    write_cached_uring_body(stream, headers, body.clone()).await
+    write_uring_file_body(stream, headers, &mut opened.file, content_length).await
 }
 
-async fn write_cached_uring_body(
+fn open_uring_static_file(
+    static_root: &UringStaticRoot,
+    file_path: &Path,
+) -> std::io::Result<OpenedStdStaticFile> {
+    let hyper_root = HyperStaticRoot {
+        root_dir_file: static_root.root_dir_file.try_clone()?,
+    };
+    open_std_hyper_static_file(&hyper_root, file_path)
+}
+
+async fn write_uring_file_body(
     stream: &UringTcpStream,
     headers: Vec<u8>,
-    body: Bytes,
+    file: &mut std::fs::File,
+    content_length: u64,
 ) -> std::io::Result<()> {
     let (result, _) = stream.write_all(headers).await;
     result?;
 
+    let mut body = Vec::with_capacity(content_length as usize);
+    std::io::Read::read_to_end(file, &mut body)?;
     for chunk in body.chunks(URING_STATIC_BODY_WRITE_CHUNK_SIZE) {
         let (result, _) = stream.write_all(chunk.to_vec()).await;
         result?;
@@ -954,33 +976,6 @@ fn status_line_and_headers(
         connection,
     )
     .into_bytes()
-}
-
-fn load_uring_static_cache(static_root: &Path) -> std::io::Result<UringStaticRoot> {
-    let mut files = HashMap::new();
-    load_uring_static_cache_dir(static_root, static_root, &mut files)?;
-    Ok(UringStaticRoot { files })
-}
-
-fn load_uring_static_cache_dir(
-    static_root: &Path,
-    dir: &Path,
-    files: &mut HashMap<PathBuf, Bytes>,
-) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            load_uring_static_cache_dir(static_root, &path, files)?;
-        } else if file_type.is_file() {
-            let rel_path = path.strip_prefix(static_root).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "static file escaped root")
-            })?;
-            files.insert(rel_path.to_path_buf(), Bytes::from(std::fs::read(path)?));
-        }
-    }
-    Ok(())
 }
 
 async fn write_uring_response(stream: &UringTcpStream, response: Vec<u8>) -> std::io::Result<()> {
@@ -1032,6 +1027,117 @@ fn text_response(status: StatusCode, text: &'static str) -> Response<HyperStatic
                 .boxed()
         )
         .unwrap()
+}
+'''
+
+
+REUSEPORT_DIRSERVER_MAIN_RS = r'''use cyfs_gateway_lib::{
+    hyper_serve_http1, DirServer, DirServerFileIoMode, StreamInfo,
+};
+use sfo_reuseport::{
+    Error as ReuseportError, ServerRuntime, ServerRuntimeConfig, SocketOptions, TcpServer,
+    TcpServiceConfig, TransparentMode,
+};
+use std::env;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = listen_addr("REUSEPORT_DIRSERVER_PORT", "0.0.0.0:10082");
+    let addr = resolve_addr(&addr)?;
+    let static_root = env::var("STATIC_ROOT").unwrap_or_else(|_| "/etc/cyfs-perf/static".to_owned());
+    let static_root = PathBuf::from(static_root).canonicalize()?;
+    let threads = configured_threads()?;
+    let file_io_mode = configured_file_io_mode()?;
+
+    serve_reuseport_dirserver(addr, static_root, threads, file_io_mode)
+}
+
+fn listen_addr(port_var: &str, default_addr: &str) -> String {
+    match env::var(port_var) {
+        Ok(port) if port.contains(':') => port,
+        Ok(port) if !port.is_empty() => format!("0.0.0.0:{port}"),
+        _ => default_addr.to_owned(),
+    }
+}
+
+fn configured_threads() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    if let Ok(raw) = env::var("REUSEPORT_DIRSERVER_THREADS") {
+        let parsed = raw.parse::<usize>()?;
+        if parsed > 0 {
+            return Ok(parsed);
+        }
+    }
+    Ok(thread::available_parallelism().map(|value| value.get()).unwrap_or(1))
+}
+
+fn configured_file_io_mode() -> Result<DirServerFileIoMode, Box<dyn std::error::Error + Send + Sync>> {
+    match env::var("REUSEPORT_DIRSERVER_FILE_IO_MODE").as_deref() {
+        Ok("sync") => Ok(DirServerFileIoMode::Sync),
+        Ok("async") | Err(_) => Ok(DirServerFileIoMode::Async),
+        Ok(value) => Err(format!("REUSEPORT_DIRSERVER_FILE_IO_MODE must be async or sync, got {value}").into()),
+    }
+}
+
+fn resolve_addr(addr: &str) -> std::io::Result<SocketAddr> {
+    addr.to_socket_addrs()?
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty listen address"))
+}
+
+fn serve_reuseport_dirserver(
+    addr: SocketAddr,
+    static_root: PathBuf,
+    threads: usize,
+    file_io_mode: DirServerFileIoMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let runtime = ServerRuntime::start(ServerRuntimeConfig::new().with_workers(threads))?;
+    let service_config = TcpServiceConfig::new(addr).with_socket_options(SocketOptions {
+        reuse_address: true,
+        ipv4_transparent: TransparentMode::Disabled,
+        ipv6_transparent: TransparentMode::Disabled,
+    });
+    let server = build_dir_server(static_root, file_io_mode)?;
+    let _server = TcpServer::serve(&runtime, service_config, move |stream| {
+        let server = server.clone();
+        async move {
+            stream.set_nodelay(true)?;
+            hyper_serve_http1(Box::new(stream), server, StreamInfo::default())
+                .await
+                .map_err(|err| ReuseportError::Handler(format!("reuseport DirServer connection failed: {err}")))
+        }
+    })?;
+
+    eprintln!(
+        "reuseport DirServer fixture listening on {addr} with {threads} sfo-reuseport workers and {file_io_mode:?} file IO"
+    );
+    loop {
+        thread::park();
+    }
+}
+
+fn build_dir_server(
+    static_root: PathBuf,
+    file_io_mode: DirServerFileIoMode,
+) -> Result<Arc<DirServer>, Box<dyn std::error::Error + Send + Sync>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let server = runtime.block_on(async move {
+        DirServer::builder()
+            .id("perf_reuseport_dirserver")
+            .root_path(static_root)
+            .index_file("index.html")
+            .version("HTTP/1.1")
+            .autoindex(true)
+            .etag(true)
+            .file_io_mode(file_io_mode)
+            .build()
+            .await
+    })?;
+    Ok(Arc::new(server))
 }
 '''
 
@@ -1274,6 +1380,7 @@ def image_build_plan(plan: BenchmarkPlan, image_key: str, output: Path) -> tuple
 def fixture_build_commands(context: Path) -> list[CommandPlan]:
     fixture_dir = context / "reverse_proxy_fixture"
     reuseport_static_dir = context / "reuseport_static_fixture"
+    reuseport_dirserver_dir = context / "reuseport_dirserver_fixture"
     return [
         CommandPlan(
             "build reverse_proxy_fixture binary",
@@ -1285,6 +1392,11 @@ def fixture_build_commands(context: Path) -> list[CommandPlan]:
             ("cargo", "build", "--release"),
             cwd=str(reuseport_static_dir),
         ),
+        CommandPlan(
+            "build reuseport_dirserver_fixture binary",
+            ("cargo", "build", "--release"),
+            cwd=str(reuseport_dirserver_dir),
+        ),
     ]
 
 
@@ -1293,6 +1405,8 @@ def fixture_package_commands(context: Path) -> list[CommandPlan]:
     packaged = fixture_packaged_binary(context)
     static_binary = reuseport_static_build_binary(context)
     static_packaged = reuseport_static_packaged_binary(context)
+    dirserver_binary = reuseport_dirserver_build_binary(context)
+    dirserver_packaged = reuseport_dirserver_packaged_binary(context)
     return [
         CommandPlan(
             "package reverse_proxy_fixture binary",
@@ -1301,6 +1415,10 @@ def fixture_package_commands(context: Path) -> list[CommandPlan]:
         CommandPlan(
             "package reuseport_static_fixture binary",
             ("install", "-m", "0755", str(static_binary), str(static_packaged)),
+        ),
+        CommandPlan(
+            "package reuseport_dirserver_fixture binary",
+            ("install", "-m", "0755", str(dirserver_binary), str(dirserver_packaged)),
         ),
     ]
 
@@ -1403,7 +1521,49 @@ def cyfs_gateway_binary_metadata(plan: BenchmarkPlan, context: Path) -> dict:
     }
 
 
-def write_fixture_sources(context: Path) -> dict:
+def cyfs_gateway_lib_path(plan: BenchmarkPlan) -> Path:
+    source = cyfs_gateway_source(plan)
+    return Path(source["repo_root"]) / "src" / "components" / "cyfs-gateway-lib"
+
+
+def reuseport_dirserver_release_lto(plan: BenchmarkPlan) -> bool:
+    fixture = reuseport_dirserver_config(plan)
+    return bool(fixture.get("release_lto", False))
+
+
+def reuseport_dirserver_cargo_toml(plan: BenchmarkPlan) -> str:
+    lib_path = str(cyfs_gateway_lib_path(plan)).replace("\\", "\\\\")
+    release_profile = """
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+""" if reuseport_dirserver_release_lto(plan) else ""
+    return f"""[package]
+name = "cyfs-perf-reuseport-dirserver-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+cyfs-gateway-lib = {{ path = "{lib_path}" }}
+sfo-reuseport = {{ version = "0.2.5", features = ["quinn"] }}
+tokio = {{ version = "1", features = ["rt"] }}
+{release_profile}
+"""
+
+
+REUSEPORT_DIRSERVER_CARGO_CONFIG_TOML = """[target.'cfg(target_os = "linux")']
+rustflags = ["--cfg", "tokio_unstable"]
+"""
+
+
+def reuseport_dirserver_tokio_unstable(plan: BenchmarkPlan) -> bool:
+    return True
+
+
+def write_fixture_sources(plan: BenchmarkPlan, context: Path) -> dict:
     fixture_dir = context / "reverse_proxy_fixture"
     src = fixture_dir / "src"
     src.mkdir(parents=True, exist_ok=True)
@@ -1414,6 +1574,15 @@ def write_fixture_sources(context: Path) -> dict:
     static_src.mkdir(parents=True, exist_ok=True)
     (static_fixture_dir / "Cargo.toml").write_text(REUSEPORT_STATIC_CARGO_TOML, encoding="utf-8")
     (static_src / "main.rs").write_text(REUSEPORT_STATIC_MAIN_RS, encoding="utf-8")
+    dirserver_fixture_dir = context / "reuseport_dirserver_fixture"
+    dirserver_src = dirserver_fixture_dir / "src"
+    dirserver_cargo_dir = dirserver_fixture_dir / ".cargo"
+    dirserver_src.mkdir(parents=True, exist_ok=True)
+    dirserver_cargo_dir.mkdir(parents=True, exist_ok=True)
+    (dirserver_fixture_dir / "Cargo.toml").write_text(reuseport_dirserver_cargo_toml(plan), encoding="utf-8")
+    if reuseport_dirserver_tokio_unstable(plan):
+        (dirserver_cargo_dir / "config.toml").write_text(REUSEPORT_DIRSERVER_CARGO_CONFIG_TOML, encoding="utf-8")
+    (dirserver_src / "main.rs").write_text(REUSEPORT_DIRSERVER_MAIN_RS, encoding="utf-8")
     return {
         "cargo_toml": str(fixture_dir / "Cargo.toml"),
         "main_rs": str(src / "main.rs"),
@@ -1427,6 +1596,16 @@ def write_reuseport_static_sources_metadata(context: Path) -> dict:
         "cargo_toml": str(fixture_dir / "Cargo.toml"),
         "main_rs": str(fixture_dir / "src" / "main.rs"),
         **reuseport_static_binary_metadata(context),
+    }
+
+
+def write_reuseport_dirserver_sources_metadata(context: Path) -> dict:
+    fixture_dir = context / "reuseport_dirserver_fixture"
+    return {
+        "cargo_toml": str(fixture_dir / "Cargo.toml"),
+        "cargo_config_toml": str(fixture_dir / ".cargo" / "config.toml"),
+        "main_rs": str(fixture_dir / "src" / "main.rs"),
+        **reuseport_dirserver_binary_metadata(context),
     }
 
 
@@ -1468,6 +1647,25 @@ def reuseport_static_packaged_binary(context: Path) -> Path:
     return context / "generated" / "cyfs-perf-reuseport-static-fixture"
 
 
+def reuseport_dirserver_binary_metadata(context: Path) -> dict:
+    binary = reuseport_dirserver_build_binary(context)
+    packaged = reuseport_dirserver_packaged_binary(context)
+    return {
+        "build_binary": str(binary),
+        "build_binary_exists": binary.exists(),
+        "packaged_binary": str(packaged),
+        "packaged_binary_exists": packaged.exists(),
+    }
+
+
+def reuseport_dirserver_build_binary(context: Path) -> Path:
+    return context / "reuseport_dirserver_fixture" / "target" / "release" / "cyfs-perf-reuseport-dirserver-fixture"
+
+
+def reuseport_dirserver_packaged_binary(context: Path) -> Path:
+    return context / "generated" / "cyfs-perf-reuseport-dirserver-fixture"
+
+
 def reuseport_static_config(plan: BenchmarkPlan) -> dict:
     fixture = plan.upstream.get("reuseport_static_fixture") if isinstance(plan.upstream, dict) else None
     return fixture if isinstance(fixture, dict) else {}
@@ -1488,6 +1686,28 @@ def reuseport_static_threads(plan: BenchmarkPlan) -> int | None:
 def reuseport_static_runtime(plan: BenchmarkPlan) -> str:
     runtime = reuseport_static_config(plan).get("runtime")
     return runtime if runtime in {"tokio", "tokio_custom", "tokio_uring"} else "tokio"
+
+
+def reuseport_dirserver_config(plan: BenchmarkPlan) -> dict:
+    fixture = plan.upstream.get("reuseport_dirserver_fixture") if isinstance(plan.upstream, dict) else None
+    return fixture if isinstance(fixture, dict) else {}
+
+
+def reuseport_dirserver_enabled(plan: BenchmarkPlan) -> bool:
+    return bool(reuseport_dirserver_config(plan).get("enabled", False))
+
+
+def reuseport_dirserver_threads(plan: BenchmarkPlan) -> int | None:
+    fixture = reuseport_dirserver_config(plan)
+    if not fixture:
+        return None
+    threads = fixture.get("threads")
+    return threads if isinstance(threads, int) and threads > 0 else None
+
+
+def reuseport_dirserver_file_io_mode(plan: BenchmarkPlan) -> str:
+    mode = reuseport_dirserver_config(plan).get("file_io_mode")
+    return mode if mode in {"async", "sync"} else "async"
 
 
 def dockerfile_env_lines(plan: BenchmarkPlan, image_key: str) -> str:
@@ -1530,23 +1750,32 @@ def write_image_context(plan: BenchmarkPlan, image_key: str, output: Path) -> di
     )
     _write_candidate_configs(plan, image_key, config_dir)
     static_files = write_static_files(plan, config_dir)
-    fixture = write_fixture_sources(dockerfile.parent)
+    fixture = write_fixture_sources(plan, dockerfile.parent)
     reuseport_static_fixture = write_reuseport_static_sources_metadata(dockerfile.parent)
+    reuseport_dirserver_fixture = write_reuseport_dirserver_sources_metadata(dockerfile.parent)
     http_port = int((plan.upstream.get("http_fixture") or {}).get("port") or 8080)
     stream_port = int((plan.upstream.get("stream_fixture") or {}).get("port") or 9000)
     hyper_static_port = int((plan.upstream.get("hyper_static_fixture") or {}).get("port") or 10080)
     reuseport_static_port = int(reuseport_static_config(plan).get("port") or 10081)
+    reuseport_dirserver_port = int(reuseport_dirserver_config(plan).get("port") or 10082)
     reuseport_enabled = reuseport_static_enabled(plan)
+    reuseport_dirserver_is_enabled = reuseport_dirserver_enabled(plan)
     hyper_static_threads = reuseport_static_threads(plan)
+    dirserver_threads = reuseport_dirserver_threads(plan)
+    dirserver_file_io_mode = reuseport_dirserver_file_io_mode(plan)
     reuseport_runtime = reuseport_static_runtime(plan)
     candidate_env = dockerfile_env_lines(plan, image_key)
     hyper_static_thread_env = f"ENV REUSEPORT_STATIC_THREADS={hyper_static_threads}\n" if hyper_static_threads else ""
+    dirserver_thread_env = f"ENV REUSEPORT_DIRSERVER_THREADS={dirserver_threads}\n" if dirserver_threads else ""
     reuseport_start = "if [ x$REUSEPORT_STATIC_ENABLED = x1 ]; then cyfs-perf-reuseport-static-fixture & fi; "
+    dirserver_start = "if [ x$REUSEPORT_DIRSERVER_ENABLED = x1 ]; then cyfs-perf-reuseport-dirserver-fixture & fi; "
     fixture_env = (
         "COPY generated/cyfs-perf-reverse-proxy-fixture /usr/local/bin/cyfs-perf-reverse-proxy-fixture\n"
         "COPY generated/cyfs-perf-reuseport-static-fixture /usr/local/bin/cyfs-perf-reuseport-static-fixture\n"
+        "COPY generated/cyfs-perf-reuseport-dirserver-fixture /usr/local/bin/cyfs-perf-reuseport-dirserver-fixture\n"
         "RUN chmod +x /usr/local/bin/cyfs-perf-reverse-proxy-fixture\n"
         "RUN chmod +x /usr/local/bin/cyfs-perf-reuseport-static-fixture\n"
+        "RUN chmod +x /usr/local/bin/cyfs-perf-reuseport-dirserver-fixture\n"
         f"ENV HTTP_PORT={http_port}\n"
         f"ENV STREAM_PORT={stream_port}\n"
         f"ENV HYPER_STATIC_PORT={hyper_static_port}\n"
@@ -1554,8 +1783,12 @@ def write_image_context(plan: BenchmarkPlan, image_key: str, output: Path) -> di
         f"ENV REUSEPORT_STATIC_ENABLED={1 if reuseport_enabled else 0}\n"
         f"ENV REUSEPORT_STATIC_RUNTIME={reuseport_runtime}\n"
         + hyper_static_thread_env
+        + f"ENV REUSEPORT_DIRSERVER_PORT={reuseport_dirserver_port}\n"
+        + f"ENV REUSEPORT_DIRSERVER_ENABLED={1 if reuseport_dirserver_is_enabled else 0}\n"
+        + f"ENV REUSEPORT_DIRSERVER_FILE_IO_MODE={dirserver_file_io_mode}\n"
+        + dirserver_thread_env
         + "ENV STATIC_ROOT=/etc/cyfs-perf/static\n"
-        + f"EXPOSE 80 443 9080 9443 {http_port} {stream_port} {hyper_static_port} {reuseport_static_port}\n"
+        + f"EXPOSE 80 443 9080 9443 {http_port} {stream_port} {hyper_static_port} {reuseport_static_port} {reuseport_dirserver_port}\n"
     )
     source_build = None
     if image_key == "cyfs_gateway":
@@ -1569,7 +1802,7 @@ def write_image_context(plan: BenchmarkPlan, image_key: str, output: Path) -> di
             + "COPY generated/nginx.conf /etc/nginx/nginx.conf\n"
             + fixture_env
             + candidate_env
-            + dockerfile_cmd(f"cyfs-perf-reverse-proxy-fixture & {reuseport_start}exec nginx -g 'daemon off;'")
+            + dockerfile_cmd(f"cyfs-perf-reverse-proxy-fixture & {reuseport_start}{dirserver_start}exec nginx -g 'daemon off;'")
         )
     else:
         base_image = docker_base_image(plan, image_key, "ubuntu:22.04")
@@ -1580,7 +1813,7 @@ def write_image_context(plan: BenchmarkPlan, image_key: str, output: Path) -> di
             + fixture_env
             + candidate_env
             + dockerfile_cmd(
-                f"cyfs-perf-reverse-proxy-fixture & {reuseport_start}exec cyfs_gateway --config_file /etc/cyfs-perf/gateway.yaml"
+                f"cyfs-perf-reverse-proxy-fixture & {reuseport_start}{dirserver_start}exec cyfs_gateway --config_file /etc/cyfs-perf/gateway.yaml"
             )
         )
     dockerfile.write_text(body, encoding="utf-8")
@@ -1611,6 +1844,16 @@ def write_image_context(plan: BenchmarkPlan, image_key: str, output: Path) -> di
             "enabled": reuseport_enabled,
             "threads": hyper_static_threads or "available_parallelism",
             "runtime": reuseport_runtime,
+        },
+        "packaged_reuseport_dirserver_fixture": {
+            **reuseport_dirserver_fixture,
+            "ports": {
+                "reuseport_dirserver": reuseport_dirserver_port,
+            },
+            "enabled": reuseport_dirserver_is_enabled,
+            "threads": dirserver_threads or "available_parallelism",
+            "file_io_mode": dirserver_file_io_mode,
+            "cyfs_gateway_lib": str(cyfs_gateway_lib_path(plan)),
         },
         "commands": [list(command.command) for command in commands],
         "source_build": source_build,

@@ -5,10 +5,18 @@ from .model import BenchmarkPlan, ConfigError, ScenarioPlan
 
 HYPER_STATIC_CANDIDATES = ("nginx_hyper", "cyfs_gateway_hyper")
 REUSEPORT_STATIC_CANDIDATES = ("nginx_reuseport_static", "cyfs_gateway_reuseport_static")
+REUSEPORT_DIRSERVER_CANDIDATES = ("nginx_reuseport_dirserver", "cyfs_gateway_reuseport_dirserver")
 
 
 def reuseport_static_enabled(plan: BenchmarkPlan) -> bool:
     fixture = plan.upstream.get("reuseport_static_fixture") if isinstance(plan.upstream, dict) else None
+    if not isinstance(fixture, dict):
+        return False
+    return bool(fixture.get("enabled", False))
+
+
+def reuseport_dirserver_enabled(plan: BenchmarkPlan) -> bool:
+    fixture = plan.upstream.get("reuseport_dirserver_fixture") if isinstance(plan.upstream, dict) else None
     if not isinstance(fixture, dict):
         return False
     return bool(fixture.get("enabled", False))
@@ -41,12 +49,15 @@ def expand_scenarios(plan: BenchmarkPlan) -> list[ScenarioPlan]:
 
     result: list[ScenarioPlan] = []
     reuseport_enabled = reuseport_static_enabled(plan)
+    dirserver_enabled = reuseport_dirserver_enabled(plan)
     for candidate in plan.candidates:
         if candidate in REUSEPORT_STATIC_CANDIDATES and not reuseport_enabled:
             continue
+        if candidate in REUSEPORT_DIRSERVER_CANDIDATES and not dirserver_enabled:
+            continue
         for scenario, payloads, stream_modes in scenarios:
             scenario_protocols = protocols
-            if candidate in HYPER_STATIC_CANDIDATES or candidate in REUSEPORT_STATIC_CANDIDATES:
+            if candidate in HYPER_STATIC_CANDIDATES or candidate in REUSEPORT_STATIC_CANDIDATES or candidate in REUSEPORT_DIRSERVER_CANDIDATES:
                 if scenario != "static_http_file":
                     continue
                 scenario_protocols = [protocol for protocol in scenario_protocols if protocol == "http"]

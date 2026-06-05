@@ -19,6 +19,10 @@ def endpoint_for(scenario: ScenarioPlan, host: str = "127.0.0.1") -> tuple[str, 
         return host, 18181, False
     if scenario.candidate == "cyfs_gateway_reuseport_static":
         return host, 28181, False
+    if scenario.candidate == "nginx_reuseport_dirserver":
+        return host, 18182, False
+    if scenario.candidate == "cyfs_gateway_reuseport_dirserver":
+        return host, 28182, False
     if scenario.scenario == "stream_reverse_proxy":
         tls = scenario.protocol == "https"
         if scenario.candidate == "nginx":
