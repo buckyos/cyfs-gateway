@@ -38,9 +38,8 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'}')
     .add(b'/');
-const SMALL_FILE_INLINE_LIMIT: u64 = 64 * 1024;
-const MIN_FILE_STREAM_BUFFER_SIZE: usize = 16 * 1024;
-const MAX_FILE_STREAM_BUFFER_SIZE: usize = 64 * 1024;
+const SMALL_FILE_INLINE_LIMIT: u64 = 32 * 1024;
+const DEFAULT_FILE_READ_BUFFER_SIZE: usize = 64 * 1024;
 
 /// DirServer Builder for fluent configuration
 pub struct DirServerBuilder {
@@ -55,6 +54,7 @@ pub struct DirServerBuilder {
     if_modified_since: Option<String>,
     open_file_cache: Option<OpenFileCacheSettings>,
     file_io_mode: DirServerFileIoMode,
+    file_read_buffer_size: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -515,6 +515,11 @@ impl DirServerBuilder {
         self
     }
 
+    pub fn file_read_buffer_size(mut self, size: usize) -> Self {
+        self.file_read_buffer_size = size;
+        self
+    }
+
     pub async fn build(self) -> ServerResult<DirServer> {
         DirServer::create_server(self).await
     }
@@ -535,6 +540,7 @@ pub struct DirServer {
     if_modified_since: IfModifiedSinceMode,
     open_file_cache: Option<OpenFileCache>,
     file_io_mode: DirServerFileIoMode,
+    file_read_buffer_size: usize,
 }
 
 impl DirServer {
@@ -551,6 +557,7 @@ impl DirServer {
             if_modified_since: None,
             open_file_cache: None,
             file_io_mode: DirServerFileIoMode::default(),
+            file_read_buffer_size: DEFAULT_FILE_READ_BUFFER_SIZE,
         }
     }
 
@@ -571,6 +578,13 @@ impl DirServer {
 
         let root_path = builder.root_path.unwrap();
         let file_io_mode = builder.file_io_mode;
+        if builder.file_read_buffer_size == 0 {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "file_read_buffer_size must be greater than 0"
+            ));
+        }
+
         let root_metadata = match Self::fs_metadata(file_io_mode, &root_path).await {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -679,6 +693,7 @@ impl DirServer {
             if_modified_since,
             open_file_cache: builder.open_file_cache.map(OpenFileCache::new),
             file_io_mode,
+            file_read_buffer_size: builder.file_read_buffer_size,
         })
     }
 
@@ -931,11 +946,9 @@ impl DirServer {
         }
     }
 
-    fn file_stream_buffer_size(content_length: u64) -> usize {
-        content_length.clamp(
-            MIN_FILE_STREAM_BUFFER_SIZE as u64,
-            MAX_FILE_STREAM_BUFFER_SIZE as u64,
-        ) as usize
+    fn file_stream_buffer_size(configured_size: usize, content_length: u64) -> usize {
+        let content_length = usize::try_from(content_length).unwrap_or(usize::MAX);
+        configured_size.min(content_length).max(1)
     }
 
     fn empty_body() -> UnsyncBoxBody<Bytes, ServerError> {
@@ -945,6 +958,7 @@ impl DirServer {
     }
 
     async fn full_or_stream_body(
+        &self,
         file: DirReadFile,
         content_length: u64,
     ) -> ServerResult<UnsyncBoxBody<Bytes, ServerError>> {
@@ -972,7 +986,10 @@ impl DirServer {
         }
 
         let stream =
-            ReaderStream::with_capacity(file, Self::file_stream_buffer_size(content_length))
+            ReaderStream::with_capacity(
+                file,
+                Self::file_stream_buffer_size(self.file_read_buffer_size, content_length),
+            )
                 .map_ok(Frame::data);
 
         Ok(BodyExt::map_err(StreamBody::new(stream), |e| {
@@ -1013,6 +1030,7 @@ impl DirServer {
     }
 
     async fn range_body(
+        &self,
         file: DirReadFile,
         start: u64,
         content_length: u64,
@@ -1034,7 +1052,7 @@ impl DirServer {
 
         let stream = ReaderStream::with_capacity(
             file.take(content_length),
-            Self::file_stream_buffer_size(content_length),
+            Self::file_stream_buffer_size(self.file_read_buffer_size, content_length),
         )
         .map_ok(Frame::data);
 
@@ -1199,7 +1217,7 @@ impl DirServer {
                 let body = if req_info.is_head {
                     Self::empty_body()
                 } else {
-                    Self::range_body(file, start, content_length).await?
+                    self.range_body(file, start, content_length).await?
                 };
                 return response_builder.body(body).map_err(|e| {
                     server_err!(ServerErrorCode::IOError, "Failed to build response: {}", e)
@@ -1224,7 +1242,7 @@ impl DirServer {
         let body = if req_info.is_head {
             Self::empty_body()
         } else {
-            Self::full_or_stream_body(file, file_size).await?
+            self.full_or_stream_body(file, file_size).await?
         };
 
         response_builder
@@ -1648,6 +1666,8 @@ pub struct DirServerConfig {
     pub open_file_cache_errors: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_io_mode: Option<DirServerFileIoMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_read_buffer_size: Option<usize>,
 }
 
 /// Nginx-like `open_file_cache` directive for DirServer path metadata lookup.
@@ -1840,6 +1860,9 @@ impl ServerFactory for DirServerFactory {
         if let Some(file_io_mode) = config.file_io_mode {
             builder = builder.file_io_mode(file_io_mode);
         }
+        if let Some(file_read_buffer_size) = config.file_read_buffer_size {
+            builder = builder.file_read_buffer_size(file_read_buffer_size);
+        }
 
         let server = builder.build().await?;
         Ok(vec![Server::Http(Arc::new(server))])
@@ -1861,12 +1884,20 @@ mod tests {
     }
 
     #[test]
-    fn test_large_file_stream_buffer_is_capped_at_64k() {
+    fn test_large_file_stream_buffer_uses_configured_size() {
         assert_eq!(
-            DirServer::file_stream_buffer_size(SMALL_FILE_INLINE_LIMIT + 1),
-            MAX_FILE_STREAM_BUFFER_SIZE
+            DirServer::file_stream_buffer_size(DEFAULT_FILE_READ_BUFFER_SIZE, 128 * 1024),
+            64 * 1024
         );
-        assert_eq!(MAX_FILE_STREAM_BUFFER_SIZE, 64 * 1024);
+        assert_eq!(DEFAULT_FILE_READ_BUFFER_SIZE, 64 * 1024);
+    }
+
+    #[test]
+    fn test_large_file_stream_buffer_does_not_exceed_content_length() {
+        assert_eq!(
+            DirServer::file_stream_buffer_size(DEFAULT_FILE_READ_BUFFER_SIZE, 8 * 1024),
+            8 * 1024
+        );
     }
 
     #[tokio::test]
@@ -2026,6 +2057,7 @@ mod tests {
             open_file_cache_min_uses: None,
             open_file_cache_errors: None,
             file_io_mode: None,
+            file_read_buffer_size: None,
         };
 
         let factory = DirServerFactory::new();
@@ -2107,6 +2139,19 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_dir_server_file_read_buffer_size_config_deserializes_value() {
+        let config: DirServerConfig = serde_json::from_value(serde_json::json!({
+            "id": "test",
+            "type": "dir",
+            "root_path": "/tmp",
+            "file_read_buffer_size": 131072
+        }))
+        .unwrap();
+
+        assert_eq!(config.file_read_buffer_size, Some(128 * 1024));
+    }
+
     #[tokio::test]
     async fn test_dir_server_file_io_mode_defaults_to_async() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2118,6 +2163,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(server.file_io_mode, DirServerFileIoMode::Async);
+        assert_eq!(server.file_read_buffer_size, DEFAULT_FILE_READ_BUFFER_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_dir_server_file_read_buffer_size_config_selects_value() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config: DirServerConfig = serde_json::from_value(serde_json::json!({
+            "id": "test",
+            "type": "dir",
+            "root_path": temp_dir.path().to_string_lossy(),
+            "file_read_buffer_size": 131072
+        }))
+        .unwrap();
+
+        let server = DirServer::builder()
+            .id(config.id)
+            .root_path(PathBuf::from(config.root_path))
+            .file_read_buffer_size(config.file_read_buffer_size.unwrap())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(server.file_read_buffer_size, 128 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_dir_server_file_read_buffer_size_rejects_zero() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = DirServer::builder()
+            .id("test")
+            .root_path(temp_dir.path().to_path_buf())
+            .file_read_buffer_size(0)
+            .build()
+            .await;
+
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.code(), ServerErrorCode::InvalidConfig);
+        }
     }
 
     #[tokio::test]

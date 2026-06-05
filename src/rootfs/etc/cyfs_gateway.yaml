@@ -251,6 +251,7 @@ stacks:
     #    open_file_cache_valid: "60s"               # revalidate cached stat/error after this duration
     #    open_file_cache_min_uses: 2                # cache only after this many accesses
     #    open_file_cache_errors: true               # cache stat errors such as missing files
+    #    file_read_buffer_size: 65536               # optional stream read buffer size in bytes; default 64K
 
   # dns_example:
   #   type: dns
