@@ -4,7 +4,7 @@ use crate::{
     ServerFactory, ServerResult, StreamInfo,
 };
 use chrono::{DateTime, Local};
-use futures_util::TryStreamExt;
+use futures_util::{Stream, TryStreamExt};
 use http::{StatusCode, Version};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -21,9 +21,12 @@ use std::io::ErrorKind;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio_util::bytes::{BufMut, BytesMut};
 use tokio_util::io::ReaderStream;
 
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -38,7 +41,6 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'{')
     .add(b'}')
     .add(b'/');
-const SMALL_FILE_INLINE_LIMIT: u64 = 32 * 1024;
 const DEFAULT_FILE_READ_BUFFER_SIZE: usize = 64 * 1024;
 
 /// DirServer Builder for fluent configuration
@@ -297,6 +299,74 @@ enum DirReadFile {
     Sync(std::fs::File),
 }
 
+struct SyncFileBodyStream {
+    file: std::fs::File,
+    remaining: u64,
+    buffer_size: usize,
+    buf: BytesMut,
+}
+
+impl SyncFileBodyStream {
+    fn new(file: std::fs::File, content_length: u64, buffer_size: usize) -> Self {
+        Self {
+            file,
+            remaining: content_length,
+            buffer_size,
+            buf: BytesMut::with_capacity(buffer_size),
+        }
+    }
+}
+
+impl Stream for SyncFileBodyStream {
+    type Item = std::io::Result<Frame<Bytes>>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.remaining == 0 {
+            return Poll::Ready(None);
+        }
+
+        let read_len = DirServer::file_stream_buffer_size(self.buffer_size, self.remaining);
+        if self.buf.capacity() == 0 {
+            let buffer_size = self.buffer_size;
+            self.buf.reserve(buffer_size);
+        }
+
+        let read_result = {
+            let this = &mut *self;
+            let spare = this.buf.spare_capacity_mut();
+            let read_len = read_len.min(spare.len());
+            // Read initializes at most `read_len` bytes, which are made visible below.
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), read_len)
+            };
+            std::io::Read::read(&mut this.file, dst)
+        };
+
+        match read_result {
+            Ok(0) => {
+                self.remaining = 0;
+                Poll::Ready(Some(Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "sync file stream ended before expected content length",
+                ))))
+            }
+            Ok(n) => {
+                // `read` reported exactly `n` initialized bytes in the spare capacity.
+                unsafe {
+                    self.buf.advance_mut(n);
+                }
+                self.remaining = self.remaining.saturating_sub(n as u64);
+                let chunk = self.buf.split();
+                Poll::Ready(Some(Ok(Frame::data(chunk.freeze()))))
+            }
+            Err(e) => {
+                self.remaining = 0;
+                Poll::Ready(Some(Err(e)))
+            }
+        }
+    }
+}
+
 impl DirPathStat {
     async fn from_path(path: &Path, file_io_mode: DirServerFileIoMode) -> Self {
         match DirServer::fs_metadata(file_io_mode, path).await {
@@ -449,7 +519,7 @@ pub enum DirServerFileIoMode {
 
 impl Default for DirServerFileIoMode {
     fn default() -> Self {
-        Self::Async
+        Self::Sync
     }
 }
 
@@ -951,6 +1021,11 @@ impl DirServer {
         configured_size.min(content_length).max(1)
     }
 
+    fn should_inline_file_body(&self, content_length: u64) -> bool {
+        let inline_limit = u64::try_from(self.file_read_buffer_size).unwrap_or(u64::MAX);
+        content_length <= inline_limit
+    }
+
     fn empty_body() -> UnsyncBoxBody<Bytes, ServerError> {
         Full::new(Bytes::new())
             .map_err(|e| match e {})
@@ -968,10 +1043,12 @@ impl DirServer {
 
         let mut file = match file {
             DirReadFile::Tokio(file) => file,
-            file @ DirReadFile::Sync(_) => return Self::sync_full_body(file, content_length).await,
+            file @ DirReadFile::Sync(_) => {
+                return self.sync_full_or_stream_body(file, content_length).await;
+            }
         };
 
-        if content_length <= SMALL_FILE_INLINE_LIMIT {
+        if self.should_inline_file_body(content_length) {
             let mut buf = Vec::with_capacity(content_length as usize);
             file.read_to_end(&mut buf).await.map_err(|e| {
                 server_err!(
@@ -1002,31 +1079,36 @@ impl DirServer {
         .boxed_unsync())
     }
 
-    async fn sync_full_body(
+    async fn sync_full_or_stream_body(
+        &self,
         file: DirReadFile,
         content_length: u64,
     ) -> ServerResult<UnsyncBoxBody<Bytes, ServerError>> {
         let DirReadFile::Sync(mut file) = file else {
-            unreachable!("sync_full_body only accepts sync files");
+            unreachable!("sync_full_or_stream_body only accepts sync files");
         };
-        let capacity = usize::try_from(content_length).map_err(|_| {
-            server_err!(
-                ServerErrorCode::IOError,
-                "file content is too large to read synchronously"
-            )
-        })?;
-        let mut buf = Vec::with_capacity(capacity);
-        std::io::Read::read_to_end(&mut file, &mut buf).map_err(|e| {
-            server_err!(
-                ServerErrorCode::IOError,
-                "Failed to read sync file content: {}",
-                e
-            )
-        })?;
 
-        Ok(Full::new(Bytes::from(buf))
-            .map_err(|e| match e {})
-            .boxed_unsync())
+        if self.should_inline_file_body(content_length) {
+            let mut buf = Vec::with_capacity(content_length as usize);
+            std::io::Read::read_to_end(&mut file, &mut buf).map_err(|e| {
+                server_err!(
+                    ServerErrorCode::IOError,
+                    "Failed to read sync file content: {}",
+                    e
+                )
+            })?;
+
+            return Ok(Full::new(Bytes::from(buf))
+                .map_err(|e| match e {})
+                .boxed_unsync());
+        }
+
+        Ok(Self::sync_file_stream_body(
+            file,
+            content_length,
+            Self::file_stream_buffer_size(self.file_read_buffer_size, content_length),
+            "Failed to read sync file stream",
+        ))
     }
 
     async fn range_body(
@@ -1042,13 +1124,25 @@ impl DirServer {
         let mut file = match file {
             DirReadFile::Tokio(file) => file,
             file @ DirReadFile::Sync(_) => {
-                return Self::sync_range_body(file, start, content_length).await;
+                return self.sync_range_body(file, start, content_length).await;
             }
         };
 
         file.seek(SeekFrom::Start(start)).await.map_err(|e| {
             server_err!(ServerErrorCode::IOError, "Failed to seek file range: {}", e)
         })?;
+
+        if self.should_inline_file_body(content_length) {
+            let len = content_length as usize;
+            let mut buf = vec![0u8; len];
+            file.read_exact(&mut buf).await.map_err(|e| {
+                server_err!(ServerErrorCode::IOError, "Failed to read file range: {}", e)
+            })?;
+
+            return Ok(Full::new(Bytes::from(buf))
+                .map_err(|e| match e {})
+                .boxed_unsync());
+        }
 
         let stream = ReaderStream::with_capacity(
             file.take(content_length),
@@ -1063,6 +1157,7 @@ impl DirServer {
     }
 
     async fn sync_range_body(
+        &self,
         file: DirReadFile,
         start: u64,
         content_length: u64,
@@ -1070,27 +1165,45 @@ impl DirServer {
         let DirReadFile::Sync(mut file) = file else {
             unreachable!("sync_range_body only accepts sync files");
         };
-        let len = usize::try_from(content_length).map_err(|_| {
-            server_err!(
-                ServerErrorCode::IOError,
-                "file range is too large to read synchronously"
-            )
-        })?;
         std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(start)).map_err(|e| {
             server_err!(ServerErrorCode::IOError, "Failed to seek sync file range: {}", e)
         })?;
-        let mut buf = vec![0u8; len];
-        std::io::Read::read_exact(&mut file, &mut buf).map_err(|e| {
-            server_err!(
-                ServerErrorCode::IOError,
-                "Failed to read sync file range: {}",
-                e
-            )
-        })?;
 
-        Ok(Full::new(Bytes::from(buf))
-            .map_err(|e| match e {})
-            .boxed_unsync())
+        if self.should_inline_file_body(content_length) {
+            let len = content_length as usize;
+            let mut buf = vec![0u8; len];
+            std::io::Read::read_exact(&mut file, &mut buf).map_err(|e| {
+                server_err!(
+                    ServerErrorCode::IOError,
+                    "Failed to read sync file range: {}",
+                    e
+                )
+            })?;
+
+            return Ok(Full::new(Bytes::from(buf))
+                .map_err(|e| match e {})
+                .boxed_unsync());
+        }
+
+        Ok(Self::sync_file_stream_body(
+            file,
+            content_length,
+            Self::file_stream_buffer_size(self.file_read_buffer_size, content_length),
+            "Failed to read sync file range stream",
+        ))
+    }
+
+    fn sync_file_stream_body(
+        file: std::fs::File,
+        content_length: u64,
+        buffer_size: usize,
+        error_message: &'static str,
+    ) -> UnsyncBoxBody<Bytes, ServerError> {
+        let stream = SyncFileBodyStream::new(file, content_length, buffer_size);
+        BodyExt::map_err(StreamBody::new(stream), move |e| {
+            server_err!(ServerErrorCode::IOError, "{}: {}", error_message, e)
+        })
+        .boxed_unsync()
     }
 
     /// Parse Range header (e.g., "bytes=start-end")
@@ -2236,6 +2349,7 @@ mod tests {
             .id("test")
             .root_path(temp_dir.path().to_path_buf())
             .file_io_mode(DirServerFileIoMode::Sync)
+            .file_read_buffer_size(4)
             .build()
             .await
             .unwrap();
