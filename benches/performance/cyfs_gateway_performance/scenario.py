@@ -57,8 +57,12 @@ def expand_scenarios(plan: BenchmarkPlan) -> list[ScenarioPlan]:
             continue
         for scenario, payloads, stream_modes in scenarios:
             scenario_protocols = protocols
-            if candidate in HYPER_STATIC_CANDIDATES or candidate in REUSEPORT_STATIC_CANDIDATES or candidate in REUSEPORT_DIRSERVER_CANDIDATES:
+            if candidate in HYPER_STATIC_CANDIDATES or candidate in REUSEPORT_STATIC_CANDIDATES:
                 if scenario != "static_http_file":
+                    continue
+                scenario_protocols = [protocol for protocol in scenario_protocols if protocol == "http"]
+            if candidate in REUSEPORT_DIRSERVER_CANDIDATES:
+                if scenario not in {"static_http_file", "http_reverse_proxy"}:
                     continue
                 scenario_protocols = [protocol for protocol in scenario_protocols if protocol == "http"]
             for protocol in scenario_protocols:

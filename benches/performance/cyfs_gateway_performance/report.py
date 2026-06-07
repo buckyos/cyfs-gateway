@@ -17,6 +17,8 @@ _CANDIDATE_ORDER = {
     "cyfs_gateway_hyper": 3,
     "nginx_reuseport_static": 4,
     "cyfs_gateway_reuseport_static": 5,
+    "nginx_reuseport_dirserver": 6,
+    "cyfs_gateway_reuseport_dirserver": 7,
 }
 
 

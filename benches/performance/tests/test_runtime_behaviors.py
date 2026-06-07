@@ -33,6 +33,7 @@ from cyfs_gateway_performance.workload import endpoint_for, run_fixed_rate_workl
 
 
 PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "performance.yaml"
+LOCAL_ROOTFS_PROFILE = Path(__file__).resolve().parents[3] / "src" / "local_rootfs" / "performance.yaml"
 
 
 class RuntimeBehaviorTests(unittest.TestCase):
@@ -130,7 +131,17 @@ class RuntimeBehaviorTests(unittest.TestCase):
             ("127.0.0.1", 18182, False),
         )
         self.assertEqual(
+            endpoint_for(ScenarioPlan("nginx_reuseport_dirserver", "http_reverse_proxy", "http", 1, "/proxy/payload")),
+            ("127.0.0.1", 18182, False),
+        )
+        self.assertEqual(
             endpoint_for(ScenarioPlan("cyfs_gateway_reuseport_dirserver", "static_http_file", "http", 1, "/payload.bin")),
+            ("127.0.0.1", 28182, False),
+        )
+        self.assertEqual(
+            endpoint_for(
+                ScenarioPlan("cyfs_gateway_reuseport_dirserver", "http_reverse_proxy", "http", 1, "/proxy/payload")
+            ),
             ("127.0.0.1", 28182, False),
         )
         self.assertEqual(container_name_for_candidate("nginx_hyper"), "cyfs-perf-nginx")
@@ -326,13 +337,45 @@ class RuntimeBehaviorTests(unittest.TestCase):
                 "cyfs_gateway_hyper",
                 "nginx_reuseport_static",
                 "cyfs_gateway_reuseport_static",
-                "nginx_reuseport_dirserver",
-                "cyfs_gateway_reuseport_dirserver",
             }
         ]
         self.assertTrue(hyper_static)
         self.assertEqual({scenario.scenario for scenario in hyper_static}, {"static_http_file"})
         self.assertEqual({scenario.protocol for scenario in hyper_static}, {"http"})
+        dirserver = [
+            scenario
+            for scenario in scenarios
+            if scenario.candidate in {"nginx_reuseport_dirserver", "cyfs_gateway_reuseport_dirserver"}
+        ]
+        self.assertTrue(dirserver)
+        self.assertEqual({scenario.scenario for scenario in dirserver}, {"static_http_file", "http_reverse_proxy"})
+        self.assertEqual({scenario.protocol for scenario in dirserver}, {"http"})
+        self.assertEqual(
+            {
+                scenario.payload
+                for scenario in dirserver
+                if scenario.scenario == "http_reverse_proxy"
+                and scenario.rate == 100
+                and scenario.connection_reuse == "new_connection"
+            },
+            {"/proxy/payload"},
+        )
+
+    def test_local_rootfs_profile_runs_cyfs_gateway_reuseport_dirserver_reverse_proxy(self) -> None:
+        plan = load_profile(LOCAL_ROOTFS_PROFILE)
+        scenarios = expand_scenarios(plan)
+        dirserver_proxy = [
+            scenario
+            for scenario in scenarios
+            if scenario.candidate == "cyfs_gateway_reuseport_dirserver"
+            and scenario.scenario == "http_reverse_proxy"
+            and scenario.protocol == "http"
+            and scenario.payload == "/proxy/payload"
+            and scenario.rate == 500
+        ]
+
+        self.assertTrue(plan.upstream["reuseport_dirserver_fixture"]["enabled"])
+        self.assertEqual({scenario.connection_reuse for scenario in dirserver_proxy}, {"new_connection", "reuse_connection"})
 
     def test_profile_candidates_filter_scenario_matrix_and_deployment(self) -> None:
         plan = replace(load_profile(PROFILE), candidates=("nginx_hyper",))

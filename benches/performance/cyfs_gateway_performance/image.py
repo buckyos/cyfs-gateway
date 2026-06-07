@@ -1031,11 +1031,18 @@ fn text_response(status: StatusCode, text: &'static str) -> Response<HyperStatic
 '''
 
 
-REUSEPORT_DIRSERVER_MAIN_RS = r'''use cyfs_gateway_lib::{
-    hyper_serve_http1, DirServer, DirServerFileIoMode, StreamInfo,
+REUSEPORT_DIRSERVER_MAIN_RS = r'''use bytes::Bytes;
+use cyfs_gateway_lib::{
+    hyper_serve_http1, DirServer, DirServerFileIoMode, HttpServer, ServerError, ServerErrorCode,
+    ServerResult, StreamInfo,
 };
+use hyper::http::{self, HeaderName};
+use http_body_util::combinators::UnsyncBoxBody;
+use http_body_util::{BodyExt, Full};
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use sfo_reuseport::{
-    Error as ReuseportError, ServerRuntime, ServerRuntimeConfig, SocketOptions, TcpServer,
+    spawn_local, Error as ReuseportError, ServerRuntime, ServerRuntimeConfig, SocketOptions, TcpServer,
     TcpServiceConfig, TransparentMode,
 };
 use std::env;
@@ -1051,8 +1058,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let static_root = PathBuf::from(static_root).canonicalize()?;
     let threads = configured_threads()?;
     let file_io_mode = configured_file_io_mode()?;
+    let proxy_prefix = env::var("REUSEPORT_DIRSERVER_PROXY_PREFIX").unwrap_or_else(|_| "/proxy".to_owned());
+    let proxy_upstream = env::var("REUSEPORT_DIRSERVER_PROXY_UPSTREAM").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
 
-    serve_reuseport_dirserver(addr, static_root, threads, file_io_mode)
+    serve_reuseport_dirserver(addr, static_root, threads, file_io_mode, proxy_prefix, proxy_upstream)
 }
 
 fn listen_addr(port_var: &str, default_addr: &str) -> String {
@@ -1092,6 +1101,8 @@ fn serve_reuseport_dirserver(
     static_root: PathBuf,
     threads: usize,
     file_io_mode: DirServerFileIoMode,
+    proxy_prefix: String,
+    proxy_upstream: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let runtime = ServerRuntime::start(ServerRuntimeConfig::new().with_workers(threads))?;
     let service_config = TcpServiceConfig::new(addr).with_socket_options(SocketOptions {
@@ -1099,7 +1110,7 @@ fn serve_reuseport_dirserver(
         ipv4_transparent: TransparentMode::Disabled,
         ipv6_transparent: TransparentMode::Disabled,
     });
-    let server = build_dir_server(static_root, file_io_mode)?;
+    let server = build_proxy_dir_server(static_root, file_io_mode, proxy_prefix.clone(), proxy_upstream.clone())?;
     let _server = TcpServer::serve(&runtime, service_config, move |stream| {
         let server = server.clone();
         async move {
@@ -1111,7 +1122,7 @@ fn serve_reuseport_dirserver(
     })?;
 
     eprintln!(
-        "reuseport DirServer fixture listening on {addr} with {threads} sfo-reuseport workers and {file_io_mode:?} file IO"
+        "reuseport DirServer fixture listening on {addr} with {threads} sfo-reuseport workers, {file_io_mode:?} file IO, and reverse proxy {proxy_prefix}/ -> {proxy_upstream}"
     );
     loop {
         thread::park();
@@ -1138,6 +1149,179 @@ fn build_dir_server(
             .await
     })?;
     Ok(Arc::new(server))
+}
+
+fn build_proxy_dir_server(
+    static_root: PathBuf,
+    file_io_mode: DirServerFileIoMode,
+    proxy_prefix: String,
+    proxy_upstream: String,
+) -> Result<Arc<dyn HttpServer>, Box<dyn std::error::Error + Send + Sync>> {
+    let dir_server = build_dir_server(static_root, file_io_mode)?;
+    Ok(Arc::new(ReverseProxyDirServer {
+        dir_server,
+        proxy_prefix: normalize_proxy_prefix(proxy_prefix),
+        proxy_upstream,
+    }))
+}
+
+struct ReverseProxyDirServer {
+    dir_server: Arc<DirServer>,
+    proxy_prefix: String,
+    proxy_upstream: String,
+}
+
+#[async_trait::async_trait]
+impl HttpServer for ReverseProxyDirServer {
+    async fn serve_request(
+        &self,
+        req: Request<UnsyncBoxBody<Bytes, ServerError>>,
+        info: StreamInfo,
+    ) -> ServerResult<Response<UnsyncBoxBody<Bytes, ServerError>>> {
+        if path_matches_proxy(req.uri().path(), &self.proxy_prefix) {
+            return Ok(reverse_proxy(req, &self.proxy_upstream).await);
+        }
+        self.dir_server.serve_request(req, info).await
+    }
+
+    fn id(&self) -> String {
+        "perf_reuseport_dirserver_proxy".to_owned()
+    }
+
+    fn http_version(&self) -> hyper::Version {
+        self.dir_server.http_version()
+    }
+
+    fn http3_port(&self) -> Option<u16> {
+        self.dir_server.http3_port()
+    }
+}
+
+fn normalize_proxy_prefix(prefix: String) -> String {
+    let trimmed = prefix.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/proxy".to_owned()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_owned()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn path_matches_proxy(path: &str, prefix: &str) -> bool {
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+async fn reverse_proxy(
+    req: Request<UnsyncBoxBody<Bytes, ServerError>>,
+    upstream: &str,
+) -> Response<UnsyncBoxBody<Bytes, ServerError>> {
+    match reverse_proxy_inner(req, upstream).await {
+        Ok(response) => response,
+        Err(err) => text_response(StatusCode::BAD_GATEWAY, format!("reverse proxy failed: {err}")),
+    }
+}
+
+async fn reverse_proxy_inner(
+    req: Request<UnsyncBoxBody<Bytes, ServerError>>,
+    upstream: &str,
+) -> Result<Response<UnsyncBoxBody<Bytes, ServerError>>, Box<dyn std::error::Error + Send + Sync>> {
+    let (parts, body) = req.into_parts();
+    let body = body
+        .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
+        .boxed_unsync();
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+    let request_url = format!("http://{upstream}{path}");
+    let tcp_stream = tokio::net::TcpStream::connect(upstream).await?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tcp_stream)).await?;
+    spawn_local(async move {
+        if let Err(err) = conn.await {
+            eprintln!("reuseport DirServer reverse proxy upstream connection closed with error: {err}");
+        }
+    })?;
+
+    let mut upstream_req = Request::builder()
+        .method(parts.method)
+        .uri(request_url)
+        .body(body)?;
+    set_minimal_upstream_headers(upstream_req.headers_mut(), &parts.headers, upstream)?;
+
+    let mut response = sender.send_request(upstream_req).await?;
+    strip_hop_by_hop_headers(response.headers_mut());
+    Ok(response.map(|body| {
+        body.map_err(|err| ServerError::new(ServerErrorCode::StreamError, format!("{:?}", err)))
+            .boxed_unsync()
+    }))
+}
+
+fn set_minimal_upstream_headers(
+    upstream_headers: &mut http::HeaderMap,
+    original_headers: &http::HeaderMap,
+    upstream: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    upstream_headers.insert(http::header::HOST, upstream.parse()?);
+    if let Some(value) = original_headers.get(http::header::CONTENT_LENGTH) {
+        upstream_headers.insert(http::header::CONTENT_LENGTH, value.clone());
+    }
+    if let Some(value) = original_headers.get(http::header::CONTENT_TYPE) {
+        upstream_headers.insert(http::header::CONTENT_TYPE, value.clone());
+    }
+    Ok(())
+}
+
+fn strip_hop_by_hop_headers(header: &mut http::HeaderMap) {
+    let mut connection_tokens = Vec::new();
+    for value in header.get_all(http::header::CONNECTION).iter() {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+                connection_tokens.push(name);
+            }
+        }
+    }
+
+    for name in connection_tokens {
+        header.remove(name);
+    }
+
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        header.remove(name);
+    }
+}
+
+fn text_response(status: StatusCode, body: impl Into<Bytes>) -> Response<UnsyncBoxBody<Bytes, ServerError>> {
+    let body = body.into();
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain")
+        .header("Content-Length", body.len().to_string())
+        .body(full_body(body))
+        .expect("build text response")
+}
+
+fn full_body(body: impl Into<Bytes>) -> UnsyncBoxBody<Bytes, ServerError> {
+    Full::new(body.into())
+        .map_err(|never| match never {})
+        .boxed_unsync()
 }
 '''
 
@@ -1547,9 +1731,14 @@ edition = "2021"
 [workspace]
 
 [dependencies]
+async-trait = "0.1"
+bytes = "1"
 cyfs-gateway-lib = {{ path = "{lib_path}" }}
+http-body-util = "0.1"
+hyper = {{ version = "1", features = ["http1"] }}
+hyper-util = {{ version = "0.1", features = ["tokio"] }}
 sfo-reuseport = {{ version = "0.2.5", features = ["quinn"] }}
-tokio = {{ version = "1", features = ["rt"] }}
+tokio = {{ version = "1", features = ["io-util", "net", "rt"] }}
 {release_profile}
 """
 
@@ -1764,6 +1953,7 @@ def write_image_context(plan: BenchmarkPlan, image_key: str, output: Path) -> di
     dirserver_threads = reuseport_dirserver_threads(plan)
     dirserver_file_io_mode = reuseport_dirserver_file_io_mode(plan)
     reuseport_runtime = reuseport_static_runtime(plan)
+    proxy_prefix = _reverse_proxy_prefix(plan)
     candidate_env = dockerfile_env_lines(plan, image_key)
     hyper_static_thread_env = f"ENV REUSEPORT_STATIC_THREADS={hyper_static_threads}\n" if hyper_static_threads else ""
     dirserver_thread_env = f"ENV REUSEPORT_DIRSERVER_THREADS={dirserver_threads}\n" if dirserver_threads else ""
@@ -1786,6 +1976,8 @@ def write_image_context(plan: BenchmarkPlan, image_key: str, output: Path) -> di
         + f"ENV REUSEPORT_DIRSERVER_PORT={reuseport_dirserver_port}\n"
         + f"ENV REUSEPORT_DIRSERVER_ENABLED={1 if reuseport_dirserver_is_enabled else 0}\n"
         + f"ENV REUSEPORT_DIRSERVER_FILE_IO_MODE={dirserver_file_io_mode}\n"
+        + f"ENV REUSEPORT_DIRSERVER_PROXY_PREFIX={proxy_prefix}\n"
+        + f"ENV REUSEPORT_DIRSERVER_PROXY_UPSTREAM=127.0.0.1:{http_port}\n"
         + dirserver_thread_env
         + "ENV STATIC_ROOT=/etc/cyfs-perf/static\n"
         + f"EXPOSE 80 443 9080 9443 {http_port} {stream_port} {hyper_static_port} {reuseport_static_port} {reuseport_dirserver_port}\n"
