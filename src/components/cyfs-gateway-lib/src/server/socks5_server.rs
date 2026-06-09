@@ -7,7 +7,7 @@ pub struct Socks5Server {
     hook_point: Arc<HookPoint>,
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl StreamServer for Socks5Server {
     async fn serve_connection(
         &self,

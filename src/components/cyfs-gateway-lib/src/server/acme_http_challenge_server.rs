@@ -31,7 +31,7 @@ impl AcmeHttpChallengeServer {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl HttpServer for AcmeHttpChallengeServer {
     async fn serve_request(
         &self,

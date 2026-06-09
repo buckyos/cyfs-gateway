@@ -190,7 +190,10 @@ async fn run_gateway_with_config(
     debug!("Register rtcp stack factory");
     factory.register_stack_factory(
         StackProtocol::Extension("tun".to_string()),
-        Arc::new(TunStackFactory::new(connect_manager.clone())),
+        Arc::new(TunStackFactory::new(
+            connect_manager.clone(),
+            tcp_server_runtime.clone(),
+        )),
     );
     debug!("Register tun stack context factory");
     factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new()));

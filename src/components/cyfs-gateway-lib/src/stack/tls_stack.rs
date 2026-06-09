@@ -1734,7 +1734,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl StreamServer for MockServer {
         async fn serve_connection(
             &self,

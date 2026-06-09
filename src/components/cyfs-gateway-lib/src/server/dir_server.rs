@@ -1606,7 +1606,7 @@ struct DirectoryListingEntry {
     size: String,
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl HttpServer for DirServer {
     async fn serve_request(
         &self,
@@ -2061,7 +2061,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_serve_existing_file() {
         // Create a temporary directory
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2083,7 +2083,7 @@ mod tests {
 
         let (client, server_stream) = tokio::io::duplex(1024);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -2111,7 +2111,7 @@ mod tests {
         assert_eq!(body_bytes.as_ref(), b"Hello, World!");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_serve_non_existent_file() {
         let temp_dir = tempfile::tempdir().unwrap();
 
@@ -2126,7 +2126,7 @@ mod tests {
 
         let (client, server_stream) = tokio::io::duplex(1024);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -2773,7 +2773,7 @@ mod tests {
         assert!(cache.stat_cache.get(&missing_path).is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_dir_prefers_index_file_before_autoindex_listing() {
         let temp_dir = tempfile::tempdir().unwrap();
         tokio::fs::write(temp_dir.path().join("index.html"), b"index-body")
@@ -2795,7 +2795,7 @@ mod tests {
 
         let (client, server_stream) = tokio::io::duplex(1024);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -2822,7 +2822,7 @@ mod tests {
         assert_eq!(body_bytes.as_ref(), b"index-body");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_dir_returns_listing_when_index_missing_and_autoindex_enabled() {
         let temp_dir = tempfile::tempdir().unwrap();
         tokio::fs::write(temp_dir.path().join("visible.txt"), b"visible")
@@ -2844,7 +2844,7 @@ mod tests {
 
         let (client, server_stream) = tokio::io::duplex(4096);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -2880,7 +2880,7 @@ mod tests {
         assert!(body.contains("Index of /"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_if_none_match_returns_not_modified() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("etag.txt");
@@ -2896,7 +2896,7 @@ mod tests {
         );
 
         let (client, server_stream) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -2938,7 +2938,7 @@ mod tests {
         assert_eq!(second_resp.status(), StatusCode::NOT_MODIFIED);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_if_modified_since_exact_returns_not_modified() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("ims.txt");
@@ -2959,7 +2959,7 @@ mod tests {
         );
 
         let (client, server_stream) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -2985,7 +2985,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_if_none_match_precedence_over_if_modified_since() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("precedence.txt");
@@ -3008,7 +3008,7 @@ mod tests {
         );
 
         let (client, server_stream) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -3035,7 +3035,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_response_contains_etag_and_last_modified() {
         let temp_dir = tempfile::tempdir().unwrap();
         let file_path = temp_dir.path().join("headers.txt");
@@ -3051,7 +3051,7 @@ mod tests {
         );
 
         let (client, server_stream) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http1(Box::new(server_stream), server, StreamInfo::default())
                 .await
                 .unwrap();

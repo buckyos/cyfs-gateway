@@ -816,7 +816,7 @@ impl Listener {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl RTcpListener for Listener {
     async fn on_new_tunnel(
         &self,
@@ -900,7 +900,7 @@ impl RTcpListener for Listener {
         let stat_stream = Box::new(StatStream::new_with_tracker(stream, stat.clone()));
 
         let speed = stat_stream.get_speed_stat();
-        let handle = tokio::spawn(async move {
+        let handle = tokio::task::spawn_local(async move {
             if let Err(e) = handler_snapshot
                 .handle_stream(
                     stat_stream,
@@ -997,7 +997,7 @@ impl RTcpListener for Listener {
         let stat_stream = Box::new(StatStream::new_with_tracker(stream, stat.clone()));
 
         let speed = stat_stream.get_speed_stat();
-        let handle = tokio::spawn(async move {
+        let handle = tokio::task::spawn_local(async move {
             if let Err(e) = handler_snapshot
                 .handle_datagram(
                     stat_stream,
@@ -2003,7 +2003,7 @@ mod tests {
         assert!(accepted.is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_stack_reject() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -2142,7 +2142,7 @@ mod tests {
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_stack_drop() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -2275,7 +2275,7 @@ mod tests {
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_stack_forward() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -2421,7 +2421,7 @@ mod tests {
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_stack_forward_err() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -2561,7 +2561,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl StreamServer for MockServer {
         async fn serve_connection(
             &self,
@@ -2581,7 +2581,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_stack_server() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -2722,7 +2722,7 @@ mod tests {
         assert_eq!(&buf, b"recv");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_io_dump_raw_single_roundtrip() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (s1, k1) = generate_ed25519_key();
@@ -2847,7 +2847,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_io_dump_raw_flush_on_upload_limit() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (s1, k1) = generate_ed25519_key();
@@ -2975,7 +2975,7 @@ mod tests {
         id: String,
     }
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl StreamServer for MockHttpKeepAliveServer {
         async fn serve_connection(
             &self,
@@ -3012,7 +3012,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_io_dump_http_multi_requests_same_connection() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (s1, k1) = generate_ed25519_key();
@@ -3149,7 +3149,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_io_dump_http_flush_on_upload_limit() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (s1, k1) = generate_ed25519_key();
@@ -3274,7 +3274,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rudp_stack_reject() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -3406,7 +3406,7 @@ mod tests {
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_udp_stack_drop() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -3538,7 +3538,7 @@ mod tests {
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_udp_stack_forward() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -3684,7 +3684,7 @@ mod tests {
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rudp_stack_forward_err() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -3817,7 +3817,7 @@ mod tests {
         assert!(ret.is_err() || ret.unwrap().is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_stack_stat_server() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -3965,7 +3965,7 @@ mod tests {
         assert_eq!(test_stat.get_write_sum_size(), 4);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_stack_stat_limiter_server() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -4117,7 +4117,7 @@ mod tests {
         assert!(start.elapsed().as_millis() < 2500);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_stack_stat_group_limiter_server() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -4276,7 +4276,7 @@ mod tests {
         assert!(start.elapsed().as_millis() < 2500);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_stack_stat_group_limiter_server2() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -4445,7 +4445,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl crate::server::DatagramServer for MockDatagramServer {
         async fn serve_datagram(&self, buf: &[u8], _info: DatagramInfo) -> ServerResult<Vec<u8>> {
             assert_eq!(buf, b"test_server");
@@ -4457,7 +4457,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rudp_stack_server() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -4593,7 +4593,7 @@ mod tests {
         assert_eq!(&buf, b"datagram");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rudp_stack_stat_server() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -4752,7 +4752,7 @@ mod tests {
         assert_eq!(&buf, b"datagram");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rudp_stack_stat_limiter_server() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -4903,7 +4903,7 @@ mod tests {
         assert!(start.elapsed().as_millis() < 5200);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rudp_stack_stat_group_limiter_server() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -5061,7 +5061,7 @@ mod tests {
         assert!(start.elapsed().as_millis() < 5000);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rudp_stack_stat_group_limiter_server2() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();

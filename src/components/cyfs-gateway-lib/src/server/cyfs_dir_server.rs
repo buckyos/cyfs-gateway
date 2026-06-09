@@ -332,7 +332,7 @@ impl CyfsDirServer {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl HttpServer for CyfsDirServer {
     async fn serve_request(
         &self,

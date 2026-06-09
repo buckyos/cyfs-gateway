@@ -6,11 +6,11 @@ use cyfs_process_chain::{
 use ipstack::{IpStackStream, IpStackTcpStream, IpStackUdpStream};
 use serde::{Deserialize, Serialize};
 use sfo_io::{LimitDatagramRecv, LimitDatagramSend, LimitStream, StatStream};
+use sfo_reuseport::TaskHandle;
 use std::io::Error;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::task::JoinHandle;
 
 pub const DEFAULT_MTU: u16 = 1500;
 
@@ -553,13 +553,13 @@ impl<R: sfo_io::DatagramRecv<Error = Error>, S: sfo_io::DatagramSend<Error = Err
 
 pub struct TunStack {
     inner: Arc<TunStackInner>,
-    handle: Mutex<Option<JoinHandle<()>>>,
+    handle: Mutex<Option<TaskHandle>>,
 }
 
 impl Drop for TunStack {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.lock().unwrap().take() {
-            handle.abort();
+            handle.cancel();
         }
     }
 }
@@ -682,6 +682,7 @@ struct TunStackInner {
     handler: Arc<RwLock<Arc<TunConnectionHandler>>>,
     prepare_handler: Arc<RwLock<Option<Arc<TunConnectionHandler>>>>,
     connection_manager: Option<ConnectionManagerRef>,
+    server_runtime: ReuseportServerRuntime,
 }
 
 impl TunStackInner {
@@ -710,6 +711,12 @@ impl TunStackInner {
                 "stack_context is required"
             ));
         }
+        if builder.server_runtime.is_none() {
+            return Err(stack_err!(
+                StackErrorCode::InvalidConfig,
+                "server_runtime is required"
+            ));
+        }
 
         let env = builder.stack_context.unwrap();
         let handler = TunConnectionHandler::create(
@@ -731,10 +738,11 @@ impl TunStackInner {
             handler: Arc::new(RwLock::new(Arc::new(handler))),
             prepare_handler: Arc::new(Default::default()),
             connection_manager: builder.connection_manager,
+            server_runtime: builder.server_runtime.unwrap(),
         })
     }
 
-    async fn start(self: &Arc<Self>) -> StackResult<JoinHandle<()>> {
+    async fn start(self: &Arc<Self>) -> StackResult<TaskHandle> {
         let mut config = tun::Configuration::default();
         config.address(self.ip).netmask(self.mask);
 
@@ -784,7 +792,7 @@ impl TunStackInner {
 
         let this = self.clone();
         let mut ip_stack = ipstack::IpStack::new(ipstack_config, dev);
-        let handle = tokio::spawn(async move {
+        let handle = self.server_runtime.spawn_task(move || async move {
             loop {
                 match ip_stack.accept().await {
                     Ok(stream) => match stream {
@@ -799,7 +807,7 @@ impl TunStackInner {
                                 let handler = this.handler.read().unwrap();
                                 handler.clone()
                             };
-                            let handle = tokio::spawn(async move {
+                            let handle = tokio::task::spawn_local(async move {
                                 if let Err(e) = handler_snapshot
                                     .handle_tcp_stream(stat_stream, compose_stat)
                                     .await
@@ -830,7 +838,7 @@ impl TunStackInner {
                                 let handler = this.handler.read().unwrap();
                                 handler.clone()
                             };
-                            let handle = tokio::spawn(async move {
+                            let handle = tokio::task::spawn_local(async move {
                                 if let Err(e) = handler_snapshot
                                     .handle_udp_stream(stat_stream, compose_stat)
                                     .await
@@ -870,7 +878,10 @@ impl TunStackInner {
                     }
                 }
             }
-        });
+        }).map_err(into_stack_err!(
+            StackErrorCode::ServerError,
+            "spawn tun stack receive loop failed"
+        ))?;
         Ok(handle)
     }
 }
@@ -886,6 +897,7 @@ pub struct TunStackBuilder {
     connect_timeout: std::time::Duration,
     hook_point: Option<ProcessChainConfigs>,
     connection_manager: Option<ConnectionManagerRef>,
+    server_runtime: Option<ReuseportServerRuntime>,
     stack_context: Option<Arc<TunStackContext>>,
     io_dump: Option<IoDumpStackConfig>,
 }
@@ -903,6 +915,7 @@ impl TunStackBuilder {
             connect_timeout: connect_timeout_from_secs(None),
             hook_point: None,
             connection_manager: None,
+            server_runtime: None,
             stack_context: None,
             io_dump: None,
         }
@@ -955,6 +968,11 @@ impl TunStackBuilder {
 
     pub fn connection_manager(mut self, connection_manager: ConnectionManagerRef) -> Self {
         self.connection_manager = Some(connection_manager);
+        self
+    }
+
+    pub fn server_runtime(mut self, server_runtime: ReuseportServerRuntime) -> Self {
+        self.server_runtime = Some(server_runtime);
         self
     }
 
@@ -1018,11 +1036,18 @@ impl StackConfig for TunStackConfig {
 
 pub struct TunStackFactory {
     connection_manager: ConnectionManagerRef,
+    server_runtime: ReuseportServerRuntime,
 }
 
 impl TunStackFactory {
-    pub fn new(connection_manager: ConnectionManagerRef) -> Self {
-        TunStackFactory { connection_manager }
+    pub fn new(
+        connection_manager: ConnectionManagerRef,
+        server_runtime: ReuseportServerRuntime,
+    ) -> Self {
+        TunStackFactory {
+            connection_manager,
+            server_runtime,
+        }
     }
 }
 
@@ -1072,6 +1097,7 @@ impl StackFactory for TunStackFactory {
             .connect_timeout(connect_timeout_from_secs(config.connect_timeout))
             .hook_point(config.hook_point.clone())
             .connection_manager(self.connection_manager.clone())
+            .server_runtime(self.server_runtime.clone())
             .stack_context(stack_context.clone())
             .io_dump(io_dump)
             .build()

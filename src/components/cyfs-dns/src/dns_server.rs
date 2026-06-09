@@ -876,7 +876,7 @@ impl ProcessChainDnsServer {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl cyfs_gateway_lib::server::DatagramServer for ProcessChainDnsServer {
     async fn serve_datagram(&self, buf: &[u8], info: DatagramInfo) -> ServerResult<Vec<u8>> {
         let response = self.handle(buf, info.src_addr, info.dst_addr).await?;

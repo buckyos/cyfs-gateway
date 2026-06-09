@@ -73,7 +73,7 @@ mini-moka = "0.10"
 callback-trait = "0.1"
 reqwest.workspace = true
 sfo-ip = "0.1"
-sfo-reuseport = {version = "0.2.5", features = ["quinn"]}
+sfo-reuseport = {version = "0.3", features = ["quinn"]}
 
 buckyos-kit.workspace = true
 kRPC.workspace = true

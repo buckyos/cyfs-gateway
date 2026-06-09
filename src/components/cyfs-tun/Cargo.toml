@@ -14,5 +14,6 @@ serde_json.workspace = true
 cyfs-process-chain = { path = "../cyfs-process-chain" }
 log.workspace = true
 sfo-io = "0.1"
+sfo-reuseport = { version = "0.3", features = ["quinn"] }
 shlex.workspace = true
 buckyos-kit.workspace = true

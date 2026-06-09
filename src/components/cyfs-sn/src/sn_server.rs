@@ -3504,7 +3504,7 @@ impl SNServer {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl HttpServer for SNServer {
     fn id(&self) -> String {
         self.id.clone()

@@ -698,7 +698,7 @@ impl UdpDatagramHandler {
                                         let src_addr_copy = src_addr;
                                         let dest_addr_copy = dest_addr;
                                         let datagram_server = datagram_server.clone();
-                                        let handle = tokio::spawn(async move {
+                                        let handle = tokio::task::spawn_local(async move {
                                             let mut buffer = vec![0u8; 1024 * 4];
                                             loop {
                                                 match receive_datagram.recv_from(&mut buffer).await
@@ -2277,7 +2277,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl DatagramServer for MockServer {
         async fn serve_datagram(&self, buf: &[u8], _info: DatagramInfo) -> ServerResult<Vec<u8>> {
             assert_eq!(buf, b"test_server");

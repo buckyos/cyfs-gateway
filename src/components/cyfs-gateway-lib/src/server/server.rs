@@ -13,7 +13,9 @@ use http::{HeaderName, Method, Response, StatusCode, Uri};
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper::rt::Executor;
+use hyper_util::rt::TokioIo;
+use std::future::Future;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
@@ -21,6 +23,19 @@ use std::str::FromStr;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex, RwLock as StdRwLock, Weak};
 use tokio::net::{TcpListener, TcpStream};
+
+#[derive(Clone, Copy, Debug)]
+struct LocalExecutor;
+
+impl<Fut> Executor<Fut> for LocalExecutor
+where
+    Fut: Future + 'static,
+    Fut::Output: 'static,
+{
+    fn execute(&self, fut: Fut) {
+        tokio::task::spawn_local(fut);
+    }
+}
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ServerErrorCode {
@@ -106,7 +121,7 @@ impl StreamInfo {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 pub trait HttpServer: Send + Sync + 'static {
     async fn serve_request(
         &self,
@@ -249,7 +264,7 @@ async fn serve_auto_http(
     info: StreamInfo,
     add_http3_alt_svc: bool,
 ) -> ServerResult<()> {
-    hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+    hyper_util::server::conn::auto::Builder::new(LocalExecutor)
         .serve_connection(
             TokioIo::new(stream),
             hyper::service::service_fn(|req| {
@@ -429,7 +444,7 @@ impl Router {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl HttpServer for Router {
     async fn serve_request(
         &self,
@@ -540,7 +555,7 @@ impl Runner {
     }
 
     pub fn start(self) -> ServerResult<()> {
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             let _ = self.run().await;
         });
         Ok(())
@@ -564,7 +579,7 @@ impl Runner {
             };
 
             let server = Arc::new(self.router.clone());
-            tokio::spawn(async move {
+            tokio::task::spawn_local(async move {
                 if let Err(err) = serve_tcp_stream(stream, server, peer_addr).await {
                     error!("failed to serve {}: {:?}", peer_addr, err);
                 }
@@ -615,7 +630,6 @@ pub trait ServerContext: AsAny + Send + Sync {
 pub type ServerContextRef = Arc<dyn ServerContext>;
 
 #[async_trait::async_trait]
-#[callback_trait::callback_trait]
 pub trait ServerFactory: Send + Sync {
     async fn create(
         &self,
@@ -730,7 +744,7 @@ pub struct HttpRequestProcessChainVars {
 }
 
 // 流处理服务
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 pub trait StreamServer: Send + Sync {
     async fn serve_connection(
         &self,
@@ -1397,7 +1411,7 @@ impl DatagramInfo {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 pub trait DatagramServer: Send + Sync + 'static {
     async fn serve_datagram(&self, buf: &[u8], info: DatagramInfo) -> ServerResult<Vec<u8>>;
     fn id(&self) -> String;

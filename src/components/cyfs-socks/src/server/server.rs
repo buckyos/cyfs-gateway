@@ -20,7 +20,7 @@ impl SocksServer {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl StreamServer for SocksServer {
     async fn serve_connection(
         &self,

@@ -175,7 +175,7 @@ struct CmdResp<R: Serialize> {
     result: Option<R>,
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl HttpServer for GatewayControlServer {
     fn id(&self) -> String {
         self.config.id.clone()

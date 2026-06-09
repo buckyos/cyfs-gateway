@@ -81,7 +81,7 @@ impl WelcomeServer {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl HttpServer for WelcomeServer {
     async fn serve_request(
         &self,

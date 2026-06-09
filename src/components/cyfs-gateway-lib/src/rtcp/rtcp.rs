@@ -1075,7 +1075,7 @@ impl RTcpInner {
                 debug!("RTcp stack accept new tcp stream from {}", addr.clone());
 
                 let this = this.clone();
-                task::spawn(async move {
+                task::spawn_local(async move {
                     this.serve_connection(stream, addr).await;
                 });
             }
@@ -1543,7 +1543,7 @@ impl RTcpInner {
 
             let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
             let tunnel_map = self.tunnel_map.clone();
-            task::spawn(async move {
+            task::spawn_local(async move {
                 debug!(
                     "RTcp tunnel {} established (bootstrap), tunnel running",
                     tunnel_key.as_str()
@@ -1642,7 +1642,7 @@ impl RTcpInner {
                     );
                     let result: TunnelResult<Box<dyn TunnelBox>> = Ok(Box::new(tunnel.clone()));
                     let tunnel_map = self.tunnel_map.clone();
-                    task::spawn(async move {
+                    task::spawn_local(async move {
                         debug!(
                             "RTcp tunnel {} established, tunnel running",
                             tunnel_key.as_str()
@@ -2650,7 +2650,7 @@ impl RTcpTunnel {
         // arriving HelloStream does not stall the tunnel read loop. The
         // permit is dropped when the task exits, releasing the quota slot.
         let this = self.clone();
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             let _permit = permit;
             if let Err(e) = this.finish_open(open_package, real_key).await {
                 error!("RTcp on_open background task error: {}", e);
@@ -3202,7 +3202,7 @@ impl RTcpTunnel {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 pub trait RTcpListener: 'static + Send + Sync {
     async fn on_new_tunnel(
         &self,
@@ -3413,6 +3413,14 @@ mod tests {
         }
     }
 
+    fn available_tcp_port_pair() -> (u16, u16) {
+        let listener1 = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listener2 = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port1 = listener1.local_addr().unwrap().port();
+        let port2 = listener2.local_addr().unwrap().port();
+        (port1, port2)
+    }
+
     struct RelayRTcpListener {
         routes: HashMap<String, SocketAddr>,
     }
@@ -3437,7 +3445,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl RTcpListener for MockRTcpListener {
         async fn on_new_stream(
             &self,
@@ -3494,7 +3502,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl RTcpListener for RelayRTcpListener {
         async fn on_new_stream(
             &self,
@@ -3640,7 +3648,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_ping() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -3715,7 +3723,7 @@ mod tests {
     // verifies the prober returns a measured RTT via the new ping_rtt
     // path. Then re-probes and asserts the second call hits the existing
     // tunnel (source = ExistingTunnel).
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_probe_url_measures_rtt_and_reuses_tunnel() {
         use crate::tunnel_url_status::TunnelProbeOptions;
 
@@ -3883,7 +3891,7 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_stream() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
@@ -3975,7 +3983,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_nested_remote_rebinds_transport_via_rtcp_relay() {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let port_a = 19173;
@@ -4145,9 +4153,10 @@ mod tests {
         assert_ne!(id_b, id_c);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_rtcp_datagram() {
         let _ = init_name_lib_for_test(&HashMap::new()).await.unwrap();
+        let (port1, port2) = available_tcp_port_pair();
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
         let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
@@ -4169,7 +4178,7 @@ mod tests {
 
         let mut rtcp1 = RTcp::new(
             device_config.id,
-            "127.0.0.1:19043".to_string(),
+            format!("127.0.0.1:{}", port1),
             Some(pkcs8_bytes),
             None,
             Arc::new(MockRTcpListener::new()),
@@ -4197,7 +4206,7 @@ mod tests {
 
         let mut rtcp2 = RTcp::new(
             device_config.id,
-            "127.0.0.1:19044".to_string(),
+            format!("127.0.0.1:{}", port2),
             Some(pkcs8_bytes),
             None,
             Arc::new(MockRTcpListener::new()),
@@ -4207,7 +4216,7 @@ mod tests {
 
         {
             let tunnel = rtcp1
-                .create_tunnel(Some(format!("{}:19044", id2.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:{}", id2.to_host_name(), port2).as_str()))
                 .await
                 .unwrap();
             let stream = tunnel
@@ -4227,7 +4236,7 @@ mod tests {
 
         {
             let tunnel = rtcp2
-                .create_tunnel(Some(format!("{}:19043", id1.to_host_name()).as_str()))
+                .create_tunnel(Some(format!("{}:{}", id1.to_host_name(), port1).as_str()))
                 .await
                 .unwrap();
             let stream = tunnel

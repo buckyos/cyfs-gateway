@@ -1862,7 +1862,7 @@ impl ProcessChainHttpServer {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl HttpServer for ProcessChainHttpServer {
     async fn serve_request(
         &self,
@@ -2540,7 +2540,7 @@ mod tests {
         content_encoding: Option<&'static str>,
     }
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl HttpServer for FixedResponseServer {
         async fn serve_request(
             &self,
@@ -2585,7 +2585,7 @@ mod tests {
         id: String,
     }
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl HttpServer for EchoBodyServer {
         async fn serve_request(
             &self,
@@ -3425,7 +3425,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_handle_http1_request_http1_server() {
         let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
@@ -3453,7 +3453,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http1(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -3477,7 +3477,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_post_hook_point_adds_header() {
         let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
@@ -3515,7 +3515,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http1(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -3539,7 +3539,7 @@ mod tests {
         assert_eq!(resp.headers().get("x-test").unwrap(), "1");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_handle_http1_request_http2_server() {
         let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
@@ -3567,7 +3567,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -3591,7 +3591,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_handle_http2_request_http2_server() {
         let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
@@ -3619,7 +3619,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -3644,7 +3644,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_handle_http2_request_http1_server() {
         let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
@@ -3672,7 +3672,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             let ret = hyper_serve_http(Box::new(server), http_server, StreamInfo::default()).await;
             assert!(ret.is_err());
         });
@@ -3696,7 +3696,7 @@ mod tests {
         assert!(resp.is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_process_chain_http_server_forward() {
         // 鍒涘缓涓�涓洃鍚�8090绔彛鐨凥TTP鏈嶅姟鍣ㄦ潵澶勭悊璇锋眰
         tokio::spawn(async move {
@@ -3784,7 +3784,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http(
                 Box::new(server),
                 http_server,
@@ -3830,7 +3830,7 @@ mod tests {
         assert_eq!(body, Bytes::from("forward success"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_process_chain_http_server_forward_tcp() {
         tokio::spawn(async move {
             use http_body_util::BodyExt;
@@ -3894,7 +3894,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -3922,7 +3922,7 @@ mod tests {
         assert_eq!(body, Bytes::from("forward success"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_process_chain_http_server_uses_forward_plan_from_process_chain() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::net::TcpListener;
@@ -3995,7 +3995,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -4024,7 +4024,7 @@ mod tests {
         assert_eq!(hit_count.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_process_chain_http_server_forward_err() {
         init_logging("test", false);
         let mock_server_mgr = Arc::new(ServerManager::new());
@@ -4053,7 +4053,7 @@ mod tests {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -4465,7 +4465,7 @@ function slow_post(context) {
         assert!(msg.contains("127.0.0.1:9"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_process_chain_http_server_redirect_default_status() {
         let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
@@ -4493,7 +4493,7 @@ function slow_post(context) {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -4524,7 +4524,7 @@ function slow_post(context) {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_process_chain_http_server_redirect_custom_status() {
         let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
@@ -4552,7 +4552,7 @@ function slow_post(context) {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -4583,7 +4583,7 @@ function slow_post(context) {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_process_chain_http_server_redirect_invalid_status() {
         let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
@@ -4611,7 +4611,7 @@ function slow_post(context) {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -4636,7 +4636,7 @@ function slow_post(context) {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_process_chain_http_server_error_status() {
         let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
@@ -4664,7 +4664,7 @@ function slow_post(context) {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -4689,7 +4689,7 @@ function slow_post(context) {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_process_chain_http_server_error_with_message() {
         let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
@@ -4717,7 +4717,7 @@ function slow_post(context) {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();
@@ -4744,7 +4744,7 @@ function slow_post(context) {
         assert_eq!(body, Bytes::from("upstream unavailable"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_process_chain_http_server_error_invalid_status() {
         let mock_server_mgr = Arc::new(ServerManager::new());
         let chains = r#"
@@ -4772,7 +4772,7 @@ function slow_post(context) {
 
         let (client, server) = tokio::io::duplex(128);
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
                 .await
                 .unwrap();

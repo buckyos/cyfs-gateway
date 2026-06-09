@@ -754,7 +754,7 @@ impl QuicConnectionHandler {
                                                 Ok(permit) => permit,
                                                 Err(_) => break,
                                             };
-                                            let handle = tokio::spawn(async move {
+                                            let handle = tokio::task::spawn_local(async move {
                                                 let _permit = permit;
                                                 let ret: StackResult<()> = async move {
                                                     let (req, stream) = resolver.unwrap().resolve_request().await
@@ -899,7 +899,7 @@ impl QuicConnectionHandler {
                                             Box::new(stat_stream)
                                         };
                                         let device_info = device_info.clone();
-                                        let handle = tokio::spawn(async move {
+                                        let handle = tokio::task::spawn_local(async move {
                                             let _permit = permit;
                                             let info = StreamInfo::with_addrs(
                                                 Some(remote_addr.to_string()),
@@ -1753,7 +1753,7 @@ impl QuicStackInner {
                         continue;
                     }
                     let this = self.clone();
-                    tokio::spawn(async move {
+                    tokio::task::spawn_local(async move {
                         if let Err(e) = this.accept(conn).await {
                             log::error!("quic accept error: {}", e);
                         }
@@ -2614,7 +2614,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl StreamServer for MockServer {
         async fn serve_connection(
             &self,
@@ -3135,7 +3135,7 @@ mod tests {
         id: String,
     }
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl StreamServer for MockHttpKeepAliveServer {
         async fn serve_connection(
             &self,
