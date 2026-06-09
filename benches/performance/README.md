@@ -63,27 +63,27 @@ profile with refs that the build host can push and the target host can pull.
 
 ## Running
 
-From the repository root, use the local wrapper:
+From the repository root, run the package through uv:
 
 ```bash
-python3 benches/performance/perf_compare.py build-image \
+uv run --project benches/performance cyfs-gateway-performance build-image \
   --profile benches/performance/profiles/performance.yaml
 ```
 
 Build only one candidate image:
 
 ```bash
-python3 benches/performance/perf_compare.py build-nginx-image \
+uv run --project benches/performance cyfs-gateway-performance build-nginx-image \
   --profile benches/performance/profiles/performance.yaml
 
-python3 benches/performance/perf_compare.py build-cyfs-gateway-image \
+uv run --project benches/performance cyfs-gateway-performance build-cyfs-gateway-image \
   --profile benches/performance/profiles/performance.yaml
 ```
 
 Push an already-built image ref:
 
 ```bash
-python3 benches/performance/perf_compare.py push-image \
+uv run --project benches/performance cyfs-gateway-performance push-image \
   --profile benches/performance/profiles/performance.yaml \
   --image nginx
 ```
@@ -91,23 +91,16 @@ python3 benches/performance/perf_compare.py push-image \
 Run the benchmark:
 
 ```bash
-python3 benches/performance/perf_compare.py run \
+uv run --project benches/performance cyfs-gateway-performance run \
   --profile benches/performance/profiles/performance.yaml
 ```
 
 Regenerate reports from an existing result:
 
 ```bash
-python3 benches/performance/perf_compare.py report \
+uv run --project benches/performance cyfs-gateway-performance report \
   --profile benches/performance/profiles/performance.yaml \
   --input benches/performance/results/latest/result.json
-```
-
-After editable installation, the package entrypoint can also be used:
-
-```bash
-cyfs-gateway-performance run \
-  --profile benches/performance/profiles/performance.yaml
 ```
 
 ## Outputs
@@ -131,14 +124,14 @@ environment cannot complete a real run.
 Run unit coverage through the harness entrypoint:
 
 ```bash
-python3 ./harness/scripts/test-run.py performance-test unit
+uv run python3 ./harness/scripts/test-run.py performance-test unit
 ```
 
 Run the local Docker DV path when the host has the required Ubuntu/Debian, Docker,
 cargo, registry, and port environment:
 
 ```bash
-python3 ./harness/scripts/test-run.py performance-test dv
+uv run python3 ./harness/scripts/test-run.py performance-test dv
 ```
 
 SSH remote benchmark validation is manual because credentials, Docker

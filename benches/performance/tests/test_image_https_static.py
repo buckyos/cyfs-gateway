@@ -127,6 +127,9 @@ class ImageHttpsStaticTests(unittest.TestCase):
         self.assertIn("strip_hop_by_hop_headers(response.headers_mut())", REUSEPORT_DIRSERVER_MAIN_RS)
         self.assertIn("sender.send_request(upstream_req).await?", REUSEPORT_DIRSERVER_MAIN_RS)
         self.assertIn("spawn_local(async move", REUSEPORT_DIRSERVER_MAIN_RS)
+        self.assertIn("#[async_trait::async_trait(?Send)]", REUSEPORT_DIRSERVER_MAIN_RS)
+        self.assertIn("if let Err(err) = hyper_serve_http1(Box::new(stream), server, StreamInfo::default()).await", REUSEPORT_DIRSERVER_MAIN_RS)
+        self.assertIn("spawn reuseport DirServer connection task failed", REUSEPORT_DIRSERVER_MAIN_RS)
         self.assertNotIn("tokio::spawn(async move", REUSEPORT_DIRSERVER_MAIN_RS)
         self.assertNotIn("fn write_raw_upstream_request(", REUSEPORT_DIRSERVER_MAIN_RS)
         self.assertNotIn("struct RawUpstreamBody", REUSEPORT_DIRSERVER_MAIN_RS)
@@ -166,7 +169,7 @@ class ImageHttpsStaticTests(unittest.TestCase):
 
     def test_hyper_static_fixture_uses_openat_and_dirserver_style_body_policy(self) -> None:
         self.assertIn('name = "cyfs-perf-reuseport-static-fixture"', REUSEPORT_STATIC_CARGO_TOML)
-        self.assertIn('sfo-reuseport = "0.2.4"', REUSEPORT_STATIC_CARGO_TOML)
+        self.assertIn('sfo-reuseport = "0.3"', REUSEPORT_STATIC_CARGO_TOML)
         self.assertIn('socket2 = "0.6"', REUSEPORT_STATIC_CARGO_TOML)
         self.assertIn('tokio-uring = "0.5"', REUSEPORT_STATIC_CARGO_TOML)
         self.assertIn("ServerRuntime::start(ServerRuntimeConfig::new().with_workers(threads))", REUSEPORT_STATIC_MAIN_RS)
@@ -227,7 +230,7 @@ class ImageHttpsStaticTests(unittest.TestCase):
         self.assertNotIn("[features]", dirserver_cargo_toml)
         self.assertIn('cyfs-gateway-lib = { path = "', dirserver_cargo_toml)
         self.assertNotIn('serde_json = "1"', dirserver_cargo_toml)
-        self.assertIn('sfo-reuseport = { version = "0.2.5", features = ["quinn"] }', dirserver_cargo_toml)
+        self.assertIn('sfo-reuseport = { version = "0.3", features = ["quinn"] }', dirserver_cargo_toml)
         self.assertIn('tokio = { version = "1", features = ["io-util", "net", "rt"] }', dirserver_cargo_toml)
         self.assertNotIn("optional = true", dirserver_cargo_toml)
         self.assertNotIn('io-uring = "0.7"', dirserver_cargo_toml)

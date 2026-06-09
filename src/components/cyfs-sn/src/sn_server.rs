@@ -4230,6 +4230,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sn_api() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
         init_logging("sn", false);
         let (user_signing_key, user_pkcs8_bytes) = generate_ed25519_key();
         let user_public_key = encode_ed25519_sk_to_pk_jwk(&user_signing_key);
@@ -4341,7 +4343,7 @@ mod tests {
         }
         let dns_server = dns_server.unwrap();
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             use http_body_util::BodyExt;
             use tokio::net::TcpListener;
 
@@ -4350,7 +4352,7 @@ mod tests {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let http_server = http_server.clone();
-                tokio::spawn(async move {
+                tokio::task::spawn_local(async move {
                     let ret = hyper_serve_http(
                         Box::new(stream),
                         http_server,
@@ -5052,10 +5054,14 @@ mod tests {
                 .unwrap(),
             0
         );
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn test_sn_v2_api() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
         init_logging("sn", false);
         let (user_signing_key, user_pkcs8_bytes) = generate_ed25519_key();
         let user_public_key = encode_ed25519_sk_to_pk_jwk(&user_signing_key);
@@ -5119,7 +5125,7 @@ mod tests {
         }
         let http_server = http_server.unwrap();
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             use http_body_util::BodyExt;
             use tokio::net::TcpListener;
 
@@ -5128,7 +5134,7 @@ mod tests {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
                 let http_server = http_server.clone();
-                tokio::spawn(async move {
+                tokio::task::spawn_local(async move {
                     let ret = hyper_serve_http(
                         Box::new(stream),
                         http_server,
@@ -5635,5 +5641,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
         assert!(err.contains("[SNV2:1004:user_auth_not_found]"));
+            })
+            .await;
     }
 }

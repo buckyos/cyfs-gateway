@@ -298,6 +298,8 @@ mod tests {
         let reject_port = allocate_free_port().await;
         let socks_stack_port = allocate_free_port().await;
         let upstream_socks_stack_port = allocate_free_port().await;
+        let control_port = allocate_free_port().await;
+        let control_server = format!("http://127.0.0.1:{control_port}");
 
         let config = include_str!("test_cyfs_gateway.yaml");
         let local_dns = include_str!("local_dns.toml");
@@ -373,6 +375,10 @@ function test_js_hook(context, host) {
             echo_direct_port.to_string().as_str(),
         );
         let config = config.replace("{{echo_proxy_port}}", echo_proxy_port.to_string().as_str());
+        let mut config_value: serde_json::Value = serde_yaml_ng::from_str(config.as_str()).unwrap();
+        config_value["stacks"]["__control_server__"] =
+            json!({ "bind": format!("127.0.0.1:{control_port}") });
+        let config = serde_yaml_ng::to_string(&config_value).unwrap();
 
         std::fs::write(config_file.path(), config).unwrap();
 
@@ -673,14 +679,12 @@ function test_js_hook(context, host) {
 
         {
             let socket = tokio::net::TcpSocket::new_v4().unwrap();
-            socket
-                .bind(SocketAddr::from_str("127.0.0.1:18123").unwrap())
-                .unwrap();
+            socket.bind(SocketAddr::from_str("127.0.0.1:0").unwrap()).unwrap();
+            let expected_port = socket.local_addr().unwrap().port();
             let stream = socket
                 .connect(SocketAddr::from_str("127.0.0.1:18082").unwrap())
                 .await
                 .unwrap();
-            let expected_port = 18123;
 
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .handshake(TokioIo::new(stream))
@@ -758,7 +762,7 @@ function test_js_hook(context, host) {
 
         {
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client.add_rule("stack:test1", r#"http_probe && eq ${REQ.dest_host} "test.buckyos.com" && call-server www.buckyos.com;"#).await;
             assert!(ret.is_err());
             let ret = cyfs_cmd_client.add_rule("stack1:test1", r#"http-probe && eq ${REQ.dest_host} "test.buckyos.com" && call-server www.buckyos.com;"#).await;
@@ -799,7 +803,7 @@ function test_js_hook(context, host) {
 
         {
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client.add_rule("stack:test1", r#"http-probe && eq ${REQ.dest_host} "test2.buckyos.com" && call-server www.buckyos.com;"#).await;
             assert!(ret.is_ok());
 
@@ -836,7 +840,7 @@ function test_js_hook(context, host) {
 
         {
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client.add_rule("server:www.buckyos.com:main:test2", r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;"#).await;
             assert!(ret.is_ok());
 
@@ -877,7 +881,7 @@ function test_js_hook(context, host) {
 
         {
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client
                 .remove_rule("server:www.buckyos.com:main:test2")
                 .await;
@@ -922,7 +926,7 @@ function test_js_hook(context, host) {
 
         {
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client.append_rule("server:www.buckyos.com:main:test2", r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;"#).await;
             assert!(ret.is_ok());
 
@@ -963,7 +967,7 @@ function test_js_hook(context, host) {
 
         {
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client
                 .move_rule("server:www.buckyos.com:main:test2", -1)
                 .await;
@@ -1003,7 +1007,7 @@ function test_js_hook(context, host) {
 
         {
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client.set_rule("server:www.buckyos.com:main:test2", r#"starts-with ${REQ.path} "/snsn" && rewrite ${REQ.path} "/snsn*" "/*" && call-server sn.http;"#).await;
             assert!(ret.is_ok());
 
@@ -1045,7 +1049,7 @@ function test_js_hook(context, host) {
             std::fs::write(router_dir.path().join("index.html"), "router").unwrap();
 
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client
                 .add_router(
                     Some("server:www.buckyos.com"),
@@ -1084,7 +1088,7 @@ function test_js_hook(context, host) {
             assert_eq!(data.to_bytes().as_ref(), b"router");
 
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client
                 .remove_router(
                     Some("server:www.buckyos.com"),
@@ -1126,7 +1130,7 @@ function test_js_hook(context, host) {
 
         {
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client
                 .add_router(
                     Some("server:www.buckyos.com"),
@@ -1166,7 +1170,7 @@ function test_js_hook(context, host) {
             assert_eq!(data.to_bytes().as_ref(), b"www.buckyos.com");
 
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client
                 .remove_router(
                     Some("server:www.buckyos.com"),
@@ -1200,7 +1204,7 @@ function test_js_hook(context, host) {
 
         {
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client
                 .add_dispatch("19080", "127.0.0.1:18080", None)
                 .await;
@@ -1240,7 +1244,7 @@ function test_js_hook(context, host) {
 
         {
             let cyfs_cmd_client =
-                GatewayControlClient::new(CONTROL_SERVER, read_login_token(CONTROL_SERVER));
+                GatewayControlClient::new(control_server.as_str(), read_login_token(CONTROL_SERVER));
             let ret = cyfs_cmd_client.remove_dispatch("19080", None).await;
             assert!(ret.is_ok());
 

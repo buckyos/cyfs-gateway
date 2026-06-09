@@ -10,6 +10,7 @@ mod tests {
     use serde_json::{json, Value};
     use sfo_js::JsPkgManager;
     use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -66,6 +67,14 @@ mod tests {
         }
     }
 
+    fn available_tcp_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
     #[tokio::test]
     async fn test_cmd_server() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -76,6 +85,9 @@ mod tests {
         init_logging("cyfs_gateway", false);
         let mut cmd_config: serde_json::Value =
             serde_yaml_ng::from_str(GATEWAY_CONTROL_SERVER_CONFIG).unwrap();
+        let control_port = available_tcp_port();
+        cmd_config["stacks"][GATEWAY_CONTROL_SERVER_KEY]["bind"] =
+            json!(format!("127.0.0.1:{control_port}"));
 
         // Load config from json
         let parser = Arc::new(GatewayConfigParser::new());
@@ -159,7 +171,10 @@ mod tests {
         );
         factory.register_stack_factory(
             StackProtocol::Rtcp,
-            Arc::new(RtcpStackFactory::new(connect_manager.clone())),
+            Arc::new(RtcpStackFactory::new(
+                connect_manager.clone(),
+                tcp_server_runtime.clone(),
+            )),
         );
 
         factory.register_server_factory("http", Arc::new(ProcessChainHttpServerFactory::new()));
@@ -188,7 +203,8 @@ mod tests {
         };
         gateway.start(params).await.unwrap();
 
-        let cmd_client = GatewayControlClient::new("http://127.0.0.1:13451".to_string(), None);
+        let cmd_client =
+            GatewayControlClient::new(format!("http://127.0.0.1:{control_port}"), None);
         let ret = cmd_client.get_system_info().await;
         assert!(ret.is_ok());
         let system_info = ret.unwrap();

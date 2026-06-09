@@ -2266,7 +2266,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dir_server_file_io_mode_defaults_to_async() {
+    async fn test_dir_server_file_io_mode_defaults_to_sync() {
         let temp_dir = tempfile::tempdir().unwrap();
         let server = DirServer::builder()
             .id("test")
@@ -2275,7 +2275,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(server.file_io_mode, DirServerFileIoMode::Async);
+        assert_eq!(server.file_io_mode, DirServerFileIoMode::Sync);
         assert_eq!(server.file_read_buffer_size, DEFAULT_FILE_READ_BUFFER_SIZE);
     }
 

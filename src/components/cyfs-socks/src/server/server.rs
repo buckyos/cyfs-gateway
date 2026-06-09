@@ -364,12 +364,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_socks_server_reject_connection() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
         let provider = MockTunnelProvider::default();
         let socks_server =
             create_socks_stream_server("reject;", provider_ref(provider.clone())).await;
 
         let (mut client, server_stream) = tokio::io::duplex(1024);
-        let task = tokio::spawn(async move {
+        let task = tokio::task::spawn_local(async move {
             socks_server
                 .serve_connection(Box::new(server_stream), StreamInfo::default())
                 .await
@@ -386,17 +388,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(ret.is_ok());
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn test_socks_server_accept_direct_connection() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
         let provider = MockTunnelProvider::default();
         let socks_server =
             create_socks_stream_server("return \"DIRECT\";", provider_ref(provider.clone())).await;
 
         let target_addr = start_echo_server().await;
         let (mut client, server_stream) = tokio::io::duplex(4096);
-        let task = tokio::spawn(async move {
+        let task = tokio::task::spawn_local(async move {
             socks_server
                 .serve_connection(Box::new(server_stream), StreamInfo::default())
                 .await
@@ -419,10 +425,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(ret.is_ok());
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn test_socks_server_proxy_connection() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
         let provider = MockTunnelProvider::default();
         let socks_server = create_socks_stream_server(
             "return \"PROXY socks://proxy.example:1080\";",
@@ -432,7 +442,7 @@ mod tests {
 
         let target_addr = start_echo_server().await;
         let (mut client, server_stream) = tokio::io::duplex(4096);
-        let task = tokio::spawn(async move {
+        let task = tokio::task::spawn_local(async move {
             socks_server
                 .serve_connection(Box::new(server_stream), StreamInfo::default())
                 .await
@@ -460,5 +470,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(ret.is_ok());
+            })
+            .await;
     }
 }

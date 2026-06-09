@@ -1234,8 +1234,13 @@ impl UdpStackInner {
     fn local_ips() -> StackResult<Vec<IpAddr>> {
         let mut list = vec![];
 
-        let interfaces = list_afinet_netifas()
-            .map_err(|e| stack_err!(StackErrorCode::InvalidConfig, "list local ip error: {}", e))?;
+        let interfaces = match list_afinet_netifas() {
+            Ok(interfaces) => interfaces,
+            Err(e) => {
+                log::warn!("list local ip error: {}, continuing with loopback-only detection", e);
+                return Ok(list);
+            }
+        };
         for (_, ip) in interfaces {
             list.push(ip);
         }

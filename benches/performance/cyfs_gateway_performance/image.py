@@ -402,7 +402,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
-sfo-reuseport = "0.2.4"
+sfo-reuseport = "0.3"
 socket2 = "0.6"
 tokio = { version = "1", features = ["fs", "io-util", "net", "rt"] }
 tokio-uring = "0.5"
@@ -1115,9 +1115,13 @@ fn serve_reuseport_dirserver(
         let server = server.clone();
         async move {
             stream.set_nodelay(true)?;
-            hyper_serve_http1(Box::new(stream), server, StreamInfo::default())
-                .await
-                .map_err(|err| ReuseportError::Handler(format!("reuseport DirServer connection failed: {err}")))
+            spawn_local(async move {
+                if let Err(err) = hyper_serve_http1(Box::new(stream), server, StreamInfo::default()).await {
+                    eprintln!("reuseport DirServer connection failed: {err}");
+                }
+            })
+            .map_err(|err| ReuseportError::Runtime(format!("spawn reuseport DirServer connection task failed: {err}")))?;
+            Ok(())
         }
     })?;
 
@@ -1171,7 +1175,7 @@ struct ReverseProxyDirServer {
     proxy_upstream: String,
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl HttpServer for ReverseProxyDirServer {
     async fn serve_request(
         &self,
@@ -1737,7 +1741,7 @@ cyfs-gateway-lib = {{ path = "{lib_path}" }}
 http-body-util = "0.1"
 hyper = {{ version = "1", features = ["http1"] }}
 hyper-util = {{ version = "0.1", features = ["tokio"] }}
-sfo-reuseport = {{ version = "0.2.5", features = ["quinn"] }}
+sfo-reuseport = {{ version = "0.3", features = ["quinn"] }}
 tokio = {{ version = "1", features = ["io-util", "net", "rt"] }}
 {release_profile}
 """
