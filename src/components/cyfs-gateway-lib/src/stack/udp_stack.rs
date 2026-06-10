@@ -500,9 +500,9 @@ impl UdpDatagramHandler {
                             let forward_recv = forward.clone();
                             let stat = speed_stat.clone();
                             let notify = Arc::new(Notify::new());
-                            let is_limit = true;
+                            let is_limit = limiter.is_some();
                             if is_limit {
-                                let (sender, receive) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+                                let (sender, receive) = tokio::sync::mpsc::channel::<Vec<u8>>(2048);
                                 let send_datagram = Box::new(ChannelDatagram::new(sender));
                                 let mut receive_datagram: Box<dyn Datagram<Error = StackError>> =
                                     if limiter.is_some() {
@@ -522,7 +522,7 @@ impl UdpDatagramHandler {
                                         ))
                                     };
                                 let stat = speed_stat.clone();
-                                let send_handle = tokio::spawn(async move {
+                                let send_handle = tokio::task::spawn_local(async move {
                                     let mut buffer = vec![0u8; 1024 * 4];
                                     loop {
                                         match receive_datagram.recv_from(&mut buffer).await {
@@ -563,7 +563,7 @@ impl UdpDatagramHandler {
                                 } else {
                                     Box::new(UdpSendDatagram::new(udp_socket.clone(), src_addr))
                                 };
-                                let handle = tokio::spawn(async move {
+                                let handle = tokio::task::spawn_local(async move {
                                     let mut buffer = vec![0u8; 1024 * 4];
                                     loop {
                                         let len =
@@ -609,7 +609,7 @@ impl UdpDatagramHandler {
                                 let io_dump = self.io_dump.clone();
                                 let src_addr_copy = src_addr;
                                 let dest_addr_copy = dest_addr;
-                                let handle = tokio::spawn(async move {
+                                let handle = tokio::task::spawn_local(async move {
                                     let mut buffer = vec![0u8; 1024 * 4];
                                     loop {
                                         let len =
@@ -665,7 +665,7 @@ impl UdpDatagramHandler {
                             {
                                 if let Server::Datagram(datagram_server) = &server {
                                     let notify = Arc::new(Notify::new());
-                                    let is_limit = true;
+                                    let is_limit = limiter.is_some();
                                     let session_server = server.clone();
                                     if is_limit {
                                         let (sender, receive) =
@@ -763,6 +763,58 @@ impl UdpDatagramHandler {
                                                     speed_stat: speed_stat.clone(),
                                                     send_handle: Some(handle),
                                                     send_datagram: Some(send_datagram),
+                                                },
+                                            ),
+                                            connection_target: server_name.clone(),
+                                            speed_stat: speed_stat_ref.clone(),
+                                        });
+                                    } else {
+                                        let buf = datagram_server
+                                            .serve_datagram(
+                                                &data[..len],
+                                                DatagramInfo::new(Some(src_addr.to_string()))
+                                                    .with_dst_addr(Some(dest_addr.to_string())),
+                                            )
+                                            .await
+                                            .map_err(|e| {
+                                                stack_err!(
+                                                    StackErrorCode::ServerError,
+                                                    "server error: {}",
+                                                    e
+                                                )
+                                            })?;
+                                        udp_socket
+                                            .send_to(buf.as_slice(), src_addr)
+                                            .await
+                                            .map_err(|e| {
+                                                stack_err!(
+                                                    StackErrorCode::BindFailed,
+                                                    "send datagram error: {}",
+                                                    e
+                                                )
+                                            })?;
+                                        if let Some(io_dump) = self.io_dump.as_ref() {
+                                            dump_single_datagram(
+                                                io_dump,
+                                                src_addr.to_string(),
+                                                dest_addr.to_string(),
+                                                Vec::new(),
+                                                buf.clone(),
+                                            );
+                                        }
+                                        speed_stat.add_read_data_size(len as u64);
+                                        speed_stat.add_write_data_size(buf.len() as u64);
+
+                                        new_session = Some(NewDatagramSession {
+                                            session: DatagramSession::Server(
+                                                DatagramServerSession {
+                                                    server: session_server,
+                                                    latest_time: chrono::Utc::now().timestamp()
+                                                        as u64,
+                                                    notify: notify.clone(),
+                                                    speed_stat: speed_stat.clone(),
+                                                    send_handle: None,
+                                                    send_datagram: None,
                                                 },
                                             ),
                                             connection_target: server_name.clone(),
@@ -1472,12 +1524,14 @@ impl UdpStackInner {
 
         const MAX_CLEAN_PER_CYCLE: usize = 1500;
         let mut count = 0;
+        let mut next_key = None;
         let mut deletes = Vec::new();
         if latest_key.is_some() {
             for (k, session) in sessions.range(latest_key.unwrap()..) {
                 count += 1;
                 if count > MAX_CLEAN_PER_CYCLE {
-                    return Some(k.clone());
+                    next_key = Some(*k);
+                    break;
                 }
                 let remove = if let Ok(mut guard) = session.try_lock() {
                     if let Some(datagram_session) = guard.as_mut() {
@@ -1501,7 +1555,8 @@ impl UdpStackInner {
             for (k, session) in sessions.iter() {
                 count += 1;
                 if count > MAX_CLEAN_PER_CYCLE {
-                    return Some(k.clone());
+                    next_key = Some(*k);
+                    break;
                 }
                 let remove = if let Ok(mut guard) = session.try_lock() {
                     if let Some(datagram_session) = guard.as_mut() {
@@ -1525,7 +1580,7 @@ impl UdpStackInner {
         for k in deletes {
             sessions.remove(&k);
         }
-        None
+        next_key
     }
 
     async fn clear_socket(&self) {
@@ -1666,7 +1721,7 @@ impl Stack for UdpStack {
         }
         let server = self.inner.start_listener().await?;
         let inner = self.inner.clone();
-        *self.clear_handle.lock().unwrap() = Some(tokio::spawn(async move {
+        *self.clear_handle.lock().unwrap() = Some(tokio::task::spawn(async move {
             let mut latest_key = None;
             let clear_interval = inner.session_idle_time;
             loop {
@@ -2085,6 +2140,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_udp_clear_idle_sessions_deletes_before_paginating() {
+        let stack_context = build_udp_context(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
+        let stack = UdpStack::builder()
+            .id("test-clear-idle")
+            .bind("0.0.0.0:0")
+            .hook_point(vec![])
+            .server_runtime(test_server_runtime())
+            .session_idle_time(Duration::from_secs(1))
+            .stack_context(stack_context)
+            .build()
+            .await
+            .unwrap();
+
+        {
+            let mut sessions = stack.inner.all_client_session.lock().unwrap();
+            for port in 10_000..11_501 {
+                let key = super::SessionKey::new(
+                    format!("127.0.0.1:{port}").parse().unwrap(),
+                    "127.0.0.1:9000".parse().unwrap(),
+                );
+                sessions.insert(key, Arc::new(tokio::sync::Mutex::new(None)));
+            }
+        }
+
+        assert_eq!(stack.get_session_count(), 1501);
+
+        let next_key = stack.inner.clear_idle_sessions(None).await;
+
+        assert!(next_key.is_some());
+        assert_eq!(stack.get_session_count(), 1);
+
+        let next_key = stack.inner.clear_idle_sessions(next_key).await;
+
+        assert!(next_key.is_none());
+        assert_eq!(stack.get_session_count(), 0);
+    }
+
+    #[tokio::test(flavor = "local")]
     async fn test_udp_stack_forward() {
         init_logging("test", false);
         let chains = r#"
@@ -2121,7 +2221,7 @@ mod tests {
         let result = stack.start().await;
         assert!(result.is_ok());
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             let udp_socket = UdpSocket::bind("127.0.0.1:8933").await.unwrap();
             let mut buf = [0; 1024];
             let (n, addr) = udp_socket.recv_from(&mut buf).await.unwrap();
@@ -2148,7 +2248,7 @@ mod tests {
         assert_eq!(stack.get_session_count(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_udp_io_dump_forward_single_roundtrip() {
         let chains = r#"
 - id: main
@@ -2193,7 +2293,7 @@ mod tests {
             .unwrap();
         stack.start().await.unwrap();
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             let udp_socket = UdpSocket::bind("127.0.0.1:8942").await.unwrap();
             let mut buf = [0; 1024];
             let (n, addr) = udp_socket.recv_from(&mut buf).await.unwrap();
@@ -2223,7 +2323,7 @@ mod tests {
                 .any(|f| f.upload.is_empty() && f.download == b"recv")
         );
     }
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_udp_stack_forward_err() {
         let chains = r#"
 - id: main
@@ -2294,7 +2394,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_udp_stack_serve() {
         let chains = r#"
 - id: main
@@ -2353,7 +2453,7 @@ mod tests {
         assert_eq!(stack.get_session_count(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_udp_io_dump_server_single_roundtrip() {
         let chains = r#"
 - id: main
@@ -2432,7 +2532,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_udp_stack_stat_serve() {
         let chains = r#"
 - id: main
@@ -2498,7 +2598,7 @@ mod tests {
         assert_eq!(stack.get_session_count(), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_udp_stack_stat_limiter_serve() {
         let chains = r#"
 - id: main
