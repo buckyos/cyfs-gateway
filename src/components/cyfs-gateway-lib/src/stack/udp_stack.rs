@@ -23,6 +23,7 @@ use sfo_reuseport::{
     PacketMeta, ServerRuntime, SocketOptions, TransparentMode, UdpServer, UdpServiceConfig,
     UdpSocket as ReuseportUdpSocket,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Div;
@@ -30,11 +31,15 @@ use std::ops::Div;
 use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawSocket, IntoRawSocket};
-use std::sync::{Arc, Mutex, RwLock};
+use std::rc::Rc;
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use url::Url;
 
 #[derive(Clone)]
@@ -599,6 +604,7 @@ impl UdpDatagramHandler {
                                         latest_time: chrono::Utc::now().timestamp() as u64,
                                         receive_handle: Some(handle),
                                         notify: notify.clone(),
+                                        stopped: None,
                                         speed_stat: speed_stat.clone(),
                                         send_handle: Some(send_handle),
                                     }),
@@ -645,6 +651,7 @@ impl UdpDatagramHandler {
                                         latest_time: chrono::Utc::now().timestamp() as u64,
                                         receive_handle: Some(handle),
                                         notify: notify.clone(),
+                                        stopped: None,
                                         speed_stat: speed_stat.clone(),
                                         send_handle: None,
                                     }),
@@ -760,6 +767,7 @@ impl UdpDatagramHandler {
                                                     latest_time: chrono::Utc::now().timestamp()
                                                         as u64,
                                                     notify: notify.clone(),
+                                                    stopped: None,
                                                     speed_stat: speed_stat.clone(),
                                                     send_handle: Some(handle),
                                                     send_datagram: Some(send_datagram),
@@ -812,6 +820,7 @@ impl UdpDatagramHandler {
                                                     latest_time: chrono::Utc::now().timestamp()
                                                         as u64,
                                                     notify: notify.clone(),
+                                                    stopped: None,
                                                     speed_stat: speed_stat.clone(),
                                                     send_handle: None,
                                                     send_datagram: None,
@@ -951,7 +960,14 @@ impl Datagram for ChannelDatagram {
     type Error = StackError;
 
     async fn send_to(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        let _ = self.sender.try_send(buf.to_vec());
+        self.sender.try_send(buf.to_vec()).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                stack_err!(StackErrorCode::IoError, "udp datagram channel is full")
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                stack_err!(StackErrorCode::IoError, "udp datagram channel is closed")
+            }
+        })?;
         Ok(buf.len())
     }
 
@@ -977,20 +993,23 @@ impl SessionKey {
 
 struct UdpSessionController {
     session_key: SessionKey,
-    client_session: DatagramClientSessionMap,
+    command_sender: tokio::sync::mpsc::UnboundedSender<UdpWorkerCommand>,
     notify: Arc<Notify>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl UdpSessionController {
     fn new(
         session_key: SessionKey,
-        client_session: DatagramClientSessionMap,
+        command_sender: tokio::sync::mpsc::UnboundedSender<UdpWorkerCommand>,
         notify: Arc<Notify>,
+        stopped: Arc<AtomicBool>,
     ) -> Arc<Self> {
         Arc::new(Self {
             session_key,
-            client_session,
+            command_sender,
             notify,
+            stopped,
         })
     }
 }
@@ -998,8 +1017,10 @@ impl UdpSessionController {
 #[async_trait::async_trait]
 impl ConnectionController for UdpSessionController {
     fn stop_connection(&self) {
-        let mut all_sessions = self.client_session.lock().unwrap();
-        all_sessions.remove(&self.session_key);
+        self.stopped.store(true, Ordering::SeqCst);
+        let _ = self
+            .command_sender
+            .send(UdpWorkerCommand::RemoveSession(self.session_key));
     }
 
     async fn wait_stop(&self) {
@@ -1007,8 +1028,7 @@ impl ConnectionController for UdpSessionController {
     }
 
     fn is_stopped(&self) -> bool {
-        let all_sessions = self.client_session.lock().unwrap();
-        !all_sessions.contains_key(&self.session_key)
+        self.stopped.load(Ordering::SeqCst)
     }
 }
 
@@ -1017,6 +1037,7 @@ struct DatagramForwardSession {
     latest_time: u64,
     receive_handle: Option<JoinHandle<()>>,
     notify: Arc<Notify>,
+    stopped: Option<Arc<AtomicBool>>,
     speed_stat: Arc<dyn SpeedTracker>,
     send_handle: Option<JoinHandle<()>>,
 }
@@ -1029,6 +1050,9 @@ impl Drop for DatagramForwardSession {
         if let Some(handle) = self.send_handle.take() {
             handle.abort();
         }
+        if let Some(stopped) = self.stopped.as_ref() {
+            stopped.store(true, Ordering::SeqCst);
+        }
         self.notify.notify_waiters();
     }
 }
@@ -1037,6 +1061,7 @@ struct DatagramServerSession {
     server: Server,
     latest_time: u64,
     notify: Arc<Notify>,
+    stopped: Option<Arc<AtomicBool>>,
     speed_stat: Arc<dyn SpeedTracker>,
     send_handle: Option<JoinHandle<()>>,
     send_datagram: Option<Box<dyn Datagram<Error = StackError>>>,
@@ -1047,6 +1072,9 @@ impl Drop for DatagramServerSession {
         if let Some(handle) = self.send_handle.take() {
             handle.abort();
         }
+        if let Some(stopped) = self.stopped.as_ref() {
+            stopped.store(true, Ordering::SeqCst);
+        }
         self.notify.notify_waiters();
     }
 }
@@ -1056,6 +1084,15 @@ enum DatagramSession {
     Server(DatagramServerSession),
 }
 
+impl DatagramSession {
+    fn set_stopped_flag(&mut self, stopped: Arc<AtomicBool>) {
+        match self {
+            Self::Forward(session) => session.stopped = Some(stopped),
+            Self::Server(session) => session.stopped = Some(stopped),
+        }
+    }
+}
+
 struct NewDatagramSession {
     session: DatagramSession,
     connection_target: String,
@@ -1063,7 +1100,121 @@ struct NewDatagramSession {
 }
 
 type DatagramClientSessionMap =
-    Arc<Mutex<BTreeMap<SessionKey, Arc<tokio::sync::Mutex<Option<DatagramSession>>>>>>;
+    RefCell<BTreeMap<SessionKey, Rc<tokio::sync::Mutex<Option<DatagramSession>>>>>;
+
+enum UdpWorkerCommand {
+    RemoveSession(SessionKey),
+}
+
+struct UdpWorkerState {
+    all_client_session: DatagramClientSessionMap,
+    session_count: Arc<AtomicUsize>,
+    command_sender: tokio::sync::mpsc::UnboundedSender<UdpWorkerCommand>,
+    command_receiver: RefCell<tokio::sync::mpsc::UnboundedReceiver<UdpWorkerCommand>>,
+}
+
+impl UdpWorkerState {
+    fn new(session_count: Arc<AtomicUsize>) -> Self {
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            all_client_session: RefCell::new(BTreeMap::new()),
+            session_count,
+            command_sender,
+            command_receiver: RefCell::new(command_receiver),
+        }
+    }
+
+    fn drain_commands(&self) {
+        let mut receiver = self.command_receiver.borrow_mut();
+        while let Ok(command) = receiver.try_recv() {
+            match command {
+                UdpWorkerCommand::RemoveSession(session_key) => {
+                    if self
+                        .all_client_session
+                        .borrow_mut()
+                        .remove(&session_key)
+                        .is_some()
+                    {
+                        self.session_count.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn clear_idle_sessions(
+        &self,
+        latest_key: Option<SessionKey>,
+        session_idle_time: Duration,
+    ) -> Option<SessionKey> {
+        self.drain_commands();
+        let mut sessions = self.all_client_session.borrow_mut();
+        let now = chrono::Utc::now().timestamp() as u64;
+        let timeout = session_idle_time.as_secs();
+
+        const MAX_CLEAN_PER_CYCLE: usize = 1500;
+        let mut count = 0;
+        let mut next_key = None;
+        let mut deletes = Vec::new();
+        if latest_key.is_some() {
+            for (k, session) in sessions.range(latest_key.unwrap()..) {
+                count += 1;
+                if count > MAX_CLEAN_PER_CYCLE {
+                    next_key = Some(*k);
+                    break;
+                }
+                let remove = if let Ok(mut guard) = session.try_lock() {
+                    if let Some(datagram_session) = guard.as_mut() {
+                        let latest_time = match datagram_session {
+                            DatagramSession::Forward(f) => f.latest_time,
+                            DatagramSession::Server(s) => s.latest_time,
+                        };
+
+                        now.saturating_sub(latest_time) >= timeout
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                };
+                if remove {
+                    deletes.push(*k);
+                }
+            }
+        } else {
+            for (k, session) in sessions.iter() {
+                count += 1;
+                if count > MAX_CLEAN_PER_CYCLE {
+                    next_key = Some(*k);
+                    break;
+                }
+                let remove = if let Ok(mut guard) = session.try_lock() {
+                    if let Some(datagram_session) = guard.as_mut() {
+                        let latest_time = match datagram_session {
+                            DatagramSession::Forward(f) => f.latest_time,
+                            DatagramSession::Server(s) => s.latest_time,
+                        };
+
+                        now.saturating_sub(latest_time) >= timeout
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                };
+                if remove {
+                    deletes.push(*k);
+                }
+            }
+        }
+        for k in deletes {
+            if sessions.remove(&k).is_some() {
+                self.session_count.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        next_key
+    }
+}
 
 const DEFAULT_UDP_CONCURRENCY: u32 = 0;
 const DEFAULT_UDP_MAX_SESSIONS: u32 = 0;
@@ -1076,7 +1227,7 @@ fn normalize_concurrency(concurrency: u32) -> u32 {
     }
 }
 
-fn normalize_max_sessions(max_sessions: u32) -> usize {
+fn normalize_max_sessions_per_worker(max_sessions: u32) -> usize {
     if max_sessions == 0 {
         usize::MAX
     } else {
@@ -1110,13 +1261,13 @@ fn recv_message(fd: std::os::unix::io::RawFd, buffer: &mut [u8]) -> Result<usize
 }
 
 struct SocketCache {
-    socket_cache: Arc<tokio::sync::Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>>,
+    socket_cache: tokio::sync::Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>,
 }
 
 impl SocketCache {
     pub fn new() -> Self {
         Self {
-            socket_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            socket_cache: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1145,6 +1296,9 @@ impl SocketCache {
             ))?;
             #[cfg(target_os = "linux")]
             {
+                // SocketCache is used for replies from transparent proxy sessions whose
+                // original destination is not a local address, so the socket must bind
+                // and send as that original destination.
                 socket.set_reuse_address(true).map_err(into_stack_err!(
                     StackErrorCode::IoError,
                     "set reuse address error"
@@ -1218,7 +1372,7 @@ impl SocketCache {
         let mut list = Vec::new();
         for (addr, socket) in cache.iter() {
             if Arc::strong_count(socket) == 1 {
-                list.push(addr.clone());
+                list.push(*addr);
             }
         }
 
@@ -1233,14 +1387,15 @@ struct UdpStackInner {
     bind_addr: String,
     concurrency: u32,
     server_runtime: ServerRuntime,
-    max_sessions: usize,
+    max_sessions_per_worker: usize,
     session_idle_time: Duration,
-    all_client_session: DatagramClientSessionMap,
+    session_count: Arc<AtomicUsize>,
+    socket_cache: Arc<SocketCache>,
+    cleanup_handles: Arc<Mutex<Vec<AbortHandle>>>,
     connection_manager: Option<ConnectionManagerRef>,
     transparent: bool,
     reuse_address: bool,
     local_ips: Vec<IpAddr>,
-    socket_cache: SocketCache,
     handler: Arc<RwLock<Arc<UdpDatagramHandler>>>,
     io_dump: Arc<RwLock<Option<IoDumpStackConfig>>>,
 }
@@ -1262,22 +1417,24 @@ impl UdpStackInner {
 
         let local_ips = Self::local_ips()?;
         let io_dump = handler.read().unwrap().io_dump.clone();
+        let id = builder.id.unwrap();
         Ok(Self {
-            id: builder.id.unwrap(),
+            id,
             bind_addr: builder.bind.unwrap(),
             concurrency: builder.concurrency,
             server_runtime: builder.server_runtime.ok_or(stack_err!(
                 StackErrorCode::InvalidConfig,
                 "server_runtime is required"
             ))?,
-            max_sessions: normalize_max_sessions(builder.max_sessions),
+            max_sessions_per_worker: normalize_max_sessions_per_worker(builder.max_sessions),
             session_idle_time: builder.session_idle_time,
-            all_client_session: Arc::new(Mutex::new(BTreeMap::new())),
+            session_count: Arc::new(AtomicUsize::new(0)),
+            socket_cache: Arc::new(SocketCache::new()),
+            cleanup_handles: Arc::new(Mutex::new(Vec::new())),
             connection_manager: builder.connection_manager,
             transparent: builder.transparent,
             reuse_address: builder.reuse_address,
             local_ips,
-            socket_cache: SocketCache::new(),
             io_dump: Arc::new(RwLock::new(io_dump)),
             handler,
         })
@@ -1289,7 +1446,10 @@ impl UdpStackInner {
         let interfaces = match list_afinet_netifas() {
             Ok(interfaces) => interfaces,
             Err(e) => {
-                log::warn!("list local ip error: {}, continuing with loopback-only detection", e);
+                log::warn!(
+                    "list local ip error: {}, continuing with loopback-only detection",
+                    e
+                );
                 return Ok(list);
             }
         };
@@ -1308,6 +1468,7 @@ impl UdpStackInner {
 
     async fn handle_datagram(
         &self,
+        worker_state: Rc<UdpWorkerState>,
         udp_socket: UdpSocketRef,
         src_addr: SocketAddr,
         dest_addr: SocketAddr,
@@ -1324,21 +1485,23 @@ impl UdpStackInner {
             );
         }
         let session_key = SessionKey::new(src_addr, dest_addr);
+        worker_state.drain_commands();
         let client_session = {
-            let mut all_sessions = self.all_client_session.lock().unwrap();
+            let mut all_sessions = worker_state.all_client_session.borrow_mut();
             let client_session = all_sessions.get(&session_key);
             if client_session.is_none() {
-                if all_sessions.len() >= self.max_sessions {
+                if all_sessions.len() >= self.max_sessions_per_worker {
                     log::warn!(
-                        "udp session limit reached: max_sessions={}, drop {} -> {}",
-                        self.max_sessions,
+                        "udp worker session limit reached: max_sessions_per_worker={}, drop {} -> {}",
+                        self.max_sessions_per_worker,
                         src_addr,
                         dest_addr
                     );
                     return Ok(());
                 }
-                let client_session = Arc::new(tokio::sync::Mutex::new(None));
+                let client_session = Rc::new(tokio::sync::Mutex::new(None));
                 all_sessions.insert(session_key, client_session.clone());
+                worker_state.session_count.fetch_add(1, Ordering::Relaxed);
             }
             let client_session = all_sessions.get(&session_key);
             let client_session = client_session.unwrap();
@@ -1449,18 +1612,24 @@ impl UdpStackInner {
             .await?
         {
             let NewDatagramSession {
-                session,
+                mut session,
                 connection_target,
                 speed_stat,
             } = new_session;
+            let stopped = Arc::new(AtomicBool::new(false));
+            session.set_stopped_flag(stopped.clone());
             let notify = match &session {
                 DatagramSession::Forward(session) => session.notify.clone(),
                 DatagramSession::Server(session) => session.notify.clone(),
             };
             *session_guard = Some(session);
             if let Some(connection_manager) = self.connection_manager.as_ref() {
-                let controller =
-                    UdpSessionController::new(session_key, self.all_client_session.clone(), notify);
+                let controller = UdpSessionController::new(
+                    session_key,
+                    worker_state.command_sender.clone(),
+                    notify,
+                    stopped,
+                );
                 connection_manager.add_connection(ConnectionInfo::new(
                     src_addr.to_string(),
                     connection_target,
@@ -1471,6 +1640,26 @@ impl UdpStackInner {
             }
         }
         Ok(())
+    }
+
+    fn start_worker_cleanup(&self, worker_state: Rc<UdpWorkerState>) {
+        let session_idle_time = self.session_idle_time;
+        let cleanup_interval = session_idle_time.div(2).max(Duration::from_secs(1));
+        let socket_cache = self.socket_cache.clone();
+        let handle = tokio::task::spawn_local(async move {
+            let mut latest_key = None;
+            loop {
+                latest_key = worker_state
+                    .clear_idle_sessions(latest_key, session_idle_time)
+                    .await;
+                socket_cache.clear_socket().await;
+                tokio::time::sleep(cleanup_interval).await;
+            }
+        });
+        self.cleanup_handles
+            .lock()
+            .unwrap()
+            .push(handle.abort_handle());
     }
 
     pub async fn start_listener(self: &Arc<Self>) -> StackResult<UdpServer> {
@@ -1502,89 +1691,25 @@ impl UdpStackInner {
                 service_config.with_max_concurrency_per_worker(self.concurrency as usize);
         }
 
-        let server = UdpServer::serve(
+        let state_owner = self.clone();
+        let server = UdpServer::serve_with_state(
             &self.server_runtime,
             service_config,
-            move |socket, meta, payload| {
+            move || {
+                let worker_state = Rc::new(UdpWorkerState::new(state_owner.session_count.clone()));
+                state_owner.start_worker_cleanup(worker_state.clone());
+                worker_state
+            },
+            move |worker_state, socket, meta, payload| {
                 let this = this.clone();
                 async move {
-                    handle_reuseport_udp_datagram(this, socket, meta, payload).await;
+                    handle_reuseport_udp_datagram(this, worker_state, socket, meta, payload).await;
                     Ok(())
                 }
             },
         )
         .map_err(|e| stack_err!(StackErrorCode::BindFailed, "start udp server error: {e}"))?;
         Ok(server)
-    }
-
-    async fn clear_idle_sessions(&self, latest_key: Option<SessionKey>) -> Option<SessionKey> {
-        let mut sessions = self.all_client_session.lock().unwrap();
-        let now = chrono::Utc::now().timestamp() as u64;
-        let timeout = self.session_idle_time.as_secs();
-
-        const MAX_CLEAN_PER_CYCLE: usize = 1500;
-        let mut count = 0;
-        let mut next_key = None;
-        let mut deletes = Vec::new();
-        if latest_key.is_some() {
-            for (k, session) in sessions.range(latest_key.unwrap()..) {
-                count += 1;
-                if count > MAX_CLEAN_PER_CYCLE {
-                    next_key = Some(*k);
-                    break;
-                }
-                let remove = if let Ok(mut guard) = session.try_lock() {
-                    if let Some(datagram_session) = guard.as_mut() {
-                        let latest_time = match datagram_session {
-                            DatagramSession::Forward(f) => f.latest_time,
-                            DatagramSession::Server(s) => s.latest_time,
-                        };
-
-                        now.saturating_sub(latest_time) >= timeout
-                    } else {
-                        true
-                    }
-                } else {
-                    false
-                };
-                if remove {
-                    deletes.push(k.clone());
-                }
-            }
-        } else {
-            for (k, session) in sessions.iter() {
-                count += 1;
-                if count > MAX_CLEAN_PER_CYCLE {
-                    next_key = Some(*k);
-                    break;
-                }
-                let remove = if let Ok(mut guard) = session.try_lock() {
-                    if let Some(datagram_session) = guard.as_mut() {
-                        let latest_time = match datagram_session {
-                            DatagramSession::Forward(f) => f.latest_time,
-                            DatagramSession::Server(s) => s.latest_time,
-                        };
-
-                        now.saturating_sub(latest_time) >= timeout
-                    } else {
-                        true
-                    }
-                } else {
-                    false
-                };
-                if remove {
-                    deletes.push(k.clone());
-                }
-            }
-        }
-        for k in deletes {
-            sessions.remove(&k);
-        }
-        next_key
-    }
-
-    async fn clear_socket(&self) {
-        self.socket_cache.clear_socket().await;
     }
 }
 
@@ -1605,6 +1730,7 @@ fn transparent_mode(transparent: bool, matches_bind_family: bool) -> Transparent
 
 async fn handle_reuseport_udp_datagram(
     inner: Arc<UdpStackInner>,
+    worker_state: Rc<UdpWorkerState>,
     socket: ReuseportUdpSocket,
     meta: PacketMeta,
     payload: Vec<u8>,
@@ -1626,6 +1752,7 @@ async fn handle_reuseport_udp_datagram(
     let len = payload.len();
     if let Err(e) = inner
         .handle_datagram(
+            worker_state,
             UdpSocketRef::Reuseport(socket),
             src_addr,
             dest_addr,
@@ -1642,7 +1769,6 @@ pub struct UdpStack {
     inner: Arc<UdpStackInner>,
     prepare_handler: Arc<RwLock<Option<Arc<UdpDatagramHandler>>>>,
     server: Mutex<Option<UdpServer>>,
-    clear_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Drop for UdpStack {
@@ -1652,8 +1778,10 @@ impl Drop for UdpStack {
                 log::error!("close udp server failed: {}", e);
             }
         }
-        if let Some(handle) = self.clear_handle.lock().unwrap().take() {
-            handle.abort();
+        if let Ok(mut handles) = self.inner.cleanup_handles.lock() {
+            for handle in handles.drain(..) {
+                handle.abort();
+            }
         }
     }
 }
@@ -1690,13 +1818,12 @@ impl UdpStack {
             inner: Arc::new(inner),
             prepare_handler: Arc::new(Default::default()),
             server: Mutex::new(None),
-            clear_handle: Mutex::new(None),
         })
     }
 
     #[cfg(test)]
     fn get_session_count(&self) -> usize {
-        self.inner.all_client_session.lock().unwrap().len()
+        self.inner.session_count.load(Ordering::Relaxed)
     }
 }
 
@@ -1720,16 +1847,6 @@ impl Stack for UdpStack {
             }
         }
         let server = self.inner.start_listener().await?;
-        let inner = self.inner.clone();
-        *self.clear_handle.lock().unwrap() = Some(tokio::task::spawn(async move {
-            let mut latest_key = None;
-            let clear_interval = inner.session_idle_time;
-            loop {
-                latest_key = inner.clear_idle_sessions(latest_key).await;
-                inner.clear_socket().await;
-                tokio::time::sleep(clear_interval.div(2)).await;
-            }
-        }));
         *self.server.lock().unwrap() = Some(server);
         Ok(())
     }
@@ -1930,6 +2047,7 @@ pub struct UdpStackConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Max tracked UDP sessions per reuseport worker. `0` means unlimited.
     pub max_sessions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_idle_time: Option<u64>,
@@ -2043,13 +2161,19 @@ mod tests {
     };
     use buckyos_kit::init_logging;
     use std::path::Path;
+    use std::rc::Rc;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use tokio::net::UdpSocket;
 
     fn test_server_runtime() -> sfo_reuseport::ServerRuntime {
+        test_server_runtime_with_workers(1)
+    }
+
+    fn test_server_runtime_with_workers(workers: usize) -> sfo_reuseport::ServerRuntime {
         sfo_reuseport::ServerRuntime::start(
-            sfo_reuseport::ServerRuntimeConfig::new().with_workers(1),
+            sfo_reuseport::ServerRuntimeConfig::new().with_workers(workers),
         )
         .unwrap()
     }
@@ -2139,7 +2263,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn test_udp_clear_idle_sessions_deletes_before_paginating() {
         let stack_context = build_udp_context(
             Arc::new(ServerManager::new()),
@@ -2160,25 +2284,33 @@ mod tests {
             .await
             .unwrap();
 
+        let worker_state = Rc::new(super::UdpWorkerState::new(
+            stack.inner.session_count.clone(),
+        ));
         {
-            let mut sessions = stack.inner.all_client_session.lock().unwrap();
+            let mut sessions = worker_state.all_client_session.borrow_mut();
             for port in 10_000..11_501 {
                 let key = super::SessionKey::new(
                     format!("127.0.0.1:{port}").parse().unwrap(),
                     "127.0.0.1:9000".parse().unwrap(),
                 );
-                sessions.insert(key, Arc::new(tokio::sync::Mutex::new(None)));
+                sessions.insert(key, Rc::new(tokio::sync::Mutex::new(None)));
+                stack.inner.session_count.fetch_add(1, Ordering::Relaxed);
             }
         }
 
         assert_eq!(stack.get_session_count(), 1501);
 
-        let next_key = stack.inner.clear_idle_sessions(None).await;
+        let next_key = worker_state
+            .clear_idle_sessions(None, stack.inner.session_idle_time)
+            .await;
 
         assert!(next_key.is_some());
         assert_eq!(stack.get_session_count(), 1);
 
-        let next_key = stack.inner.clear_idle_sessions(next_key).await;
+        let next_key = worker_state
+            .clear_idle_sessions(next_key, stack.inner.session_idle_time)
+            .await;
 
         assert!(next_key.is_none());
         assert_eq!(stack.get_session_count(), 0);
@@ -2450,6 +2582,74 @@ mod tests {
 
         assert!(stack.get_session_count() > 0);
         tokio::time::sleep(std::time::Duration::from_secs(9)).await;
+        assert_eq!(stack.get_session_count(), 0);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn test_udp_stack_serve_with_multiple_workers_reuses_session() {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        return "server mock";
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+
+        let datagram_server_manager = Arc::new(ServerManager::new());
+        datagram_server_manager
+            .add_server(Server::Datagram(Arc::new(MockServer::new(
+                "mock".to_string(),
+            ))))
+            .unwrap();
+        let stack_context = build_udp_context(
+            datagram_server_manager,
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+            None,
+        );
+        let stack = UdpStack::builder()
+            .id("test-multi-worker")
+            .bind("127.0.0.1:0")
+            .hook_point(chains)
+            .server_runtime(test_server_runtime_with_workers(2))
+            .session_idle_time(Duration::from_secs(1))
+            .stack_context(stack_context)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+        let server_addr = stack
+            .server
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .listener_socket()
+            .unwrap()
+            .local_addr()
+            .unwrap();
+
+        let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for _ in 0..3 {
+            udp_client
+                .send_to(b"test_server", server_addr)
+                .await
+                .unwrap();
+            let mut buf = [0; 1024];
+            let (n, _) =
+                tokio::time::timeout(Duration::from_secs(10), udp_client.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&buf[..n], b"datagram");
+        }
+
+        assert_eq!(stack.get_session_count(), 1);
+        tokio::time::sleep(Duration::from_secs(3)).await;
         assert_eq!(stack.get_session_count(), 0);
     }
 

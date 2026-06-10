@@ -127,7 +127,7 @@ stacks:
     #   protocol: udp
     #   bind: 0.0.0.0:53
     #   concurrency: 0              # default 0 (unlimited)
-    #   max_sessions: 0             # max tracked udp sessions, default 0 (unlimited)
+    #   max_sessions: 0             # max tracked udp sessions per worker, default 0 (unlimited)
     #   session_idle_time: 5        # session timeout (seconds), default 5
     #   transparent: false
     #   reuse_address: false
