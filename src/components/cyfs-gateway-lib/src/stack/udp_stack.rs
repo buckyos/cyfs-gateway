@@ -1773,9 +1773,11 @@ pub struct UdpStack {
 
 impl Drop for UdpStack {
     fn drop(&mut self) {
-        if let Some(server) = self.server.lock().unwrap().take() {
-            if let Err(e) = server.close() {
-                log::error!("close udp server failed: {}", e);
+        if let Ok(mut server) = self.server.lock() {
+            if let Some(server) = server.take() {
+                if let Err(e) = server.close() {
+                    log::error!("close udp server failed: {}", e);
+                }
             }
         }
         if let Ok(mut handles) = self.inner.cleanup_handles.lock() {
@@ -2176,6 +2178,11 @@ mod tests {
             sfo_reuseport::ServerRuntimeConfig::new().with_workers(workers),
         )
         .unwrap()
+    }
+
+    fn unused_udp_addr() -> std::net::SocketAddr {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap()
     }
 
     fn build_udp_context(
@@ -2611,27 +2618,19 @@ mod tests {
             Some(Arc::new(GlobalProcessChains::new())),
             None,
         );
+        let server_addr = unused_udp_addr();
+        let server_runtime = test_server_runtime_with_workers(2);
         let stack = UdpStack::builder()
             .id("test-multi-worker")
-            .bind("127.0.0.1:0")
+            .bind(server_addr.to_string())
             .hook_point(chains)
-            .server_runtime(test_server_runtime_with_workers(2))
+            .server_runtime(server_runtime.clone())
             .session_idle_time(Duration::from_secs(1))
             .stack_context(stack_context)
             .build()
             .await
             .unwrap();
         stack.start().await.unwrap();
-        let server_addr = stack
-            .server
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .listener_socket()
-            .unwrap()
-            .local_addr()
-            .unwrap();
 
         let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         for _ in 0..3 {
